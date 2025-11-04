@@ -1,4 +1,4 @@
 pip install uv
-uv venv --clear
-uv sync
+python -m uv venv --clear
+python -m uv sync
 copy doc\windows.bat gtools.bat

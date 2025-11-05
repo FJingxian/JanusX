@@ -104,26 +104,26 @@ GEMMA:
 ```bash
 # 表型预处理 去表头 创建双id
 awk -F "\t" {'print $1,$1,$2'} ~/data_pub/1.database/RiceAtlas/1.pheno.blup.tsv | tail +2 > data/test.pheno
-plink --bfile ~/data_pub/1.database/RiceAtlas/Rice6048 --pheno data/test.pheno --make-bed --out data/test
+python -c "import pandas as pd;data = pd.read_csv('test.pheno',sep='\s+',header=None);data.fillna('-9').to_csv('test.pheno.gemma.gcta.txt',sep=' ',index=None,header=None)"
+plink --bfile ~/data_pub/1.database/RiceAtlas/Rice6048 --pheno data/test.pheno.gemma.gcta.txt --make-bed --out data/test
 # 测试
 time gemma -bfile data/test -gk -o gemma
 # GEMMA 0.98.5 (2021-08-25) by Xiang Zhou, Pjotr Prins and team (C) 2012-2021
 # Reading Files ... 
 # ## number of total individuals = 6048
-# ## number of analyzed individuals = 3487
+# ## number of analyzed individuals = 3381
 # ## number of covariates = 1
 # ## number of phenotypes = 1
 # ## number of total SNPs/var        =  5694922
-# ## number of analyzed SNPs         =  4832333
+# ## number of analyzed SNPs         =  4828877
 # Calculating Relatedness Matrix ... 
 # ================================================== 100%
 # **** INFO: Done.
 
-# real    30m53.343s
-# user    1420m22.217s
-# sys     149m17.993s
-time ./gemma -bfile data/test -k output/gemma.cXX.txt 
--lmm -o gemma
+# real    30m38.194s
+# user    1432m23.940s
+# sys     112m30.275s
+time ./gemma -bfile data/test -k output/gemma.cXX.txt -lmm -o gemma
 # GEMMA 0.98.5 (2021-08-25) by Xiang Zhou, Pjotr Prins and team (C) 2012-2021
 # Reading Files ... 
 # ## number of total individuals = 6048

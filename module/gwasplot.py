@@ -1,3 +1,4 @@
+from _readanno import readanno
 from bioplotkit import GWASPLOT
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -148,24 +149,7 @@ if args.anno is not None:
     if os.path.exists(args.anno):
         df_filter = df.loc[df[pvalue_string]<=threshold,[chr_string,pos_string,pvalue_string]].set_index([chr_string,pos_string])
         logger.info('* Annotating...')
-        suffix = args.anno.replace('.gz','').split('.')[-1]
-        if suffix == 'bed':
-            anno = pd.read_csv(args.anno,sep='\t',header=None,).fillna('NA')
-            if anno.shape[1]<=4:
-                anno[4] = ['NA' for _ in anno.index]
-            if anno.shape[1]<=5:
-                anno[5] = ['NA' for _ in anno.index]
-        elif suffix == 'gff' or suffix == 'gff3':
-            anno = pd.read_csv(args.anno,sep='\t',header=None,comment='#',low_memory=False,usecols=[0,2,3,4,8])
-            anno = anno[(anno[2]=='gene')&(anno[0].astype(str).isin(np.arange(1,50).astype(str)))]
-            del anno[2]
-            anno[0] = anno[0].astype(int)
-            anno = anno.sort_values([0,3])
-            anno.columns = range(anno.shape[1])
-            anno[4] = anno[3].str.extract(fr'{args.descItem}=(.*?);').fillna('NA')
-            anno[3] = anno[3].str.extract(r'ID=(.*?);').fillna('NA')
-            anno[5] = ['NA' for _ in anno.index]
-        '''After treating: anno 0-chr,1-start,2-end,3-geneID,4-description1,5-description2'''
+        anno = readanno(args.anno,args.descItem) # After treating: anno 0-chr,1-start,2-end,3-geneID,4-description1,5-description2
         desc = list(map(lambda x:anno.loc[(anno[0]==x[0])&(anno[1]<=x[1])&(anno[2]>=x[1])], df_filter.index))
         df_filter['desc'] = list(map(lambda x:f'''{x.iloc[0,3]};{x.iloc[0,4]};{x.iloc[0,5]}''' if not x.empty else 'NA;NA;NA', desc))
         if args.annobroaden is not None:

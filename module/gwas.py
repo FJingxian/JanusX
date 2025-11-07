@@ -131,8 +131,9 @@ def main(log:bool=True):
     # create log file
     if not os.path.exists(args.out):
         os.mkdir(args.out,0o755)
+    
     filename = os.path.basename(gfile)
-    logger = setup_logging(f'''{args.out}/{filename.replace('.vcf','').replace('.gz','')}.gwas.log'''.replace('//','/'))
+    logger = setup_logging(f'''{args.out}/{filename.replace('.vcf','').replace('.gz','')}.log'''.replace('//','/'))
     logger.info('High Performance Linear Mixed Model Solver for Genome-Wide Association Studies')
     logger.info(f'Host: {socket.gethostname()}\n')
     # Print configuration summary
@@ -149,6 +150,12 @@ def main(log:bool=True):
         logger.info(f"Threads:          {args.thread} ({'All cores' if args.thread == -1 else 'User specified'})")
         logger.info(f"HighAC mode:      {args.AC}")
         logger.info("*"*60 + "\n")
+    
+    # Create output directory if it doesn't exist
+    if not os.path.exists(args.out):
+        os.makedirs(args.out, mode=0o755)
+        if log:
+            print(f"Created output directory: {args.out}")
     return gfile,args,logger
 
 t_start = time.time()
@@ -205,7 +212,6 @@ if qcal or kcal:
             np.savetxt(f'{prefix}.q.{qdim}.txt',qmatrix,fmt='%.6f')
         else:
             qmatrix = np.array([]).reshape(geno.shape[0],0)
-
 else:
     if qdim == '0':
         qmatrix = np.array([]).reshape(geno.shape[0],0)
@@ -219,19 +225,18 @@ else:
         kmatrix = np.genfromtxt(kinship_method)
     else:
         raise f'{kinship_method} is not a calculation method of kinship and a file'
+if cov is not None:
+    if os.path.exists(cov):
+        cov = np.genfromtxt(cov,).reshape(-1,1)
+        logger.info(f'Covmatrix {cov.shape}:')
+        qmatrix = np.concatenate([qmatrix,cov],axis=1)
+    else:
+        raise f'{cov} is not a file'
 logger.info(f'GRM {str(kmatrix.shape)}:')
 logger.info(kmatrix[:5,:5])
 logger.info(f'Qmatrix {str(qmatrix.shape)}:')
 logger.info(qmatrix[:5,:5])
 
-if cov is not None:
-    if os.path.exists(cov):
-        cov = np.genfromtxt(cov,).reshape(-1,1)
-        logger.info(f'Covmatrix {cov.shape}:')
-        logger.info(cov[:5,:5])
-        qmatrix = np.concatenate([qmatrix,cov],axis=1)
-    else:
-        raise f'{cov} is not a file'
 for i in pheno.columns:
     t = time.time()
     logger.info('*'*60)

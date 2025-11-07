@@ -5,8 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "pyblup==1.0.4","gfreader","bioplotkit"
+    "pyblup==1.0.5","gfreader","bioplotkit"
 ]
 
-# [tool.uv]
-# index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

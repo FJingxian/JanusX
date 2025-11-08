@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "pyblup==1.0.5","gfreader","bioplotkit"
+    "pyblup==1.0.5","gfreader==1.0.3","bioplotkit"
 ]
 
 [tool.uv]

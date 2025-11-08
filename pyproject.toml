@@ -8,5 +8,5 @@ dependencies = [
     "pyblup==1.0.5","gfreader==1.0.5","bioplotkit"
 ]
 
-# [tool.uv]
-# index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

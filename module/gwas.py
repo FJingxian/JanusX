@@ -168,6 +168,17 @@ HighAC = args.AC
 threads = args.thread
 kcal = True if kinship_method in ['VanRanden', 'gemma1', 'gemma2', 'pearson'] else False
 qcal = True if qdim in np.arange(1,20).astype(str) else False
+
+# test exist of all input files
+assert os.path.isfile(gfile), f"can not find file: {gfile}"
+assert os.path.isfile(phenofile), f"can not find file: {phenofile}"
+if not kcal:
+    assert os.path.isfile(kinship_method), f"{kinship_method} is not a GRM calculation method of kinship or a file"
+if not qcal:
+    assert os.path.isfile(qdim), f"{qdim} is not a dimension of q matrix or a file"
+if cov is not None:
+    assert os.path.isfile(cov), f"{cov} is not a file"
+
 if not os.path.exists(outfolder):
     os.makedirs(outfolder,mode=0o755)
 prefix = gfile.replace('.vcf','').replace('.gz','')
@@ -218,20 +229,16 @@ else:
     elif not qcal and os.path.exists(qdim):
         logger.info(f'* Loading Q matrix from {qdim}...')
         qmatrix = np.genfromtxt(qdim)
-    else:
-        raise f'{qdim} is not a number and a file'
+    
     if not kcal and os.path.exists(kinship_method):
         logger.info(f'* Loading GRM from {kinship_method}...')
         kmatrix = np.genfromtxt(kinship_method)
-    else:
-        raise f'{kinship_method} is not a calculation method of kinship and a file'
+        
 if cov is not None:
-    if os.path.exists(cov):
-        cov = np.genfromtxt(cov,).reshape(-1,1)
-        logger.info(f'Covmatrix {cov.shape}:')
-        qmatrix = np.concatenate([qmatrix,cov],axis=1)
-    else:
-        raise f'{cov} is not a file'
+    cov = np.genfromtxt(cov,).reshape(-1,1)
+    logger.info(f'Covmatrix {cov.shape}:')
+    qmatrix = np.concatenate([qmatrix,cov],axis=1)
+
 logger.info(f'GRM {str(kmatrix.shape)}:')
 logger.info(kmatrix[:5,:5])
 logger.info(f'Qmatrix {str(qmatrix.shape)}:')

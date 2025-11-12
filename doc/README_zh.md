@@ -86,7 +86,7 @@ $$
 
 **对比软件**：[GEMMA](https://github.com/genetics-statistics/GEMMA)、GCTA以及rMVP
 **测试平台**：Ubuntu 22.04.5 LTS(x86_64), 2*Intel(R) Xeon(R) Gold 5318Y CPU @ 2.10GHz
-**测试数据集**: [RiceAtlas](http://60.30.67.242:18076/#/download)，表型
+**测试数据集**: [RiceAtlas](http://60.30.67.242:18076/#/download)，6048个体 Panicle_length性状 (基因型+表型)
 **数据格式**：
 基因型属于plink标准格式
 表型格式如下，每列是不同样本，第二列~第n列是多种表型。\t 作为分隔符
@@ -278,39 +278,6 @@ gtools gwas --bfile data/test --pheno data/test.pheno --out . --thread 92 --qcov
 # ************************************************************
 # Genotype file:    data/test
 # Phenotype file:   data/test.pheno
-# Output directory: .
-# GRM method:       VanRanden
-# Q matrix:         0
-# Covariant matrix: None
-# Threads:          92 (User specified)
-# HighAC mode:      True
-# ************************************************************
-
-# Loading genotype from data/test.bed...
-# Loading phenotype from data/test.pheno...
-# Geno and Pheno are ready!
-# * Calculation method of kinship matrix is VanRanden
-# * Dimension of PC for q matrix is 0
-# GRM (6048, 6048):
-# [[1.3707275  0.8874752  0.8883423  0.89439726 0.8315204 ]
-#  [0.8874752  1.3321023  1.0507029  0.9417346  0.9758807 ]
-#  [0.8883423  1.0507029  1.3232387  1.0112458  1.1409674 ]
-#  [0.89439726 0.9417346  1.0112458  1.3440443  0.99946934]
-#  [0.8315204  0.9758807  1.1409674  0.99946934 1.3501267 ]]
-# Qmatrix (6048, 0):
-# []
-
-# Finished, Total time: 6424.28 secs
-# 2025-10-31 10:33:24
-
-# High Performance Linear Mixed Model Solver for Genome-Wide Association Studies
-# Host: user-NF5466M6
-
-# ************************************************************
-# GWAS LMM SOLVER CONFIGURATION
-# ************************************************************
-# Genotype file:    data/test
-# Phenotype file:   data/test.pheno
 # Output directory: output
 # GRM method:       VanRanden
 # Q matrix:         0
@@ -348,12 +315,29 @@ gtools gwas --bfile data/test --pheno data/test.pheno --out . --thread 92 --qcov
 
 ### 准确性测试
 
+&emsp;&emsp;对上述比较测试中gtools和GEMMA生成的结果进行比较。结果显示，在使用各自计算的亲缘关系矩阵下，即使算法设计一致，也可能由于每一步计算误差的级联反应而对结果产生一定偏差（如下第一张图）；在统一使用GEMMA计算的亲缘关系矩阵的情况下，结果近乎完全一致（如下第二张图）。
+
+![ACtest2](../fig/ac_test2.png "Test of accuracy compared with GEMMA"){: style="display: block; margin: 0 auto"}
+
+![ACtest](../fig/ac_test.png "Test of accuracy compared with GEMMA"){: style="display: block; margin: 0 auto"}
+
 ### 效率测试
+
+&emsp;&emsp;为了测试代码多线程的效率，本研究在服务器上固定基因型、表型，探究CPU核心数和耗时之间的关系。理想的并行计算情况下，耗时应该会随着核心数的增加而线性降低。然而，结果表明耗时随CPU核心的增加呈现负指数衰减，并非线性关系。最高效的计算方法是评估基因型读取时间和单个表型计算时间，最终确定拆分计算亦或合并计算。
+
+|core|time (min)|
+|:-:|:-:|
+|8|69|
+|16|42|
+|32|28|
+|64|23|
+
+![CPUtest](../fig/cpu_time_test.png "Test of relation between CPU and costed time"){: style="display: block; margin: 0 auto"}
 
 ### 结论
 
-计算结果一致，但pyBLUP计算速度更快。
-那么pyBLUP是完美的吗？当然不是，他的缺点是内存占用显著高于现有的软件，$M_{1000 \times 1000000}$的矩阵内存占用高达xxx。此外随着个体数的增加，初始化时间（SVD）将会显著增长。而杨剑等的fast-gwa在2019年就实现了算法改进，使其GWAS模型适用于百万级个体的关联分析。
+&emsp;&emsp;总体而言，使用统一模型的前提下计算结果一致，pyBLUP相较于其他程序调用多线程更加积极、计算速度更快。
+&emsp;&emsp;那么pyBLUP是完美的吗？当然不是，他的缺点是内存占用显著高于现有的软件，$M_{1,000 \times 1,000,000}$的矩阵内存占用高达12g，是其他软件的内存占用的2-3倍。此外随着个体数的增加，初始化时间（主要是奇异值分解的时间）将会显著增长。而杨剑等的[fast-gwa](https://doi.org/10.1038/s41588-019-0530-8)在2019年就实现了算法改进，使其GWAS模型适用于百万级个体的关联分析。
 
 ## 使用方法
 
@@ -399,48 +383,15 @@ gtools [模块名] [模块命令](后续增加 coloc、gs 等模块)
 
 ```bash
 gtools gwas -h # 查看帮助
-gtools gwas --vcf example/mouse_hs1940.vcf.gz --pheno example/mouse_hs1940.pheno --out test # 用法和 python gwas.py [参数] 一致
+# 混合线性模型
+gtools gwas --vcf example/mouse_hs1940.vcf.gz --pheno example/mouse_hs1940.pheno --out test
+# 可视化
+gtools gwasplot --file test/test0.assoc.tsv
 ```
 
-使用[测试数据](https://doi.org/10.1038/ng.3609)输出结果如下所示：
-![GWAStest](../fig/test0.png "GWAS test of pyBLUP")
+使用example文件夹下的[测试数据](https://doi.org/10.1038/ng.3609)输出结果如下所示：
+![GWAStest](../fig/test0.png "GWAS test of pyBLUP"){: style="display: block; margin: 0 auto"}
 *(The above image depicts physiological and behavioral trait loci identified in CFW mice using GEMMA, from Parker et al, Nature Genetics, 2016.)
 
-### 功能2: GBLUP & rrBLUP
-
-```python
-from pyBLUP import BLUP,GWAS
-import numpy as np
-import time
-np.random.seed(2025)
-def GS_test() -> None:
-    snp_num = 10000
-    sample_num = 500
-    pve = 0.5
-    sigmau = 1
-    x = np.zeros(shape=(sample_num,snp_num)) # 0,1,2 of SNP
-    for i in range(snp_num):
-        maf = np.random.uniform(0.05,0.5)
-        x[:,i] = np.random.binomial(2,maf,size=sample_num)
-    u = np.random.normal(0,sigmau,size=(snp_num,1)) # effect of SNP is obey to normal distribution
-    g = x @ u
-    e = np.random.normal(0,np.sqrt((1-pve)/pve*(g.var())),size=(sample_num,1))
-    y = g + e
-    for i in [None,'pearson','VanRanden','gemma1','gemma2']: # rrBLUP和四种亲缘关系矩阵下的GBLUP
-        _ = []
-        _hat = []
-        t = time.time()
-        model = BLUP(y,x,kinship=i)
-        print((time.time()-t)/60,'mins')
-        y_hat = model.predict(x)
-        _+=y.tolist()
-        _hat+=y_hat.tolist()
-        real_pred = np.concatenate([np.array(_),np.array(_hat)],axis=1)
-        print(f'{i}({round(model.pve,3)})',np.corrcoef(real_pred,rowvar=False)[0,1])
-
-if __name__ == "__main__":
-    GS_test() # test of GBLUP and rrBLUP
-```
-
-更多用法可以访问[Github仓库](https://github.com/MaizeMan-JxFU/pyBLUP)，仍在更新中...
 更新计划：重写bed_reader函数，获得更高效的基因型编码方式，从而降低内存占用；优化biokitplot中的GWASplot函数，使其绘制千万级别位点的速度更快、内存占用更低。混合线性模型中加入牛顿法，解决多随机效应方差估计的问题（目前pyBLUP只能引入单一随机效应，例如亲缘关系）。
+更多用法可以访问[Github仓库](https://github.com/MaizeMan-JxFU/pyBLUP)，仍在更新中...

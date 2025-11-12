@@ -172,6 +172,7 @@ qcal = True if qdim in np.arange(1,20).astype(str) else False
 # test exist of all input files
 assert os.path.isfile(gfile), f"can not find file: {gfile}"
 assert os.path.isfile(phenofile), f"can not find file: {phenofile}"
+
 if not kcal:
     assert os.path.isfile(kinship_method), f"{kinship_method} is not a GRM calculation method of kinship or a file"
 if not qcal:

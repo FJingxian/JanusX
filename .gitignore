@@ -23,3 +23,7 @@ test.*
 uv.lock
 .python-version
 .venv/
+
+# ignore docker files
+*.sif
+*.tar

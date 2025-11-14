@@ -170,7 +170,6 @@ kcal = True if kinship_method in ['VanRanden', 'gemma1', 'gemma2', 'pearson'] el
 qcal = True if qdim in np.arange(1,20).astype(str) else False
 
 # test exist of all input files
-assert os.path.isfile(gfile), f"can not find file: {gfile}"
 assert os.path.isfile(phenofile), f"can not find file: {phenofile}"
 
 if not kcal:

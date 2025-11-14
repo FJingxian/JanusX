@@ -27,7 +27,7 @@ Citation:
 '''
 
 from pyBLUP import QK,GWAS
-from gfreader import breader,vcfreader
+from _gfreader import breader,vcfreader
 import pandas as pd
 import numpy as np
 import argparse

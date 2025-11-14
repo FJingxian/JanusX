@@ -1,7 +1,3 @@
-from pyBLUP import mlm
-from gfreader import breader,vcfreader
-import pandas as pd
-import numpy as np
 import argparse
 import time
 import socket

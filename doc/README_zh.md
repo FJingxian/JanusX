@@ -369,6 +369,21 @@ cd gtools
 
 ```
 
+### Modules
+
+|模块|功能|最简语法|
+|-|-|-|
+|gwas|利用混合线性模型进行全基因组关联分析|基因型文件+表型文件: ```gtools gwas --bfile test --pheno test.tsv```|
+|gwasplot|可视化及注释全基因组关联分析的结果|gwas模块生成的结果文件: ```gtools gwasplot --file test.assoc.tsv [--anno anno.gff]```|
+|transanno|gwasplot模块注释结果的迁移基因组版本注释|gwasplot模块生成的注释文件: ```gtools transanno [anno file] [site mapping file] [new gff3 or bed file]```|
+|cpheno|合并同一群体多个表型|同一群体的多个表型文件: ```gtools cpheno --files pheno1.tsv,pheno2.tsv,... --out outprefix```|
+
+|计划更新模块|功能|最简语法|
+|-|-|-|
+|pca|基于随机奇异值分解计算输入文件行主成分及可视化|基因型文件: ```gtools pca ...```|
+|iqtree|最大似然法计算输入样本的系统发育关系|phy文件: ```gtools iqtree ...```|
+|...|...|...|
+
 ### 功能1: 全基因组关联分析
 
 模块: gwas

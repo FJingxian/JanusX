@@ -1,6 +1,6 @@
 # pyBLUP
 
-[English](./README.md) | [简体中文(推荐)](./doc/README_zh.html)
+[English](./README.md) | [简体中文(推荐)](./doc/README_zh.md)
 
 ## Usage
 

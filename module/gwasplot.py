@@ -10,8 +10,6 @@ import logging
 import sys
 import os
 import matplotlib as mpl
-mpl.rcParams['pdf.fonttype'] = 42
-mpl.use('Agg')
 '''
 Examples:
   # Basic usage with gwasplot
@@ -132,6 +130,11 @@ def main(log:bool=True):
     return args,logger
 
 t_start = time.time()
+mpl.use('Agg')
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.rcParams['ps.fonttype'] = 42
+logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 args,logger = main()
 file = args.file
 chr_string,pos_string,pvalue_string = args.chr,args.pos,args.pvalue
@@ -147,6 +150,7 @@ if args.plot:
     plotmodel.qq(ax=ax2)
     plt.tight_layout()
     plt.savefig(f'{args.out}.pdf',transparent=True)
+    plt.close()
     logger.info(f'Saved in {args.out}.pdf')
 if args.anno is not None:
     if os.path.exists(args.anno):

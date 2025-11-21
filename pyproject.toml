@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
     "pyblup==1.0.5",
-    "bioplotkit",
+    "bioplotkit==1.0.1",
     "bed-reader==1.0.6"
 ]
 

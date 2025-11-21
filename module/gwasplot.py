@@ -9,6 +9,9 @@ import socket
 import logging
 import sys
 import os
+import matplotlib as mpl
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.use('Agg')
 '''
 Examples:
   # Basic usage with gwasplot
@@ -143,8 +146,8 @@ if args.plot:
     plotmodel.manhattan(-np.log10(threshold),ax=ax)
     plotmodel.qq(ax=ax2)
     plt.tight_layout()
-    plt.savefig(f'{args.out}.png',transparent=True)
-    logger.info(f'Saved in {args.out}.png')
+    plt.savefig(f'{args.out}.pdf',transparent=True)
+    logger.info(f'Saved in {args.out}.pdf')
 if args.anno is not None:
     if os.path.exists(args.anno):
         df_filter = df.loc[df[pvalue_string]<=threshold,[chr_string,pos_string,pvalue_string]].set_index([chr_string,pos_string])

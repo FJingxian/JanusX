@@ -1,6 +1,16 @@
+import time
 from bed_reader import open_bed
 import pandas as pd
 import gzip
+import psutil
+import os
+def get_process_info():
+    """Usage of CPU and memory"""
+    process = psutil.Process(os.getpid())
+    cpu_percent = psutil.cpu_percent(interval=None)
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024**3  # GB
+    return cpu_percent, memory_mb
 
 class GENOMETOOL:
     def __init__(self,genomePath:str):
@@ -53,8 +63,10 @@ def breader(prefix:str,ref_adjust:str=None) -> pd.DataFrame:
         genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
     return genotype
 
-def vcfreader(vcfPath:str,chunksize=10_000,ref_adjust:str=None) -> pd.DataFrame:
+def vcfreader(vcfPath:str,chunksize=50_000,ref_adjust:str=None) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
+    from itertools import takewhile,repeat
+    buffer = 1024*1024
     if '.gz' == vcfPath[-3:]:
         compression = 'gzip'
         with gzip.open(vcfPath) as f:
@@ -63,6 +75,8 @@ def vcfreader(vcfPath:str,chunksize=10_000,ref_adjust:str=None) -> pd.DataFrame:
                 if "#CHROM" in line:
                     col = line.replace('\n','').split('\t')
                     break
+            buf_gen = takewhile(lambda x: x, (f.read(buffer) for _ in repeat(None)))
+            sum_snp = sum(buf.decode('utf-8').count('\n') for buf in buf_gen)-sum(buf.count('#') for buf in buf_gen)
     else:
         compression = None
         with open(vcfPath) as f:
@@ -70,11 +84,21 @@ def vcfreader(vcfPath:str,chunksize=10_000,ref_adjust:str=None) -> pd.DataFrame:
                 if "#CHROM" in line:
                     col = line.replace('\n','').split('\t')
                     break
+            buf_gen = takewhile(lambda x: x, (f.read(buffer) for _ in repeat(None)))
+            sum_snp = sum(buf.decode('utf-8').count('\n') for buf in buf_gen)-sum(buf.count('#') for buf in buf_gen)
     ncol = [0,1,3,4]+list(range(col.index('FORMAT')+1,len(col)))
     col = [col[i] for i in ncol]
     vcf_chunks = pd.read_csv(vcfPath,sep=r'\s+',comment='#',header=None,usecols=ncol,low_memory=False,compression=compression,chunksize=chunksize)
     genotype = []
-    for vcf_chunk in vcf_chunks: # 分块处理vcf
+    t_start = time.time()
+    for iter,vcf_chunk in enumerate(vcf_chunks): # 分块处理vcf
+        end = iter*chunksize + vcf_chunk.shape[0]
+        iter_ratio = round(end/sum_snp,2)
+        time_cost = time.time()-t_start
+        time_left = time_cost/iter_ratio
+        all_time_info = f'''{round(100*iter_ratio,2)}% (time cost: {round(time_cost/60,2)}/{round(time_left/60,2)} mins)'''
+        cpu,mem = get_process_info()
+        print(f'\rCPU: {cpu}%, Memory: {round(mem,2)} G, Process: {all_time_info}',end='')
         vcf_chunk:pd.DataFrame = vcf_chunk.set_index([0,1]).fillna('-9')
         ref_alt = vcf_chunk.iloc[:,:2]
         def transG(col:pd.Series):
@@ -84,6 +108,7 @@ def vcfreader(vcfPath:str,chunksize=10_000,ref_adjust:str=None) -> pd.DataFrame:
         vcf_chunk = vcf_chunk.iloc[:,2:].apply(transG,axis=0)
         vcf_chunk = pd.concat([ref_alt,vcf_chunk],axis=1)
         genotype.append(vcf_chunk)
+    print()
     genotype = pd.concat(genotype,axis=0)
     genotype.columns = col[2:]
     genotype.index = genotype.index.rename(['#CHROM','POS'])

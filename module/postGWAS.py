@@ -11,6 +11,10 @@ Examples:
 Citation:
   https://github.com/MaizeMan-JxFU/gtools/
 '''
+import os
+for key in ['MPLBACKEND']:
+    if key in os.environ:
+        del os.environ[key]
 import matplotlib as mpl
 import logging
 mpl.use('Agg')
@@ -19,14 +23,13 @@ mpl.rcParams['ps.fonttype'] = 42
 logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 from bioplotkit import GWASPLOT
+from bioplotkit.sci_set import color_set
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import argparse
 import time
 import socket
-import os
-from bioplotkit.sci_set import color_set
 from _common.log import setup_logging
 from _common.readanno import readanno
 

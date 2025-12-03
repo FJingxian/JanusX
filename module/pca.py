@@ -1,24 +1,27 @@
 # -*- coding: utf-8 -*-
-from gfreader import breader,vcfreader,npyreader
-from pyBLUP import QK,Eigendec
+import sys
+import os
+for key in ['MPLBACKEND']:
+    if key in os.environ:
+        del os.environ[key]
 import pandas as pd
 import numpy as np
 import argparse
 import time
 import socket
 import logging
-logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
-logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 mpl.use('Agg')
+logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
 from _common.log import setup_logging
-import sys
-import os
 from bioplotkit.sci_set import color_set
 from bioplotkit import PCSHOW
+from gfreader import breader,vcfreader,npyreader
+from pyBLUP import QK,Eigendec
 
 def main(log:bool=True):
     parser = argparse.ArgumentParser(

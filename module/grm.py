@@ -87,9 +87,10 @@ m,n = geno.shape
 n = n - 2
 logger.info('* Calculating GRM...')
 logger.info(f'Loaded SNP: {m}, individual: {n}')
-qkmodel = QK(geno.iloc[:,2:].values)
-logger.info(f'Effective SNP: {qkmodel.M.shape[0]}')
 samples = geno.columns[2:]
+geno = geno.iloc[:,2:].values
+qkmodel = QK(geno)
+logger.info(f'Effective SNP: {qkmodel.M.shape[0]}')
 grm = qkmodel.GRM(method=args.method)
 del qkmodel
 if args.npz:

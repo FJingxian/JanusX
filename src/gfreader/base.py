@@ -4,7 +4,10 @@ import numpy as np
 import pandas as pd
 import gzip
 import psutil
+from tqdm import tqdm
 import os
+import psutil
+process = psutil.Process()
 def get_process_info():
     """Usage of CPU and memory"""
     process = psutil.Process(os.getpid())
@@ -200,43 +203,41 @@ def vcfinfo():
     return vcf_info
 
 def genotype2npy(geno: pd.DataFrame,outPrefix:str=None):
-    geno = geno.reset_index() if geno.columns[0] != "#CHROM" else geno
-    np.savez_compressed(f'{outPrefix}.npz',geno.iloc[:,4:].values)
-    geno.iloc[:,:4].to_csv(f'{outPrefix}.snp',header=None,index=None,sep='\t')
-    geno.columns[4:].to_frame().to_csv(f'{outPrefix}.idv',header=None,index=None,sep='\t')
-
+    '''geno: index-(chr,pos),columns-(ref,alt,sample1,sample2,...)'''
+    geno.iloc[:,:2].to_csv(f'{outPrefix}.snp',header=None,sep='\t')
+    geno.columns[2:].to_frame().to_csv(f'{outPrefix}.idv',header=None,index=None,sep='\t')
+    np.savez_compressed(f'{outPrefix}.npz',geno.iloc[:,2:].values)
+    
 def genotype2vcf(geno:pd.DataFrame,outPrefix:str=None,chunksize:int=10_000):
     import warnings
     warnings.filterwarnings('ignore')
+    m,n = geno.shape
     vcf_head = 'ID QUAL FILTER INFO FORMAT'.split(' ')
-    geno = geno.reset_index() if geno.columns[0] != "#CHROM" else geno
-    geno_ = geno.iloc[:,4:].copy()
-    geno_[geno_<0] = -9
-    sample_duploc = geno_.columns.duplicated()
-    if sample_duploc.sum()>0:
-        dupsamples = ','.join(geno_.columns[sample_duploc].unique())
-        print(f'Duplicated samples: {dupsamples}')
-        geno_ = geno_.loc[:,~sample_duploc]
-    samples = geno_.columns
-    geno.columns = ['#CHROM','POS','REF','ALT']+geno.columns[4:].tolist()
-    vcf = pd.DataFrame([['.','.','.','PR','GT'] for i in geno.index],columns=vcf_head)
-    vcf = pd.concat([geno[['#CHROM','POS']],vcf['ID'],geno[['REF','ALT']],vcf[['QUAL','FILTER','INFO','FORMAT']],geno_],axis=1)
-    def transG(col:pd.Series):
-        vcf_transdict = {0:'0/0',2:'1/1',1:'0/1',-9:'./.'}
-        return col.map(vcf_transdict).fillna('./.')
+    samples = geno.columns[2:]
+    sample_duploc = samples.duplicated()
+    dupsamples = ','.join(samples[sample_duploc])
+    assert sample_duploc.sum()==0, f'Duplicated samples: {dupsamples}'
     with open(f'{outPrefix}.vcf','w') as f:
         f.writelines(vcfinfo())
-    if chunksize >= vcf.shape[0]:
-        vcf[samples] = vcf[samples].apply(transG,axis=0)
-        vcf.to_csv(f'{outPrefix}.vcf',sep='\t',index=None,mode='a')
-    else:
-        for i in range(0,vcf.shape[0],chunksize):
-            vcf_chunk = vcf.iloc[i:i+chunksize,:]
-            vcf_chunk[samples] = vcf_chunk[samples].apply(transG,axis=0)
-            if i == 0:
-                vcf_chunk.to_csv(f'{outPrefix}.vcf',sep='\t',index=None,mode='a')
-            else:
-                vcf_chunk.to_csv(f'{outPrefix}.vcf',sep='\t',index=None,header=False,mode='a')
-        
+    pbar = tqdm(total=m, desc="Saving as VCF",ascii=True)
+    for i in range(0,m,chunksize):
+        i_end = np.min([i+chunksize,m])
+        g_chunk = np.full((i_end-i,n-2), './.', dtype=object)
+        g_chunk[geno.iloc[i:i_end,2:]==0] = '0/0'
+        g_chunk[geno.iloc[i:i_end,2:]==2] = '1/1'
+        g_chunk[geno.iloc[i:i_end,2:]==1] = '0/1'
+        info_chunk = geno.iloc[i:i_end,:2].reset_index()
+        info_chunk.columns = ['#CHROM','POS','REF','ALT']
+        vcf_chunk = pd.DataFrame([['.','.','.','PR','GT'] for i in range(i_end-i)],columns=vcf_head)
+        vcf_chunk = pd.concat([info_chunk[['#CHROM','POS']],vcf_chunk['ID'],info_chunk[['REF','ALT']],vcf_chunk[['QUAL','FILTER','INFO','FORMAT']],pd.DataFrame(g_chunk,columns=samples)],axis=1)
+        pbar.update(i_end-i)
+        if i % 10 == 0:
+            memory_usage = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
+        if i == 0:
+            vcf_chunk.to_csv(f'{outPrefix}.vcf',sep='\t',index=None,mode='a') # keep header
+        else:
+            vcf_chunk.to_csv(f'{outPrefix}.vcf',sep='\t',index=None,header=False,mode='a') # ignore header
+
 if __name__ == "__main__":
     pass

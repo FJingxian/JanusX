@@ -105,78 +105,79 @@ def main(log:bool=True):
         logger.info("*"*60 + "\n")
     return gfile,args,logger
 
-t_start = time.time()
-gfile,args,logger = main()
 
-t_loading = time.time()
-if not args.pcfile:
-    if args.vcf:
-        logger.info(f'Loading genotype from {gfile}...')
-        geno = vcfreader(rf'{gfile}') # VCF format
-    elif args.bfile:
-        logger.info(f'Loading genotype from {gfile}.bed...')
-        geno = breader(rf'{gfile}') # PLINK format
-    elif args.npy:
-        logger.info(f'Loading genotype from {gfile}.npz...')
-        geno = npyreader(rf'{gfile}') # numpy format
-    logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
-    m,n = geno.shape
-    n = n - 2
-    logger.info('* Calculating PC...')
-    logger.info(f'Loaded SNP: {m}, individual: {n}')
-    qkmodel = QK(geno.iloc[:,2:].values)
-    logger.info(f'Effective SNP: {qkmodel.M.shape[0]}')
-    samples = geno.columns[2:]
-    eigenvec, eigenval = qkmodel.PCA()
-    del qkmodel
-    np.savetxt(f'{args.out}/{args.prefix}.eigenvec.id',samples.values,fmt='%s')
-    np.savetxt(f'{args.out}/{args.prefix}.eigenvec',eigenvec[:,:args.dim],fmt='%.6f')
-    np.savetxt(f'{args.out}/{args.prefix}.eigenval',eigenval,fmt='%.2f')
-    logger.info(f'Saved in folder "{args.out}" with files named {args.prefix}.eigenvec, {args.prefix}.eigenvec.id and {args.prefix}.eigenval')
-else:
-    logger.info(f'Loading genotype from {gfile}.eigenvec, {gfile}.eigenvec.id and {gfile}.eigenval...')
-    eigenvec,samples,eigenval = np.genfromtxt(f'{gfile}.eigenvec'),np.genfromtxt(f'{gfile}.eigenvec.id'),np.genfromtxt(f'{gfile}.eigenval')
-if args.plot or args.plot3D:
-    from bioplotkit import PCSHOW
-    import matplotlib.pyplot as plt
-    import matplotlib as mpl
-    mpl.use('Agg')
-    mpl.rcParams['pdf.fonttype'] = 42
-    mpl.rcParams['ps.fonttype'] = 42
-    logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
-    logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
-    if args.plot:
-        logger.info('* Visualizing...')
-        exp = 100*eigenval/np.sum(eigenval)
-        df_pc = pd.DataFrame(eigenvec[:,:3],index=samples,columns=[f'''PC{i+1}({round(float(exp[i]),2)}%)''' for i in range(3)])
-        if args.group:
-            df_pc = pd.concat([df_pc,pd.read_csv(args.group,sep='\t',index_col=0,)],axis=1)
-            group = df_pc.columns[3]
-            textanno = df_pc.columns[4]
-        else:
-            group,textanno = None,None
-        pcshow = PCSHOW(df_pc)
-        fig = plt.figure(figsize=(10,4),dpi=300)
-        ax1 = fig.add_subplot(121);ax1.set_xlabel(f'{df_pc.columns[0]}');ax1.set_ylabel(f'{df_pc.columns[1]}')
-        ax2 = fig.add_subplot(122);ax2.set_xlabel(f'{df_pc.columns[0]}');ax2.set_ylabel(f'{df_pc.columns[2]}')
-        pcshow.pcplot(df_pc.columns[0],df_pc.columns[1],group=group,ax=ax1,color_set=args.color,anno_tag=textanno)
-        pcshow.pcplot(df_pc.columns[0],df_pc.columns[2],group=group,ax=ax2,color_set=args.color,anno_tag=textanno)
-        plt.tight_layout()
-        plt.savefig(f'{args.out}/{args.prefix}.eigenvec.2D.pdf',transparent=True)
-        logger.info(f'2D figure was saved in {args.out}/{args.prefix}.eigenvec.2D.pdf')
-        plt.close()
-    if args.plot3D:
-        df_pc = pd.DataFrame(eigenvec[:,:3],index=samples,columns=[f'''PC{i+1}({round(float(exp[i]),2)}%)''' for i in range(3)])
-        if args.group:
-            df_pc = pd.concat([df_pc,pd.read_csv(args.group,sep='\t',index_col=0,)],axis=1)
-            group = df_pc.columns[3]
+if __name__ == '__main__':
+    t_start = time.time()
+    gfile,args,logger = main()
+    t_loading = time.time()
+    if not args.pcfile:
+        if args.vcf:
+            logger.info(f'Loading genotype from {gfile}...')
+            geno = vcfreader(rf'{gfile}') # VCF format
+        elif args.bfile:
+            logger.info(f'Loading genotype from {gfile}.bed...')
+            geno = breader(rf'{gfile}') # PLINK format
+        elif args.npy:
+            logger.info(f'Loading genotype from {gfile}.npz...')
+            geno = npyreader(rf'{gfile}') # numpy format
+        logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
+        m,n = geno.shape
+        n = n - 2
+        logger.info('* Calculating PC...')
+        logger.info(f'Loaded SNP: {m}, individual: {n}')
+        samples = geno.columns[2:]
+        geno = geno.iloc[:,2:].values
+        qkmodel = QK(geno)
+        logger.info(f'Effective SNP: {qkmodel.M.shape[0]}')
+        eigenvec, eigenval = qkmodel.PCA()
+        del qkmodel
+        np.savetxt(f'{args.out}/{args.prefix}.eigenvec.id',samples.values,fmt='%s')
+        np.savetxt(f'{args.out}/{args.prefix}.eigenvec',eigenvec[:,:args.dim],fmt='%.6f')
+        np.savetxt(f'{args.out}/{args.prefix}.eigenval',eigenval,fmt='%.2f')
+        logger.info(f'Saved in folder "{args.out}" with files named {args.prefix}.eigenvec, {args.prefix}.eigenvec.id and {args.prefix}.eigenval')
+    else:
+        logger.info(f'Loading genotype from {gfile}.eigenvec, {gfile}.eigenvec.id and {gfile}.eigenval...')
+        eigenvec,samples,eigenval = np.genfromtxt(f'{gfile}.eigenvec'),np.genfromtxt(f'{gfile}.eigenvec.id'),np.genfromtxt(f'{gfile}.eigenval')
+    if args.plot or args.plot3D:
+        from bioplotkit import PCSHOW
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+        mpl.use('Agg')
+        mpl.rcParams['pdf.fonttype'] = 42
+        mpl.rcParams['ps.fonttype'] = 42
+        logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
+        logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+        if args.plot:
+            logger.info('* Visualizing...')
+            exp = 100*eigenval/np.sum(eigenval)
+            df_pc = pd.DataFrame(eigenvec[:,:3],index=samples,columns=[f'''PC{i+1}({round(float(exp[i]),2)}%)''' for i in range(3)])
+            if args.group:
+                df_pc = pd.concat([df_pc,pd.read_csv(args.group,sep='\t',index_col=0,)],axis=1)
+                group = df_pc.columns[3]
+                textanno = df_pc.columns[4]
+            else:
+                group,textanno = None,None
             pcshow = PCSHOW(df_pc)
-            fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2],group,textanno,color_set[6])
-        else:
-            fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2])
-        fig.write_html(f'{args.out}/{args.prefix}.eigenvec.3D.html')
-        logger.info(f'3D figure was saved in {args.out}/{args.prefix}.eigenvec.3D.html')
-
-lt = time.localtime()
-endinfo = f'\nFinished, total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
-logger.info(endinfo)
+            fig = plt.figure(figsize=(10,4),dpi=300)
+            ax1 = fig.add_subplot(121);ax1.set_xlabel(f'{df_pc.columns[0]}');ax1.set_ylabel(f'{df_pc.columns[1]}')
+            ax2 = fig.add_subplot(122);ax2.set_xlabel(f'{df_pc.columns[0]}');ax2.set_ylabel(f'{df_pc.columns[2]}')
+            pcshow.pcplot(df_pc.columns[0],df_pc.columns[1],group=group,ax=ax1,color_set=args.color,anno_tag=textanno)
+            pcshow.pcplot(df_pc.columns[0],df_pc.columns[2],group=group,ax=ax2,color_set=args.color,anno_tag=textanno)
+            plt.tight_layout()
+            plt.savefig(f'{args.out}/{args.prefix}.eigenvec.2D.pdf',transparent=True)
+            logger.info(f'2D figure was saved in {args.out}/{args.prefix}.eigenvec.2D.pdf')
+            plt.close()
+        if args.plot3D:
+            df_pc = pd.DataFrame(eigenvec[:,:3],index=samples,columns=[f'''PC{i+1}({round(float(exp[i]),2)}%)''' for i in range(3)])
+            if args.group:
+                df_pc = pd.concat([df_pc,pd.read_csv(args.group,sep='\t',index_col=0,)],axis=1)
+                group = df_pc.columns[3]
+                pcshow = PCSHOW(df_pc)
+                fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2],group,textanno,color_set[6])
+            else:
+                fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2])
+            fig.write_html(f'{args.out}/{args.prefix}.eigenvec.3D.html')
+            logger.info(f'3D figure was saved in {args.out}/{args.prefix}.eigenvec.3D.html')
+    lt = time.localtime()
+    endinfo = f'\nFinished, total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
+    logger.info(endinfo)

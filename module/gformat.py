@@ -86,51 +86,53 @@ def main(log:bool=True):
         logger.info("*"*60 + "\n")
     return gfile,args,logger
 
-t_start = time.time()
-gfile,args,logger = main()
 
-assert args.recode in ['vcf','npy'], f'recode must be vcf or npy'
-t_loading = time.time()
-if args.vcf:
-    logger.info(f'Loading genotype from {gfile}...')
-    geno = vcfreader(rf'{gfile}') # VCF format
-if args.ivcf:
-    logger.info(f'Loading genotype from {gfile}...')
-    geno = vcfreader(rf'{gfile}',vcftype='ivcf') # VCF format
-if args.fvcf:
-    logger.info(f'Loading genotype from {gfile}...')
-    geno = vcfreader(rf'{gfile}',vcftype='fvcf') # VCF format
-elif args.bfile:
-    logger.info(f'Loading genotype from {gfile}.bed...')
-    geno = breader(rf'{gfile}') # PLINK format
-elif args.npy:
-    logger.info(f'Loading genotype from {gfile}.npz...')
-    geno = npyreader(rf'{gfile}') # numpy format
-logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
-# if args.maf>0 or geno<1
-m,n = geno.shape
-n = n - 2
-logger.info(f'Loaded SNP: {m}, individual: {n}')
-if not args.ivcf and not args.fvcf:
-    if args.maf>0 or args.geno<1:
-        qkmodel = QK(geno.iloc[:,2:].values,maff=args.maf,missf=args.geno)
-        samples = geno.columns[2:]
-        ref_alt:pd.DataFrame = geno.iloc[:,:2]
-        ref_alt = ref_alt.loc[qkmodel.SNPretain]
-        ref_alt.iloc[qkmodel.maftmark,[0,1]] = ref_alt.iloc[qkmodel.maftmark,[1,0]]
-        geno = pd.concat([ref_alt,pd.DataFrame(qkmodel.M,index=ref_alt.index,columns=samples)],axis=1)
-        m,n = geno.shape
-        n = n - 2
-        logger.info(f'After filtering, SNP: {m}, individual: {n}, mean of maf: {np.mean(qkmodel.maf):.3f}, mean of miss: {np.mean(qkmodel.missrate):.3f}')
-        del qkmodel
-logger.info(f'Genotype is transformed to {args.recode} format...')
-if args.recode == 'npy':
-    genotype2npy(geno,f'{args.out}/{args.prefix}')
-    logger.info(f'Saved in {args.out}/{args.prefix}.npz, {args.out}/{args.prefix}.idv and {args.out}/{args.prefix}.snp')
-if args.recode == 'vcf':
-    genotype2vcf(geno,f'{args.out}/{args.prefix}')
-    logger.info(f'Saved in {args.out}/{args.prefix}.vcf')
+if __name__ == "__main__":
+    t_start = time.time()
+    gfile,args,logger = main()
 
-lt = time.localtime()
-endinfo = f'\nFinished, Total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
-logger.info(endinfo)
+    assert args.recode in ['vcf','npy'], f'recode must be vcf or npy'
+    t_loading = time.time()
+    if args.vcf:
+        logger.info(f'Loading genotype from {gfile}...')
+        geno = vcfreader(rf'{gfile}') # VCF format
+    if args.ivcf:
+        logger.info(f'Loading genotype from {gfile}...')
+        geno = vcfreader(rf'{gfile}',vcftype='ivcf') # VCF format
+    if args.fvcf:
+        logger.info(f'Loading genotype from {gfile}...')
+        geno = vcfreader(rf'{gfile}',vcftype='fvcf') # VCF format
+    elif args.bfile:
+        logger.info(f'Loading genotype from {gfile}.bed...')
+        geno = breader(rf'{gfile}') # PLINK format
+    elif args.npy:
+        logger.info(f'Loading genotype from {gfile}.npz...')
+        geno = npyreader(rf'{gfile}') # numpy format
+    logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
+    # if args.maf>0 or geno<1
+    m,n = geno.shape
+    n = n - 2
+    logger.info(f'Loaded SNP: {m}, individual: {n}')
+    if not args.ivcf and not args.fvcf:
+        if args.maf>0 or args.geno<1:
+            qkmodel = QK(geno.iloc[:,2:].values,maff=args.maf,missf=args.geno)
+            samples = geno.columns[2:]
+            ref_alt:pd.DataFrame = geno.iloc[:,:2]
+            ref_alt = ref_alt.loc[qkmodel.SNPretain]
+            ref_alt.iloc[qkmodel.maftmark,[0,1]] = ref_alt.iloc[qkmodel.maftmark,[1,0]]
+            geno = pd.concat([ref_alt,pd.DataFrame(qkmodel.M,index=ref_alt.index,columns=samples)],axis=1)
+            m,n = geno.shape
+            n = n - 2
+            logger.info(f'After filtering, SNP: {m}, individual: {n}, mean of maf: {np.mean(qkmodel.maf):.3f}, mean of miss: {np.mean(qkmodel.missrate):.3f}')
+            del qkmodel
+    logger.info(f'Genotype is transformed to {args.recode} format...')
+    if args.recode == 'npy':
+        genotype2npy(geno,f'{args.out}/{args.prefix}')
+        logger.info(f'Saved in {args.out}/{args.prefix}.npz, {args.out}/{args.prefix}.idv and {args.out}/{args.prefix}.snp')
+    if args.recode == 'vcf':
+        genotype2vcf(geno,f'{args.out}/{args.prefix}')
+        logger.info(f'Saved in {args.out}/{args.prefix}.vcf')
+
+    lt = time.localtime()
+    endinfo = f'\nFinished, Total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
+    logger.info(endinfo)

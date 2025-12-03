@@ -1,4 +1,3 @@
-from matplotlib.style import available
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.stats import norm

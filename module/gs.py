@@ -107,7 +107,7 @@ if __name__ == '__main__':
         for i in pheno.columns:
             t = time.time()
             logger.info('*'*60)
-            logger.info(f'* GWAS process for {i}')
+            logger.info(f'* GS process for {i}')
             p = pheno[i]
             namark = p.isna()
             trainmark = np.isin(samples,p.index[~namark])
@@ -116,11 +116,8 @@ if __name__ == '__main__':
             TrainSNP = geno[:,trainmark]
             TrainP = p.loc[samples[trainmark]].values.reshape(-1,1)
             if TrainP.size > 0:
-                for test,train in  kfold(TrainSNP.shape[1],k=5,seed=None):
-                    model = BLUP(TrainP[train],TrainSNP[:,train],)
-                    # import matplotlib.pyplot as plt
-                    # plt.scatter(TrainP[test],model.predict(TrainSNP[:,test]))
-                    # plt.savefig('test/test.gs.png',)
+                for test,train in  kfold(TrainSNP.shape[1],k=5,seed=1):
+                    model = BLUP(TrainP[train],TrainSNP[:,train],kinship=None)
                     logger.info(np.corrcoef(np.concatenate([TrainP[test],model.predict(TrainSNP[:,test])],axis=1),rowvar=False)[0,1])
                 # Prediction for test population
                 TestSNP = geno[:,testmark]

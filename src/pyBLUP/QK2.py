@@ -6,13 +6,14 @@ process = psutil.Process()
 class QK:
     def __init__(self,M:np.ndarray,chunksize:int=100_000,
                  Mcopy:bool=False,maff:float=0.02,missf:float=0.05,
-                 impute:typing.Literal['mean','mode']='mode'):
+                 impute:typing.Literal['mean','mode']='mode',log:bool=True):
         '''
         Calculation of Q and K matrix with low memory and high speed
         
         :param M: marker matrix with m snps multiply n samples (0,1,2 int8)
         :param chunksize: int (default: 500_000)
         '''
+        self.log = log
         M = M.copy() if Mcopy else M
         NAmark = M<0 # Mark miss as bool matrix
         M[NAmark] = 0 # Miss -> 0
@@ -50,18 +51,20 @@ class QK:
         Mvar_sum = np.sum(self.Mvar)
         Mvar_r = 1/self.Mvar
         grm = np.zeros((n,n),dtype='float32')
-        pbar = tqdm(total=m, desc="Process of GRM",ascii=True)
+        if self.log:
+            pbar = tqdm(total=m, desc="Process of GRM",ascii=True)
         for i in range(0,m,self.chunksize):
             i_end = min(i+self.chunksize,m)
             block_i = self.M[i:i_end]-self.Mmean[i:i_end]
             if method == 1:
                 grm+=block_i.T@block_i/Mvar_sum
             elif method == 2:
-                grm+=Mvar_r[i:i_end]/m*block_i.T@block_i
-            pbar.update(i_end-i)
-            if i % 10 == 0:
-                memory_usage = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
+                grm+=Mvar_r[i:i_end].T/m*block_i.T@block_i
+            if self.log:
+                pbar.update(i_end-i)
+                if i % 10 == 0:
+                    memory_usage = process.memory_info().rss / 1024**3
+                    pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
         return (grm+grm.T)/2
     def PCA(self):
         '''
@@ -75,15 +78,17 @@ class QK:
         m,n = self.M.shape
         Mstd = np.sqrt(self.Mvar)
         MTM = np.zeros((n,n),dtype='float32')
-        pbar = tqdm(total=m, desc="Process of PCA",ascii=True)
+        if self.log:
+            pbar = tqdm(total=m, desc="Process of PCA",ascii=True)
         for i in range(0,m,self.chunksize):
             i_end = min(i + self.chunksize, m)
             block_i = (self.M[i:i_end]-self.Mmean[i:i_end])/Mstd[i:i_end]
             MTM += block_i.T @ block_i
-            pbar.update(i_end-i)
-            if i % 10 == 0:
-                memory_usage = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
+            if self.log:
+                pbar.update(i_end-i)
+                if i % 10 == 0:
+                    memory_usage = process.memory_info().rss / 1024**3
+                    pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
         MTM = (MTM + MTM.T)/2
         eigval,eigvec = np.linalg.eigh(MTM/m)
         idx = np.argsort(eigval)[::-1]

@@ -22,7 +22,7 @@ class BLUP:
         self.p = self.X.shape[1]
         self.kinship = kinship # 确保训练和预测的kinship方法一致
         if self.kinship is not None:
-            qkmodel = QK(M,low_memory=False)
+            qkmodel = QK(M,maff=0.01,log=False)
             self.G = qkmodel.GRM(method=self.kinship)
             self.G+=1e-6*np.eye(self.G.shape[0]) # 添加正则项 确保矩阵正定
             self.Z = Z
@@ -58,7 +58,7 @@ class BLUP:
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         X = np.concatenate([np.ones((M.shape[1],1)),cov],axis=1) if cov is not None else np.ones((M.shape[1],1))
         if self.kinship is not None:
-            qkmodel = QK(np.concatenate([self.M, M]))
+            qkmodel = QK(np.concatenate([self.M, M],axis=1),maff=0.01,log=False)
             G = qkmodel.GRM(method=self.kinship)
             G+=1e-6*np.eye(G.shape[1]) # 添加正则项 确保矩阵正定
             return X@self.beta+G[self.n:, :self.n]@np.linalg.solve(self.G,self.u)

@@ -10,7 +10,7 @@ class QK:
         '''
         Calculation of Q and K matrix with low memory and high speed
         
-        :param M: marker matrix with n samples multiply m snp (0,1,2 int8)
+        :param M: marker matrix with m snps multiply n samples (0,1,2 int8)
         :param chunksize: int (default: 500_000)
         '''
         M = M.copy() if Mcopy else M

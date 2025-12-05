@@ -12,7 +12,7 @@ wheels/
 # test folder
 test*
 
-gtools.*
+jx.*
 
 # ignore huge matrix generated from gwas module
 example/*.q.*

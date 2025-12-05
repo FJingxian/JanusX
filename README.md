@@ -87,9 +87,9 @@ Each module corresponds to a CLI command. The launcher script (`jx.bat`/`jx`) di
 
 **Mixed Linear Model**: Uses SVD decomposition of the kinship matrix to simplify variance computation, with Brent's method for REML parameter optimization. Lambda (variance ratio) is the single parameter being optimized.
 
-**Kinship Methods**: VanRanden (default), GEMMA-style methods (gemma1, gemma2), Pearson correlation
+**Kinship Methods**: VanRanden (Centralization, default), Yang (Standardization).
 
-**PCA**: Supports both exact SVD and randomized SVD for large datasets
+**PCA**: Matrix block partitioning for computation.
 
 ## File Formats
 

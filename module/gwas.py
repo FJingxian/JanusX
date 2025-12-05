@@ -2,16 +2,16 @@
 '''
 Examples:
   # Basic usage with VCF file
-  --vcf genotypes.vcf --pheno phenotypes.txt --out results
+  -vcf genotypes.vcf -p phenotypes.txt -o results
   
   # Using PLINK binary files with custom parameters
-  --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --thread 8
+  -bfile genotypes -p phenotypes.txt -o results -k 1 -q 3 --thread 8
   
   # Using external kinship matrix and enabling fast mode
-  --vcf genotypes.vcf --pheno phenotypes.txt --out results --grm kinship_matrix.txt --qcov 10 --fast
+  -vcf genotypes.vcf -p phenotypes.txt -o results -k kinship_matrix.txt -qc 10 -fast
   
-  # Maximum performance with all threads
-  --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --cov covfile.txt --thread -1
+  # Maximum performance with one thread
+  --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --cov covfile.txt --thread 1
 
 File Formats:
   VCF/BFILE:    Standard VCF or PLINK binary format (bed/bim/fam)
@@ -24,7 +24,7 @@ Citation:
   https://github.com/MaizeMan-JxFU/gtools/
 '''
 
-from pyBLUP import GWAS
+from pyBLUP import GWAS,LM
 from pyBLUP import QK
 from gfreader import breader,vcfreader,npyreader
 import pandas as pd
@@ -43,15 +43,15 @@ def format_dataframe_for_export(df:pd.DataFrame, scientific_cols=None, float_col
     - float_cols: 浮点数列
     """
     df_export = df.copy()
-    # 科学计数法
+    # Scientific
     if scientific_cols:
         for col in scientific_cols:
-            if col in df_export.columns and df_export[col].dtype in [np.float64, np.int64]:
+            if col in df_export.columns and df_export[col].dtype in [np.float64, np.int64, np.float32]:
                 df_export[col] = df_export[col].apply(lambda x: f"{x:.4e}")
-    # 浮点数
+    # Float
     if float_cols:
         for col in float_cols:
-            if col in df_export.columns and df_export[col].dtype in [np.float64, np.int64]:
+            if col in df_export.columns and df_export[col].dtype in [np.float64, np.int64, np.float32]:
                 df_export[col] = df_export[col].apply(lambda x: f"{x:.4f}")
     return df_export
 def main(log:bool=True):
@@ -60,7 +60,8 @@ def main(log:bool=True):
         epilog=__doc__
     )
     # Required arguments
-    required_group = parser.add_argument_group('Required Arguments')
+    required_group = parser.add_argument_group('Required arguments')
+    ## Genotype file
     geno_group = required_group.add_mutually_exclusive_group(required=True)
     geno_group.add_argument('-vcf','--vcf', type=str, 
                            help='Input genotype file in VCF format (.vcf or .vcf.gz)')
@@ -68,22 +69,37 @@ def main(log:bool=True):
                            help='Input genotype files in PLINK binary format (prefix for .bed, .bim, .fam)')
     geno_group.add_argument('-npy','--npy', type=str, 
                            help='Input genotype files in PLINK binary format (prefix for .npz, .snp, .idv)')
+    ## Phenotype file
     required_group.add_argument('-p','--pheno', type=str, required=True,
                                help='Phenotype file (tab-delimited with sample IDs in first column)')
     # Optional arguments
     optional_group = parser.add_argument_group('Optional Arguments')
-    optional_group.add_argument('-k','--grm', type=str,
-                               default='1',
-                               help='Kinship matrix calculation method or path to pre-calculated GRM file '
+    ## Model
+    optional_group.add_argument('-lm','--lm', action='store_true',default=False,
+                               help='Additional calculation of general model '
+                                   '(default: %(default)s)')
+    ## Point out phenotype or snp
+    optional_group.add_argument('-n','--ncol', type=int, default=None,
+                               help='Only analysis n columns in phenotype ranged from 0-n '
+                                   '(default: %(default)s)')
+    optional_group.add_argument('-cl','--chrloc', type=str, default=None,
+                               help='Only analysis ranged SNP, eg. 1:1000000:3000000 '
+                                   '(default: %(default)s)')
+    ## More detail arguments
+    optional_group.add_argument('-k','--grm', type=str, default='1',
+                               help='Kinship matrix calculation method [1-centralization or 2-standardization] or path to pre-calculated GRM file '
                                    '(default: %(default)s)')
     optional_group.add_argument('-q','--qcov', type=str, default='0',
                                help='Number of principal components for Q matrix or path to covariate matrix file '
                                    '(default: %(default)s)')
     optional_group.add_argument('-c','--cov', type=str, default=None,
-                               help='Path to Covariance file '
+                               help='Path to covariance file '
                                    '(default: %(default)s)')
     optional_group.add_argument('-d','--dom', action='store_true', default=False,
                                help='Estimate dominance effects '
+                                   '(default: %(default)s)')
+    optional_group.add_argument('-snpck','--snpck', type=str, default=None,
+                               help='ConditionalGWAS for  '
                                    '(default: %(default)s)')
     optional_group.add_argument('-t','--thread', type=int, default=-1,
                                help='Number of CPU threads to use (-1 for all available cores, default: %(default)s)')
@@ -113,16 +129,24 @@ def main(log:bool=True):
         logger.info("*"*60)
         logger.info(f"Genotype file:    {gfile}")
         logger.info(f"Phenotype file:   {args.pheno}")
+        logger.info(f"Analysis nSNP:    {args.chrloc}") if args.chrloc is not None else logger.info(f"Analysis nSNP:    All")
+        logger.info(f"Analysis Pcol:    {args.ncol}") if args.ncol is not None else logger.info(f"Analysis Pcol:    All")
+        if args.dom: # Dominance model
+            logger.info(f"Dominance model:  {args.dom}")
+        if args.snpck: # Dominance model
+            logger.info(f"Dominance model:  {args.dom}")
+        logger.info(f"Estimate Model:   Mixed Linear Model")
+        if args.lm:
+            logger.info("Estimate Model:   General Linear model")
         logger.info(f"Output directory: {args.out}")
-        logger.info(f"Genotype RMatrix: {args.grm}")
+        logger.info(f"Estimate of GRM:  {args.grm}")
         if args.qcov != '0':
             logger.info(f"Q matrix:         {args.qcov}")
         if args.cov:
             logger.info(f"Covariant matrix: {args.cov}")
-        if args.dom:
-            logger.info(f"Dominance model:  {args.dom}")
         logger.info(f"Threads:          {args.thread} ({'All cores' if args.thread == -1 else 'User specified'})")
-        logger.info(f"FAST mode:        {args.fast}")
+        if args.fast:
+            logger.info(f"FAST mode:        {args.fast}")
         logger.info("*"*60 + "\n")
     return gfile,args,logger
 
@@ -144,21 +168,22 @@ assert qcal or os.path.isfile(qdim), f'Error: {qdim} is not a dimension of PC or
 assert cov is None or os.path.isfile(cov), f"{cov} is applied, but it is not a file"
 
 # Loading genotype matrix
-logger.info(f'Loading phenotype from {phenofile}...')
-pheno = pd.read_csv(rf'{phenofile}',sep='\t') # 第一列是样本ID, 第一行是表型名
-pheno = pheno.groupby(pheno.columns[0]).mean() # 重复样本表型取均值
+logger.info(f'* Loading phenotype from {phenofile}...')
+pheno = pd.read_csv(rf'{phenofile}',sep='\t') # Col 1 - idv ID; row 1 - pheno tag
+pheno = pheno.groupby(pheno.columns[0]).mean() # Mean of duplicated samples
 pheno.index = pheno.index.astype(str)
-if pheno.shape[1]==0:
-    print(pheno.head())
-    raise ValueError('No phenotype data found, please check the phenotype file format!')
+assert pheno.shape[1]>0, f'No phenotype data found, please check the phenotype file format!\n{pheno.head()}'
+if args.ncol is not None: 
+    assert args.ncol <= pheno.shape[1], "IndexError: Phenotype column index out of range."
+    pheno = pheno.iloc[:,[args.ncol]]
 if args.vcf:
-    logger.info(f'Loading genotype from {gfile}...')
+    logger.info(f'* Loading genotype from {gfile}...')
     geno = vcfreader(rf'{gfile}') # VCF format
 elif args.bfile:
-    logger.info(f'Loading genotype from {gfile}.bed...')
+    logger.info(f'* Loading genotype from {gfile}.bed...')
     geno = breader(rf'{gfile}') # PLINK format
 elif args.npy:
-    logger.info(f'Loading genotype from {gfile}.npz...')
+    logger.info(f'* Loading genotype from {gfile}.npz...')
     geno = npyreader(rf'{gfile}') # numpy format
 ref_alt:pd.DataFrame = geno.iloc[:,:2]
 famid = geno.columns[2:].values.astype(str)
@@ -166,7 +191,10 @@ geno = geno.iloc[:,2:].to_numpy(copy=False)
 logger.info('Geno and Pheno are ready!')
 
 # GRM & PCA
-qkmodel = QK(geno)
+logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
+logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
+qkmodel = QK(geno,maff=0.01)
+logger.info('Completed')
 geno = qkmodel.M
 if args.dom: # Additive kinship but dominant single SNP
     logger.info('Transfer additive gmatrix to dominance gmatrix')
@@ -175,6 +203,21 @@ if args.dom: # Additive kinship but dominant single SNP
 ref_alt = ref_alt.loc[qkmodel.SNPretain]
 ref_alt.iloc[qkmodel.maftmark,[0,1]] = ref_alt.iloc[qkmodel.maftmark,[1,0]]
 ref_alt['maf'] = qkmodel.maf
+
+if args.chrloc:
+    chr_loc = np.array(args.chrloc.split(':'),dtype=np.int32)
+    chr,start,end = chr_loc[0],np.min(chr_loc[1:]),np.max(chr_loc[1:])
+    onlySNP = ref_alt.index.to_frame().values
+    filt1 = onlySNP[:,0]==chr
+    filt2 = (onlySNP[filt1,1]<=end) & (onlySNP[filt1,1]>=start)
+    if start == 0 and end == 0:
+        geno = geno[filt1]
+        ref_alt = ref_alt.loc[filt1]
+    else:
+        geno = geno[filt1][filt2]
+        ref_alt = ref_alt.loc[filt1].loc[filt2]
+
+assert geno.size>0, 'After filtering, number of SNP is 0'
 
 prefix = gfile.replace('.vcf','').replace('.gz','')
 if kcal:
@@ -216,20 +259,35 @@ del qkmodel
 for i in pheno.columns:
     t = time.time()
     logger.info('*'*60)
+    logger.info(f'* GWAS process for {i}')
     p = pheno[i].dropna()
     famidretain = np.isin(famid,p.index)
+    snp_sub = geno[:,famidretain]
+    p_sub = p.loc[famid[famidretain]].values.reshape(-1,1)
+    q_sub = qmatrix[famidretain]
+    k_sub = kmatrix[famidretain][:,famidretain]
     if len(p)>0:
-        gwasmodel = GWAS(y=p.loc[famid[famidretain]].values.reshape(-1,1),X=qmatrix[famidretain],kinship=kmatrix[famidretain][:,famidretain])
-        logger.info(f'''Phenotype: {i}, Number of samples: {np.sum(famidretain)}, Number of SNP: {geno.shape[0]}, pve of null: {round(gwasmodel.pve,3)}, FAST mode: {FASTmode}''')
-        results = gwasmodel.gwas(snp=geno[:,famidretain],chunksize=100_000,threads=threads,fast=FASTmode) # gwas running...
+        gwasmodel = GWAS(y=p_sub,X=q_sub,kinship=k_sub)
+        logger.info(f'''** Mixed Linear Model:''')
+        logger.info(f'''Number of samples: {np.sum(famidretain)}, Number of SNP: {geno.shape[0]}, pve of null: {round(gwasmodel.pve,3)}, FAST mode: {FASTmode}''')
+        results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads,fast=FASTmode) # gwas running...
         logger.info(f'Effective number of SNP: {results.shape[0]}')
         results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
         results = pd.concat([ref_alt,results],axis=1)
         results = results.reset_index()
         results_save = format_dataframe_for_export(results, scientific_cols=['p'], float_cols=['beta','se','maf'])
-        results_save.to_csv(f'{outfolder}/{i}.assoc.tsv',sep='\t',index=False)
-        logger.info(f'Saved in {outfolder}/{i}.assoc.tsv'.replace('//','/'))
-        del results,results_save,gwasmodel,p
+        results_save.to_csv(f'{outfolder}/{i}.mlm.tsv',sep='\t',index=False)
+        logger.info(f'Saved in {outfolder}/{i}.mlm.tsv'.replace('//','/'))
+        if args.lm:
+            logger.info(f'''** General Linear Model:''')
+            gwasmodel = LM(y=p_sub,X=q_sub)
+            results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
+            results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
+            results = pd.concat([ref_alt,results],axis=1)
+            results = results.reset_index()
+            results_save = format_dataframe_for_export(results, scientific_cols=['p'], float_cols=['beta','se','maf'])
+            results_save.to_csv(f'{outfolder}/{i}.lm.tsv',sep='\t',index=False)
+            logger.info(f'Saved in {outfolder}/{i}.lm.tsv'.replace('//','/'))
     else:
         logger.info(f'Phenotype {i} has no overlapping samples with genotype, please check sample id. skipped.\n')
     logger.info(f'Time costed: {round(time.time()-t,2)} secs\n')

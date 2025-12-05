@@ -69,7 +69,7 @@ class GWAS:
             try:
                 beta = np.linalg.solve(XTV_invX, XTV_invy)
             except:
-                beta = np.linalg.solve(XTV_invX+1e-8*np.eye(XTV_invX.shape[0]), XTV_invy)
+                beta = np.linalg.solve(XTV_invX+1e-6*np.eye(XTV_invX.shape[0]), XTV_invy)
             r = self.y - X_cov_snp@beta
             rTV_invr = V_inv * r.T@r
             log_detV = np.sum(np.log(V))
@@ -146,6 +146,61 @@ class GWAS:
                     pbar.set_postfix(memory=f'{memory_usage:.2f} GB',total=f'{(memory.used/1024**3):.2f}/{(memory.total/1024**3):.2f} GB')
             gc.collect()
         self.lbd = lbds if not fast else None
+        return np.concatenate(beta_se_p)
+
+class LM:
+    def __init__(self,y:np.ndarray=None,X:np.ndarray=None,log:bool=True):
+        '''
+        Fast Solve of Mixed Linear Model by Brent.
+        
+        :param y: Phenotype nx1\n
+        :param X: Designed matrix for fixed effect nxp\n
+        :param kinship: Calculation method of kinship matrix nxn
+        '''
+        self.log = log
+        self.y = y.reshape(-1,1) # ensure the dim of y
+        self.X = np.concatenate([np.ones((y.shape[0],1)),X],axis=1) if X is not None else np.ones((y.shape[0],1))
+        pass
+    def gwas(self,snp:np.ndarray=None,chunksize=100_000,threads=1):
+        '''
+        Speed version of mlm
+        
+        :param snp: Marker matrix, np.ndarray, SNP per rows and IDV per columns
+        :param chunksize: calculation number per times, int
+        
+        :return: beta coefficients, standard errors and p-values for each SNP, np.ndarray
+        '''
+        m,n = snp.shape
+        beta_se_p = []
+        pbar = tqdm(total=m, desc="Process of GWAS",ascii=True)
+        def process_col(i):
+            '''
+            solving beta and its se in multiprocess
+            '''
+            X = np.column_stack([self.X, snp_chunk[:, i]])
+            XTX = X.T@X
+            try:
+                XTX_inv = np.linalg.inv(XTX)
+            except:
+                XTX_inv = np.linalg.inv(XTX+np.eye(XTX.shape[0]))
+            XTy = X.T@self.y
+            beta = XTX_inv@XTy
+            r = (self.y-X@beta)
+            se = np.sqrt((r.T@r)/(n-XTX.shape[0])*XTX_inv[-1,-1])
+            return beta[-1,0],se[0,0]
+        for i in range(0,m,chunksize):
+            i_end = min(i+chunksize,m)
+            snp_chunk = snp[i:i_end].T
+            if snp_chunk.shape[1]>0:
+                results = np.array(Parallel(n_jobs=threads)(delayed(process_col)(i) for i in range(snp_chunk.shape[1])))
+                beta_se_p.append(np.concatenate([results,2*norm.sf(np.abs(results[:,0]/results[:,1])).reshape(-1,1)],axis=1))
+            if self.log:
+                pbar.update(i_end-i)
+                if i % 10 == 0:
+                    memory = psutil.virtual_memory()
+                    memory_usage = process.memory_info().rss/1024**3
+                    pbar.set_postfix(memory=f'{memory_usage:.2f} GB',total=f'{(memory.used/1024**3):.2f}/{(memory.total/1024**3):.2f} GB')
+            gc.collect()
         return np.concatenate(beta_se_p)
     
 if __name__ == '__main__':

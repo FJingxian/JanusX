@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+from tqdm import tqdm
 for key in ['MPLBACKEND']:
     if key in os.environ:
         del os.environ[key]
@@ -100,66 +101,75 @@ if __name__ == '__main__':
     if args.ncol is not None: 
         assert args.ncol <= pheno.shape[1], "IndexError: Phenotype column index out of range."
         pheno = pheno.iloc[:,[args.ncol]]
-    if args.npy or args.vcf or args.bfile:
-        if args.vcf:
-            logger.info(f'Loading genotype from {gfile}...')
-            geno = vcfreader(rf'{gfile}') # VCF format
-        elif args.bfile:
-            logger.info(f'Loading genotype from {gfile}.bed...')
-            geno = breader(rf'{gfile}') # PLINK format
-        elif args.npy:
-            logger.info(f'Loading genotype from {gfile}.npz...')
-            geno = npyreader(rf'{gfile}') # numpy format
-        logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
-        m,n = geno.shape
-        n = n - 2
-        logger.info(f'Loaded SNP: {m}, individual: {n}')
-        samples = geno.columns[2:]
-        geno = geno.iloc[:,2:].values
-        logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
-        logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
-        qkmodel = QK(geno,maff=0.01)
-        logger.info('Completed')
-        geno = qkmodel.M
-        # GWAS
-        for i in pheno.columns:
-            t = time.time()
-            logger.info('*'*60)
-            logger.info(f'* GS process for {i}')
-            p = pheno[i]
-            namark = p.isna()
-            trainmark = np.isin(samples,p.index[~namark])
-            testmark = ~trainmark
-            # Estimation of train population modeling
-            TrainSNP = geno[:,trainmark]
-            TrainP = p.loc[samples[trainmark]].values.reshape(-1,1)
-            if TrainP.size > 0:
-                test4train = []
-                train4train = []
-                for test,train in kfold(TrainSNP.shape[1],k=5,seed=1):
-                    model = BLUP(TrainP[train],TrainSNP[:,train],kinship=None)
-                    print(TrainP[test].shape)
-                    test4train.append(np.concatenate([TrainP[test],model.predict(TrainSNP[:,test]),np.array(train)],axis=1))
-                    train4train.append(np.concatenate([TrainP[train],model.predict(TrainSNP[:,train])],axis=1))
-                    # logger.info(np.corrcoef(np.concatenate([TrainP[test],model.predict(TrainSNP[:,test])],axis=1),rowvar=False)[0,1])
-                test4train = np.concatenate(test4train,axis=0)
-                train4train = np.concatenate(train4train,axis=0)
-                print(train4train.shape)
-                if args.plot:
-                    fig = plt.figure(figsize=(5,4),dpi=300)
-                    plt.scatter(train4train[:,0],train4train[:,1],color=color_set[0][0],alpha=.8,label='Train data')
-                    plt.scatter(test4train[:,0],test4train[:,1],color=color_set[0][1],alpha=.6,label='Test data')
-                    plt.plot([np.min(test4train),np.max(test4train)],[np.min(test4train),np.max(test4train)],linestyle='--',color=color_set[0][0],alpha=.8,label='y = x (Ideal)')
-                    plt.xlabel('True Values')
-                    plt.ylabel('Predicted Values')
-                    plt.legend()
-                    plt.tight_layout()
-                    plt.grid(True, alpha=0.3, axis='both')
-                    plt.savefig(f'{args.out}/{args.prefix}.{i}.gs.5fcv.pdf',transparent=True)
-                # Prediction for test population
-                TestSNP = geno[:,testmark]
-                model = BLUP(TrainP,TrainSNP,)
-                logger.info(model.predict(TestSNP).shape)
+    if args.vcf:
+        logger.info(f'Loading genotype from {gfile}...')
+        geno = vcfreader(rf'{gfile}') # VCF format
+    elif args.bfile:
+        logger.info(f'Loading genotype from {gfile}.bed...')
+        geno = breader(rf'{gfile}') # PLINK format
+    elif args.npy:
+        logger.info(f'Loading genotype from {gfile}.npz...')
+        geno = npyreader(rf'{gfile}') # numpy format
+    logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
+    m,n = geno.shape
+    n = n - 2
+    logger.info(f'Loaded SNP: {m}, individual: {n}')
+    samples = geno.columns[2:]
+    geno = geno.iloc[:,2:].values
+    logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
+    logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
+    qkmodel = QK(geno,maff=0.01)
+    logger.info('Completed')
+    geno = qkmodel.M
+    # Genomic Selection
+    for i in pheno.columns:
+        t = time.time()
+        logger.info('*'*60)
+        logger.info(f'* GS process for {i}')
+        p = pheno[i]
+        namark = p.isna()
+        trainmark = np.isin(samples,p.index[~namark])
+        testmark = ~trainmark
+        # Estimation of train population modeling
+        TrainSNP = geno[:,trainmark]
+        TrainP = p.loc[samples[trainmark]].values.reshape(-1,1)
+        if TrainP.size > 0:
+            test4train,train4train = [],[]
+            mse_train,mse_test = [],[]
+            r2_train,r2_test = [],[]
+            for test,train in tqdm(kfold(TrainSNP.shape[1],k=5,seed=None),ncols=60):
+                model = BLUP(TrainP[train],TrainSNP[:,train],kinship=1)
+                ttest = np.concatenate([TrainP[test],model.predict(TrainSNP[:,test])],axis=1)
+                ttrain = np.concatenate([TrainP[train],model.predict(TrainSNP[:,train])],axis=1)
+                test4train.append(ttest);train4train.append(ttrain)
+                mse_train.append(np.sum((ttrain[:,0]-ttrain[:,1])**2)/ttrain.shape[0])
+                r2_train.append(1-np.sum((ttrain[:,0]-ttrain[:,1])**2)/np.sum((ttrain[:,0]-ttest[:,0].mean())**2))
+                mse_test.append(np.sum((ttest[:,0]-ttest[:,1])**2)/ttest.shape[0])
+                r2_test.append(1-np.sum((ttest[:,0]-ttest[:,1])**2)/np.sum((ttest[:,0]-ttest[:,0].mean())**2))
+            showidx = np.argmin(np.array(r2_train)-np.array(r2_test))
+            test4train = test4train[showidx]
+            train4train = train4train[showidx]
+            if args.plot:
+                fig = plt.figure(figsize=(5,4),dpi=300)
+                plt.plot([np.min(test4train),np.max(test4train)],[np.min(test4train),np.max(test4train)],linestyle='--',color=color_set[0][0],alpha=.8,label='y = x (Ideal)')
+                plt.scatter(train4train[:,0],train4train[:,1],color=color_set[0][1],alpha=.4,marker='+',label='Train data')
+                plt.scatter(test4train[:,0],test4train[:,1],color=color_set[0][0],alpha=.8,marker='*',label='Test data')
+                plt.xlabel('True Values')
+                plt.ylabel('Predicted Values')
+                plt.legend(loc='upper left')
+                plt.tight_layout()
+                plt.grid(True, alpha=0.3, axis='both')
+                plt.gca().text(0.96, 0.04, 
+                    f'Train MSE: {np.mean(mse_train):.2f}\nTest MSE: {np.mean(mse_test):.2f}\nTrain R2: {np.mean(r2_train):.2f}\nTest R2: {np.mean(r2_test):.2f}',
+                    transform=plt.gca().transAxes,
+                    ha='right', va='bottom',
+                    color='gray',alpha=.8,
+                    multialignment='left')
+                plt.savefig(f'{args.out}/{args.prefix}.{i}.gs.cv.pdf',transparent=True)
+            # Prediction for test population
+            TestSNP = geno[:,testmark]
+            model = BLUP(TrainP,TrainSNP,)
+            TestP = model.predict(TestSNP)
     lt = time.localtime()
     endinfo = f'\nFinished, total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
     logger.info(endinfo)

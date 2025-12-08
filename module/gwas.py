@@ -98,8 +98,8 @@ def main(log:bool=True):
     optional_group.add_argument('-d','--dom', action='store_true', default=False,
                                help='Estimate dominance effects '
                                    '(default: %(default)s)')
-    optional_group.add_argument('-snpck','--snpck', type=str, default=None,
-                               help='ConditionalGWAS for  '
+    optional_group.add_argument('-csnp','--csnp', type=str, default=None,
+                               help='Control snp for conditional GWAS, eg. 1:1200000 '
                                    '(default: %(default)s)')
     optional_group.add_argument('-t','--thread', type=int, default=-1,
                                help='Number of CPU threads to use (-1 for all available cores, default: %(default)s)')
@@ -133,8 +133,8 @@ def main(log:bool=True):
         logger.info(f"Analysis Pcol:    {args.ncol}") if args.ncol is not None else logger.info(f"Analysis Pcol:    All")
         if args.dom: # Dominance model
             logger.info(f"Dominance model:  {args.dom}")
-        if args.snpck: # Dominance model
-            logger.info(f"Dominance model:  {args.dom}")
+        if args.csnp: # Conditional GWAS
+            logger.info(f"Conditional SNP:  {args.csnp}")
         logger.info(f"Estimate Model:   Mixed Linear Model")
         if args.lm:
             logger.info("Estimate Model:   General Linear model")
@@ -247,6 +247,12 @@ else:
     qmatrix = np.genfromtxt(qdim)
 if cov:
     cov = np.genfromtxt(cov,).reshape(-1,1)
+    logger.info(f'Covmatrix {cov.shape}:')
+    qmatrix = np.concatenate([qmatrix,cov],axis=1)
+if args.csnp:
+    chr_loc = args.csnp.split(':')
+    chr,start = chr_loc[0],chr_loc[1]
+    cov = geno[ref_alt.index.get_loc((int(chr),int(start)))].reshape(-1,1)
     logger.info(f'Covmatrix {cov.shape}:')
     qmatrix = np.concatenate([qmatrix,cov],axis=1)
 logger.info(f'GRM {str(kmatrix.shape)}:')

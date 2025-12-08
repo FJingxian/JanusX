@@ -34,7 +34,7 @@ def GSapi(Y:np.ndarray,Xtrain:np.ndarray,Xtest:np.ndarray,method:typing.Literal[
         val,vec = np.linalg.eigh(Xtt.T@Xtt/Xtt.shape[0])
         idx = np.argsort(val)[::-1]
         val,vec = val[idx],vec[:, idx]
-        dim = np.sum(np.cumsum(val)/np.sum(val)>0.9)
+        dim = np.sum(np.cumsum(val)/np.sum(val)<=0.9)
         vec = val[:dim]*vec[:,:dim]
         Xtrain,Xtest = vec[:Xtrain.shape[1],:].T,vec[Xtrain.shape[1]:,:].T
     if method == 'GBLUP':
@@ -47,13 +47,21 @@ def GSapi(Y:np.ndarray,Xtrain:np.ndarray,Xtest:np.ndarray,method:typing.Literal[
         param_grid = {
             'n_estimators': [10,25,50,75],
             'max_depth': [None, 1, 3, 5, 7, 10], # adjust overfit
-            # 'min_samples_split': [2, 5, 10],
-            # 'min_samples_leaf': [1, 2, 4, 8],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4, 8],
         }
-        grid = GridSearchCV(RandomForestRegressor(), param_grid, cv=5, n_jobs=-1)
+        grid = RandomizedSearchCV(RandomForestRegressor(), param_grid, cv=5, n_jobs=-1,n_iter=30)
         grid.fit(Xtrain.T, Y.flatten())
         return grid.predict(Xtrain.T).reshape(-1,1),grid.predict(Xtest.T).reshape(-1,1)
     elif method == 'SVM':
+        param_grid = {
+            'C': [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2],
+            'gamma': ['scale', 0.01, 0.1]
+        }
+        grid = GridSearchCV(SVR(), param_grid, cv=5, n_jobs=-1)
+        grid.fit(Xtrain.T, Y.flatten())
+        return grid.predict(Xtrain.T).reshape(-1,1),grid.predict(Xtest.T).reshape(-1,1)
+    elif method == 'AdaBoost':
         param_grid = {
             'C': [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2],
             'gamma': ['scale', 0.01, 0.1]

@@ -182,9 +182,9 @@ geno = geno.iloc[:,2:].to_numpy(copy=False)
 logger.info(f'Geno and Pheno are ready, costed {(time.time()-t_loading):.2f} secs')
 
 # GRM & PCA
+t_control = time.time()
 logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
 logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
-t_control = time.time()
 qkmodel = QK(geno,maff=0.01)
 logger.info(f'Filter finished, costed {(time.time()-t_control):.2f} secs')
 geno = qkmodel.M

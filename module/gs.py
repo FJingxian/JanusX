@@ -212,11 +212,12 @@ if __name__ == '__main__':
     logger.info(f'Loaded SNP: {m}, individual: {n}')
     samples = geno.columns[2:]
     geno = geno.iloc[:,2:].values
-    logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
+    t_control = time.time()
+    logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode.')
     logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
     qkmodel = QK(geno,maff=0.01)
-    logger.info('Completed')
     geno = qkmodel.M
+    logger.info(f'Filter finished, costed {(time.time()-t_control):.2f} secs')
     # Genomic Selection
     for i in pheno.columns:
         t = time.time()
@@ -233,7 +234,9 @@ if __name__ == '__main__':
             kfoldset = kfold(TrainSNP.shape[1],k=5,seed=None)
             outpred = []
             for ind,method in enumerate(methods):
-                print(f'Method{ind+1}: {method}')
+                logger.info(f'Method{ind+1}: {method}')
+                if method not in ['GBLUP', 'rrBLUP']:
+                    print('Training the model may take a long time...')
                 test4train,train4train = [],[]
                 r2_train,r2_test = [],[]
                 num = 0

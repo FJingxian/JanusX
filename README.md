@@ -47,9 +47,13 @@ jx gwas --vcf example/mouse_hs1940.vcf.gz --pheno example/mouse_hs1940.pheno --o
 
 # GWAS with PLINK format
 jx gwas --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --thread 8
+jx gwas -bfile genotypes -p phenotypes.txt -o results -k 1 -q 3 -t 8
 
 # Visualize GWAS results
-jx postGWAS --file test/test0.assoc.tsv --threshold 1e-6
+jx postGWAS -f test/test0.assoc.tsv -threshold 1e-6
+
+# GS with PLINK format
+jx gs -bfile genotypes -p phenotypes.txt -o results -GBLUP -rrBLUP -RF
 ```
 
 ![manhanden&qq](./fig/test0.png "Simple visualization")

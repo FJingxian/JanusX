@@ -1,7 +1,7 @@
 [project]
 name = "JanusX"
-version = "0.1.0"
-description = "A Suite of Genotyping Tools"
+version = "1.0.0"
+description = "A Suite of Genotyping Tools for Genome-Wide Association Study and Genomic Selection"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [

@@ -8,32 +8,32 @@ class BLUP:
         '''Fast Solve of Mixed Linear Model by Brent.
         
         :param y: Phenotype nx1\n
-        :param X: Designed matrix for fixed effect nxp\n
+        :param M: Marker matrix mxn(0,1,2 of SNP)\n
+        :param cov: Designed matrix for fixed effect nxp\n
         :param Z: Designed matrix for random effect nxq\n
-        :param M: Marker matrix mxq(0,1,2 of SNP)\n
         :param kinship: Calculation method of kinship matrix (None,1,2)
         '''
-        Z = Z if Z is not None else np.eye(y.shape[0]) # 设计矩阵 或 单位矩阵(一般没有重复则采用单位矩阵)
-        assert M.shape[1] == Z.shape[1] # 随机效应和效应值相同
-        self.X = np.concatenate([np.ones((y.shape[0],1)),cov],axis=1) if cov is not None else np.ones((y.shape[0],1)) # 设计矩阵 或 n1 向量
+        Z = Z if Z is not None else np.eye(y.shape[0]) # Design matrix or I matrix
+        assert M.shape[1] == Z.shape[1] # Test Random factor
+        self.X = np.concatenate([np.ones((y.shape[0],1)),cov],axis=1) if cov is not None else np.ones((y.shape[0],1)) # Design matrix of 1st vector
         self.y = y.reshape(-1,1)
         self.M = M
         self.n = self.X.shape[0]
         self.p = self.X.shape[1]
-        self.kinship = kinship # 确保训练和预测的kinship方法一致
+        self.kinship = kinship # control method to calculate kinship matrix
         if self.kinship is not None:
             self.G = GRM(M,log=False)
-            self.G+=1e-6*np.eye(self.G.shape[0]) # 添加正则项 确保矩阵正定
+            self.G+=1e-6*np.eye(self.G.shape[0]) # Add regular item
             self.Z = Z
         else:
             self.G = np.eye(M.shape[0])
             self.Z = Z@M.T
-        # 简化G矩阵求逆
+        # Simplify inverse matrix
         self.D, self.S, self.Dh = np.linalg.svd(self.Z@self.G@self.Z.T)
         self.X = self.Dh@self.X
         self.y = self.Dh@self.y
         self.Z = self.Dh@self.Z
-        self.result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # 寻找lbd 最大化似然函数
+        self.result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # minimize REML
         lbd = 10**(self.result.x[0,0])
         Vg = np.mean(self.S)
         Ve = lbd
@@ -52,13 +52,13 @@ class BLUP:
         log_detV = np.sum(np.log(V))
         signX, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
         total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX
-        self.V_inv,self.r = V_inv,r # 估计随机效应时使用
+        self.V_inv,self.r = V_inv,r # Estimate random effect
         return c - total_log / 2
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         X = np.concatenate([np.ones((M.shape[1],1)),cov],axis=1) if cov is not None else np.ones((M.shape[1],1))
         if self.kinship is not None:
             G = GRM(np.concatenate([self.M, M],axis=1),log=False)
-            G+=1e-6*np.eye(G.shape[1]) # 添加正则项 确保矩阵正定
+            G+=1e-6*np.eye(G.shape[1]) # Regular item
             return X@self.beta+G[self.n:, :self.n]@np.linalg.solve(self.G,self.u)
         else:
             return X@self.beta+M.T@self.u

@@ -236,7 +236,7 @@ if __name__ == '__main__':
             for ind,method in enumerate(methods):
                 logger.info(f'Method{ind+1}: {method}')
                 if method not in ['GBLUP', 'rrBLUP']:
-                    print('Training the model may take a long time...')
+                    print(f'Training the {method} model may take a long time...')
                 test4train,train4train = [],[]
                 r2_train,r2_test = [],[]
                 num = 0

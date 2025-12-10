@@ -275,7 +275,7 @@ for i in pheno.columns:
         results = pd.concat([ref_alt,results],axis=1)
         results = results.reset_index()
         results_save = format_dataframe_for_export(results, scientific_cols=['p'], float_cols=['beta','se','maf'])
-        results_save.to_csv(f'{outfolder}/{args.prefix}.{i}.mlm.tsv',sep='\t',index=False)
+        results_save.dropna().to_csv(f'{outfolder}/{args.prefix}.{i}.mlm.tsv',sep='\t',index=False)
         logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.mlm.tsv'.replace('//','/'))
         if args.lm:
             logger.info(f'''** General Linear Model:''')

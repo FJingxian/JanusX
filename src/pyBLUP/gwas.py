@@ -30,7 +30,7 @@ class GWAS:
         del kinship
         self.Xcov = self.Dh@X
         self.y = self.Dh@y
-        result = minimize_scalar(lambda lbd: -self._NULLREML(10**(lbd)),bounds=(-8,8),method='bounded',options={'xatol': 1e-4,'maxiter':500},)
+        result = minimize_scalar(lambda lbd: -self._NULLREML(10**(lbd)),bounds=(-8,8),method='bounded',options={'xatol': 1e-3},)
         lbd_null = 10**(result.x[0,0])
         vg_null = np.mean(self.S)
         pve = vg_null/(vg_null+lbd_null)
@@ -96,18 +96,21 @@ class GWAS:
         return beta[-1,0],se
     def _HACfit(self,snp:np.ndarray=None):
         result = minimize_scalar(lambda lbd: -self._REML(10**(lbd),snp),bounds=self.bounds,method='bounded',options={'xatol': 1e-2, 'maxiter': 50},) # 寻找lbd 最大化似然函数
-        lbd = self.lbd_null if not result.success else 10**(result.x[0,0])
-        X = np.column_stack([self.Xcov, snp])
-        n,p = X.shape
-        V_inv = 1/(self.S+lbd)
-        XTV_invX = V_inv*X.T@X + 1e-6*np.eye(X.shape[1])
-        XTV_invy = V_inv*X.T@self.y
-        beta = np.linalg.solve(XTV_invX,XTV_invy)
-        r = self.y - X@beta
-        rTV_invr = V_inv * r.T@r
-        sigma2 = rTV_invr/(n-p)
-        se = np.sqrt(np.linalg.inv(XTV_invX/sigma2)[-1,-1])
-        return beta[-1,0],se,lbd
+        if result.success:
+            lbd = self.lbd_null if not result.success else 10**(result.x[0,0])
+            X = np.column_stack([self.Xcov, snp])
+            n,p = X.shape
+            V_inv = 1/(self.S+lbd)
+            XTV_invX = V_inv*X.T@X + 1e-6*np.eye(X.shape[1])
+            XTV_invy = V_inv*X.T@self.y
+            beta = np.linalg.solve(XTV_invX,XTV_invy)
+            r = self.y - X@beta
+            rTV_invr = V_inv * r.T@r
+            sigma2 = rTV_invr/(n-p)
+            se = np.sqrt(np.linalg.inv(XTV_invX/sigma2)[-1,-1])
+            return beta[-1,0],se,lbd
+        else:
+            return np.nan,np.nan,np.nan
     def gwas(self,snp:np.ndarray=None,chunksize=100_000,fast:bool=False,threads=1):
         '''
         Speed version of mlm

@@ -50,7 +50,7 @@ jx gwas --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 
 jx gwas -bfile genotypes -p phenotypes.txt -o results -k 1 -q 3 -t 8
 
 # Visualize GWAS results
-jx postGWAS -f test/test0.assoc.tsv -threshold 1e-6
+jx postGWAS -f test/*.mlm.tsv -threshold 1e-6 -t 4
 
 # GS with PLINK format
 jx gs -bfile genotypes -p phenotypes.txt -o results -GBLUP -rrBLUP -RF

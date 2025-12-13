@@ -211,6 +211,25 @@ class LM:
                     pbar.set_postfix(memory=f'{memory_usage:.2f} GB',total=f'{(memory.used/1024**3):.2f}/{(memory.total/1024**3):.2f} GB')
             gc.collect()
         return np.concatenate(beta_se_p)
+
     
+class FARMCPU:
+    def __init__(self,y:np.ndarray=None,M:np.ndarray=None,X:np.ndarray=None,kinship:np.ndarray=None,log:bool=True):
+        '''
+        Fast Solve of Mixed Linear Model by Brent.
+        
+        :param y: Phenotype nx1\n
+        :param M: SNP matrix mxn\n
+        :param X: Designed matrix for fixed effect nxp\n
+        :param kinship: Calculation method of kinship matrix nxn
+        '''
+        
+        pass
+    def _FEM(self,QTN:np.ndarray):
+        return
+    def _REM(self,QTN:np.ndarray):
+        return
+    
+
 if __name__ == '__main__':
     pass

@@ -88,7 +88,10 @@ def main():
     args.prefix = 'JanusX' if args.prefix is None else args.prefix
     # create log file
     # Create output directory if it doesn't exist
-    os.makedirs(args.out, mode=0o755,exist_ok=True)
+    if args.out != '':
+        os.makedirs(args.out, mode=0o755,exist_ok=True)
+    else:
+        args.out = '.'
     logger = setup_logging(f'''{args.out}/{args.prefix}.postGWAS.log'''.replace('//','/'))
     # Print configuration summary
     logger.info('Script of GWAS post analysis')

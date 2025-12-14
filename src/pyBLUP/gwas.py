@@ -85,7 +85,7 @@ class GWAS:
             return c - total_log / 2
         except:
             return -1e8
-    def _fit(self,snp:np.ndarray=None):
+    def _Fastfit(self,snp:np.ndarray=None):
         X = np.column_stack([self.Xcov, snp])
         n,p = X.shape
         V_inv = 1/(self.S+self.lbd_null)
@@ -97,7 +97,7 @@ class GWAS:
         sigma2 = rTV_invr/(n-p)
         se = np.sqrt(np.linalg.inv(XTV_invX/sigma2)[-1,-1])
         return beta[-1,0],se
-    def _HACfit(self,snp:np.ndarray=None):
+    def _fit(self,snp:np.ndarray=None):
         result = minimize_scalar(lambda lbd: -self._REML(10**(lbd),snp),bounds=self.bounds,method='bounded',options={'xatol': 1e-2, 'maxiter': 50},) # 寻找lbd 最大化似然函数
         if result.success:
             lbd = self.lbd_null if not result.success else 10**(result.x[0,0])
@@ -127,22 +127,11 @@ class GWAS:
         lbds = []
         beta_se_p = []
         pbar = tqdm(total=m, desc="Process of GWAS",ascii=True)
-        def ACmode(i):
-            '''
-            solving beta and its se in multiprocess
-            '''
-            return self._HACfit(snp_chunk[:, i])
-        def FASTmode(i):
-            '''
-            solving beta and its se in multiprocess
-            '''
-            return self._fit(snp_chunk[:, i])
-        process_col = FASTmode if fast else ACmode
         for i in range(0,m,chunksize):
             i_end = min(i+chunksize,m)
             snp_chunk = self.Dh@snp[i:i_end].T
             if snp_chunk.shape[1]>0:
-                results = np.array(Parallel(n_jobs=threads)(delayed(process_col)(i) for i in range(snp_chunk.shape[1])))
+                results = np.array(Parallel(n_jobs=threads)(delayed(self._fit)(snp_chunk[:, i]) for i in range(snp_chunk.shape[1])))
                 if results.shape[1] == 3:
                     lbds.extend(results[:,-1])
                     results = results[:,:-1]

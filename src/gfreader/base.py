@@ -107,7 +107,7 @@ def vcfreader(vcfPath:str,chunksize=50_000,ref_adjust:str=None,vcftype:str=None)
         print(f'\rCPU: {cpu}%, Memory: {round(mem,2)} G, Process: {all_time_info}',end='')
         vcf_chunk[0] = vcf_chunk[0].str.upper().str.replace('CHR0','').str.replace('CHR','')
         vcf_chunk = vcf_chunk.loc[vcf_chunk[0].isin(np.arange(1,30).astype(str))]
-        vcf_chunk[0] = vcf_chunk[0].astype('int8')
+        vcf_chunk.loc[:,0] = vcf_chunk.loc[:,0].astype('int8')
         vcf_chunk:pd.DataFrame = vcf_chunk.set_index([0,1])
         ref_alt.append(vcf_chunk.iloc[:,:2])
         def transG(col:pd.Series):

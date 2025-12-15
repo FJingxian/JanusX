@@ -1,6 +1,8 @@
 import os
-import logging
 import sys
+import logging
+logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 def setup_logging(log_file_path):
     """set logging"""
     if os.path.exists(log_file_path) and log_file_path[-4:]=='.log':

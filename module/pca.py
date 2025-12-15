@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import sys
 import os
 for key in ['MPLBACKEND']:
     if key in os.environ:

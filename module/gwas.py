@@ -23,7 +23,16 @@ File Formats:
 Citation:
   https://github.com/MaizeMan-JxFU/JanusX/
 '''
-
+import os
+for key in ['MPLBACKEND']:
+    if key in os.environ:
+        del os.environ[key]
+import matplotlib as mpl
+mpl.use('Agg')
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.rcParams['ps.fonttype'] = 42
+import matplotlib.pyplot as plt
+from bioplotkit import GWASPLOT
 from pyBLUP import GWAS,LM
 from pyBLUP import QK
 from gfreader import breader,vcfreader,npyreader
@@ -32,7 +41,6 @@ import numpy as np
 import argparse
 import time
 import socket
-import os
 from _common.log import setup_logging
 
 def main(log:bool=True):
@@ -54,12 +62,16 @@ def main(log:bool=True):
     ## Phenotype file
     required_group.add_argument('-p','--pheno', type=str, required=True,
                                help='Phenotype file (tab-delimited with sample IDs in first column)')
+    ## Model
+    models_group = parser.add_argument_group('Model Arguments')
+    models_group.add_argument('-lmm','--lmm', action='store_true',default=False,
+                               help='Additional calculation of linear mixed model '
+                                   '(default: %(default)s)')
+    models_group.add_argument('-lm','--lm', action='store_true',default=False,
+                               help='Additional calculation of general linear model '
+                                   '(default: %(default)s)')
     # Optional arguments
     optional_group = parser.add_argument_group('Optional Arguments')
-    ## Model
-    optional_group.add_argument('-lm','--lm', action='store_true',default=False,
-                               help='Additional calculation of general model '
-                                   '(default: %(default)s)')
     ## Point out phenotype or snp
     optional_group.add_argument('-n','--ncol', action='extend', nargs='*',default=None,type=int,
                                help='Analyed phenotype column, eg. "-n 0 -n 3" is to analyze phenotype 1 and phenetype 4 '
@@ -82,6 +94,9 @@ def main(log:bool=True):
                                    '(default: %(default)s)')
     optional_group.add_argument('-csnp','--csnp', type=str, default=None,
                                help='Control snp for conditional GWAS, eg. 1:1200000 '
+                                   '(default: %(default)s)')
+    optional_group.add_argument('-plot','--plot', action='store_true', default=False,
+                               help='Visualization of GWAS result '
                                    '(default: %(default)s)')
     optional_group.add_argument('-t','--thread', type=int, default=-1,
                                help='Number of CPU threads to use (-1 for all available cores, default: %(default)s)')
@@ -120,9 +135,10 @@ def main(log:bool=True):
             logger.info(f"Dominance model:  {args.dom}")
         if args.csnp: # Conditional GWAS
             logger.info(f"Conditional SNP:  {args.csnp}")
-        logger.info(f"Estimate Model:   Mixed Linear Model")
         if args.lm:
             logger.info("Estimate Model:   General Linear model")
+        if args.lmm:
+            logger.info("Estimate Model:   Mixed Linear model")
         logger.info(f"Estimate of GRM:  {args.grm}")
         if args.qcov != '0':
             logger.info(f"Q matrix:         {args.qcov}")
@@ -140,11 +156,13 @@ def main(log:bool=True):
         kcal = True if kinship_method in ['1','2'] else False
         qcal = True if qdim in np.arange(0,30).astype(str) else False
         # test exist of all input files
-        assert os.path.isfile(phenofile), f"can not find file: {phenofile}"
+        assert os.path.isfile(phenofile), f"can not find file {phenofile}"
         # test k and q matrix
-        assert kcal or os.path.isfile(kinship_method), f'Error: {kinship_method} is not a calculation method or grm file'
-        assert qcal or os.path.isfile(qdim), f'Error: {qdim} is not a dimension of PC or PC file'
+        assert kcal or os.path.isfile(kinship_method), f'{kinship_method} is not a calculation method or grm file'
+        assert qcal or os.path.isfile(qdim), f'{qdim} is not a dimension of PC or PC file'
         assert cov is None or os.path.isfile(cov), f"{cov} is applied, but it is not a file"
+        # test exist of calculating model
+        assert args.lm or args.lmm, 'no model to estimate, try -lm or -lmm'
 
         # Loading genotype matrix
         t_loading = time.time()
@@ -157,7 +175,7 @@ def main(log:bool=True):
         pheno.index = pheno.index.astype(str)
         assert pheno.shape[1]>0, f'No phenotype data found, please check the phenotype file format!\n{pheno.head()}'
         if args.ncol is not None: 
-            assert np.min(args.ncol) <= pheno.shape[1], "IndexError: Phenotype column index out of range."
+            assert np.min(args.ncol) <= pheno.shape[1], "Phenotype column index out of range."
             args.ncol = [i for i in args.ncol if i in range(pheno.shape[1])]
             logger.info(f'''These phenotype will be analyzed: {'\t'.join(pheno.columns[args.ncol])}''',)
             pheno = pheno.iloc[:,args.ncol]
@@ -259,25 +277,54 @@ def main(log:bool=True):
             q_sub = qmatrix[famidretain]
             k_sub = kmatrix[famidretain][:,famidretain]
             if len(p)>0:
-                gwasmodel = GWAS(y=p_sub,X=q_sub,kinship=k_sub)
-                logger.info(f'** Mixed Linear Model:')
-                logger.info(f'''Number of samples: {np.sum(famidretain)}, Number of SNP: {geno.shape[0]}, pve of null: {round(gwasmodel.pve,3)}''')
-                results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
-                results = pd.DataFrame(results,columns=['beta','se','p0'],index=ref_alt.index)
-                results = pd.concat([ref_alt,results],axis=1)
-                results = results.reset_index().dropna()
-                logger.info(f'Effective number of SNP: {results.shape[0]}')
-                results.loc[:,'p'] = results['p0'].map(lambda x: f"{x:.4e}");del results["p0"]
-                results.to_csv(f"{outfolder}/{args.prefix}.{i}.mlm.tsv",sep="\t",float_format="%.4f",index=False)
-                logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.mlm.tsv'.replace('//','/'))
+                if args.lmm:
+                    logger.info(f'** Mixed Linear Model:')
+                    gwasmodel = GWAS(y=p_sub,X=q_sub,kinship=k_sub)
+                    logger.info(f'''Number of samples: {np.sum(famidretain)}, Number of SNP: {geno.shape[0]}, pve of null: {round(gwasmodel.pve,3)}''')
+                    results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
+                    results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
+                    results = pd.concat([ref_alt,results],axis=1)
+                    results = results.reset_index().dropna()
+                    logger.info(f'Effective number of SNP: {results.shape[0]}')
+                    if args.plot:
+                        results = results.astype({"POS": "int64"})
+                        fig = plt.figure(figsize=(16,4),dpi=300)
+                        layout = [['A','B','B','C']]
+                        axes:plt.Axes = fig.subplot_mosaic(mosaic=layout)
+                        gwasplot = GWASPLOT(results)
+                        axes['A'].hist(p_sub,bins=15)
+                        axes['A'].set_xlabel(i)
+                        axes['A'].set_ylabel('count')
+                        gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
+                        gwasplot.qq(ax=axes['C'])
+                        plt.tight_layout()
+                        plt.savefig(f"{outfolder}/{args.prefix}.{i}.gwas.mlm.pdf",transparent=True)
+                    results = results.astype({"p": "object"})
+                    results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
+                    results.to_csv(f"{outfolder}/{args.prefix}.{i}.mlm.tsv",sep="\t",float_format="%.4f",index=False)
+                    logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.mlm.tsv'.replace('//','/'))
                 if args.lm:
                     logger.info(f'** General Linear Model:')
                     gwasmodel = LM(y=p_sub,X=q_sub)
                     results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
-                    results = pd.DataFrame(results,columns=['beta','se','p0'],index=ref_alt.index)
+                    results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
                     results = pd.concat([ref_alt,results],axis=1)
                     results = results.reset_index().dropna()
-                    results.loc[:,'p'] = results['p0'].map(lambda x: f"{x:.4e}");del results["p0"]
+                    if args.plot:
+                        results = results.astype({"POS": "int64"})
+                        fig = plt.figure(figsize=(16,4),dpi=300)
+                        layout = [['A','B','B','C']]
+                        axes:plt.Axes = fig.subplot_mosaic(mosaic=layout)
+                        gwasplot = GWASPLOT(results)
+                        axes['A'].hist(p_sub,bins=15)
+                        axes['A'].set_xlabel(i)
+                        axes['A'].set_ylabel('count')
+                        gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
+                        gwasplot.qq(ax=axes['C'])
+                        plt.tight_layout()
+                        plt.savefig(f"{outfolder}/{args.prefix}.{i}.gwas.lm.pdf",transparent=True)
+                    results = results.astype({"p": "object"})
+                    results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
                     results.to_csv(f"{outfolder}/{args.prefix}.{i}.lm.tsv",sep="\t",float_format="%.4f",index=None)
                     logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.lm.tsv'.replace('//','/'))
             else:

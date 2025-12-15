@@ -12,16 +12,14 @@ Citation:
   https://github.com/MaizeMan-JxFU/JanusX/
 '''
 import os
+from _common.log import setup_logging
 for key in ['MPLBACKEND']:
     if key in os.environ:
         del os.environ[key]
 import matplotlib as mpl
 mpl.use('Agg')
-import logging
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
-logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
-logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 from bioplotkit import GWASPLOT
 from bioplotkit.sci_set import color_set
 import matplotlib.pyplot as plt
@@ -30,7 +28,6 @@ import numpy as np
 import argparse
 import time
 import socket
-from _common.log import setup_logging
 from _common.readanno import readanno
 from joblib import Parallel,delayed
 import warnings
@@ -70,7 +67,7 @@ def GWASplot(file,args,logger):
         plt.savefig(f'{args.out}/{args.prefix}.manh.pdf',transparent=True)
         plt.close(fig)
         fig = plt.figure(figsize=(5,4),dpi=300)
-        ax2 =fig.add_subplot(111,)
+        ax2 =fig.add_subplot(111)
         plotmodel.qq(ax=ax2,color_set=args.color)
         plt.tight_layout()
         plt.savefig(f'{args.out}/{args.prefix}.qq.pdf',transparent=True)

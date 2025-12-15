@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-import os
+import logging
 import typing
-from bioplotkit import gsplot
+import os
 for key in ['MPLBACKEND']:
     if key in os.environ:
         del os.environ[key]
 import matplotlib as mpl
-import logging
 mpl.use('Agg')
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
 logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 from bioplotkit.sci_set import color_set
+from bioplotkit import gsplot
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
@@ -106,11 +106,11 @@ def main(log:bool=True):
     model_group.add_argument('-ADB','--AdaBoost', action='store_true', default=False,
                                help='Method of AdaBoost to train and predict '
                                    '(default: %(default)s)')
-    model_group.add_argument('-pcd','--pcd', action='store_true', default=False,
-                               help='Decomposition of data by PCA '
-                                   '(default: %(default)s)')
     # Optional arguments
     optional_group = parser.add_argument_group('Optional Arguments')
+    optional_group.add_argument('-pcd','--pcd', action='store_true', default=False,
+                               help='Decomposition of data by PCA '
+                                   '(default: %(default)s)')
     ## Point out phenotype or snp
     optional_group.add_argument('-n','--ncol', type=int, default=None,
                                help='Only analysis n columns in phenotype ranged from 0-n '

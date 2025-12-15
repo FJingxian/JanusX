@@ -27,7 +27,7 @@ if __name__ == "__main__":
     print(__logo__)
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
-            print(f'Usage: {sys.argv[0]} <module> [parameter]')
+            print('Usage: jx <module> [parameter]')
             print(f'''Modules: {' '.join(module.keys())}''')
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
             print(__version__)

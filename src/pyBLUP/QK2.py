@@ -43,7 +43,7 @@ class QK:
         self.Mvar = (2*self.maf*(1-self.maf))
         self.M = M
         self.chunksize = chunksize
-    def GRM(self,method:typing.Literal[0,1]=1):
+    def GRM(self,method:typing.Literal[1,2]=1):
         '''
         :param method: int {1-Centralization, 2-Standardization}
         :return: np.ndarray, positive definite matrix or positive semidefinite matrix

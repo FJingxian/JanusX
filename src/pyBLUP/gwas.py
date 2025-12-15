@@ -1,4 +1,3 @@
-from re import L
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.stats import norm
@@ -7,7 +6,7 @@ from tqdm import tqdm
 import gc # garbage collection
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, 
-                        message="invalid value encountered in subtract")
+                        message="invalid value encountered in")
 import psutil
 process = psutil.Process()
 
@@ -32,7 +31,7 @@ class GWAS:
         self.Xcov = self.Dh@X
         self.y = self.Dh@y
         result = minimize_scalar(lambda lbd: -self._NULLREML(10**(lbd)),bounds=(-5,5),method='bounded',options={'xatol': 1e-3},)
-        lbd_null = 10**(result.x[0,0])
+        lbd_null = 10**(result.x)
         vg_null = np.mean(self.S)
         pve = vg_null/(vg_null+lbd_null)
         self.lbd_null = lbd_null
@@ -54,7 +53,7 @@ class GWAS:
             XTV_invy = V_inv*X_cov_snp.T @ self.y
             beta = np.linalg.solve(XTV_invX, XTV_invy)
             r = self.y - X_cov_snp@beta
-            rTV_invr = V_inv * r.T@r
+            rTV_invr = (V_inv * r.T@r)[0,0]
             log_detV = np.sum(np.log(V))
             sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
             total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX # log items
@@ -78,7 +77,7 @@ class GWAS:
             except:
                 beta = np.linalg.solve(XTV_invX+1e-6*np.eye(XTV_invX.shape[0]), XTV_invy)
             r = self.y - X_cov_snp@beta
-            rTV_invr = V_inv * r.T@r
+            rTV_invr = (V_inv*r.T @ r)[0,0]
             log_detV = np.sum(np.log(V))
             sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
             total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX # log items
@@ -86,22 +85,10 @@ class GWAS:
             return c - total_log / 2
         except:
             return -1e8
-    def _Fastfit(self,snp:np.ndarray=None):
-        X = np.column_stack([self.Xcov, snp])
-        n,p = X.shape
-        V_inv = 1/(self.S+self.lbd_null)
-        XTV_invX = V_inv*X.T@X + 1e-6*np.eye(X.shape[1])
-        XTV_invy = V_inv*X.T@self.y
-        beta = np.linalg.solve(XTV_invX,XTV_invy)
-        r = self.y - X@beta
-        rTV_invr = V_inv * r.T@r
-        sigma2 = rTV_invr/(n-p)
-        se = np.sqrt(np.linalg.inv(XTV_invX/sigma2)[-1,-1])
-        return beta[-1,0],se
     def _fit(self,snp:np.ndarray=None):
         result = minimize_scalar(lambda lbd: -self._REML(10**(lbd),snp),bounds=self.bounds,method='bounded',options={'xatol': 1e-2, 'maxiter': 50},) # 寻找lbd 最大化似然函数
         if result.success:
-            lbd = self.lbd_null if not result.success else 10**(result.x[0,0])
+            lbd = self.lbd_null if not result.success else 10**(result.x)
             X = np.column_stack([self.Xcov, snp])
             n,p = X.shape
             V_inv = 1/(self.S+lbd)
@@ -115,7 +102,7 @@ class GWAS:
             return beta[-1,0],se,lbd
         else:
             return np.nan,np.nan,np.nan
-    def gwas(self,snp:np.ndarray=None,chunksize=100_000,fast:bool=False,threads=1):
+    def gwas(self,snp:np.ndarray=None,chunksize=100_000,threads=1):
         '''
         Speed version of mlm
         
@@ -130,12 +117,11 @@ class GWAS:
         pbar = tqdm(total=m, desc="Process of GWAS",ascii=True)
         for i in range(0,m,chunksize):
             i_end = min(i+chunksize,m)
-            snp_chunk = self.Dh@snp[i:i_end].T
+            snp_chunk = snp[i:i_end]@self.Dh.T
             if snp_chunk.shape[1]>0:
-                results = np.array(Parallel(n_jobs=threads)(delayed(self._fit)(snp_chunk[:, i]) for i in range(snp_chunk.shape[1])))
-                if results.shape[1] == 3:
-                    lbds.extend(results[:,-1])
-                    results = results[:,:-1]
+                results = np.array(Parallel(n_jobs=threads,)(delayed(self._fit)(i) for i in snp_chunk))
+                lbds.extend(results[:,-1])
+                results = results[:,:-1]
                 beta_se_p.append(np.concatenate([results,2*norm.sf(np.abs(results[:,0]/results[:,1])).reshape(-1,1)],axis=1))
             if self.log:
                 pbar.update(i_end-i)
@@ -144,7 +130,7 @@ class GWAS:
                     memory_usage = process.memory_info().rss/1024**3
                     pbar.set_postfix(memory=f'{memory_usage:.2f} GB',total=f'{(memory.used/1024**3):.2f}/{(memory.total/1024**3):.2f} GB')
             gc.collect()
-        self.lbd = lbds if not fast else None
+        self.lbd = lbds
         return np.concatenate(beta_se_p)
 
 class LM:
@@ -189,9 +175,9 @@ class LM:
         pbar = tqdm(total=m, desc="Process of GWAS",ascii=True)
         for i in range(0,m,chunksize):
             i_end = min(i+chunksize,m)
-            snp_chunk = snp[i:i_end].T
+            snp_chunk = snp[i:i_end]
             if snp_chunk.shape[1]>0:
-                results = np.array(Parallel(n_jobs=threads)(delayed(self._fit)(snp_chunk[:,i]) for i in range(snp_chunk.shape[1])))
+                results = np.array(Parallel(n_jobs=threads)(delayed(self._fit)(i) for i in snp_chunk))
                 beta_se_p.append(np.concatenate([results,2*norm.sf(np.abs(results[:,0]/results[:,1])).reshape(-1,1)],axis=1))
             if self.log:
                 pbar.update(i_end-i)
@@ -213,7 +199,6 @@ class FARMCPU:
         :param X: Designed matrix for fixed effect nxp\n
         :param kinship: Calculation method of kinship matrix nxn
         '''
-        
         pass
     def _FEM(self,QTN:np.ndarray):
         return

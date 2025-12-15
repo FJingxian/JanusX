@@ -1,5 +1,7 @@
 # JanusX：高效的全基因组关联分析及全基因组选择工具
 
+[English](../README.md) | [简体中文(推荐)](./README_zh.md)
+
 ## 引言
 
 &emsp;&emsp;随着基因组学研究的深入，海量基因型和表型数据的分析需求日益增长。现有全基因组关联分析(GWAS)软件如GEMMA、GCTA、rMVP和TASSEL等在处理大规模数据时存在一些局限性：GEMMA缺乏Windows版本，跨平台兼容性不足；多核并行计算效率低下；计算亲缘关系矩阵(Q矩阵)依赖外部工具等
@@ -346,40 +348,33 @@ jx gwas --bfile data/test --pheno data/test.pheno --out . --thread 92 --qcov 0 -
 首先需要环境中需要包含 [python](https://www.python.org/downloads/release/python-3139/) (3.9~3.13)
 如果有git基础，以下几行代码即可完成安装啦~
 
-Linux:
-
 ```bash
 # 网络顺畅的情况
 # git clone https://github.com/MaizeMan-JxFU/JanusX.git
 # 不能科学上网可以选择国内代理
 git clone https://gh-proxy.com/https://github.com/MaizeMan-JxFU/JanusX.git
 # 进入目标文件夹
-cd JanusX; sh ./install.sh
-
-```
-
-Windows
-
-```powershell
-git clone https://gh-proxy.com/https://github.com/MaizeMan-JxFU/JanusX.git
 cd JanusX
-.\install.bat
+sh ./install.sh
 
 ```
+
+**注意**: Windows安装已不再支持。请使用Linux/macOS或Windows子系统Linux (WSL)。
 
 ### Modules
 
 |模块|功能|最简语法|
 |-|-|-|
-|gwas|利用混合线性模型进行全基因组关联分析|基因型文件+表型文件: ```jx gwas --bfile test --pheno test.tsv```|
-|gwasplot|可视化及注释全基因组关联分析的结果|gwas模块生成的结果文件: ```jx gwasplot --file test.assoc.tsv [--anno anno.gff]```|
-|transanno|gwasplot模块注释结果的迁移基因组版本注释|gwasplot模块生成的注释文件: ```jx transanno [anno file] [site mapping file] [new gff3 or bed file]```|
-|cpheno|合并同一群体多个表型|同一群体的多个表型文件: ```jx cpheno --files pheno1.tsv,pheno2.tsv,... --out outprefix```|
+|**gwas**|利用混合线性模型进行全基因组关联分析|```jx gwas -h```|
+|**gs**|利用BLUP和机器学习模型进行全基因组选择|```jx gs -h```|
+|**postGWAS**|可视化及注释全基因组关联分析的结果|```jx postGWAS -h```|
+|**pca**|谱分解计算输入文件行主成分及可视化|```jx pca -h```|
+|**grm**|亲缘关系矩阵估计(1-VanRanden;2-Yang)|```jx grm -h```|
 
 |计划更新模块|功能|最简语法|
 |-|-|-|
-|pca|基于随机奇异值分解计算输入文件行主成分及可视化|基因型文件: ```jx pca ...```|
-|iqtree|最大似然法计算输入样本的系统发育关系|phy文件: ```jx iqtree ...```|
+|**gwas: FarmCPU**|利用REM和FEM进行全基因组关联分析|```jx gwas --farmcpu ...```|
+|**iqtree** (extModule)|最大似然法计算输入样本的系统发育关系|```jx iqtree ...```|
 |...|...|...|
 
 ### 功能1: 全基因组关联分析
@@ -390,17 +385,18 @@ cd JanusX
 必须参数3：--out [结果文件输出文件夹(不存在则自动创建)]
 默认参数：计算 VanRanden 亲缘关系矩阵、基于基因型的前3个主成分，生成文件于vcf或bfile文件目录
 
-#### 多平台使用
-
-jx [模块名] [模块命令](后续增加 coloc、gs 等模块)
-
 ```bash
-jx gwas -h # 查看帮助
+jx <module> [options]
+
+# 查看帮助
+jx gwas --help
+
 # 混合线性模型
-jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -o test # vcf format
-jx gwas -npy example/mouse_hs1940 -p example/mouse_hs1940.pheno -o test # numpy format
+jx gwas --vcf example/mouse_hs1940.vcf.gz --pheno example/mouse_hs1940.pheno --out test  # vcf format
+jx gwas --npy example/mouse_hs1940 --pheno example/mouse_hs1940.pheno --out test  # numpy format
+
 # 可视化
-jx postGWAS -file test/test0.assoc.tsv -threshold 1e-6
+jx postGWAS --files test/test0.assoc.tsv --threshold 1e-6
 ```
 
 使用example文件夹下的[测试数据](https://doi.org/10.1038/ng.3609)输出结果如下所示：

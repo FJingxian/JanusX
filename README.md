@@ -12,22 +12,18 @@ JanusX is a high-performance toolkit for Genome-Wide Association Studies (GWAS) 
 
 ```bash
 git clone https://github.com/MaizeMan-JxFU/JanusX.git
-# Linux/macOS
-cd JanusX; sh ./install.sh
-# # Windows
-# .\install.bat
+cd JanusX
+sh ./install.sh
 ```
 
-The install scripts use `uv` for dependency management and create a virtual environment in `.venv/`.
+The install script uses `uv` for dependency management and creates a virtual environment in `.venv/`.
+
+**Note**: Windows installation is no longer supported. Please use Linux/macOS or Windows Subsystem for Linux (WSL).
 
 ### Running the CLI
 
 ```bash
-# Linux/macOS
 ./jx <module> [options]
-
-# Windows
-.\jx <module> [options]
 ```
 
 ### Available Modules
@@ -47,13 +43,15 @@ jx gwas --vcf example/mouse_hs1940.vcf.gz --pheno example/mouse_hs1940.pheno --o
 
 # GWAS with PLINK format
 jx gwas --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --thread 8
-jx gwas -bfile genotypes -p phenotypes.txt -o results -k 1 -q 3 -t 8
+
+# Using kinship matrix and fast mode
+jx gwas --vcf genotypes.vcf --pheno phenotypes.txt --out results --grm kinship_matrix.txt --qcov 10 --lm
 
 # Visualize GWAS results
-jx postGWAS -f test/*.mlm.tsv -threshold 1e-6 -t 4
+jx postGWAS --files test/*.mlm.tsv --threshold 1e-6 --thread 4
 
-# GS with PLINK format
-jx gs -bfile genotypes -p phenotypes.txt -o results -GBLUP -rrBLUP -RF
+# Genomic selection with PLINK format
+jx gs --bfile genotypes --pheno phenotypes.txt --out results --GBLUP --rrBLUP --RF
 ```
 
 ![manhanden&qq](./fig/test0.png "Simple visualization")

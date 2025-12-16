@@ -22,6 +22,10 @@ readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
 keywords = ["GWAS", "GS", "REML", "PCA"]
 
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

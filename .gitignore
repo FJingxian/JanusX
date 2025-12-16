@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-
+.vscode
 # test folder
 test*
 
@@ -24,6 +24,4 @@ test.*
 uv.lock
 .python-version
 
-# ignore docker files
-*.sif
-*.tar
+jx

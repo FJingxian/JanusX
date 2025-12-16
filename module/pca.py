@@ -188,6 +188,7 @@ def main(log:bool=True):
             pcshow = PCSHOW(df_pc)
             fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2],group,textanno,color_set[6])
         else:
+            pcshow = PCSHOW(df_pc)
             fig = pcshow.pcplot3D(df_pc.columns[0],df_pc.columns[1],df_pc.columns[2])
         fig.write_html(f'{args.out}/{args.prefix}.eigenvec.3D.html')
         logger.info(f'3D figure was saved in {args.out}/{args.prefix}.eigenvec.3D.html')

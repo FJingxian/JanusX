@@ -96,7 +96,7 @@ Each module corresponds to a CLI command. The launcher script (`jx.bat`/`jx`) di
 
 ### Key Algorithms
 
-**Mixed Linear Model**: Uses SVD decomposition of the kinship matrix to simplify variance computation, with Brent's method for REML parameter optimization. Lambda (variance ratio) is the single parameter being optimized.
+**Mixed Linear Model**: Uses eigen decomposition of the kinship matrix to simplify variance computation, with Brent's method for REML parameter optimization. Lambda (variance ratio) is the single parameter being optimized.
 
 **Kinship Methods**: VanRanden (Centralization, default), Yang (Standardization).
 
@@ -104,7 +104,7 @@ Each module corresponds to a CLI command. The launcher script (`jx.bat`/`jx`) di
 
 ## File Formats
 
-**Phenotype file**: Tab-delimited, first column = sample ID, subsequent columns = phenotypes
+**Phenotype file**: Tab-delimited, first column is sample ID, subsequent columns is phenotype
 
 | samples | pheno_name |
 | :-----: | :--------: |

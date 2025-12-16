@@ -125,7 +125,7 @@ def main():
                                help='Color style for manhanden and qq figure, 0-6 (default: %(default)s)')
     optional_group.add_argument('-hl','--highlight', type=str, default=None,
                                help='Hightlight SNP with gene name in .bed file, eg. 1\t100021\t100021\tgenename\tfunction (default: %(default)s)')
-    optional_group.add_argument('-format','--format', type=str, default='pdf',
+    optional_group.add_argument('-format','--format', type=str, default='png',
                                help='Figure format, eg. pdf, png, svg, tif (default: %(default)s)')
     optional_group.add_argument('-a','--anno', type=str, default=None,
                                help='annotation option, .gff file or .bed file'

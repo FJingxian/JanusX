@@ -33,7 +33,6 @@ class GWASPLOT:
         self.chruniq = df[chr].unique()
         transdict = dict(zip(self.chruniq,range(1,1+len(self.chruniq))))
         df[chr] = df[chr].map(transdict).astype(int)
-        print(df)
         df = df.sort_values(by=[chr,pos])
         self.chrlist = df[chr].unique()
         self.interval = int(interval_rate*df[pos].max())

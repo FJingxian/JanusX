@@ -88,7 +88,7 @@ class GWAS:
     def _fit(self,snp:np.ndarray=None):
         result = minimize_scalar(lambda lbd: -self._REML(10**(lbd),snp),bounds=self.bounds,method='bounded',options={'xatol': 1e-2, 'maxiter': 50},) # 寻找lbd 最大化似然函数
         if result.success:
-            lbd = self.lbd_null if not result.success else 10**(result.x)
+            lbd = 10**(result.x)
             X = np.column_stack([self.Xcov, snp])
             n,p = X.shape
             V_inv = 1/(self.S+lbd)

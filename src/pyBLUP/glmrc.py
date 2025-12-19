@@ -1,6 +1,6 @@
 import numpy as np
 try:
-    from glm_rs import glmi8
+    from jxglm_rs import glmi8
 except:
     raise "Please build jxglm_rs for glmrc. Source code is in ext/glm_rs"
 

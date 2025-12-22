@@ -33,15 +33,32 @@ mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
 import matplotlib.pyplot as plt
 from bioplotkit import GWASPLOT
-from pyBLUP import GWAS,LM
+from pyBLUP import GWAS,LM,farmcpu
 from pyBLUP import QK
 from gfreader import breader,vcfreader,npyreader
+from joblib import cpu_count
 import pandas as pd
 import numpy as np
 import argparse
 import time
 import socket
 from ._common.log import setup_logging
+
+def fastplot(gwasresult:pd.DataFrame,phenosub:pd.DataFrame,xlabel:str='',ylabel:str='',outpdf:str='fastplot.pdf'):
+    '''Fast plot for GWASresult data'''
+    results = gwasresult.astype({"POS": "int64"})
+    fig = plt.figure(figsize=(16,4),dpi=300)
+    layout = [['A','B','B','C']]
+    axes:dict = fig.subplot_mosaic(mosaic=layout)
+    gwasplot = GWASPLOT(results)
+    axes['A'].hist(phenosub,bins=15)
+    axes['A'].set_xlabel(xlabel)
+    axes['A'].set_ylabel('count')
+    gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
+    gwasplot.qq(ax=axes['C'])
+    plt.tight_layout()
+    plt.savefig(f"{outpdf}",transparent=True)
+
 
 def main(log:bool=True):
     parser = argparse.ArgumentParser(
@@ -65,10 +82,13 @@ def main(log:bool=True):
     ## Model
     models_group = parser.add_argument_group('Model Arguments')
     models_group.add_argument('-lmm','--lmm', action='store_true',default=False,
-                               help='Additional calculation of linear mixed model '
+                               help='Linear mixed model '
+                                   '(default: %(default)s)')
+    models_group.add_argument('-farmcpu','--farmcpu', action='store_true',default=False,
+                               help='FarmCPU model '
                                    '(default: %(default)s)')
     models_group.add_argument('-lm','--lm', action='store_true',default=False,
-                               help='Additional calculation of general linear model '
+                               help='General linear model '
                                    '(default: %(default)s)')
     # Optional arguments
     optional_group = parser.add_argument_group('Optional Arguments')
@@ -117,6 +137,7 @@ def main(log:bool=True):
     elif args.npy:
         gfile = args.npy
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+    args.thread = cpu_count() if args.thread == -1 else args.thread
     gfile = gfile.replace('\\','/') # adjust \ in Windows
     # create output folder and log file
     os.makedirs(args.out,0o755,exist_ok=True)
@@ -144,7 +165,7 @@ def main(log:bool=True):
             logger.info(f"Q matrix:         {args.qcov}")
         if args.cov:
             logger.info(f"Covariant matrix: {args.cov}")
-        logger.info(f"Threads:          {args.thread} ({'All cores' if args.thread == -1 else 'User specified'})")
+        logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
         logger.info(f"Output prefix:    {args.out}/{args.prefix}")
         logger.info("*"*60 + "\n")
     try:
@@ -162,7 +183,7 @@ def main(log:bool=True):
         assert qcal or os.path.isfile(qdim), f'{qdim} is not a dimension of PC or PC file'
         assert cov is None or os.path.isfile(cov), f"{cov} is applied, but it is not a file"
         # test exist of calculating model
-        assert args.lm or args.lmm, 'no model to estimate, try -lm or -lmm'
+        assert args.lm or args.lmm or args.farmcpu, 'no model to estimate, try -lm, -farmcpu or -lmm'
 
         # Loading genotype matrix
         t_loading = time.time()
@@ -224,17 +245,19 @@ def main(log:bool=True):
         assert geno.size>0, 'After filtering, number of SNP is 0'
 
         prefix = gfile.replace('.vcf','').replace('.gz','')
-        if kcal:
-            if os.path.exists(f'{prefix}.k.{kinship_method}.txt'):
-                logger.info(f'* Loading GRM from {prefix}.k.{kinship_method}.txt...')
-                kmatrix = np.genfromtxt(f'{prefix}.k.{kinship_method}.txt')
-            else:    
-                logger.info(f'* Calculation method of kinship matrix is {kinship_method}')
-                kmatrix = qkmodel.GRM(method=int(kinship_method))
-                np.savetxt(f'{prefix}.k.{kinship_method}.txt',kmatrix,fmt='%.6f')
-        else:
-            logger.info(f'* Loading GRM from {kinship_method}...')
-            kmatrix = np.genfromtxt(kinship_method) if kinship_method[-4:] != '.npz' else np.load(kinship_method,)['arr_0']
+        if args.lmm:
+            logger.info(f'* Preparing GRM and Q matrix for LMM...')
+            if kcal:
+                if os.path.exists(f'{prefix}.k.{kinship_method}.txt'):
+                    logger.info(f'* Loading GRM from {prefix}.k.{kinship_method}.txt...')
+                    kmatrix = np.genfromtxt(f'{prefix}.k.{kinship_method}.txt')
+                else:    
+                    logger.info(f'* Calculation method of kinship matrix is {kinship_method}')
+                    kmatrix = qkmodel.GRM(method=int(kinship_method))
+                    np.savetxt(f'{prefix}.k.{kinship_method}.txt',kmatrix,fmt='%.6f')
+            else:
+                logger.info(f'* Loading GRM from {kinship_method}...')
+                kmatrix = np.genfromtxt(kinship_method) if kinship_method[-4:] != '.npz' else np.load(kinship_method,)['arr_0']
         if qcal:
             if os.path.exists(f'{prefix}.q.{qdim}.txt'):
                 logger.info(f'* Loading Q matrix from {prefix}.q.{qdim}.txt...')
@@ -260,8 +283,9 @@ def main(log:bool=True):
             cov = geno[chr_loc_index.get_loc(args.csnp)].reshape(-1,1)
             logger.info(f'Covmatrix {cov.shape}:')
             qmatrix = np.concatenate([qmatrix,cov],axis=1)
-        logger.info(f'GRM {str(kmatrix.shape)}:')
-        logger.info(kmatrix[:5,:5])
+        if args.lmm:
+            logger.info(f'GRM {str(kmatrix.shape)}:')
+            logger.info(kmatrix[:5,:5])
         logger.info(f'Qmatrix {str(qmatrix.shape)}:')
         logger.info(qmatrix[:5,:5])
         del qkmodel
@@ -275,7 +299,8 @@ def main(log:bool=True):
             snp_sub = geno[:,famidretain]
             p_sub = p.loc[famid[famidretain]].values.reshape(-1,1)
             q_sub = qmatrix[famidretain]
-            k_sub = kmatrix[famidretain][:,famidretain]
+            if args.lmm:
+                k_sub = kmatrix[famidretain][:,famidretain]
             if len(p)>0:
                 if args.lmm:
                     logger.info(f'** Mixed Linear Model:')
@@ -286,19 +311,7 @@ def main(log:bool=True):
                     results = pd.concat([ref_alt,results],axis=1)
                     results = results.reset_index().dropna()
                     logger.info(f'Effective number of SNP: {results.shape[0]}')
-                    if args.plot:
-                        results = results.astype({"POS": "int64"})
-                        fig = plt.figure(figsize=(16,4),dpi=300)
-                        layout = [['A','B','B','C']]
-                        axes:plt.Axes = fig.subplot_mosaic(mosaic=layout)
-                        gwasplot = GWASPLOT(results)
-                        axes['A'].hist(p_sub,bins=15)
-                        axes['A'].set_xlabel(i)
-                        axes['A'].set_ylabel('count')
-                        gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
-                        gwasplot.qq(ax=axes['C'])
-                        plt.tight_layout()
-                        plt.savefig(f"{outfolder}/{args.prefix}.{i}.gwas.lmm.pdf",transparent=True)
+                    fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.lmm.pdf") if args.plot else None
                     results = results.astype({"p": "object"})
                     results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
                     results.to_csv(f"{outfolder}/{args.prefix}.{i}.lmm.tsv",sep="\t",float_format="%.4f",index=False)
@@ -310,28 +323,27 @@ def main(log:bool=True):
                     results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
                     results = pd.concat([ref_alt,results],axis=1)
                     results = results.reset_index().dropna()
-                    if args.plot:
-                        results = results.astype({"POS": "int64"})
-                        fig = plt.figure(figsize=(16,4),dpi=300)
-                        layout = [['A','B','B','C']]
-                        axes:plt.Axes = fig.subplot_mosaic(mosaic=layout)
-                        gwasplot = GWASPLOT(results)
-                        axes['A'].hist(p_sub,bins=15)
-                        axes['A'].set_xlabel(i)
-                        axes['A'].set_ylabel('count')
-                        gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
-                        gwasplot.qq(ax=axes['C'])
-                        plt.tight_layout()
-                        plt.savefig(f"{outfolder}/{args.prefix}.{i}.gwas.lm.pdf",transparent=True)
+                    fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.lm.pdf") if args.plot else None
                     results = results.astype({"p": "object"})
                     results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
                     results.to_csv(f"{outfolder}/{args.prefix}.{i}.lm.tsv",sep="\t",float_format="%.4f",index=None)
                     logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.lm.tsv'.replace('//','/'))
+                if args.farmcpu:
+                    logger.info(f'** FarmCPU Model:')
+                    results = farmcpu(y=p_sub,M=snp_sub,X=q_sub,chrlist=ref_alt.reset_index().iloc[:,0].values,poslist=ref_alt.reset_index().iloc[:,1].values,iteration=20,threads=threads)
+                    results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
+                    results = pd.concat([ref_alt,results],axis=1)
+                    results = results.reset_index()
+                    fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.farmcpu.pdf") if args.plot else None
+                    results = results.astype({"p": "object"})
+                    results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
+                    results.to_csv(f"{outfolder}/{args.prefix}.{i}.farmcpu.tsv",sep="\t",float_format="%.4f",index=None)
+                    logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.farmcpu.tsv'.replace('//','/'))
             else:
                 logger.info(f'Phenotype {i} has no overlapping samples with genotype, please check sample id. skipped.\n')
             logger.info(f'Time costed: {round(time.time()-t,2)} secs\n')
     except Exception as e:
-        logger.info(f'Error of JanusX: {e}')
+        logger.exception(f'Error of JanusX: {e}')
     lt = time.localtime()
     endinfo = f'\nFinished, Total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
     logger.info(endinfo)

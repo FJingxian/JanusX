@@ -187,59 +187,6 @@ class LM:
                     pbar.set_postfix(memory=f'{memory_usage:.2f} GB',total=f'{(memory.used/1024**3):.2f}/{(memory.total/1024**3):.2f} GB')
             gc.collect()
         return np.concatenate(beta_se_p)
-
     
-class FARMCPU:
-    def __init__(self,y:np.ndarray=None,M:np.ndarray=None,X:np.ndarray=None,kinship:np.ndarray=None,log:bool=True):
-        '''
-        Fast Solve of Mixed Linear Model by Brent.
-        
-        :param y: Phenotype nx1\n
-        :param M: SNP matrix mxn\n
-        :param X: Designed matrix for fixed effect nxp\n
-        :param kinship: Calculation method of kinship matrix nxn
-        '''
-        self.y = y
-        self.M = M
-        self.X = np.concatenate([np.ones((y.shape[0],1)),X],axis=1) if X is not None else np.ones((y.shape[0],1))
-        pass
-    def _FEM(self,snp:np.ndarray):
-        '''
-        solving beta and its se in multiprocess
-        '''
-        X = np.column_stack([self.X, snp])
-        XTX = X.T@X
-        try:
-            XTX_inv = np.linalg.inv(XTX)
-        except:
-            XTX_inv = np.linalg.inv(XTX+np.eye(XTX.shape[0]))
-        XTy = X.T@self.y
-        beta = XTX_inv@XTy
-        r = (self.y-X@beta)
-        se = np.sqrt((r.T@r)/(X.shape[0]-XTX.shape[0])*XTX_inv[-1,-1])
-        return beta[-1,0],se[0,0]
-    def _NULLREML(self,lbd: float):
-        '''Restricted Maximum Likelihood Estimation (REML) of NULL'''
-        try:
-            n,p_cov = self.Xcov.shape
-            p = p_cov
-            V = self.S+lbd
-            V_inv = 1/V
-            X_cov_snp = self.Xcov
-            XTV_invX = V_inv*X_cov_snp.T @ X_cov_snp
-            XTV_invy = V_inv*X_cov_snp.T @ self.y
-            beta = np.linalg.solve(XTV_invX, XTV_invy)
-            r = self.y - X_cov_snp@beta
-            rTV_invr = (V_inv * r.T@r)[0,0]
-            log_detV = np.sum(np.log(V))
-            sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
-            total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX # log items
-            c = (n-p)*(np.log(n-p)-1-np.log(2*np.pi))/2 # Constant
-            return c - total_log / 2
-        except Exception as e:
-            print(f"REML error: {e}, lbd={lbd}")
-            return -1e8
-    
-
 if __name__ == '__main__':
     pass

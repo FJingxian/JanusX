@@ -19,8 +19,7 @@ class GWASPLOT:
         :param pos: str, colname of POS\n
         :param pvalue: str, colname of Pvalue\n
         '''
-        # DataFrame Compression down-sampling
-        if compression:
+        if compression: # DataFrame Compression down-sampling
             cnum = df.shape[0] // 100_000 if df.shape[0]>=100_000 else 1 # Final number of SNP to plot is 100_000
             cpvalue = 10_000/df.shape[0] # set compression threshold
             df_cp = df.loc[df.sort_values(pvalue,ascending=False).iloc[:cnum*int(np.sum(df[pvalue]>cpvalue)//cnum),:].index].sort_index() # 过滤大多数阈值线以下的位点

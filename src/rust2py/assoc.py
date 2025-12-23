@@ -1,7 +1,11 @@
 try:
-    from jxglm_rs import glmi8,mlmi8,mlmpf32
+    from jxglm_rs import glmi8
 except Exception as e:
     print(f"{e}\nPlease build jxglm_rs for glmrc. Source code is in ext/glm_rs")
+try:
+    from lmm_rs import lmm_reml_chunk_f32
+except Exception as e:
+    print(f"{e}\nPlease build lmm_rs for lmm_reml_chunk_f32. Source code is in ext/lmm_rs")
 import numpy as np   
 
 
@@ -19,6 +23,8 @@ def FEM(y:np.ndarray,X:np.ndarray,M:np.ndarray,chunksize:int=50_000,threads:int=
     :type chunksize: int
     :param threads: number of threads
     :type threads: int
+    
+    :return: beta, se, pvalue
     '''
     y = np.ascontiguousarray(y, dtype=np.float64).ravel()
     X = np.ascontiguousarray(X, dtype=np.float64)
@@ -31,46 +37,71 @@ def FEM(y:np.ndarray,X:np.ndarray,M:np.ndarray,chunksize:int=50_000,threads:int=
     result:np.ndarray = glmi8(y,X,ixx,M,chunksize,threads)
     return result
 
-def fastMLM(y, X, UT, iUXUX=None, vgs=1.0, G=None, step=10000, threads=0):
-    """
-    # Per-marker MLM test (G is int8, marker rows).
-    
-    :param y: (n,) float64
-    :param X: (n,q0) float64
-    :param UT: (n,n) float64  = U.T
-    :param iUXUX: (q0,q0) float64  = pinv((UT@X).T @ (UT@X))
-    :param vgs: scalar
-    :param G: (m,n) int8
-    
-    :return: (m,3) float64 -> beta, se, p
-    """
-    y = np.ascontiguousarray(y, dtype=np.float64).ravel()
-    X = np.ascontiguousarray(X, dtype=np.float64)
-    UT = np.ascontiguousarray(UT, dtype=np.float64)
-    G = np.ascontiguousarray(G, dtype=np.int8)
-    Uy = UT @ y
-    UX = UT @ X
-    if iUXUX is None:
-        iUXUX = np.linalg.pinv(UX.T @ UX)
-    iUXUX = np.ascontiguousarray(iUXUX, dtype=np.float64)
-    UXUy = UX.T @ Uy
-    Uy = np.ascontiguousarray(Uy, dtype=np.float64)
-    UX = np.ascontiguousarray(UX, dtype=np.float64)
-    UXUy = np.ascontiguousarray(UXUy, dtype=np.float64).ravel()
-    return mlmi8(Uy, UX, iUXUX, UXUy, UT, G, float(vgs), step=int(step), threads=int(threads))
 
-def poolMLM(y, X, UT, G_pool, vgs=1.0, ridge=1e-10):
+def lmm_reml(S:np.ndarray, Xcov:np.ndarray, y_rot:np.ndarray, Dh:np.ndarray, snp_chunk:np.ndarray, bounds:tuple,
+                       max_iter=30, tol=1e-2, threads=4):
     """
-    # Multi-locus test: put all loci in G_pool into fixed effects simultaneously,
-    
-    :param y: (n,)
-    :param X: (n,q0)
-    :param UT: (n,n)
-    :param G_pool: (k,n) int8 (rows are loci)
-    :return: beta/se/p (k,3), for each locus in the pool.
+    Python wrapper for Rust function lmm_reml_chunk_f32.
+
+    This function:
+      1. Ensures correct shapes and dtypes for Rust (float64/float32)
+      2. Rotates genotype chunk (snp_chunk @ Dh.T)
+      3. Performs REML optimization for each SNP in the chunk
+      4. Returns beta, se, p, lambda vectors
+
+    Parameters
+    ----------
+    S : ndarray (n,)
+        Eigenvalues of the kinship matrix (float64).
+    Xcov : ndarray (n, q)
+        Rotated covariates matrix: Dh @ X.
+    y_rot : ndarray (n,)
+        Rotated phenotype: Dh @ y.
+    Dh : ndarray (n, n)
+        Eigenvector matrix transpose (U^T).
+    snp_chunk : ndarray (m_chunk, n)
+        SNP genotype chunk BEFORE rotation.
+        dtype can be int8/float32/float64.
+    bounds : tuple (low, high)
+        log10(lambda) lower and upper bounds.
+    max_iter : int
+        Max iterations for Brent optimization.
+    tol : float
+        Convergence tolerance in log10(lambda).
+    threads : int
+        Number of parallel worker threads.
+
+    Returns
+    -------
+    beta_se_p : ndarray (m_chunk, 3)
+        Columns: beta, se, p.
+    lambdas : ndarray (m_chunk,)
+        Estimated REML lambda for each SNP.
     """
-    y = np.ascontiguousarray(y, dtype=np.float64).ravel()
-    X = np.ascontiguousarray(X, dtype=np.float64)
-    UT = np.ascontiguousarray(UT, dtype=np.float64)
-    G_pool = np.ascontiguousarray(G_pool, dtype=np.int8)
-    return mlmpf32(y, X, UT, G_pool, float(vgs), float(ridge))
+
+    low, high = bounds
+
+    # --- Convert all numpy arrays into valid Rust inputs ---
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
+    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+
+    # ----- Rotate genotype chunk: g_rot = snp_chunk @ Dh.T -----
+    # snp_chunk: (m, n), Dh.T: (n, n)
+    g_rot_chunk = snp_chunk @ Dh.T
+    g_rot_chunk = np.ascontiguousarray(g_rot_chunk, dtype=np.float32)
+
+    # ----- Call the Rust core function -----
+    beta_se_p, lambdas = lmm_reml_chunk_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(low),
+        float(high),
+        g_rot_chunk,
+        max_iter,
+        tol,
+        threads
+    )
+
+    return beta_se_p, lambdas

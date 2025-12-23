@@ -1,18 +1,14 @@
 import numpy as np
 from scipy.optimize import minimize_scalar
-from scipy.stats import norm
-from joblib import Parallel, delayed # for parallel processing
-from tqdm import tqdm
-import gc # garbage collection
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, 
                         message="invalid value encountered in")
 import psutil
 process = psutil.Process()
-from lmm_rs import lmm_reml_chunk_f32
+from rust2py.assoc import lmm_reml,FEM
 
 class LMM:
-    def __init__(self,y:np.ndarray=None,X:np.ndarray=None,kinship:np.ndarray=None,log:bool=True):
+    def __init__(self,y:np.ndarray=None,X:np.ndarray=None,kinship:np.ndarray=None):
         '''
         Fast Solve of Mixed Linear Model by Brent.
         
@@ -20,7 +16,6 @@ class LMM:
         :param X: Designed matrix for fixed effect nxp\n
         :param kinship: Calculation method of kinship matrix nxn
         '''
-        self.log = log
         y = y.reshape(-1,1) # ensure the dim of y
         X = np.concatenate([np.ones((y.shape[0],1)),X],axis=1) if X is not None else np.ones((y.shape[0],1))
         # Simplify inverse matrix
@@ -71,19 +66,27 @@ class LMM:
         
         :return: beta coefficients, standard errors and p-values for each SNP, np.ndarray
         '''
-        beta_se_p, lambdas = lmm_reml_chunk_f32(
+        beta_se_p, lambdas = lmm_reml(
             self.S,             # eigenvalues of K
             self.Xcov,          # DH @ X
-            self.y.ravel(),             # DH @ y
-            self.bounds[0],     # log10(lbd lower bound)
-            self.bounds[1],     # ⑤ log10(lbd upper bound)
-            snp@self.Dh.T,      #g rotated: snp_chunk @ DH.T (float32)
+            self.y,             # DH @ y
+            self.Dh,
+            snp,      #g rotated: snp_chunk @ DH.T (float32)
+            self.bounds,     # log10(lbd lower bound)
             max_iter=30,
             tol=1e-2,
             threads=threads
         )
         self.lbd = lambdas
         return beta_se_p
-    
+
+class LM:
+    def __init__(self,y:np.ndarray=None,X:np.ndarray=None):
+        self.y = y.reshape(-1,1) # ensure the dim of y
+        self.X = np.concatenate([np.ones((y.shape[0],1)),X],axis=1) if X is not None else np.ones((y.shape[0],1))
+    def gwas(self,snp:np.ndarray,threads:int=1):
+        beta_se_p = FEM(self.y,self.X,snp,snp.shape[0],threads)[:,[0,1,-1]]
+        return beta_se_p
+
 if __name__ == '__main__':
     pass

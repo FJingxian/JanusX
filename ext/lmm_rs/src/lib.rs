@@ -187,7 +187,6 @@ fn reml_loglike(
     }
 }
 
-/// 简单的黄金分割搜索，在 log10(lbd) 上最大化 REML
 fn brent_max_reml(
     s: &[f64],
     xcov: &[f64],
@@ -200,41 +199,193 @@ fn brent_max_reml(
     tol: f64,
     max_iter: usize,
 ) -> (f64, f64) {
+    // 容错：low < high
     let mut a = low;
-    let mut b = high;
-    let phi = 0.5 * (3.0_f64.sqrt() - 1.0); // ~0.618
+    let mut c = high;
+    if !(a < c) {
+        std::mem::swap(&mut a, &mut c);
+    }
 
-    let mut c = b - phi * (b - a);
-    let mut d = a + phi * (b - a);
+    // 机器精度防护
+    let eps = 2.220_446_049_250_313e-16_f64; // f64::EPSILON
+    let tol = tol.abs().max(1e-12);
 
-    let mut fc = reml_loglike(c, s, xcov, y, snp, n, p_cov);
-    let mut fd = reml_loglike(d, s, xcov, y, snp, n, p_cov);
+    // 目标函数：g(x) = -REML(x)，Brent 是最小化
+    let f = |x: f64| -> f64 {
+        -reml_loglike(x, s, xcov, y, snp, n, p_cov)
+    };
 
-    for _ in 0..max_iter {
-        if (b - a).abs() < tol {
+    // 初始点：取中点
+    let mut x = 0.5 * (a + c);
+    let mut w = x;
+    let mut v = x;
+
+    let mut fx = f(x);
+    let mut fw = fx;
+    let mut fv = fx;
+
+    // 这两个是最近一步和上上步的步长
+    let mut d = 0.0_f64;
+    let mut e = 0.0_f64;
+
+    for _iter in 0..max_iter {
+        let m = 0.5 * (a + c);
+        let tol1 = tol * x.abs() + eps;
+        let tol2 = 2.0 * tol1;
+
+        // 收敛判据：当前 x 已经在区间中点附近，并且区间足够小
+        if (x - m).abs() <= tol2 - 0.5 * (c - a) {
             break;
         }
-        if fc > fd {
-            b = d;
-            d = c;
-            fd = fc;
-            c = b - phi * (b - a);
-            fc = reml_loglike(c, s, xcov, y, snp, n, p_cov);
+
+        let mut p = 0.0_f64;
+        let mut q = 0.0_f64;
+        let mut r = 0.0_f64;
+        let mut u: f64;
+
+        let use_parabolic = if e.abs() > tol1 {
+            // 尝试抛物线插值
+            r = (x - w) * (fx - fv);
+            q = (x - v) * (fx - fw);
+            p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+
+            if q > 0.0 {
+                p = -p;
+            } else {
+                q = -q;
+            }
+
+            let mut ok = false;
+            if q.abs() > eps {
+                let s = p / q;
+                u = x + s;
+
+                // 条件：u 在 (a,c) 内，并且步长不太大
+                if (u - a) >= tol2
+                    && (c - u) >= tol2
+                    && s.abs() < 0.5 * e.abs()
+                {
+                    ok = true;
+                }
+            }
+
+            if ok {
+                d = p / q;
+                u = x + d;
+                // 如果太接近边界，再稍微偏移一下
+                if (u - a) < tol2 || (c - u) < tol2 {
+                    d = if x < m { tol1 } else { -tol1 };
+                }
+                true
+            } else {
+                false
+            }
         } else {
-            a = c;
-            c = d;
-            fc = fd;
-            d = a + phi * (b - a);
-            fd = reml_loglike(d, s, xcov, y, snp, n, p_cov);
+            false
+        };
+
+        if !use_parabolic {
+            // 退回黄金分割步骤
+            e = if x < m { c - x } else { x - a };
+            d = 0.3819660_f64 * e; // (3 - sqrt(5)) / 2 ≈ 0.381966
+        }
+
+        // 确保步长至少为 tol1
+        if d.abs() < tol1 {
+            d = if d >= 0.0 { tol1 } else { -tol1 };
+        }
+
+        u = x + d;
+        let fu = f(u);
+
+        // 更新区间和三点 x,w,v
+        if fu <= fx {
+            // u 成为新的最好点
+            if u >= x {
+                a = x;
+            } else {
+                c = x;
+            }
+            v = w;
+            fv = fw;
+            w = x;
+            fw = fx;
+            x = u;
+            fx = fu;
+        } else {
+            // u 只是次优点
+            if u >= x {
+                a = u;
+            } else {
+                c = u;
+            }
+            if fu <= fw || w == x {
+                v = w;
+                fv = fw;
+                w = u;
+                fw = fu;
+            } else if fu <= fv || v == x || v == w {
+                v = u;
+                fv = fu;
+            }
         }
     }
 
-    if fc > fd {
-        (c, fc)
-    } else {
-        (d, fd)
-    }
+    let best_log10_lbd = x;
+    let best_ll = -fx; // 因为 f = -REML
+
+    (best_log10_lbd, best_ll)
 }
+
+// /// 简单的黄金分割搜索，在 log10(lbd) 上最大化 REML
+// fn brent_max_reml(
+//     s: &[f64],
+//     xcov: &[f64],
+//     y: &[f64],
+//     snp: &[f64],
+//     n: usize,
+//     p_cov: usize,
+//     low: f64,
+//     high: f64,
+//     tol: f64,
+//     max_iter: usize,
+// ) -> (f64, f64) {
+//     let mut a = low;
+//     let mut b = high;
+//     let phi = 0.5 * (3.0_f64.sqrt() - 1.0); // ~0.618
+
+//     let mut c = b - phi * (b - a);
+//     let mut d = a + phi * (b - a);
+
+//     let mut fc = reml_loglike(c, s, xcov, y, snp, n, p_cov);
+//     let mut fd = reml_loglike(d, s, xcov, y, snp, n, p_cov);
+
+//     for _ in 0..max_iter {
+//         if (b - a).abs() < tol {
+//             break;
+//         }
+//         if fc > fd {
+//             b = d;
+//             d = c;
+//             fd = fc;
+//             c = b - phi * (b - a);
+//             fc = reml_loglike(c, s, xcov, y, snp, n, p_cov);
+//         } else {
+//             a = c;
+//             c = d;
+//             fc = fd;
+//             d = a + phi * (b - a);
+//             fd = reml_loglike(d, s, xcov, y, snp, n, p_cov);
+//         }
+//     }
+
+//     if fc > fd {
+//         (c, fc)
+//     } else {
+//         (d, fd)
+//     }
+// }
 
 /// 计算最终 beta, se, lbd：
 /// 逻辑对应 LMM._fit 里成功找到 lbd 后那一段

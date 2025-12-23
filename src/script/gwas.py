@@ -64,7 +64,7 @@ def fastplot(gwasresult:pd.DataFrame,phenosub:pd.DataFrame,xlabel:str='',outpdf:
     plt.savefig(f"{outpdf}",transparent=True)
 
 def lowm_GWAS(genofile:os.PathLike, pheno_file:os.PathLike, pheno_col:int,outprefix:str,
-              maf_threshold:float=0.01,max_missing_rate:float=0.05, mem:float=None,plot: bool=False,
+              maf_threshold:float=0.01,max_missing_rate:float=0.05, chunk_size:int=100_000,plot: bool=False,
               mgrm:str='1',pcdim:str='10',model:str='lmm',threads:int=4):
     pheno = pd.read_csv(rf'{pheno_file}',sep='\t') # Col 1 - idv ID; row 1 - pheno tag
     pheno = pheno.groupby(pheno.columns[0]).mean() # Mean of duplicated samples
@@ -82,8 +82,6 @@ def lowm_GWAS(genofile:os.PathLike, pheno_file:os.PathLike, pheno_col:int,outpre
     ids, m = inspect_genotype_file(genofile)
     ids = np.array(ids).astype(str)
     n = len(ids)
-    mem = psutil.virtual_memory().available if mem is None else mem
-    chunk_size = int(mem*0.8/(4*n))
     # Process of Calculating Kinship & PCA
     grm = np.zeros((n,n),dtype='float32')
     if mgrm in ['1','2']:
@@ -210,9 +208,6 @@ def main(log:bool=True):
     optional_group.add_argument('-lmem','--lmem', action='store_true', default=False,
                                help='Low memory cost mode '
                                    '(default: %(default)s)')
-    optional_group.add_argument('-setmem','--setmem', type=float, default=None,
-                               help='Memory limitation for all task '
-                                   '(default: %(default)s)')
     optional_group.add_argument('-k','--grm', type=str, default='1',
                                help='Kinship matrix calculation method [1-centralization or 2-standardization] or path to pre-calculated GRM file '
                                    '(default: %(default)s)')
@@ -251,7 +246,6 @@ def main(log:bool=True):
         gfile = args.npy
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
     threads = cpu_count() if args.thread<=0 else args.thread
-    mem = 1024**3*args.setmem if args.setmem is not None else psutil.virtual_memory().available
     gfile = gfile.replace('\\','/') # adjust \ in Windows
     # create output folder and log file
     os.makedirs(args.out,0o755,exist_ok=True)
@@ -307,9 +301,9 @@ def main(log:bool=True):
             if args.farmcpu:
                 print('Low mem mode do not support FarmCPU, it will be ignored...')
             if args.lmm:
-                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lmm',threads=threads,mem=mem,plot=args.plot)
+                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lmm',threads=threads,plot=args.plot)
             if args.lm:
-                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lm',threads=threads,mem=mem,plot=args.plot)
+                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lm',threads=threads,plot=args.plot)
         else:
             logger.info('* Loading genotype and phenotype')
             if not args.npy:

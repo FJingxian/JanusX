@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX – Fast Genetic Relationship Matrix (GRM) Calculator
+JanusX - Fast Genetic Relationship Matrix (GRM) Calculator
 
 Design summary
 --------------
@@ -213,7 +213,7 @@ def main(log: bool = True):
     log_path = f"{args.out}/{args.prefix}.grm.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX – Fast Genetic Relationship Matrix (GRM) Calculator")
+    logger.info("JanusX - Fast Genetic Relationship Matrix (GRM) Calculator")
     logger.info(f"Host: {socket.gethostname()}\n")
 
     if log:

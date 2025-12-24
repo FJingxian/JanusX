@@ -1,268 +1,577 @@
 # -*- coding: utf-8 -*-
+"""
+JanusX – Genomic Selection Command-Line Interface
+
+Supported models
+----------------
+  - GBLUP    : Genomic Best Linear Unbiased Prediction (GBLUP, kinship = 1)
+  - rrBLUP   : Ridge regression BLUP (rrBLUP, kinship = None)
+  - RF       : Random Forest regressor with randomized hyperparameter search
+  - SVM      : Support Vector Regression (SVR) with grid search
+  - AdaBoost : AdaBoost regressor with grid search
+
+Genotype input formats
+----------------------
+  - VCF   : .vcf or .vcf.gz (using gfreader.vcfreader)
+  - PLINK : Binary PLINK (.bed/.bim/.fam) via prefix (using gfreader.breader)
+  - NPY   : npz/snp/idv bundle (using gfreader.npyreader)
+
+Phenotype input format
+----------------------
+  - Tab-delimited text file
+  - First column: sample IDs
+  - Remaining columns: phenotype traits
+  - Duplicated IDs will be averaged.
+
+Cross-validation
+----------------
+  - 5-fold cross-validation is performed within the training population for each model.
+  - For each method, the fold with the highest R² on the validation set is reported
+    and (optionally) visualized.
+
+Genomic selection workflow
+--------------------------
+  1. Load genotypes and phenotypes.
+  2. Filter SNPs by MAF < 0.01 or missing rate > 0.05 and impute by mode (via QK).
+  3. For each phenotype column:
+       - Split individuals into training (non-missing phenotype) and test sets.
+       - Run 5-fold CV on the training set for each selected model.
+       - Report Pearson, Spearman, and R² per fold.
+       - Use the best fold for diagnostic plotting (if enabled).
+       - Refit model on full training set and predict the test set.
+  4. Write prediction results into {prefix}.{trait}.gs.tsv
+
+Citation
+--------
+  https://github.com/MaizeMan-JxFU/JanusX/
+"""
+
 import logging
 import typing
 import os
-for key in ['MPLBACKEND']:
+import time
+import socket
+import argparse
+
+# ----------------------------------------------------------------------
+# Matplotlib backend configuration (non-interactive, server-safe)
+# ----------------------------------------------------------------------
+for key in ["MPLBACKEND"]:
     if key in os.environ:
         del os.environ[key]
+
 import matplotlib as mpl
-mpl.use('Agg')
-mpl.rcParams['pdf.fonttype'] = 42
-mpl.rcParams['ps.fonttype'] = 42
-logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
-logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
-from bioplotkit.sci_set import color_set
-from bioplotkit import gsplot
+
+mpl.use("Agg")
+mpl.rcParams["pdf.fonttype"] = 42
+mpl.rcParams["ps.fonttype"] = 42
+
+logging.getLogger("fontTools.subset").setLevel(logging.ERROR)
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-from scipy.stats import pearsonr,spearmanr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor,AdaBoostRegressor
-from sklearn.model_selection import GridSearchCV,RandomizedSearchCV
-import argparse
-import time
-import socket
-from ._common.log import setup_logging
-from gfreader import breader,vcfreader,npyreader
-from pyBLUP import QK,BLUP,kfold
+from sklearn.ensemble import RandomForestRegressor, AdaBoostRegressor
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
-def GSapi(Y:np.ndarray,Xtrain:np.ndarray,Xtest:np.ndarray,method:typing.Literal['GBLUP','rrBLUP','RF','SVM'],PCAdec:bool=False):
+from bioplotkit.sci_set import color_set
+from bioplotkit import gsplot
+from gfreader import breader, vcfreader, npyreader
+from pyBLUP import QK, BLUP, kfold
+from ._common.log import setup_logging
+
+
+# ======================================================================
+# Core API for single-trait genomic prediction
+# ======================================================================
+
+def GSapi(
+    Y: np.ndarray,
+    Xtrain: np.ndarray,
+    Xtest: np.ndarray,
+    method: typing.Literal["GBLUP", "rrBLUP", "RF", "SVM", "AdaBoost"],
+    PCAdec: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Core genomic selection API.
+
+    Parameters
+    ----------
+    Y : np.ndarray
+        Phenotype values for training individuals, shape (n_train, 1) or (n_train,).
+    Xtrain : np.ndarray
+        Genotype matrix for training individuals, shape (m_markers, n_train).
+    Xtest : np.ndarray
+        Genotype matrix for test individuals, shape (m_markers, n_test).
+    method : {'GBLUP', 'rrBLUP', 'RF', 'SVM', 'AdaBoost'}
+        Prediction model.
+    PCAdec : bool, optional
+        If True, perform PCA-based dimensionality reduction before modeling.
+        PCA is computed on the concatenated matrix [Xtrain, Xtest].
+
+    Returns
+    -------
+    yhat_train : np.ndarray
+        Predicted phenotypes for training individuals, shape (n_train, 1).
+    yhat_test : np.ndarray
+        Predicted phenotypes for test individuals, shape (n_test, 1).
+    """
+    # Optional PCA-based dimensionality reduction
     if PCAdec:
-        Xtt = np.concatenate([Xtrain,Xtest],axis=1)
-        Xtt:np.ndarray = (Xtt-np.mean(Xtt,axis=1,keepdims=True))/(np.std(Xtt,axis=1,keepdims=True)+1e-8)
-        val,vec = np.linalg.eigh(Xtt.T@Xtt/Xtt.shape[0])
+        Xtt = np.concatenate([Xtrain, Xtest], axis=1)  # (m, n_train + n_test)
+        Xtt = (Xtt - np.mean(Xtt, axis=1, keepdims=True)) / (
+            np.std(Xtt, axis=1, keepdims=True) + 1e-8
+        )
+        # Simple PCA via eigendecomposition of X^T X
+        val, vec = np.linalg.eigh(Xtt.T @ Xtt / Xtt.shape[0])
         idx = np.argsort(val)[::-1]
-        val,vec = val[idx],vec[:, idx]
-        dim = np.sum(np.cumsum(val)/np.sum(val)<=0.9)
-        vec = val[:dim]*vec[:,:dim]
-        Xtrain,Xtest = vec[:Xtrain.shape[1],:].T,vec[Xtrain.shape[1]:,:].T
-    if method == 'GBLUP':
-        model = BLUP(Y.reshape(-1,1),Xtrain,kinship=1)
-        return model.predict(Xtrain),model.predict(Xtest)
-    elif method == 'rrBLUP':
-        model = BLUP(Y.reshape(-1,1),Xtrain,kinship=None)
-        return model.predict(Xtrain),model.predict(Xtest)
-    elif method == 'RF':
+        val, vec = val[idx], vec[:, idx]
+        # Retain components explaining up to 90% variance
+        dim = np.sum(np.cumsum(val) / np.sum(val) <= 0.9)
+        vec = val[:dim] * vec[:, :dim]
+        Xtrain, Xtest = vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
+
+    # Linear mixed models
+    if method == "GBLUP":
+        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=1)
+        return model.predict(Xtrain), model.predict(Xtest)
+
+    if method == "rrBLUP":
+        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=None)
+        return model.predict(Xtrain), model.predict(Xtest)
+
+    # Tree-based model: Random Forest
+    if method == "RF":
         param_grid = {
-            'n_estimators': [10,25,50,75],
-            'max_depth': [None, 1, 3, 5, 7, 10], # adjust overfit
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4, 8],
+            "n_estimators": [10, 25, 50, 75],
+            "max_depth": [None, 1, 3, 5, 7, 10],
+            "min_samples_split": [2, 5, 10],
+            "min_samples_leaf": [1, 2, 4, 8],
         }
-        grid = RandomizedSearchCV(RandomForestRegressor(), param_grid, cv=5, n_jobs=-1,n_iter=30)
+        grid = RandomizedSearchCV(
+            RandomForestRegressor(),
+            param_distributions=param_grid,
+            cv=5,
+            n_jobs=-1,
+            n_iter=30,
+        )
         grid.fit(Xtrain.T, Y.flatten())
-        return grid.predict(Xtrain.T).reshape(-1,1),grid.predict(Xtest.T).reshape(-1,1)
-    elif method == 'SVM':
+        return (
+            grid.predict(Xtrain.T).reshape(-1, 1),
+            grid.predict(Xtest.T).reshape(-1, 1),
+        )
+
+    # Kernel-based model: Support Vector Regression
+    if method == "SVM":
         param_grid = {
-            'C': [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2],
-            'gamma': ['scale', 0.01, 0.1]
+            "C": [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2],
+            "gamma": ["scale", 0.01, 0.1],
         }
         grid = GridSearchCV(SVR(), param_grid, cv=5, n_jobs=-1)
         grid.fit(Xtrain.T, Y.flatten())
-        return grid.predict(Xtrain.T).reshape(-1,1),grid.predict(Xtest.T).reshape(-1,1)
-    elif method == 'AdaBoost':
+        return (
+            grid.predict(Xtrain.T).reshape(-1, 1),
+            grid.predict(Xtest.T).reshape(-1, 1),
+        )
+
+    # Boosting model: AdaBoost
+    if method == "AdaBoost":
         param_grid = {
-            'n_estimators': range(50,500,50),
-            'learning_rate': [0.01, 0.1, 0.5, 1]
+            "n_estimators": range(50, 500, 50),
+            "learning_rate": [0.01, 0.1, 0.5, 1.0],
         }
         grid = GridSearchCV(AdaBoostRegressor(), param_grid, cv=5, n_jobs=-1)
         grid.fit(Xtrain.T, Y.flatten())
-        return grid.predict(Xtrain.T).reshape(-1,1),grid.predict(Xtest.T).reshape(-1,1)
+        return (
+            grid.predict(Xtrain.T).reshape(-1, 1),
+            grid.predict(Xtest.T).reshape(-1, 1),
+        )
 
-def main(log:bool=True):
+    raise ValueError(f"Unsupported GS method: {method}")
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def main(log: bool = True) -> None:
     t_start = time.time()
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
+
+    # ------------------------------------------------------------------
     # Required arguments
-    required_group = parser.add_argument_group('Required Arguments')
+    # ------------------------------------------------------------------
+    required_group = parser.add_argument_group("Required Arguments")
+
     geno_group = required_group.add_mutually_exclusive_group(required=True)
-    ## Genotype file
-    geno_group.add_argument('-vcf','--vcf', type=str, 
-                           help='Input genotype file in VCF format (.vcf or .vcf.gz)')
-    geno_group.add_argument('-bfile','--bfile', type=str, 
-                           help='Input genotype files in PLINK binary format (prefix for .bed, .bim, .fam)')
-    geno_group.add_argument('-npy','--npy', type=str, 
-                           help='Input genotype files in PLINK binary format (prefix for .npz, .snp, .idv)')
-    ## Phenotype file
-    required_group.add_argument('-p','--pheno', type=str, required=True,
-                               help='Phenotype file (tab-delimited with sample IDs in first column)')
+    geno_group.add_argument(
+        "-vcf", "--vcf",
+        type=str,
+        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+    )
+    geno_group.add_argument(
+        "-bfile", "--bfile",
+        type=str,
+        help="Input genotype files in PLINK binary format "
+             "(prefix for .bed, .bim, .fam)",
+    )
+    geno_group.add_argument(
+        "-npy", "--npy",
+        type=str,
+        help="Input genotype matrix in NPY bundle format "
+             "(prefix for .npz, .snp, .idv)",
+    )
+
+    required_group.add_argument(
+        "-p", "--pheno",
+        type=str,
+        required=True,
+        help="Phenotype file (tab-delimited, sample IDs in the first column)",
+    )
+
+    # ------------------------------------------------------------------
     # Model arguments
-    model_group = parser.add_argument_group('Model Arguments')
-    model_group.add_argument('-GBLUP','--GBLUP', action='store_true', default=False,
-                               help='Method of GBLUP to train and predict '
-                                   '(default: %(default)s)')
-    model_group.add_argument('-rrBLUP','--rrBLUP', action='store_true', default=False,
-                               help='Method of rrBLUP to train and predict '
-                                   '(default: %(default)s)')
-    model_group.add_argument('-SVM','--SVM', action='store_true', default=False,
-                               help='Method of support vector machine to train and predict '
-                                   '(default: %(default)s)')
-    model_group.add_argument('-RF','--RF', action='store_true', default=False,
-                               help='Method of random forest to train and predict '
-                                   '(default: %(default)s)')
-    model_group.add_argument('-ADB','--AdaBoost', action='store_true', default=False,
-                               help='Method of AdaBoost to train and predict '
-                                   '(default: %(default)s)')
+    # ------------------------------------------------------------------
+    model_group = parser.add_argument_group("Model Arguments")
+    model_group.add_argument(
+        "-GBLUP", "--GBLUP",
+        action="store_true",
+        default=False,
+        help="Use GBLUP model for training and prediction "
+             "(default: %(default)s)",
+    )
+    model_group.add_argument(
+        "-rrBLUP", "--rrBLUP",
+        action="store_true",
+        default=False,
+        help="Use rrBLUP model for training and prediction "
+             "(default: %(default)s)",
+    )
+    model_group.add_argument(
+        "-SVM", "--SVM",
+        action="store_true",
+        default=False,
+        help="Use Support Vector Regression for training and prediction "
+             "(default: %(default)s)",
+    )
+    model_group.add_argument(
+        "-RF", "--RF",
+        action="store_true",
+        default=False,
+        help="Use Random Forest for training and prediction "
+             "(default: %(default)s)",
+    )
+    model_group.add_argument(
+        "-ADB", "--AdaBoost",
+        action="store_true",
+        default=False,
+        help="Use AdaBoost regressor for training and prediction "
+             "(default: %(default)s)",
+    )
+
+    # ------------------------------------------------------------------
     # Optional arguments
-    optional_group = parser.add_argument_group('Optional Arguments')
-    optional_group.add_argument('-pcd','--pcd', action='store_true', default=False,
-                               help='Decomposition of data by PCA '
-                                   '(default: %(default)s)')
-    ## Point out phenotype or snp
-    optional_group.add_argument('-n','--ncol', type=int, default=None,
-                               help='Only analysis n columns in phenotype ranged from 0-n '
-                                   '(default: %(default)s)')
-    ## Other optional arguments
-    optional_group.add_argument('-plot','--plot', action='store_true', default=False,
-                               help='Visualization of 5-fold cross-validation and different model tree '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-o', '--out', type=str, default=None,
-                               help='Output directory for results'
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-prefix','--prefix',type=str,default=None,
-                               help='prefix of output file'
-                                   '(default: %(default)s)')
+    # ------------------------------------------------------------------
+    optional_group = parser.add_argument_group("Optional Arguments")
+    optional_group.add_argument(
+        "-pcd", "--pcd",
+        action="store_true",
+        default=False,
+        help="Enable PCA-based dimensionality reduction on genotypes "
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-n", "--ncol",
+        type=int,
+        default=None,
+        help="Zero-based phenotype column index to analyze. "
+             "If not set, all phenotype columns will be processed "
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-plot", "--plot",
+        action="store_true",
+        default=False,
+        help="Enable visualization of 5-fold CV and model performance "
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-o", "--out",
+        type=str,
+        default=None,
+        help="Output directory for results "
+             "(default: same directory as genotype file)",
+    )
+    optional_group.add_argument(
+        "-prefix", "--prefix",
+        type=str,
+        default=None,
+        help="Prefix of output files "
+             "(default: genotype basename)",
+    )
+
     args = parser.parse_args()
-    # Determine genotype file
+
+    # ------------------------------------------------------------------
+    # Determine genotype file and output prefix
+    # ------------------------------------------------------------------
     if args.vcf:
         gfile = args.vcf
-        args.prefix = os.path.basename(gfile).replace('.gz','').replace('.vcf','') if args.prefix is None else args.prefix
+        args.prefix = (
+            os.path.basename(gfile)
+            .replace(".gz", "")
+            .replace(".vcf", "")
+            if args.prefix is None else args.prefix
+        )
     elif args.bfile:
         gfile = args.bfile
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
     elif args.npy:
         gfile = args.npy
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    gfile = gfile.replace('\\','/') # adjust \ in Windows
+    else:
+        raise ValueError("No genotype input detected. Use -vcf, -bfile or -npy.")
+
+    gfile = gfile.replace("\\", "/")  # Normalize Windows-style paths
     args.out = os.path.dirname(gfile) if args.out is None else args.out
-    # create log file
-    os.makedirs(args.out,0o755,exist_ok=True)
-    logger = setup_logging(f'''{args.out}/{args.prefix}.gs.log'''.replace('\\','/').replace('//','/'))
-    logger.info('Genomic Selection Module')
-    logger.info(f'Host: {socket.gethostname()}\n')
-    num = 0
+
+    # ------------------------------------------------------------------
+    # Logger
+    # ------------------------------------------------------------------
+    os.makedirs(args.out, 0o755, exist_ok=True)
+    log_path = f"{args.out}/{args.prefix}.gs.log".replace("\\", "/").replace("//", "/")
+    logger = setup_logging(log_path)
+
+    logger.info("Genomic Selection Module")
+    logger.info(f"Host: {socket.gethostname()}\n")
+
+    # Configuration summary
     if log:
-        logger.info("*"*60)
+        logger.info("*" * 60)
         logger.info("GENOMIC SELECTION CONFIGURATION")
-        logger.info("*"*60)
+        logger.info("*" * 60)
         logger.info(f"Genotype file:   {gfile}")
         logger.info(f"Phenotype file:  {args.pheno}")
-        logger.info(f"Analysis Pcol:   {args.ncol}") if args.ncol is not None else logger.info(f"Analysis Pcol:   All")
+        if args.ncol is not None:
+            logger.info(f"Analysis Pcol:   {args.ncol}")
+        else:
+            logger.info("Analysis Pcol:   All")
+
+        model_count = 0
         if args.GBLUP:
-            num += 1
-            logger.info(f"Used model{num}:     GBLUP")
+            model_count += 1
+            logger.info(f"Used model{model_count}:     GBLUP")
         if args.rrBLUP:
-            num += 1
-            logger.info(f"Used model{num}:     rrBLUP")
+            model_count += 1
+            logger.info(f"Used model{model_count}:     rrBLUP")
         if args.SVM:
-            num += 1
-            logger.info(f"Used model{num}:     Support vecter machine")
+            model_count += 1
+            logger.info(f"Used model{model_count}:     Support Vector Machine")
         if args.RF:
-            num += 1
-            logger.info(f"Used model{num}:     Random Forest")
+            model_count += 1
+            logger.info(f"Used model{model_count}:     Random Forest")
         if args.AdaBoost:
-            num += 1
-            logger.info(f"Used model{num}:     AdaBoost")
-        logger.info(f"Decomposition:   {args.pcd}")
+            model_count += 1
+            logger.info(f"Used model{model_count}:     AdaBoost")
+
+        logger.info(f"Use PCA:         {args.pcd}")
         if args.plot:
             logger.info(f"Plot mode:       {args.plot}")
         logger.info(f"Output prefix:   {args.out}/{args.prefix}")
-        logger.info("*"*60 + "\n")
-        
+        logger.info("*" * 60 + "\n")
+
+    # ------------------------------------------------------------------
+    # Load phenotype
+    # ------------------------------------------------------------------
     t_loading = time.time()
-    logger.info(f'Loading phenotype from {args.pheno}...')
-    pheno = pd.read_csv(rf'{args.pheno}',sep='\t') # Col 1 - idv ID; row 1 - pheno tag
-    pheno = pheno.groupby(pheno.columns[0]).mean() # Mean of duplicated samples
+    logger.info(f"Loading phenotype from {args.pheno}...")
+    pheno = pd.read_csv(args.pheno, sep="\t")
+    # First column is sample ID; average duplicated IDs
+    pheno = pheno.groupby(pheno.columns[0]).mean()
     pheno.index = pheno.index.astype(str)
-    assert pheno.shape[1]>0, f'No phenotype data found, please check the phenotype file format!\n{pheno.head()}'
-    if args.ncol is not None: 
-        assert args.ncol <= pheno.shape[1], "IndexError: Phenotype column index out of range."
-        pheno = pheno.iloc[:,[args.ncol]]
-    methods = []
+
+    assert pheno.shape[1] > 0, (
+        "No phenotype data found. Please check the phenotype file format.\n"
+        f"{pheno.head()}"
+    )
+
+    if args.ncol is not None:
+        assert 0 <= args.ncol < pheno.shape[1], (
+            "IndexError: phenotype column index out of range."
+        )
+        pheno = pheno.iloc[:, [args.ncol]]
+
+    # ------------------------------------------------------------------
+    # Collect methods to run
+    # ------------------------------------------------------------------
+    methods: list[str] = []
     if args.GBLUP:
-        methods.append('GBLUP')
+        methods.append("GBLUP")
     if args.rrBLUP:
-        methods.append('rrBLUP')
+        methods.append("rrBLUP")
     if args.SVM:
-        methods.append('SVM')
+        methods.append("SVM")
     if args.RF:
-        methods.append('RF')
+        methods.append("RF")
     if args.AdaBoost:
-        methods.append('AdaBoost')
-    assert len(methods) > 0, 'No method exists'
+        methods.append("AdaBoost")
+    assert len(methods) > 0, "No model selected. Use --GBLUP/--rrBLUP/--SVM/--RF/--AdaBoost."
+
+    # ------------------------------------------------------------------
+    # Load genotype
+    # ------------------------------------------------------------------
     if args.vcf:
-        logger.info(f'Loading genotype from {gfile}...')
-        geno = vcfreader(rf'{gfile}') # VCF format
+        logger.info(f"Loading genotype from {gfile}...")
+        geno_df = vcfreader(gfile)
     elif args.bfile:
-        logger.info(f'Loading genotype from {gfile}.bed...')
-        geno = breader(rf'{gfile}') # PLINK format
+        logger.info(f"Loading genotype from {gfile}.bed...")
+        geno_df = breader(gfile)
     elif args.npy:
-        logger.info(f'Loading genotype from {gfile}.npz...')
-        geno = npyreader(rf'{gfile}') # numpy format
-    logger.info(f'Completed, cost: {round(time.time()-t_loading,3)} secs')
-    m,n = geno.shape
-    n = n - 2
-    logger.info(f'Loaded SNP: {m}, individual: {n}')
-    samples = geno.columns[2:]
-    geno = geno.iloc[:,2:].values
+        logger.info(f"Loading genotype from {gfile}.npz...")
+        geno_df = npyreader(gfile)
+    else:
+        raise ValueError("Genotype input not recognized.")
+
+    logger.info(f"Completed, cost: {round(time.time() - t_loading, 3)} secs")
+
+    m, n = geno_df.shape
+    n = n - 2  # First 2 columns usually CHR and POS
+    logger.info(f"Loaded SNP: {m}, individuals: {n}")
+
+    samples = geno_df.columns[2:].astype(str)
+    geno = geno_df.iloc[:, 2:].values
+
+    # ------------------------------------------------------------------
+    # SNP filtering and imputation
+    # ------------------------------------------------------------------
     t_control = time.time()
-    logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode.')
-    logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
-    qkmodel = QK(geno,maff=0.01)
+    logger.info("* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode.")
+    logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
+    qkmodel = QK(geno, maff=0.01)
     geno = qkmodel.M
-    logger.info(f'Filter finished, costed {(time.time()-t_control):.2f} secs')
-    # Genomic Selection
-    for i in pheno.columns:
-        t = time.time()
-        logger.info('*'*60)
-        logger.info(f'* GS process for {i}')
-        p = pheno[i]
+    logger.info(f"Filter finished, cost: {(time.time() - t_control):.2f} secs")
+
+    # ------------------------------------------------------------------
+    # Genomic Selection for each phenotype
+    # ------------------------------------------------------------------
+    for trait_name in pheno.columns:
+        logger.info("*" * 60)
+        logger.info(f"* Genomic Selection for trait: {trait_name}")
+        t_trait = time.time()
+
+        p = pheno[trait_name]
         namark = p.isna()
-        trainmark = np.isin(samples,p.index[~namark])
-        testmark = ~trainmark
-        # Estimation of train population modeling
-        TrainSNP = geno[:,trainmark]
-        TrainP = p.loc[samples[trainmark]].values.reshape(-1,1)
-        if TrainP.size > 0:
-            kfoldset = kfold(TrainSNP.shape[1],k=5,seed=None)
-            outpred = []
-            for ind,method in enumerate(methods):
-                logger.info(f'Method{ind+1}: {method}')
-                if method not in ['GBLUP', 'rrBLUP']:
-                    print(f'Training the {method} model may take a long time...')
-                test4train,train4train = [],[]
-                r2_train,r2_test = [],[]
-                num = 0
-                for test,train in kfoldset:
-                    t_fold = time.time()
-                    Pred_train,Pred_test = GSapi(TrainP[train],TrainSNP[:,train],TrainSNP[:,test],method=method,PCAdec=args.pcd)
-                    ttest = np.concatenate([TrainP[test],Pred_test],axis=1)
-                    ttrain = np.concatenate([TrainP[train],Pred_train],axis=1)
-                    test4train.append(ttest);train4train.append(ttrain)
-                    r2 = 1-np.sum((ttest[:,0]-ttest[:,1])**2)/np.sum((ttest[:,0]-ttest[:,0].mean())**2)
-                    r2_test.append(r2)
-                    num+=1
-                    logger.info(f'Fold{num}: {pearsonr(test4train[num-1][:,0],test4train[num-1][:,1]).statistic:.2f}(pearson), {spearmanr(test4train[num-1][:,0],test4train[num-1][:,1]).statistic:.2f}(spearman), {r2:.2f}(R2). Time costed: {(time.time()-t_fold):.2f} secs')
-                showidx = np.argmax(r2_test)
-                test4train = test4train[showidx]
-                train4train = train4train[showidx]
-                if args.plot:
-                    fig = plt.figure(figsize=(5,4),dpi=300)
-                    gsplot.scatterh(test4train,train4train,color_set=color_set[0],fig=fig)
-                    plt.savefig(f'{args.out}/{args.prefix}.{i}.gs.{method}.pdf',transparent=True)
-                # Prediction for test population
-                TestSNP = geno[:,testmark]
-                _TrainP,TestP = GSapi(TrainP,TrainSNP,TestSNP,method=method,PCAdec=args.pcd)
-                outpred.append(TestP)
-            outpred = pd.DataFrame(np.concatenate(outpred,axis=1),columns=methods,index=samples[testmark])
-            outpred.to_csv(f'{args.out}/{args.prefix}.{i}.gs.tsv',sep='\t',float_format='%.4f')
-            logger.info(f'Saved in {args.out}/{args.prefix}.{i}.gs.tsv'.replace('//','/'))
+        trainmask = np.isin(samples, p.index[~namark])
+        testmask = ~trainmask
+
+        train_snp = geno[:, trainmask]
+        train_pheno = p.loc[samples[trainmask]].values.reshape(-1, 1)
+
+        if train_pheno.size == 0:
+            logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
+            continue
+
+        # 5-fold cross-validation on training population
+        kfoldset = kfold(train_snp.shape[1], k=5, seed=None)
+        outpred_list = []
+
+        for idx_method, method in enumerate(methods, start=1):
+            logger.info(f"Method{idx_method}: {method}")
+            if method not in ["GBLUP", "rrBLUP"]:
+                logger.info(
+                    f"Training the {method} model may take a long time on large data sets."
+                )
+
+            fold_test_pairs = []
+            fold_train_pairs = []
+            r2_test = []
+            fold_id = 0
+
+            for test_idx, train_idx in kfoldset:
+                fold_id += 1
+                t_fold = time.time()
+
+                yhat_train, yhat_test = GSapi(
+                    train_pheno[train_idx],
+                    train_snp[:, train_idx],
+                    train_snp[:, test_idx],
+                    method=method,
+                    PCAdec=args.pcd,
+                )
+
+                ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
+                ttrain = np.concatenate([train_pheno[train_idx], yhat_train], axis=1)
+
+                fold_test_pairs.append(ttest)
+                fold_train_pairs.append(ttrain)
+
+                ss_res = np.sum((ttest[:, 0] - ttest[:, 1]) ** 2)
+                ss_tot = np.sum((ttest[:, 0] - ttest[:, 0].mean()) ** 2)
+                r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                r2_test.append(r2)
+
+                pear = pearsonr(ttest[:, 0], ttest[:, 1]).statistic
+                spear = spearmanr(ttest[:, 0], ttest[:, 1]).statistic
+                logger.info(
+                    f"Fold{fold_id}: "
+                    f"{pear:.2f} (Pearson), {spear:.2f} (Spearman), "
+                    f"{r2:.2f} (R²). "
+                    f"Time cost: {(time.time() - t_fold):.2f} secs"
+                )
+
+            # Use the fold with highest R² for plotting
+            best_idx = int(np.argmax(r2_test))
+            best_test = fold_test_pairs[best_idx]
+            best_train = fold_train_pairs[best_idx]
+
+            if args.plot:
+                fig = plt.figure(figsize=(5, 4), dpi=300)
+                gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
+                out_pdf = f"{args.out}/{args.prefix}.{trait_name}.gs.{method}.pdf"
+                plt.savefig(out_pdf, transparent=True)
+                plt.close(fig)
+
+            # ------------------------------------------------------------------
+            # Final prediction on test population
+            # ------------------------------------------------------------------
+            test_snp = geno[:, testmask]
+            _, test_pred = GSapi(
+                train_pheno,
+                train_snp,
+                test_snp,
+                method=method,
+                PCAdec=args.pcd,
+            )
+            outpred_list.append(test_pred)
+
+        # Stack predictions from all models: shape (n_test, n_methods)
+        outpred = pd.DataFrame(
+            np.concatenate(outpred_list, axis=1),
+            columns=methods,
+            index=samples[testmask],
+        )
+        out_tsv = f"{args.out}/{args.prefix}.{trait_name}.gs.tsv"
+        outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
+        logger.info(f"Saved predictions to {out_tsv}".replace("//", "/"))
+        logger.info(f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
+
+    # ----------------------------------------------------------------------
+    # Final summary
+    # ----------------------------------------------------------------------
     lt = time.localtime()
-    endinfo = f'\nFinished, total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
+    endinfo = (
+        f"\nFinished, total time: {round(time.time() - t_start, 2)} secs\n"
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    )
     logger.info(endinfo)
+
 
 if __name__ == "__main__":
     main()

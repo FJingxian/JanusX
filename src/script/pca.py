@@ -279,20 +279,20 @@ def main(log: bool = True):
         logger.info("PCA CONFIGURATION")
         logger.info("*" * 60)
         if args.vcf or args.bfile:
-            logger.info(f"Genotype file:   {gfile}")
-            logger.info(f"Output PCs:      top {args.dim}")
+            logger.info(f"Genotype file:    {gfile}")
+            logger.info(f"Output PCs:       top {args.dim}")
         elif args.grm:
-            logger.info(f"GRM prefix:      {gfile}")
-            logger.info(f"Output PCs:      top {args.dim}")
+            logger.info(f"GRM prefix:       {gfile}")
+            logger.info(f"Output PCs:       top {args.dim}")
         elif args.pcfile:
-            logger.info(f"PCA prefix:      {gfile} (visualization only)")
+            logger.info(f"PCA prefix:       {gfile} (visualization only)")
         if args.plot or args.plot3D:
             logger.info(f"2D visualization: {args.plot}")
             logger.info(f"3D visualization: {args.plot3D}")
         if args.group:
             logger.info(f"Group file:      {args.group}")
             logger.info(f"Color palette:   index {palette_idx}")
-        logger.info(f"Output prefix:   {args.out}/{args.prefix}")
+        logger.info(f"Output prefix:    {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
 
     # ------------------------- PCA core logic -------------------------

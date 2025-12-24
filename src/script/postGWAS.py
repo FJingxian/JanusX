@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX – Post-GWAS Visualization and Annotation
+JanusX - Post-GWAS Visualization and Annotation
 
 Examples
 --------
@@ -357,7 +357,7 @@ def main():
     # ------------------------------------------------------------------
     # Configuration summary
     # ------------------------------------------------------------------
-    logger.info("JanusX – Post-GWAS visualization and annotation")
+    logger.info("JanusX - Post-GWAS visualization and annotation")
     logger.info(f"Host: {socket.gethostname()}\n")
 
     logger.info("*" * 60)

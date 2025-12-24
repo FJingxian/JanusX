@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX – High Performance GWAS Command-Line Interface
+JanusX - High Performance GWAS Command-Line Interface
 
 Design summary
 --------------
@@ -357,6 +357,11 @@ def run_chunked_gwas_lmm_lm(
 ) -> None:
     """
     Run LMM or LM GWAS using a streaming, low-memory pipeline.
+
+    For each trait, this will also report:
+      - wall time
+      - average CPU usage (normalized by number of logical cores)
+      - approximate peak RSS memory usage
     """
     # Load phenotype
     pheno = load_phenotype(phenofile, pheno_cols, logger)
@@ -392,10 +397,17 @@ def run_chunked_gwas_lmm_lm(
     ModelCls = model_map[model_name]
 
     process = psutil.Process()
+    n_cores = psutil.cpu_count(logical=True) or cpu_count()
 
     for pname in pheno.columns:
         logger.info("*" * 60)
         logger.info(f"Streaming {model_name.upper()} GWAS for trait: {pname}")
+
+        # --- trait-level resource baseline ---
+        cpu_t0 = process.cpu_times()
+        rss0 = process.memory_info().rss
+        t0 = time.time()
+        peak_rss = rss0
 
         pheno_sub = pheno[pname].dropna()
         sameidx = np.isin(ids, pheno_sub.index)
@@ -430,6 +442,9 @@ def run_chunked_gwas_lmm_lm(
         maf_list = []
         done_snps = 0
 
+        # prime cpu_percent (first call usually returns 0.0)
+        process.cpu_percent(interval=None)
+
         pbar = tqdm(total=n_snps, desc=f"{model_name}-{pname}", ascii=True)
 
         for genosub, sites in load_genotype_chunks(
@@ -451,16 +466,44 @@ def run_chunked_gwas_lmm_lm(
             done_snps += m_chunk
             pbar.update(m_chunk)
 
+            # sample memory & CPU for this trait
+            mem_info = process.memory_info()
+            peak_rss = max(peak_rss, mem_info.rss)
+            # only show memory in tqdm to avoid clutter
             if done_snps % (10 * chunk_size) == 0:
-                mem = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f"{mem:.2f} GB")
+                mem_gb = mem_info.rss / 1024**3
+                pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
 
         # force bar to 100%
         pbar.n = pbar.total
         pbar.refresh()
         pbar.close()
+        logger.info(f"Effective SNP: {done_snps}")
+
+        # --- trait-level resource summary ---
+        cpu_t1 = process.cpu_times()
+        rss1 = process.memory_info().rss
+        t1 = time.time()
+
+        wall = t1 - t0
+        user_cpu = cpu_t1.user - cpu_t0.user
+        sys_cpu = cpu_t1.system - cpu_t0.system
+        total_cpu = user_cpu + sys_cpu
+
+        if wall > 0:
+            avg_cpu_pct = 100.0 * total_cpu / wall / (n_cores or 1)
+        else:
+            avg_cpu_pct = 0.0
+
+        avg_rss_gb = (rss0 + rss1) / 2 / 1024**3
+        peak_rss_gb = peak_rss / 1024**3
+
         logger.info(
-            f"Effective SNP: {done_snps}"
+            f"Resource usage for {model_name.upper()} / {pname}: "
+            f"wall={wall:.2f} s, "
+            f"avg CPU={avg_cpu_pct:.1f}% of {n_cores} cores, "
+            f"avg RSS={avg_rss_gb:.2f} GB, "
+            f"peak RSS≈{peak_rss_gb:.2f} GB"
         )
 
         if not results_chunks:
@@ -759,6 +802,11 @@ def parse_args():
              "(default: %(default)s)",
     )
     optional_group.add_argument(
+        "-chunksize", "--chunksize", type=int, default=100_000,
+        help="Number of SNPs per chunk for streaming LMM/LM "
+             "(affects GRM and GWAS; default: %(default)s)",
+    )
+    optional_group.add_argument(
         "-t", "--thread", type=int, default=-1,
         help="Number of CPU threads (-1 uses all available cores, "
              "default: %(default)s)",
@@ -815,6 +863,7 @@ def main(log: bool = True):
         logger.info(f"Q option:         {args.qcov}")
         if args.cov:
             logger.info(f"Covariate file:   {args.cov}")
+        logger.info(f"Chunk size:       {args.chunksize}")
         logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
         logger.info(f"Output prefix:    {outprefix}")
         logger.info("*" * 60 + "\n")
@@ -842,7 +891,7 @@ def main(log: bool = True):
                 outprefix=outprefix,
                 maf_threshold=0.01,
                 max_missing_rate=0.05,
-                chunk_size=100_000,
+                chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
                 cov_path=args.cov,
@@ -860,7 +909,7 @@ def main(log: bool = True):
                 outprefix=outprefix,
                 maf_threshold=0.01,
                 max_missing_rate=0.05,
-                chunk_size=100_000,
+                chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
                 cov_path=args.cov,

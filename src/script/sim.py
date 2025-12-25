@@ -42,7 +42,9 @@ def main():
             print(f'Generating with {nsnp:.1e} SNPs and {nidv} individuals...')
             save_genotype_streaming(outprefix,samples.tolist(),chunks,total_snps=nsnp)
             y = np.concatenate([samples.reshape(-1,1),samples.reshape(-1,1),y],axis=1,dtype=object)
+            ynew = np.concatenate([[['tag','test']],y[:,[1,2]]],dtype=object)
             np.savetxt(f'{outprefix}.pheno',y,delimiter='\t',fmt=['%s', '%s', '%.3f'])
+            np.savetxt(f'{outprefix}.pheno.txt',ynew,delimiter='\t',fmt=['%s', '%s'])
         else:
             print('Usage: jx sim [nsnp(k)] [nidv] [outprefix]')
     else:

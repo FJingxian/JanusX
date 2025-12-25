@@ -1,470 +1,968 @@
 # -*- coding: utf-8 -*-
-'''
-Examples:
-  # Basic usage with VCF file
-  -vcf genotypes.vcf -p phenotypes.txt -o results
-  
-  # Using PLINK binary files with custom parameters
-  -bfile genotypes -p phenotypes.txt -o results -k 1 -q 3 --thread 8
-  
-  # Using external kinship matrix and enabling fast mode
-  -vcf genotypes.vcf -p phenotypes.txt -o results -k kinship_matrix.txt -qc 10 -fast
-  
-  # Maximum performance with one thread
-  --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --cov covfile.txt --thread 1
+"""
+JanusX - High Performance GWAS Command-Line Interface
 
-File Formats:
-  VCF/BFILE:    Standard VCF or PLINK binary format (bed/bim/fam)
-  PHENO:        Tab-delimited file with sample IDs in first column and phenotypes in subsequent columns
-  GRM File:     Space/tab-delimited kinship matrix file
-  QCOV File:    Space/tab-delimited covariate matrix file
-  COV File:    Space/tab-delimited covariate matrix file
-        
-Citation:
+Design summary
+--------------
+Models:
+  - LMM  : always uses a low-memory, chunk-based implementation (slim.LMM)
+  - LM   : always uses a low-memory, chunk-based implementation (slim.LM)
+  - FarmCPU : uses a high-memory implementation (pyBLUP.farmcpu) that loads
+              the full genotype matrix into memory
+
+Execution mode (automatic)
+--------------------------
+  - There is no explicit "low-memory" flag.
+  - LMM/LM always work in streaming mode using rust2py.gfreader.load_genotype_chunks.
+  - FarmCPU always uses a full in-memory genotype matrix.
+
+Caching:
+  - GRM (kinship) and PCA (Q matrix) are cached on disk using a shared naming
+    scheme for streaming LMM/LM runs:
+      * GRM: {prefix}.k.{method}.txt
+      * Q   : {prefix}.q.{pcdim}.txt
+
+Covariates:
+  - The --cov option is shared by LMM, LM and FarmCPU.
+  - For LMM/LM, the covariate file is assumed to be aligned with the genotype
+    sample order (inspect_genotype_file IDs).
+  - For FarmCPU, the covariate file is aligned with the genotype sample order
+    (famid from the genotype matrix).
+
+Citation
+--------
   https://github.com/MaizeMan-JxFU/JanusX/
-'''
+"""
+
 import os
-for key in ['MPLBACKEND']:
-    if key in os.environ:
-        del os.environ[key]
-import matplotlib as mpl
-mpl.use('Agg')
-mpl.rcParams['pdf.fonttype'] = 42
-mpl.rcParams['ps.fonttype'] = 42
-import matplotlib.pyplot as plt
-from bioplotkit import GWASPLOT
-from pyBLUP import GWAS,LM,farmcpu
-from pyBLUP import QK
-from gfreader import breader,vcfreader,npyreader
-from joblib import cpu_count
-import pandas as pd
-import numpy as np
-import argparse
 import time
 import socket
-from ._common.log import setup_logging
-from rust2py.gfreader import load_genotype_chunks,inspect_genotype_file
-from pyBLUP import slim
-import psutil
+import argparse
+
+# ---- Matplotlib backend configuration (non-interactive, server-safe) ----
+for key in ["MPLBACKEND"]:
+    if key in os.environ:
+        del os.environ[key]
+
+import matplotlib as mpl
+
+mpl.use("Agg")
+mpl.rcParams["pdf.fonttype"] = 42
+mpl.rcParams["ps.fonttype"] = 42
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from joblib import cpu_count
 from tqdm import tqdm
-  
-def fastplot(gwasresult:pd.DataFrame,phenosub:pd.DataFrame,xlabel:str='',outpdf:str='fastplot.pdf'):
-    '''Fast plot for GWASresult data'''
+import psutil
+
+from bioplotkit import GWASPLOT
+from pyBLUP import QK
+from assoc_rs import LMM,LM,farmcpu
+from gfreader import breader, vcfreader
+from gfreader_rs import load_genotype_chunks, inspect_genotype_file
+from ._common.log import setup_logging
+
+
+# ======================================================================
+# Basic utilities
+# ======================================================================
+
+def _section(logger, title: str) -> None:
+    """Pretty section separator in log (with a blank line before each section)."""
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(title)
+    logger.info("=" * 60)
+
+
+def fastplot(
+    gwasresult: pd.DataFrame,
+    phenosub: np.ndarray,
+    xlabel: str = "",
+    outpdf: str = "fastplot.pdf",
+) -> None:
+    """
+    Quick diagnostic plot of GWAS results: phenotype histogram, Manhattan, QQ.
+    """
     results = gwasresult.astype({"POS": "int64"})
-    fig = plt.figure(figsize=(16,4),dpi=300)
-    layout = [['A','B','B','C']]
-    axes:dict = fig.subplot_mosaic(mosaic=layout)
+    fig = plt.figure(figsize=(16, 4), dpi=300)
+    layout = [["A", "B", "B", "C"]]
+    axes = fig.subplot_mosaic(mosaic=layout)
+
     gwasplot = GWASPLOT(results)
-    axes['A'].hist(phenosub,bins=15)
-    axes['A'].set_xlabel(xlabel)
-    axes['A'].set_ylabel('count')
-    gwasplot.manhattan(-np.log10(1/results.shape[0]),ax=axes['B'])
-    gwasplot.qq(ax=axes['C'])
+
+    # A: phenotype distribution
+    axes["A"].hist(phenosub, bins=15)
+    axes["A"].set_xlabel(xlabel)
+    axes["A"].set_ylabel("Count")
+
+    # B: Manhattan plot
+    gwasplot.manhattan(-np.log10(1 / results.shape[0]), ax=axes["B"])
+
+    # C: QQ plot
+    gwasplot.qq(ax=axes["C"])
+
     plt.tight_layout()
-    plt.savefig(f"{outpdf}",transparent=True)
+    plt.savefig(outpdf, transparent=True)
 
-def lowm_GWAS(genofile:os.PathLike, pheno_file:os.PathLike, pheno_col:int,outprefix:str,
-              maf_threshold:float=0.01,max_missing_rate:float=0.05, chunk_size:int=100_000,plot: bool=False,
-              mgrm:str='1',pcdim:str='10',model:str='lmm',threads:int=4):
-    pheno = pd.read_csv(rf'{pheno_file}',sep='\t') # Col 1 - idv ID; row 1 - pheno tag
-    pheno = pheno.groupby(pheno.columns[0]).mean() # Mean of duplicated samples
-    pheno.index = pheno.index.astype(str)
-    assert pheno.shape[1]>0, f'No phenotype data found, please check the phenotype file format!\n{pheno.head()}'
-    if pheno_col is not None: 
-        assert np.min(pheno_col) <= pheno.shape[1], "Phenotype column index out of range."
-        pheno_col = [i for i in pheno_col if i in range(pheno.shape[1])]
-        pheno = pheno.iloc[:,pheno_col]
-    modeldict = {'lmm':slim.LMM,'lm':slim.LM}
-    gwasmodel = modeldict[model]
-    process = psutil.Process()
-    method = str(mgrm)  # 1: VanRaden; 2: Yang et al.
-    dim = str(pcdim)
-    ids, m = inspect_genotype_file(genofile)
-    ids = np.array(ids).astype(str)
-    n = len(ids)
-    # Process of Calculating Kinship & PCA
-    grm = np.zeros((n,n),dtype='float32')
-    if mgrm in ['1','2']:
-        method = int(mgrm)
-        pbar = tqdm(total=m, desc="grm&pca",ascii=True)
-        varsum = 0
-        num = 0
-        for genosub,sites in load_genotype_chunks(genofile,chunk_size,maf_threshold,max_missing_rate):
-            genosub:np.ndarray = genosub
-            maf = genosub.mean(axis=1,dtype='float32',keepdims=True)/2
-            genosub = genosub - 2*maf
-            if method == 1:
-                grm += genosub.T @ genosub
-                varsum += np.sum(2*maf*(1-maf))
-            elif method == 2:
-                grm += 1/(2*maf*(1-maf)) * genosub.T @ genosub
-            num += genosub.shape[0]
-            pbar.update(genosub.shape[0])
-            if num % 10*chunk_size == 0:
-                memory_usage = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
-        if method == 1:
-            grm = (grm + grm.T) / varsum / 2
-        elif method == 2:
-            grm = (grm + grm.T) / num / 2
-        m = num # refresh nsnp
-        pbar.close()
-    elif os.path.isfile(mgrm):
-        grm:np.ndarray = np.genfromtxt(mgrm,dtype='float32')
-        assert grm.size == n*n, f'GRM file size not match: expected {n*n}, got {grm.size}'
-    else:
-        raise ValueError(f'Unknown GRM option: {mgrm}')
-    if pcdim in np.arange(1,n).astype(str):
-        dim = int(pcdim)
-        eigval,eigvec = np.linalg.eigh(grm)
-        idx = np.argsort(eigval)[::-1]
-        eigval = eigval[idx]
-        eigvec = eigvec[:, idx]
-        eigval = eigval[:dim]
-        eigvec = eigvec[:, :dim]
-    elif pcdim == '0':
-        eigvec = np.array([],dtype='float32').reshape(n,0)
-    elif os.path.isfile(pcdim):
-        eigvec:np.ndarray = np.genfromtxt(pcdim,dtype='float32')
-        assert eigvec.shape[0] == n, f'PCA file size not match: expected {n}, got {eigvec.shape[0]}'
-    else:
-        raise ValueError(f'Unknown PCA option: {pcdim}')
-    for p in pheno.columns:
-        pheno_sub:pd.DataFrame = pheno[p].dropna()
-        sameidx = np.isin(ids,pheno_sub.index)
-        pheno_sub = pheno_sub.loc[ids[sameidx]].values
-        results = []
-        maf = []
-        c_p_ref_alt = []
-        mod = gwasmodel(y=pheno_sub,X=eigvec[sameidx],kinship=grm[sameidx,:][:,sameidx]) if model == 'lmm' else gwasmodel(y=pheno_sub,X=eigvec[sameidx])
-        num = 0
-        # Process of GWAS
-        print('*'*60)
-        if model == 'lmm':
-            print(f'''Number of samples: {np.sum(sameidx)}, Number of SNP: {m}, pve of null: {round(mod.pve,3)}''')
-        pbar = tqdm(total=m, desc=f"{model}",ascii=True)
-        for genosub, sites in load_genotype_chunks(genofile,chunk_size,maf_threshold,max_missing_rate):
-            genosub:np.ndarray = genosub[:,sameidx]
-            maf.extend(np.mean(genosub,axis=1)/2)
-            results.append(mod.gwas(genosub,threads=threads))
-            c_p_ref_alt.extend([[i.chrom,i.pos,i.ref_allele,i.alt_allele] for i in sites])
-            pbar.update(genosub.shape[0])
-            num += genosub.shape[0]
-            if num % 10*chunk_size == 0:
-                memory_usage = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
-        pbar.close()
-        results = np.concatenate(results,axis=0)
-        c_p_ref_alt = np.array(c_p_ref_alt)
-        results = pd.DataFrame(np.concatenate([c_p_ref_alt, results, np.array(maf).reshape(-1,1)],axis=1),columns=['#CHROM','POS','REF','ALT','beta','se','p','maf'])
-        results = results[['#CHROM','POS','REF','ALT','maf','beta','se','p']]
-        results = results.astype({'POS':int,'maf':float,'beta':float,'se':float,'p':float})
-        fastplot(results,pheno_sub,xlabel=p,outpdf=f"{outprefix}.{p}.{model}.pdf") if plot else None
-        results = results.astype({"p": "object"})
-        results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
-        results.to_csv(f"{outprefix}.{p}.{model}.tsv",sep="\t",float_format="%.4f",index=None)
-        print(f'Saved in {outprefix}.{p}.{model}.tsv'.replace('//','/'))
 
-def main(log:bool=True):
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
-    )
-    t_start = time.time()
-    # Required arguments
-    required_group = parser.add_argument_group('Required arguments')
-    ## Genotype file
-    geno_group = required_group.add_mutually_exclusive_group(required=True)
-    geno_group.add_argument('-vcf','--vcf', type=str, 
-                           help='Input genotype file in VCF format (.vcf or .vcf.gz)')
-    geno_group.add_argument('-bfile','--bfile', type=str, 
-                           help='Input genotype files in PLINK binary format (prefix for .bed, .bim, .fam)')
-    geno_group.add_argument('-npy','--npy', type=str, 
-                           help='Input genotype files in PLINK binary format (prefix for .npz, .snp, .idv)')
-    ## Phenotype file
-    required_group.add_argument('-p','--pheno', type=str, required=True,
-                               help='Phenotype file (tab-delimited with sample IDs in first column)')
-    ## Model
-    models_group = parser.add_argument_group('Model Arguments')
-    models_group.add_argument('-lmm','--lmm', action='store_true',default=False,
-                               help='Linear mixed model '
-                                   '(default: %(default)s)')
-    models_group.add_argument('-farmcpu','--farmcpu', action='store_true',default=False,
-                               help='FarmCPU model '
-                                   '(default: %(default)s)')
-    models_group.add_argument('-lm','--lm', action='store_true',default=False,
-                               help='General linear model '
-                                   '(default: %(default)s)')
-    # Optional arguments
-    optional_group = parser.add_argument_group('Optional Arguments')
-    ## Point out phenotype or snp
-    optional_group.add_argument('-n','--ncol', action='extend', nargs='*',default=None,type=int,
-                               help='Analyed phenotype column, eg. "-n 0 -n 3" is to analyze phenotype 1 and phenetype 4 '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-cl','--chrloc', type=str, default=None,
-                               help='Only analysis ranged SNP, eg. 1:1000000:3000000 '
-                                   '(default: %(default)s)')
-    ## More detail arguments
-    optional_group.add_argument('-lmem','--lmem', action='store_true', default=False,
-                               help='Low memory cost mode '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-k','--grm', type=str, default='1',
-                               help='Kinship matrix calculation method [1-centralization or 2-standardization] or path to pre-calculated GRM file '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-q','--qcov', type=str, default='0',
-                               help='Number of principal components for Q matrix or path to covariate matrix file '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-c','--cov', type=str, default=None,
-                               help='Path to covariance file '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-d','--dom', action='store_true', default=False,
-                               help='Estimate dominance effects '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-csnp','--csnp', type=str, default=None,
-                               help='Control snp for conditional GWAS, eg. 1:1200000 '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-plot','--plot', action='store_true', default=False,
-                               help='Visualization of GWAS result '
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-t','--thread', type=int, default=-1,
-                               help='Number of CPU threads to use (-1 for all available cores, default: %(default)s)')
-    optional_group.add_argument('-o', '--out', type=str, default='.',
-                               help='Output directory for results'
-                                   '(default: %(default)s)')
-    optional_group.add_argument('-prefix','--prefix',type=str,default=None,
-                               help='prefix of output file'
-                                   '(default: %(default)s)')
-    args = parser.parse_args()
-    # Determine genotype file
+def determine_genotype_source(args) -> tuple[str, str]:
+    """
+    Determine genotype input path and output prefix from CLI arguments.
+    """
     if args.vcf:
         gfile = args.vcf
-        args.prefix = os.path.basename(gfile).replace('.gz','').replace('.vcf','') if args.prefix is None else args.prefix
+        prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "")
     elif args.bfile:
         gfile = args.bfile
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    elif args.npy:
-        gfile = args.npy
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    threads = cpu_count() if args.thread<=0 else args.thread
-    gfile = gfile.replace('\\','/') # adjust \ in Windows
-    # create output folder and log file
-    os.makedirs(args.out,0o755,exist_ok=True)
-    logger = setup_logging(f'''{args.out}/{args.prefix}.gwas.log'''.replace('\\','/').replace('//','/'))
-    logger.info('High Performance Linear Mixed Model Solver for Genome-Wide Association Studies')
-    logger.info(f'Host: {socket.gethostname()}\n')
+        prefix = os.path.basename(gfile)
+    else:
+        raise ValueError("No genotype input specified. Use -vcf or -bfile.")
+
+    if args.prefix is not None:
+        prefix = args.prefix
+
+    gfile = gfile.replace("\\", "/")
+    return gfile, prefix
+
+
+def load_phenotype(phenofile: str, ncol: list[int] | None, logger) -> pd.DataFrame:
+    """
+    Load and preprocess phenotype table.
+
+    Assumptions
+    -----------
+      - First column contains sample IDs.
+      - Duplicated IDs are averaged.
+    """
+    logger.info(f"Loading phenotype from {phenofile}...")
+    pheno = pd.read_csv(phenofile, sep="\t")
+    pheno = pheno.groupby(pheno.columns[0]).mean()
+    pheno.index = pheno.index.astype(str)
+
+    assert pheno.shape[1] > 0, (
+        "No phenotype data found. Please check the phenotype file format.\n"
+        f"{pheno.head()}"
+    )
+
+    if ncol is not None:
+        assert np.min(ncol) < pheno.shape[1], "Phenotype column index out of range."
+        ncol = [i for i in ncol if i in range(pheno.shape[1])]
+        logger.info("Phenotypes to be analyzed: " + "\t".join(pheno.columns[ncol]))
+        pheno = pheno.iloc[:, ncol]
+
+    return pheno
+
+
+# ======================================================================
+# Low-memory LMM/LM: streaming GRM + PCA with caching
+# ======================================================================
+
+def build_grm_streaming(
+    genofile: str,
+    n_samples: int,
+    n_snps: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    method: int,
+    logger,
+) -> tuple[np.ndarray, int]:
+    """
+    Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
+    """
+    logger.info(f"Building GRM (streaming), method={method}")
+    grm = np.zeros((n_samples, n_samples), dtype="float32")
+    pbar = tqdm(total=n_snps, desc="GRM (streaming)", ascii=False)
+    process = psutil.Process()
+
+    varsum = 0.0
+    eff_m = 0
+
+    for genosub, _sites in load_genotype_chunks(
+        genofile, chunk_size, maf_threshold, max_missing_rate
+    ):
+        # genosub: (m_chunk, n_samples)
+        maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
+        genosub = genosub - 2 * maf
+
+        if method == 1:
+            grm += genosub.T @ genosub
+            varsum += np.sum(2 * maf * (1 - maf))
+        elif method == 2:
+            w = 1.0 / (2 * maf * (1 - maf))              # (m_chunk,1)
+            grm += (genosub.T * w.ravel()) @ genosub     # (n_samples, n_samples)
+        else:
+            raise ValueError(f"Unsupported GRM method: {method}")
+
+        eff_m += genosub.shape[0]
+        pbar.update(genosub.shape[0])
+
+        if eff_m % (10 * chunk_size) == 0:
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    # force bar to 100% even if SNPs were filtered in Rust
+    pbar.n = pbar.total
+    pbar.refresh()
+    pbar.close()
+
+    if method == 1:
+        grm = (grm + grm.T) / varsum / 2
+    else:  # method == 2
+        grm = (grm + grm.T) / eff_m / 2
+
+    logger.info("GRM construction finished.")
+    return grm, eff_m
+
+
+def load_or_build_grm_with_cache(
+    genofile: str,
+    prefix: str,
+    mgrm: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    logger,
+) -> tuple[np.ndarray, int]:
+    """
+    Load or build a GRM with caching for streaming LMM/LM runs.
+    """
+    ids, n_snps = inspect_genotype_file(genofile)
+    n_samples = len(ids)
+    method_is_builtin = mgrm in ["1", "2"]
+
+    if method_is_builtin:
+        km_path = f"{prefix}.k.{mgrm}.txt"
+        if os.path.exists(km_path):
+            logger.info(f"Loading cached GRM from {km_path}...")
+            grm = np.genfromtxt(km_path)
+            grm = grm.reshape(n_samples, n_samples)
+            eff_m = n_snps  # approximate; exact effective M not critical here
+        else:
+            method_int = int(mgrm)
+            grm, eff_m = build_grm_streaming(
+                genofile=genofile,
+                n_samples=n_samples,
+                n_snps=n_snps,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                chunk_size=chunk_size,
+                method=method_int,
+                logger=logger,
+            )
+            np.savetxt(km_path, grm, fmt="%.6f")
+            logger.info(f"Cached GRM written to {km_path}")
+    else:
+        assert os.path.isfile(mgrm), f"GRM file not found: {mgrm}"
+        logger.info(f"Loading GRM from {mgrm}...")
+        grm = np.genfromtxt(mgrm, dtype="float32")
+        assert grm.size == n_samples * n_samples, (
+            f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
+        )
+        grm = grm.reshape(n_samples, n_samples)
+        eff_m = n_snps
+
+    logger.info(f"GRM shape: {grm.shape}")
+    return grm, eff_m
+
+
+def build_pcs_from_grm(grm: np.ndarray, dim: int, logger) -> np.ndarray:
+    """
+    Compute leading principal components from GRM.
+    """
+    logger.info(f"Computing top {dim} PCs from GRM...")
+    eigval, eigvec = np.linalg.eigh(grm)
+    idx = np.argsort(eigval)[::-1]
+    eigvec = eigvec[:, idx]
+    pcs = eigvec[:, :dim]
+    logger.info("PC computation finished.")
+    return pcs
+
+
+def load_or_build_q_with_cache(
+    grm: np.ndarray,
+    prefix: str,
+    pcdim: str,
+    logger,
+) -> np.ndarray:
+    """
+    Load or build Q matrix (PCs) with caching for streaming LMM/LM.
+    """
+    n = grm.shape[0]
+
+    if pcdim in np.arange(1, n).astype(str):
+        dim = int(pcdim)
+        q_path = f"{prefix}.q.{pcdim}.txt"
+        if os.path.exists(q_path):
+            logger.info(f"Loading cached Q matrix from {q_path}...")
+            qmatrix = np.genfromtxt(q_path)
+        else:
+            qmatrix = build_pcs_from_grm(grm, dim, logger)
+            np.savetxt(q_path, qmatrix, fmt="%.6f")
+            logger.info(f"Cached Q matrix written to {q_path}")
+    elif pcdim == "0":
+        logger.info("PC dimension set to 0; using empty Q matrix.")
+        qmatrix = np.zeros((n, 0), dtype="float32")
+    elif os.path.isfile(pcdim):
+        logger.info(f"Loading Q matrix from {pcdim}...")
+        qmatrix = np.genfromtxt(pcdim, dtype="float32")
+        assert qmatrix.shape[0] == n, (
+            f"Q matrix row count mismatch: expected {n}, got {qmatrix.shape[0]}"
+        )
+    else:
+        raise ValueError(f"Unknown Q/PC option: {pcdim}")
+
+    logger.info(f"Q matrix shape: {qmatrix.shape}")
+    return qmatrix
+
+
+def _load_covariate_for_streaming(
+    cov_path: str | None,
+    n_samples: int,
+    logger,
+) -> np.ndarray | None:
+    """
+    Load covariate matrix for streaming LMM/LM.
+
+    Assumptions
+    -----------
+      - The covariate file is aligned with the genotype sample order
+        given by inspect_genotype_file (one row per sample).
+    """
+    if cov_path is None:
+        return None
+
+    logger.info(f"Loading covariate matrix for streaming models from {cov_path}...")
+    cov_all = np.genfromtxt(cov_path, dtype=float)
+    if cov_all.ndim == 1:
+        cov_all = cov_all.reshape(-1, 1)
+    assert cov_all.shape[0] == n_samples, (
+        f"Covariate rows ({cov_all.shape[0]}) do not match sample count "
+        f"({n_samples}) from genotype metadata."
+    )
+    logger.info(f"Covariate matrix (streaming) shape: {cov_all.shape}")
+    return cov_all
+
+
+def prepare_streaming_context(
+    genofile: str,
+    phenofile: str,
+    pheno_cols: list[int] | None,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    mgrm: str,
+    pcdim: str,
+    cov_path: str | None,
+    logger,
+):
+    """
+    Prepare all shared resources for streaming LMM/LM once:
+      - phenotype
+      - genotype metadata (ids, n_snps)
+      - GRM + Q (cached)
+      - covariates (optional)
+    """
+    pheno = load_phenotype(phenofile, pheno_cols, logger)
+
+    ids, n_snps = inspect_genotype_file(genofile)
+    ids = np.array(ids).astype(str)
+    n_samples = len(ids)
+    logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
+
+    grm, eff_m = load_or_build_grm_with_cache(
+        genofile=genofile,
+        prefix=outprefix,
+        mgrm=mgrm,
+        maf_threshold=maf_threshold,
+        max_missing_rate=max_missing_rate,
+        chunk_size=chunk_size,
+        logger=logger,
+    )
+
+    qmatrix = load_or_build_q_with_cache(
+        grm=grm,
+        prefix=outprefix,
+        pcdim=pcdim,
+        logger=logger,
+    )
+
+    cov_all = _load_covariate_for_streaming(cov_path, n_samples, logger)
+
+    return pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m
+
+
+def run_chunked_gwas_lmm_lm(
+    model_name: str,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    n_snps: int,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    grm: np.ndarray,
+    qmatrix: np.ndarray,
+    cov_all: np.ndarray | None,
+    eff_m: int,
+    plot: bool,
+    threads: int,
+    logger,
+) -> None:
+    """
+    Run LMM or LM GWAS using a streaming, low-memory pipeline.
+
+    Important: This function assumes pheno/ids/grm/q/cov have already been prepared
+    once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
+    """
+    model_map = {"lmm": LMM, "lm": LM}
+    ModelCls = model_map[model_name]
+
+    process = psutil.Process()
+    n_cores = psutil.cpu_count(logical=True) or cpu_count()
+
+    for pname in pheno.columns:
+        logger.info(f"Streaming {model_name.upper()} GWAS for trait: {pname}")
+
+        cpu_t0 = process.cpu_times()
+        rss0 = process.memory_info().rss
+        t0 = time.time()
+        peak_rss = rss0
+
+        pheno_sub = pheno[pname].dropna()
+        sameidx = np.isin(ids, pheno_sub.index)
+        if np.sum(sameidx) == 0:
+            logger.info(
+                f"No overlapping samples between genotype and phenotype {pname}. Skipped."
+            )
+            continue
+
+        y_vec = pheno_sub.loc[ids[sameidx]].values
+
+        # Build covariate matrix X_cov for this trait
+        X_cov = qmatrix[sameidx]
+        if cov_all is not None:
+            X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
+
+        if model_name == "lmm":
+            mod = ModelCls(y=y_vec, X=X_cov, kinship=grm[sameidx][:, sameidx])
+            logger.info(
+                f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}, PVE(null): {round(mod.pve, 3)}"
+            )
+        else:
+            mod = ModelCls(y=y_vec, X=X_cov)
+            logger.info(f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}")
+
+        results_chunks = []
+        info_chunks = []
+        maf_list = []
+        done_snps = 0
+
+        process.cpu_percent(interval=None)
+        pbar = tqdm(total=n_snps, desc=f"{model_name}-{pname}", ascii=False)
+
+        for genosub, sites in load_genotype_chunks(
+            genofile,
+            chunk_size,
+            maf_threshold,
+            max_missing_rate,
+        ):
+            genosub = genosub[:, sameidx]  # (m_chunk, n_use)
+            maf_list.extend(np.mean(genosub, axis=1) / 2)
+
+            results_chunks.append(mod.gwas(genosub, threads=threads))
+            info_chunks.extend(
+                [[s.chrom, s.pos, s.ref_allele, s.alt_allele] for s in sites]
+            )
+
+            m_chunk = genosub.shape[0]
+            done_snps += m_chunk
+            pbar.update(m_chunk)
+
+            mem_info = process.memory_info()
+            peak_rss = max(peak_rss, mem_info.rss)
+            if done_snps % (10 * chunk_size) == 0:
+                mem_gb = mem_info.rss / 1024**3
+                pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
+
+        pbar.n = pbar.total
+        pbar.refresh()
+        pbar.close()
+
+        cpu_t1 = process.cpu_times()
+        rss1 = process.memory_info().rss
+        t1 = time.time()
+
+        wall = t1 - t0
+        user_cpu = cpu_t1.user - cpu_t0.user
+        sys_cpu = cpu_t1.system - cpu_t0.system
+        total_cpu = user_cpu + sys_cpu
+
+        avg_cpu_pct = 100.0 * total_cpu / wall / (n_cores or 1) if wall > 0 else 0.0
+        avg_rss_gb = (rss0 + rss1) / 2 / 1024**3
+        peak_rss_gb = peak_rss / 1024**3
+
+        logger.info(
+            f"Effective SNP: {done_snps} | "
+            f"Resource usage for {model_name.upper()} / {pname}: "
+            f"wall={wall:.2f} s, "
+            f"avg CPU={avg_cpu_pct:.1f}% of {n_cores} cores, "
+            f"avg RSS={avg_rss_gb:.2f} GB, "
+            f"peak RSS≈{peak_rss_gb:.2f} GB"
+        )
+
+        if not results_chunks:
+            logger.info(f"No SNPs passed filters for trait {pname}.")
+            continue
+
+        results = np.concatenate(results_chunks, axis=0)
+        info_arr = np.array(info_chunks)
+
+        df = pd.DataFrame(
+            np.concatenate(
+                [info_arr, results, np.array(maf_list).reshape(-1, 1)], axis=1
+            ),
+            columns=["#CHROM", "POS", "REF", "ALT", "beta", "se", "p", "maf"],
+        )
+        df = df[["#CHROM", "POS", "REF", "ALT", "maf", "beta", "se", "p"]]
+        df = df.astype(
+            {"POS": int, "maf": float, "beta": float, "se": float, "p": float}
+        )
+
+        if plot:
+            fastplot(
+                df,
+                y_vec,
+                xlabel=pname,
+                outpdf=f"{outprefix}.{pname}.{model_name}.pdf",
+            )
+
+        df = df.astype({"p": "object"})
+        df.loc[:, "p"] = df["p"].map(lambda x: f"{x:.4e}")
+        out_tsv = f"{outprefix}.{pname}.{model_name}.tsv"
+        df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        logger.info(f"Saved {model_name.upper()} results to {out_tsv}".replace("//", "/"))
+        logger.info("")  # ensure blank line between traits
+
+
+# ======================================================================
+# High-memory FarmCPU: full genotype + QK
+# ======================================================================
+
+def load_genotype_full(args, gfile: str, logger):
+    """
+    Load full genotype matrix into memory (VCF or PLINK binary).
+    """
+    if args.vcf:
+        logger.info(f"** Loading genotype from {gfile}...")
+        geno_df = vcfreader(gfile)
+    elif args.bfile:
+        logger.info(f"Loading genotype from {gfile}.bed...")
+        geno_df = breader(gfile)
+    else:
+        raise ValueError("No genotype input specified for FarmCPU.")
+
+    ref_alt = geno_df.iloc[:, :2]
+    famid = geno_df.columns[2:].values.astype(str)
+    geno = geno_df.iloc[:, 2:].to_numpy(copy=False)
+    return ref_alt, famid, geno
+
+
+def prepare_qk_and_filter(geno: np.ndarray, ref_alt: pd.DataFrame, logger):
+    """
+    Filter SNPs and impute missing values using QK, then update ref_alt.
+    """
+    logger.info("* Filtering SNPs (MAF < 0.01 or missing rate > 0.05; mode imputation)...")
+    logger.info("  Tip: if available, use pre-imputed genotypes from BEAGLE/IMPUTE2.")
+    qkmodel = QK(geno, maff=0.01)
+    geno_filt = qkmodel.M
+
+    ref_alt_filt = ref_alt.loc[qkmodel.SNPretain].copy()
+    # Swap REF/ALT for extremely rare alleles
+    ref_alt_filt.iloc[qkmodel.maftmark, [0, 1]] = ref_alt_filt.iloc[
+        qkmodel.maftmark, [1, 0]
+    ]
+    ref_alt_filt["maf"] = qkmodel.maf
+    logger.info("Filtering and imputation finished.")
+    return geno_filt, ref_alt_filt, qkmodel
+
+
+def build_qmatrix_farmcpu(
+    gfile_prefix: str,
+    qkmodel: QK,
+    geno: np.ndarray,
+    qdim: str,
+    cov_path: str | None,
+    logger,
+) -> np.ndarray:
+    """
+    Build or load Q matrix for FarmCPU (PCs + optional covariates).
+    """
+    if qdim in np.arange(0, 30).astype(str):
+        q_path = f"{gfile_prefix}.q.{qdim}.txt"
+        if os.path.exists(q_path):
+            logger.info(f"* Loading Q matrix from {q_path}...")
+            qmatrix = np.genfromtxt(q_path)
+        elif qdim == "0":
+            qmatrix = np.array([]).reshape(geno.shape[1], 0)
+        else:
+            logger.info(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
+            qmatrix, _eigval = qkmodel.PCA()
+            qmatrix = qmatrix[:, : int(qdim)]
+            np.savetxt(q_path, qmatrix, fmt="%.6f")
+            logger.info(f"Cached Q matrix written to {q_path}")
+    else:
+        logger.info(f"* Loading Q matrix from {qdim}...")
+        qmatrix = np.genfromtxt(qdim)
+
+    if cov_path:
+        cov_arr = np.genfromtxt(cov_path, dtype=float)
+        if cov_arr.ndim == 1:
+            cov_arr = cov_arr.reshape(-1, 1)
+        assert cov_arr.shape[0] == geno.shape[1], (
+            f"Covariate rows ({cov_arr.shape[0]}) do not match sample count "
+            f"({geno.shape[1]}) in genotype matrix."
+        )
+        logger.info(f"Appending covariate matrix for FarmCPU: shape={cov_arr.shape}")
+        qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
+
+    logger.info(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
+    return qmatrix
+
+
+def run_farmcpu_fullmem(
+    args,
+    gfile: str,
+    prefix: str,
+    logger,
+    pheno_preloaded: pd.DataFrame | None = None,
+) -> None:
+    """
+    Run FarmCPU in high-memory mode (full genotype + QK + PCA).
+
+    If pheno_preloaded is provided, it will reuse that phenotype table to avoid
+    repeated "Loading phenotype ..." logs and repeated I/O.
+    """
+    t_loading = time.time()
+    phenofile = args.pheno
+    outfolder = args.out
+    qdim = args.qcov
+    cov = args.cov
+
+    logger.info("* FarmCPU pipeline: loading genotype and phenotype")
+    pheno = pheno_preloaded if pheno_preloaded is not None else load_phenotype(
+        phenofile, args.ncol, logger
+    )
+
+    ref_alt, famid, geno = load_genotype_full(args, gfile, logger)
+    logger.info(
+        f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
+    )
+
+    geno, ref_alt, qkmodel = prepare_qk_and_filter(geno, ref_alt, logger)
+    assert geno.size > 0, "After filtering, number of SNPs is zero for FarmCPU."
+
+    gfile_prefix = gfile.replace(".vcf", "").replace(".gz", "")
+
+    qmatrix = build_qmatrix_farmcpu(
+        gfile_prefix=gfile_prefix,
+        qkmodel=qkmodel,
+        geno=geno,
+        qdim=qdim,
+        cov_path=cov,
+        logger=logger,
+    )
+
+    for phename in pheno.columns:
+        logger.info(f"* FarmCPU GWAS for trait: {phename}")
+        t_trait = time.time()
+
+        p = pheno[phename].dropna()
+        famidretain = np.isin(famid, p.index)
+        if np.sum(famidretain) == 0:
+            logger.info(f"Trait {phename}: no overlapping samples, skipped.")
+            continue
+
+        snp_sub = geno[:, famidretain]
+        p_sub = p.loc[famid[famidretain]].values.reshape(-1, 1)
+        q_sub = qmatrix[famidretain]
+
+        logger.info(f"Samples: {np.sum(famidretain)}, SNPs: {snp_sub.shape[0]}")
+        res = farmcpu(
+            y=p_sub,
+            M=snp_sub,
+            X=q_sub,
+            chrlist=ref_alt.reset_index().iloc[:, 0].values,
+            poslist=ref_alt.reset_index().iloc[:, 1].values,
+            iter=20,
+            threads=args.thread,
+        )
+        res_df = pd.DataFrame(res, columns=["beta", "se", "p"], index=ref_alt.index)
+        res_df = pd.concat([ref_alt, res_df], axis=1)
+        res_df = res_df.reset_index()
+
+        if args.plot:
+            fastplot(
+                res_df,
+                p_sub,
+                xlabel=phename,
+                outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.pdf",
+            )
+
+        res_df = res_df.astype({"p": "object"})
+        res_df.loc[:, "p"] = res_df["p"].map(lambda x: f"{x:.4e}")
+        out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
+        res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        logger.info(f"FarmCPU results saved to {out_tsv}".replace("//", "/"))
+        logger.info(f"Trait {phename} finished in {time.time() - t_trait:.2f} s")
+        logger.info("")
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    required_group = parser.add_argument_group("Required arguments")
+
+    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group.add_argument(
+        "-vcf", "--vcf", type=str,
+        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+    )
+    geno_group.add_argument(
+        "-bfile", "--bfile", type=str,
+        help="Input genotype in PLINK binary format "
+             "(prefix for .bed, .bim, .fam)",
+    )
+
+    required_group.add_argument(
+        "-p", "--pheno", type=str, required=True,
+        help="Phenotype file (tab-delimited, sample IDs in the first column)",
+    )
+
+    models_group = parser.add_argument_group("Model Arguments")
+    models_group.add_argument(
+        "-lmm", "--lmm", action="store_true", default=False,
+        help="Run linear mixed model (low-memory, chunk-based) "
+             "(default: %(default)s)",
+    )
+    models_group.add_argument(
+        "-farmcpu", "--farmcpu", action="store_true", default=False,
+        help="Run FarmCPU model (high-memory, full genotype) "
+             "(default: %(default)s)",
+    )
+    models_group.add_argument(
+        "-lm", "--lm", action="store_true", default=False,
+        help="Run general linear model (low-memory, chunk-based) "
+             "(default: %(default)s)",
+    )
+
+    optional_group = parser.add_argument_group("Optional Arguments")
+    optional_group.add_argument(
+        "-n", "--ncol", action="extend", nargs="*",
+        default=None, type=int,
+        help='Zero-based phenotype column indices to analyze. '
+             'E.g., "-n 0 -n 3" to analyze the 1st and 4th traits '
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-k", "--grm", type=str, default="1",
+        help="GRM option: 1 (centering), 2 (standardization), "
+             "or path to precomputed GRM file (default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-q", "--qcov", type=str, default="0",
+        help="Number of principal components for Q matrix or path to Q file "
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-c", "--cov", type=str, default=None,
+        help="Path to additional covariate file. "
+             "For LMM/LM, the file must be aligned with the genotype sample "
+             "order from inspect_genotype_file (one row per sample). "
+             "For FarmCPU, it must follow the genotype sample order "
+             "(famid) (default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-plot", "--plot", action="store_true", default=False,
+        help="Generate diagnostic plots (histogram, Manhattan, QQ) "
+             "(default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-chunksize", "--chunksize", type=int, default=100_000,
+        help="Number of SNPs per chunk for streaming LMM/LM "
+             "(affects GRM and GWAS; default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-t", "--thread", type=int, default=-1,
+        help="Number of CPU threads (-1 uses all available cores, "
+             "default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-o", "--out", type=str, default=".",
+        help="Output directory for results (default: %(default)s)",
+    )
+    optional_group.add_argument(
+        "-prefix", "--prefix", type=str, default=None,
+        help="Prefix for output files (default: %(default)s)",
+    )
+
+    return parser.parse_args()
+
+
+def main(log: bool = True):
+    t_start = time.time()
+    args = parse_args()
+
+    if args.thread <= 0:
+        args.thread = cpu_count()
+
+    gfile, prefix = determine_genotype_source(args)
+
+    os.makedirs(args.out, 0o755, exist_ok=True)
+    outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
+    log_path = f"{outprefix}.gwas.log"
+    logger = setup_logging(log_path)
+
+    logger.info(
+        "JanusX - High Performance GWAS CLI "
+        "(LMM/LM: streaming low-memory; FarmCPU: full-memory)"
+    )
+    logger.info(f"Host: {socket.gethostname()}\n")
+
     if log:
-        logger.info("*"*60)
-        logger.info("GWAS LMM SOLVER CONFIGURATION")
-        logger.info("*"*60)
+        logger.info("*" * 60)
+        logger.info("GWAS CONFIGURATION")
+        logger.info("*" * 60)
         logger.info(f"Genotype file:    {gfile}")
         logger.info(f"Phenotype file:   {args.pheno}")
-        logger.info(f"Analysis nSNP:    {args.chrloc}") if args.chrloc is not None else logger.info(f"Analysis nSNP:    All")
-        logger.info(f"Analysis Pcol:    {args.ncol}") if args.ncol is not None else logger.info(f"Analysis Pcol:    All")
-        if args.lm:
-            logger.info("Estimate Model:   General Linear model")
-        if args.lmm:
-            logger.info("Estimate Model:   Mixed Linear model")
-        if args.farmcpu:
-            logger.info("Estimate Model:   FarmCPU")
-        logger.info(f"Low memory mode:  {args.ncol}")
-        if args.dom: # Dominance model
-            logger.info(f"Dominance model:  {args.dom}")
-        if args.csnp: # Conditional GWAS
-            logger.info(f"Conditional SNP:  {args.csnp}")
-        logger.info(f"Estimate of GRM:  {args.grm}")
-        if args.qcov != '0':
-            logger.info(f"Q matrix:         {args.qcov}")
+        logger.info(f"Phenotype cols:   {args.ncol if args.ncol is not None else 'All'}")
+        logger.info(
+            f"Models:           "
+            f"{'LMM ' if args.lmm else ''}"
+            f"{'LM ' if args.lm else ''}"
+            f"{'FarmCPU' if args.farmcpu else ''}"
+        )
+        logger.info(f"GRM option:       {args.grm}")
+        logger.info(f"Q option:         {args.qcov}")
         if args.cov:
-            logger.info(f"Covariant matrix: {args.cov}")
-        logger.info(f"Threads:          {threads} ({cpu_count()} available)")
-        logger.info(f"Output prefix:    {args.out}/{args.prefix}")
-        logger.info("*"*60 + "\n")
+            logger.info(f"Covariate file:   {args.cov}")
+        logger.info(f"Chunk size:       {args.chunksize}")
+        logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
+        logger.info(f"Output prefix:    {outprefix}")
+        logger.info("*" * 60 + "\n")
+
     try:
-        phenofile,outfolder = args.pheno,args.out
-        kinship_method = args.grm
-        qdim = args.qcov
-        cov = args.cov
-        kcal = True if kinship_method in ['1','2'] else False
-        qcal = True if qdim in np.arange(0,30).astype(str) else False
-        # test exist of all input files
-        assert os.path.isfile(phenofile), f"can not find file {phenofile}"
-        # test k and q matrix
-        assert kcal or os.path.isfile(kinship_method), f'{kinship_method} is not a calculation method or grm file'
-        assert qcal or os.path.isfile(qdim), f'{qdim} is not a dimension of PC or PC file'
-        assert cov is None or os.path.isfile(cov), f"{cov} is applied, but it is not a file"
-        # test exist of calculating model
-        assert args.lm or args.lmm or args.farmcpu, 'no model to estimate, try -lm, -farmcpu or -lmm'
+        assert os.path.isfile(args.pheno), f"Cannot find phenotype file {args.pheno}"
+        grm_is_valid = args.grm in ["1", "2"] or os.path.isfile(args.grm)
+        q_is_valid = args.qcov in np.arange(0, 30).astype(str) or os.path.isfile(args.qcov)
+        assert grm_is_valid, f"{args.grm} is neither GRM method nor an existing GRM file."
+        assert q_is_valid, f"{args.qcov} is neither PC dimension nor Q matrix file."
+        assert args.cov is None or os.path.isfile(args.cov), f"Covariate file {args.cov} does not exist."
+        assert (args.lm or args.lmm or args.farmcpu), "No model selected. Use -lm, -lmm, and/or -farmcpu."
 
-        # Loading genotype matrix
-        t_loading = time.time()
-        if args.lmem:
-            if args.farmcpu:
-                print('Low mem mode do not support FarmCPU, it will be ignored...')
-            if args.lmm:
-                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lmm',threads=threads,plot=args.plot)
-            if args.lm:
-                results = lowm_GWAS(gfile,phenofile,args.ncol,f'{args.out}/{args.prefix}',mgrm=args.grm,pcdim=args.qcov,model='lm',threads=threads,plot=args.plot)
-        else:
-            logger.info('* Loading genotype and phenotype')
-            if not args.npy:
-                logger.info('Recommended: Use numpy format of genotype matrix (just use gformat module to transfer)')
-            logger.info(f'** Loading phenotype from {phenofile}...')
-            pheno = pd.read_csv(rf'{phenofile}',sep='\t') # Col 1 - idv ID; row 1 - pheno tag
-            pheno = pheno.groupby(pheno.columns[0]).mean() # Mean of duplicated samples
-            pheno.index = pheno.index.astype(str)
-            assert pheno.shape[1]>0, f'No phenotype data found, please check the phenotype file format!\n{pheno.head()}'
-            if args.ncol is not None: 
-                assert np.min(args.ncol) <= pheno.shape[1], "Phenotype column index out of range."
-                args.ncol = [i for i in args.ncol if i in range(pheno.shape[1])]
-                logger.info(f'''These phenotype will be analyzed: {'\t'.join(pheno.columns[args.ncol])}''',)
-                pheno = pheno.iloc[:,args.ncol]
-            if args.vcf:
-                logger.info(f'** Loading genotype from {gfile}...')
-                geno = vcfreader(rf'{gfile}') # VCF format
-            elif args.bfile:
-                logger.info(f'Loading genotype from {gfile}.bed...')
-                geno = breader(rf'{gfile}') # PLINK format
-            elif args.npy:
-                logger.info(f'Loading genotype from {gfile}.npz...')
-                geno = npyreader(rf'{gfile}') # numpy format
-            ref_alt:pd.DataFrame = geno.iloc[:,:2]
-            famid = geno.columns[2:].values.astype(str)
-            geno = geno.iloc[:,2:].to_numpy(copy=False)
-            logger.info(f'Geno and Pheno are ready, costed {(time.time()-t_loading):.2f} secs')
+        # --- prepare streaming context once if needed ---
+        pheno = None
+        ids = None
+        n_snps = None
+        grm = None
+        qmatrix = None
+        cov_all = None
+        eff_m = None
 
-            # GRM & PCA
-            t_control = time.time()
-            logger.info('* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode...')
-            logger.info('Recommended: Use genotype matrix imputed by beagle or impute2 as input')
-            qkmodel = QK(geno,maff=0.01)
-            logger.info(f'Filter finished, costed {(time.time()-t_control):.2f} secs')
-            geno = qkmodel.M
-            if args.dom: # Additive kinship but dominant single SNP
-                logger.info('* Transfer additive gmatrix to dominance gmatrix')
-                np.subtract(geno,1,out=geno)
-                np.absolute(geno, out=geno)
-            ref_alt = ref_alt.loc[qkmodel.SNPretain]
-            ref_alt.iloc[qkmodel.maftmark,[0,1]] = ref_alt.iloc[qkmodel.maftmark,[1,0]]
-            ref_alt['maf'] = qkmodel.maf
+        if args.lmm or args.lm:
+            _section(logger, "Prepare streaming context (phenotype/genotype meta/GRM/Q/cov)")
+            pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m = prepare_streaming_context(
+                genofile=gfile,
+                phenofile=args.pheno,
+                pheno_cols=args.ncol,
+                outprefix=outprefix,
+                maf_threshold=0.01,
+                max_missing_rate=0.05,
+                chunk_size=args.chunksize,
+                mgrm=args.grm,
+                pcdim=args.qcov,
+                cov_path=args.cov,
+                logger=logger,
+            )
 
-            if args.chrloc:
-                chr_loc = np.array(args.chrloc.split(':'),dtype=np.int32)
-                chr,start,end = chr_loc[0],np.min(chr_loc[1:]),np.max(chr_loc[1:])
-                onlySNP = ref_alt.index.to_frame().values
-                filt1 = onlySNP[:,0].astype(str)==str(chr)
-                filt2 = (onlySNP[filt1,1]<=end) & (onlySNP[filt1,1]>=start)
-                if start == 0 and end == 0:
-                    geno = geno[filt1]
-                    ref_alt = ref_alt.loc[filt1]
-                else:
-                    geno = geno[filt1][filt2]
-                    ref_alt = ref_alt.loc[filt1].loc[filt2]
+        # --- run streaming LMM ---
+        if args.lmm:
+            _section(logger, "Run streaming LMM")
+            run_chunked_gwas_lmm_lm(
+                model_name="lmm",
+                genofile=gfile,
+                pheno=pheno,
+                ids=ids,
+                n_snps=n_snps,
+                outprefix=outprefix,
+                maf_threshold=0.01,
+                max_missing_rate=0.05,
+                chunk_size=args.chunksize,
+                grm=grm,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                eff_m=eff_m,
+                plot=args.plot,
+                threads=args.thread,
+                logger=logger,
+            )
 
-            assert geno.size>0, 'After filtering, number of SNP is 0'
+        # --- run streaming LM ---
+        if args.lm:
+            _section(logger, "Run streaming LM")
+            run_chunked_gwas_lmm_lm(
+                model_name="lm",
+                genofile=gfile,
+                pheno=pheno,
+                ids=ids,
+                n_snps=n_snps,
+                outprefix=outprefix,
+                maf_threshold=0.01,
+                max_missing_rate=0.05,
+                chunk_size=args.chunksize,
+                grm=grm,  # LM 不用 kinship，但函数签名统一，传入无妨
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                eff_m=eff_m,
+                plot=args.plot,
+                threads=args.thread,
+                logger=logger,
+            )
 
-            prefix = gfile.replace('.vcf','').replace('.gz','')
-            if args.lmm:
-                logger.info(f'* Preparing GRM and Q matrix for LMM...')
-                if kcal:
-                    if os.path.exists(f'{prefix}.k.{kinship_method}.txt'):
-                        logger.info(f'* Loading GRM from {prefix}.k.{kinship_method}.txt...')
-                        kmatrix = np.genfromtxt(f'{prefix}.k.{kinship_method}.txt')
-                    else:    
-                        logger.info(f'* Calculation method of kinship matrix is {kinship_method}')
-                        kmatrix = qkmodel.GRM(method=int(kinship_method))
-                        np.savetxt(f'{prefix}.k.{kinship_method}.txt',kmatrix,fmt='%.6f')
-                else:
-                    logger.info(f'* Loading GRM from {kinship_method}...')
-                    kmatrix = np.genfromtxt(kinship_method) if kinship_method[-4:] != '.npz' else np.load(kinship_method,)['arr_0']
-            if qcal:
-                if os.path.exists(f'{prefix}.q.{qdim}.txt'):
-                    logger.info(f'* Loading Q matrix from {prefix}.q.{qdim}.txt...')
-                    qmatrix = np.genfromtxt(f'{prefix}.q.{qdim}.txt')
-                elif qdim=="0":
-                    qmatrix = np.array([]).reshape(geno.shape[1],0)
-                else:
-                    logger.info(f'* Dimension of PC for q matrix is {qdim}')
-                    qmatrix,eigenval = qkmodel.PCA()
-                    qmatrix = qmatrix[:,:int(qdim)]
-                    np.savetxt(f'{prefix}.q.{qdim}.txt',qmatrix,fmt='%.6f')       
-            else:
-                logger.info(f'* Loading Q matrix from {qdim}...')
-                qmatrix = np.genfromtxt(qdim)
-            if cov:
-                cov = np.genfromtxt(cov,).reshape(-1,1)
-                logger.info(f'Covmatrix {cov.shape}:')
-                qmatrix = np.concatenate([qmatrix,cov],axis=1)
-            if args.csnp:
-                logger.info(f'* Use SNP in {args.csnp} as control for conditional GWAS')
-                chr_loc_index = ref_alt.reset_index().iloc[:,:2].astype(str)
-                chr_loc_index = pd.Index(chr_loc_index.iloc[:,0]+':'+chr_loc_index.iloc[:,1])
-                cov = geno[chr_loc_index.get_loc(args.csnp)].reshape(-1,1)
-                logger.info(f'Covmatrix {cov.shape}:')
-                qmatrix = np.concatenate([qmatrix,cov],axis=1)
-            if args.lmm:
-                logger.info(f'GRM {str(kmatrix.shape)}:')
-                logger.info(kmatrix[:5,:5])
-            logger.info(f'Qmatrix {str(qmatrix.shape)}:')
-            logger.info(qmatrix[:5,:5])
-            del qkmodel
-            # GWAS
-            for i in pheno.columns:
-                t = time.time()
-                logger.info('*'*60)
-                logger.info(f'* GWAS process for {i}')
-                p = pheno[i].dropna()
-                famidretain = np.isin(famid,p.index)
-                snp_sub = geno[:,famidretain]
-                p_sub = p.loc[famid[famidretain]].values.reshape(-1,1)
-                q_sub = qmatrix[famidretain]
-                if args.lmm:
-                    k_sub = kmatrix[famidretain][:,famidretain]
-                if len(p)>0:
-                    if args.lmm:
-                        logger.info(f'** Mixed Linear Model:')
-                        gwasmodel = GWAS(y=p_sub,X=q_sub,kinship=k_sub)
-                        logger.info(f'''Number of samples: {np.sum(famidretain)}, Number of SNP: {geno.shape[0]}, pve of null: {round(gwasmodel.pve,3)}''')
-                        results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
-                        results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
-                        results = pd.concat([ref_alt,results],axis=1)
-                        results = results.reset_index().dropna()
-                        logger.info(f'Effective number of SNP: {results.shape[0]}')
-                        fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.lmm.pdf") if args.plot else None
-                        results = results.astype({"p": "object"})
-                        results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
-                        results.to_csv(f"{outfolder}/{args.prefix}.{i}.lmm.tsv",sep="\t",float_format="%.4f",index=False)
-                        logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.lmm.tsv'.replace('//','/'))
-                    if args.lm:
-                        logger.info(f'** General Linear Model:')
-                        gwasmodel = LM(y=p_sub,X=q_sub)
-                        results = gwasmodel.gwas(snp=snp_sub,chunksize=100_000,threads=threads) # gwas running...
-                        results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
-                        results = pd.concat([ref_alt,results],axis=1)
-                        results = results.reset_index().dropna()
-                        fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.lm.pdf") if args.plot else None
-                        results = results.astype({"p": "object"})
-                        results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
-                        results.to_csv(f"{outfolder}/{args.prefix}.{i}.lm.tsv",sep="\t",float_format="%.4f",index=None)
-                        logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.lm.tsv'.replace('//','/'))
-                    if args.farmcpu:
-                        logger.info(f'** FarmCPU Model:')
-                        results = farmcpu(y=p_sub,M=snp_sub,X=q_sub,chrlist=ref_alt.reset_index().iloc[:,0].values,poslist=ref_alt.reset_index().iloc[:,1].values,iter=20,threads=threads)
-                        results = pd.DataFrame(results,columns=['beta','se','p'],index=ref_alt.index)
-                        results = pd.concat([ref_alt,results],axis=1)
-                        results = results.reset_index()
-                        fastplot(results,p_sub,xlabel=i,outpdf=f"{outfolder}/{args.prefix}.{i}.farmcpu.pdf") if args.plot else None
-                        results = results.astype({"p": "object"})
-                        results.loc[:,'p'] = results['p'].map(lambda x: f"{x:.4e}")
-                        results.to_csv(f"{outfolder}/{args.prefix}.{i}.farmcpu.tsv",sep="\t",float_format="%.4f",index=None)
-                        logger.info(f'Saved in {outfolder}/{args.prefix}.{i}.farmcpu.tsv'.replace('//','/'))
-                else:
-                    logger.info(f'Phenotype {i} has no overlapping samples with genotype, please check sample id. skipped.\n')
-                logger.info(f'Time costed: {round(time.time()-t,2)} secs\n')
+        # --- run FarmCPU (full memory) ---
+        if args.farmcpu:
+            _section(logger, "Run FarmCPU (full memory)")
+            run_farmcpu_fullmem(
+                args=args,
+                gfile=gfile,
+                prefix=prefix,
+                logger=logger,
+                pheno_preloaded=pheno,  # 若 streaming 已加载 pheno，则复用，避免重复 log
+            )
+
     except Exception as e:
-        logger.exception(f'Error of JanusX: {e}')
+        logger.exception(f"Error in JanusX GWAS pipeline: {e}")
+
     lt = time.localtime()
-    endinfo = f'\nFinished, Total time: {round(time.time()-t_start,2)} secs\n{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}'
+    endinfo = (
+        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    )
     logger.info(endinfo)
+
 
 if __name__ == "__main__":
     main()

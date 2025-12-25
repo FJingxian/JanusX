@@ -1,7 +1,7 @@
 import numpy as np
 from joblib import Parallel,delayed,cpu_count
 from tqdm import trange
-from rust2py.assoc import FEM
+from ._assoc import FEM
 
 def REM(sz,n,pvalue,pos,M,y,X):
     bin_id = pos//sz
@@ -12,9 +12,7 @@ def REM(sz,n,pvalue,pos,M,y,X):
     return -2*results['LL'],leadidx
 
 def _pinv_safe(A: np.ndarray, rcond: float = 1e-12) -> np.ndarray:
-    # ginv(beta1+beta2)
     return np.linalg.pinv(A, rcond=rcond)
-
 def ll(pheno: np.ndarray,
         snp_pool: np.ndarray,
         X0: np.ndarray | None = None,
@@ -24,7 +22,7 @@ def ll(pheno: np.ndarray,
         svd_eps: float = 1e-8,
         pinv_rcond: float = 1e-12):
     """
-    Python rewrite of rMVP::FarmCPU.FaSTLMM.LL (grid-search delta, FaST-LMM style).
+    Python rewrite of FaST-LMM (grid-search delta).
 
     Parameters
     ----------
@@ -88,7 +86,7 @@ def ll(pheno: np.ndarray,
     # handler of single snp: if(is.null(dim(U1))) U1=matrix(U1,ncol=1)
     # U1 in numpy is 2D
     r = U1.shape[1]  # length(d)
-    # R: n=nrow(U1)   (就是个体数)
+    # R: n=nrow(U1)   (number of samples)
     # precompute terms
     # U1TX=crossprod(U1,X) = U1^T X   (r,p)
     # U1TY=crossprod(U1,y) = U1^T y   (r,1)

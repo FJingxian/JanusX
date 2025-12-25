@@ -1,12 +1,5 @@
 import numpy as np
-
-try:
-    from gfreader_rs import BedChunkReader, VcfChunkReader, count_vcf_snps
-except ImportError as e:
-    raise RuntimeError(
-        f"{e}\n"
-        "Please build gfreader_rs first. The Rust source is in ext/gfreader_rs/."
-    )
+from .gfreader_rs import BedChunkReader, VcfChunkReader, count_vcf_snps
 
 def load_genotype_chunks(
     path_or_prefix: str,

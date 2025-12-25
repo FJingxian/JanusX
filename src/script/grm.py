@@ -31,7 +31,7 @@ import numpy as np
 from tqdm import tqdm
 import psutil
 
-from rust2py.gfreader import load_genotype_chunks, inspect_genotype_file
+from gfreader_rs import load_genotype_chunks, inspect_genotype_file
 from ._common.log import setup_logging
 
 

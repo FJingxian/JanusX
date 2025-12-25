@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX – Principal Component Analysis (PCA) Command-Line Interface
+JanusX - Principal Component Analysis (PCA) Command-Line Interface
 
 Design summary
 --------------
@@ -26,7 +26,7 @@ PCA computation strategy
       * Only produce 2D/3D visualization
 
 Output:
-  - {prefix}.eigenvec      : PC coordinates (samples × dim)
+  - {prefix}.eigenvec      : PC coordinates (samples, dim)
   - {prefix}.eigenvec.id   : sample IDs
   - {prefix}.eigenval      : eigenvalues (variance along each PC)
   - Optional plots:
@@ -59,8 +59,7 @@ mpl.rcParams["ps.fonttype"] = 42
 
 from bioplotkit.sci_set import color_set
 from bioplotkit import PCSHOW
-from gfreader import breader, vcfreader  # kept for backward compatibility (not used in PCA core now)
-from rust2py.gfreader import load_genotype_chunks, inspect_genotype_file
+from gfreader_rs import load_genotype_chunks, inspect_genotype_file
 from ._common.log import setup_logging
 
 

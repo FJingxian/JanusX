@@ -1,2 +1,3 @@
-from ._assoc import FEM, lmm_reml
-__all__ = ["FEM", "lmm_reml"]
+from ._assoc import LMM, LM, FEM
+from ._farmcpu import farmcpu
+__all__ = ["FEM", "LMM", "LM", "farmcpu"]

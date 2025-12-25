@@ -1,28 +1,15 @@
-[build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
-
 [project]
 name = "gfreader_rs"
 version = "0.1.0"
 description = "Fast chunk-wise genotype reader (PLINK BED / VCF) powered by Rust + PyO3"
-authors = [
-    { name = "Jingxian FU", email = "827888724@qq.com" }
-]
-requires-python = ">=3.8"
-license = {text = "MIT"}
+requires-python = ">=3.9"
 
-classifiers = [
-    "Programming Language :: Python",
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
-]
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [tool.maturin]
-# 使用 PyO3
 bindings = "pyo3"
-# 可选: 指定build的 Python 版本
-# python-source = ["3.8", "3.9", "3.10", "3.11", "3.12"]
 strip = true
-features = []
+module-name = "gfreader_rs"
+python-source = "python"

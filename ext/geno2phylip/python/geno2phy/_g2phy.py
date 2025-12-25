@@ -1,10 +1,6 @@
 import os
 import typing
-try:
-    import geno2phy as gp
-except ImportError as e:
-    print(f"{e}\nPlease build geno2phy. Source code is in ext/geno2phylip")
-
+import .geno2phy as gp
 
 def geno2phy(genofile:os.PathLike,filetype:typing.Literal['vcf','bfile','npy'],out:os.PathLike=".",outprefix:str=None, min_samples_locus:int=1,
              outgroup:str=None,
@@ -142,6 +138,3 @@ def geno2phy(genofile:os.PathLike,filetype:typing.Literal['vcf','bfile','npy'],o
 
     else:
         raise ValueError('filetype must be one of {"npy", "bfile", "vcf"}')
-    
-if __name__ == "__main__":
-    geno2phy("example/mouse_hs1940", filetype="npy", out="test", min_samples_locus=1,)

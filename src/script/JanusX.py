@@ -10,7 +10,7 @@ warnings.filterwarnings(
 import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.backends.backend_pdf # pdf support
-from script import gwas2,gs,postGWAS,grm,pca
+from script import gwas,gs,postGWAS,grm,pca
 
 __logo__ = r'''
        _                      __   __
@@ -24,7 +24,7 @@ __version__ = 'JanusX v1.0.0'
 
 def main():
     module = dict(zip(['gwas','gs','postGWAS','grm','pca'],
-                      [gwas2,gs,postGWAS,grm,pca]))
+                      [gwas,gs,postGWAS,grm,pca]))
     extmodule = {}
     print(__logo__)
     if len(sys.argv)>1:

@@ -59,7 +59,7 @@ mpl.rcParams["ps.fonttype"] = 42
 
 from bioplotkit.sci_set import color_set
 from bioplotkit import PCSHOW
-from gfreader_rs import load_genotype_chunks, inspect_genotype_file
+from JanusX_rs.gfreader import load_genotype_chunks, inspect_genotype_file
 from ._common.log import setup_logging
 
 

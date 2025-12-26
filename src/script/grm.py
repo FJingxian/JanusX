@@ -31,7 +31,7 @@ import numpy as np
 from tqdm import tqdm
 import psutil
 
-from gfreader_rs import load_genotype_chunks, inspect_genotype_file
+from JanusX_rs.gfreader import load_genotype_chunks, inspect_genotype_file
 from ._common.log import setup_logging
 
 

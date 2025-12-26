@@ -1,7 +1,7 @@
 import os
 import sys
 import numpy as np
-from gfreader_rs import save_genotype_streaming, SiteInfo
+from JanusX_rs.gfreader import save_genotype_streaming, SiteInfo
 def simulate_chunks(nsnp, nidv, chunk_size=50_000, maf_low=0.02, maf_high=0.45, seed=1):
     rng = np.random.default_rng(seed)
     n_done = 0

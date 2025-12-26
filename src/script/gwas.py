@@ -38,6 +38,7 @@ import os
 import time
 import socket
 import argparse
+import logging
 
 # ---- Matplotlib backend configuration (non-interactive, server-safe) ----
 for key in ["MPLBACKEND"]:
@@ -59,9 +60,9 @@ import psutil
 
 from bioplotkit import GWASPLOT
 from pyBLUP import QK
-from assoc_rs import LMM,LM,farmcpu
 from gfreader import breader, vcfreader
-from gfreader_rs import load_genotype_chunks, inspect_genotype_file
+from JanusX_rs.gfreader import load_genotype_chunks, inspect_genotype_file
+from JanusX_rs.assoc import LMM,LM,farmcpu
 from ._common.log import setup_logging
 
 
@@ -69,7 +70,7 @@ from ._common.log import setup_logging
 # Basic utilities
 # ======================================================================
 
-def _section(logger, title: str) -> None:
+def _section(logger:logging.Logger, title: str) -> None:
     """Pretty section separator in log (with a blank line before each section)."""
     logger.info("")
     logger.info("=" * 60)
@@ -89,7 +90,7 @@ def fastplot(
     results = gwasresult.astype({"POS": "int64"})
     fig = plt.figure(figsize=(16, 4), dpi=300)
     layout = [["A", "B", "B", "C"]]
-    axes = fig.subplot_mosaic(mosaic=layout)
+    axes:dict[str,plt.Axes] = fig.subplot_mosaic(mosaic=layout)
 
     gwasplot = GWASPLOT(results)
 
@@ -185,6 +186,7 @@ def build_grm_streaming(
         genofile, chunk_size, maf_threshold, max_missing_rate
     ):
         # genosub: (m_chunk, n_samples)
+        genosub:np.ndarray
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
         genosub = genosub - 2 * maf
 
@@ -412,7 +414,7 @@ def run_chunked_gwas_lmm_lm(
     eff_m: int,
     plot: bool,
     threads: int,
-    logger,
+    logger:logging.Logger,
 ) -> None:
     """
     Run LMM or LM GWAS using a streaming, low-memory pipeline.
@@ -472,6 +474,7 @@ def run_chunked_gwas_lmm_lm(
             maf_threshold,
             max_missing_rate,
         ):
+            genosub:np.ndarray
             genosub = genosub[:, sameidx]  # (m_chunk, n_use)
             maf_list.extend(np.mean(genosub, axis=1) / 2)
 

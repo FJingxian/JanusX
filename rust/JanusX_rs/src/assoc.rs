@@ -258,7 +258,7 @@ impl GlmScratch {
 ///   col2..: p-values for coefficients (q0 covariates + snp)
 #[pyfunction]
 #[pyo3(signature = (y, x, ixx, g, step=10000, threads=0))]
-fn glmf32<'py>(
+pub fn glmf32<'py>(
     py: Python<'py>,
     y: PyReadonlyArray1<'py, f64>,
     x: PyReadonlyArray2<'py, f64>,
@@ -702,7 +702,7 @@ fn final_beta_se(
 
 #[pyfunction]
 #[pyo3(signature = (s, xcov, y_rot, low, high, g_rot_chunk, max_iter=50, tol=1e-2, threads=0))]
-fn lmm_reml_chunk_f32<'py>(
+pub fn lmm_reml_chunk_f32<'py>(
     py: Python<'py>,
     s: PyReadonlyArray1<'py, f64>,
     xcov: PyReadonlyArray2<'py, f64>,
@@ -808,15 +808,4 @@ fn lmm_reml_chunk_f32<'py>(
     });
 
     Ok((beta_se_p, lambdas))
-}
-
-// =============================================================================
-// Python module
-// =============================================================================
-
-#[pymodule]
-fn assoc_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(glmf32, m)?)?;
-    m.add_function(wrap_pyfunction!(lmm_reml_chunk_f32, m)?)?;
-    Ok(())
 }

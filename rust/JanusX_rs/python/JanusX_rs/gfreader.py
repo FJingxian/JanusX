@@ -1,6 +1,6 @@
 import numpy as np
 from tqdm import tqdm
-from .gfreader_rs import BedChunkReader, VcfChunkReader, count_vcf_snps, PlinkStreamWriter, VcfStreamWriter
+from .JanusX_rs import BedChunkReader, VcfChunkReader, count_vcf_snps, PlinkStreamWriter, VcfStreamWriter, SiteInfo
 
 def load_genotype_chunks(
     path_or_prefix: str,

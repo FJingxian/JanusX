@@ -1,9 +1,9 @@
 [project]
-name = "gfreader_rs"
+name = "JanusX_rs"
 version = "0.1.0"
 description = "Fast chunk-wise genotype reader (PLINK BED / VCF) powered by Rust + PyO3"
 requires-python = ">=3.9"
-dependencies = ["tqdm"]
+dependencies = ["tqdm","numpy","scipy"]
 
 [build-system]
 requires = ["maturin>=1.7,<2"]
@@ -12,5 +12,5 @@ build-backend = "maturin"
 [tool.maturin]
 bindings = "pyo3"
 strip = true
-module-name = "gfreader_rs"
+module-name = "JanusX_rs"
 python-source = "python"

@@ -324,7 +324,7 @@ class LMM:
         self.pve = pve
 
         # Adaptive bounds around null (if PVE not degenerate)
-        if pve > 0.999 or pve < 0.001:
+        if pve > 0.95 or pve < 0.05:
             self.bounds = (-5, 5)
         else:
             self.bounds = (np.log10(lbd_null) - 2, np.log10(lbd_null) + 2)

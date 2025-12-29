@@ -146,7 +146,7 @@ Tab-delimited, first column is sample ID, subsequent columns are phenotypes:
 
 - **bioplotkit** - Visualization
   - Manhattan and QQ plots
-  - PCA visualization (2D and 3D)
+  - PCA visualization (2D and 3D GIF)
   - LD block visualization
 
 ### CLI Entry Points (src/script/)
@@ -183,6 +183,29 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 
 - **Method 1 (VanRaden)**: Centered GRM (default)
 - **Method 2 (Yang)**: Standardized/weighted GRM
+
+## Conda Packaging
+
+If you want to upload JanusX to conda/bioconda, prepare a recipe with:
+
+- `meta.yaml` (package metadata, dependencies, entry points)
+- `build.sh` / `bld.bat` (build steps, call `pip install .`)
+- `conda_build_config.yaml` (optional pinning)
+- Tests in `meta.yaml` (e.g. `jx -h`, `python -c "import JanusX"`)
+
+Minimal steps:
+
+```bash
+# build local recipe in this repo
+conda build conda/recipe
+```
+
+If you publish to conda-forge, you will also need:
+- `conda-smithy` and a feedstock repo
+- CI setup for linux/macOS builds
+
+For Bioconda submission, fork `bioconda-recipes`, add `recipes/janusx`,
+and run `bioconda-utils build --packages janusx`.
 
 ## Python Version
 

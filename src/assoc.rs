@@ -910,18 +910,20 @@ pub fn lmm_assoc_chunk_f32<'py>(
             .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
     };
 
-    // Flatten X for faster access
-    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    // Use contiguous slice directly (no copy)
+    let xcov_slice: &[f64] = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
     let p = p_cov;
 
-    // Build weights W = V^{-1} = 1/(s + lbd)
-    let mut w = vec![0.0_f64; n];
+    // Build weights W = V^{-1} = 1/(s + lbd) (store as f32 to reduce bandwidth)
+    let mut w = vec![0.0_f32; n];
     for i in 0..n {
         let vv = s[i] + lbd;
         if vv <= 0.0 {
             return Err(PyRuntimeError::new_err("non-positive s[i]+lbd"));
         }
-        w[i] = 1.0 / vv;
+        w[i] = (1.0 / vv) as f32;
     }
 
     // Precompute A = X'WX, b = X'Wy, yWy
@@ -930,15 +932,17 @@ pub fn lmm_assoc_chunk_f32<'py>(
     let mut ywy = 0.0_f64;
 
     for i in 0..n {
-        let wi = w[i];
+        let wi = w[i] as f64;
         let yi = y[i];
         ywy += wi * yi * yi;
 
-        let xi = &xcov_flat[i * p..(i + 1) * p];
+        let base = i * p;
         for r in 0..p {
-            b[r] += wi * xi[r] * yi;
+            let xir = xcov_slice[base + r];
+            b[r] += wi * xir * yi;
             for c in 0..=r {
-                a[r * p + c] += wi * xi[r] * xi[c];
+                let xic = xcov_slice[base + c];
+                a[r * p + c] += wi * xir * xic;
             }
         }
     }
@@ -998,17 +1002,17 @@ pub fn lmm_assoc_chunk_f32<'py>(
 
                         for i in 0..n {
                             let gi = g_arr[(idx, i)] as f64;
-                            let wi = w[i];
+                            let wi = w[i] as f64;
                             let yi = y[i];
-                            let xrow = &xcov_flat[i * p..(i + 1) * p];
+                            let base = i * p;
 
                             let wgi = wi * gi;
                             d += wgi * gi;
                             e += wgi * yi;
 
-                            // c[r] += wgi * xrow[r]
+                            // c[r] += wgi * xcov[i, r]
                             for r in 0..p {
-                                scr.c[r] += wgi * xrow[r];
+                                scr.c[r] += wgi * xcov_slice[base + r];
                             }
                         }
 

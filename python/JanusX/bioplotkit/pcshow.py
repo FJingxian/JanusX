@@ -55,7 +55,7 @@ class PCSHOW:
         except:
             raise ImportError("Please use pip install plotly or conda install plotly")
         data = self.data.reset_index().copy()
-        data['size'] = 8
+        data['size'] = 5
         if group:
             data[group] = data[group].fillna('others')
             groups = data[group].unique()
@@ -70,7 +70,10 @@ class PCSHOW:
                             hover_name=data.columns[0],
                             color=group if group is not None else None,
                             size='size',
+                            opacity=0.7,
                             color_discrete_map=color if group is not None else None,)
+        # Remove marker outlines to avoid white-edge overlap
+        fig.update_traces(marker=dict(line=dict(width=0)))
         if group and anno_tag:
             data_anno = data.loc[~data[anno_tag].isna()]
             if not data_anno.empty:
@@ -80,28 +83,31 @@ class PCSHOW:
                     z=data_anno[z],
                     mode='markers+text',  # show markers and text
                     marker=dict(
-                        symbol='circle-open',
-                        color='#6ff01a',
-                        size=8,
+                        symbol='diamond',
+                        color='#39ff14',
+                        size=12,
                         opacity=1.0,
-                        line=dict(width=2, color='#6ff01a')
+                        line=dict(width=3, color='#39ff14')
                     ),
                     text=data_anno[anno_tag],  # show id text
                     textposition="top center",  # text loc
                     textfont=dict(
                         size=12,
-                        color='black'
+                        color='#39ff14'
                     ),
                     name='Hilighted',
                     hoverinfo='text',
                     showlegend=True
                 ))
         fig.update_layout(
-        title='PCA',
+        title=None,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         scene=dict(
-            xaxis_title=x,
-            yaxis_title=y,
-            zaxis_title=z,
+            xaxis=dict(title=x, tickfont=dict(color="black"), titlefont=dict(color="black")),
+            yaxis=dict(title=y, tickfont=dict(color="black"), titlefont=dict(color="black")),
+            zaxis=dict(title=z, tickfont=dict(color="black"), titlefont=dict(color="black")),
             # cube aspect
             aspectmode='cube' if equal_aspect else 'auto'
         ),

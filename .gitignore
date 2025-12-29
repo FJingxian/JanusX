@@ -30,6 +30,8 @@ test*
 # Tooling
 uv.lock
 .python-version
+webapp/db.sqlite3
+webapp/media/
 
 # OS files
 .DS_Store
@@ -40,3 +42,6 @@ target
 
 # External binaries
 ext/bin/*
+
+# Webapp test
+webapp

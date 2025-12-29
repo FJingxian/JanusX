@@ -481,7 +481,7 @@ def main(log: bool = True):
         )
 
         out_html = f"{args.out}/{args.prefix}.eigenvec.3D.html"
-        fig.write_html(out_html)
+        fig.write_html(out_html, config={"displayModeBar": False})
         logger.info(f"3D PCA figure saved to {out_html.replace('//', '/')}")
 
     if args.gif3D:

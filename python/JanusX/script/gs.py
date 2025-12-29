@@ -533,8 +533,8 @@ def main(log: bool = True) -> None:
             if args.plot:
                 fig = plt.figure(figsize=(5, 4), dpi=300)
                 gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
-                out_pdf = f"{args.out}/{args.prefix}.{trait_name}.gs.{method}.pdf"
-                plt.savefig(out_pdf, transparent=True)
+                out_svg = f"{args.out}/{args.prefix}.{trait_name}.gs.{method}.svg"
+                plt.savefig(out_svg, transparent=False, facecolor="white")
                 plt.close(fig)
 
             # ------------------------------------------------------------------

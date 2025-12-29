@@ -172,7 +172,7 @@ def GWASplot(file: str, args, logger) -> None:
 
         plt.tight_layout()
         manh_path = f"{args.out}/{args.prefix}.manh.{args.format}"
-        plt.savefig(manh_path, transparent=True)
+        plt.savefig(manh_path, transparent=False, facecolor="white")
         plt.close(fig)
 
         # ----------------- QQ plot -----------------
@@ -181,7 +181,7 @@ def GWASplot(file: str, args, logger) -> None:
         plotmodel.qq(ax=ax2, color_set=plot_colors)
         plt.tight_layout()
         qq_path = f"{args.out}/{args.prefix}.qq.{args.format}"
-        plt.savefig(qq_path, transparent=True)
+        plt.savefig(qq_path, transparent=False, facecolor="white")
         plt.close(fig)
 
         logger.info(

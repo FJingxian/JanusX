@@ -87,6 +87,7 @@ def fastplot(
     """
     Quick diagnostic plot of GWAS results: phenotype histogram, Manhattan, QQ.
     """
+    mpl.rcParams["font.size"] = 12
     results = gwasresult.astype({"POS": "int64"})
     fig = plt.figure(figsize=(16, 4), dpi=300)
     layout = [["A", "B", "B", "C"]]
@@ -106,7 +107,7 @@ def fastplot(
     gwasplot.qq(ax=axes["C"])
 
     plt.tight_layout()
-    plt.savefig(outpdf, transparent=True)
+    plt.savefig(outpdf, transparent=False, facecolor="white")
 
 
 def determine_genotype_source(args) -> tuple[str, str]:
@@ -557,7 +558,7 @@ def run_chunked_gwas_lmm_lm(
                 df,
                 y_vec,
                 xlabel=pname,
-                outpdf=f"{outprefix}.{pname}.{model_name}.pdf",
+                outpdf=f"{outprefix}.{pname}.{model_name}.svg",
             )
 
         df = df.astype({"p": "object"})
@@ -729,7 +730,7 @@ def run_farmcpu_fullmem(
                 res_df,
                 p_sub,
                 xlabel=phename,
-                outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.pdf",
+                outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
             )
 
         res_df = res_df.astype({"p": "object"})

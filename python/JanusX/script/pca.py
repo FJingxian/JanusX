@@ -236,10 +236,6 @@ def main(log: bool = True):
     )
     optional_group.add_argument(
         "-plot3D", "--plot3D", action="store_true", default=False,
-        help="Generate 3D interactive scatter plot for PC1–PC3 (default: %(default)s)",
-    )
-    optional_group.add_argument(
-        "-gif3D", "--gif3D", action="store_true", default=False,
         help="Generate 3D rotating GIF for PC1–PC3 (default: %(default)s)",
     )
     optional_group.add_argument(
@@ -306,7 +302,7 @@ def main(log: bool = True):
             logger.info(f"PCA prefix:       {gfile} (visualization only)")
         if args.plot or args.plot3D:
             logger.info(f"2D visualization: {args.plot}")
-            logger.info(f"3D visualization: {args.plot3D}")
+            logger.info(f"3D visualization (GIF): {args.plot3D}")
         if args.group:
             logger.info(f"Group file:      {args.group}")
             logger.info(
@@ -417,7 +413,7 @@ def main(log: bool = True):
         raise RuntimeError("PCA results are not available; check input arguments.")
 
     # ------------------------- Visualization -------------------------
-    if args.plot or args.plot3D or args.gif3D:
+    if args.plot or args.plot3D:
         exp = 100 * eigenval / np.sum(eigenval)
         df_pc = pd.DataFrame(
             eigenvec[:, :3],
@@ -469,22 +465,6 @@ def main(log: bool = True):
         logger.info(f"2D PCA figure saved to {out_pdf.replace('//', '/')}")
 
     if args.plot3D:
-        logger.info("* Generating 3D PCA scatter plot...")
-        pcshow = PCSHOW(df_pc)
-        fig = pcshow.pcplot3D(
-            df_pc.columns[0],
-            df_pc.columns[1],
-            df_pc.columns[2],
-            group=group,
-            anno_tag=textanno,
-            color_set=args.color,
-        )
-
-        out_html = f"{args.out}/{args.prefix}.eigenvec.3D.html"
-        fig.write_html(out_html, config={"displayModeBar": False})
-        logger.info(f"3D PCA figure saved to {out_html.replace('//', '/')}")
-
-    if args.gif3D:
         logger.info("* Generating 3D PCA rotating GIF...")
         pcshow = PCSHOW(df_pc)
         out_gif = f"{args.out}/{args.prefix}.eigenvec.3D.gif"

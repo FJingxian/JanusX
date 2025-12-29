@@ -55,7 +55,7 @@ class PCSHOW:
         except:
             raise ImportError("Please use pip install plotly or conda install plotly")
         data = self.data.reset_index().copy()
-        data['size'] = 5
+        data['size'] = 4
         if group:
             data[group] = data[group].fillna('others')
             groups = data[group].unique()
@@ -83,7 +83,7 @@ class PCSHOW:
                     z=data_anno[z],
                     mode='markers+text',  # show markers and text
                     marker=dict(
-                        symbol='diamond',
+                        symbol='circle-open',
                         color='#39ff14',
                         size=12,
                         opacity=1.0,
@@ -105,9 +105,9 @@ class PCSHOW:
         paper_bgcolor="white",
         plot_bgcolor="white",
         scene=dict(
-            xaxis=dict(title=x, tickfont=dict(color="black"), titlefont=dict(color="black")),
-            yaxis=dict(title=y, tickfont=dict(color="black"), titlefont=dict(color="black")),
-            zaxis=dict(title=z, tickfont=dict(color="black"), titlefont=dict(color="black")),
+            xaxis=dict(title=dict(text=x, font=dict(color="black")), tickfont=dict(color="black")),
+            yaxis=dict(title=dict(text=y, font=dict(color="black")), tickfont=dict(color="black")),
+            zaxis=dict(title=dict(text=z, font=dict(color="black")), tickfont=dict(color="black")),
             # cube aspect
             aspectmode='cube' if equal_aspect else 'auto'
         ),

@@ -10,7 +10,7 @@ warnings.filterwarnings(
 import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.backends.backend_pdf # pdf support
-from script import gwas,gs,postGWAS,grm,pca,sim,lm,lmm,farmcpu
+from script import gwas,gs,postGWAS,grm,pca,sim
 
 __logo__ = r'''
        _                      __   __
@@ -23,8 +23,8 @@ __logo__ = r'''
 __version__ = 'JanusX v1.0.1'
 
 def main():
-    module = dict(zip(['gwas','lm','lmm','farmcpu','postGWAS','grm','pca','gs','sim'],
-                      [gwas,lm,lmm,farmcpu,postGWAS,grm,pca,gs,sim]))
+    module = dict(zip(['gwas','postGWAS','grm','pca','gs','sim'],
+                      [gwas,postGWAS,grm,pca,gs,sim]))
     print(__logo__)
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':

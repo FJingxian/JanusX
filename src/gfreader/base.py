@@ -1,5 +1,6 @@
 import time
-from bed_reader import open_bed
+from itertools import takewhile,repeat
+from JanusX_rs.gfreader import load_genotype_chunks,inspect_genotype_file
 import numpy as np
 import pandas as pd
 import gzip
@@ -50,15 +51,22 @@ class GENOMETOOL:
         self.exchange_loc:bool = (ref_alt.iloc[:,0]!=ref)
         return ref_alt.astype('category')
 
-def breader(prefix:str,ref_adjust:str=None) -> pd.DataFrame:
+def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
-    with open_bed(f"{prefix}.bed",count_A1=False) as bed:
-        genotype = bed.read(dtype='int8')
-    fam = pd.read_csv(f'{prefix}.fam',sep=r'\s+',header=None)
+    idv,m = inspect_genotype_file(prefix)
+    chunks = load_genotype_chunks(prefix,chunk_size)
+    genotype = np.zeros(shape=(len(idv),m),dtype='int8')
+    pbar = tqdm(total=m, desc="Loading bed",ascii=True)
+    num = 0
+    for chunk,_ in chunks:
+        cksize = chunk.shape[0]
+        genotype[:,num:num+cksize] = chunk.T
+        num += cksize
+        pbar.update(cksize)
     bim = pd.read_csv(f'{prefix}.bim',sep=r'\s+',header=None)
-    genotype = pd.DataFrame(genotype,index=fam[1],).T
+    genotype = pd.DataFrame(genotype,index=idv,).T
     genotype = pd.concat([bim[[0,3,4,5]],genotype],axis=1)
-    genotype.columns = ['#CHROM','POS','A0','A1']+fam[1].to_list()
+    genotype.columns = ['#CHROM','POS','A0','A1']+idv
     genotype = genotype.set_index(['#CHROM','POS'])
     if ref_adjust is not None:
         adjust_m = GENOMETOOL(ref_adjust)
@@ -69,7 +77,6 @@ def breader(prefix:str,ref_adjust:str=None) -> pd.DataFrame:
 
 def vcfreader(vcfPath:str,chunksize=50_000,ref_adjust:str=None,vcftype:str=None) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
-    from itertools import takewhile,repeat
     buffer = 8*1024*1024
     if '.gz' == vcfPath[-3:]:
         compression = 'gzip'

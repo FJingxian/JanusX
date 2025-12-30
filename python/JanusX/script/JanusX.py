@@ -11,6 +11,11 @@ import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.backends.backend_pdf # pdf support
 from JanusX.script import gwas,gs,postGWAS,grm,pca,sim
+from importlib.metadata import version, PackageNotFoundError
+try:
+    v = version("janusx")
+except PackageNotFoundError:
+    v = "0.0.0"
 
 __logo__ = r'''
        _                      __   __
@@ -18,9 +23,9 @@ __logo__ = r'''
       | | __ _ _ __  _   _ ___ \ V / 
   _   | |/ _` | '_ \| | | / __| > <  
  | |__| | (_| | | | | |_| \__ \/ . \ 
-  \____/ \__,_|_| |_|\__,_|___/_/ \_\
+  \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
 '''
-__version__ = 'JanusX v1.0.3 by Jingxian FU in Yazhouwan National Laboratory'
+__version__ = f'{'*'*60}\n>JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n>Please report bugs to <fujingxian@yzwlab.cn>\nBuild in 2025.12.31\n{'*'*60}'
 
 def main():
     module = dict(zip(['gwas','postGWAS','grm','pca','gs','sim'],

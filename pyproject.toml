@@ -1,6 +1,6 @@
 [project]
 name = "janusx"
-version = "1.0.3"
+version = "1.0.4"
 description = "A Suite of Genotyping Tools for Genome-Wide Association Study and Genomic Selection"
 requires-python = ">=3.10,<3.13"
 dependencies = [

@@ -10,7 +10,7 @@ dependencies = [
     "matplotlib",
     "psutil",
     "tqdm",
-    "scikit-learn==1.8.0",
+    "scikit-learn",
     "joblib>=1.5.2",
 ]
 authors = [

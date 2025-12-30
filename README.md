@@ -10,42 +10,41 @@ It provides significant performance improvements over tools like GEMMA, GCTA, an
 
 ## Installation
 
+### PyPI
+
+```bash
+pip install janusx
+```
+
+### From Source
+
 ```bash
 git clone https://github.com/MaizeMan-JxFU/JanusX.git
 cd JanusX
-sh ./install.sh
+pip install .
 ```
 
-The install script uses `uv` for dependency management and creates a virtual environment in `.venv/`.
+Building from source requires a Rust toolchain (maturin will compile the native core).
 
 ### Pre-compiled Releases
 
-For convenience, we also provide pre-compiled binaries that don't require building from source. The releases are available at [Releases v1.0.0](https://github.com/MaizeMan-JxFU/JanusX/releases/tag/v1.0.0) for the following platforms:
-
-- **Linux AMD64**: [JanusX-v1.0.0-linux-AMD64.tgz](https://github.com/MaizeMan-JxFU/JanusX/releases/download/v1.0.0/JanusX-v1.0.0-linux-AMD64.tgz)
-- **Windows AMD64**: [JanusX-v1.0.0-windows-AMD64.tgz](https://github.com/MaizeMan-JxFU/JanusX/releases/download/v1.0.0/JanusX-v1.0.0-windows-AMD64.tgz)
-
-Simply download and extract the archive, then run the executable directly.
-
-**Note**: Windows installation is no longer supported. Please use Linux/macOS or Windows Subsystem for Linux (WSL). But there is a pre-build version for Windows.
+We provide pre-compiled binaries on the [GitHub Releases](https://github.com/MaizeMan-JxFU/JanusX/releases) page for Windows, Linux, and macOS.
+Download and extract the archive, then run the executable directly.
 
 ## Running the CLI
 
 ```bash
-./jx -h
-./jx <module> [options]
+jx -h
+jx <module> [options]
 ```
 
-Note that running `./jx -h` might take a while at first! This is because the Python interpreter is compiling source code into the `pycache` directory. Subsequent runs will use the pre-compiled code and load much faster!
+Note that running `jx -h` might take a while at first! This is because the Python interpreter is compiling source code into the `pycache` directory. Subsequent runs will use the pre-compiled code and load much faster!
 
 ## Available Modules
 
 | Module | Description |
 |:-------|:------------|
-| `gwas` | Unified GWAS wrapper (LM/LMM/FarmCPU) |
-| `lm` | Linear Model GWAS (streaming, low-memory) |
-| `lmm` | Linear Mixed Model GWAS (streaming, low-memory) |
-| `farmcpu` | FarmCPU GWAS (high-memory) |
+| `gwas` | Unified GWAS wrapper (LM/LMM/fastLMM/FarmCPU) |
 | `gs` | Genomic Selection (GBLUP, rrBLUP) |
 | `postGWAS` | Visualization and annotation |
 | `grm` | Genetic relationship matrix calculation |
@@ -58,44 +57,39 @@ Note that running `./jx -h` might take a while at first! This is because the Pyt
 
 ```bash
 # Using unified gwas module (select one or more models)
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm --out results
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o results
 
-# Run all three models at once
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --farmcpu --out results
-
-# Or use individual modules directly
-./jx lm --vcf data.vcf.gz --pheno pheno.txt --out results
-./jx lmm --vcf data.vcf.gz --pheno pheno.txt --out results
-./jx farmcpu --vcf data.vcf.gz --pheno pheno.txt --out results
+# Run multiple models at once
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o results
 
 # With PLINK format
-./jx gwas --bfile genotypes --pheno phenotypes.txt --out results --grm 1 --qcov 3 --thread 8
+jx gwas --bfile genotypes --pheno phenotypes.txt --grm 1 --qcov 3 --thread 8 -o results
 
-# With diagnostic plots
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm --plot --out results
+# With diagnostic plots (SVG)
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm --plot -o results
 ```
 
 ### Genomic Selection
 
 ```bash
 # Run both GS models
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP --out results
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o results
 
 # Specific models
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --out results
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP -o results
 
 # With PCA-based dimensionality reduction
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd --out results
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd -o results
 ```
 
 ### Visualization
 
 ```bash
 # Generate Manhattan and QQ plots
-./jx postGWAS -f results/*.lmm.tsv --threshold 1e-6
+jx postGWAS -f results/*.lmm.tsv --threshold 1e-6
 
 # With SNP annotation
-./jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 100
+jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 50
 ```
 
 ![manhanden&qq](./fig/test0.png "Simple visualization")
@@ -106,10 +100,10 @@ Test data in example is from [genetics-statistics/GEMMA](https://github.com/gene
 
 ```bash
 # Compute GRM
-./jx grm --vcf data.vcf.gz --out results
+jx grm --vcf data.vcf.gz -o results
 
 # PCA analysis
-./jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D --out results
+jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D -o results
 ```
 
 ## Input File Formats
@@ -130,25 +124,29 @@ Tab-delimited, first column is sample ID, subsequent columns are phenotypes:
 
 ## Architecture
 
-### Core Libraries (src/)
+### Core Libraries
 
-- **pyBLUP** - Core statistical engine
+- **python/janusx/pyBLUP** - Core statistical engine
   - GWAS implementations (LM, LMM, FarmCPU)
   - QK matrix calculation with memory-optimized chunking
   - PCA computation with randomized SVD
   - Cross-validation utilities
 
-- **gfreader** - Genotype file I/O
+- **python/janusx/gfreader** - Genotype file I/O
   - VCF reader
   - PLINK binary reader (.bed/.bim/.fam)
   - NumPy format support
 
-- **bioplotkit** - Visualization
+- **python/janusx/bioplotkit** - Visualization
   - Manhattan and QQ plots
   - PCA visualization (2D and 3D GIF)
   - LD block visualization
 
-### CLI Entry Points (src/script/)
+### Native Core (src/)
+
+Rust kernels for fast linear algebra and association testing.
+
+### CLI Entry Points (python/janusx/script/)
 
 Each module corresponds to a CLI command. The launcher script (`jx`) dispatches to `script/<name>.py`.
 
@@ -166,6 +164,7 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 |--------|-------------|----------|
 | **Linear Model (LM)** | Standard GLM for association testing | Large datasets without population structure |
 | **Linear Mixed Model (LMM)** | Incorporates kinship matrix to control population structure | Most GWAS scenarios |
+| **fastLMM** | Fixed-lambda mixed model for speed | Fast approximate screening |
 | **FarmCPU** | Iterative fixed/random effect alternation | High power with strict false positive control |
 
 ### GS Methods
@@ -180,47 +179,20 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 - **Method 1 (VanRaden)**: Centered GRM (default)
 - **Method 2 (Yang)**: Standardized/weighted GRM
 
-## Conda Packaging
-
-If you want to upload JanusX to conda/bioconda, prepare a recipe with:
-
-- `meta.yaml` (package metadata, dependencies, entry points)
-- `build.sh` / `bld.bat` (build steps, call `pip install .`)
-- `conda_build_config.yaml` (optional pinning)
-- Tests in `meta.yaml` (e.g. `jx -h`, `python -c "import JanusX"`)
-
-Minimal steps:
-
-```bash
-# build local recipe in this repo
-conda build conda/recipe
-```
-
-If you publish to conda-forge, you will also need:
-- `conda-smithy` and a feedstock repo
-- CI setup for linux/macOS builds
-
-For Bioconda submission, fork `bioconda-recipes`, add `recipes/janusx`,
-and run `bioconda-utils build --packages janusx`.
-
 ## Python Version
 
-Requires Python 3.9+
+Requires Python 3.10+
+
+## Test Data
+
+Example data in `example/` directory from Parker et al, Nature Genetics, 2016 (via GEMMA project)
 
 ## Citation
 
 ```bibtex
 @software{JanusX,
   title = {JanusX: High-performance GWAS and Genomic Selection Suite},
-  author = {MaizeMan-JxFU},
+  author = {Jingxian FU},
   url = {https://github.com/MaizeMan-JxFU/JanusX}
 }
 ```
-
-## Test Data
-
-Example data in `example/` directory from Parker et al, Nature Genetics, 2016 (via GEMMA project)
-
-## Documentation
-
-For detailed CLI documentation, see [CLI_README.md](./doc/CLI_README.md)

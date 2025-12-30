@@ -1,8 +1,6 @@
-# JanusX CLI 模块文档 | CLI Module Documentation
+# JanusX CLI 文档
 
 本文档描述 JanusX 所有命令行工具的用法。
-
-This document describes all command-line tools in JanusX.
 
 ---
 
@@ -18,18 +16,18 @@ This document describes all command-line tools in JanusX.
 
 ---
 
-## 快速开始 | Quick Start
+## 快速开始
 
 ```bash
 # 查看帮助
-./jx -h
-./jx <module> -h
+jx -h
+jx <module> -h
 
 # 示例：运行 GWAS 分析
-./jx gwas --vcf example.vcf.gz --pheno phenotype.txt --out results
+jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
 ```
 
-### 输入格式 | Input Formats
+### 输入格式
 
 **基因型文件 (Genotype)**:
 
@@ -59,22 +57,26 @@ This document describes all command-line tools in JanusX.
 |------|----------|------|------|
 | **LM** | 大样本、无明显群体结构 | 速度快、内存占用低 | 无法控制群体结构导致的假阳性 |
 | **LMM** | 有群体结构或亲缘关系 | 控制假阳性、检验力较高 | 计算量较大 |
+| **fastLMM** | 固定 lambda 的混合模型 | 速度快、适合筛选 | 近似解 |
 | **FarmCPU** | 需要平衡检验力和假阳性 | 双重检验、控制混杂 | 需要全量基因型，内存要求高 |
 
 ### 使用方法
 
 ```bash
 # LM 模型 (流式/低内存)
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --out out/
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm -o out/
 
 # LMM 模型 (流式/低内存)
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm --out out/
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o out/
+
+# fastLMM 模型 (固定 lambda)
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --fastlmm -o out/
 
 # FarmCPU 模型 (全内存)
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --farmcpu --out out/
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --farmcpu -o out/
 
 # 同时运行多个模型
-./jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --farmcpu --out out/
+jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o out/
 ```
 
 ### 参数说明
@@ -87,6 +89,7 @@ This document describes all command-line tools in JanusX.
 | `-n/--ncol` | 表型列索引 (1-based，可多次指定) | 全部列 |
 | `-lm/--lm` | 运行 LM 模型 | False |
 | `-lmm/--lmm` | 运行 LMM 模型 | False |
+| `-fastlmm/--fastlmm` | 运行 fastLMM (固定 lambda) | False |
 | `-farmcpu/--farmcpu` | 运行 FarmCPU 模型 | False |
 | `-k/--grm` | GRM 计算方法: `1`(居中), `2`(标准化), 或预计算矩阵路径 | "1" |
 | `-q/--qcov` | 主成分数量或 Q 矩阵文件路径 | "0" |
@@ -103,9 +106,9 @@ This document describes all command-line tools in JanusX.
 |------|------|
 | `{prefix}.{trait}.lm.tsv` | LM 模型结果 |
 | `{prefix}.{trait}.lmm.tsv` | LMM 模型结果 |
+| `{prefix}.{trait}.fastlmm.tsv` | fastLMM 模型结果 |
 | `{prefix}.{trait}.farmcpu.tsv` | FarmCPU 模型结果 |
-| `{prefix}.{trait}.{model}.manh.png` | Manhattan 图 (如启用) |
-| `{prefix}.{trait}.{model}.qq.png` | QQ 图 (如启用) |
+| `{prefix}.{trait}.{model}.svg` | 直方、Manhattan 和 QQ 图 (如启用) |
 
 **结果文件格式** (制表符分隔):
 
@@ -139,16 +142,16 @@ This document describes all command-line tools in JanusX.
 
 ```bash
 # 运行全部模型
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP --out out/
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o out/
 
 # 指定模型
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --out out/
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP -o out/
 
 # 指定特定表型列 (1-based 索引)
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --n 0 --GBLUP --out out/
+jx gs --vcf data.vcf.gz --pheno pheno.txt --n 0 --GBLUP -o out/
 
 # 启用 PCA 降维并生成可视化
-./jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd --plot --out out/
+jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd --plot -o out/
 ```
 
 ### 参数说明
@@ -163,7 +166,7 @@ This document describes all command-line tools in JanusX.
 | `-pcd/--pcd` | 启用 PCA 降维 (自动选择主成分数) | False |
 | `-n/--ncol` | 表型列索引 (1-based) | 全部列 |
 | `-plot/--plot` | 生成预测结果散点图 | False |
-| `-o/--out` | 输出目录 | 同基因型目录 |
+| `-o/--out` | 输出目录 | 当前目录 |
 | `-prefix/--prefix` | 输出文件前缀 | 自动生成 |
 
 ### 输出文件
@@ -171,7 +174,7 @@ This document describes all command-line tools in JanusX.
 | 文件 | 说明 |
 |------|------|
 | `{prefix}.{trait}.gs.tsv` | 各模型的 GEBV 预测值 |
-| `{prefix}.{trait}.gs.pdf` | 预测值与真实值散点图 (如启用) |
+| `{prefix}.{trait}.gs.{model}.svg` | 预测值与真实值散点图 (如启用) |
 
 **结果文件格式** (制表符分隔):
 
@@ -201,13 +204,13 @@ This document describes all command-line tools in JanusX.
 
 ```bash
 # 默认方法 (居中 GRM)
-./jx grm --vcf data.vcf.gz --out out/
+jx grm --vcf data.vcf.gz -o out/
 
 # 标准化方法
-./jx grm --vcf data.vcf.gz --method 2 --out out/
+jx grm --vcf data.vcf.gz --method 2 -o out/
 
 # 输出为压缩格式 (节省空间)
-./jx grm --vcf data.vcf.gz --npz --out out/
+jx grm --vcf data.vcf.gz --npz -o out/
 ```
 
 ### 参数说明
@@ -218,7 +221,7 @@ This document describes all command-line tools in JanusX.
 | `-bfile/--bfile` | PLINK 格式前缀 | 互斥组 |
 | `-m/--method` | GRM 计算方法: `1`(居中), `2`(标准化) | 1 |
 | `-npz/--npz` | 保存为压缩 NPZ 格式 (节省空间) | False |
-| `-o/--out` | 输出目录 | 同基因型目录 |
+| `-o/--out` | 输出目录 | 当前目录 |
 | `-prefix/--prefix` | 输出文件前缀 | 自动生成 |
 
 ### 输出文件
@@ -230,6 +233,7 @@ This document describes all command-line tools in JanusX.
 | `{prefix}.grm.npz` | GRM 矩阵 (压缩格式，如启用) |
 
 **GRM 矩阵说明**:
+
 - 对角线元素表示个体与自身的遗传关系，理论值为 1 (纯合) ~ 2 (完全杂合)
 - 非对角线元素表示两个体间的遗传关系，范围 0~2
 
@@ -240,6 +244,7 @@ This document describes all command-line tools in JanusX.
 ### 模块说明
 
 主成分分析 (Principal Component Analysis, PCA) 用于揭示群体遗传结构，常用于:
+
 - 检测群体分层
 - 识别离群个体
 - 作为 GWAS 的协变量校正群体结构
@@ -248,22 +253,22 @@ This document describes all command-line tools in JanusX.
 
 ```bash
 # 从 VCF 计算 PCA
-./jx pca --vcf data.vcf.gz --out out/
+jx pca --vcf data.vcf.gz -o out/
 
 # 从 PLINK 计算
-./jx pca --bfile data --out out/
+jx pca --bfile data -o out/
 
 # 从预计算 GRM 计算
-./jx pca --grm prefix --out out/
+jx pca --grm prefix -o out/
 
 # 从已有 PCA 结果可视化
-./jx pca --pcfile prefix --plot --plot3D --out out/
+jx pca --pcfile prefix --plot --plot3D -o out/
 
 # 指定输出维度并可视化
-./jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D --out out/
+jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D -o out/
 
 # 添加分组信息
-./jx pca --vcf data.vcf.gz --plot --group groups.txt --out out/
+jx pca --vcf data.vcf.gz --plot --group groups.txt -o out/
 ```
 
 ### 参数说明
@@ -276,15 +281,15 @@ This document describes all command-line tools in JanusX.
 | `-pcfile/--pcfile` | 已有 PCA 结果前缀 | 互斥组 |
 | `-dim/--dim` | 输出主成分数量 | 3 |
 | `-plot/--plot` | 生成 2D 散点图 | False |
-| `-plot3D/--plot3D` | 生成 3D 交互图 (HTML) | False |
+| `-plot3D/--plot3D` | 生成 3D 旋转 GIF | False |
 | `-group/--group` | 分组文件路径 (ID, 分组, [标签]) | None |
 | `-color/--color` | 颜色方案索引 (0-6) | 1 |
-| `-o/--out` | 输出目录 | 自动 |
+| `-o/--out` | 输出目录 | 当前目录 |
 | `-prefix/--prefix` | 输出文件前缀 | 自动生成 |
 
 ### 分组文件格式
 
-```
+```text
 ID      Group   Label (可选)
 indv1   PopA    Sample1
 indv2   PopA    Sample2
@@ -299,7 +304,8 @@ indv3   PopB    Sample3
 | `{prefix}.eigenvec.id` | 样本 ID 列表 |
 | `{prefix}.eigenval` | 各主成分的特征值 |
 | `{prefix}.eigenvec.2D.pdf` | 2D 散点图 (如启用) |
-| `{prefix}.eigenvec.3D.html` | 3D 交互图 (如启用) |
+| `{prefix}.eigenvec.3D.gif` | 3D 旋转 GIF (如启用) |
+| `{prefix}.eigenvec.3D.gif` | 3D 旋转 GIF (如启用) |
 
 ---
 
@@ -308,6 +314,7 @@ indv3   PopB    Sample3
 ### 模块说明
 
 对 GWAS 分析结果进行可视化，包括:
+
 - **Manhattan 图**: 展示各染色体上 SNP 的 P 值分布
 - **QQ 图**: 检验 GWAS 结果是否符合预期 (判断混杂)
 - **SNP 注释**: 将显著位点关联到基因功能区域
@@ -316,28 +323,28 @@ indv3   PopB    Sample3
 
 ```bash
 # 基本用法
-./jx postGWAS -f result.assoc.tsv
+jx postGWAS -f result.assoc.tsv
 
 # 指定列名
-./jx postGWAS -f result.tsv -chr "chr" -pos "pos" -pvalue "P_wald"
+jx postGWAS -f result.tsv -chr "chr" -pos "pos" -pvalue "P_wald"
 
 # 设置显著性阈值
-./jx postGWAS -f result.tsv --threshold 1e-6
+jx postGWAS -f result.tsv --threshold 1e-6
 
 # 高亮特定 SNP 区域
-./jx postGWAS -f result.tsv --highlight snps.bed
+jx postGWAS -f result.tsv --highlight snps.bed
 
 # 注释显著 SNP
-./jx postGWAS -f result.tsv -a annotation.gff
+jx postGWAS -f result.tsv -a annotation.gff
 
 # 扩展注释窗口 (±100kb)
-./jx postGWAS -f result.tsv -a annotation.gff --annobroaden 100
+jx postGWAS -f result.tsv -a annotation.gff --annobroaden 100
 
 # 指定输出格式和颜色
-./jx postGWAS -f result.tsv --format pdf --color 2
+jx postGWAS -f result.tsv --format pdf --color 2
 
 # 批量处理多个文件
-./jx postGWAS -f results/*.tsv --threshold 1e-6 --out plots/
+jx postGWAS -f results/*.tsv --threshold 1e-6 --out plots/
 ```
 
 ### 参数说明
@@ -356,13 +363,13 @@ indv3   PopB    Sample3
 | `-a/--anno` | 注释文件路径 (GFF/GTF/BED) | None |
 | `-ab/--annobroaden` | 注释扩展窗口 (kb) | None |
 | `-descItem/--descItem` | GFF 描述字段的键名 | "description" |
-| `-o/--out` | 输出目录 | 同输入文件目录 |
+| `-o/--out` | 输出目录 | 当前目录 |
 | `-prefix/--prefix` | 日志文件前缀 | "JanusX" |
 | `-t/--thread` | 并行线程数 (`-1` 表示全部可用核心) | -1 |
 
 ### 高亮文件格式
 
-```
+```text
 chr1    start   end     name    description
 chr1    1000000 1000000 GeneA   Description of GeneA
 chr1    2000000 2000000 GeneB   Description of GeneB
@@ -371,7 +378,8 @@ chr1    2000000 2000000 GeneB   Description of GeneB
 ### 注释文件格式
 
 支持 GFF/GTF 或 BED 格式。GFF 示例:
-```
+
+```text
 chr1    .       gene    1000000 2000000 .       +       .       ID=gene1;description=Example gene
 chr1    .       mRNA    1000000 2000000 .       +       .       ID=mRNA1;Parent=gene1
 ```
@@ -396,10 +404,10 @@ chr1    .       mRNA    1000000 2000000 .       +       .       ID=mRNA1;Parent=
 
 ```bash
 # 基本用法：模拟 100k SNP，500 个体
-./jx sim 100 500 output_prefix
+jx sim 100 500 output_prefix
 
 # 自定义 SNP 数量 (k 为单位)
-./jx sim 500 1000 mydata   # 500k SNPs, 1000 individuals
+jx sim 500 1000 mydata   # 500k SNPs, 1000 individuals
 ```
 
 ### 参数说明
@@ -471,18 +479,19 @@ JanusX 会自动缓存中间结果，避免重复计算:
 ### Q: 如何解读 QQ 图？
 
 QQ 图用于检验 GWAS 结果是否存在混杂:
+
 - 点沿对角线分布: 结果正常 (符合零假设)
 - 右上角偏离对角线: 存在显著关联信号
 - 整体偏离对角线: 可能存在群体分层或技术混杂
 
 ---
 
-## 引用 | Citation
+## 引用
 
 ```bibtex
 @software{JanusX,
   title = {JanusX: High-performance GWAS and Genomic Selection Suite},
-  author = {MaizeMan-JxFU},
+  author = {Jingxian FU},
   url = {https://github.com/MaizeMan-JxFU/JanusX}
 }
 ```

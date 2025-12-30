@@ -25,7 +25,14 @@ __logo__ = r'''
  | |__| | (_| | | | | |_| \__ \/ . \ 
   \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
 '''
-__version__ = f'{'*'*60}\n>JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n>Please report bugs to <fujingxian@yzwlab.cn>\nBuild in 2025.12.31\n{'*'*60}'
+_banner_line = "*" * 60
+__version__ = (
+    f"{_banner_line}\n"
+    f">JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
+    "Please report bugs to <fujingxian@yzwlab.cn>\n"
+    "Build in 2025.12.31\n"
+    f"{_banner_line}"
+)
 
 def main():
     module = dict(zip(['gwas','postGWAS','grm','pca','gs','sim'],

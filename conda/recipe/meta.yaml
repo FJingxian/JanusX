@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://github.com/MaizeMan-JxFU/JanusX/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 7a0f1c142f53e45a99ced7f90b7de3a07f7d7303165514cf5226d933e9490601
+  sha256: f458470c848bd3ae627ad9f34df19f5aa327eb818430093fc535b3d0d960c340
 
 build:
   number: 0

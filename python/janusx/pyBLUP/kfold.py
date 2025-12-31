@@ -1,10 +1,17 @@
 import numpy as np
 def kfold(n:int,k:int=5,seed:int=520):
-    '''
-    :param n: Sample size
-    :param k: Fold size
-    :param seed: Random seed
-    '''
+    """
+    Generate k-fold train/test splits.
+
+    Parameters
+    ----------
+    n : int
+        Sample size.
+    k : int
+        Number of folds.
+    seed : int
+        Random seed.
+    """
     np.random.seed(seed)
     row = np.arange(n)
     row_ = row.copy()

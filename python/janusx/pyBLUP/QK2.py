@@ -8,12 +8,16 @@ class QK:
                  Mcopy:bool=False,maff:float=0.02,missf:float=0.05,
                  impute:typing.Literal['mean','mode']='mode',check:bool=True,
                  log:bool=True):
-        '''
-        Calculation of Q and K matrix with low memory and high speed
-        
-        :param M: marker matrix with m snps multiply n samples (0,1,2 int8)
-        :param chunksize: int (default: 500_000)
-        '''
+        """
+        Compute Q and K matrices with low memory and high throughput.
+
+        Parameters
+        ----------
+        M : np.ndarray
+            Marker matrix of shape (m, n) with genotypes coded as 0/1/2 (int8).
+        chunksize : int
+            Chunk size for streaming computation.
+        """
         self.log = log
         M = M.copy() if Mcopy else M
         NAmark = M<0 # Mark miss as bool matrix
@@ -44,10 +48,19 @@ class QK:
         self.M = M
         self.chunksize = chunksize
     def GRM(self,method:typing.Literal[1,2]=1):
-        '''
-        :param method: int {1-Centralization, 2-Standardization}
-        :return: np.ndarray, positive definite matrix or positive semidefinite matrix
-        '''
+        """
+        Compute the genomic relationship matrix (GRM).
+
+        Parameters
+        ----------
+        method : int
+            1 for centering, 2 for standardization.
+
+        Returns
+        -------
+        np.ndarray
+            A positive definite or positive semidefinite matrix.
+        """
         m,n = self.M.shape
         Mvar_sum = np.sum(self.Mvar)
         Mvar_r = 1/self.Mvar
@@ -68,14 +81,14 @@ class QK:
                     pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
         return (grm+grm.T)/2
     def PCA(self):
-        '''
-        random SVD
-        
-        :param dim: dimension of pc
-        :param iter_num: iteration numbers of Q matrix
-        
-        :return: tuple, (eigenvec[:, :dim], eigenval[:dim])
-        '''
+        """
+        Perform randomized SVD for PCA.
+
+        Returns
+        -------
+        tuple
+            (eigenvec[:, :dim], eigenval[:dim])
+        """
         m,n = self.M.shape
         Mstd = np.sqrt(self.Mvar)
         MTM = np.zeros((n,n),dtype='float32')

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX – Genomic Selection Command-Line Interface
+JanusX: Genomic Selection Command-Line Interface
 
 Supported models
 ----------------
@@ -22,7 +22,7 @@ Phenotype input format
 Cross-validation
 ----------------
   - 5-fold cross-validation is performed within the training population for each model.
-  - For each method, the fold with the highest R² on the validation set is reported
+  - For each method, the fold with the highest R^2 on the validation set is reported
     and (optionally) visualized.
 
 Genomic selection workflow
@@ -35,7 +35,7 @@ Genomic selection workflow
        - Report Pearson, Spearman, and R² per fold.
        - Use the best fold for diagnostic plotting (if enabled).
        - Refit model on full training set and predict the test set.
-  4. Write prediction results into {prefix}.{trait}.gs.tsv
+  4. Write prediction results to {prefix}.{trait}.gs.tsv.
 
 Citation
 --------
@@ -158,19 +158,19 @@ def main(log: bool = True) -> None:
     geno_group.add_argument(
         "-vcf", "--vcf",
         type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile",
         type=str,
         help="Input genotype files in PLINK binary format "
-             "(prefix for .bed, .bim, .fam)",
+             "(prefix for .bed, .bim, .fam).",
     )
     required_group.add_argument(
         "-p", "--pheno",
         type=str,
         required=True,
-        help="Phenotype file (tab-delimited, sample IDs in the first column)",
+        help="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
 
     # ------------------------------------------------------------------
@@ -182,14 +182,14 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Use GBLUP model for training and prediction "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     model_group.add_argument(
         "-rrBLUP", "--rrBLUP",
         action="store_true",
         default=False,
         help="Use rrBLUP model for training and prediction "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     # ------------------------------------------------------------------
     # Optional arguments
@@ -200,7 +200,7 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Enable PCA-based dimensionality reduction on genotypes "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-n", "--ncol",
@@ -208,27 +208,27 @@ def main(log: bool = True) -> None:
         default=None,
         help="Zero-based phenotype column index to analyze. "
              "If not set, all phenotype columns will be processed "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-plot", "--plot",
         action="store_true",
         default=False,
         help="Enable visualization of 5-fold CV and model performance "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-o", "--out",
         type=str,
         default=".",
-        help="Output directory for results (default: current directory)",
+        help="Output directory for results (default: current directory).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix",
         type=str,
         default=None,
         help="Prefix of output files "
-             "(default: genotype basename)",
+             "(default: genotype basename).",
     )
 
     args = parser.parse_args()

@@ -25,7 +25,7 @@ def simulate_chunks(nsnp, nidv, chunk_size=50_000, maf_low=0.02, maf_high=0.45, 
 def main():
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
-            print('Usage: jx sim [nsnp(k)] [nidv] [outprefix]')
+            print("Usage: jx sim <nsnp_k> <n_individuals> <outprefix>")
         elif len(sys.argv) == 4:
             nsnp, nidv = int(1e3*int(sys.argv[1])),int(sys.argv[2])
             outprefix = sys.argv[3]
@@ -39,13 +39,13 @@ def main():
                 if iter == 10:
                     y += (np.abs(np.random.randn(g.shape[0],1)).T@g).T
             chunks = simulate_chunks(nsnp, nidv)
-            print(f'Generating with {nsnp:.1e} SNPs and {nidv} individuals...')
+            print(f"Generating data with {nsnp:.1e} SNPs and {nidv} individuals...")
             save_genotype_streaming(outprefix,samples.tolist(),chunks,total_snps=nsnp)
             y = np.concatenate([samples.reshape(-1,1),samples.reshape(-1,1),y],axis=1,dtype=object)
             ynew = np.concatenate([[['tag','test']],y[:,[1,2]]],dtype=object)
             np.savetxt(f'{outprefix}.pheno',y,delimiter='\t',fmt=['%s', '%s', '%.3f'])
             np.savetxt(f'{outprefix}.pheno.txt',ynew,delimiter='\t',fmt=['%s', '%s'])
         else:
-            print('Usage: jx sim [nsnp(k)] [nidv] [outprefix]')
+            print("Usage: jx sim <nsnp_k> <n_individuals> <outprefix>")
     else:
-        print('Usage: jx sim [nsnp(k)] [nidv] [outprefix]')
+        print("Usage: jx sim <nsnp_k> <n_individuals> <outprefix>")

@@ -246,13 +246,13 @@ impl GlmScratch {
     }
 }
 
-/// Fast GLM for:
+/// Fast GLM interface:
 /// y: (n,) float64
 /// X: (n, q0) float64
 /// ixx: (q0, q0) float64
-/// G: (m, n) float32  (marker rows)
+/// G: (m, n) float32 (marker rows)
 ///
-/// Return: (m, q0+3) float64
+/// Returns: (m, q0 + 3) float64
 ///   col0: beta_snp
 ///   col1: se_snp
 ///   col2..: p-values for coefficients (q0 covariates + snp)

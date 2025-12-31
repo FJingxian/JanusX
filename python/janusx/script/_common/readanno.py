@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 def readanno(annofile:str,descItem:str='description'):
-    '''After treating: anno 0-chr,1-start,2-end,3-geneID,4-description1,5-description2'''
+    """After processing: anno columns are 0=chr, 1=start, 2=end, 3=geneID, 4=desc1, 5=desc2."""
     suffix = annofile.replace('.gz','').split('.')[-1]
     if suffix == 'bed':
         anno = pd.read_csv(annofile,sep='\t',header=None,).fillna('NA')

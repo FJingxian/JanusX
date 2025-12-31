@@ -16,10 +16,10 @@ def load_genotype_chunks(
     missing_rate: float = 1.0
 ):
     """
-    Unified high-level Python interface for reading genotype data in chunks
+    High-level Python interface for reading genotype data in chunks
     using the Rust gfreader_rs backend.
 
-    This function provides a *streaming* (iterator-based) interface and never
+    This function provides a streaming (iterator-based) interface and never
     loads the full genotype matrix into memory.
 
     It works for:
@@ -37,8 +37,8 @@ def load_genotype_chunks(
         Number of SNPs (rows) decoded per iteration.
 
     maf : float
-        Minor Allele Frequency threshold.
-        SNPs with MAF < maf are filtered out *during decoding* in Rust.
+        Minor allele frequency threshold.
+        SNPs with MAF < maf are filtered during decoding in Rust.
 
     missing_rate : float
         Maximum allowed missing genotype rate per SNP.
@@ -54,7 +54,7 @@ def load_genotype_chunks(
           - dense float32 array backed by Rust memory
 
     sites : list[SiteInfo]
-        Metadata objects for each SNP in this chunk.
+        Metadata objects for each SNP in the chunk.
         Length == n_snps_chunk.
         Fields:
           - chrom
@@ -98,16 +98,16 @@ def load_genotype_chunks(
         geno, sites = out
 
         # geno is already float32 C-contiguous memory managed by Rust
-        # Convert to numpy array (zero-copy)
+        # Convert to NumPy array (zero-copy)
         geno_np = np.asarray(geno, dtype=np.float32)
 
         yield geno_np, sites
     
 def inspect_genotype_file(path_or_prefix: str):
     """
-    Inspect genotype input and return sample IDs and SNP count.
+    Inspect the genotype input and return sample IDs and the SNP count.
 
-    This function is cheap and does NOT decode genotypes.
+    This function is lightweight and does not decode genotypes.
 
     Returns
     -------

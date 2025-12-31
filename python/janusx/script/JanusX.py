@@ -29,8 +29,8 @@ _banner_line = "*" * 60
 __version__ = (
     f"{_banner_line}\n"
     f">JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
-    "Please report bugs to <fujingxian@yzwlab.cn>\n"
-    "Build in 2025.12.31\n"
+    "Please report issues to <fujingxian@yzwlab.cn>\n"
+    "Build date: 2025-12-31\n"
     f"{_banner_line}"
 )
 
@@ -40,8 +40,8 @@ def main():
     print(__logo__)
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
-            print('Usage: jx <module> [parameter]')
-            print(f'''Modules: {' '.join(module.keys())}''')
+            print("Usage: jx <module> [options]")
+            print(f"Available modules: {' '.join(module.keys())}")
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
             print(__version__)
         else:
@@ -50,12 +50,12 @@ def main():
                 sys.argv.remove(sys.argv[1])
                 module[module_name].main() # Process of Target Module
             elif sys.argv[1] not in module.keys():
-                print(f'Unkown module: {sys.argv[1]}')
-                print(f'Usage: {sys.argv[0]} <module> [parameter]')
-                print(f'''Modules: {' '.join(module.keys())}''')
+                print(f"Unknown module: {sys.argv[1]}")
+                print(f"Usage: {sys.argv[0]} <module> [options]")
+                print(f"Available modules: {' '.join(module.keys())}")
     else:
-        print(f'Usage: {sys.argv[0]} <module> [parameter]')
-        print(f'''Modules: {' '.join(module.keys())}''')
+        print(f"Usage: {sys.argv[0]} <module> [options]")
+        print(f"Available modules: {' '.join(module.keys())}")
 
 if __name__ == "__main__":
     main()

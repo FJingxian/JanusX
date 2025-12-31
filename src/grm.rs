@@ -5,7 +5,7 @@ use rand::Rng;
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use ndarray::Array2;
+use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::prelude::*;
 
@@ -237,7 +237,7 @@ fn small_b_bed_parallel(prefix: &str, maf: f32, miss: f32, den: f64, q: &DMatrix
     Ok(b.scale(1.0 / den))
 }
 
-/// Randomized PCA for GRM
+/// Randomized PCA of the GRM
 pub fn randomized_grm_pca(
     kind: InputKind,
     k: usize,

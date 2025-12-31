@@ -8,9 +8,8 @@ name = "janusx"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.21", features = ["extension-module"] }
-numpy = "0.21"
-ndarray = "0.15"
+pyo3 = { version = "0.22.5", features = ["extension-module"] }
+numpy = "0.22"
 csv = "1.3"
 flate2 = "1.0"
 memmap2 = "0.9"

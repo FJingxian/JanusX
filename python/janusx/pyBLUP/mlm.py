@@ -5,14 +5,22 @@ from .QK2 import GRM
     
 class BLUP:
     def __init__(self,y:np.ndarray,M:np.ndarray,cov:np.ndarray=None,Z:np.ndarray=None, kinship:typing.Literal[None,1]=None,log:bool=False):
-        '''Fast Solve of Mixed Linear Model by Brent.
-        
-        :param y: Phenotype nx1\n
-        :param M: Marker matrix mxn(0,1,2 of SNP)\n
-        :param cov: Designed matrix for fixed effect nxp\n
-        :param Z: Designed matrix for random effect nxq\n
-        :param kinship: Calculation method of kinship matrix (None,1,2)
-        '''
+        """
+        Fast solution of the mixed linear model via Brent's method.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Phenotype vector of shape (n, 1).
+        M : np.ndarray
+            Marker matrix of shape (m, n) with genotypes coded as 0/1/2.
+        cov : np.ndarray, optional
+            Fixed-effect design matrix of shape (n, p).
+        Z : np.ndarray, optional
+            Random-effect design matrix of shape (n, q).
+        kinship : {None, 1}
+            Kinship specification; None disables kinship.
+        """
         self.log = log
         Z = Z if Z is not None else np.eye(y.shape[0]) # Design matrix or I matrix
         assert M.shape[1] == Z.shape[1] # Test Random factor

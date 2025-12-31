@@ -12,13 +12,18 @@ process = psutil.Process()
 
 class GWAS:
     def __init__(self,y:np.ndarray=None,X:np.ndarray=None,kinship:np.ndarray=None,log:bool=True):
-        '''
-        Fast Solve of Mixed Linear Model by Brent.
-        
-        :param y: Phenotype nx1\n
-        :param X: Designed matrix for fixed effect nxp\n
-        :param kinship: Calculation method of kinship matrix nxn
-        '''
+        """
+        Fast solution of the mixed linear model via Brent's method.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Phenotype vector of shape (n, 1).
+        X : np.ndarray
+            Fixed-effect design matrix of shape (n, p).
+        kinship : np.ndarray
+            Kinship matrix of shape (n, n).
+        """
         self.log = log
         y = y.reshape(-1,1) # ensure the dim of y
         X = np.concatenate([np.ones((y.shape[0],1)),X],axis=1) if X is not None else np.ones((y.shape[0],1))
@@ -42,7 +47,7 @@ class GWAS:
             self.bounds = (np.log10(lbd_null)-2,np.log10(lbd_null)+2)
         pass
     def _NULLREML(self,lbd: float):
-        '''Restricted Maximum Likelihood Estimation (REML) of NULL'''
+        """Restricted maximum likelihood (REML) for the null model."""
         try:
             n,p_cov = self.Xcov.shape
             p = p_cov
@@ -63,7 +68,7 @@ class GWAS:
             print(f"REML error: {e}, lbd={lbd}")
             return -1e8
     def _REML(self,lbd: float, snp_vec:np.array):
-        '''Restricted Maximum Likelihood Estimation (REML)'''
+        """Restricted maximum likelihood (REML) for a SNP-augmented model."""
         try:
             n,p_cov = self.Xcov.shape
             p = p_cov + 1
@@ -103,14 +108,21 @@ class GWAS:
         else:
             return np.nan,np.nan,np.nan
     def gwas(self,snp:np.ndarray=None,chunksize=100_000,threads=1):
-        '''
-        Speed version of mlm
-        
-        :param snp: Marker matrix, np.ndarray, samples per rows and snp per columns
-        :param chunksize: calculation number per times, int
-        
-        :return: beta coefficients, standard errors and p-values for each SNP, np.ndarray
-        '''
+        """
+        Accelerated mixed linear model GWAS scan.
+
+        Parameters
+        ----------
+        snp : np.ndarray
+            Marker matrix with samples in rows and SNPs in columns.
+        chunksize : int
+            Number of SNPs processed per chunk.
+
+        Returns
+        -------
+        np.ndarray
+            Beta coefficients, standard errors, and p-values for each SNP.
+        """
         m,n = snp.shape
         lbds = []
         beta_se_p = []

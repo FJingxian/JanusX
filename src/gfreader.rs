@@ -1,8 +1,8 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::*;
 
-use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::ndarray::Array2;
+use numpy::{PyArray2, PyReadonlyArray2};
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -14,7 +14,7 @@ use flate2::Compression;
 use crate::gfcore::{BedSnpIter, VcfSnpIter};
 use crate::gfcore as core;
 
-// -------- Py-exposed SiteInfo (wrapper) ----------
+// -------- Py-exposed SiteInfo (wrapper) --------
 #[pyclass]
 #[derive(Clone)]
 pub struct SiteInfo {
@@ -38,7 +38,7 @@ impl SiteInfo {
     }
 }
 
-// -------- BedChunkReader ----------
+// -------- BedChunkReader --------
 #[pyclass]
 pub struct BedChunkReader {
     it: BedSnpIter,
@@ -47,6 +47,7 @@ pub struct BedChunkReader {
 #[pymethods]
 impl BedChunkReader {
     #[new]
+    #[pyo3(signature = (prefix, maf_threshold=None, max_missing_rate=None))]
     fn new(prefix: String, maf_threshold: Option<f32>, max_missing_rate: Option<f32>) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -68,7 +69,7 @@ impl BedChunkReader {
         &mut self,
         py: Python<'py>,
         chunk_size: usize,
-    ) -> PyResult<Option<(&'py PyArray2<f32>, Vec<SiteInfo>)>> {
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
         if chunk_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
         }
@@ -93,12 +94,12 @@ impl BedChunkReader {
             }
         }
         #[allow(deprecated)]
-        let py_mat = mat.into_pyarray(py);
+        let py_mat = PyArray2::from_owned_array_bound(py, mat);
         Ok(Some((py_mat, sites)))
     }
 }
 
-// -------- VcfChunkReader ----------
+// -------- VcfChunkReader --------
 #[pyclass]
 pub struct VcfChunkReader {
     it: VcfSnpIter,
@@ -107,6 +108,7 @@ pub struct VcfChunkReader {
 #[pymethods]
 impl VcfChunkReader {
     #[new]
+    #[pyo3(signature = (path, maf_threshold=None, max_missing_rate=None))]
     fn new(path: String, maf_threshold: Option<f32>, max_missing_rate: Option<f32>) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -122,7 +124,7 @@ impl VcfChunkReader {
         &mut self,
         py: Python<'py>,
         chunk_size: usize,
-    ) -> PyResult<Option<(&'py PyArray2<f32>, Vec<SiteInfo>)>> {
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
         if chunk_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
         }
@@ -147,15 +149,14 @@ impl VcfChunkReader {
             }
         }
         #[allow(deprecated)]
-        let py_mat = mat.into_pyarray(py);
+        let py_mat = PyArray2::from_owned_array_bound(py, mat);
         Ok(Some((py_mat, sites)))
     }
 }
 
-// -------- count_vcf_snps (Py function) ----------
+// -------- count_vcf_snps (Py function) --------
 #[pyfunction]
 pub fn count_vcf_snps(path: String) -> PyResult<usize> {
-    // 复用 core 的 open_text_maybe_gz
     let p = Path::new(&path);
     let mut reader = core::open_text_maybe_gz(p)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
@@ -174,7 +175,7 @@ pub fn count_vcf_snps(path: String) -> PyResult<usize> {
 }
 
 // ============================================================
-// Streaming PLINK writer: write .fam once, stream .bim + .bed
+// Streaming PLINK writer: write .fam once, then stream .bim and .bed
 // ============================================================
 
 fn write_fam_simple(path: &Path, sample_ids: &[String], phenotype: Option<&[f64]>) -> Result<(), String> {
@@ -189,7 +190,7 @@ fn write_fam_simple(path: &Path, sample_ids: &[String], phenotype: Option<&[f64]
 
 #[inline]
 fn plink2bits_from_g_i8(g: i8) -> u8 {
-    // PLINK bed 2-bit:
+    // PLINK .bed 2-bit encoding:
     // 00 = homozygous A1/A1
     // 10 = heterozygous
     // 11 = homozygous A2/A2
@@ -214,11 +215,12 @@ pub struct PlinkStreamWriter {
 impl PlinkStreamWriter {
     /// PlinkStreamWriter(prefix, sample_ids, phenotype=None)
     ///
-    /// Creates:
+    /// Creates the following files:
     ///   - {prefix}.fam  (written once)
-    ///   - {prefix}.bed  (written once with header, then streamed)
+    ///   - {prefix}.bed  (header written once, then streamed)
     ///   - {prefix}.bim  (streamed line-by-line)
     #[new]
+    #[pyo3(signature = (prefix, sample_ids, phenotype))]
     fn new(prefix: String, sample_ids: Vec<String>, phenotype: Option<Vec<f64>>) -> PyResult<Self> {
         if sample_ids.is_empty() {
             return Err(PyValueError::new_err("sample_ids is empty"));
@@ -264,8 +266,8 @@ impl PlinkStreamWriter {
 
     /// write_chunk(geno_chunk, sites)
     ///
-    /// geno_chunk: ndarray[int8] shape (m_chunk, n_samples), SNP-major, -9 missing
-    /// sites: Vec<SiteInfo> length m_chunk
+    /// geno_chunk: ndarray[int8], shape (m_chunk, n_samples), SNP-major, -9 for missing
+    /// sites: Vec<SiteInfo>, length m_chunk
     fn write_chunk(&mut self, geno_chunk: PyReadonlyArray2<i8>, sites: Vec<SiteInfo>) -> PyResult<()> {
         let arr = geno_chunk.as_array();
         let shape = arr.shape();

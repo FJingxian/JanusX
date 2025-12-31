@@ -10,7 +10,7 @@ import os
 import psutil
 process = psutil.Process()
 def get_process_info():
-    """Usage of CPU and memory"""
+    """Return current CPU utilization and resident memory usage."""
     process = psutil.Process(os.getpid())
     cpu_percent = psutil.cpu_percent(interval=None)
     memory_info = process.memory_info()
@@ -19,7 +19,7 @@ def get_process_info():
 
 class GENOMETOOL:
     def __init__(self,genomePath:str):
-        print(f'Adjusting ref alt alleles by {genomePath}...')
+        print(f"Adjusting reference/alternate alleles using {genomePath}...")
         chrom = []
         seqs = []
         with open(genomePath,'r') as f:
@@ -47,7 +47,10 @@ class GENOMETOOL:
         ref_alt = pd.concat([ref,alt],axis=1)
         self.error = ref_alt.loc[alt.str.len()!=1,:].index
         ref_alt.loc[self.error,:] = pd.NA
-        print(f'Number of sites differ with reference is {len(self.error)}, ratio is {round(len(self.error)/ref_alt.shape[0],3)}')
+        print(
+            "Number of sites differing from the reference: "
+            f"{len(self.error)} (ratio={round(len(self.error)/ref_alt.shape[0],3)})"
+        )
         self.exchange_loc:bool = (ref_alt.iloc[:,0]!=ref)
         return ref_alt.astype('category')
 

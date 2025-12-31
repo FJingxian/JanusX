@@ -1,32 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-JanusX - High Performance GWAS Command-Line Interface
+JanusX: High-Performance GWAS Command-Line Interface
 
-Design summary
---------------
+Design overview
+---------------
 Models:
-  - LMM  : always uses a low-memory, chunk-based implementation (slim.LMM)
-  - LM   : always uses a low-memory, chunk-based implementation (slim.LM)
-  - FarmCPU : uses a high-memory implementation (pyBLUP.farmcpu) that loads
-              the full genotype matrix into memory
+  - LMM     : streaming, low-memory implementation (slim.LMM)
+  - LM      : streaming, low-memory implementation (slim.LM)
+  - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
+              full genotype matrix
 
 Execution mode (automatic)
 --------------------------
-  - There is no explicit "low-memory" flag.
-  - LMM/LM always work in streaming mode using rust2py.gfreader.load_genotype_chunks.
-  - FarmCPU always uses a full in-memory genotype matrix.
+  - No explicit "low-memory" flag is required.
+  - LMM/LM always run in streaming mode via rust2py.gfreader.load_genotype_chunks.
+  - FarmCPU always runs on the full in-memory genotype matrix.
 
-Caching:
-  - GRM (kinship) and PCA (Q matrix) are cached in the genotype folder
+Caching
+-------
+  - GRM (kinship) and PCA (Q matrix) are cached in the genotype directory
     for streaming LMM/LM runs:
       * GRM: {geno_prefix}.k.{method}.npy
       * Q   : {geno_prefix}.q.{pcdim}.txt
 
-Covariates:
-  - The --cov option is shared by LMM, LM and FarmCPU.
-  - For LMM/LM, the covariate file is assumed to be aligned with the genotype
-    sample order (inspect_genotype_file IDs).
-  - For FarmCPU, the covariate file is aligned with the genotype sample order
+Covariates
+----------
+  - The --cov option is shared by LMM, LM, and FarmCPU.
+  - For LMM/LM, the covariate file must match the genotype sample order
+    (inspect_genotype_file IDs).
+  - For FarmCPU, the covariate file must match the genotype sample order
     (famid from the genotype matrix).
 
 Citation
@@ -70,7 +72,7 @@ from ._common.log import setup_logging
 # ======================================================================
 
 def _section(logger:logging.Logger, title: str) -> None:
-    """Pretty section separator in log (with a blank line before each section)."""
+    """Emit a formatted log section header with a leading blank line."""
     logger.info("")
     logger.info("=" * 60)
     logger.info(title)
@@ -84,7 +86,7 @@ def fastplot(
     outpdf: str = "fastplot.pdf",
 ) -> None:
     """
-    Quick diagnostic plot of GWAS results: phenotype histogram, Manhattan, QQ.
+    Generate diagnostic plots for GWAS results: phenotype histogram, Manhattan, and QQ.
     """
     mpl.rcParams["font.size"] = 12
     results = gwasresult.astype({"POS": "int64"})
@@ -111,7 +113,7 @@ def fastplot(
 
 def determine_genotype_source(args) -> tuple[str, str]:
     """
-    Determine genotype input path and output prefix from CLI arguments.
+    Resolve genotype input and output prefix from CLI arguments.
     """
     if args.vcf:
         gfile = args.vcf
@@ -131,7 +133,7 @@ def determine_genotype_source(args) -> tuple[str, str]:
 
 def genotype_cache_prefix(genofile: str) -> str:
     """
-    Build cache prefix inside the genotype folder.
+    Construct a cache prefix within the genotype directory.
     """
     base = os.path.basename(genofile)
     if base.endswith(".vcf.gz"):
@@ -534,7 +536,7 @@ def run_chunked_gwas_lmm_lm(
             f"wall={wall:.2f} s, "
             f"avg CPU={avg_cpu_pct:.1f}% of {n_cores} cores, "
             f"avg RSS={avg_rss_gb:.2f} GB, "
-            f"peak RSS≈{peak_rss_gb:.2f} GB"
+            f"peak RSS ~ {peak_rss_gb:.2f} GB"
         )
 
         if not results_chunks:
@@ -759,58 +761,54 @@ def parse_args():
     geno_group = required_group.add_mutually_exclusive_group(required=True)
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
         help="Input genotype in PLINK binary format "
-             "(prefix for .bed, .bim, .fam)",
+             "(prefix for .bed, .bim, .fam).",
     )
 
     required_group.add_argument(
         "-p", "--pheno", type=str, required=True,
-        help="Phenotype file (tab-delimited, sample IDs in the first column)",
+        help="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
 
     models_group = parser.add_argument_group("Model Arguments")
     models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
-        help="Run linear mixed model (low-memory, chunk-based) "
-             "(default: %(default)s)",
+        help="Run the linear mixed model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-fastlmm", "--fastlmm", action="store_true", default=False,
-        help="Run fast LMM with fixed lambda (low-memory, chunk-based) "
-             "(default: %(default)s)",
+        help="Run fastLMM with fixed lambda (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
-        help="Run FarmCPU model (high-memory, full genotype) "
-             "(default: %(default)s)",
+        help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
-        help="Run general linear model (low-memory, chunk-based) "
-             "(default: %(default)s)",
+        help="Run the linear model (streaming, low-memory; default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
         "-n", "--ncol", action="extend", nargs="*",
         default=None, type=int,
-        help='Zero-based phenotype column indices to analyze. '
+        help="Zero-based phenotype column indices to analyze. "
              'E.g., "-n 0 -n 3" to analyze the 1st and 4th traits '
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-k", "--grm", type=str, default="1",
         help="GRM option: 1 (centering), 2 (standardization), "
-             "or path to precomputed GRM file (default: %(default)s)",
+             "or a path to a precomputed GRM file (default: %(default)s).",
     )
     optional_group.add_argument(
         "-q", "--qcov", type=str, default="0",
         help="Number of principal components for Q matrix or path to Q file "
-             "(default: %(default)s)",
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-c", "--cov", type=str, default=None,
@@ -818,30 +816,28 @@ def parse_args():
              "For LMM/LM, the file must be aligned with the genotype sample "
              "order from inspect_genotype_file (one row per sample). "
              "For FarmCPU, it must follow the genotype sample order "
-             "(famid) (default: %(default)s)",
+             "(famid) (default: %(default)s).",
     )
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
-        help="Generate diagnostic plots (histogram, Manhattan, QQ) "
-             "(default: %(default)s)",
+        help="Generate diagnostic plots (histogram, Manhattan, QQ; default: %(default)s).",
     )
     optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=100_000,
         help="Number of SNPs per chunk for streaming LMM/LM "
-             "(affects GRM and GWAS; default: %(default)s)",
+             "(affects GRM and GWAS; default: %(default)s).",
     )
     optional_group.add_argument(
         "-t", "--thread", type=int, default=-1,
-        help="Number of CPU threads (-1 uses all available cores, "
-             "default: %(default)s)",
+        help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
-        help="Output directory for results (default: %(default)s)",
+        help="Output directory for results (default: %(default)s).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix", type=str, default=None,
-        help="Prefix for output files (default: %(default)s)",
+        help="Prefix for output files (default: %(default)s).",
     )
 
     return parser.parse_args()
@@ -916,7 +912,6 @@ def main(log: bool = True):
                 genofile=gfile,
                 phenofile=args.pheno,
                 pheno_cols=args.ncol,
-                outprefix=outprefix,
                 maf_threshold=0.01,
                 max_missing_rate=0.05,
                 chunk_size=args.chunksize,

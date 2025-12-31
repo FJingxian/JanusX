@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-JanusX - Principal Component Analysis (PCA) Command-Line Interface
+JanusX: Principal Component Analysis (PCA) Command-Line Interface
 
-Design summary
---------------
+Design overview
+---------------
 Input modes:
-  - VCF    : genotype in VCF / VCF.GZ format
+  - VCF    : genotype in VCF/VCF.GZ format
   - BFILE  : genotype in PLINK binary format (.bed/.bim/.fam prefix)
-  - GRM    : precomputed genetic relationship matrix (GRM) + ID file
-  - PCFILE : precomputed PCA results (eigenvec / eigenval / eigenvec.id) for visualization only
+  - GRM    : precomputed genetic relationship matrix (GRM) plus ID file
+  - PCFILE : precomputed PCA results (eigenvec/eigenval/eigenvec.id) for
+             visualization only
 
 PCA computation strategy
 ------------------------
   - For VCF/BFILE:
-      * Use rust2py.gfreader.load_genotype_chunks to stream genotype data
-      * Build GRM in a low-memory, chunk-based fashion (same logic as GWAS module)
-      * Perform eigen decomposition of GRM via numpy.linalg.eigh
+      * Stream genotypes via rust2py.gfreader.load_genotype_chunks.
+      * Build the GRM in a low-memory, chunk-based fashion.
+      * Perform eigendecomposition of the GRM using numpy.linalg.eigh.
 
   - For GRM:
-      * Read precomputed GRM from .grm.txt or .grm.npz
-      * Perform eigen decomposition of GRM via numpy.linalg.eigh
+      * Read the precomputed GRM from .grm.txt or .grm.npz.
+      * Perform eigendecomposition using numpy.linalg.eigh.
 
   - For PCFILE:
-      * Load PC coordinates and eigenvalues directly
-      * Only produce 2D/3D visualization
+      * Load PC coordinates and eigenvalues directly.
+      * Produce only visualization outputs.
 
 Output:
   - {prefix}.eigenvec      : PC coordinates (samples, dim)
@@ -31,7 +32,7 @@ Output:
   - {prefix}.eigenval      : eigenvalues (variance along each PC)
   - Optional plots:
       * {prefix}.eigenvec.2D.pdf
-      * {prefix}.eigenvec.3D.html
+      * {prefix}.eigenvec.3D.gif
 """
 
 import os
@@ -85,7 +86,7 @@ def build_grm_streaming_for_pca(
     logger=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build a GRM in streaming mode using rust2py.gfreader.load_genotype_chunks
+    Construct the GRM in streaming mode via rust2py.gfreader.load_genotype_chunks
     and return (GRM, sample_ids).
 
     This follows the same strategy as the GWAS module:
@@ -191,27 +192,27 @@ def main(log: bool = True):
     geno_group = required_group.add_mutually_exclusive_group(required=True)
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
         help=(
             "Input genotype in PLINK binary format "
-            "(prefix for .bed, .bim, .fam)"
+            "(prefix for .bed, .bim, .fam)."
         ),
     )
     geno_group.add_argument(
         "-grm", "--grm", type=str,
         help=(
             "GRM prefix for PCA (expects {prefix}.grm.id and "
-            "{prefix}.grm.txt or {prefix}.grm.npz)"
+            "{prefix}.grm.txt or {prefix}.grm.npz)."
         ),
     )
     geno_group.add_argument(
         "-pcfile", "--pcfile", type=str,
         help=(
             "Prefix of existing PCA result files for visualization only "
-            "({prefix}.eigenval, {prefix}.eigenvec, {prefix}.eigenvec.id)"
+            "({prefix}.eigenval, {prefix}.eigenvec, {prefix}.eigenvec.id)."
         ),
     )
 
@@ -219,34 +220,37 @@ def main(log: bool = True):
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
-        help="Output directory for PCA results (default: current directory)",
+        help="Output directory for PCA results (default: current directory).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of output files (default: inferred from input file name)",
+        help="Prefix of output files (default: inferred from input file name).",
     )
     optional_group.add_argument(
         "-dim", "--dim", type=int, default=3,
-        help="Number of leading principal components to output (default: %(default)s)",
+        help="Number of leading principal components to output (default: %(default)s).",
     )
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
-        help="Generate 2D scatter plots for PC1 vs PC2 and PC1 vs PC3 (default: %(default)s)",
+        help="Generate 2D scatter plots for PC1 vs PC2 and PC1 vs PC3 "
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-plot3D", "--plot3D", action="store_true", default=False,
-        help="Generate 3D rotating GIF for PC1–PC3 (default: %(default)s)",
+        help="Generate a 3D rotating GIF for PC1-PC3 (default: %(default)s).",
     )
     optional_group.add_argument(
         "-group", "--group", type=str, default=None,
         help=(
             "Group file with two columns: sample ID and group label (no header). "
-            "Optional third column will be used as text annotation tag (default: %(default)s)"
+            "Optional third column will be used as a text annotation tag "
+            "(default: %(default)s)."
         ),
     )
     optional_group.add_argument(
         "-color", "--color", type=int, default=-1,
-        help="Color palette index for PCA plots, 0–6; -1 uses auto palette (default: %(default)s)",
+        help="Color palette index for PCA plots, 0-6; -1 uses auto palette "
+             "(default: %(default)s).",
     )
 
     args = parser.parse_args()
@@ -276,7 +280,7 @@ def main(log: bool = True):
     if args.color == -1:
         args.color = None
     else:
-        assert 0 <= args.color <= 6, "Color set index out of range; please use 0–6."
+        assert 0 <= args.color <= 6, "Color set index out of range; please use 0-6."
         args.color = color_set[palette_idx]
 
     # ------------------------- Logging -------------------------
@@ -284,7 +288,7 @@ def main(log: bool = True):
     log_path = f"{args.out}/{args.prefix}.pca.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX – Principal Component Analysis Module")
+    logger.info("JanusX - Principal Component Analysis Module")
     logger.info(f"Host: {socket.gethostname()}\n")
 
     if log:

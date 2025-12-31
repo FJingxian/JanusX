@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-JanusX - Post-GWAS Visualization and Annotation
+JanusX: Post-GWAS Visualization and Annotation
 
 Examples
 --------
   # Basic usage with default column names (#CHROM, POS, p)
   -f result.assoc.txt
 
-  # Use different column names
+  # Specify alternative column names
   -f result.assoc.txt -chr "chr" -pos "pos" -pvalue "P_wald"
 
   # Specify output path and format
@@ -25,7 +25,7 @@ Citation
 import os
 from ._common.log import setup_logging
 
-# Make sure matplotlib runs in a non-interactive backend
+# Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
     if key in os.environ:
         del os.environ[key]
@@ -59,7 +59,7 @@ def _auto_colors(n: int) -> list[str]:
 
 def GWASplot(file: str, args, logger) -> None:
     """
-    Plot Manhattan/QQ and optionally annotate significant hits
+    Plot Manhattan/QQ figures and optionally annotate significant hits
     for a single GWAS result file.
     """
     mpl.rcParams["pdf.fonttype"] = 42
@@ -277,7 +277,7 @@ def main():
     required_group = parser.add_argument_group("Required Arguments")
     required_group.add_argument(
         "-f", "--file", nargs="+", type=str, required=True,
-        help="One or more GWAS result files (tab-delimited)",
+        help="One or more GWAS result files (tab-delimited).",
     )
 
     # ------------------------------------------------------------------
@@ -286,27 +286,28 @@ def main():
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
         "-chr", "--chr", type=str, default="#CHROM",
-        help="Column name for chromosome (default: %(default)s)",
+        help="Column name for chromosome (default: %(default)s).",
     )
     optional_group.add_argument(
         "-pos", "--pos", type=str, default="POS",
-        help="Column name for base position (default: %(default)s)",
+        help="Column name for base position (default: %(default)s).",
     )
     optional_group.add_argument(
         "-pvalue", "--pvalue", type=str, default="p",
-        help="Column name for p-value (default: %(default)s)",
+        help="Column name for p-value (default: %(default)s).",
     )
     optional_group.add_argument(
         "-threshold", "--threshold", type=float, default=None,
-        help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s)",
+        help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
     )
     optional_group.add_argument(
         "-noplot", "--noplot", action="store_false", default=True,
-        help="Disable plotting Manhattan/QQ figures (default: %(default)s)",
+        help="Disable plotting Manhattan/QQ figures (default: %(default)s).",
     )
     optional_group.add_argument(
         "-color", "--color", type=int, default=0,
-        help="Color style index for Manhattan and QQ (0–6); -1 uses auto palette (default: %(default)s)",
+        help="Color style index for Manhattan and QQ (0-6); -1 uses auto palette "
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-hl", "--highlight", type=str, default=None,
@@ -317,31 +318,31 @@ def main():
     )
     optional_group.add_argument(
         "-format", "--format", type=str, default="png",
-        help="Output figure format: pdf, png, svg, tif (default: %(default)s)",
+        help="Output figure format: pdf, png, svg, tif (default: %(default)s).",
     )
     optional_group.add_argument(
         "-a", "--anno", type=str, default=None,
-        help="Annotation file (.gff or .bed) for SNP annotation (default: %(default)s)",
+        help="Annotation file (.gff or .bed) for SNP annotation (default: %(default)s).",
     )
     optional_group.add_argument(
         "-ab", "--annobroaden", type=float, default=None,
-        help="Broaden annotation window around SNP (Kb) (default: %(default)s)",
+        help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
     )
     optional_group.add_argument(
         "-descItem", "--descItem", type=str, default="description",
-        help="Attribute key used as description in GFF file (default: %(default)s)",
+        help="Attribute key used as description in the GFF file (default: %(default)s).",
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
-        help="Output directory for plots and annotation (default: current directory)",
+        help="Output directory for plots and annotation (default: current directory).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of log file (default: JanusX)",
+        help="Prefix of the log file (default: JanusX).",
     )
     optional_group.add_argument(
         "-t", "--thread", type=int, default=-1,
-        help="Number of CPU threads (-1 uses all available cores, default: %(default)s)",
+        help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
     )
 
     args = parser.parse_args()
@@ -349,7 +350,7 @@ def main():
     # ------------------------------------------------------------------
     # Basic checks and configuration
     # ------------------------------------------------------------------
-    assert args.color <= 6, "Color set index out of range; please use 0–6 or -1."
+    assert args.color <= 6, "Color set index out of range; please use 0-6 or -1."
     assert args.format in ["pdf", "png", "svg", "tif"], (
         f"Unsupported figure format: {args.format} "
         "(choose from: pdf, png, svg, tif)"

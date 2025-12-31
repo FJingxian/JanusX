@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-JanusX - Fast Genetic Relationship Matrix (GRM) Calculator
+JanusX: Efficient Genetic Relationship Matrix (GRM) Calculator
 
-Design summary
---------------
+Design overview
+---------------
 Input:
-  - VCF   : genotype in VCF / VCF.GZ format
+  - VCF   : genotype in VCF/VCF.GZ format
   - BFILE : genotype in PLINK binary format (.bed/.bim/.fam prefix)
 
 Implementation:
-  - Genotypes are read in a streaming fashion via rust2py.gfreader.load_genotype_chunks
-  - SNPs are filtered (MAF / missing rate) inside the Rust reader
+  - Genotypes are streamed via rust2py.gfreader.load_genotype_chunks.
+  - SNPs are filtered by MAF and missing rate inside the Rust reader.
   - GRM is accumulated chunk-by-chunk:
       * method = 1 : centered GRM
-      * method = 2 : standardized / weighted GRM
-  - Memory usage is low and independent of the total SNP count
+      * method = 2 : standardized/weighted GRM
+  - Memory usage is low and independent of the total SNP count.
 
 Output:
   - {prefix}.grm.id   : sample IDs
@@ -45,12 +45,12 @@ def build_grm_streaming(
     logger,
 ) -> tuple[np.ndarray, int]:
     """
-    Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
+    Build the GRM in streaming mode using rust2py.gfreader.load_genotype_chunks.
 
     Parameters
     ----------
     genofile : str
-        Path / prefix to genotype file (VCF or PLINK bfile).
+        Path or prefix to the genotype file (VCF or PLINK bfile).
     n_samples : int
         Number of samples.
     n_snps : int
@@ -58,11 +58,11 @@ def build_grm_streaming(
     method : int
         GRM method:
           - 1: centered GRM
-          - 2: standardized / weighted GRM
+          - 2: standardized/weighted GRM
     maf_threshold : float
-        MAF filter threshold passed to Rust reader.
+        MAF filter threshold passed to the Rust reader.
     max_missing_rate : float
-        Missing rate filter threshold passed to Rust reader.
+        Missing-rate filter threshold passed to the Rust reader.
     chunk_size : int
         Number of SNPs per chunk.
     logger : logging.Logger
@@ -153,12 +153,12 @@ def main(log: bool = True):
     geno_group = required_group.add_mutually_exclusive_group(required=True)
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
-        help="Input genotype file in VCF format (.vcf or .vcf.gz)",
+        help="Input genotype file in VCF format (.vcf or .vcf.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
         help="Input genotype in PLINK binary format "
-             "(prefix for .bed, .bim, .fam)",
+             "(prefix for .bed, .bim, .fam).",
     )
 
     # ------------------------------------------------------------------
@@ -167,22 +167,22 @@ def main(log: bool = True):
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
-        help="Output directory for results (default: current directory)",
+        help="Output directory for results (default: current directory).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix", type=str, default=None,
-        help="Prefix of output files (default: inferred from input file name)",
+        help="Prefix of output files (default: inferred from input file name).",
     )
     optional_group.add_argument(
         "-m", "--method", type=int, default=1,
         help=(
             "GRM calculation method: 1=centered (default), "
-            "2=standardized/weighted (default: %(default)s)"
+            "2=standardized/weighted (default: %(default)s)."
         ),
     )
     optional_group.add_argument(
         "-npz", "--npz", action="store_true", default=False,
-        help="Save GRM as compressed NPZ instead of plain text (default: %(default)s)",
+        help="Save GRM as compressed NPZ instead of plain text (default: %(default)s).",
     )
 
     args = parser.parse_args()
@@ -212,7 +212,7 @@ def main(log: bool = True):
     log_path = f"{args.out}/{args.prefix}.grm.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX - Fast Genetic Relationship Matrix (GRM) Calculator")
+    logger.info("JanusX: Efficient Genetic Relationship Matrix (GRM) Calculator")
     logger.info(f"Host: {socket.gethostname()}\n")
 
     if log:

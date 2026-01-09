@@ -995,9 +995,7 @@ pub fn convert_genotypes(
         }
     }
 
-    let report_progress = progress_callback.is_some()
-        && progress_every > 0
-        && matches!(&it, InputIter::Bed(_));
+    let report_progress = progress_callback.is_some() && progress_every > 0;
     let total_sites = if report_progress {
         match &it {
             InputIter::Bed(bed) => bed.sites.len() as u64,

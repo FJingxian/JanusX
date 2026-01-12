@@ -4,6 +4,7 @@ use pyo3::exceptions::*;
 use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray2};
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -38,38 +39,182 @@ impl SiteInfo {
     }
 }
 
+pub(crate) fn build_sample_selection(
+    samples: &[String],
+    sample_ids: Option<Vec<String>>,
+    sample_indices: Option<Vec<usize>>,
+) -> Result<(Vec<usize>, Vec<String>), String> {
+    if sample_ids.is_some() && sample_indices.is_some() {
+        return Err("Provide only one of sample_ids or sample_indices".into());
+    }
+    if let Some(ids) = sample_ids {
+        if ids.is_empty() {
+            return Err("sample_ids is empty".into());
+        }
+        let mut map: HashMap<&str, usize> = HashMap::with_capacity(samples.len());
+        for (i, sid) in samples.iter().enumerate() {
+            map.insert(sid.as_str(), i);
+        }
+        let mut seen: HashSet<usize> = HashSet::with_capacity(ids.len());
+        let mut indices: Vec<usize> = Vec::with_capacity(ids.len());
+        for sid in ids.iter() {
+            let idx = *map
+                .get(sid.as_str())
+                .ok_or_else(|| format!("sample id not found: {sid}"))?;
+            if !seen.insert(idx) {
+                return Err(format!("duplicate sample id: {sid}"));
+            }
+            indices.push(idx);
+        }
+        return Ok((indices, ids));
+    }
+    if let Some(idxs) = sample_indices {
+        if idxs.is_empty() {
+            return Err("sample_indices is empty".into());
+        }
+        let mut seen: HashSet<usize> = HashSet::with_capacity(idxs.len());
+        for &idx in idxs.iter() {
+            if idx >= samples.len() {
+                return Err(format!("sample index out of range: {idx}"));
+            }
+            if !seen.insert(idx) {
+                return Err(format!("duplicate sample index: {idx}"));
+            }
+        }
+        let ids: Vec<String> = idxs.iter().map(|&i| samples[i].clone()).collect();
+        return Ok((idxs, ids));
+    }
+
+    let indices: Vec<usize> = (0..samples.len()).collect();
+    Ok((indices, samples.to_vec()))
+}
+
+pub(crate) fn build_snp_indices(
+    sites: &[core::SiteInfo],
+    snp_range: Option<(usize, usize)>,
+    snp_indices: Option<Vec<usize>>,
+    bim_range: Option<(String, i32, i32)>,
+) -> Result<Option<Vec<usize>>, String> {
+    let mut count = 0;
+    if snp_range.is_some() { count += 1; }
+    if snp_indices.is_some() { count += 1; }
+    if bim_range.is_some() { count += 1; }
+    if count > 1 {
+        return Err("Provide only one of snp_range, snp_indices, or bim_range".into());
+    }
+
+    if let Some((start, end)) = snp_range {
+        let n = sites.len();
+        if start >= end || end > n {
+            return Err(format!("invalid snp_range: ({start}, {end})"));
+        }
+        let indices: Vec<usize> = (start..end).collect();
+        return Ok(Some(indices));
+    }
+
+    if let Some(idxs) = snp_indices {
+        if idxs.is_empty() {
+            return Err("snp_indices is empty".into());
+        }
+        let mut seen: HashSet<usize> = HashSet::with_capacity(idxs.len());
+        for &idx in idxs.iter() {
+            if idx >= sites.len() {
+                return Err(format!("snp index out of range: {idx}"));
+            }
+            if !seen.insert(idx) {
+                return Err(format!("duplicate snp index: {idx}"));
+            }
+        }
+        return Ok(Some(idxs));
+    }
+
+    if let Some((chrom, start, end)) = bim_range {
+        if start > end {
+            return Err("bim_range start > end".into());
+        }
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, site) in sites.iter().enumerate() {
+            if site.chrom == chrom && site.pos >= start && site.pos <= end {
+                indices.push(i);
+            }
+        }
+        return Ok(Some(indices));
+    }
+
+    Ok(None)
+}
+
 // -------- BedChunkReader --------
 #[pyclass]
 pub struct BedChunkReader {
     it: BedSnpIter,
+    snp_indices: Option<Vec<usize>>,
+    snp_pos: usize,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
 }
 
 #[pymethods]
 impl BedChunkReader {
     #[new]
-    #[pyo3(signature = (prefix, maf_threshold=None, max_missing_rate=None, fill_missing=None))]
+    #[pyo3(signature = (
+        prefix,
+        maf_threshold=None,
+        max_missing_rate=None,
+        fill_missing=None,
+        snp_range=None,
+        snp_indices=None,
+        bim_range=None,
+        sample_ids=None,
+        sample_indices=None,
+    ))]
     fn new(
         prefix: String,
         maf_threshold: Option<f32>,
         max_missing_rate: Option<f32>,
         fill_missing: Option<bool>,
+        snp_range: Option<(usize, usize)>,
+        snp_indices: Option<Vec<usize>>,
+        bim_range: Option<(String, i32, i32)>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
         let it = BedSnpIter::new_with_fill(&prefix, maf, miss, fill)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        Ok(Self { it })
+        let (sample_indices, sample_ids) = build_sample_selection(
+            &it.samples,
+            sample_ids,
+            sample_indices,
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let snp_indices = build_snp_indices(
+            &it.sites,
+            snp_range,
+            snp_indices,
+            bim_range,
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        Ok(Self {
+            it,
+            snp_indices,
+            snp_pos: 0,
+            sample_indices,
+            sample_ids,
+        })
     }
 
     #[getter]
-    fn n_samples(&self) -> usize { self.it.n_samples() }
+    fn n_samples(&self) -> usize { self.sample_indices.len() }
 
     #[getter]
-    fn n_snps(&self) -> usize { self.it.sites.len() }
+    fn n_snps(&self) -> usize {
+        self.snp_indices.as_ref().map(|v| v.len()).unwrap_or(self.it.sites.len())
+    }
 
     #[getter]
-    fn sample_ids(&self) -> Vec<String> { self.it.samples.clone() }
+    fn sample_ids(&self) -> Vec<String> { self.sample_ids.clone() }
 
     fn next_chunk<'py>(
         &mut self,
@@ -80,14 +225,42 @@ impl BedChunkReader {
             return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
         }
 
-        let n = self.it.n_samples();
+        let n = self.sample_indices.len();
+        if n == 0 {
+            return Ok(None);
+        }
         let mut rows: Vec<Vec<f32>> = Vec::new();
         let mut sites: Vec<SiteInfo> = Vec::new();
+        let full_samples = self.sample_indices.len() == self.it.n_samples();
 
-        while rows.len() < chunk_size {
-            match self.it.next_snp() {
-                Some((row, site)) => { rows.push(row); sites.push(site.into()); }
-                None => break,
+        if let Some(ref snp_indices) = self.snp_indices {
+            while rows.len() < chunk_size && self.snp_pos < snp_indices.len() {
+                let snp_idx = snp_indices[self.snp_pos];
+                self.snp_pos += 1;
+                if let Some((row, site)) = self.it.get_snp_row(snp_idx) {
+                    let out_row = if full_samples {
+                        row
+                    } else {
+                        self.sample_indices.iter().map(|&i| row[i]).collect()
+                    };
+                    rows.push(out_row);
+                    sites.push(site.into());
+                }
+            }
+        } else {
+            while rows.len() < chunk_size {
+                match self.it.next_snp() {
+                    Some((row, site)) => {
+                        let out_row = if full_samples {
+                            row
+                        } else {
+                            self.sample_indices.iter().map(|&i| row[i]).collect()
+                        };
+                        rows.push(out_row);
+                        sites.push(site.into());
+                    }
+                    None => break,
+                }
             }
         }
         if rows.is_empty() { return Ok(None); }

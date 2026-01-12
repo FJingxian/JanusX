@@ -11,6 +11,8 @@ use std::path::Path;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use memmap2::Mmap;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 use crate::gfcore::{open_text_maybe_gz, read_bim, read_fam, SiteInfo};
 
@@ -578,10 +580,21 @@ impl VcfWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    fn finish(self) -> Result<(), String> {
         self.out.finish().map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+enum RowOutcome {
+    Keep {
+        site: SiteInfo,
+        gref: String,
+        galt: String,
+        row_i8: Vec<i8>,
+    },
+    DropMulti,
+    DropNonSnp,
 }
 
 struct PlinkBfileWriter {
@@ -945,7 +958,7 @@ pub fn merge_genotypes(inputs: Vec<String>, out: String, out_fmt: Option<String>
 // Single-input conversion (PyO3)
 // ============================================================
 
-#[pyfunction(signature = (input, out, out_fmt=None, progress_callback=None, progress_every=10000))]
+#[pyfunction(signature = (input, out, out_fmt=None, progress_callback=None, progress_every=10000, threads=0))]
 pub fn convert_genotypes(
     py: Python<'_>,
     input: String,
@@ -953,6 +966,7 @@ pub fn convert_genotypes(
     out_fmt: Option<String>,
     progress_callback: Option<PyObject>,
     progress_every: usize,
+    threads: usize,
 ) -> PyResult<PyConvertStats> {
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1006,54 +1020,168 @@ pub fn convert_genotypes(
     };
     let mut last_report: u64 = 0;
 
-    let mut row_i8: Vec<i8> = Vec::with_capacity(n_samples);
-    while let Some((row, site)) = it.next_snp() {
-        stats.n_sites_seen += 1;
-        if report_progress && stats.n_sites_seen - last_report >= progress_every as u64 {
-            if let Some(cb) = progress_callback.as_ref() {
-                cb.call1(py, (stats.n_sites_seen, total_sites))?;
-            }
-            last_report = stats.n_sites_seen;
-        }
+    let use_parallel = threads > 1 && matches!(&it, InputIter::Bed(_));
+    if use_parallel {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        let (gref, galt) = match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
-            Some(x) => x,
-            None => {
-                if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
-                    stats.n_sites_dropped_multiallelic += 1;
-                } else {
-                    stats.n_sites_dropped_non_snp += 1;
-                }
-                continue;
-            }
-        };
-
-        if row.len() != n_samples {
+        let InputIter::Bed(bed) = it else {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "internal row length mismatch",
+                "internal error: expected BED iterator",
             ));
+        };
+        let n_sites = bed.sites.len();
+        let data = &bed.mmap[3..];
+        let bytes_per_snp = bed.bytes_per_snp;
+        let sites = &bed.sites;
+        let target_bytes = 16usize * 1024 * 1024;
+        let mut chunk_size = target_bytes / n_samples.max(1);
+        if chunk_size == 0 {
+            chunk_size = 1;
+        }
+        if chunk_size > 4096 {
+            chunk_size = 4096;
         }
 
-        row_i8.clear();
-        row_i8.extend(row.iter().map(|&g| dosage_to_i8(g)));
+        for start in (0..n_sites).step_by(chunk_size) {
+            let end = (start + chunk_size).min(n_sites);
+            let rows: Vec<RowOutcome> = py.allow_threads(|| {
+                pool.install(|| {
+                    (start..end)
+                        .into_par_iter()
+                        .map(|idx| {
+                            let site = sites[idx].clone();
+                            match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
+                                Some((gref, galt)) => {
+                                    let offset = idx * bytes_per_snp;
+                                    let snp_bytes = &data[offset..offset + bytes_per_snp];
+                                    let mut row: Vec<i8> = vec![-9; n_samples];
+                                    for (byte_idx, byte) in snp_bytes.iter().enumerate() {
+                                        for within in 0..4 {
+                                            let samp_idx = byte_idx * 4 + within;
+                                            if samp_idx >= n_samples {
+                                                break;
+                                            }
+                                            let code = (byte >> (within * 2)) & 0b11;
+                                            row[samp_idx] = match code {
+                                                0b00 => 0,
+                                                0b10 => 1,
+                                                0b11 => 2,
+                                                0b01 => -9,
+                                                _ => -9,
+                                            };
+                                        }
+                                    }
+                                    RowOutcome::Keep {
+                                        site,
+                                        gref,
+                                        galt,
+                                        row_i8: row,
+                                    }
+                                }
+                                None => {
+                                    if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
+                                        RowOutcome::DropMulti
+                                    } else {
+                                        RowOutcome::DropNonSnp
+                                    }
+                                }
+                            }
+                        })
+                        .collect()
+                })
+            });
 
-        match fmt {
-            OutFmt::Vcf => {
-                vcf_w
-                    .as_mut()
-                    .unwrap()
-                    .write_site(&site, &gref, &galt, &row_i8)
-                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-            }
-            OutFmt::Plink => {
-                plink_w
-                    .as_mut()
-                    .unwrap()
-                    .write_site_and_row(&site, &gref, &galt, &row_i8)
-                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            for row in rows {
+                stats.n_sites_seen += 1;
+                if report_progress && stats.n_sites_seen - last_report >= progress_every as u64 {
+                    if let Some(cb) = progress_callback.as_ref() {
+                        cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                    }
+                    last_report = stats.n_sites_seen;
+                }
+
+                match row {
+                    RowOutcome::Keep { site, gref, galt, row_i8 } => {
+                        match fmt {
+                            OutFmt::Vcf => {
+                                vcf_w
+                                    .as_mut()
+                                    .unwrap()
+                                    .write_site(&site, &gref, &galt, &row_i8)
+                                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                            }
+                            OutFmt::Plink => {
+                                plink_w
+                                    .as_mut()
+                                    .unwrap()
+                                    .write_site_and_row(&site, &gref, &galt, &row_i8)
+                                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                            }
+                        }
+                        stats.n_sites_written += 1;
+                    }
+                    RowOutcome::DropMulti => {
+                        stats.n_sites_dropped_multiallelic += 1;
+                    }
+                    RowOutcome::DropNonSnp => {
+                        stats.n_sites_dropped_non_snp += 1;
+                    }
+                }
             }
         }
-        stats.n_sites_written += 1;
+    } else {
+        let mut row_i8: Vec<i8> = Vec::with_capacity(n_samples);
+        while let Some((row, site)) = it.next_snp() {
+            stats.n_sites_seen += 1;
+            if report_progress && stats.n_sites_seen - last_report >= progress_every as u64 {
+                if let Some(cb) = progress_callback.as_ref() {
+                    cb.call1(py, (stats.n_sites_seen, total_sites))?;
+                }
+                last_report = stats.n_sites_seen;
+            }
+
+            let (gref, galt) = match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
+                Some(x) => x,
+                None => {
+                    if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
+                        stats.n_sites_dropped_multiallelic += 1;
+                    } else {
+                        stats.n_sites_dropped_non_snp += 1;
+                    }
+                    continue;
+                }
+            };
+
+            if row.len() != n_samples {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "internal row length mismatch",
+                ));
+            }
+
+            row_i8.clear();
+            row_i8.extend(row.iter().map(|&g| dosage_to_i8(g)));
+
+            match fmt {
+                OutFmt::Vcf => {
+                    vcf_w
+                        .as_mut()
+                        .unwrap()
+                        .write_site(&site, &gref, &galt, &row_i8)
+                        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                }
+                OutFmt::Plink => {
+                    plink_w
+                        .as_mut()
+                        .unwrap()
+                        .write_site_and_row(&site, &gref, &galt, &row_i8)
+                        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                }
+            }
+            stats.n_sites_written += 1;
+        }
     }
 
     if report_progress {

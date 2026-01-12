@@ -532,11 +532,11 @@ def run_chunked_gwas_lmm_lm(
 
         logger.info(
             f"Effective SNP: {done_snps} | "
-            f"Resource usage for {model_label} / {pname}: "
+            f"Resource usage for {model_label} / {pname}: \n"
             f"wall={wall:.2f} s, "
             f"avg CPU={avg_cpu_pct:.1f}% of {n_cores} cores, "
             f"avg RSS={avg_rss_gb:.2f} GB, "
-            f"peak RSS ~ {peak_rss_gb:.2f} GB"
+            f"peak RSS ~ {peak_rss_gb:.2f} GB\n"
         )
 
         if not results_chunks:

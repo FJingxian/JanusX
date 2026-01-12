@@ -33,7 +33,7 @@ Covariates
 
 Citation
 --------
-  https://github.com/MaizeMan-JxFU/JanusX/
+  https://github.com/FJingxian/JanusX/
 """
 
 import os
@@ -596,13 +596,22 @@ def load_genotype_full(args, gfile: str, logger):
     return ref_alt, famid, geno
 
 
-def prepare_qk_and_filter(geno: np.ndarray, ref_alt: pd.DataFrame, logger):
+def prepare_qk_and_filter(
+    geno: np.ndarray,
+    ref_alt: pd.DataFrame,
+    maf_threshold: float,
+    max_missing_rate: float,
+    logger,
+):
     """
     Filter SNPs and impute missing values using QK, then update ref_alt.
     """
-    logger.info("* Filtering SNPs (MAF < 0.01 or missing rate > 0.05; mode imputation)...")
+    logger.info(
+        "* Filtering SNPs (MAF < "
+        f"{maf_threshold} or missing rate > {max_missing_rate}; mode imputation)..."
+    )
     logger.info("  Tip: if available, use pre-imputed genotypes from BEAGLE/IMPUTE2.")
-    qkmodel = QK(geno, maff=0.01)
+    qkmodel = QK(geno, maff=maf_threshold, missf=max_missing_rate)
     geno_filt = qkmodel.M
 
     ref_alt_filt = ref_alt.loc[qkmodel.SNPretain].copy()
@@ -687,7 +696,13 @@ def run_farmcpu_fullmem(
         f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
     )
 
-    geno, ref_alt, qkmodel = prepare_qk_and_filter(geno, ref_alt, logger)
+    geno, ref_alt, qkmodel = prepare_qk_and_filter(
+        geno,
+        ref_alt,
+        maf_threshold=args.maf,
+        max_missing_rate=args.geno,
+        logger=logger,
+    )
     assert geno.size > 0, "After filtering, number of SNPs is zero for FarmCPU."
 
     gfile_prefix = gfile.replace(".vcf", "").replace(".gz", "")
@@ -781,7 +796,7 @@ def parse_args():
     )
     models_group.add_argument(
         "-fastlmm", "--fastlmm", action="store_true", default=False,
-        help="Run fastLMM with fixed lambda (streaming, low-memory; default: %(default)s).",
+        help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
@@ -817,6 +832,16 @@ def parse_args():
              "order from inspect_genotype_file (one row per sample). "
              "For FarmCPU, it must follow the genotype sample order "
              "(famid) (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-maf", "--maf", type=float, default=0.02,
+        help="Exclude variants with minor allele frequency lower than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-geno", "--geno", type=float, default=0.05,
+        help="Exclude variants with missing call frequencies greater than a threshold "
+             "(default: %(default)s).",
     )
     optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
@@ -881,6 +906,8 @@ def main(log: bool = True):
         logger.info(f"Q option:         {args.qcov}")
         if args.cov:
             logger.info(f"Covariate file:   {args.cov}")
+        logger.info(f"Maf threshold:    {args.maf}")
+        logger.info(f"Miss threshold:   {args.geno}")
         logger.info(f"Chunk size:       {args.chunksize}")
         logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
         logger.info(f"Output prefix:    {outprefix}")
@@ -912,8 +939,8 @@ def main(log: bool = True):
                 genofile=gfile,
                 phenofile=args.pheno,
                 pheno_cols=args.ncol,
-                maf_threshold=0.01,
-                max_missing_rate=0.05,
+                maf_threshold=args.maf,
+                max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
@@ -931,8 +958,8 @@ def main(log: bool = True):
                 ids=ids,
                 n_snps=n_snps,
                 outprefix=outprefix,
-                maf_threshold=0.01,
-                max_missing_rate=0.05,
+                maf_threshold=args.maf,
+                max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 grm=grm,
                 qmatrix=qmatrix,
@@ -953,8 +980,8 @@ def main(log: bool = True):
                 ids=ids,
                 n_snps=n_snps,
                 outprefix=outprefix,
-                maf_threshold=0.01,
-                max_missing_rate=0.05,
+                maf_threshold=args.maf,
+                max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 grm=grm,
                 qmatrix=qmatrix,
@@ -974,10 +1001,10 @@ def main(log: bool = True):
                 ids=ids,
                 n_snps=n_snps,
                 outprefix=outprefix,
-                maf_threshold=0.01,
-                max_missing_rate=0.05,
+                maf_threshold=args.maf,
+                max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
-                grm=grm,  # LM 不用 kinship，但函数签名统一，传入无妨
+                grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,
                 eff_m=eff_m,

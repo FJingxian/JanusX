@@ -80,7 +80,7 @@ def load_group_table(group_path: str) -> tuple[pd.DataFrame, str | None, str | N
 
 def build_grm_streaming_for_pca(
     genofile: str,
-    maf_threshold: float = 0.01,
+    maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
     chunk_size: int = 100_000,
     logger=None,
@@ -231,6 +231,16 @@ def main(log: bool = True):
         help="Number of leading principal components to output (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-maf", "--maf", type=float, default=0.02,
+        help="Exclude variants with minor allele frequency lower than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-geno", "--geno", type=float, default=0.05,
+        help="Exclude variants with missing call frequencies greater than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
         help="Generate 2D scatter plots for PC1 vs PC2 and PC1 vs PC3 "
              "(default: %(default)s).",
@@ -298,6 +308,8 @@ def main(log: bool = True):
         if args.vcf or args.bfile:
             logger.info(f"Genotype file:    {gfile}")
             logger.info(f"Output PCs:       top {args.dim}")
+            logger.info(f"MAF threshold:    {args.maf}")
+            logger.info(f"Missing rate:     {args.geno}")
         elif args.grm:
             logger.info(f"GRM prefix:       {gfile}")
             logger.info(f"Output PCs:       top {args.dim}")
@@ -324,13 +336,13 @@ def main(log: bool = True):
     # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
     if args.vcf or args.bfile:
         logger.info("* PCA from genotype (VCF/BFILE) using streaming GRM.")
-        logger.info("  MAF filter = 0.01, missing rate filter = 0.05.")
+        logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
 
         # Build GRM in streaming mode
         grm, samples = build_grm_streaming_for_pca(
             genofile=gfile,
-            maf_threshold=0.01,
-            max_missing_rate=0.05,
+            maf_threshold=args.maf,
+            max_missing_rate=args.geno,
             chunk_size=100_000,
             logger=logger,
         )

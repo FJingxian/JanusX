@@ -181,6 +181,16 @@ def main(log: bool = True):
         ),
     )
     optional_group.add_argument(
+        "-maf", "--maf", type=float, default=0.02,
+        help="Exclude variants with minor allele frequency lower than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-geno", "--geno", type=float, default=0.05,
+        help="Exclude variants with missing call frequencies greater than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-npz", "--npz", action="store_true", default=False,
         help="Save GRM as compressed NPZ instead of plain text (default: %(default)s).",
     )
@@ -223,6 +233,8 @@ def main(log: bool = True):
         logger.info(
             f"GRM method: {'Centered' if args.method == 1 else 'Standardized/weighted'}"
         )
+        logger.info(f"MAF threshold: {args.maf}")
+        logger.info(f"Missing rate:  {args.geno}")
         logger.info(f"Save as NPZ: {args.npz}")
         logger.info(f"Output prefix: {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
@@ -235,9 +247,9 @@ def main(log: bool = True):
     n_samples = len(sample_ids)
     logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
 
-    # To keep consistent with GWAS module, we fix MAF/missing filters here.
-    maf_threshold = 0.01
-    max_missing_rate = 0.05
+    # Defaults match GWAS; can be overridden via CLI.
+    maf_threshold = args.maf
+    max_missing_rate = args.geno
     chunk_size = 100_000
 
     t_loading = time.time()

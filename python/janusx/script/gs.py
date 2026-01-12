@@ -28,7 +28,8 @@ Cross-validation
 Genomic selection workflow
 --------------------------
   1. Load genotypes and phenotypes.
-  2. Filter SNPs by MAF < 0.01 or missing rate > 0.05 and impute by mode (via QK).
+  2. Filter SNPs by MAF/missing rate thresholds (default 0.02/0.05) and impute
+     by mode (via QK).
   3. For each phenotype column:
        - Split individuals into training (non-missing phenotype) and test sets.
        - Run 5-fold CV on the training set for each selected model.
@@ -39,7 +40,7 @@ Genomic selection workflow
 
 Citation
 --------
-  https://github.com/MaizeMan-JxFU/JanusX/
+  https://github.com/FJingxian/JanusX/
 """
 
 import logging
@@ -203,6 +204,20 @@ def main(log: bool = True) -> None:
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "-maf", "--maf",
+        type=float,
+        default=0.02,
+        help="Exclude variants with minor allele frequency lower than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-geno", "--geno",
+        type=float,
+        default=0.05,
+        help="Exclude variants with missing call frequencies greater than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-n", "--ncol",
         type=int,
         default=None,
@@ -290,6 +305,8 @@ def main(log: bool = True) -> None:
             model_count += 1
             logger.info(f"Used model{model_count}:     rrBLUP")
         logger.info(f"Use PCA:         {args.pcd}")
+        logger.info(f"MAF threshold:   {args.maf}")
+        logger.info(f"Missing rate:    {args.geno}")
         if args.plot:
             logger.info(f"Plot mode:       {args.plot}")
         logger.info(f"Output prefix:   {args.out}/{args.prefix}")
@@ -351,9 +368,12 @@ def main(log: bool = True) -> None:
     # SNP filtering and imputation
     # ------------------------------------------------------------------
     t_control = time.time()
-    logger.info("* Filter SNPs with MAF < 0.01 or missing rate > 0.05; impute with mode.")
+    logger.info(
+        f"* Filter SNPs with MAF < {args.maf} or missing rate > {args.geno}; "
+        "impute with mode."
+    )
     logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
-    qkmodel = QK(geno, maff=0.01)
+    qkmodel = QK(geno, maff=args.maf, missf=args.geno)
     geno = qkmodel.M
     logger.info(f"Filter finished, cost: {(time.time() - t_control):.2f} secs")
 

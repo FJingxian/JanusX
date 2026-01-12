@@ -19,7 +19,7 @@ Examples
 
 Citation
 --------
-  https://github.com/MaizeMan-JxFU/JanusX/
+  https://github.com/FJingxian/JanusX/
 """
 
 import os

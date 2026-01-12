@@ -42,7 +42,6 @@ class BLUP:
         idx = np.argsort(val)[::-1]
         val,vec = val[idx],vec[:, idx]
         self.S,self.Dh = val, vec.T
-        # self.D,self.S,self.Dh = np.linalg.svd(self.Z@self.G@self.Z.T)
         self.X = self.Dh@self.X
         self.y = self.Dh@self.y
         self.Z = self.Dh@self.Z

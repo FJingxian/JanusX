@@ -9,12 +9,63 @@ from ..janusx import (
     SiteInfo,
 )
 
+def bed_chunk_reader(
+    prefix: str,
+    chunk_size: int = 50000,
+    maf: float = 0.0,
+    missing_rate: float = 1.0,
+    impute: bool = True,
+    *,
+    snp_range: tuple[int, int] | None = None,
+    snp_indices: list[int] | None = None,
+    bim_range: tuple[str, int, int] | None = None,
+    sample_ids: list[str] | None = None,
+    sample_indices: list[int] | None = None,
+):
+    """
+    Stream PLINK BED/BIM/FAM chunks with optional SNP/sample selection.
+
+    Selection (mutually exclusive):
+      - snp_range   : (start, end) with end exclusive (0-based)
+      - snp_indices : explicit 0-based SNP indices
+      - bim_range   : (chrom, start_pos, end_pos), inclusive on positions
+
+    Samples (mutually exclusive):
+      - sample_ids     : list of IID strings from .fam
+      - sample_indices : explicit 0-based sample indices
+    """
+    reader = BedChunkReader(
+        prefix,
+        float(maf),
+        float(missing_rate),
+        bool(impute),
+        snp_range,
+        snp_indices,
+        bim_range,
+        sample_ids,
+        sample_indices,
+    )
+
+    while True:
+        out = reader.next_chunk(chunk_size)
+        if out is None:
+            break
+        geno, sites = out
+        geno_np = np.asarray(geno, dtype=np.float32)
+        yield geno_np, sites
+
 def load_genotype_chunks(
     path_or_prefix: str,
     chunk_size: int = 50000,
     maf: float = 0.0,
     missing_rate: float = 1.0,
     impute: bool = True,
+    *,
+    snp_range: tuple[int, int] | None = None,
+    snp_indices: list[int] | None = None,
+    bim_range: tuple[str, int, int] | None = None,
+    sample_ids: list[str] | None = None,
+    sample_indices: list[int] | None = None,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -72,6 +123,14 @@ def load_genotype_chunks(
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
 
+    Selection (PLINK only)
+    ----------------------
+    - snp_range: (start, end) 0-based, end exclusive
+    - snp_indices: list of 0-based SNP indices
+    - bim_range: (chrom, start_pos, end_pos), inclusive on positions
+    - sample_ids: list of IID strings from .fam
+    - sample_indices: list of 0-based sample indices
+
     Example
     -------
     >>> for geno, sites in load_genotype_chunks("QC", chunk_size=20000, maf=0.05):
@@ -81,6 +140,8 @@ def load_genotype_chunks(
 
     # 1) Determine file type: BED or VCF
     if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
+        if any(v is not None for v in (snp_range, snp_indices, bim_range, sample_ids, sample_indices)):
+            raise ValueError("SNP/sample selection is only supported for PLINK BED/BIM/FAM inputs.")
         reader = VcfChunkReader(
             path_or_prefix,
             float(maf),
@@ -89,12 +150,19 @@ def load_genotype_chunks(
         )
     else:
         # Otherwise treat it as PLINK BED prefix
-        reader = BedChunkReader(
+        yield from bed_chunk_reader(
             path_or_prefix,
-            float(maf),
-            float(missing_rate),
-            bool(impute),
+            chunk_size=chunk_size,
+            maf=maf,
+            missing_rate=missing_rate,
+            impute=impute,
+            snp_range=snp_range,
+            snp_indices=snp_indices,
+            bim_range=bim_range,
+            sample_ids=sample_ids,
+            sample_indices=sample_indices,
         )
+        return
 
     # 2) Iterate until exhausted
     while True:

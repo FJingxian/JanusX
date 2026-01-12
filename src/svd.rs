@@ -1,8 +1,7 @@
 use std::borrow::Cow;
-use std::fs::File;
-use std::str;
+use std::sync::Arc;
 
-use memmap2::Mmap;
+use matrixmultiply::dgemm;
 use nalgebra::{DMatrix, SymmetricEigen};
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
@@ -12,8 +11,11 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
 use rand::Rng;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{BedSnpIter, VcfSnpIter};
+use crate::gfcore::BedSnpIter;
+use crate::gfreader::{build_sample_selection, build_snp_indices};
 
 fn matmul_a_b(a: &[f64], m: usize, n: usize, b: &[f64], l: usize, block_rows: usize) -> Vec<f64> {
     let mut y = vec![0.0; m * l];
@@ -126,9 +128,112 @@ fn transpose_rowmajor(src: &[f64], rows: usize, cols: usize) -> Vec<f64> {
     dst
 }
 
+#[derive(Clone, Copy)]
+struct RowStats {
+    mean: f64,
+    inv_std: f64,
+}
+
+fn gemm_rowmajor(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f64],
+    rsa: isize,
+    csa: isize,
+    b: &[f64],
+    rsb: isize,
+    csb: isize,
+    c: &mut [f64],
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    debug_assert!(c.len() >= m * n);
+    unsafe {
+        dgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            rsa,
+            csa,
+            b.as_ptr(),
+            rsb,
+            csb,
+            0.0,
+            c.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+}
+
+fn compute_u_row(q_row: &[f64], m: usize, l: usize, u_b_row: &[f64], k: usize) -> Vec<f64> {
+    let mut u_row = vec![0.0; m * k];
+    if m == 0 || l == 0 || k == 0 {
+        return u_row;
+    }
+    gemm_rowmajor(
+        m,
+        l,
+        k,
+        q_row,
+        l as isize,
+        1,
+        u_b_row,
+        k as isize,
+        1,
+        &mut u_row,
+    );
+    u_row
+}
+
+fn compute_vt_from_b(u_b_row: &[f64], k: usize, l: usize, b: &[f64], n: usize, s: &[f64]) -> Vec<f64> {
+    let mut vt = vec![0.0; k * n];
+    if k == 0 || l == 0 || n == 0 {
+        return vt;
+    }
+    gemm_rowmajor(
+        k,
+        l,
+        n,
+        u_b_row,
+        1,
+        k as isize,
+        b,
+        n as isize,
+        1,
+        &mut vt,
+    );
+    for col in 0..k {
+        let sigma = s[col];
+        if sigma == 0.0 {
+            let row = &mut vt[col * n..(col + 1) * n];
+            row.fill(0.0);
+            continue;
+        }
+        let inv_sigma = 1.0 / sigma;
+        let row = &mut vt[col * n..(col + 1) * n];
+        for val in row.iter_mut() {
+            *val *= inv_sigma;
+        }
+    }
+    vt
+}
+
 trait GenoIter {
     fn n_samples(&self) -> usize;
     fn next_row(&mut self) -> Option<Vec<f32>>;
+}
+
+struct BedSnpIterSelect {
+    it: BedSnpIter,
+    snp_indices: Option<Arc<Vec<usize>>>,
+    snp_pos: usize,
+    sample_indices: Arc<Vec<usize>>,
+    full_samples: bool,
 }
 
 impl GenoIter for BedSnpIter {
@@ -141,13 +246,44 @@ impl GenoIter for BedSnpIter {
     }
 }
 
-impl GenoIter for VcfSnpIter {
+impl GenoIter for BedSnpIterSelect {
     fn n_samples(&self) -> usize {
-        VcfSnpIter::n_samples(self)
+        self.sample_indices.len()
     }
 
     fn next_row(&mut self) -> Option<Vec<f32>> {
-        VcfSnpIter::next_snp(self).map(|(row, _)| row)
+        if let Some(ref snp_indices) = self.snp_indices {
+            while self.snp_pos < snp_indices.len() {
+                let snp_idx = snp_indices[self.snp_pos];
+                self.snp_pos += 1;
+                if let Some((row, _site)) = self.it.get_snp_row(snp_idx) {
+                    if self.full_samples {
+                        return Some(row);
+                    }
+                    let mut out = Vec::with_capacity(self.sample_indices.len());
+                    for &idx in self.sample_indices.iter() {
+                        out.push(row[idx]);
+                    }
+                    return Some(out);
+                }
+            }
+            return None;
+        }
+
+        match self.it.next_snp() {
+            Some((row, _site)) => {
+                if self.full_samples {
+                    Some(row)
+                } else {
+                    let mut out = Vec::with_capacity(self.sample_indices.len());
+                    for &idx in self.sample_indices.iter() {
+                        out.push(row[idx]);
+                    }
+                    Some(out)
+                }
+            }
+            None => None,
+        }
     }
 }
 
@@ -169,17 +305,46 @@ fn row_mean_invstd(row: &[f32], center: bool, scale: bool) -> (f64, f64) {
     (mean, 1.0 / var.sqrt())
 }
 
+#[inline]
+fn row_mean_invstd_selected(
+    row: &[f32],
+    sample_indices: &[usize],
+    center: bool,
+    scale: bool,
+    full_samples: bool,
+) -> (f64, f64) {
+    if !center && !scale {
+        return (0.0, 1.0);
+    }
+    if full_samples {
+        return row_mean_invstd(row, center, scale);
+    }
+    let sum: f64 = sample_indices.iter().map(|&i| row[i] as f64).sum();
+    let mean = sum / sample_indices.len() as f64;
+    if !scale {
+        return (mean, 1.0);
+    }
+    let p = (mean / 2.0).clamp(0.0, 1.0);
+    let var = 2.0 * p * (1.0 - p);
+    if var <= 0.0 {
+        return (mean, 0.0);
+    }
+    (mean, 1.0 / var.sqrt())
+}
+
 fn compute_y_with_iter<I: GenoIter>(
     mut it: I,
     omega: &[f64],
     l: usize,
     center: bool,
     scale: bool,
-) -> Result<(Vec<f64>, usize), String> {
+) -> Result<(Vec<f64>, usize, Option<Vec<RowStats>>), String> {
     let n = it.n_samples();
     if omega.len() != n * l {
         return Err("omega size mismatch".into());
     }
+    let cache_stats = center || scale;
+    let mut stats = if cache_stats { Some(Vec::new()) } else { None };
     let mut y: Vec<f64> = Vec::new();
     while let Some(row) = it.next_row() {
         let base = y.len();
@@ -197,6 +362,9 @@ fn compute_y_with_iter<I: GenoIter>(
             }
         } else {
             let (mean, inv_std) = row_mean_invstd(&row, center, scale);
+            if let Some(ref mut stats_vec) = stats {
+                stats_vec.push(RowStats { mean, inv_std });
+            }
             if scale && inv_std == 0.0 {
                 continue;
             }
@@ -214,7 +382,569 @@ fn compute_y_with_iter<I: GenoIter>(
             }
         }
     }
-    Ok((y, n))
+    Ok((y, n, stats))
+}
+
+fn compute_y_rows_bed_parallel(
+    it: &BedSnpIter,
+    snp_indices: Option<&[usize]>,
+    sample_indices: &[usize],
+    full_samples: bool,
+    mat: &[f64],
+    l: usize,
+    center: bool,
+    scale: bool,
+    retained: Option<&[usize]>,
+    stats: Option<&[RowStats]>,
+    pool: &rayon::ThreadPool,
+) -> Result<(Vec<f64>, Vec<usize>, Option<Vec<RowStats>>), String> {
+    let n_samples = sample_indices.len();
+    if mat.len() != n_samples * l {
+        return Err("projection matrix size mismatch".into());
+    }
+    if stats.is_some() && retained.is_none() {
+        return Err("stats require retained SNP list".into());
+    }
+    if let (Some(stats), Some(retained)) = (stats, retained) {
+        if stats.len() != retained.len() {
+            return Err("stats length mismatch".into());
+        }
+    }
+    let block_snps = 256usize;
+    let cache_stats = stats.is_none() && (center || scale);
+    let use_stats = stats.is_some() && (center || scale);
+    let stats_slice = stats.unwrap_or(&[]);
+
+    let (total, mode_list): (usize, Option<&[usize]>) = if let Some(retained_idx) = retained {
+        (retained_idx.len(), Some(retained_idx))
+    } else if let Some(list) = snp_indices {
+        (list.len(), Some(list))
+    } else {
+        (it.n_snps(), None)
+    };
+    if total == 0 {
+        let stats_out = if cache_stats { Some(Vec::new()) } else { None };
+        return Ok((Vec::new(), Vec::new(), stats_out));
+    }
+
+    let blocks: Vec<(usize, usize)> = (0..total)
+        .step_by(block_snps)
+        .map(|start| (start, (start + block_snps).min(total)))
+        .collect();
+
+    let results: Vec<(usize, Vec<usize>, Vec<f64>, Vec<RowStats>)> = pool.install(|| {
+        blocks
+            .par_iter()
+            .enumerate()
+            .map(|(block_idx, (start, end))| {
+                let mut kept: Vec<usize> = Vec::new();
+                let mut rows: Vec<f64> = Vec::new();
+                let mut stats_block: Vec<RowStats> = Vec::new();
+                for i in *start..*end {
+                    let snp_idx = if let Some(list) = mode_list {
+                        list[i]
+                    } else {
+                        i
+                    };
+                    let Some((row, _)) = it.get_snp_row(snp_idx) else {
+                        if retained.is_some() {
+                            return Err("SNP missing during pass".to_string());
+                        }
+                        continue;
+                    };
+                    let (mean, inv_std) = if !center && !scale {
+                        (0.0, 1.0)
+                    } else if use_stats {
+                        let stat = stats_slice
+                            .get(i)
+                            .ok_or_else(|| "stats length mismatch".to_string())?;
+                        (stat.mean, stat.inv_std)
+                    } else {
+                        row_mean_invstd_selected(
+                            &row,
+                            sample_indices,
+                            center,
+                            scale,
+                            full_samples,
+                        )
+                    };
+                    if scale && inv_std == 0.0 {
+                        if retained.is_some() {
+                            return Err("SNP variance is zero in later pass".to_string());
+                        }
+                        continue;
+                    }
+                    let base = rows.len();
+                    rows.resize(base + l, 0.0);
+                    let y_row = &mut rows[base..base + l];
+                    if !center && !scale {
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let val = row[k] as f64;
+                                if val != 0.0 {
+                                    let mat_row = &mat[k * l..(k + 1) * l];
+                                    for j in 0..l {
+                                        y_row[j] += val * mat_row[j];
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let val = row[orig_idx] as f64;
+                                if val != 0.0 {
+                                    let mat_row = &mat[sel_pos * l..(sel_pos + 1) * l];
+                                    for j in 0..l {
+                                        y_row[j] += val * mat_row[j];
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let mut val = row[k] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    let mat_row = &mat[k * l..(k + 1) * l];
+                                    for j in 0..l {
+                                        y_row[j] += val * mat_row[j];
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let mut val = row[orig_idx] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    let mat_row = &mat[sel_pos * l..(sel_pos + 1) * l];
+                                    for j in 0..l {
+                                        y_row[j] += val * mat_row[j];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    kept.push(snp_idx);
+                    if cache_stats {
+                        stats_block.push(RowStats { mean, inv_std });
+                    }
+                }
+                Ok((block_idx, kept, rows, stats_block))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+
+    let mut results = results;
+    results.sort_by_key(|(idx, _, _, _)| *idx);
+
+    let mut y: Vec<f64> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
+    let mut stats_out: Option<Vec<RowStats>> = if cache_stats { Some(Vec::new()) } else { None };
+    for (_idx, mut blk_kept, blk_rows, blk_stats) in results {
+        kept.append(&mut blk_kept);
+        y.extend_from_slice(&blk_rows);
+        if let Some(ref mut stats_vec) = stats_out {
+            stats_vec.extend_from_slice(&blk_stats);
+        }
+    }
+
+    Ok((y, kept, stats_out))
+}
+
+fn compute_at_y_bed_parallel(
+    it: &BedSnpIter,
+    retained: &[usize],
+    sample_indices: &[usize],
+    full_samples: bool,
+    y: &[f64],
+    l: usize,
+    center: bool,
+    scale: bool,
+    stats: Option<&[RowStats]>,
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<f64>, String> {
+    let n_samples = sample_indices.len();
+    if y.len() != retained.len() * l {
+        return Err("Y size mismatch".into());
+    }
+    if let Some(stats) = stats {
+        if stats.len() != retained.len() {
+            return Err("stats length mismatch in A^T*Y".into());
+        }
+    }
+    let block_snps = 256usize;
+    let blocks: Vec<(usize, usize)> = (0..retained.len())
+        .step_by(block_snps)
+        .map(|start| (start, (start + block_snps).min(retained.len())))
+        .collect();
+
+    let z = pool.install(|| {
+        blocks
+            .par_iter()
+            .map(|(start, end)| {
+                let mut z_block = vec![0.0f64; n_samples * l];
+                for row_idx in *start..*end {
+                    let snp_idx = retained[row_idx];
+                    let y_row = &y[row_idx * l..(row_idx + 1) * l];
+                    let Some((row, _)) = it.get_snp_row(snp_idx) else {
+                        return Err("SNP missing during A^T*Y".to_string());
+                    };
+                    if !center && !scale {
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let val = row[k] as f64;
+                                if val != 0.0 {
+                                    let z_row = &mut z_block[k * l..(k + 1) * l];
+                                    for j in 0..l {
+                                        z_row[j] += val * y_row[j];
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let val = row[orig_idx] as f64;
+                                if val != 0.0 {
+                                    let z_row = &mut z_block[sel_pos * l..(sel_pos + 1) * l];
+                                    for j in 0..l {
+                                        z_row[j] += val * y_row[j];
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let (mean, inv_std) = if let Some(stats) = stats {
+                            let stat = stats
+                                .get(row_idx)
+                                .ok_or_else(|| "stats length mismatch in A^T*Y".to_string())?;
+                            (stat.mean, stat.inv_std)
+                        } else {
+                            row_mean_invstd_selected(
+                                &row,
+                                sample_indices,
+                                center,
+                                scale,
+                                full_samples,
+                            )
+                        };
+                        if scale && inv_std == 0.0 {
+                            return Err("SNP variance is zero in later pass".to_string());
+                        }
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let mut val = row[k] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    let z_row = &mut z_block[k * l..(k + 1) * l];
+                                    for j in 0..l {
+                                        z_row[j] += val * y_row[j];
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let mut val = row[orig_idx] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    let z_row = &mut z_block[sel_pos * l..(sel_pos + 1) * l];
+                                    for j in 0..l {
+                                        z_row[j] += val * y_row[j];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(z_block)
+            })
+            .reduce(
+                || Ok(vec![0.0f64; n_samples * l]),
+                |a, b| {
+                    let mut a = a?;
+                    let b = b?;
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )
+    })?;
+
+    Ok(z)
+}
+
+fn compute_qt_a_bed_parallel(
+    it: &BedSnpIter,
+    retained: &[usize],
+    sample_indices: &[usize],
+    full_samples: bool,
+    q: &[f64],
+    l: usize,
+    center: bool,
+    scale: bool,
+    stats: Option<&[RowStats]>,
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<f64>, String> {
+    let n_samples = sample_indices.len();
+    if q.len() != retained.len() * l {
+        return Err("Q size mismatch".into());
+    }
+    if let Some(stats) = stats {
+        if stats.len() != retained.len() {
+            return Err("stats length mismatch in Q^T*A".into());
+        }
+    }
+    let block_snps = 256usize;
+    let blocks: Vec<(usize, usize)> = (0..retained.len())
+        .step_by(block_snps)
+        .map(|start| (start, (start + block_snps).min(retained.len())))
+        .collect();
+
+    let b = pool.install(|| {
+        blocks
+            .par_iter()
+            .map(|(start, end)| {
+                let mut b_block = vec![0.0f64; l * n_samples];
+                for row_idx in *start..*end {
+                    let snp_idx = retained[row_idx];
+                    let q_row = &q[row_idx * l..(row_idx + 1) * l];
+                    let Some((row, _)) = it.get_snp_row(snp_idx) else {
+                        return Err("SNP missing during Q^T*A".to_string());
+                    };
+                    if !center && !scale {
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let val = row[k] as f64;
+                                if val != 0.0 {
+                                    for j in 0..l {
+                                        b_block[j * n_samples + k] += q_row[j] * val;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let val = row[orig_idx] as f64;
+                                if val != 0.0 {
+                                    for j in 0..l {
+                                        b_block[j * n_samples + sel_pos] += q_row[j] * val;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let (mean, inv_std) = if let Some(stats) = stats {
+                            let stat = stats
+                                .get(row_idx)
+                                .ok_or_else(|| "stats length mismatch in Q^T*A".to_string())?;
+                            (stat.mean, stat.inv_std)
+                        } else {
+                            row_mean_invstd_selected(
+                                &row,
+                                sample_indices,
+                                center,
+                                scale,
+                                full_samples,
+                            )
+                        };
+                        if scale && inv_std == 0.0 {
+                            return Err("SNP variance is zero in later pass".to_string());
+                        }
+                        if full_samples {
+                            for k in 0..n_samples {
+                                let mut val = row[k] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    for j in 0..l {
+                                        b_block[j * n_samples + k] += q_row[j] * val;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (sel_pos, &orig_idx) in sample_indices.iter().enumerate() {
+                                let mut val = row[orig_idx] as f64 - mean;
+                                if scale {
+                                    val *= inv_std;
+                                }
+                                if val != 0.0 {
+                                    for j in 0..l {
+                                        b_block[j * n_samples + sel_pos] += q_row[j] * val;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(b_block)
+            })
+            .reduce(
+                || Ok(vec![0.0f64; l * n_samples]),
+                |a, b| {
+                    let mut a = a?;
+                    let b = b?;
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )
+    })?;
+
+    Ok(b)
+}
+
+fn randomized_svd_bed_parallel(
+    it: &BedSnpIter,
+    snp_indices: Option<&[usize]>,
+    sample_indices: &[usize],
+    full_samples: bool,
+    k: usize,
+    oversample: usize,
+    n_iter: usize,
+    center: bool,
+    scale: bool,
+    seed: u64,
+    threads: usize,
+    need_u: bool,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, usize, usize), String> {
+    let n = sample_indices.len();
+    if n == 0 {
+        return Err("no samples selected".into());
+    }
+    let min_dim = n;
+    if k == 0 || k > min_dim {
+        return Err(format!("k must be in 1..={min_dim}"));
+    }
+    let l = k.checked_add(oversample).ok_or("k + oversample overflow")?;
+    if l == 0 || l > min_dim {
+        return Err("k + oversample must be in 1..=n_samples".into());
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut omega = vec![0.0; n * l];
+    for i in 0..n {
+        let row = &mut omega[i * l..(i + 1) * l];
+        for j in 0..l {
+            row[j] = rng.sample(StandardNormal);
+        }
+    }
+
+    let (mut y, retained, stats) = compute_y_rows_bed_parallel(
+        it,
+        snp_indices,
+        sample_indices,
+        full_samples,
+        &omega,
+        l,
+        center,
+        scale,
+        None,
+        None,
+        &pool,
+    )?;
+    let m_eff = retained.len();
+    if m_eff == 0 {
+        return Err("no variants left after QC".into());
+    }
+    if l > m_eff {
+        return Err("k + oversample exceeds retained variant count".into());
+    }
+
+    for _ in 0..n_iter {
+        let z = compute_at_y_bed_parallel(
+            it,
+            &retained,
+            sample_indices,
+            full_samples,
+            &y,
+            l,
+            center,
+            scale,
+            stats.as_deref(),
+            &pool,
+        )?;
+        let (y_new, retained_new, _stats_new) = compute_y_rows_bed_parallel(
+            it,
+            None,
+            sample_indices,
+            full_samples,
+            &z,
+            l,
+            center,
+            scale,
+            Some(&retained),
+            stats.as_deref(),
+            &pool,
+        )?;
+        if retained_new.len() != retained.len() {
+            return Err("inconsistent SNP filtering across passes".into());
+        }
+        y = y_new;
+    }
+
+    let y_mat = DMatrix::from_row_slice(m_eff, l, &y);
+    let qr = y_mat.qr();
+    let q_full = qr.q();
+    let q = q_full.columns(0, l).into_owned();
+    let q_row = dmatrix_to_rowmajor(&q);
+
+    let b = compute_qt_a_bed_parallel(
+        it,
+        &retained,
+        sample_indices,
+        full_samples,
+        &q_row,
+        l,
+        center,
+        scale,
+        stats.as_deref(),
+        &pool,
+    )?;
+
+    let c = gram_b(&b, l, n);
+    let c_mat = DMatrix::from_row_slice(l, l, &c);
+    let eig = SymmetricEigen::new(c_mat);
+
+    let mut pairs: Vec<(f64, usize)> = eig
+        .eigenvalues
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, v)| (v, i))
+        .collect();
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut s = Vec::with_capacity(k);
+    let mut u_b = DMatrix::<f64>::zeros(l, k);
+    for (col, (val, idx)) in pairs.into_iter().take(k).enumerate() {
+        let sigma = val.max(0.0).sqrt();
+        s.push(sigma);
+        let ucol = eig.eigenvectors.column(idx);
+        u_b.set_column(col, &ucol);
+    }
+
+    let u_b_row = dmatrix_to_rowmajor(&u_b);
+    let u_row = if need_u {
+        compute_u_row(&q_row, m_eff, l, &u_b_row, k)
+    } else {
+        Vec::new()
+    };
+    let vt = compute_vt_from_b(&u_b_row, k, l, &b, n, &s);
+
+    Ok((u_row, s, vt, m_eff, n))
 }
 
 fn compute_at_y_with_iter<I: GenoIter>(
@@ -223,8 +953,14 @@ fn compute_at_y_with_iter<I: GenoIter>(
     l: usize,
     center: bool,
     scale: bool,
+    stats: Option<&[RowStats]>,
 ) -> Result<(Vec<f64>, usize), String> {
     let n = it.n_samples();
+    if let Some(stats) = stats {
+        if stats.len() * l != y.len() {
+            return Err("stats length mismatch in A^T*Y".into());
+        }
+    }
     let mut z = vec![0.0f64; n * l];
     let mut row_idx: usize = 0;
     while let Some(row) = it.next_row() {
@@ -242,7 +978,14 @@ fn compute_at_y_with_iter<I: GenoIter>(
                 }
             }
         } else {
-            let (mean, inv_std) = row_mean_invstd(&row, center, scale);
+            let (mean, inv_std) = if let Some(stats) = stats {
+                let stat = stats
+                    .get(row_idx)
+                    .ok_or_else(|| "stats length mismatch in A^T*Y".to_string())?;
+                (stat.mean, stat.inv_std)
+            } else {
+                row_mean_invstd(&row, center, scale)
+            };
             if scale && inv_std == 0.0 {
                 row_idx += 1;
                 continue;
@@ -274,12 +1017,14 @@ fn compute_a_z_with_iter<I: GenoIter>(
     l: usize,
     center: bool,
     scale: bool,
+    stats: Option<&[RowStats]>,
 ) -> Result<(Vec<f64>, usize), String> {
     let n = it.n_samples();
     if z.len() != n * l {
         return Err("Z size mismatch".into());
     }
     let mut y: Vec<f64> = Vec::new();
+    let mut row_idx: usize = 0;
     while let Some(row) = it.next_row() {
         let base = y.len();
         y.resize(base + l, 0.0);
@@ -295,8 +1040,16 @@ fn compute_a_z_with_iter<I: GenoIter>(
                 }
             }
         } else {
-            let (mean, inv_std) = row_mean_invstd(&row, center, scale);
+            let (mean, inv_std) = if let Some(stats) = stats {
+                let stat = stats
+                    .get(row_idx)
+                    .ok_or_else(|| "stats length mismatch in A*Z".to_string())?;
+                (stat.mean, stat.inv_std)
+            } else {
+                row_mean_invstd(&row, center, scale)
+            };
             if scale && inv_std == 0.0 {
+                row_idx += 1;
                 continue;
             }
             for k in 0..n {
@@ -312,6 +1065,12 @@ fn compute_a_z_with_iter<I: GenoIter>(
                 }
             }
         }
+        row_idx += 1;
+    }
+    if let Some(stats) = stats {
+        if row_idx != stats.len() {
+            return Err("stats length mismatch in A*Z".into());
+        }
     }
     Ok((y, n))
 }
@@ -322,10 +1081,16 @@ fn compute_qt_a_with_iter<I: GenoIter>(
     l: usize,
     center: bool,
     scale: bool,
+    stats: Option<&[RowStats]>,
 ) -> Result<(Vec<f64>, usize), String> {
     let n = it.n_samples();
     let mut b = vec![0.0f64; l * n];
     let mut row_idx: usize = 0;
+    if let Some(stats) = stats {
+        if stats.len() * l != q.len() {
+            return Err("stats length mismatch in Q^T*A".into());
+        }
+    }
     while let Some(row) = it.next_row() {
         let q_row = q
             .get(row_idx * l..(row_idx + 1) * l)
@@ -340,7 +1105,14 @@ fn compute_qt_a_with_iter<I: GenoIter>(
                 }
             }
         } else {
-            let (mean, inv_std) = row_mean_invstd(&row, center, scale);
+            let (mean, inv_std) = if let Some(stats) = stats {
+                let stat = stats
+                    .get(row_idx)
+                    .ok_or_else(|| "stats length mismatch in Q^T*A".to_string())?;
+                (stat.mean, stat.inv_std)
+            } else {
+                row_mean_invstd(&row, center, scale)
+            };
             if scale && inv_std == 0.0 {
                 row_idx += 1;
                 continue;
@@ -373,6 +1145,7 @@ fn randomized_svd_streaming<I, F>(
     center: bool,
     scale: bool,
     seed: u64,
+    need_u: bool,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, usize, usize), String>
 where
     I: GenoIter,
@@ -401,26 +1174,26 @@ where
         }
     }
 
-    let (mut y, n_y) = compute_y_with_iter(iter0, &omega, l, center, scale)?;
+    let (mut y, n_y, stats) = compute_y_with_iter(iter0, &omega, l, center, scale)?;
     if n_y != n {
         return Err("sample count mismatch".into());
     }
     if y.len() % l != 0 {
         return Err("Y size mismatch".into());
     }
-    let mut m_eff = y.len() / l;
+    let m_eff = y.len() / l;
     if m_eff == 0 {
         return Err("no variants left after QC".into());
     }
 
     for _ in 0..n_iter {
         let iter_z = make_iter()?;
-        let (z, n_z) = compute_at_y_with_iter(iter_z, &y, l, center, scale)?;
+        let (z, n_z) = compute_at_y_with_iter(iter_z, &y, l, center, scale, stats.as_deref())?;
         if n_z != n {
             return Err("sample count mismatch".into());
         }
         let iter_y = make_iter()?;
-        let (y_new, n_y2) = compute_a_z_with_iter(iter_y, &z, l, center, scale)?;
+        let (y_new, n_y2) = compute_a_z_with_iter(iter_y, &z, l, center, scale, stats.as_deref())?;
         if n_y2 != n {
             return Err("sample count mismatch".into());
         }
@@ -447,7 +1220,7 @@ where
     let q_row = dmatrix_to_rowmajor(&q);
 
     let iter_b = make_iter()?;
-    let (b, n_b) = compute_qt_a_with_iter(iter_b, &q_row, l, center, scale)?;
+    let (b, n_b) = compute_qt_a_with_iter(iter_b, &q_row, l, center, scale, stats.as_deref())?;
     if n_b != n {
         return Err("sample count mismatch".into());
     }
@@ -474,181 +1247,15 @@ where
         u_b.set_column(col, &ucol);
     }
 
-    let u = &q * &u_b;
-    let u_row = dmatrix_to_rowmajor(&u);
-
-    let mut vt = vec![0.0; k * n];
-    for col in 0..k {
-        let sigma = s[col];
-        if sigma == 0.0 {
-            continue;
-        }
-        let inv_sigma = 1.0 / sigma;
-        let vt_row = &mut vt[col * n..(col + 1) * n];
-        for r in 0..l {
-            let coeff = u_b[(r, col)];
-            if coeff != 0.0 {
-                let b_row = &b[r * n..(r + 1) * n];
-                for j in 0..n {
-                    vt_row[j] += coeff * b_row[j];
-                }
-            }
-        }
-        for j in 0..n {
-            vt_row[j] *= inv_sigma;
-        }
-    }
+    let u_b_row = dmatrix_to_rowmajor(&u_b);
+    let u_row = if need_u {
+        compute_u_row(&q_row, m_eff, l, &u_b_row, k)
+    } else {
+        Vec::new()
+    };
+    let vt = compute_vt_from_b(&u_b_row, k, l, &b, n, &s);
 
     Ok((u_row, s, vt, m_eff, n))
-}
-
-fn extract_quoted_value(header: &str, key: &str) -> Option<String> {
-    let key_pos = header.find(key)?;
-    let rest = &header[key_pos + key.len()..];
-    let colon_pos = rest.find(':')?;
-    let rest = rest[colon_pos + 1..].trim_start();
-    let mut chars = rest.chars();
-    let quote = chars.next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let end = chars.position(|c| c == quote)?;
-    Some(rest[1..1 + end].to_string())
-}
-
-fn extract_bool_value(header: &str, key: &str) -> Option<bool> {
-    let key_pos = header.find(key)?;
-    let rest = &header[key_pos + key.len()..];
-    let colon_pos = rest.find(':')?;
-    let rest = rest[colon_pos + 1..].trim_start();
-    if rest.starts_with("True") {
-        Some(true)
-    } else if rest.starts_with("False") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn extract_shape(header: &str) -> Option<Vec<usize>> {
-    let key_pos = header.find("shape")?;
-    let rest = &header[key_pos + "shape".len()..];
-    let colon_pos = rest.find(':')?;
-    let rest = rest[colon_pos + 1..].trim_start();
-    let start = rest.find('(')?;
-    let end = rest[start + 1..].find(')')? + start + 1;
-    let inner = &rest[start + 1..end];
-    let mut dims = Vec::new();
-    for part in inner.split(',') {
-        let val = part.trim();
-        if val.is_empty() {
-            continue;
-        }
-        dims.push(val.parse::<usize>().ok()?);
-    }
-    Some(dims)
-}
-
-fn parse_npy_header(bytes: &[u8]) -> Result<(usize, String, bool, Vec<usize>), String> {
-    if bytes.len() < 10 {
-        return Err("npy file too small".into());
-    }
-    if &bytes[0..6] != b"\x93NUMPY" {
-        return Err("not a .npy file".into());
-    }
-    let major = bytes[6];
-    let _minor = bytes[7];
-    let (header_len, header_start) = match major {
-        1 => {
-            if bytes.len() < 10 {
-                return Err("npy header truncated".into());
-            }
-            let len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-            (len, 10)
-        }
-        2 | 3 => {
-            if bytes.len() < 12 {
-                return Err("npy header truncated".into());
-            }
-            let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-            (len, 12)
-        }
-        _ => return Err(format!("unsupported npy version: {major}")),
-    };
-    let header_end = header_start + header_len;
-    if bytes.len() < header_end {
-        return Err("npy header truncated".into());
-    }
-    let header = str::from_utf8(&bytes[header_start..header_end])
-        .map_err(|_| "npy header not utf8".to_string())?;
-    let descr = extract_quoted_value(header, "descr")
-        .ok_or_else(|| "npy header missing descr".to_string())?;
-    let fortran = extract_bool_value(header, "fortran_order")
-        .ok_or_else(|| "npy header missing fortran_order".to_string())?;
-    let shape = extract_shape(header)
-        .ok_or_else(|| "npy header missing shape".to_string())?;
-    Ok((header_end, descr, fortran, shape))
-}
-
-struct NpyView {
-    mmap: Mmap,
-    offset: usize,
-    rows: usize,
-    cols: usize,
-    descr: String,
-    fortran: bool,
-}
-
-impl NpyView {
-    fn open(path: &str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-        let (offset, descr, fortran, shape) = parse_npy_header(&mmap)?;
-        if shape.len() != 2 {
-            return Err("only 2D .npy arrays are supported".into());
-        }
-        let rows = shape[0];
-        let cols = shape[1];
-        Ok(Self {
-            mmap,
-            offset,
-            rows,
-            cols,
-            descr,
-            fortran,
-        })
-    }
-
-    fn as_f64(&self) -> Result<Cow<[f64]>, String> {
-        if self.fortran {
-            return Err("fortran_order .npy not supported".into());
-        }
-        if self.descr.starts_with('>') {
-            return Err("big-endian .npy not supported".into());
-        }
-        if self.descr != "<f8" && self.descr != "|f8" && self.descr != "f8" {
-            return Err(format!("unsupported dtype: {}", self.descr));
-        }
-
-        let len_bytes = self.rows.checked_mul(self.cols)
-            .and_then(|v| v.checked_mul(8))
-            .ok_or("matrix too large")?;
-        let data = self.mmap.get(self.offset..self.offset + len_bytes)
-            .ok_or("npy data truncated")?;
-
-        let (prefix, aligned, suffix) = unsafe { data.align_to::<f64>() };
-        if prefix.is_empty() && suffix.is_empty() {
-            return Ok(Cow::Borrowed(aligned));
-        }
-
-        let mut out = Vec::with_capacity(self.rows * self.cols);
-        for chunk in data.chunks_exact(8) {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(chunk);
-            out.push(f64::from_le_bytes(bytes));
-        }
-        Ok(Cow::Owned(out))
-    }
 }
 
 fn randomized_svd_blocked(
@@ -720,30 +1327,9 @@ fn randomized_svd_blocked(
         u_b.set_column(col, &ucol);
     }
 
-    let u = &q * &u_b;
-    let u_row = dmatrix_to_rowmajor(&u);
-
-    let mut vt = vec![0.0; k * n];
-    for col in 0..k {
-        let sigma = s[col];
-        if sigma == 0.0 {
-            continue;
-        }
-        let inv_sigma = 1.0 / sigma;
-        let vt_row = &mut vt[col * n..(col + 1) * n];
-        for r in 0..l {
-            let coeff = u_b[(r, col)];
-            if coeff != 0.0 {
-                let b_row = &b[r * n..(r + 1) * n];
-                for j in 0..n {
-                    vt_row[j] += coeff * b_row[j];
-                }
-            }
-        }
-        for j in 0..n {
-            vt_row[j] *= inv_sigma;
-        }
-    }
+    let u_b_row = dmatrix_to_rowmajor(&u_b);
+    let u_row = compute_u_row(&q_row, m, l, &u_b_row, k);
+    let vt = compute_vt_from_b(&u_b_row, k, l, &b, n, &s);
 
     Ok((u_row, s, vt))
 }
@@ -797,53 +1383,30 @@ pub fn block_randomized_svd<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, k, oversample=10, n_iter=2, block_rows=4096, seed=0))]
-/// Blocked randomized SVD for a float64 C-order .npy file.
-pub fn block_randomized_svd_npy<'py>(
-    py: Python<'py>,
-    path: &str,
-    k: usize,
-    oversample: usize,
-    n_iter: usize,
-    block_rows: usize,
-    seed: u64,
-) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray2<f64>>)> {
-    let view = NpyView::open(path).map_err(PyRuntimeError::new_err)?;
-    let a_data = view.as_f64().map_err(PyRuntimeError::new_err)?;
-    let (m, n) = (view.rows, view.cols);
-
-    let result = py.allow_threads(|| {
-        randomized_svd_blocked(
-            a_data.as_ref(),
-            m,
-            n,
-            k,
-            oversample,
-            n_iter,
-            block_rows,
-            seed,
-        )
-    });
-    let (u_vec, s_vec, vt_vec) =
-        result.map_err(|e| PyRuntimeError::new_err(e))?;
-
-    let u_arr = Array2::from_shape_vec((m, k), u_vec)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let vt_arr = Array2::from_shape_vec((k, n), vt_vec)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    let u_np = u_arr.into_pyarray_bound(py);
-    let s_np = s_vec.into_pyarray_bound(py);
-    let vt_np = vt_arr.into_pyarray_bound(py);
-
-    Ok((u_np, s_np, vt_np))
-}
-
-#[pyfunction]
-#[pyo3(signature = (prefix, k, oversample=10, n_iter=2, maf=0.0, miss=1.0, center=true, scale=false, impute=true, seed=0))]
+#[pyo3(signature = (
+    prefix,
+    k,
+    oversample=10,
+    n_iter=2,
+    maf=0.0,
+    miss=1.0,
+    center=true,
+    scale=false,
+    impute=true,
+    seed=0,
+    threads=0,
+    snp_range=None,
+    snp_indices=None,
+    bim_range=None,
+    sample_ids=None,
+    sample_indices=None,
+    return_vt=true,
+))]
 /// Blocked randomized SVD for PLINK bed/bim/fam (SNP-major).
 /// Returns (U, S, Vt) for the transposed orientation:
 ///   U: (n_samples, k), Vt: (k, n_snps_retained).
+/// Set return_vt=false to skip SNP-side vectors.
+/// Optional SNP/sample selection follows the BED reader rules.
 pub fn block_randomized_svd_bed<'py>(
     py: Python<'py>,
     prefix: &str,
@@ -856,79 +1419,98 @@ pub fn block_randomized_svd_bed<'py>(
     scale: bool,
     impute: bool,
     seed: u64,
-) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray2<f64>>)> {
+    threads: usize,
+    snp_range: Option<(usize, usize)>,
+    snp_indices: Option<Vec<usize>>,
+    bim_range: Option<(String, i32, i32)>,
+    sample_ids: Option<Vec<String>>,
+    sample_indices: Option<Vec<usize>>,
+    return_vt: bool,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Option<Bound<'py, PyArray2<f64>>>,
+)> {
     let center = center || scale;
     let prefix_s = prefix.to_string();
-    let result = py.allow_threads(|| {
-        randomized_svd_streaming::<BedSnpIter, _>(
-            || BedSnpIter::new_with_fill(&prefix_s, maf, miss, impute),
-            k,
-            oversample,
-            n_iter,
-            center,
-            scale,
-            seed,
-        )
-    });
+    let meta_it = BedSnpIter::new_with_fill(&prefix_s, maf, miss, impute)
+        .map_err(PyRuntimeError::new_err)?;
+    let (sample_indices, _sample_ids) = build_sample_selection(
+        &meta_it.samples,
+        sample_ids,
+        sample_indices,
+    ).map_err(PyRuntimeError::new_err)?;
+    let snp_indices = build_snp_indices(
+        &meta_it.sites,
+        snp_range,
+        snp_indices,
+        bim_range,
+    ).map_err(PyRuntimeError::new_err)?;
+    let full_samples = sample_indices.len() == meta_it.n_samples()
+        && sample_indices.iter().enumerate().all(|(i, idx)| *idx == i);
+
+    let sample_indices = Arc::new(sample_indices);
+    let snp_indices = snp_indices.map(Arc::new);
+
+    let need_u = return_vt;
+    let result = if threads > 1 {
+        let it = BedSnpIter::new_with_fill(&prefix_s, maf, miss, impute)
+            .map_err(PyRuntimeError::new_err)?;
+        py.allow_threads(|| {
+            randomized_svd_bed_parallel(
+                &it,
+                snp_indices.as_deref().map(|v| v.as_slice()),
+                sample_indices.as_ref(),
+                full_samples,
+                k,
+                oversample,
+                n_iter,
+                center,
+                scale,
+                seed,
+                threads,
+                need_u,
+            )
+        })
+    } else {
+        py.allow_threads(|| {
+            randomized_svd_streaming::<BedSnpIterSelect, _>(
+                || {
+                    let it = BedSnpIter::new_with_fill(&prefix_s, maf, miss, impute)?;
+                    Ok(BedSnpIterSelect {
+                        it,
+                        snp_indices: snp_indices.clone(),
+                        snp_pos: 0,
+                        sample_indices: sample_indices.clone(),
+                        full_samples,
+                    })
+                },
+                k,
+                oversample,
+                n_iter,
+                center,
+                scale,
+                seed,
+                need_u,
+            )
+        })
+    };
     let (u_vec, s_vec, vt_vec, m, n) = result.map_err(PyRuntimeError::new_err)?;
     let u_out = transpose_rowmajor(&vt_vec, k, n);
-    let vt_out = transpose_rowmajor(&u_vec, m, k);
 
     let u_arr = Array2::from_shape_vec((n, k), u_out)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let vt_arr = Array2::from_shape_vec((k, m), vt_out)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let u_np = u_arr.into_pyarray_bound(py);
     let s_np = s_vec.into_pyarray_bound(py);
-    let vt_np = vt_arr.into_pyarray_bound(py);
-
-    Ok((u_np, s_np, vt_np))
-}
-
-#[pyfunction]
-#[pyo3(signature = (path, k, oversample=10, n_iter=2, maf=0.0, miss=1.0, center=true, scale=false, impute=true, seed=0))]
-/// Blocked randomized SVD for VCF/VCF.GZ (SNP-major).
-/// Returns (U, S, Vt) for the transposed orientation:
-///   U: (n_samples, k), Vt: (k, n_snps_retained).
-pub fn block_randomized_svd_vcf<'py>(
-    py: Python<'py>,
-    path: &str,
-    k: usize,
-    oversample: usize,
-    n_iter: usize,
-    maf: f32,
-    miss: f32,
-    center: bool,
-    scale: bool,
-    impute: bool,
-    seed: u64,
-) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray2<f64>>)> {
-    let center = center || scale;
-    let path_s = path.to_string();
-    let result = py.allow_threads(|| {
-        randomized_svd_streaming::<VcfSnpIter, _>(
-            || VcfSnpIter::new_with_fill(&path_s, maf, miss, impute),
-            k,
-            oversample,
-            n_iter,
-            center,
-            scale,
-            seed,
-        )
-    });
-    let (u_vec, s_vec, vt_vec, m, n) = result.map_err(PyRuntimeError::new_err)?;
-    let u_out = transpose_rowmajor(&vt_vec, k, n);
-    let vt_out = transpose_rowmajor(&u_vec, m, k);
-
-    let u_arr = Array2::from_shape_vec((n, k), u_out)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let vt_arr = Array2::from_shape_vec((k, m), vt_out)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    let u_np = u_arr.into_pyarray_bound(py);
-    let s_np = s_vec.into_pyarray_bound(py);
-    let vt_np = vt_arr.into_pyarray_bound(py);
+    let vt_np = if return_vt {
+        let vt_out = transpose_rowmajor(&u_vec, m, k);
+        let vt_arr = Array2::from_shape_vec((k, m), vt_out)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Some(vt_arr.into_pyarray_bound(py))
+    } else {
+        None
+    };
 
     Ok((u_np, s_np, vt_np))
 }

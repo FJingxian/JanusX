@@ -550,9 +550,9 @@ def run_chunked_gwas_lmm_lm(
             np.concatenate(
                 [info_arr, results, np.array(maf_list).reshape(-1, 1)], axis=1
             ),
-            columns=["#CHROM", "POS", "REF", "ALT", "beta", "se", "p", "maf"],
+            columns=["#CHROM", "POS", "allele0", "allele1", "beta", "se", "p", "maf"],
         )
-        df = df[["#CHROM", "POS", "REF", "ALT", "maf", "beta", "se", "p"]]
+        df = df[["#CHROM", "POS", "allele0", "allele1", "maf", "beta", "se", "p"]]
         df = df.astype(
             {"POS": int, "maf": float, "beta": float, "se": float, "p": float}
         )

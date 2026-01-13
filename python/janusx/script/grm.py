@@ -196,7 +196,7 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "--mmap-limit", action="store_true", default=False,
+        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
     optional_group.add_argument(

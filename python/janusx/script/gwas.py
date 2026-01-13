@@ -484,9 +484,6 @@ def run_chunked_gwas_lmm_lm(
         has_results = False
         out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
         wrote_header = False
-        plot_chr = []
-        plot_pos = []
-        plot_p = []
 
         process.cpu_percent(interval=None)
         pbar = tqdm(total=n_snps, desc=f"{model_label}-{pname}", ascii=False)
@@ -525,11 +522,6 @@ def run_chunked_gwas_lmm_lm(
                 }
             )
             chunk_df["POS"] = chunk_df["POS"].astype(int)
-
-            if plot:
-                plot_chr.append(np.asarray(chroms, dtype=object))
-                plot_pos.append(np.asarray(poss, dtype="int64"))
-                plot_p.append(results[:, 2].astype("float64", copy=False))
 
             chunk_df["p"] = chunk_df["p"].map(lambda x: f"{x:.4e}")
             chunk_df.to_csv(
@@ -583,13 +575,13 @@ def run_chunked_gwas_lmm_lm(
             continue
 
         if plot:
-            plot_df = pd.DataFrame(
-                {
-                    "#CHROM": np.concatenate(plot_chr),
-                    "POS": np.concatenate(plot_pos),
-                    "p": np.concatenate(plot_p),
-                }
+            plot_df = pd.read_csv(
+                out_tsv,
+                sep="\t",
+                usecols=["#CHROM", "POS", "p"],
+                dtype={"#CHROM": str, "POS": "int64"},
             )
+            plot_df["p"] = pd.to_numeric(plot_df["p"], errors="coerce")
             fastplot(
                 plot_df,
                 y_vec,

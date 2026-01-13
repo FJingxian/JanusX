@@ -8,6 +8,23 @@ use memmap2::{Mmap, MmapOptions};
 
 const BED_HEADER_LEN: usize = 3;
 
+#[inline]
+fn system_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 {
+            ps as usize
+        } else {
+            4096
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        4096
+    }
+}
+
 // ---------------------------
 // Variant metadata
 // ---------------------------
@@ -299,7 +316,7 @@ impl BedSnpIter {
         let map_snps = remaining_snps.min(window_snps);
 
         let desired_offset = BED_HEADER_LEN + start_snp * bytes_per_snp;
-        let page_size = memmap2::page_size();
+        let page_size = system_page_size();
         let aligned_offset = desired_offset / page_size * page_size;
         let leading = desired_offset - aligned_offset;
         let desired_len = leading + map_snps * bytes_per_snp;

@@ -30,7 +30,11 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import psutil
-from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
+from janusx.gfreader import (
+    load_genotype_chunks,
+    inspect_genotype_file,
+    auto_mmap_window_mb,
+)
 from ._common.log import setup_logging
 
 
@@ -42,6 +46,7 @@ def build_grm_streaming(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    mmap_window_mb: int | None,
     logger,
 ) -> tuple[np.ndarray, int]:
     """
@@ -86,12 +91,12 @@ def build_grm_streaming(
 
     varsum = 0.0
     eff_m = 0
-
     for genosub, _sites in load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
+        mmap_window_mb=mmap_window_mb,
     ):
         # genosub: (m_chunk, n_samples)
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2  # (m_chunk,1)
@@ -191,6 +196,10 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "--mmap-limit", action="store_true", default=False,
+        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+    )
+    optional_group.add_argument(
         "-npz", "--npz", action="store_true", default=False,
         help="Save GRM as compressed NPZ instead of plain text (default: %(default)s).",
     )
@@ -235,6 +244,7 @@ def main(log: bool = True):
         )
         logger.info(f"MAF threshold: {args.maf}")
         logger.info(f"Missing rate:  {args.geno}")
+        logger.info(f"Mmap limit:    {args.mmap_limit}")
         logger.info(f"Save as NPZ: {args.npz}")
         logger.info(f"Output prefix: {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
@@ -251,6 +261,10 @@ def main(log: bool = True):
     maf_threshold = args.maf
     max_missing_rate = args.geno
     chunk_size = 100_000
+    mmap_window_mb = (
+        auto_mmap_window_mb(gfile, n_samples, n_snps, chunk_size)
+        if args.mmap_limit else None
+    )
 
     t_loading = time.time()
     grm, eff_m = build_grm_streaming(
@@ -261,6 +275,7 @@ def main(log: bool = True):
         maf_threshold=maf_threshold,
         max_missing_rate=max_missing_rate,
         chunk_size=chunk_size,
+        mmap_window_mb=mmap_window_mb,
         logger=logger,
     )
     logger.info(

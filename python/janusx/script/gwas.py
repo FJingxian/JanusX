@@ -62,7 +62,11 @@ import psutil
 from janusx.bioplotkit import GWASPLOT
 from janusx.pyBLUP import QK
 from janusx.gfreader import breader, vcfreader
-from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
+from janusx.gfreader import (
+    load_genotype_chunks,
+    inspect_genotype_file,
+    auto_mmap_window_mb,
+)
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
 
@@ -184,6 +188,7 @@ def build_grm_streaming(
     max_missing_rate: float,
     chunk_size: int,
     method: int,
+    mmap_window_mb: int | None,
     logger,
 ) -> tuple[np.ndarray, int]:
     """
@@ -196,9 +201,12 @@ def build_grm_streaming(
 
     varsum = 0.0
     eff_m = 0
-
     for genosub, _sites in load_genotype_chunks(
-        genofile, chunk_size, maf_threshold, max_missing_rate
+        genofile,
+        chunk_size,
+        maf_threshold,
+        max_missing_rate,
+        mmap_window_mb=mmap_window_mb,
     ):
         # genosub: (m_chunk, n_samples)
         genosub:np.ndarray
@@ -242,6 +250,7 @@ def load_or_build_grm_with_cache(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    mmap_limit: bool,
     logger:logging.Logger,
 ) -> tuple[np.ndarray, int]:
     """
@@ -268,6 +277,9 @@ def load_or_build_grm_with_cache(
                 max_missing_rate=max_missing_rate,
                 chunk_size=chunk_size,
                 method=method_int,
+                mmap_window_mb=auto_mmap_window_mb(
+                    genofile, n_samples, n_snps, chunk_size
+                ) if mmap_limit else None,
                 logger=logger,
             )
             np.save(f'{km_path}.npy', grm)
@@ -373,6 +385,7 @@ def prepare_streaming_context(
     mgrm: str,
     pcdim: str,
     cov_path: str | None,
+    mmap_limit: bool,
     logger,
 ):
     """
@@ -399,6 +412,7 @@ def prepare_streaming_context(
         maf_threshold=maf_threshold,
         max_missing_rate=max_missing_rate,
         chunk_size=chunk_size,
+        mmap_limit=mmap_limit,
         logger=logger,
     )
 
@@ -424,6 +438,7 @@ def run_chunked_gwas_lmm_lm(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    mmap_limit: bool,
     grm: np.ndarray,
     qmatrix: np.ndarray,
     cov_all: np.ndarray | None,
@@ -484,6 +499,10 @@ def run_chunked_gwas_lmm_lm(
         has_results = False
         out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
         wrote_header = False
+        mmap_window_mb = (
+            auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
+            if mmap_limit else None
+        )
 
         process.cpu_percent(interval=None)
         pbar = tqdm(total=n_snps, desc=f"{model_label}-{pname}", ascii=False)
@@ -494,7 +513,8 @@ def run_chunked_gwas_lmm_lm(
             chunk_size,
             maf_threshold,
             max_missing_rate,
-            sample_ids=sample_sub
+            sample_ids=sample_sub,
+            mmap_window_mb=mmap_window_mb,
         ):
             genosub:np.ndarray
             genosub = genosub[:, sameidx]  if sample_sub is None else genosub # (m_chunk, n_use)
@@ -875,6 +895,10 @@ def parse_args():
              "(affects GRM and GWAS; default: %(default)s).",
     )
     optional_group.add_argument(
+        "--mmap-limit", action="store_true", default=False,
+        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+    )
+    optional_group.add_argument(
         "-t", "--thread", type=int, default=-1,
         help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
     )
@@ -917,6 +941,7 @@ def main(log: bool = True):
         logger.info(f"Genotype file:    {gfile}")
         logger.info(f"Phenotype file:   {args.pheno}")
         logger.info(f"Phenotype cols:   {args.ncol if args.ncol is not None else 'All'}")
+        logger.info(f"Mmap limit:       {args.mmap_limit}")
         logger.info(
             f"Models:           "
             f"{'LMM ' if args.lmm else ''}"
@@ -967,6 +992,7 @@ def main(log: bool = True):
                 mgrm=args.grm,
                 pcdim=args.qcov,
                 cov_path=args.cov,
+                mmap_limit=args.mmap_limit,
                 logger=logger,
             )
 
@@ -983,6 +1009,7 @@ def main(log: bool = True):
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
+                mmap_limit=args.mmap_limit,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,
@@ -1005,6 +1032,7 @@ def main(log: bool = True):
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
+                mmap_limit=args.mmap_limit,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,
@@ -1026,6 +1054,7 @@ def main(log: bool = True):
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
+                mmap_limit=args.mmap_limit,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,

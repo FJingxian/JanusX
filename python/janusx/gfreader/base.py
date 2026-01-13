@@ -62,7 +62,7 @@ class GENOMETOOL:
 def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(prefix)
-    chunks = load_genotype_chunks(prefix,chunk_size)
+    chunks = load_genotype_chunks(prefix, chunk_size)
     genotype = np.zeros(shape=(len(idv),m),dtype='int8')
     pbar = tqdm(total=m, desc="Loading bed",ascii=True)
     num = 0

@@ -59,7 +59,11 @@ mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import PCSHOW
-from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
+from janusx.gfreader import (
+    load_genotype_chunks,
+    inspect_genotype_file,
+    auto_mmap_window_mb,
+)
 from ._common.log import setup_logging
 
 
@@ -83,6 +87,7 @@ def build_grm_streaming_for_pca(
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
     chunk_size: int = 100_000,
+    mmap_limit: bool = False,
     logger=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -109,12 +114,16 @@ def build_grm_streaming_for_pca(
 
     varsum = 0.0
     eff_m = 0
-
+    mmap_window_mb = (
+        auto_mmap_window_mb(genofile, n_samples, n_snps, chunk_size)
+        if mmap_limit else None
+    )
     for genosub, _sites in load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
+        mmap_window_mb=mmap_window_mb,
     ):
         # genosub: (m_chunk, n_samples)
         # MAF per SNP
@@ -231,6 +240,10 @@ def main(log: bool = True):
         help="Number of leading principal components to output (default: %(default)s).",
     )
     optional_group.add_argument(
+        "--mmap-limit", action="store_true", default=False,
+        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+    )
+    optional_group.add_argument(
         "-maf", "--maf", type=float, default=0.02,
         help="Exclude variants with minor allele frequency lower than a threshold "
              "(default: %(default)s).",
@@ -310,6 +323,7 @@ def main(log: bool = True):
             logger.info(f"Output PCs:       top {args.dim}")
             logger.info(f"MAF threshold:    {args.maf}")
             logger.info(f"Missing rate:     {args.geno}")
+            logger.info(f"Mmap limit:       {args.mmap_limit}")
         elif args.grm:
             logger.info(f"GRM prefix:       {gfile}")
             logger.info(f"Output PCs:       top {args.dim}")
@@ -344,6 +358,7 @@ def main(log: bool = True):
             maf_threshold=args.maf,
             max_missing_rate=args.geno,
             chunk_size=100_000,
+            mmap_limit=args.mmap_limit,
             logger=logger,
         )
 

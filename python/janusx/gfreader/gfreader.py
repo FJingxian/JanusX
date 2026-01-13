@@ -9,6 +9,40 @@ from ..janusx import (
     SiteInfo,
 )
 
+def calc_mmap_window_mb(
+    n_samples: int,
+    n_snps: int,
+    chunk_size: int,
+    min_chunks: int = 2,
+) -> int | None:
+    """
+    Compute a BED mmap window size (MB) to cover at least `min_chunks` chunks.
+
+    Returns None when inputs are invalid.
+    """
+    if n_samples <= 0 or n_snps <= 0 or chunk_size <= 0:
+        return None
+    target_snps = min(n_snps, max(1, min_chunks) * chunk_size)
+    bytes_per_snp = (n_samples + 3) // 4
+    required_bytes = max(1, target_snps * bytes_per_snp)
+    mb = (required_bytes + (1024 * 1024 - 1)) // (1024 * 1024)
+    return int(max(1, mb))
+
+
+def auto_mmap_window_mb(
+    path_or_prefix: str,
+    n_samples: int,
+    n_snps: int,
+    chunk_size: int,
+    min_chunks: int = 2,
+) -> int | None:
+    """
+    Compute mmap window size for BED inputs; return None for VCF inputs.
+    """
+    if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
+        return None
+    return calc_mmap_window_mb(n_samples, n_snps, chunk_size, min_chunks=min_chunks)
+
 def bed_chunk_reader(
     prefix: str,
     chunk_size: int = 50000,

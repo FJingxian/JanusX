@@ -21,6 +21,7 @@ def bed_chunk_reader(
     bim_range: tuple[str, int, int] | None = None,
     sample_ids: list[str] | None = None,
     sample_indices: list[int] | None = None,
+    mmap_window_mb: int | None = None,
 ):
     """
     Stream PLINK BED/BIM/FAM chunks with optional SNP/sample selection.
@@ -33,6 +34,8 @@ def bed_chunk_reader(
     Samples (mutually exclusive):
       - sample_ids     : list of IID strings from .fam
       - sample_indices : explicit 0-based sample indices
+    mmap_window_mb:
+      - limit BED mmap window size (MB); disables snp_range/snp_indices/bim_range
     """
     reader = BedChunkReader(
         prefix,
@@ -44,6 +47,7 @@ def bed_chunk_reader(
         bim_range,
         sample_ids,
         sample_indices,
+        mmap_window_mb,
     )
 
     while True:
@@ -66,6 +70,7 @@ def load_genotype_chunks(
     bim_range: tuple[str, int, int] | None = None,
     sample_ids: list[str] | None = None,
     sample_indices: list[int] | None = None,
+    mmap_window_mb: int | None = None,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -130,6 +135,7 @@ def load_genotype_chunks(
     - bim_range: (chrom, start_pos, end_pos), inclusive on positions
     - sample_ids: list of IID strings from .fam
     - sample_indices: list of 0-based sample indices
+    - mmap_window_mb: window size (MB) for BED mmap; not supported for VCF
 
     Example
     -------
@@ -140,6 +146,8 @@ def load_genotype_chunks(
 
     # 1) Determine file type: BED or VCF
     if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
+        if mmap_window_mb is not None:
+            raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
         if any(v is not None for v in (snp_range, snp_indices, bim_range, sample_ids, sample_indices)):
             raise ValueError("SNP/sample selection is only supported for PLINK BED/BIM/FAM inputs.")
         reader = VcfChunkReader(
@@ -161,6 +169,7 @@ def load_genotype_chunks(
             bim_range=bim_range,
             sample_ids=sample_ids,
             sample_indices=sample_indices,
+            mmap_window_mb=mmap_window_mb,
         )
         return
 

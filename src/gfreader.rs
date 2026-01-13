@@ -167,6 +167,7 @@ impl BedChunkReader {
         bim_range=None,
         sample_ids=None,
         sample_indices=None,
+        mmap_window_mb=None,
     ))]
     fn new(
         prefix: String,
@@ -178,12 +179,25 @@ impl BedChunkReader {
         bim_range: Option<(String, i32, i32)>,
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
+        mmap_window_mb: Option<usize>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let it = BedSnpIter::new_with_fill(&prefix, maf, miss, fill)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        if mmap_window_mb.is_some()
+            && (snp_range.is_some() || snp_indices.is_some() || bim_range.is_some())
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "mmap_window_mb does not support snp_range/snp_indices/bim_range",
+            ));
+        }
+        let it = if let Some(window_mb) = mmap_window_mb {
+            BedSnpIter::new_with_fill_window(&prefix, maf, miss, fill, window_mb)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
+        } else {
+            BedSnpIter::new_with_fill(&prefix, maf, miss, fill)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
+        };
         let (sample_indices, sample_ids) = build_sample_selection(
             &it.samples,
             sample_ids,

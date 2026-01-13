@@ -1,10 +1,12 @@
 // src/gfcore.rs
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
+
+const BED_HEADER_LEN: usize = 3;
 
 // ---------------------------
 // Variant metadata
@@ -160,6 +162,12 @@ pub struct BedSnpIter {
     pub samples: Vec<String>,
     pub sites: Vec<SiteInfo>,
     mmap: Mmap,
+    mmap_offset: usize,
+    window_snps: Option<usize>,
+    window_start_snp: usize,
+    window_len_snps: usize,
+    bed_len: usize,
+    bed_file: Option<File>,
     n_samples: usize,
     n_snps: usize,
     bytes_per_snp: usize,
@@ -183,8 +191,9 @@ impl BedSnpIter {
         let bed_path = format!("{prefix}.bed");
         let file = File::open(&bed_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        let bed_len = mmap.len();
 
-        if mmap.len() < 3 {
+        if bed_len < BED_HEADER_LEN {
             return Err("BED too small".into());
         }
         if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
@@ -198,6 +207,69 @@ impl BedSnpIter {
             samples,
             sites,
             mmap,
+            mmap_offset: 0,
+            window_snps: None,
+            window_start_snp: 0,
+            window_len_snps: n_snps,
+            bed_len,
+            bed_file: None,
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf,
+            miss,
+            fill_missing,
+        })
+    }
+
+    pub fn new_with_fill_window(
+        prefix: &str,
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        mmap_window_mb: usize,
+    ) -> Result<Self, String> {
+        if mmap_window_mb == 0 {
+            return Err("mmap_window_mb must be > 0".into());
+        }
+        let samples = read_fam(prefix)?;
+        let sites = read_bim(prefix)?;
+        let n_samples = samples.len();
+        let n_snps = sites.len();
+
+        let bed_path = format!("{prefix}.bed");
+        let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
+        let bed_len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+
+        let mut header = [0u8; BED_HEADER_LEN];
+        file.read_exact(&mut header).map_err(|e| e.to_string())?;
+        if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+            return Err("Only SNP-major BED supported".into());
+        }
+
+        let bytes_per_snp = (n_samples + 3) / 4;
+        let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
+        let window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
+        let (mmap, mmap_offset, window_len_snps) = Self::map_window(
+            &file,
+            bed_len,
+            0,
+            window_snps,
+            bytes_per_snp,
+        )?;
+
+        Ok(Self {
+            prefix: prefix.to_string(),
+            samples,
+            sites,
+            mmap,
+            mmap_offset,
+            window_snps: Some(window_snps),
+            window_start_snp: 0,
+            window_len_snps,
+            bed_len,
+            bed_file: Some(file),
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -210,13 +282,81 @@ impl BedSnpIter {
 
     pub fn n_snps(&self) -> usize { self.n_snps }
 
+    fn map_window(
+        file: &File,
+        bed_len: usize,
+        start_snp: usize,
+        window_snps: usize,
+        bytes_per_snp: usize,
+    ) -> Result<(Mmap, usize, usize), String> {
+        let data_len = bed_len.checked_sub(BED_HEADER_LEN)
+            .ok_or_else(|| "BED too small".to_string())?;
+        let max_snps = data_len / bytes_per_snp;
+        if start_snp >= max_snps {
+            return Err("window start SNP out of range".into());
+        }
+        let remaining_snps = max_snps - start_snp;
+        let map_snps = remaining_snps.min(window_snps);
+
+        let desired_offset = BED_HEADER_LEN + start_snp * bytes_per_snp;
+        let page_size = memmap2::page_size();
+        let aligned_offset = desired_offset / page_size * page_size;
+        let leading = desired_offset - aligned_offset;
+        let desired_len = leading + map_snps * bytes_per_snp;
+        let max_len = bed_len - aligned_offset;
+        let map_len = desired_len.min(max_len);
+
+        let mmap = unsafe {
+            MmapOptions::new()
+                .offset(aligned_offset as u64)
+                .len(map_len)
+                .map(file)
+                .map_err(|e| e.to_string())?
+        };
+        Ok((mmap, aligned_offset, map_snps))
+    }
+
+    fn remap_window(&mut self, start_snp: usize) -> Result<(), String> {
+        let window_snps = self.window_snps.ok_or_else(|| "window_snps not set".to_string())?;
+        let file = self.bed_file.as_ref().ok_or_else(|| "bed_file not set".to_string())?;
+        let (mmap, mmap_offset, window_len_snps) = Self::map_window(
+            file,
+            self.bed_len,
+            start_snp,
+            window_snps,
+            self.bytes_per_snp,
+        )?;
+        self.mmap = mmap;
+        self.mmap_offset = mmap_offset;
+        self.window_start_snp = start_snp;
+        self.window_len_snps = window_len_snps;
+        Ok(())
+    }
+
+    fn snp_bytes(&self, snp_idx: usize) -> Option<&[u8]> {
+        let offset = BED_HEADER_LEN + snp_idx * self.bytes_per_snp;
+        if let Some(_window_snps) = self.window_snps {
+            let window_end = self.window_start_snp + self.window_len_snps;
+            if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                return None;
+            }
+        }
+        let rel = offset.checked_sub(self.mmap_offset)?;
+        let end = rel + self.bytes_per_snp;
+        if end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[rel..end])
+    }
+
     /// 随机访问解码某个 SNP（用于并行）
     pub fn get_snp_row(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
         if snp_idx >= self.n_snps { return None; }
-        let data = &self.mmap[3..];
+        if self.window_snps.is_some() {
+            panic!("windowed mmap does not support random SNP access");
+        }
 
-        let offset = snp_idx * self.bytes_per_snp;
-        let snp_bytes = &data[offset..offset + self.bytes_per_snp];
+        let snp_bytes = self.snp_bytes(snp_idx)?;
 
         let mut row: Vec<f32> = vec![-9.0; self.n_samples];
 
@@ -250,14 +390,23 @@ impl BedSnpIter {
     pub fn n_samples(&self) -> usize { self.n_samples }
 
     pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
-        let data = &self.mmap[3..];
-
         while self.cur < self.n_snps {
             let snp_idx = self.cur;
             self.cur += 1;
 
-            let offset = snp_idx * self.bytes_per_snp;
-            let snp_bytes = &data[offset..offset + self.bytes_per_snp];
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
 
             let mut row: Vec<f32> = vec![-9.0; self.n_samples];
 

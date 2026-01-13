@@ -480,10 +480,13 @@ def run_chunked_gwas_lmm_lm(
             mod = ModelCls(y=y_vec, X=X_cov)
             logger.info(f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}")
 
-        results_chunks = []
-        info_chunks = []
-        maf_list = []
         done_snps = 0
+        has_results = False
+        out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
+        wrote_header = False
+        plot_chr = []
+        plot_pos = []
+        plot_p = []
 
         process.cpu_percent(interval=None)
         pbar = tqdm(total=n_snps, desc=f"{model_label}-{pname}", ascii=False)
@@ -496,14 +499,50 @@ def run_chunked_gwas_lmm_lm(
         ):
             genosub:np.ndarray
             genosub = genosub[:, sameidx]  # (m_chunk, n_use)
-            maf_list.extend(np.mean(genosub, axis=1) / 2)
-
-            results_chunks.append(mod.gwas(genosub, threads=threads))
-            info_chunks.extend(
-                [[s.chrom, s.pos, s.ref_allele, s.alt_allele] for s in sites]
-            )
-
             m_chunk = genosub.shape[0]
+            if m_chunk == 0:
+                continue
+
+            maf_chunk = np.mean(genosub, axis=1) / 2
+            results = mod.gwas(genosub, threads=threads)
+            info_chunk = [
+                (s.chrom, s.pos, s.ref_allele, s.alt_allele) for s in sites
+            ]
+            if not info_chunk:
+                continue
+
+            chroms, poss, allele0, allele1 = zip(*info_chunk)
+            chunk_df = pd.DataFrame(
+                {
+                    "#CHROM": chroms,
+                    "POS": poss,
+                    "allele0": allele0,
+                    "allele1": allele1,
+                    "maf": maf_chunk,
+                    "beta": results[:, 0],
+                    "se": results[:, 1],
+                    "p": results[:, 2],
+                }
+            )
+            chunk_df["POS"] = chunk_df["POS"].astype(int)
+
+            if plot:
+                plot_chr.append(np.asarray(chroms, dtype=object))
+                plot_pos.append(np.asarray(poss, dtype="int64"))
+                plot_p.append(results[:, 2].astype("float64", copy=False))
+
+            chunk_df["p"] = chunk_df["p"].map(lambda x: f"{x:.4e}")
+            chunk_df.to_csv(
+                out_tsv,
+                sep="\t",
+                float_format="%.4f",
+                index=False,
+                header=not wrote_header,
+                mode="w" if not wrote_header else "a",
+            )
+            wrote_header = True
+            has_results = True
+
             done_snps += m_chunk
             pbar.update(m_chunk)
 
@@ -539,36 +578,25 @@ def run_chunked_gwas_lmm_lm(
             f"peak RSS ~ {peak_rss_gb:.2f} GB\n"
         )
 
-        if not results_chunks:
+        if not has_results:
             logger.info(f"No SNPs passed filters for trait {pname}.")
             continue
 
-        results = np.concatenate(results_chunks, axis=0)
-        info_arr = np.array(info_chunks)
-
-        df = pd.DataFrame(
-            np.concatenate(
-                [info_arr, results, np.array(maf_list).reshape(-1, 1)], axis=1
-            ),
-            columns=["#CHROM", "POS", "allele0", "allele1", "beta", "se", "p", "maf"],
-        )
-        df = df[["#CHROM", "POS", "allele0", "allele1", "maf", "beta", "se", "p"]]
-        df = df.astype(
-            {"POS": int, "maf": float, "beta": float, "se": float, "p": float}
-        )
-
         if plot:
+            plot_df = pd.DataFrame(
+                {
+                    "#CHROM": np.concatenate(plot_chr),
+                    "POS": np.concatenate(plot_pos),
+                    "p": np.concatenate(plot_p),
+                }
+            )
             fastplot(
-                df,
+                plot_df,
                 y_vec,
                 xlabel=pname,
                 outpdf=f"{outprefix}.{pname}.{model_tag}.svg",
             )
 
-        df = df.astype({"p": "object"})
-        df.loc[:, "p"] = df["p"].map(lambda x: f"{x:.4e}")
-        out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
-        df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         logger.info(f"Saved {model_label} results to {out_tsv}".replace("//", "/"))
         logger.info("")  # ensure blank line between traits
 

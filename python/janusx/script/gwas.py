@@ -488,14 +488,16 @@ def run_chunked_gwas_lmm_lm(
         process.cpu_percent(interval=None)
         pbar = tqdm(total=n_snps, desc=f"{model_label}-{pname}", ascii=False)
 
+        sample_sub = None if genofile.endswith('.vcf') or genofile.endswith('.vcf.gz') else ids[sameidx]
         for genosub, sites in load_genotype_chunks(
             genofile,
             chunk_size,
             maf_threshold,
             max_missing_rate,
+            sample_ids=sample_sub
         ):
             genosub:np.ndarray
-            genosub = genosub[:, sameidx]  # (m_chunk, n_use)
+            genosub = genosub[:, sameidx]  if sample_sub is None else genosub # (m_chunk, n_use)
             m_chunk = genosub.shape[0]
             if m_chunk == 0:
                 continue

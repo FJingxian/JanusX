@@ -229,49 +229,45 @@ impl BedChunkReader {
         if n == 0 {
             return Ok(None);
         }
-        let mut rows: Vec<Vec<f32>> = Vec::new();
-        let mut sites: Vec<SiteInfo> = Vec::new();
+        let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let full_samples = self.sample_indices.len() == self.it.n_samples();
+        let mut m: usize = 0;
 
         if let Some(ref snp_indices) = self.snp_indices {
-            while rows.len() < chunk_size && self.snp_pos < snp_indices.len() {
+            while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let snp_idx = snp_indices[self.snp_pos];
                 self.snp_pos += 1;
                 if let Some((row, site)) = self.it.get_snp_row(snp_idx) {
-                    let out_row = if full_samples {
-                        row
+                    if full_samples {
+                        data.extend_from_slice(&row);
                     } else {
-                        self.sample_indices.iter().map(|&i| row[i]).collect()
-                    };
-                    rows.push(out_row);
+                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                    }
                     sites.push(site.into());
+                    m += 1;
                 }
             }
         } else {
-            while rows.len() < chunk_size {
+            while m < chunk_size {
                 match self.it.next_snp() {
                     Some((row, site)) => {
-                        let out_row = if full_samples {
-                            row
+                        if full_samples {
+                            data.extend_from_slice(&row);
                         } else {
-                            self.sample_indices.iter().map(|&i| row[i]).collect()
-                        };
-                        rows.push(out_row);
+                            data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                        }
                         sites.push(site.into());
+                        m += 1;
                     }
                     None => break,
                 }
             }
         }
-        if rows.is_empty() { return Ok(None); }
+        if m == 0 { return Ok(None); }
 
-        let m = rows.len();
-        let mut mat = Array2::<f32>::zeros((m, n));
-        for (i, r) in rows.into_iter().enumerate() {
-            for (j, g) in r.into_iter().enumerate() {
-                mat[[i, j]] = g;
-            }
-        }
+        let mat = Array2::from_shape_vec((m, n), data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         #[allow(deprecated)]
         let py_mat = PyArray2::from_owned_array_bound(py, mat);
         Ok(Some((py_mat, sites)))
@@ -315,24 +311,24 @@ impl VcfChunkReader {
         }
 
         let n = self.it.n_samples();
-        let mut rows: Vec<Vec<f32>> = Vec::new();
-        let mut sites: Vec<SiteInfo> = Vec::new();
+        let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut m: usize = 0;
 
-        while rows.len() < chunk_size {
+        while m < chunk_size {
             match self.it.next_snp() {
-                Some((row, site)) => { rows.push(row); sites.push(site.into()); }
+                Some((row, site)) => {
+                    data.extend_from_slice(&row);
+                    sites.push(site.into());
+                    m += 1;
+                }
                 None => break,
             }
         }
-        if rows.is_empty() { return Ok(None); }
+        if m == 0 { return Ok(None); }
 
-        let m = rows.len();
-        let mut mat = Array2::<f32>::zeros((m, n));
-        for (i, r) in rows.into_iter().enumerate() {
-            for (j, g) in r.into_iter().enumerate() {
-                mat[[i, j]] = g;
-            }
-        }
+        let mat = Array2::from_shape_vec((m, n), data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         #[allow(deprecated)]
         let py_mat = PyArray2::from_owned_array_bound(py, mat);
         Ok(Some((py_mat, sites)))

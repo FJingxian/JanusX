@@ -42,12 +42,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4
 
+      - name: Set Python tag (Linux)
+        if: runner.os == 'Linux'
+        run: echo "PY_TAG=${PYTHON_VERSION/./}" >> $GITHUB_ENV
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+
       - name: Build wheels (Linux)
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --interpreter python
+          args: --release --out dist --interpreter /opt/python/cp${{ env.PY_TAG }}-cp${{ env.PY_TAG }}/bin/python
           manylinux: ${{ matrix.python-version == '3.13' && '2_28' || '2014' }}
           python-version: ${{ matrix.python-version }}
 

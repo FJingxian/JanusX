@@ -41,6 +41,7 @@ import time
 import socket
 import argparse
 import logging
+import uuid
 
 # ---- Matplotlib backend configuration (non-interactive, server-safe) ----
 for key in ["MPLBACKEND"]:
@@ -439,7 +440,6 @@ def run_chunked_gwas_lmm_lm(
     max_missing_rate: float,
     chunk_size: int,
     mmap_limit: bool,
-    force: bool,
     grm: np.ndarray,
     qmatrix: np.ndarray,
     cov_all: np.ndarray | None,
@@ -465,14 +465,6 @@ def run_chunked_gwas_lmm_lm(
     n_cores = psutil.cpu_count(logical=True) or cpu_count()
 
     for pname in pheno.columns:
-        out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
-        if os.path.exists(out_tsv) and not force:
-            logger.info(
-                f"Skip trait {pname}: output already exists at {out_tsv}. "
-                "Use --force to overwrite."
-            )
-            continue
-
         logger.info(f"Streaming {model_label} GWAS for trait: {pname}")
 
         cpu_t0 = process.cpu_times()
@@ -506,6 +498,8 @@ def run_chunked_gwas_lmm_lm(
 
         done_snps = 0
         has_results = False
+        out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
+        tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (
             auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
@@ -555,7 +549,7 @@ def run_chunked_gwas_lmm_lm(
 
             chunk_df["p"] = chunk_df["p"].map(lambda x: f"{x:.4e}")
             chunk_df.to_csv(
-                out_tsv,
+                tmp_tsv,
                 sep="\t",
                 float_format="%.4f",
                 index=False,
@@ -602,11 +596,13 @@ def run_chunked_gwas_lmm_lm(
 
         if not has_results:
             logger.info(f"No SNPs passed filters for trait {pname}.")
+            if os.path.exists(tmp_tsv):
+                os.remove(tmp_tsv)
             continue
 
         if plot:
             plot_df = pd.read_csv(
-                out_tsv,
+                tmp_tsv,
                 sep="\t",
                 usecols=["#CHROM", "POS", "p"],
                 dtype={"#CHROM": str, "POS": "int64"},
@@ -619,6 +615,7 @@ def run_chunked_gwas_lmm_lm(
                 outpdf=f"{outprefix}.{pname}.{model_tag}.svg",
             )
 
+        os.replace(tmp_tsv, out_tsv)
         logger.info(f"Saved {model_label} results to {out_tsv}".replace("//", "/"))
         logger.info("")  # ensure blank line between traits
 
@@ -918,10 +915,6 @@ def parse_args():
         "-prefix", "--prefix", type=str, default=None,
         help="Prefix for output files (default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-force", "--force", action="store_true", default=False,
-        help="Force overwrite existing output files (default: %(default)s).",
-    )
 
     return parser.parse_args()
 
@@ -967,7 +960,6 @@ def main(log: bool = True):
             logger.info(f"Covariate file:   {args.cov}")
         logger.info(f"Maf threshold:    {args.maf}")
         logger.info(f"Miss threshold:   {args.geno}")
-        logger.info(f"Force overwrite:  {args.force}")
         logger.info(f"Chunk size:       {args.chunksize}")
         logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
         logger.info(f"Output prefix:    {outprefix}")
@@ -1023,7 +1015,6 @@ def main(log: bool = True):
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
-                force=args.force,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,
@@ -1047,7 +1038,6 @@ def main(log: bool = True):
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
-                force=args.force,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,
@@ -1070,7 +1060,6 @@ def main(log: bool = True):
                 max_missing_rate=args.geno,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
-                force=args.force,
                 grm=grm,
                 qmatrix=qmatrix,
                 cov_all=cov_all,

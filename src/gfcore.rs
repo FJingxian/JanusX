@@ -195,10 +195,6 @@ pub struct BedSnpIter {
 }
 
 impl BedSnpIter {
-    pub fn new(prefix: &str, maf: f32, miss: f32) -> Result<Self, String> {
-        Self::new_with_fill(prefix, maf, miss, true)
-    }
-
     pub fn new_with_fill(prefix: &str, maf: f32, miss: f32, fill_missing: bool) -> Result<Self, String> {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
@@ -296,8 +292,6 @@ impl BedSnpIter {
             fill_missing,
         })
     }
-
-    pub fn n_snps(&self) -> usize { self.n_snps }
 
     fn map_window(
         file: &File,
@@ -472,10 +466,6 @@ pub struct VcfSnpIter {
 }
 
 impl VcfSnpIter {
-    pub fn new(path: &str, maf: f32, miss: f32) -> Result<Self, String> {
-        Self::new_with_fill(path, maf, miss, true)
-    }
-
     pub fn new_with_fill(path: &str, maf: f32, miss: f32, fill_missing: bool) -> Result<Self, String> {
         let p = Path::new(path);
         let mut reader = open_text_maybe_gz(p)?;

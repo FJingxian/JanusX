@@ -5,14 +5,10 @@ mod gfcore;
 mod gfreader;
 mod gmerge;
 mod assoc;
-mod grm;
-mod svd;
 
 use assoc::{glmf32, lmm_reml_chunk_f32, lmm_assoc_chunk_f32};
 use gfreader::{SiteInfo, BedChunkReader, VcfChunkReader, PlinkStreamWriter, VcfStreamWriter,count_vcf_snps};
 use gmerge::{merge_genotypes, PyMergeStats, convert_genotypes, PyConvertStats};
-use grm::{grm_pca_bed, grm_pca_vcf};
-use svd::{block_randomized_svd, block_randomized_svd_bed};
 // ============================================================
 // PyO3 module exports
 // ============================================================
@@ -32,9 +28,5 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_pca_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_pca_vcf, m)?)?;
-    m.add_function(wrap_pyfunction!(block_randomized_svd, m)?)?;
-    m.add_function(wrap_pyfunction!(block_randomized_svd_bed, m)?)?;
     Ok(())
 }

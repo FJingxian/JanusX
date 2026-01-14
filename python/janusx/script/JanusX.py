@@ -30,7 +30,7 @@ __version__ = (
     f"{_banner_line}\n"
     f">JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
     "Please report issues to <fujingxian@yzwlab.cn>\n"
-    "Build date: 2025-1-13\n"
+    "Build date: 2026-1-13\n"
     f"{_banner_line}"
 )
 

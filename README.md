@@ -19,7 +19,7 @@ pip install janusx
 ### From Source
 
 ```bash
-git clone https://github.com/MaizeMan-JxFU/JanusX.git
+git clone https://github.com/FJingxian/JanusX.git
 cd JanusX
 pip install .
 ```
@@ -28,7 +28,7 @@ Building from source requires a Rust toolchain (maturin will compile the native 
 
 ### Pre-compiled Releases
 
-We provide pre-compiled binaries on the [GitHub Releases](https://github.com/MaizeMan-JxFU/JanusX/releases) page for Windows, Linux, and macOS.
+We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows, Linux, and macOS.
 Download and extract the archive, then run the executable directly.
 
 ## Running the CLI
@@ -193,6 +193,6 @@ Example data in `example/` directory from Parker et al, Nature Genetics, 2016 (v
 @software{JanusX,
   title = {JanusX: High-performance GWAS and Genomic Selection Suite},
   author = {Jingxian FU},
-  url = {https://github.com/MaizeMan-JxFU/JanusX}
+  url = {https://github.com/FJingxian/JanusX}
 }
 ```

@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import Optional, Tuple
-
 import numpy as np
 
 from janusx.janusx import bayesa as _bayesa
@@ -206,8 +204,8 @@ if __name__ == "__main__":
     import pandas as pd
     # /Users/jingxianfu/script/JanusX/example/mouse_hs1940.vcf.gz
     # /Users/jingxianfu/script/JanusX/example/mouse_hs1940.pheno
-    genofile = '。/example/mouse_hs1940.vcf.gz'
-    phenofile = '。/example/mouse_hs1940.pheno'
+    genofile = './example/mouse_hs1940.vcf.gz'
+    phenofile = './example/mouse_hs1940.pheno'
     ids, nsnp = inspect_genotype_file(genofile)
     pheno = pd.read_csv(phenofile,sep='\t',index_col=0).iloc[:,0].dropna()
     samplec = np.isin(ids,pheno.index)

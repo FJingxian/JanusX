@@ -42,7 +42,7 @@ fn bayesa_core_impl(
     s0_e_opt: Option<f64>,
     min_abs_beta: f64,
     seed: Option<u64>,
-) -> Result<(Vec<f64>, Vec<f64>, f64), String> {
+) -> Result<(Vec<f64>, Vec<f64>), String> {
     let n_f = n as f64;
     if n_f <= 1.0 {
         return Err("n must be > 1".to_string());
@@ -150,8 +150,6 @@ fn bayesa_core_impl(
     let mut r = y.to_vec();
     let mut beta_sum = vec![0.0; p];
     let mut alpha_sum = vec![0.0; q];
-    let mut mu = 0.0;
-    let mut mu_sum = 0.0;
     let mut n_keep = 0usize;
     let var_b_fixed = 1e10_f64;
 
@@ -159,21 +157,6 @@ fn bayesa_core_impl(
     let chi_e = ChiSquared::new(n_f + df0_e).map_err(|e| e.to_string())?;
 
     for it in 0..n_iter {
-        for i in 0..n {
-            r[i] += mu;
-        }
-        let mut rhs = 0.0;
-        for i in 0..n {
-            rhs += r[i];
-        }
-        rhs /= var_e;
-        let c_mu = n_f / var_e;
-        let z_mu: f64 = rng.sample(StandardNormal);
-        mu = rhs / c_mu + (1.0 / c_mu).sqrt() * z_mu;
-        for i in 0..n {
-            r[i] -= mu;
-        }
-
         for k in 0..q {
             let mut rhs = 0.0;
             for i in 0..n {
@@ -244,7 +227,6 @@ fn bayesa_core_impl(
             for k in 0..q {
                 alpha_sum[k] += alpha[k];
             }
-            mu_sum += mu;
             n_keep += 1;
         }
     }
@@ -260,9 +242,7 @@ fn bayesa_core_impl(
     for k in 0..q {
         alpha_sum[k] *= inv_keep;
     }
-    mu_sum *= inv_keep;
-
-    Ok((beta_sum, alpha_sum, mu_sum))
+    Ok((beta_sum, alpha_sum))
 }
 
 #[pyfunction]
@@ -300,7 +280,7 @@ pub fn bayesa(
     s0_e: Option<f64>,
     min_abs_beta: f64,
     seed: Option<u64>,
-) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>, f64)> {
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
     }
@@ -338,7 +318,7 @@ pub fn bayesa(
             let q = x_shape[1];
             (array2_to_vec(arr), q)
         }
-        None => (Vec::new(), 0usize),
+        None => (vec![1.0; n], 1usize),
     };
 
     let result = py.allow_threads(|| {
@@ -365,10 +345,10 @@ pub fn bayesa(
     });
 
     match result {
-        Ok((beta, alpha, mu)) => {
+        Ok((beta, alpha)) => {
             let beta_py = beta.into_pyarray_bound(py).unbind();
             let alpha_py = alpha.into_pyarray_bound(py).unbind();
-            Ok((beta_py, alpha_py, mu))
+            Ok((beta_py, alpha_py))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }

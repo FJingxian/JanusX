@@ -32,7 +32,7 @@ class BLUP:
         self.kinship = kinship # control method to calculate kinship matrix
         usefastlmm = self.M.shape[0] < self.n # use FaST-LMM if num of snp less than num of samples
         if self.kinship is not None:
-            self.G = GRM(M,log=self.log) + 1e-6*np.eye(self.G.shape[0]) # Add regular item
+            self.G = GRM(M,log=self.log) + 1e-6*np.eye(self.n) # Add regular item
             self.Z = Z
         else:
             self.G = np.eye(M.shape[0])

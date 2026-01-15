@@ -59,7 +59,7 @@ class GENOMETOOL:
         self.exchange_loc:bool = (ref_alt.iloc[:,0]!=ref)
         return ref_alt.astype('category')
 
-def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000,
+def breader(prefix:str,chunk_size=10_000,
             maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(prefix)
@@ -77,14 +77,9 @@ def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000,
     genotype = pd.concat([bim[[0,3,4,5]],genotype],axis=1)
     genotype.columns = ['#CHROM','POS','A0','A1']+idv
     genotype = genotype.set_index(['#CHROM','POS'])
-    if ref_adjust is not None:
-        adjust_m = GENOMETOOL(ref_adjust)
-        genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
-        genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
-        genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
     return genotype.dropna()
 
-def vcfreader(vcfPath:str,chunk_size=50_000,ref_adjust:str=None,
+def vcfreader(vcfPath:str,chunk_size=50_000,
             maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(vcfPath)
@@ -104,11 +99,6 @@ def vcfreader(vcfPath:str,chunk_size=50_000,ref_adjust:str=None,
     genotype = pd.concat([bim,genotype],axis=1)
     genotype.columns = ['#CHROM','POS','A0','A1']+idv
     genotype = genotype.set_index(['#CHROM','POS'])
-    if ref_adjust is not None:
-        adjust_m = GENOMETOOL(ref_adjust)
-        genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
-        genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
-        genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
     return genotype.dropna()
 
 def hmpreader(hmp:str,sample_start:int=None,chr:str='chrom',ps:str='position',ref:str='ref',chunksize=10_000,ref_adjust:str=None):

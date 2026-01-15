@@ -808,11 +808,12 @@ def farmcpu(
     m, n = M.shape
 
     # Map chromosome labels to integer blocks for global ordering
-    chrunique = np.unique(chrlist)
-    chrdict = dict(zip(chrunique, range(len(chrunique))))
+    chrlist = np.asarray(chrlist)
+    poslist = np.asarray(poslist, dtype=np.int64)
+    _, chr_idx = np.unique(chrlist, return_inverse=True)
 
     # "global position" = pos + chr_block * 1e12 (avoids chr collisions)
-    pos = np.array([int(poslist[i]) + chrdict[chrlist[i]] * 1e12 for i in range(len(chrlist))])
+    pos = poslist + chr_idx.astype(np.int64) * 1_000_000_000_000
 
     if QTNbound is None:
         QTNbound = int(np.sqrt(n / np.log10(n)))
@@ -861,7 +862,7 @@ def farmcpu(
         if np.array_equal(QTNidx_pre, QTNidx):
             break
         QTNidx = QTNidx_pre
-
+    print(QTNidx)
     # Final scan with final QTN set
     X_QTN = np.concatenate([X, M[QTNidx].T], axis=1)
     FEMresult = FEM(y, X_QTN, M, threads=threads)

@@ -735,8 +735,6 @@ def SUPER(corr: np.ndarray, pval: np.ndarray, thr: float = 0.7) -> np.ndarray:
     return keep
 
 
-from memory_profiler import profile
-@profile
 def farmcpu(
     y: np.ndarray,
     M: np.ndarray,

@@ -120,9 +120,6 @@ def FEM(
     # Precompute (X'X)^(-1) in Python (matches your Rust signature)
     ixx = np.ascontiguousarray(np.linalg.pinv(X.T @ X), dtype=np.float64)
 
-    # Genotypes as f32 for Rust SIMD / bandwidth-friendly kernels
-    M = np.ascontiguousarray(M, dtype=np.float32)
-
     if M.ndim != 2:
         raise ValueError("M must be a 2D array with shape (m, n) [SNP-major].")
     if M.shape[1] != y.shape[0]:
@@ -130,9 +127,14 @@ def FEM(
             f"M must be shape (m, n). Got M.shape={M.shape}, but n=len(y)={y.shape[0]}"
         )
 
-    # ---- Call Rust kernel ----
-    result: np.ndarray = glmf32(y, X, ixx, M, int(chunksize), int(threads))
-    return result
+    chunksize = 10_000
+    result = []
+    for start in range(0,M.shape[0],chunksize):
+        end = min(start+chunksize,M.shape[0])
+        # Genotypes as f32 for Rust SIMD / bandwidth-friendly kernels
+        # ---- Call Rust kernel ----
+        result.append(glmf32(y, X, ixx, np.ascontiguousarray(M[start:end], dtype=np.float32), int(chunksize), int(threads)))
+    return np.concatenate(result,axis=0)
 
 
 def lmm_reml(
@@ -843,7 +845,10 @@ def farmcpu(
         # Build grid tasks for REM
         combine_list = [(sz, n_) for sz in szbin for n_ in nbin]
 
-        REMresult = Parallel(threads)(
+        REMresult = Parallel(threads,
+                            max_nbytes="1M",
+                            mmap_mode="r",
+                            temp_folder="/tmp/janusx-joblib",)(
             delayed(REM)(sz, n_, FEMp, pos, M, y, X_QTN) for sz, n_ in combine_list
         )
 

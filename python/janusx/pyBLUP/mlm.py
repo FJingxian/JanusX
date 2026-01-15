@@ -39,7 +39,7 @@ class BLUP:
             self.Z = Z@M.T
         # Simplify inverse matrix
         if usefastlmm:
-            self.Dh,self.S,_ = np.linalg.svd(Z@M.T) if Z is not None else np.linalg.svd(M.T)
+            self.Dh,self.S,_ = np.linalg.svd(Z@M.T,full_matrices=False) if Z is not None else np.linalg.svd(M.T)
             self.S = self.S*self.S
         else:
             self.S,self.Dh = np.linalg.eigh(self.Z@self.G@self.Z.T)
@@ -71,8 +71,7 @@ class BLUP:
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         X = np.concatenate([np.ones((M.shape[1],1)),cov],axis=1) if cov is not None else np.ones((M.shape[1],1))
         if self.kinship is not None:
-            G = GRM(np.concatenate([self.M, M],axis=1),log=self.log)
-            G+=1e-6*np.eye(G.shape[1]) # Regular item
+            G = GRM(np.concatenate([self.M, M],axis=1),log=self.log)+1e-6*np.eye(self.M.shape[1]+M.shape[1])# Regular item
             return X@self.beta+G[self.n:, :self.n]@np.linalg.solve(self.G,self.u)
         else:
             return X@self.beta+M.T@self.u

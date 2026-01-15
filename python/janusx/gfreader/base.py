@@ -59,10 +59,11 @@ class GENOMETOOL:
         self.exchange_loc:bool = (ref_alt.iloc[:,0]!=ref)
         return ref_alt.astype('category')
 
-def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000) -> pd.DataFrame:
+def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000,
+            maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(prefix)
-    chunks = load_genotype_chunks(prefix, chunk_size)
+    chunks = load_genotype_chunks(prefix,chunk_size,maf,miss,impute)
     genotype = np.zeros(shape=(len(idv),m),dtype='int8')
     pbar = tqdm(total=m, desc="Loading bed",ascii=True)
     num = 0
@@ -81,75 +82,34 @@ def breader(prefix:str,ref_adjust:str=None,chunk_size=10_000) -> pd.DataFrame:
         genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
         genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
         genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
-    return genotype
+    return genotype.dropna()
 
-def vcfreader(vcfPath:str,chunksize=50_000,ref_adjust:str=None,vcftype:str=None) -> pd.DataFrame:
+def vcfreader(vcfPath:str,chunk_size=50_000,ref_adjust:str=None,
+            maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
-    buffer = 8*1024*1024
-    if '.gz' == vcfPath[-3:]:
-        compression = 'gzip'
-        with gzip.open(vcfPath) as f:
-            for line in f:
-                line = line.decode('utf-8')
-                if "#CHROM" in line:
-                    col = line.replace('\n','').split('\t')
-                    break
-            buf_gen = takewhile(lambda x: x, (f.read(buffer) for _ in repeat(None)))
-            sum_snp = sum(buf.decode('utf-8').count('\n') for buf in buf_gen)
-    else:
-        compression = None
-        with open(vcfPath) as f:
-            for line in f:
-                if "#CHROM" in line:
-                    col = line.replace('\n','').split('\t')
-                    break
-            buf_gen = takewhile(lambda x: x, (f.read(buffer) for _ in repeat(None)))
-            sum_snp = sum(buf.count('\n') for buf in buf_gen)
-    ncol = [0,1,3,4]+list(range(col.index('FORMAT')+1,len(col)))
-    col = [col[i] for i in ncol]
-    dtype_config = dict(zip(ncol,['str','int32']+['category']*(len(col)-2)))
-    vcf_chunks = pd.read_csv(vcfPath,sep=r'\s+',comment='#',header=None,usecols=ncol,low_memory=False,compression=compression,chunksize=chunksize,dtype=dtype_config)
-    genotype = []
-    ref_alt = []
-    t_start = time.time()
-    for iter,vcf_chunk in enumerate(vcf_chunks): # 分块处理vcf
-        end = iter*chunksize + vcf_chunk.shape[0]
-        iter_ratio = end/sum_snp
-        time_cost = time.time()-t_start
-        time_left = time_cost/iter_ratio
-        all_time_info = f'''{round(100*iter_ratio,2)}% (time cost: {round(time_cost/60,2)}/{round(time_left/60,2)} mins)'''
-        cpu,mem = get_process_info()
-        print(f'\rCPU: {cpu}%, Memory: {round(mem,2)} G, Process: {all_time_info}',end='')
-        vcf_chunk[0] = vcf_chunk[0].str.upper().str.replace('CHR0','').str.replace('CHR','')
-        vcf_chunk = vcf_chunk.loc[vcf_chunk[0].isin(np.arange(1,30).astype(str))]
-        vcf_chunk.loc[:,0] = vcf_chunk.loc[:,0].astype('int8')
-        vcf_chunk:pd.DataFrame = vcf_chunk.set_index([0,1])
-        ref_alt.append(vcf_chunk.iloc[:,:2])
-        def transG(col:pd.Series):
-            vcf_transdict = {'0/0':0,'1/1':2,'0/1':1,'1/0':1,'./.':-9, # Non-phased genotype
-                            '0|0':0,'1|1':2,'0|1':1,'1|0':1,'.|.':-9} # Phased genotype
-            return col.map(vcf_transdict).astype('int8').fillna(-9)
-        if not vcftype:
-            vcf_chunk = vcf_chunk.iloc[:,2:].apply(transG,axis=0)
-        else:
-            if vcftype == 'ivcf':
-                vcf_chunk = vcf_chunk.iloc[:,2:].astype('int8')
-            elif vcftype == 'fvcf':
-                vcf_chunk = vcf_chunk.iloc[:,2:].astype('float32')
-        genotype.append(vcf_chunk)
-    print()
-    genotype:pd.DataFrame = pd.concat(genotype,axis=0)
-    ref_alt:pd.DataFrame = pd.concat(ref_alt,axis=0)
-    genotype = pd.concat([ref_alt,genotype],axis=1) # minor allele as ALT
-    genotype.columns = col[2:]
-    genotype.index = genotype.index.rename(['#CHROM','POS'])
-    genotype.columns = ['A0','A1'] + genotype.columns[2:].to_list()
+    idv,m = inspect_genotype_file(vcfPath)
+    chunks = load_genotype_chunks(vcfPath,chunk_size,maf,miss,impute)
+    genotype = np.zeros(shape=(len(idv),m),dtype='int8')
+    pbar = tqdm(total=m, desc="Loading bed",ascii=True)
+    num = 0
+    bim = []
+    for chunk,site in chunks:
+        cksize = chunk.shape[0]
+        genotype[:,num:num+cksize] = chunk.T
+        num += cksize
+        pbar.update(cksize)
+        bim.extend([[i.chrom,i.pos,i.ref_allele,i.alt_allele] for i in site])
+    bim = pd.DataFrame(bim)
+    genotype = pd.DataFrame(genotype,index=idv,).T
+    genotype = pd.concat([bim,genotype],axis=1)
+    genotype.columns = ['#CHROM','POS','A0','A1']+idv
+    genotype = genotype.set_index(['#CHROM','POS'])
     if ref_adjust is not None:
         adjust_m = GENOMETOOL(ref_adjust)
         genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
         genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
         genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
-    return genotype
+    return genotype.dropna()
 
 def hmpreader(hmp:str,sample_start:int=None,chr:str='chrom',ps:str='position',ref:str='ref',chunksize=10_000,ref_adjust:str=None):
     raws = pd.read_csv(hmp,sep='\t',chunksize=chunksize)

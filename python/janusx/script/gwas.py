@@ -43,6 +43,8 @@ import argparse
 import logging
 import uuid
 
+from janusx.pyBLUP.QK2 import GRM
+
 # ---- Matplotlib backend configuration (non-interactive, server-safe) ----
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -624,25 +626,6 @@ def run_chunked_gwas_lmm_lm(
 # High-memory FarmCPU: full genotype + QK
 # ======================================================================
 
-def load_genotype_full(args, gfile: str, logger):
-    """
-    Load full genotype matrix into memory (VCF or PLINK binary).
-    """
-    if args.vcf:
-        logger.info(f"** Loading genotype from {gfile}...")
-        geno_df = vcfreader(gfile)
-    elif args.bfile:
-        logger.info(f"Loading genotype from {gfile}.bed...")
-        geno_df = breader(gfile)
-    else:
-        raise ValueError("No genotype input specified for FarmCPU.")
-
-    ref_alt = geno_df.iloc[:, :2]
-    famid = geno_df.columns[2:].values.astype(str)
-    geno = geno_df.iloc[:, 2:].to_numpy(copy=False)
-    return ref_alt, famid, geno
-
-
 def prepare_qk_and_filter(
     geno: np.ndarray,
     ref_alt: pd.DataFrame,
@@ -673,7 +656,6 @@ def prepare_qk_and_filter(
 
 def build_qmatrix_farmcpu(
     gfile_prefix: str,
-    qkmodel: QK,
     geno: np.ndarray,
     qdim: str,
     cov_path: str | None,
@@ -691,8 +673,8 @@ def build_qmatrix_farmcpu(
             qmatrix = np.array([]).reshape(geno.shape[1], 0)
         else:
             logger.info(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
-            qmatrix, _eigval = qkmodel.PCA()
-            qmatrix = qmatrix[:, : int(qdim)]
+            qmatrix, _eigval = np.linalg.eigh(GRM(geno))
+            qmatrix = qmatrix[:, -int(qdim):]
             np.savetxt(q_path, qmatrix, fmt="%.6f")
             logger.info(f"Cached Q matrix written to {q_path}")
     else:
@@ -737,26 +719,21 @@ def run_farmcpu_fullmem(
     pheno = pheno_preloaded if pheno_preloaded is not None else load_phenotype(
         phenofile, args.ncol, logger
     )
-
-    ref_alt, famid, geno = load_genotype_full(args, gfile, logger)
+    if gfile.endswith('vcf') or gfile.endswith('vcf.gz'):
+        geno = vcfreader(gfile, args.chunksize,maf=args.maf,miss=args.geno,impute=True)
+    else:
+        geno = breader(gfile, args.chunksize,maf=args.maf,miss=args.geno,impute=True)
+    ref_alt = geno.iloc[:,:2]
+    famid = geno.columns[2:]
+    geno = geno.iloc[:,2:].values    
     logger.info(
         f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
-    )
-
-    geno, ref_alt, qkmodel = prepare_qk_and_filter(
-        geno,
-        ref_alt,
-        maf_threshold=args.maf,
-        max_missing_rate=args.geno,
-        logger=logger,
     )
     assert geno.size > 0, "After filtering, number of SNPs is zero for FarmCPU."
 
     gfile_prefix = gfile.replace(".vcf", "").replace(".gz", "")
-
     qmatrix = build_qmatrix_farmcpu(
         gfile_prefix=gfile_prefix,
-        qkmodel=qkmodel,
         geno=geno,
         qdim=qdim,
         cov_path=cov,

@@ -32,16 +32,15 @@ class BLUP:
         self.kinship = kinship # control method to calculate kinship matrix
         usefastlmm = self.M.shape[0] < self.n # use FaST-LMM if num of snp less than num of samples
         if self.kinship is not None:
-            if not usefastlmm:
-                self.G = GRM(M,log=self.log)
-                self.G+=1e-6*np.eye(self.G.shape[0]) # Add regular item
-                self.Z = Z
+            self.G = GRM(M,log=self.log) + 1e-6*np.eye(self.G.shape[0]) # Add regular item
+            self.Z = Z
         else:
             self.G = np.eye(M.shape[0])
             self.Z = Z@M.T
         # Simplify inverse matrix
         if usefastlmm:
-            self.Dh,self.S,_ = np.linalg.svd(M.T)
+            self.Dh,self.S,_ = np.linalg.svd(Z@M.T) if Z is not None else np.linalg.svd(M.T)
+            self.S = self.S*self.S
         else:
             self.S,self.Dh = np.linalg.eigh(self.Z@self.G@self.Z.T)
         self.Dh = self.Dh.T

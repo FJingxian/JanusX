@@ -48,11 +48,19 @@ class BLUP:
         self.y = self.Dh@self.y
         self.Z = self.Dh@self.Z
         self.result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # minimize REML
-        lbd = 10**(self.result.x[0,0])
-        Vg = np.mean(self.S)
-        Ve = lbd
-        self.pve = Vg/(Vg+Ve)
+        lbd = 10 ** float(self.result.x)
+        self._REML(lbd)
         self.u = self.G@self.Z.T@(self.V_inv.flatten()*self.r.T).T
+        rtv_invr = float((self.V_inv * self.r.T) @ self.r)
+        sigma_g2 = rtv_invr / (self.n - self.p)
+        sigma_e2 = lbd * sigma_g2
+        if self.kinship is None:
+            g = self.M.T @ self.u
+            var_g = float(np.var(g, ddof=1))
+        else:
+            mean_s = float(np.mean(self.S))
+            var_g = sigma_g2 * mean_s
+        self.pve = var_g / (var_g + sigma_e2)
     def _REML(self,lbd: float):
         n,p = self.n,self.p
         V = self.S+lbd

@@ -8,6 +8,7 @@ Supported models
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
+  - BayesCpi : Bayesian variable selection model with shared variance (via pyBLUP.bayes)
 
 Genotype input formats
 ----------------------
@@ -88,9 +89,9 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: np.ndarray,
     Xtest: np.ndarray,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB"],
+    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"],
     PCAdec: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
 
@@ -102,7 +103,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB'}
+    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -114,6 +115,8 @@ def GSapi(
         Predicted phenotypes for training individuals, shape (n_train, 1).
     yhat_test : np.ndarray
         Predicted phenotypes for test individuals, shape (n_test, 1).
+    pve : float
+        Proportion of variance explained (GBLUP/rrBLUP) or posterior mean h2 (Bayes).
     """
     # Optional PCA-based dimensionality reduction
     if PCAdec:
@@ -131,21 +134,15 @@ def GSapi(
         Xtrain, Xtest = vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
 
     # Linear mixed models
-    if method == "GBLUP":
-        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=1)
-        return model.predict(Xtrain), model.predict(Xtest)
+    if method in ("GBLUP", "rrBLUP"):
+        kinship = 1 if method == "GBLUP" else None
+        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=kinship)
+        return model.predict(Xtrain), model.predict(Xtest), model.pve
 
-    if method == "rrBLUP":
-        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=None)
-        return model.predict(Xtrain), model.predict(Xtest)
-
-    if method == "BayesA":
-        model = BAYES(Y.reshape(-1, 1), Xtrain)
-        return model.predict(Xtrain), model.predict(Xtest)
-
-    if method == "BayesB":
-        model = BAYES(Y.reshape(-1, 1), Xtrain, method="BayesB")
-        return model.predict(Xtrain), model.predict(Xtest)
+    if method in ("BayesA", "BayesB", "BayesCpi"):
+        model = BAYES(Y.reshape(-1, 1), Xtrain, method=method)
+        pve = model.pve
+        return model.predict(Xtrain), model.predict(Xtest), pve
 
     raise ValueError(f"Unsupported GS method: {method}")
 
@@ -215,6 +212,13 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Use BayesB model for training and prediction "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-BayesCpi", "--BayesCpi",
+        action="store_true",
+        default=False,
+        help="Use BayesCpi model for training and prediction "
              "(default: %(default)s).",
     )
     # ------------------------------------------------------------------
@@ -335,6 +339,9 @@ def main(log: bool = True) -> None:
         if args.BayesB:
             model_count += 1
             logger.info(f"Used model{model_count}:     BayesB")
+        if args.BayesCpi:
+            model_count += 1
+            logger.info(f"Used model{model_count}:     BayesCpi")
         logger.info(f"Use PCA:         {args.pcd}")
         logger.info(f"MAF threshold:   {args.maf}")
         logger.info(f"Missing rate:    {args.geno}")
@@ -376,7 +383,11 @@ def main(log: bool = True) -> None:
         methods.append("BayesA")
     if args.BayesB:
         methods.append("BayesB")
-    assert len(methods) > 0, "No model selected. Use --GBLUP/--rrBLUP."
+    if args.BayesCpi:
+        methods.append("BayesCpi")
+    assert len(methods) > 0, (
+        "No model selected. Use --GBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
+    )
 
     # ------------------------------------------------------------------
     # Load genotype
@@ -418,6 +429,7 @@ def main(log: bool = True) -> None:
     for trait_name in pheno.columns:
         logger.info("*" * 60)
         t_trait = time.time()
+        logger.info(f"* Genomic Selection for trait: {trait_name}")
 
         p = pheno[trait_name]
         namark = p.isna()
@@ -428,10 +440,8 @@ def main(log: bool = True) -> None:
         train_pheno = p.loc[samples[trainmask]].values.reshape(-1, 1)
 
         if train_pheno.size == 0:
-            logger.info(f"* Genomic Selection for trait: {trait_name}\nNo non-missing phenotypes for trait {trait_name}; skipped.")
+            logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
             continue
-        pvemodel = BLUP(train_pheno,train_snp,kinship=1)
-        logger.info(f"* Genomic Selection for trait: {trait_name}, PVE: {round(pvemodel.pve,3)}")
 
         # 5-fold cross-validation on training population
         if args.cv is not None:
@@ -451,7 +461,7 @@ def main(log: bool = True) -> None:
                     fold_id += 1
                     t_fold = time.time()
 
-                    yhat_train, yhat_test = GSapi(
+                    yhat_train, yhat_test, pve = GSapi(
                         train_pheno[train_idx],
                         train_snp[:, train_idx],
                         train_snp[:, test_idx],
@@ -474,6 +484,7 @@ def main(log: bool = True) -> None:
                     spear = spearmanr(ttest[:, 0], ttest[:, 1]).statistic
                     logger.info(
                         f"Fold{fold_id}: "
+                        f"{pve:.2f} (PVE), "
                         f"{pear:.2f} (Pearson), {spear:.2f} (Spearman), "
                         f"{r2:.2f} (R²). "
                         f"Time cost: {(time.time() - t_fold):.2f} secs"
@@ -495,7 +506,7 @@ def main(log: bool = True) -> None:
             # Final prediction on test population
             # ------------------------------------------------------------------
             test_snp = geno[:, testmask]
-            _, test_pred = GSapi(
+            _, test_pred, pve = GSapi(
                 train_pheno,
                 train_snp,
                 test_snp,

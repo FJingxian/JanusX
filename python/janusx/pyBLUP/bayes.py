@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from janusx.janusx import bayesa as _bayesa
+from janusx.pyBLUP.mlm import BLUP
 
 
 def _as_1d_f64(arr: np.ndarray, name: str) -> np.ndarray:
@@ -99,8 +100,8 @@ def bayesA(
     y: np.ndarray,
     M: np.ndarray,
     X: Optional[np.ndarray] = None,
-    n_iter: int = 300,
-    burnin: int = 150,
+    n_iter: int = 400,
+    burnin: int = 200,
     thin: int = 1,
     r2: float = 0.5,
     df0_b: float = 5.0,
@@ -212,14 +213,11 @@ class BAYES:
         cov : np.ndarray, optional
             Fixed-effect design matrix of shape (n, p).
         """
+        model = BLUP(y,M,kinship=1)
         M = M.T
         X = np.concatenate([np.ones((M.shape[0],1)),cov],axis=1) if cov is not None else np.ones((M.shape[0],1)) # Design matrix of 1st vector
         y = y.reshape(-1,1)
-        self.Mmean = M.mean(axis=0,keepdims=True)
-        self.Mstd = M.std(axis=0,keepdims=True)+ridge
-        self.ymean = y.mean(axis=0,keepdims=True)
-        self.ystd = y.std(axis=0,keepdims=True)+ridge
-        self.beta_hat,self.alpha_hat = bayesA(y=(y-self.ymean)/self.ystd,M=(M-self.Mmean)/self.Mstd,X=X)
+        self.beta_hat,self.alpha_hat = bayesA(y,M,X,r2=model.pve)
         self.beta_hat = self.beta_hat.reshape(-1,1)
         self.alpha_hat = self.alpha_hat.reshape(-1,1)
         
@@ -236,4 +234,4 @@ class BAYES:
         """
         M = M.T
         X = np.concatenate([np.ones((M.shape[0],1)),cov],axis=1) if cov is not None else np.ones((M.shape[0],1)) # Design matrix of 1st vector
-        return (((M-self.Mmean)/self.Mstd)@self.beta_hat+X@self.alpha_hat+self.ymean)*self.ystd
+        return M@self.beta_hat+X@self.alpha_hat

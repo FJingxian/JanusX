@@ -7,6 +7,7 @@ Supported models
   - GBLUP  : Genomic Best Linear Unbiased Prediction (GBLUP, kinship = 1)
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
+  - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
 
 Genotype input formats
 ----------------------
@@ -87,7 +88,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: np.ndarray,
     Xtest: np.ndarray,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA"],
+    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB"],
     PCAdec: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -101,7 +102,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP'}
+    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -140,6 +141,10 @@ def GSapi(
 
     if method == "BayesA":
         model = BAYES(Y.reshape(-1, 1), Xtrain)
+        return model.predict(Xtrain), model.predict(Xtest)
+
+    if method == "BayesB":
+        model = BAYES(Y.reshape(-1, 1), Xtrain, method="BayesB")
         return model.predict(Xtrain), model.predict(Xtest)
 
     raise ValueError(f"Unsupported GS method: {method}")
@@ -203,6 +208,13 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Use BayesA model for training and prediction "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-BayesB", "--BayesB",
+        action="store_true",
+        default=False,
+        help="Use BayesB model for training and prediction "
              "(default: %(default)s).",
     )
     # ------------------------------------------------------------------
@@ -320,6 +332,9 @@ def main(log: bool = True) -> None:
         if args.BayesA:
             model_count += 1
             logger.info(f"Used model{model_count}:     BayesA")
+        if args.BayesB:
+            model_count += 1
+            logger.info(f"Used model{model_count}:     BayesB")
         logger.info(f"Use PCA:         {args.pcd}")
         logger.info(f"MAF threshold:   {args.maf}")
         logger.info(f"Missing rate:    {args.geno}")
@@ -359,6 +374,8 @@ def main(log: bool = True) -> None:
         methods.append("rrBLUP")
     if args.BayesA:
         methods.append("BayesA")
+    if args.BayesB:
+        methods.append("BayesB")
     assert len(methods) > 0, "No model selected. Use --GBLUP/--rrBLUP."
 
     # ------------------------------------------------------------------

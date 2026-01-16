@@ -48,11 +48,10 @@ class BLUP:
         self.y = self.Dh@self.y
         self.Z = self.Dh@self.Z
         self.result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # minimize REML
-        lbd = 10 ** float(self.result.x)
+        lbd = 10 ** self.result.x
         self._REML(lbd)
-        self.u = self.G@self.Z.T@(self.V_inv.flatten()*self.r.T).T
-        rtv_invr = float((self.V_inv * self.r.T) @ self.r)
-        sigma_g2 = rtv_invr / (self.n - self.p)
+        self.u = self.G@self.Z.T@(self.V_inv.ravel()*self.r.T).T
+        sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2
         if self.kinship is None:
             g = self.M.T @ self.u
@@ -62,19 +61,25 @@ class BLUP:
             var_g = sigma_g2 * mean_s
         self.pve = var_g / (var_g + sigma_e2)
     def _REML(self,lbd: float):
-        n,p = self.n,self.p
+        """Restricted maximum likelihood (REML) for the null model."""
+        n,p_cov = self.X.shape
+        p = p_cov
         V = self.S+lbd
         V_inv = 1/V
-        XTV_invX = V_inv*self.X.T @ self.X
-        XTV_invy = V_inv*self.X.T @ self.y
-        self.beta = np.linalg.solve(XTV_invX,XTV_invy)
-        r = self.y - self.X@self.beta
-        rTV_invr = V_inv * r.T@r
-        c = (n-p)*(np.log(n-p)-1-np.log(2*np.pi))/2
+        X_cov_snp = self.X
+        XTV_invX = V_inv*X_cov_snp.T @ X_cov_snp
+        XTV_invy = V_inv*X_cov_snp.T @ self.y
+        beta = np.linalg.solve(XTV_invX, XTV_invy)
+        r = self.y - X_cov_snp@beta
+        rTV_invr = (V_inv * r.T@r)[0,0]
         log_detV = np.sum(np.log(V))
-        signX, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
-        total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX
-        self.V_inv,self.r = V_inv,r # Estimate random effect
+        sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
+        total_log = (n-p)*np.log(rTV_invr) + log_detV + log_detXTV_invX # log items
+        c = (n-p)*(np.log(n-p)-1-np.log(2*np.pi))/2 # Constant
+        self.V_inv = V_inv
+        self.rTV_invr = rTV_invr
+        self.r = r
+        self.beta = beta
         return c - total_log / 2
     def predict(self,M:np.ndarray,cov:np.ndarray=None):
         X = np.concatenate([np.ones((M.shape[1],1)),cov],axis=1) if cov is not None else np.ones((M.shape[1],1))

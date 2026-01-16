@@ -23,6 +23,18 @@ fn array2_to_vec(arr: PyReadonlyArray2<f64>) -> Vec<f64> {
     out
 }
 
+fn array2_to_vec_snp_major(arr: PyReadonlyArray2<f64>) -> Vec<f64> {
+    let view = arr.as_array();
+    let (n, p) = view.dim();
+    let mut out = Vec::with_capacity(n * p);
+    for j in 0..p {
+        for i in 0..n {
+            out.push(view[[i, j]]);
+        }
+    }
+    out
+}
+
 fn bayesa_core_impl(
     y: &[f64],
     m: &[f64],
@@ -66,7 +78,7 @@ fn bayesa_core_impl(
         let mut s = 0.0;
         let mut msum = 0.0;
         for i in 0..n {
-            let v = m[i * p + j];
+            let v = m[j * n + i];
             s += v * v;
             msum += v;
         }
@@ -180,7 +192,7 @@ fn bayesa_core_impl(
         for j in 0..p {
             let mut rhs = 0.0;
             for i in 0..n {
-                rhs += m[i * p + j] * r[i];
+                rhs += m[j * n + i] * r[i];
             }
             rhs = rhs / var_e + x2[j] * beta[j] / var_e;
             let c = x2[j] / var_e + 1.0 / var_b[j];
@@ -189,7 +201,7 @@ fn bayesa_core_impl(
 
             let delta = beta[j] - new_beta;
             for i in 0..n {
-                r[i] += delta * m[i * p + j];
+                r[i] += delta * m[j * n + i];
             }
             beta[j] = new_beta;
             if beta[j].abs() < min_abs_beta {
@@ -307,7 +319,7 @@ pub fn bayesa(
         return Err(PyValueError::new_err("M rows must match len(y)"));
     }
     let p = m_shape[1];
-    let m_vec = array2_to_vec(m);
+    let m_vec = array2_to_vec_snp_major(m);
 
     let (x_vec, q) = match x {
         Some(arr) => {

@@ -446,10 +446,10 @@ def main(log: bool = True) -> None:
         # 5-fold cross-validation on training population
         if args.cv is not None:
             kfoldset = kfold(train_snp.shape[1], k=int(args.cv), seed=None)
+            spt = ' '
+            logger.info(f"-"*60)
+            logger.info(f"Method{spt}Fold{spt}Pearsonr{spt}Spearmanr{spt}R²{spt}h²{spt}time(secs)")
         outpred_list = []
-        spt = ' '
-        logger.info(f"-"*60)
-        logger.info(f"Method{spt}Fold{spt}Pearsonr{spt}Spearmanr{spt}R²{spt}h²{spt}time(secs)")
         for idx_method, method in enumerate(methods, start=1):
 
             fold_test_pairs = []
@@ -518,7 +518,7 @@ def main(log: bool = True) -> None:
                 PCAdec=args.pcd,
             )
             outpred_list.append(test_pred)
-        logger.info(f"-"*60)
+        logger.info(f"-"*60) if args.cv is not None else None
         # Stack predictions from all models: shape (n_test, n_methods)
         outpred = pd.DataFrame(
             np.concatenate(outpred_list, axis=1),

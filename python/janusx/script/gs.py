@@ -447,9 +447,10 @@ def main(log: bool = True) -> None:
         if args.cv is not None:
             kfoldset = kfold(train_snp.shape[1], k=int(args.cv), seed=None)
         outpred_list = []
-
+        spt = ' '
+        logger.info(f"-"*60)
+        logger.info(f"Method{spt}Fold{spt}Pearsonr{spt}Spearmanr{spt}R²{spt}h²{spt}time(secs)")
         for idx_method, method in enumerate(methods, start=1):
-            logger.info(f"Method{idx_method}: {method}")
 
             fold_test_pairs = []
             fold_train_pairs = []
@@ -482,12 +483,15 @@ def main(log: bool = True) -> None:
 
                     pear = pearsonr(ttest[:, 0], ttest[:, 1]).statistic
                     spear = spearmanr(ttest[:, 0], ttest[:, 1]).statistic
+
                     logger.info(
-                        f"Fold{fold_id}: "
-                        f"{pve:.2f} (PVE), "
-                        f"{pear:.2f} (Pearson), {spear:.2f} (Spearman), "
-                        f"{r2:.2f} (R²). "
-                        f"Time cost: {(time.time() - t_fold):.2f} secs"
+                        f"{method}{spt}"
+                        f"{fold_id}{spt}"
+                        f"{pear:.3f}{spt}"
+                        f"{spear:.3f}{spt}"
+                        f"{r2:.3f}{spt}"
+                        f"{pve:.3f}{spt}"
+                        f"{(time.time() - t_fold):.3f}{spt}"
                     )
 
                 # Use the fold with highest R² for plotting
@@ -514,7 +518,7 @@ def main(log: bool = True) -> None:
                 PCAdec=args.pcd,
             )
             outpred_list.append(test_pred)
-
+        logger.info(f"-"*60)
         # Stack predictions from all models: shape (n_test, n_methods)
         outpred = pd.DataFrame(
             np.concatenate(outpred_list, axis=1),

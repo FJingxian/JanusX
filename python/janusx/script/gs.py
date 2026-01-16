@@ -400,7 +400,6 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     for trait_name in pheno.columns:
         logger.info("*" * 60)
-        logger.info(f"* Genomic Selection for trait: {trait_name}")
         t_trait = time.time()
 
         p = pheno[trait_name]
@@ -412,8 +411,10 @@ def main(log: bool = True) -> None:
         train_pheno = p.loc[samples[trainmask]].values.reshape(-1, 1)
 
         if train_pheno.size == 0:
-            logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
+            logger.info(f"* Genomic Selection for trait: {trait_name}\nNo non-missing phenotypes for trait {trait_name}; skipped.")
             continue
+        pvemodel = BLUP(train_pheno,train_snp,kinship=1)
+        logger.info(f"* Genomic Selection for trait: {trait_name}, PVE: {round(pvemodel.pve,3)}")
 
         # 5-fold cross-validation on training population
         if args.cv is not None:

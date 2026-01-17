@@ -45,7 +45,7 @@ from joblib import Parallel, delayed, cpu_count
 from tqdm import trange
 
 # Rust core kernels (PyO3 extension)
-from ..janusx import glmf32, lmm_reml_chunk_f32, lmm_assoc_chunk_f32
+from janusx.janusx import glmf32, lmm_reml_chunk_f32, lmm_assoc_chunk_f32
 
 
 def FEM(

@@ -1,6 +1,6 @@
 import numpy as np
 from tqdm import tqdm
-from ..janusx import (
+from janusx.janusx import (
     BedChunkReader,
     VcfChunkReader,
     count_vcf_snps,

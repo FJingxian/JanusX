@@ -1,6 +1,6 @@
 # JanusX
 
-[简体中文(推荐)](./doc/README_zh.md) | [English](./README.md) | [算法分享](./doc/algorithm_zh.md)
+[简体中文(推荐)](./doc/README_zh.md) | [English](./README.md)
 
 ## Project Overview
 
@@ -45,7 +45,7 @@ Note that running `jx -h` might take a while at first! This is because the Pytho
 | Module | Description |
 |:-------|:------------|
 | `gwas` | Unified GWAS wrapper (LM/LMM/fastLMM/FarmCPU) |
-| `gs` | Genomic Selection (GBLUP, rrBLUP) |
+| `gs` | Genomic Selection (GBLUP, rrBLUP, BayesA/B/Cpi) |
 | `postGWAS` | Visualization and annotation |
 | `grm` | Genetic relationship matrix calculation |
 | `pca` | Principal component analysis |
@@ -77,6 +77,9 @@ jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o results
 
 # Specific models
 jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP -o results
+
+# Bayesian GS models
+jx gs --vcf data.vcf.gz --pheno pheno.txt --BayesA --BayesB --BayesCpi -o results
 
 # With PCA-based dimensionality reduction
 jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd -o results
@@ -173,6 +176,9 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 |--------|-------------|----------|
 | **GBLUP** | Genomic Best Linear Unbiased Prediction | Baseline prediction |
 | **rrBLUP** | Ridge Regression BLUP | Additive genetic value estimation |
+| **BayesA** | Marker effects with scaled-t prior | Polygenic traits with heavier tails |
+| **BayesB** | Variable selection with marker-specific variance | Sparse genetic architecture |
+| **BayesCpi** | Variable selection with shared variance | Sparse architecture with shared variance |
 
 ### Kinship Methods
 

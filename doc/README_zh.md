@@ -137,6 +137,9 @@ jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o ou
 |------|----------|------|
 | **GBLUP** | 线性模型 | 基于亲缘关系矩阵，计算稳定 |
 | **rrBLUP** | 岭回归 | 无需亲缘关系，适合高维数据 |
+| **BayesA** | 贝叶斯模型 | 标记效应为 scaled-t 先验，适合多基因性状 |
+| **BayesB** | 贝叶斯模型 | 变异选择，标记方差独立 |
+| **BayesCpi** | 贝叶斯模型 | 变异选择，共享标记方差 |
 
 ### 使用方法
 
@@ -146,6 +149,9 @@ jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o out/
 
 # 指定模型
 jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP -o out/
+
+# 运行 Bayes 系列模型
+jx gs --vcf data.vcf.gz --pheno pheno.txt --BayesA --BayesB --BayesCpi -o out/
 
 # 指定特定表型列 (1-based 索引)
 jx gs --vcf data.vcf.gz --pheno pheno.txt --n 0 --GBLUP -o out/
@@ -163,6 +169,9 @@ jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd --plot -o out/
 | `-p/--pheno` | 表型文件路径 | 必填 |
 | `-GBLUP/--GBLUP` | 使用 GBLUP 模型 | False |
 | `-rrBLUP/--rrBLUP` | 使用 rrBLUP 模型 | False |
+| `-BayesA/--BayesA` | 使用 BayesA 模型 | False |
+| `-BayesB/--BayesB` | 使用 BayesB 模型 | False |
+| `-BayesCpi/--BayesCpi` | 使用 BayesCpi 模型 | False |
 | `-pcd/--pcd` | 启用 PCA 降维 (自动选择主成分数) | False |
 | `-n/--ncol` | 表型列索引 (1-based) | 全部列 |
 | `-plot/--plot` | 生成预测结果散点图 | False |

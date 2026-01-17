@@ -429,7 +429,6 @@ def main(log: bool = True) -> None:
     for trait_name in pheno.columns:
         logger.info("*" * 60)
         t_trait = time.time()
-        logger.info(f"* Genomic Selection for trait: {trait_name}")
 
         p = pheno[trait_name]
         namark = p.isna()
@@ -438,6 +437,7 @@ def main(log: bool = True) -> None:
 
         train_snp = geno[:, trainmask]
         train_pheno = p.loc[samples[trainmask]].values.reshape(-1, 1)
+        logger.info(f"* Genomic Selection for trait: {trait_name}\nTrain size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {train_snp.shape[0]}")
 
         if train_pheno.size == 0:
             logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")

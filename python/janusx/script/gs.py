@@ -76,7 +76,7 @@ from scipy.stats import pearsonr, spearmanr
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx.gfreader import breader, vcfreader
-from janusx.pyBLUP import QK, BLUP, kfold
+from janusx.pyBLUP import BLUP, kfold
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
 
@@ -394,34 +394,25 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     if args.vcf:
         logger.info(f"Loading genotype from {gfile}...")
-        geno_df = vcfreader(gfile)
+        geno_df = vcfreader(gfile,maf=args.maf,miss=args.geno,impute=True,dtype='float32')
     elif args.bfile:
         logger.info(f"Loading genotype from {gfile}.bed...")
-        geno_df = breader(gfile)
+        geno_df = breader(gfile,maf=args.maf,miss=args.geno,impute=True,dtype='float32')
     else:
         raise ValueError("Genotype input not recognized.")
-
+    logger.info(
+        f"* Filter SNPs with MAF < {args.maf} or missing rate > {args.geno}; "
+        "impute with mean."
+    )
+    logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
     logger.info(f"Completed, cost: {round(time.time() - t_loading, 3)} secs")
-
     m, n = geno_df.shape
     n = n - 2  # First 2 columns usually CHR and POS
     logger.info(f"Loaded SNP: {m}, individuals: {n}")
 
     samples = geno_df.columns[2:].astype(str)
     geno = geno_df.iloc[:, 2:].values
-
-    # ------------------------------------------------------------------
-    # SNP filtering and imputation
-    # ------------------------------------------------------------------
-    t_control = time.time()
-    logger.info(
-        f"* Filter SNPs with MAF < {args.maf} or missing rate > {args.geno}; "
-        "impute with mode."
-    )
-    logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
-    qkmodel = QK(geno, maff=args.maf, missf=args.geno)
-    geno = qkmodel.M
-    logger.info(f"Filter finished, cost: {(time.time() - t_control):.2f} secs")
+    geno = (geno - geno.mean(axis=1,keepdims=True)) / (geno.std(axis=1,keepdims=True)+1e-6) # standardization of genotype
 
     # ------------------------------------------------------------------
     # Genomic Selection for each phenotype
@@ -450,7 +441,7 @@ def main(log: bool = True) -> None:
             logger.info(f"-"*60)
             logger.info(f"Method{spt}Fold{spt}Pearsonr{spt}Spearmanr{spt}R²{spt}h²{spt}time(secs)")
         outpred_list = []
-        for idx_method, method in enumerate(methods, start=1):
+        for method in methods:
 
             fold_test_pairs = []
             fold_train_pairs = []

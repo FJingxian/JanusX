@@ -10,6 +10,7 @@ warnings.filterwarnings(
 import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.backends.backend_pdf # pdf support
+import matplotlib.backends.backend_svg # svg support
 from janusx.script import gwas,gs,postGWAS,grm,pca,sim,gmerge
 from importlib.metadata import version, PackageNotFoundError
 try:

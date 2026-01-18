@@ -1,5 +1,6 @@
 import time
 from importlib.metadata import version, PackageNotFoundError
+from typing import Literal
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -60,11 +61,11 @@ class GENOMETOOL:
         return ref_alt.astype('category')
 
 def breader(prefix:str,chunk_size=10_000,
-            maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
+            maf: float = 0,miss: float = 1, impute: bool=False, dtype:Literal['int8','float32']='int8') -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(prefix)
     chunks = load_genotype_chunks(prefix,chunk_size,maf,miss,impute)
-    genotype = np.zeros(shape=(len(idv),m),dtype='int8')
+    genotype = np.zeros(shape=(len(idv),m),dtype=dtype)
     pbar = tqdm(total=m, desc="Loading bed",ascii=True)
     num = 0
     for chunk,_ in chunks:
@@ -80,11 +81,11 @@ def breader(prefix:str,chunk_size=10_000,
     return genotype.dropna()
 
 def vcfreader(vcfPath:str,chunk_size=50_000,
-            maf: float = 0,miss: float = 1, impute: bool=False) -> pd.DataFrame:
+            maf: float = 0,miss: float = 1, impute: bool=False, dtype:Literal['int8','float32']='int8') -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(vcfPath)
     chunks = load_genotype_chunks(vcfPath,chunk_size,maf,miss,impute)
-    genotype = np.zeros(shape=(len(idv),m),dtype='int8')
+    genotype = np.zeros(shape=(len(idv),m),dtype=dtype)
     pbar = tqdm(total=m, desc="Loading bed",ascii=True)
     num = 0
     bim = []

@@ -177,7 +177,7 @@ def load_genotype_chunks(
     ...     print(geno.shape)          # (m_chunk, n_samples)
     ...     print(sites[0].chrom, sites[0].pos)
     """
-
+    chunk_size = int(chunk_size)
     # 1) Determine file type: BED or VCF
     if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
         if mmap_window_mb is not None:

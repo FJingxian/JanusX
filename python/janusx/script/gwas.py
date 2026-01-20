@@ -527,7 +527,7 @@ def run_chunked_gwas_lmm_lm(
                 continue
 
             maf_chunk = np.mean(genosub, axis=1) / 2
-            results = mod.gwas(genosub, threads=threads)
+            results = mod.gwas(genosub-2*maf_chunk.reshape(-1,1), threads=threads) # Centralization of input genotype
             info_chunk = [
                 (s.chrom, s.pos, s.ref_allele, s.alt_allele) for s in sites
             ]

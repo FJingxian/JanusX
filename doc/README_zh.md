@@ -55,7 +55,7 @@ jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
 
 | 模型 | 适用场景 | 优点 | 缺点 |
 |------|----------|------|------|
-| **LM** | 大样本、无明显群体结构 | 速度快、内存占用低 | 无法控制群体结构导致的假阳性 |
+| **GLM** | 大样本、无明显群体结构 | 速度快、内存占用低 | 无法控制群体结构导致的假阳性 |
 | **LMM** | 有群体结构或亲缘关系 | 控制假阳性、检验力较高 | 计算量较大 |
 | **fastLMM** | 固定 lambda 的混合模型 | 速度快、适合筛选 | 近似解 |
 | **FarmCPU** | 需要平衡检验力和假阳性 | 双重检验、控制混杂 | 需要全量基因型，内存要求高 |
@@ -63,7 +63,7 @@ jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
 ### 使用方法
 
 ```bash
-# LM 模型 (流式/低内存)
+# GLM 模型 (流式/低内存)
 jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm -o out/
 
 # LMM 模型 (流式/低内存)
@@ -87,7 +87,7 @@ jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o ou
 | `-bfile/--bfile` | PLINK 二进制格式前缀 | 必填 |
 | `-p/--pheno` | 表型文件路径 | 必填 |
 | `-n/--ncol` | 表型列索引 (1-based，可多次指定) | 全部列 |
-| `-lm/--lm` | 运行 LM 模型 | False |
+| `-lm/--lm` | 运行 GLM 模型 | False |
 | `-lmm/--lmm` | 运行 LMM 模型 | False |
 | `-fastlmm/--fastlmm` | 运行 fastLMM (固定 lambda) | False |
 | `-farmcpu/--farmcpu` | 运行 FarmCPU 模型 | False |
@@ -104,7 +104,7 @@ jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o ou
 
 | 文件 | 说明 |
 |------|------|
-| `{prefix}.{trait}.lm.tsv` | LM 模型结果 |
+| `{prefix}.{trait}.lm.tsv` | GLM 模型结果 |
 | `{prefix}.{trait}.lmm.tsv` | LMM 模型结果 |
 | `{prefix}.{trait}.fastlmm.tsv` | fastLMM 模型结果 |
 | `{prefix}.{trait}.farmcpu.tsv` | FarmCPU 模型结果 |
@@ -445,13 +445,13 @@ jx sim 500 1000 mydata   # 500k SNPs, 1000 individuals
 
 | 数据特征 | 推荐模型 | 说明 |
 |----------|----------|------|
-| 大样本、无明显群体结构 | LM | 速度快，内存占用低 |
+| 大样本、无明显群体结构 | GLM | 速度快，内存占用低 |
 | 有群体结构或亲缘关系 | LMM | 控制假阳性，推荐首选 |
 | 需要平衡检验力和假阳性 | FarmCPU | 双重检验，控制混杂 |
 
 ### Q: 内存不足怎么办？
 
-1. 使用 LM 或 LMM 模型 (支持流式处理)
+1. 使用 GLM 或 LMM 模型 (支持流式处理)
 2. 减小 `--chunksize` 参数值
 3. FarmCPU 需要全量加载基因型，内存要求较高
 

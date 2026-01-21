@@ -2,11 +2,33 @@
 
 [简体中文(推荐)](./doc/README_zh.md) | [English](./README.md)
 
-## Project Overview
+## Overview
 
-JanusX is a high-performance, ALL-in-ONE suite for quantitative genetics that unifies genome-wide association studies (GWAS) and genomic selection (GS). It incorporates well-established GWAS methods (GLM, LMM, and FarmCPU) and a flexible GS toolkit including GBLUP and various machine learning models. It also combines routine genomic analyses, from data processing to publication-ready visualisation.
+JanusX is a high-performance, all-in-one suite for quantitative genetics that unifies genome-wide association studies (GWAS) and genomic selection (GS). It includes established GWAS methods (GLM, LMM, fastLMM, FarmCPU) and GS models (GBLUP, rrBLUP, BayesA/B/Cpi), plus routine analyses from data processing to publication-ready visualization.
 
-It provides significant performance improvements over tools like [GEMMA](https://github.com/genetics-statistics/GEMMA), [GCTA](https://yanglab.westlake.edu.cn/software/gcta), and [rMVP](https://github.com/xiaolei-lab/rMVP), especially in multi-threaded computation.
+It delivers strong performance gains compared with [GEMMA](https://github.com/genetics-statistics/GEMMA), [GCTA](https://yanglab.westlake.edu.cn/software/gcta), and [rMVP](https://github.com/xiaolei-lab/rMVP), especially for multi-threaded computation.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Running the CLI](#running-the-cli)
+- [Modules](#modules)
+- [Quick Start](#quick-start)
+- [Input File Formats](#input-file-formats)
+- [CLI Reference](#cli-reference)
+- [FAQ](#faq)
+- [Architecture](#architecture)
+- [Key Features](#key-features)
+- [Key Algorithms](#key-algorithms)
+- [Example Data](#example-data)
+- [Citation](#citation)
+
+## Requirements
+
+- Python 3.10+
+- Rust toolchain for source builds (maturin/PyO3)
 
 ## Installation
 
@@ -33,28 +55,29 @@ Download and extract the archive, then run the executable directly.
 
 ```bash
 jx -h
+jx <module> -h
 jx <module> [options]
 ```
 
-Note that running `jx -h` might take a while at first! This is because the Python interpreter is compiling source code into the `pycache` directory. Subsequent runs will use the pre-compiled code and load much faster!
+The first run may be slower while Python builds bytecode in `__pycache__`. Subsequent runs load the cached bytecode and start faster.
 
-## Available Modules
+## Modules
 
 | Module | Description |
-| :------- | :------------ |
+| --- | --- |
 | `gwas` | Unified GWAS wrapper (GLM/LMM/fastLMM/FarmCPU) |
 | `gs` | Genomic Selection (GBLUP, rrBLUP, BayesA/B/Cpi) |
 | `postGWAS` | Visualization and annotation |
-| `grm` | Genetic relationship matrix calculation |
+| `grm` | Genetic relationship matrix (GRM) |
 | `pca` | Principal component analysis |
 | `sim` | Genotype and phenotype simulation |
 
-## Quick Start Examples
+## Quick Start
 
 ### GWAS Analysis
 
 ```bash
-# Using unified gwas module (select one or more models)
+# Select one or more GWAS models
 jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o results
 
 # Run multiple models at once
@@ -93,9 +116,9 @@ jx postGWAS -f results/*.lmm.tsv --threshold 1e-6
 jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 50
 ```
 
-![manhanden&qq](./fig/test0.png "Simple visualization")
+![Manhattan and QQ plots](./fig/test0.png "Simple visualization")
 
-Test data in example is from [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA).
+Datasets used in the screenshots are in `example/` (sourced from [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA)).
 
 ### Population Structure
 
@@ -111,7 +134,7 @@ jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D -o results
 
 ### Phenotype File
 
-Tab-delimited, first column is sample ID, subsequent columns are phenotypes:
+Tab-delimited. First column is sample ID; remaining columns are phenotypes.
 
 | samples | trait1 | trait2 |
 |---------|--------|--------|
@@ -121,13 +144,13 @@ Tab-delimited, first column is sample ID, subsequent columns are phenotypes:
 ### Genotype Files
 
 - **VCF**: `.vcf` or `.vcf.gz`
-- **PLINK**: `.bed`/`.bim`/`.fam` (use prefix)
+- **PLINK**: `.bed`/`.bim`/`.fam` (use file prefix)
 
-## Module Guide (CLI)
+## CLI Reference
 
 ### GWAS (`gwas`)
 
-Unified GWAS runner supporting LM, LMM, fastLMM (fixed lambda), and FarmCPU.
+Unified GWAS runner supporting GLM, LMM, fastLMM (fixed lambda), and FarmCPU.
 
 ```bash
 # LM / LMM (streaming-friendly)
@@ -146,15 +169,17 @@ jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o ou
 | ------ | ------------ | ------- |
 | `-vcf/--vcf`, `-bfile/--bfile` | Genotype source (VCF or PLINK prefix) | required |
 | `-p/--pheno` | Phenotype file (tab-delimited) | required |
-| `-n/--ncol` | Phenotype column index (1-based, repeatable) | all columns |
-| `-lm/--lm`, `-lmm/--lmm`, `-fastlmm/--fastlmm`, `-farmcpu/--farmcpu` | Choose GWAS model(s) | required |
+| `-n/--ncol` | Zero-based phenotype column indices (repeatable) | all columns |
+| `-lm/--lm`, `-lmm/--lmm`, `-fastlmm/--fastlmm`, `-farmcpu/--farmcpu` | Choose GWAS model(s) | all `False` |
 | `-k/--grm` | GRM method: `1` (centered), `2` (standardized), or path to precomputed | `1` |
 | `-q/--qcov` | PC count or Q-matrix path for covariates | `0` |
 | `-c/--cov` | Covariate file (without intercept column) | `None` |
 | `-plot/--plot` | Generate Manhattan + QQ plots | `False` |
 | `-chunksize/--chunksize` | SNP block size for streaming | `100000` |
 | `-t/--thread` | CPU threads (`-1` for all cores) | `-1` |
-| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."`|
+| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
+
+Select at least one GWAS model flag when running `gwas`.
 
 **Outputs**
 
@@ -185,7 +210,7 @@ jx gs --vcf data.vcf.gz --pheno pheno.txt --n 0 --GBLUP --pcd --plot -o out/
 | `-p/--pheno` | Phenotype file | required |
 | `-GBLUP/--GBLUP`, `-rrBLUP/--rrBLUP`, `-BayesA/--BayesA`, `-BayesB/--BayesB`, `-BayesCpi/--BayesCpi` | Models to run | all `False` |
 | `-pcd/--pcd` | Enable PCA-based dimensionality reduction | `False` |
-| `-n/--ncol` | Phenotype column index (1-based) | all columns |
+| `-n/--ncol` | Zero-based phenotype column index | all columns |
 | `-plot/--plot` | Scatter plots for predicted vs. observed | `False` |
 | `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
 
@@ -247,7 +272,7 @@ jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D --group groups.txt -o out/
 Group file format:
 
 ```text
-ID      Group   Label(optional)
+ID      Group   Label (optional)
 indv1   PopA    Sample1
 indv2   PopA    Sample2
 indv3   PopB    Sample3
@@ -341,44 +366,44 @@ jx sim 500 1000 mydata
 | `{prefix}.pheno` | Full phenotype file |
 | `{prefix}.pheno.txt` | Simplified phenotype (GS-friendly) |
 
-## FAQs and Tips
+## FAQ
 
-- **Which GWAS model to pick?** Large, structure-free cohorts → LM; population structure/kinship → LMM; need speed with acceptable approximation → fastLMM; balance power/false positives with full genotype in memory → FarmCPU.
-- **Memory pressure?** Prefer LM/LMM (streaming), lower `--chunksize`, avoid FarmCPU unless full genotypes fit in memory.
-- **Caching of intermediates** (auto-reused across runs): `{prefix}.k.{method}.npy` (GRM), `{prefix}.q.{dim}.txt` (PCA), `{prefix}.grm.bin` (binary GRM).
-- **Empty outputs?** Verify genotype/phenotype sample IDs align, check phenotype columns for missing values, try `--thread 1` to debug, inspect log files.
-- **Covariates format** (no header, one row per sample, no intercept column):  
+- **Which GWAS model to pick?** Large, structure-free cohorts -> GLM; population structure/kinship -> LMM; need speed with acceptable approximation -> fastLMM; balance power/false positives with full genotype in memory -> FarmCPU.
+- **Memory pressure?** Prefer GLM/LMM (streaming), lower `--chunksize`, avoid FarmCPU unless full genotypes fit in memory.
+- **Intermediate caching** (auto-reused across runs): `{prefix}.k.{method}.npy` (GRM), `{prefix}.q.{dim}.txt` (PCA), `{prefix}.grm.bin` (binary GRM).
+- **Empty outputs?** Verify genotype/phenotype sample IDs align, check phenotype columns for missing values, try `--thread 1` for debugging, inspect log files.
+- **Covariates format** (no header, one row per sample, no intercept column):
   ```text
   0.1    -0.2     25
   0.3     0.1     30
   ```
-- **Reading QQ plots**: points along diagonal → fine; upper-right inflation → significant hits; overall deviation → likely population structure or technical confounding.
+- **Reading QQ plots**: points along diagonal -> OK; upper-right inflation -> significant hits; overall deviation -> likely population structure or technical confounding.
 
 ## Architecture
 
 ### Core Libraries
 
-- **python/janusx/pyBLUP** - Core statistical engine
-  - GWAS implementations (LM, LMM, FarmCPU)
-  - QK matrix calculation with memory-optimized chunking
+- `python/janusx/pyBLUP` - Core statistical engine
+  - GWAS implementations (GLM, LMM, FarmCPU)
+  - K/Q matrix calculation with memory-optimized chunking
   - PCA computation with randomized SVD
   - Cross-validation utilities
 
-- **python/janusx/gfreader** - Genotype file I/O
+- `python/janusx/gfreader` - Genotype file I/O
   - VCF reader
   - PLINK binary reader (.bed/.bim/.fam)
   - NumPy format support
 
-- **python/janusx/bioplotkit** - Visualization
+- `python/janusx/bioplotkit` - Visualization
   - Manhattan and QQ plots
   - PCA visualization (2D and 3D GIF)
   - LD block visualization
 
-### Native Core (src/)
+### Native Core (`src/`)
 
 Rust kernels for fast linear algebra and association testing.
 
-### CLI Entry Points (python/janusx/script/)
+### CLI Entry Points (`python/janusx/script/`)
 
 Each module corresponds to a CLI command. The launcher script (`jx`) dispatches to `script/<name>.py`.
 
@@ -393,8 +418,8 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 ### GWAS Methods
 
 | Method | Description | Best For |
-| -------- | ------------- | ---------- |
-| **Linear Model (LM)** | Standard GLM for association testing | Large datasets without population structure |
+| --- | --- | --- |
+| **Linear Model (GLM)** | Standard linear model for association testing | Large datasets without population structure |
 | **Linear Mixed Model (LMM)** | Incorporates kinship matrix to control population structure | Most GWAS scenarios |
 | **fastLMM** | Fixed-lambda mixed model for speed | Fast approximate screening |
 | **FarmCPU** | Iterative fixed/random effect alternation | High power with strict false positive control |
@@ -402,7 +427,7 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 ### GS Methods
 
 | Method | Description | Best For |
-| -------- | ------------- | ---------- |
+| --- | --- | --- |
 | **GBLUP** | Genomic Best Linear Unbiased Prediction | Baseline prediction |
 | **rrBLUP** | Ridge Regression BLUP | Additive genetic value estimation |
 | **BayesA** | Marker effects with scaled-t prior | Polygenic traits with heavier tails |
@@ -414,13 +439,9 @@ Each module corresponds to a CLI command. The launcher script (`jx`) dispatches 
 - **Method 1 (VanRaden)**: Centered GRM (default)
 - **Method 2 (Yang)**: Standardized/weighted GRM
 
-## Python Version
+## Example Data
 
-Requires Python 3.10+
-
-## Test Data
-
-Example data in `example/` directory from [GEMMA](https://github.com/genetics-statistics/GEMMA.git) project
+Sample datasets live in `example/` (sourced from [GEMMA](https://github.com/genetics-statistics/GEMMA.git)). Additional fixtures and example outputs are in `test/`.
 
 ## Citation
 

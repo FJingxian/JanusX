@@ -26,9 +26,6 @@ import socket
 import argparse
 
 from ._common.log import setup_logging
-
-# ✅ 改成你真实的模块路径
-# e.g. from janusx.gmerge import merge
 from janusx.gfreader.gmerge import merge
 
 

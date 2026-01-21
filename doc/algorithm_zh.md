@@ -19,6 +19,7 @@ $$y = \mu + X_{cov}\beta_{cov} + X_{snp}\beta_{snp} + g + \epsilon \tag{1}$$
 $$y = X\beta + g + \epsilon \tag{2}$$
 
 其中：
+
 - $X$ 是固定因子矩阵，包含1列全为1的固定截距向量以及多列固定因子向量(例如群体结构、基因型)
 - $\beta$ 是固定因子的效应值
 - $g$ 是个体随机因子，$g \sim N(0,\sigma_{g}^2 G)$，$G$ 是亲缘关系矩阵，可通过系谱关系或基因型计算获得
@@ -108,6 +109,7 @@ $$\ln L_{reml} = C_{reml} - (n-p)\ln(r'V^{-1}r) + \ln|V| + \ln|X'V^{-1}X| \tag{7
 **测试数据集**：[RiceAtlas](http://60.30.67.242:18076/#/download)，6048个体，Panicle_length性状 (基因型+表型)
 
 **数据格式**：
+
 - 基因型：plink标准格式
 - 表型格式如下，每列是不同样本，第二列~第n列是多种表型，换行符作为分隔符
 
@@ -433,8 +435,6 @@ jx postGWAS --files test/test0.assoc.tsv --threshold 1e-6
 使用example文件夹下的[测试数据](https://doi.org/10.1038/ng.3609)输出结果如下所示：
 
 ![GWAStest](../fig/test0.png "GWAS test of JanusX")
-
-*(The above image depicts physiological and behavioral trait loci identified in CFW mice using GEMMA, from Parker et al, Nature Genetics, 2016.)*
 
 ### 功能2: 全基因组选择
 

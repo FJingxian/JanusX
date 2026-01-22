@@ -53,8 +53,10 @@ for key in ["MPLBACKEND"]:
 import matplotlib as mpl
 
 mpl.use("Agg")
-mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
+mpl.rcParams["pdf.fonttype"] = 42
+mpl.rcParams['svg.fonttype'] = 'none'
+mpl.rcParams['svg.hashsalt'] = 'hello'
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -109,7 +111,7 @@ def fastplot(
     axes["A"].set_ylabel("Count")
 
     # B: Manhattan plot
-    gwasplot.manhattan(-np.log10(1 / results.shape[0]), ax=axes["B"])
+    gwasplot.manhattan(-np.log10(1 / results.shape[0]), ax=axes["B"],rasterized=True)
 
     # C: QQ plot
     gwasplot.qq(ax=axes["C"])

@@ -1,9 +1,7 @@
 import typing
-
 import numpy as np
 import jax.numpy as jnp
 from jax import grad
-import pandas as pd
 from scipy.optimize import minimize
 from tqdm import tqdm
 
@@ -37,7 +35,7 @@ def REML(
     y = jnp.asarray(y)
     n, p = X.shape
 
-    V = sum(theta[k] * SIGMAlist[k] for k in range(len(SIGMAlist)))
+    V = sum(theta[num] * G for num,G in enumerate(SIGMAlist))
     L = jnp.linalg.cholesky(V)
     Vinv = jnp.linalg.inv(V)
 
@@ -56,32 +54,41 @@ def REML(
     c = (n - p) * (jnp.log(n - p) - 1 - jnp.log(2 * jnp.pi)) / 2.0
     return total_log / 2.0 - c
 
-def _as_2d(array: np.ndarray, name: str, n_rows: int | None = None) -> np.ndarray:
-    arr = np.asarray(array, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    elif arr.ndim != 2:
-        raise ValueError(f"{name} must be 1D or 2D array, got shape {arr.shape}")
-    if n_rows is not None and arr.shape[0] != n_rows:
-        raise ValueError(f"{name} must have {n_rows} rows, got {arr.shape[0]}")
-    return arr
+def _testX(X:np.ndarray,n:int,) -> np.ndarray:
+    if X is None:
+        X = np.ones((n, 1))
+    else:
+        if X.size == n:
+            X = X.reshape(-1,1)
+            X = np.concatenate([np.ones((n, 1)), X], axis=1)
+        elif X.shape[0] == n:
+            X = np.concatenate([np.ones((n, 1)), X], axis=1)
+        else:
+            raise ValueError(f"Row number of X is not equal to {n} in y. (X.shape={X.shape}, n={n})")
+    return X
 
-
-def _normalize_Z(
-    Z: typing.Sequence[np.ndarray] | np.ndarray | None,
-    n_rows: int,
-) -> list[np.ndarray]:
+def _testZ(Z: list[np.ndarray]|np.ndarray|None,n:int|None=None) -> list[np.ndarray]:
+    Z_list:list[np.ndarray]
     if Z is None:
-        return []
-    if isinstance(Z, np.ndarray):
+        Z_list = []
+    elif isinstance(Z, np.ndarray):
         Z_list = [Z]
     else:
         Z_list = list(Z)
-    out: list[np.ndarray] = []
     for idx, z in enumerate(Z_list):
-        out.append(_as_2d(z, f"Z[{idx}]", n_rows))
-    return out
+        if not isinstance(z,np.ndarray):
+            raise TypeError(f"Type of Z{idx} is {type(z)}")
+        if z.shape[0] == n:
+            pass
+        elif z.size == n:
+            Z_list[idx] = z.reshape(-1,1)
+        else:
+            raise ValueError(f"Row number of Z{idx} is not equal to {n} in y. (Z{idx}.shape={z.shape}, n={n})")
+    return Z_list
 
+def _onehotZ(Z_list: typing.Sequence[np.ndarray],ridge:float=1e-8) -> list[typing.Tuple[float,float,float]]:
+    return list(map(lambda num: (1,0.0,1.0) if (np.isin(Z_list[num], [0, 1]).all()) and (Z_list[num].sum(axis=1) > 0).all() \
+        else (Z_list[num].shape[1],Z_list[num].mean(axis=0),Z_list[num].std(axis=0)+ridge),range(len(Z_list))))
 
 def _split_u(u: np.ndarray, Z_list: list[np.ndarray]) -> list[np.ndarray]:
     u_by_Z: list[np.ndarray] = []
@@ -98,7 +105,7 @@ class BLUP:
         self,
         y: np.ndarray,
         X: np.ndarray | None = None,
-        Z: typing.Sequence[np.ndarray] | np.ndarray | None = None,
+        Z: list[np.ndarray] | np.ndarray | None = None,
         maxiter: int = 100,
         progress: bool = True,
     ):
@@ -137,100 +144,96 @@ class BLUP:
         result : OptimizeResult
             SciPy optimization result from REML.
         """
-        y = _as_2d(y, "y")
-        if y.shape[1] != 1:
-            raise ValueError(f"y must have shape (n, 1), got {y.shape}")
-        if X is None:
-            X = np.ones((y.shape[0], 1))
-        else:
-            X = _as_2d(X, "X", y.shape[0])
-            X = np.concatenate([np.ones((X.shape[0], 1)), X], axis=1)
-
-        Z_list = _normalize_Z(Z, X.shape[0])
+        # 确保表型 y 参数 (n,1)
+        y = y.reshape(-1,1)
+        n = y.shape[0] # Row dimension
+        # 检查固定效应 X 参数 (n,p) | None
+        X = _testX(X,n)
+        p = X.shape[1]
+        # 检查随机效应 Z 参数 [(n,q1),(n,q2),...(n,qn)] | (n,q) | None
+        self.Z_list = _testZ(Z,n)
+        self.onehot_info = _onehotZ(self.Z_list)
+        self.z_cols = [z.shape[1] for z in self.Z_list]
         self.y = y
         self.X = X
-        self.Z_list = Z_list
-        self.z_cols = [z.shape[1] for z in Z_list]
-        self.n = X.shape[0]
-        self.p = X.shape[1]
+        self.n = n
+        self.p = p
         self.maxiter = maxiter
         self.progress = progress
         self._fit()
 
     def _fit(self) -> None:
-        SIGMAlist = [z @ z.T for z in self.Z_list]
-        SIGMAlist.append(np.eye(self.n))
-        theta0 = np.ones(len(SIGMAlist))
-        gradfn = grad(REML)
-
-        pbar = None
-        callback = None
-        if self.progress:
-            pbar = tqdm(total=self.maxiter, desc="REML", ncols=100)
-
-            def callback(theta):
-                pbar.update(1)
-                pbar.set_postfix({"theta": np.round(theta, 4)})
-
-        def jac(theta, y, X, SIGMAlist):
-            return np.asarray(gradfn(theta, y, X, SIGMAlist), dtype=float)
-
-        result = minimize(
-            REML,
-            theta0,
-            args=(self.y, self.X, SIGMAlist),
-            jac=jac,
-            method="L-BFGS-B",
-            callback=callback,
-            options={"maxiter": self.maxiter, "disp": False},
-        )
-        if pbar is not None:
-            pbar.close()
-        theta = np.asarray(result.x, dtype=float)
-
-        if theta.shape[0] != len(self.Z_list) + 1:
-            raise ValueError(
-                f"theta length {theta.shape[0]} does not match Z count {len(self.Z_list)}"
-            )
-
-        if self.Z_list:
-            V = sum(
-                theta[ind] * (z @ z.T) for ind, z in enumerate(self.Z_list)
-            ) + theta[-1] * np.eye(self.n)
+        if len(self.Z_list) == 0: # 无随机协变量 进入一般线性模型
+            self.theta = None
+            self.V = None
+            self.beta = np.linalg.solve(self.X.T@self.X,self.X.T@self.y)
+            self.u = None
+            self.u_by_Z = None
+            self.fitted = self.X@self.beta
+            self.residuals = self.y - self.fitted 
+            self.result = None
+            pass
         else:
-            V = theta[-1] * np.eye(self.n)
+            Zstlist = [(z-self.onehot_info[num][1])/self.onehot_info[num][2] for num,z in enumerate(self.Z_list)]
+            SIGMAlist = [jnp.array(z@z.T/self.onehot_info[num][0]) for num,z in enumerate(Zstlist)]
+            SIGMAlist.append(jnp.eye(self.n))
+            theta0 = np.ones(len(SIGMAlist))
+            gradfn = grad(REML)
 
-        VinvX = np.linalg.solve(V, self.X)
-        Vinvy = np.linalg.solve(V, self.y)
-        beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
-        r = self.y - self.X @ beta_hat
-        Vinvr = np.linalg.solve(V, r)
+            pbar = None
+            callback = None
+            if self.progress:
+                pbar = tqdm(total=self.maxiter, desc="REML", ncols=100)
 
-        if self.Z_list:
-            Zall = np.concatenate(self.Z_list, axis=1)
+                def callback(theta):
+                    pbar.update(1)
+                    pbar.set_postfix({"theta": np.round(theta, 4)})
+
+            def jac(theta, y, X, SIGMAlist):
+                return np.asarray(gradfn(theta, y, X, SIGMAlist), dtype=float)
+
+            result = minimize(
+                REML,
+                theta0,
+                args=(self.y, self.X, SIGMAlist),
+                jac=jac,
+                method="L-BFGS-B",
+                callback=callback,
+                options={"maxiter": self.maxiter, "disp": False},
+            )
+            theta = np.asarray(result.x, dtype=float)
+            if pbar is not None:
+                pbar.close()
+
+            V = sum(theta[num]*G for num,G in enumerate(SIGMAlist))
+
+            VinvX = np.linalg.solve(V, self.X)
+            Vinvy = np.linalg.solve(V, self.y)
+            beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
+            r = self.y - self.X @ beta_hat
+            Vinvr = np.linalg.solve(V, r)
+
+            Zall = np.concatenate(Zstlist, axis=1)
             Gall = np.concatenate(
-                [theta[ind] * np.ones(z.shape[1]) for ind, z in enumerate(self.Z_list)]
+                [theta[ind] * np.ones(z.shape[1]) for ind, z in enumerate(Zstlist)]
             )
             u_hat = (Zall.T @ Vinvr) * Gall[:, None]
             fitted = self.X @ beta_hat + Zall @ u_hat
-            u_by_Z = _split_u(u_hat, self.Z_list)
-        else:
-            u_hat = np.zeros((0, 1))
-            fitted = self.X @ beta_hat
-            u_by_Z = []
+            u_by_Z = _split_u(u_hat, Zstlist)
 
-        self.theta = theta
-        self.beta = beta_hat
-        self.u = u_hat
-        self.u_by_Z = u_by_Z
-        self.fitted = fitted
-        self.residuals = self.y - fitted
-        self.result = result
+            self.theta = theta
+            self.V = np.array([theta[ind]*np.diag(SIGMA).mean() for ind,SIGMA in enumerate(SIGMAlist)])
+            self.beta = beta_hat
+            self.u = u_hat
+            self.u_by_Z = u_by_Z
+            self.fitted = fitted
+            self.residuals = self.y - fitted
+            self.result = result
 
     def predict(
         self,
         X: np.ndarray | None = None,
-        Z: typing.Sequence[np.ndarray] | np.ndarray | None = None,
+        Z: list[np.ndarray] | np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Predict response for new samples using fitted effects.
@@ -248,65 +251,53 @@ class BLUP:
         np.ndarray
             Predicted values with shape (n, 1).
         """
-        n_rows = None
         if X is not None:
-            X = _as_2d(X, "X")
-            n_rows = X.shape[0]
-            X = np.concatenate([np.ones((X.shape[0], 1)), X], axis=1)
-        if Z is not None:
-            if isinstance(Z, np.ndarray):
-                if n_rows is None:
-                    n_rows = Z.shape[0]
-                Z_list = _normalize_Z(Z, n_rows)
+            n = X.shape[0]
+        elif Z is not None:
+            if isinstance(Z,np.ndarray):
+                n = Z.shape[0]
+            elif isinstance(Z,list):
+                n = Z[0].shape[0]
             else:
-                if len(Z) == 0:
-                    Z_list = []
-                else:
-                    if n_rows is None:
-                        n_rows = np.asarray(Z[0]).shape[0]
-                    Z_list = _normalize_Z(Z, n_rows)
+                raise "Type error of Z matrix"
         else:
-            Z_list = []
-        if n_rows is None:
-            n_rows = self.n
-        if X is None:
-            X = np.ones((n_rows, 1))
-
-        y_hat = X @ self.beta
-        if not Z_list:
-            return y_hat
-        if len(Z_list) != len(self.z_cols):
-            raise ValueError(f"Z count mismatch: expected {len(self.z_cols)}, got {len(Z_list)}")
-        for idx, (z, expected_cols) in enumerate(zip(Z_list, self.z_cols)):
-            if z.shape[1] != expected_cols:
+            raise ValueError(f"Input X or Z for prediction") 
+        X = _testX(X,n)
+        Z_list = _testZ(Z,n)
+        if len(self.Z_list) == 0:  # 训练集无随机协变量 进入一般线性模型
+            return X @ self.beta
+        else:
+            Z_list = [(z-self.onehot_info[num][1])/self.onehot_info[num][2] for num,z in enumerate(Z_list)]
+            y_hat = X @ self.beta
+            if len(Z_list) == 0:
+                return y_hat
+            if len(Z_list) != len(self.z_cols):
+                raise ValueError(f"Z count mismatch: expected {len(self.z_cols)}, got {len(Z_list)}")
+            for idx, (z, expected_cols) in enumerate(zip(Z_list, self.z_cols)):
+                if z.shape[1] != expected_cols:
+                    raise ValueError(
+                        f"Z[{idx}] columns mismatch: expected {expected_cols}, got {z.shape[1]}"
+                    )
+            Zall = np.concatenate(Z_list, axis=1)
+            if Zall.shape[1] != self.u.shape[0]:
                 raise ValueError(
-                    f"Z[{idx}] columns mismatch: expected {expected_cols}, got {z.shape[1]}"
+                    f"Z columns {Zall.shape[1]} do not match u length {self.u.shape[0]}"
                 )
-        Zall = np.concatenate(Z_list, axis=1)
-        if Zall.shape[1] != self.u.shape[0]:
-            raise ValueError(
-                f"Z columns {Zall.shape[1]} do not match u length {self.u.shape[0]}"
-            )
-        return y_hat + Zall @ self.u
+            return y_hat + Zall @ self.u
 
 if __name__ == "__main__":
     from janusx.gfreader import vcfreader
-    
+    import pandas as pd
     geno = vcfreader('example/mouse_hs1940.vcf.gz',maf=0.02,miss=0.05).iloc[:,2:]
     pheno = pd.read_csv('example/mouse_hs1940.pheno',sep='\t',index_col=0).iloc[:,0].dropna()
     csample = list(set(geno.columns) & set(pheno.index))
     y = pheno.loc[csample].values.reshape(-1,1)
     Z = geno[csample].values.T
-    # Z = (Z - Z.mean(axis=0)) / Z.std(axis=0)
-    # Z = [Z]
-    # data = pd.read_csv('todo/blup.test2.tsv',sep='\t',).dropna().reset_index().iloc[:,1:]
-    # y = data.iloc[:,[1]].values
-    # Z = [pd.get_dummies(data.iloc[:,0]).astype(int).values,pd.get_dummies(data.iloc[:,2]).astype(int).values]
+    data = pd.read_csv('todo/blup.test2.tsv',sep='\t',).dropna().reset_index().iloc[:,1:]
+    y = data.iloc[:,[1]].values
+    Z = [pd.get_dummies(data.iloc[:,0]).astype(int).values,pd.get_dummies(data.iloc[:,2]).astype(int).values]
     model = BLUP(y, None, Z=Z, maxiter=50, progress=True)
     print(model.beta)
     print(model.u.shape)
-    print(model.theta[0]/model.theta.sum())
-    print("theta:", model.theta)
-    print("nit:", model.result.nit)
-    print("status:", model.result.status)
-    print("message:", model.result.message)
+    print(model.V[0]/model.V.sum())
+    print(np.corrcoef(y.ravel(),model.predict(None,Z).ravel()))

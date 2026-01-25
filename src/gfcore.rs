@@ -88,7 +88,7 @@ pub fn read_bim(prefix: &str) -> Result<Vec<SiteInfo>, String> {
 // ---------------------------
 // VCF open helper
 // ---------------------------
-pub fn open_text_maybe_gz(path: &Path) -> Result<Box<dyn BufRead + Send>, String> {
+pub fn open_text_maybe_gz(path: &Path) -> Result<Box<dyn BufRead + Send + Sync>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     if path.extension().map(|e| e == "gz").unwrap_or(false) {
         Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
@@ -458,7 +458,7 @@ impl BedSnpIter {
 // ======================================================================
 pub struct VcfSnpIter {
     pub samples: Vec<String>,
-    reader: Box<dyn BufRead + Send>,
+    reader: Box<dyn BufRead + Send + Sync + 'static>,
     maf: f32,
     miss: f32,
     fill_missing: bool,

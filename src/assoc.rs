@@ -1,4 +1,5 @@
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyArrayMethods};
+use pyo3::BoundObject;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
@@ -308,7 +309,7 @@ pub fn glmf32<'py>(
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
 
-    let out = PyArray2::<f64>::zeros_bound(py, [m, row_stride], false);
+    let out = PyArray2::<f64>::zeros(py, [m, row_stride], false).into_bound();
     let out_slice: &mut [f64] = unsafe {
         out.as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
@@ -325,7 +326,7 @@ pub fn glmf32<'py>(
         None
     };
 
-    py.allow_threads(|| {
+    py.detach(|| {
         let mut runner = || {
             let mut i_marker = 0usize;
             while i_marker < m {
@@ -737,8 +738,8 @@ pub fn lmm_reml_chunk_f32<'py>(
     let m_chunk = g_arr.shape()[0];
     let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
 
-    let beta_se_p = PyArray2::<f64>::zeros_bound(py, [m_chunk, 3], false);
-    let lambdas = PyArray1::<f64>::zeros_bound(py, [m_chunk], false);
+    let beta_se_p = PyArray2::<f64>::zeros(py, [m_chunk, 3], false).into_bound();
+    let lambdas = PyArray1::<f64>::zeros(py, [m_chunk], false).into_bound();
 
     let beta_se_p_slice: &mut [f64] = unsafe {
         beta_se_p
@@ -762,7 +763,7 @@ pub fn lmm_reml_chunk_f32<'py>(
         None
     };
 
-    py.allow_threads(|| {
+    py.detach(|| {
         let compute_all = || {
             (0..m_chunk)
                 .into_par_iter()
@@ -904,7 +905,7 @@ pub fn lmm_assoc_chunk_f32<'py>(
     }
 
     let m = g_arr.shape()[0];
-    let out = PyArray2::<f64>::zeros_bound(py, [m, 3], false); // beta, se, p
+    let out = PyArray2::<f64>::zeros(py, [m, 3], false).into_bound(); // beta, se, p
     let out_slice: &mut [f64] = unsafe {
         out.as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
@@ -986,7 +987,7 @@ pub fn lmm_assoc_chunk_f32<'py>(
         None
     };
 
-    py.allow_threads(|| {
+    py.detach(|| {
         let mut run = || {
             out_slice
                 .par_chunks_mut(3)

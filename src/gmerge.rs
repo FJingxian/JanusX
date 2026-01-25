@@ -1,5 +1,5 @@
 // src/gmerge.rs
-use pyo3::prelude::*;
+use pyo3::{BoundObject, prelude::*};
 use pyo3::types::PyDict;
 
 use std::cmp::Ordering;
@@ -107,7 +107,7 @@ pub struct PyMergeStats {
 #[pymethods]
 impl PyMergeStats {
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py).into_bound();
         d.set_item("n_inputs", self.n_inputs)?;
         d.set_item("out_fmt", &self.out_fmt)?;
         d.set_item("out", &self.out)?;
@@ -153,7 +153,7 @@ pub struct PyConvertStats {
 #[pymethods]
 impl PyConvertStats {
     pub fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py).into_bound();
         d.set_item("input", &self.input)?;
         d.set_item("out_fmt", &self.out_fmt)?;
         d.set_item("out", &self.out)?;
@@ -964,7 +964,7 @@ pub fn convert_genotypes(
     input: String,
     out: String,
     out_fmt: Option<String>,
-    progress_callback: Option<PyObject>,
+    progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     threads: usize,
 ) -> PyResult<PyConvertStats> {
@@ -1047,7 +1047,7 @@ pub fn convert_genotypes(
 
         for start in (0..n_sites).step_by(chunk_size) {
             let end = (start + chunk_size).min(n_sites);
-            let rows: Vec<RowOutcome> = py.allow_threads(|| {
+            let rows: Vec<RowOutcome> = py.detach(|| {
                 pool.install(|| {
                     (start..end)
                         .into_par_iter()

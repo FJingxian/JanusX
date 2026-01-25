@@ -1,3 +1,4 @@
+use pyo3::BoundObject;
 use pyo3::prelude::*;
 use pyo3::exceptions::*;
 
@@ -283,7 +284,7 @@ impl BedChunkReader {
         let mat = Array2::from_shape_vec((m, n), data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         #[allow(deprecated)]
-        let py_mat = PyArray2::from_owned_array_bound(py, mat);
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
         Ok(Some((py_mat, sites)))
     }
 }
@@ -344,7 +345,7 @@ impl VcfChunkReader {
         let mat = Array2::from_shape_vec((m, n), data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         #[allow(deprecated)]
-        let py_mat = PyArray2::from_owned_array_bound(py, mat);
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
         Ok(Some((py_mat, sites)))
     }
 }

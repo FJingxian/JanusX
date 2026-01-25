@@ -1,3 +1,4 @@
+from typing import Union
 import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
@@ -14,7 +15,7 @@ def calc_mmap_window_mb(
     n_snps: int,
     chunk_size: int,
     min_chunks: int = 2,
-) -> int | None:
+) -> Union[int,None]:
     """
     Compute a BED mmap window size (MB) to cover at least `min_chunks` chunks.
 
@@ -35,7 +36,7 @@ def auto_mmap_window_mb(
     n_snps: int,
     chunk_size: int,
     min_chunks: int = 2,
-) -> int | None:
+) -> Union[int,None]:
     """
     Compute mmap window size for BED inputs; return None for VCF inputs.
     """
@@ -50,12 +51,12 @@ def bed_chunk_reader(
     missing_rate: float = 1.0,
     impute: bool = True,
     *,
-    snp_range: tuple[int, int] | None = None,
-    snp_indices: list[int] | None = None,
-    bim_range: tuple[str, int, int] | None = None,
-    sample_ids: list[str] | None = None,
-    sample_indices: list[int] | None = None,
-    mmap_window_mb: int | None = None,
+    snp_range: Union[tuple[int, int] , None] = None,
+    snp_indices: Union[list[int],None ]= None,
+    bim_range: Union[tuple[str, int, int] , None] = None,
+    sample_ids: Union[list[str] , None] = None,
+    sample_indices: Union[list[int] , None] = None,
+    mmap_window_mb: Union[int , None] = None,
 ):
     """
     Stream PLINK BED/BIM/FAM chunks with optional SNP/sample selection.
@@ -99,12 +100,12 @@ def load_genotype_chunks(
     missing_rate: float = 1.0,
     impute: bool = True,
     *,
-    snp_range: tuple[int, int] | None = None,
-    snp_indices: list[int] | None = None,
-    bim_range: tuple[str, int, int] | None = None,
-    sample_ids: list[str] | None = None,
-    sample_indices: list[int] | None = None,
-    mmap_window_mb: int | None = None,
+    snp_range: Union[tuple[int, int] , None] = None,
+    snp_indices: Union[list[int] , None] = None,
+    bim_range: Union[tuple[str, int, int] , None] = None,
+    sample_ids: Union[list[str] , None] = None,
+    sample_indices: Union[list[int] , None] = None,
+    mmap_window_mb: Union[int , None] = None,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -315,7 +316,7 @@ def save_genotype_streaming(
     *,
     fmt: str = "auto",
     flush_every_chunks: int = 20,
-    total_snps: int | None = None,
+    total_snps: Union[int , None] = None,
     desc: str = "Writing genotypes",
 ):
     """

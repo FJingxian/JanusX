@@ -1,4 +1,5 @@
 import time
+from typing import Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -146,10 +147,10 @@ class GWASPLOT:
     # ------------------------------------------------------------------
     def manhattan(
         self,
-        threshold: float | None = None,
-        color_set: list[str] | None = None,
-        ax: plt.Axes | None = None,
-        ignore: list = None,
+        threshold: Union[float,None] = None,
+        color_set: Union[list[str],None] = None,
+        ax: Union[plt.Axes,None] = None,
+        ignore: Union[list[str],None] = None,
         **kwargs,
     ) -> plt.Axes:
         """

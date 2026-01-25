@@ -1,3 +1,4 @@
+from typing import Union
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -53,9 +54,9 @@ class PCSHOW:
         x: str,
         y: str,
         z: str,
-        group: str | None = None,
-        anno_tag: str | None = None,
-        color_set: list | None = None,
+        group: Union[str,None] = None,
+        anno_tag: Union[str,None] = None,
+        color_set: Union[list,None] = None,
         out_gif: str = "pcshow_3d.gif",
         elev: float = 20,
         azim_start: float = 0,

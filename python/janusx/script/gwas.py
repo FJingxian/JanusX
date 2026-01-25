@@ -41,6 +41,7 @@ import time
 import socket
 import argparse
 import logging
+from typing import Union
 import uuid
 
 from janusx.pyBLUP.QK2 import GRM
@@ -153,7 +154,7 @@ def genotype_cache_prefix(genofile: str) -> str:
     return os.path.join(cache_dir, base).replace("\\", "/")
 
 
-def load_phenotype(phenofile: str, ncol: list[int] | None, logger) -> pd.DataFrame:
+def load_phenotype(phenofile: str, ncol: Union[list[int] , None], logger) -> pd.DataFrame:
     """
     Load and preprocess phenotype table.
 
@@ -193,7 +194,7 @@ def build_grm_streaming(
     max_missing_rate: float,
     chunk_size: int,
     method: int,
-    mmap_window_mb: int | None,
+    mmap_window_mb: Union[int , None],
     logger,
 ) -> tuple[np.ndarray, int]:
     """
@@ -353,10 +354,10 @@ def load_or_build_q_with_cache(
 
 
 def _load_covariate_for_streaming(
-    cov_path: str | None,
+    cov_path: Union[str , None],
     n_samples: int,
     logger,
-) -> np.ndarray | None:
+) -> Union[np.ndarray , None]:
     """
     Load covariate matrix for streaming LMM/LM.
 
@@ -383,13 +384,13 @@ def _load_covariate_for_streaming(
 def prepare_streaming_context(
     genofile: str,
     phenofile: str,
-    pheno_cols: list[int] | None,
+    pheno_cols: Union[list[int] , None],
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
     mgrm: str,
     pcdim: str,
-    cov_path: str | None,
+    cov_path: Union[str , None],
     mmap_limit: bool,
     logger,
 ):
@@ -446,7 +447,7 @@ def run_chunked_gwas_lmm_lm(
     mmap_limit: bool,
     grm: np.ndarray,
     qmatrix: np.ndarray,
-    cov_all: np.ndarray | None,
+    cov_all: Union[np.ndarray , None],
     eff_m: int,
     plot: bool,
     threads: int,
@@ -660,7 +661,7 @@ def build_qmatrix_farmcpu(
     gfile_prefix: str,
     geno: np.ndarray,
     qdim: str,
-    cov_path: str | None,
+    cov_path: Union[str , None],
     logger,
 ) -> np.ndarray:
     """
@@ -703,7 +704,7 @@ def run_farmcpu_fullmem(
     gfile: str,
     prefix: str,
     logger: logging.Logger,
-    pheno_preloaded: pd.DataFrame | None = None,
+    pheno_preloaded: Union[pd.DataFrame , None] = None,
 ) -> None:
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).

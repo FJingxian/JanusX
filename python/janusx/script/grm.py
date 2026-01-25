@@ -26,6 +26,7 @@ import os
 import time
 import socket
 import argparse
+from typing import Union
 
 import numpy as np
 from tqdm import tqdm
@@ -46,7 +47,7 @@ def build_grm_streaming(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
-    mmap_window_mb: int | None,
+    mmap_window_mb: Union[int , None],
     logger,
 ) -> tuple[np.ndarray, int]:
     """

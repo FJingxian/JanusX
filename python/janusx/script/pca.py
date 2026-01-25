@@ -36,6 +36,7 @@ Output:
 """
 
 import os
+from typing import Union
 for key in ["MPLBACKEND"]:
     if key in os.environ:
         del os.environ[key]
@@ -71,7 +72,7 @@ from ._common.log import setup_logging
 # Helpers: GRM-based PCA (aligned with GWAS module)
 # ======================================================================
 
-def load_group_table(group_path: str) -> tuple[pd.DataFrame, str | None, str | None]:
+def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
     group_df = pd.read_csv(group_path, sep="\t", header=None, index_col=0)
     if group_df.shape[1] == 0:
         raise ValueError(f"Group file has no columns: {group_path}")

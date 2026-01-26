@@ -285,15 +285,15 @@ def main():
     # ------------------------------------------------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
-        "-chr", "--chr", type=str, default="#CHROM",
+        "-chr", "--chr", type=str, default="chrom",
         help="Column name for chromosome (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-pos", "--pos", type=str, default="POS",
+        "-pos", "--pos", type=str, default="pos",
         help="Column name for base position (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-pvalue", "--pvalue", type=str, default="p",
+        "-pvalue", "--pvalue", type=str, default="pwald",
         help="Column name for p-value (default: %(default)s).",
     )
     optional_group.add_argument(

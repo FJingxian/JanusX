@@ -51,9 +51,9 @@ class GWASPLOT:
     def __init__(
         self,
         df: pd.DataFrame,
-        chr: str = "#CHROM",
-        pos: str = "POS",
-        pvalue: str = "p",
+        chr: str = "chrom",
+        pos: str = "pos",
+        pvalue: str = "pwald",
         interval_rate: float = 0.1,
         compression: bool = True,
     ) -> None:

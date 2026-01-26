@@ -1,10 +1,10 @@
-import typing
+from typing import Union,Literal
 import numpy as np
 from scipy.optimize import minimize_scalar
 from .QK2 import GRM
     
 class BLUP:
-    def __init__(self,y:np.ndarray,M:np.ndarray,cov:np.ndarray=None,Z:np.ndarray=None, kinship:typing.Literal[None,1]=None,log:bool=False):
+    def __init__(self,y:np.ndarray,M:np.ndarray,cov:Union[np.ndarray,None]=None,Z:Union[np.ndarray,None]=None, kinship:Literal[None,1]=None,log:bool=False):
         """
         Fast solution of the mixed linear model via Brent's method.
 
@@ -47,8 +47,8 @@ class BLUP:
         self.X = self.Dh@self.X
         self.y = self.Dh@self.y
         self.Z = self.Dh@self.Z
-        self.result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # minimize REML
-        lbd = 10 ** self.result.x
+        result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)),bounds=(-6,6),method='bounded') # minimize REML
+        lbd = 10 ** result.x
         self._REML(lbd)
         self.u = self.G@self.Z.T@(self.V_inv.ravel()*self.r.T).T
         sigma_g2 = self.rTV_invr / (self.n - self.p)
@@ -81,7 +81,7 @@ class BLUP:
         self.r = r
         self.beta = beta
         return c - total_log / 2
-    def predict(self,M:np.ndarray,cov:np.ndarray=None):
+    def predict(self,M:np.ndarray,cov:Union[np.ndarray,None]=None):
         X = np.concatenate([np.ones((M.shape[1],1)),cov],axis=1) if cov is not None else np.ones((M.shape[1],1))
         if self.kinship is not None:
             G = GRM(np.concatenate([self.M, M],axis=1),log=self.log)+1e-6*np.eye(self.M.shape[1]+M.shape[1])# Regular item

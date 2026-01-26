@@ -761,6 +761,7 @@ def run_farmcpu_fullmem(
         q_sub = qmatrix[famidretain]
 
         logger.info(f"Samples: {np.sum(famidretain)}, SNPs: {snp_sub.shape[0]}")
+        maf = snp_sub.mean(axis=1)/2
         res = farmcpu(
             y=p_sub,
             M=snp_sub,
@@ -771,8 +772,11 @@ def run_farmcpu_fullmem(
             threads=args.thread,
         )
         res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"], index=ref_alt.index)
+        res_df['maf'] = maf
         res_df = pd.concat([ref_alt, res_df], axis=1)
         res_df = res_df.reset_index()
+        res_df.columns = ['chrom','pos','allele0','allele1','beta','se','pwald','maf']
+        res_df = res_df[['chrom','pos','allele0','allele1','maf','beta','se','pwald']]
 
         if args.plot:
             fastplot(
@@ -782,7 +786,7 @@ def run_farmcpu_fullmem(
                 outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
             )
 
-        res_df = res_df.astype({"pwald": "object"})
+        res_df = res_df.astype({"pwald": "object","pos":int})
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)

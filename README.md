@@ -27,7 +27,7 @@ It delivers strong performance gains compared with [GEMMA](https://github.com/ge
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - Rust toolchain for source builds (maturin/PyO3)
 
 ## Installation
@@ -78,32 +78,40 @@ The first run may be slower while Python builds bytecode in `__pycache__`. Subse
 
 ```bash
 # Select one or more GWAS models
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -o results
 
 # Run multiple models at once
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lm -lmm -fastlmm -farmcpu -o results
 
 # With PLINK format
-jx gwas --bfile genotypes --pheno phenotypes.txt --grm 1 --qcov 3 --thread 8 -o results
+jx gwas -bfile genotypes -p phenotypes.txt -k 1 -qcov 3 -t 8 -o results
 
 # With diagnostic plots (SVG)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm --plot -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -plot -o results
+
+# With precomputed GRM / Q (PC) / covariates
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -k path/to/grm.txt -q path/to/q.txt -c cov.txt -o results
 ```
+
+Notes:
+- GRM file: numeric N x N matrix aligned to genotype sample order.
+- Q (PC) file: numeric N x K matrix aligned to genotype sample order.
+- Covariate file: numeric N x C matrix aligned to genotype sample order.
 
 ### Genomic Selection
 
 ```bash
 # Run both GS models
-jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -o results
 
 # Specific models
-jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -o results
 
 # Bayesian GS models
-jx gs --vcf data.vcf.gz --pheno pheno.txt --BayesA --BayesB --BayesCpi -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -BayesA -BayesB -BayesCpi -o results
 
 # With PCA-based dimensionality reduction
-jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --pcd -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -pcd -o results
 ```
 
 ### Visualization
@@ -145,6 +153,34 @@ Tab-delimited. First column is sample ID; remaining columns are phenotypes.
 
 - **VCF**: `.vcf` or `.vcf.gz`
 - **PLINK**: `.bed`/`.bim`/`.fam` (use file prefix)
+
+### GWAS Optional Matrices (GRM / Q / Covariate)
+
+GRM (kinship) example (Idv in rows and columns should be aligned to genotype matirx):
+
+```text
+1.00   0.12   0.05
+0.12   1.00   0.08
+0.05   0.08   1.00
+```
+
+Q (PC) example (Idv in rows should be aligned to genotype matirx):
+
+```text
+0.12   -0.03
+-0.05  0.08
+0.02   -0.01
+```
+
+Covariate example (Idv in rows should be aligned to genotype matirx):
+
+```text
+0    1
+1    1
+0    2
+```
+
+Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric only and aligned to the genotype sample order. Numbers are splited by space or `\t`.
 
 ## CLI Reference
 
@@ -446,9 +482,13 @@ Sample datasets live in `example/` (sourced from [GEMMA](https://github.com/gene
 ## Citation
 
 ```bibtex
-@software{JanusX,
-  title = {JanusX: High-performance GWAS and Genomic Selection Suite},
-  author = {Jingxian FU},
-  url = {https://github.com/FJingxian/JanusX}
+@article {FuJanusX,
+  title = {JanusX: an integrated and high-performance platform for scalable genome-wide association studies and genomic selection},
+  author = {Fu, Jingxian and Jia, Anqiang and Wang, Haiyang and Liu, Hai-Jun},
+  year = {2026},
+  doi = {10.64898/2026.01.20.700366},
+  publisher = {Cold Spring Harbor Laboratory},
+  URL = {https://www.biorxiv.org/content/early/2026/01/23/2026.01.20.700366},
+  journal = {bioRxiv}
 }
 ```

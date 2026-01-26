@@ -24,7 +24,7 @@ jx -h
 jx <module> -h
 
 # 示例：运行 GWAS 分析
-jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
+jx gwas -vcf example.vcf.gz -p phenotype.txt -lmm -o results
 ```
 
 ### 输入格式
@@ -45,6 +45,35 @@ jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
 | indv1   | 10.5   | 0.85   |
 | indv2   | 12.3   | 0.92   |
 
+**GWAS 可选矩阵示例 (GRM / Q / 协变量)**:
+
+GRM（亲缘矩阵）示例（行列顺序需与基因型样本顺序一致）：
+
+```
+1.00   0.12   0.05
+0.12   1.00   0.08
+0.05   0.08   1.00
+```
+
+Q（PC）矩阵示例（行顺序需与基因型样本顺序一致）：
+
+```
+0.12   -0.03
+-0.05  0.08
+0.02   -0.01
+```
+
+协变量矩阵示例（行顺序需与基因型样本顺序一致）：
+
+```
+0    1
+1    1
+0    2
+```
+
+注意：传给 `--grm`/`-k`、`--qcov`/`-q`、`--cov`/`-c` 的文件需为纯数值矩阵，
+用空格或 `\t` 分隔，且行顺序必须与基因型样本顺序一致。
+
 ---
 
 ## GWAS 全基因组关联分析
@@ -64,20 +93,28 @@ jx gwas --vcf example.vcf.gz --pheno phenotype.txt -o results
 
 ```bash
 # GLM 模型 (流式/低内存)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm -o out/
+jx gwas -vcf data.vcf.gz -p pheno.txt -lm -o out/
 
 # LMM 模型 (流式/低内存)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o out/
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -o out/
 
 # fastLMM 模型 (固定 lambda)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --fastlmm -o out/
+jx gwas -vcf data.vcf.gz -p pheno.txt -fastlmm -o out/
 
 # FarmCPU 模型 (全内存)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --farmcpu -o out/
+jx gwas -vcf data.vcf.gz -p pheno.txt -farmcpu -o out/
 
 # 同时运行多个模型
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o out/
+jx gwas -vcf data.vcf.gz -p pheno.txt -lm -lmm -fastlmm -farmcpu -o out/
+
+# 使用预计算 GRM / Q(PC) / 协变量矩阵
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -k path/to/grm.txt -q path/to/q.txt -c cov.txt -o out/
 ```
+
+说明：
+- GRM 文件：数值型 N x N 矩阵，行列顺序需与基因型样本顺序一致。
+- Q(PC) 文件：数值型 N x K 矩阵，行顺序需与基因型样本顺序一致。
+- 协变量文件：数值型 N x C 矩阵，行顺序需与基因型样本顺序一致。
 
 ### 参数说明
 
@@ -498,9 +535,13 @@ QQ 图用于检验 GWAS 结果是否存在混杂:
 ## 引用
 
 ```bibtex
-@software{JanusX,
-  title = {JanusX: High-performance GWAS and Genomic Selection Suite},
-  author = {Jingxian FU},
-  url = {https://github.com/MaizeMan-JxFU/JanusX}
+@article {FuJanusX,
+  title = {JanusX: an integrated and high-performance platform for scalable genome-wide association studies and genomic selection},
+  author = {Fu, Jingxian and Jia, Anqiang and Wang, Haiyang and Liu, Hai-Jun},
+  year = {2026},
+  doi = {10.64898/2026.01.20.700366},
+  publisher = {Cold Spring Harbor Laboratory},
+  URL = {https://www.biorxiv.org/content/early/2026/01/23/2026.01.20.700366},
+  journal = {bioRxiv}
 }
 ```

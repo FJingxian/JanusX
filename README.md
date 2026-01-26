@@ -48,7 +48,7 @@ pip install janusx
 
 ### Pre-compiled Releases (Stable)
 
-We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows, Linux, and macOS.
+We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows and Linux.
 Download and extract the archive, then run the executable directly.
 
 ## Running the CLI

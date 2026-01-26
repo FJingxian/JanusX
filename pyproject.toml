@@ -10,7 +10,7 @@ dependencies = [
     "matplotlib",
     "psutil",
     "tqdm",
-    "joblib==1.5.2",
+    "joblib>=1.5",
 ]
 authors = [
   {name = "Jingxian FU", email = "827888724@qq.com"},

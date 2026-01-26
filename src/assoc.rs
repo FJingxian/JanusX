@@ -21,7 +21,7 @@ fn normal_sf(z: f64) -> f64 {
     0.5 * libm::erfc(z / std::f64::consts::SQRT_2)
 }
 
-/// cholesky 分解（就地），a 是 dim x dim，返回下三角 L，A = L L^T
+/// cholesky 分解，a 是 dim x dim，返回下三角 L，A = L L^T
 fn cholesky_inplace(a: &mut [f64], dim: usize) -> Option<()> {
     for i in 0..dim {
         for j in 0..=i {
@@ -422,16 +422,21 @@ fn reml_loglike(
     s: &[f64],
     xcov: &[f64],
     y: &[f64],
-    snp: &[f64],
+    snp: Option<&[f64]>,
     n: usize,
     p_cov: usize,
 ) -> f64 {
+    let use_snp = snp.is_some();
+    let snp = snp.unwrap_or(&[]);
     let lbd = 10.0_f64.powf(log10_lbd);
     if !lbd.is_finite() || lbd <= 0.0 {
         return -1e8;
     }
 
-    let p = p_cov + 1;
+    if use_snp && snp.len() != n {
+        return -1e8;
+    }
+    let p = p_cov + if use_snp { 1 } else { 0 };
     if n <= p {
         return -1e8;
     }
@@ -506,11 +511,103 @@ fn reml_loglike(
     if !reml.is_finite() { -1e8 } else { reml }
 }
 
+fn ml_loglike(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: Option<&[f64]>,
+    n: usize,
+    p_cov: usize,
+) -> f64 {
+    let use_snp = snp.is_some();
+    let snp = snp.unwrap_or(&[]);
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return -1e8;
+    }
+
+    if use_snp && snp.len() != n {
+        return -1e8;
+    }
+    let p = p_cov + if use_snp { 1 } else { 0 };
+    if n <= p {
+        return -1e8;
+    }
+
+    let mut v = vec![0.0_f64; n];
+    let mut vinv = vec![0.0_f64; n];
+    for i in 0..n {
+        let vv = s[i] + lbd;
+        if vv <= 0.0 {
+            return -1e8;
+        }
+        v[i] = vv;
+        vinv[i] = 1.0 / vv;
+    }
+
+    let dim = p;
+    let mut xtv_inv_x = vec![0.0_f64; dim * dim];
+    let mut xtv_inv_y = vec![0.0_f64; dim];
+
+    for i in 0..n {
+        let vi = vinv[i];
+        let yi = y[i];
+        for r in 0..dim {
+            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            xtv_inv_y[r] += vi * xir * yi;
+
+            for c in 0..=r {
+                let xic = if c < p_cov { xcov[i * p_cov + c] } else { snp[i] };
+                xtv_inv_x[r * dim + c] += vi * xir * xic;
+            }
+        }
+    }
+
+    let ridge = 1e-6;
+    for r in 0..dim {
+        xtv_inv_x[r * dim + r] += ridge;
+        for c in 0..r {
+            let vrc = xtv_inv_x[r * dim + c];
+            xtv_inv_x[c * dim + r] = vrc;
+        }
+    }
+
+    if cholesky_inplace(&mut xtv_inv_x, dim).is_none() {
+        return -1e8;
+    }
+    let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
+
+    let mut rtv_invr = 0.0_f64;
+    for i in 0..n {
+        let mut xb = 0.0;
+        for r in 0..dim {
+            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            xb += xir * beta[r];
+        }
+        let ri = y[i] - xb;
+        rtv_invr += vinv[i] * ri * ri;
+    }
+
+    if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+        return -1e8;
+    }
+
+    let log_det_v: f64 = v.iter().map(|vv| vv.ln()).sum();
+    let n_f = n as f64;
+
+    let total_log = n_f * (rtv_invr.ln()) + log_det_v;
+    let c = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let ml = c - 0.5 * total_log;
+
+    if !ml.is_finite() { -1e8 } else { ml }
+}
+
 fn brent_max_reml(
     s: &[f64],
     xcov: &[f64],
     y: &[f64],
-    snp: &[f64],
+    snp: Option<&[f64]>,
     n: usize,
     p_cov: usize,
     low: f64,
@@ -585,7 +682,7 @@ fn brent_max_reml(
         };
 
         if !use_parabolic {
-            e = if x < m { c - x } else { x - a };
+            e = if x < m { c - x } else { a - x };
             d = 0.3819660_f64 * e;
         }
 
@@ -602,7 +699,7 @@ fn brent_max_reml(
             w = x; fw = fx;
             x = u; fx = fu;
         } else {
-            if u >= x { a = u; } else { c = u; }
+            if u >= x { c = u; } else { a = u; }
             if fu <= fw || w == x {
                 v = w; fv = fw;
                 w = u; fw = fu;
@@ -702,6 +799,69 @@ fn final_beta_se(
 }
 
 #[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, max_iter=50, tol=1e-2))]
+pub fn lmm_reml_null_f32<'py>(
+    _py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+) -> PyResult<(f64, f64)> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+
+    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    let (best_log10_lbd, reml) = brent_max_reml(
+        s, &xcov_flat, y, None, n, p_cov, low, high, tol, max_iter,
+    );
+    let lbd = 10.0_f64.powf(best_log10_lbd);
+    Ok((lbd, reml))
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd))]
+pub fn ml_loglike_null_f32<'py>(
+    _py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+) -> PyResult<f64> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+
+    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    let ml = ml_loglike(log10_lbd, s, &xcov_flat, y, None, n, p_cov);
+    Ok(ml)
+}
+
+#[pyfunction]
 #[pyo3(signature = (s, xcov, y_rot, low, high, g_rot_chunk, max_iter=50, tol=1e-2, threads=0))]
 pub fn lmm_reml_chunk_f32<'py>(
     py: Python<'py>,
@@ -738,7 +898,7 @@ pub fn lmm_reml_chunk_f32<'py>(
     let m_chunk = g_arr.shape()[0];
     let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
 
-    let beta_se_p = PyArray2::<f64>::zeros(py, [m_chunk, 3], false).into_bound();
+    let beta_se_p = PyArray2::<f64>::zeros(py, [m_chunk, 5], false).into_bound();
     let lambdas = PyArray1::<f64>::zeros(py, [m_chunk], false).into_bound();
 
     let beta_se_p_slice: &mut [f64] = unsafe {
@@ -774,12 +934,21 @@ pub fn lmm_reml_chunk_f32<'py>(
                         snp_vec[i] = row[i] as f64;
                     }
 
-                    let (best_log10_lbd, _) = brent_max_reml(
-                        s, &xcov_flat, y, &snp_vec, n, p_cov, low, high, tol, max_iter,
+                    let (best_log10_lbd, reml) = brent_max_reml(
+                        s, &xcov_flat, y, Some(&snp_vec), n, p_cov, low, high, tol, max_iter,
                     );
 
                     let (beta, se, lbd) =
                         final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
+                    let ml = ml_loglike(
+                        best_log10_lbd,
+                        s,
+                        &xcov_flat,
+                        y,
+                        Some(&snp_vec),
+                        n,
+                        p_cov,
+                    );
 
                     let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
                         let z = beta / se;
@@ -788,9 +957,9 @@ pub fn lmm_reml_chunk_f32<'py>(
                         1.0
                     };
 
-                    (beta, se, if p.is_finite() { p } else { 1.0 }, lbd)
+                    (beta, se, if p.is_finite() { p } else { 1.0 }, lbd, reml, ml)
                 })
-                .collect::<Vec<(f64, f64, f64, f64)>>()
+                .collect::<Vec<(f64, f64, f64, f64, f64, f64)>>()
         };
 
         let results = if let Some(pool) = &pool {
@@ -799,11 +968,13 @@ pub fn lmm_reml_chunk_f32<'py>(
             compute_all()
         };
 
-        for (idx, (beta, se, p, lbd)) in results.into_iter().enumerate() {
-            let out_row = &mut beta_se_p_slice[idx * 3..(idx + 1) * 3];
+        for (idx, (beta, se, p, lbd, reml, ml)) in results.into_iter().enumerate() {
+            let out_row = &mut beta_se_p_slice[idx * 5..(idx + 1) * 5];
             out_row[0] = beta;
             out_row[1] = se;
             out_row[2] = p;
+            out_row[3] = reml;
+            out_row[4] = ml;
             lambdas_slice[idx] = lbd;
         }
     });
@@ -949,7 +1120,7 @@ pub fn lmm_assoc_chunk_f32<'py>(
     }
 
     // symmetrize + ridge
-    let ridge = 1e-8;
+    let ridge = 1e-6;
     for r in 0..p {
         a[r * p + r] += ridge;
         for c in 0..r {

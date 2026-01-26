@@ -99,7 +99,7 @@ def fastplot(
     Generate diagnostic plots for GWAS results: phenotype histogram, Manhattan, and QQ.
     """
     mpl.rcParams["font.size"] = 12
-    results = gwasresult.astype({"POS": "int64"})
+    results = gwasresult.astype({"pos": "int64"})
     fig = plt.figure(figsize=(16, 4), dpi=300)
     layout = [["A", "B", "B", "C"]]
     axes:dict[str,plt.Axes] = fig.subplot_mosaic(mosaic=layout)
@@ -495,7 +495,7 @@ def run_chunked_gwas_lmm_lm(
             Ksub = grm[np.ix_(sameidx, sameidx)]
             mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
             logger.info(
-                f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}, PVE(null): {round(mod.pve, 3)}"
+                f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}, PVE(null): {mod.pve:.3f}"
             )
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
@@ -540,19 +540,22 @@ def run_chunked_gwas_lmm_lm(
             chroms, poss, allele0, allele1 = zip(*info_chunk)
             chunk_df = pd.DataFrame(
                 {
-                    "#CHROM": chroms,
-                    "POS": poss,
+                    "chrom": chroms,
+                    "pos": poss,
                     "allele0": allele0,
                     "allele1": allele1,
                     "maf": maf_chunk,
                     "beta": results[:, 0],
                     "se": results[:, 1],
-                    "p": results[:, 2],
+                    "pwald": results[:, 2],
                 }
             )
-            chunk_df["POS"] = chunk_df["POS"].astype(int)
+            if results.shape[1] > 3:
+                chunk_df["plrt"] = results[:, 3]
+                chunk_df["plrt"] = chunk_df["plrt"].map(lambda x: f"{x:.4e}")
+            chunk_df["pos"] = chunk_df["pos"].astype(int)
 
-            chunk_df["p"] = chunk_df["p"].map(lambda x: f"{x:.4e}")
+            chunk_df["pwald"] = chunk_df["pwald"].map(lambda x: f"{x:.4e}")
             chunk_df.to_csv(
                 tmp_tsv,
                 sep="\t",
@@ -609,10 +612,10 @@ def run_chunked_gwas_lmm_lm(
             plot_df = pd.read_csv(
                 tmp_tsv,
                 sep="\t",
-                usecols=["#CHROM", "POS", "p"],
-                dtype={"#CHROM": str, "POS": "int64"},
+                usecols=["chrom", "pos", "pwald"],
+                dtype={"chrom": str, "pos": "int64"},
             )
-            plot_df["p"] = pd.to_numeric(plot_df["p"], errors="coerce")
+            plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
             fastplot(
                 plot_df,
                 y_vec,
@@ -767,7 +770,7 @@ def run_farmcpu_fullmem(
             iter=20,
             threads=args.thread,
         )
-        res_df = pd.DataFrame(res, columns=["beta", "se", "p"], index=ref_alt.index)
+        res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"], index=ref_alt.index)
         res_df = pd.concat([ref_alt, res_df], axis=1)
         res_df = res_df.reset_index()
 
@@ -779,8 +782,8 @@ def run_farmcpu_fullmem(
                 outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
             )
 
-        res_df = res_df.astype({"p": "object"})
-        res_df.loc[:, "p"] = res_df["p"].map(lambda x: f"{x:.4e}")
+        res_df = res_df.astype({"pwald": "object"})
+        res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         logger.info(f"FarmCPU results saved to {out_tsv}".replace("//", "/"))

@@ -11,7 +11,7 @@ This module provides:
 Notes
 -----
 - Rust backend functions are imported from the local extension module:
-    from ..janusx import glmf32, lmm_reml_chunk_f32
+    from ..janusx import glmf32, lmm_reml_chunk_f32, lmm_reml_null_f32
 - Genotype matrix convention in THIS FILE:
     M (or snp_chunk) is SNP-major: shape = (m_snps, n_samples)
   i.e., rows are SNPs, columns are samples.
@@ -31,8 +31,9 @@ import time
 from typing import Optional, Tuple
 
 import numpy as np
-from scipy.optimize import minimize_scalar
+# from scipy.optimize import minimize_scalar
 from scipy.linalg import eigh
+from scipy.stats import chi2
 import warnings
 
 warnings.filterwarnings(
@@ -45,7 +46,13 @@ from joblib import Parallel, delayed, cpu_count
 from tqdm import trange
 
 # Rust core kernels (PyO3 extension)
-from janusx.janusx import glmf32, lmm_reml_chunk_f32, lmm_assoc_chunk_f32
+from janusx.janusx import (
+    glmf32,
+    lmm_reml_chunk_f32,
+    lmm_reml_null_f32,
+    ml_loglike_null_f32,
+    lmm_assoc_chunk_f32,
+)
 
 
 def FEM(
@@ -200,8 +207,8 @@ def lmm_reml(
 
     Returns
     -------
-    beta_se_p : np.ndarray, shape (m_chunk, 3)
-        Per-SNP results: beta, standard error, p-value.
+    beta_se_p : np.ndarray, shape (m_chunk, 5)
+        Per-SNP results: beta, standard error, p-value, REML, ML.
 
     lambdas : np.ndarray, shape (m_chunk,)
         Per-SNP estimated lambda (ratio ve/vg or similar, per your Rust model).
@@ -243,6 +250,77 @@ def lmm_reml(
     )
 
     return beta_se_p, lambdas
+
+
+def lmm_reml_null(
+    S: np.ndarray,
+    Xcov: np.ndarray,
+    y_rot: np.ndarray,
+    bounds: tuple,
+    max_iter: int = 30,
+    tol: float = 1e-2,
+) -> Tuple[float, float]:
+    """
+    Null-model REML optimization using the Rust kernel.
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (n,)
+        Eigenvalues of kinship matrix K.
+
+    Xcov : np.ndarray, shape (n, q)
+        Rotated covariates (Dh @ X).
+
+    y_rot : np.ndarray, shape (n,)
+        Rotated phenotype (Dh @ y).
+
+    bounds : tuple (low, high)
+        Search bounds in log10(lambda).
+
+    max_iter : int
+        Maximum iterations in the scalar optimizer (in Rust).
+
+    tol : float
+        Convergence tolerance in log10(lambda).
+
+    Returns
+    -------
+    lbd : float
+        Null-model lambda (ve/vg).
+
+    reml : float
+        Null REML log-likelihood (higher is better).
+    """
+    low, high = bounds
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
+    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+
+    lbd, reml = lmm_reml_null_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(low),
+        float(high),
+        int(max_iter),
+        float(tol),
+    )
+    return lbd, reml
+
+
+def ml_loglike_null(
+    S: np.ndarray,
+    Xcov: np.ndarray,
+    y_rot: np.ndarray,
+    log10_lbd: float,
+) -> float:
+    """
+    ML log-likelihood for the null model at a given log10(lambda).
+    """
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
+    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+    return ml_loglike_null_f32(S, Xcov, y_rot, float(log10_lbd))
 
 
 def lmm_assoc_fixed(
@@ -339,25 +417,33 @@ class LMM:
         self.Dh = self.Dh.T.astype('float32')
 
         # Pre-rotate covariates and phenotype once
-        self.Xcov = self.Dh @ X
-        self.y = self.Dh @ y
+        self.Xcov:np.ndarray = self.Dh @ X
+        self.y:np.ndarray = self.Dh @ y
 
         # ---- Estimate null lambda via scalar optimization (Python) ----
-        result = minimize_scalar(
-            lambda lbd: -self._NULLREML(10 ** (lbd)),
-            bounds=(-5, 5),
-            method="bounded",
-            options={"xatol": 1e-3},
-        )
-        lbd_null = 10 ** (result.x)
+        lbd_null,reml = lmm_reml_null(self.S,self.Xcov,self.y,(-5, 5),max_iter=50,tol=1e-3)
+        # print(lbd_null,reml)
+        # result = minimize_scalar(
+        #     lambda lbd: -self._NULLREML(10 ** (lbd)),
+        #     bounds=(-5, 5),
+        #     method="bounded",
+        #     options={"xatol": 1e-3},
+        # )
+        # print(10**result.x,-result.fun)
+        # lbd_null = 10 ** (result.x)
 
-        # A crude PVE estimate; adjust if your model defines vg differently
         vg_null = np.mean(self.S)
         pve = vg_null / (vg_null + lbd_null)
 
         self.lbd_null = lbd_null
         self.pve = pve
-
+        self.LL0 = reml # LL value in null model
+        self.ML0 = ml_loglike_null_f32(
+            np.ascontiguousarray(self.S, dtype=np.float64),
+            np.ascontiguousarray(self.Xcov, dtype=np.float64),
+            np.ascontiguousarray(self.y, dtype=np.float64).ravel(),
+            float(np.log10(lbd_null)),
+        )
         # Adaptive bounds around null (if PVE not degenerate)
         if pve > 0.95 or pve < 0.05:
             self.bounds = (-5, 5)
@@ -423,8 +509,8 @@ class LMM:
 
         Returns
         -------
-        beta_se_p : np.ndarray, shape (m, 3)
-            Per-SNP beta, se, p.
+        beta_se_p : np.ndarray, shape (m, 6)
+            Per-SNP beta, se, pwald, plrt, reml, ml.
         """
         beta_se_p, lambdas = lmm_reml(
             self.S,
@@ -438,7 +524,14 @@ class LMM:
             threads=threads,
         )
         self.lbd = lambdas
-        return beta_se_p
+        stat = 2.0 * (beta_se_p[:, 4] - self.ML0)
+        stat = np.maximum(stat, 0.0)
+        plrt = chi2.sf(stat, df=1)
+
+        out = np.empty((beta_se_p.shape[0], 6), dtype=beta_se_p.dtype)
+        out[:, 0:3] = beta_se_p[:, 0:3]
+        out[:, 3] = plrt
+        return out
 
 
 class FastLMM(LMM):

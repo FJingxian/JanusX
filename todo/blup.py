@@ -1,15 +1,17 @@
 import typing
 import numpy as np
 import jax.numpy as jnp
+from jax.scipy.linalg import cho_solve
+# from jax.scipy.optimize import minimize
 from jax import grad
 from scipy.optimize import minimize
 from tqdm import tqdm
 
 def REML(
-    theta: typing.Sequence[float],
-    y: np.ndarray,
-    X: np.ndarray,
-    SIGMAlist: typing.Sequence[np.ndarray],
+    theta: jnp.ndarray,
+    y: jnp.ndarray,
+    X: jnp.ndarray,
+    Zlist: typing.List[np.ndarray],
 ) -> float:
     """
     Restricted Maximum Likelihood (REML) for variance components.
@@ -34,18 +36,20 @@ def REML(
     X = jnp.asarray(X)
     y = jnp.asarray(y)
     n, p = X.shape
-
-    V = sum(theta[num] * G for num,G in enumerate(SIGMAlist))
+    V = theta[-1]*jnp.eye(n)
+    for num,Z in enumerate(Zlist):
+        V += theta[num] * Z@Z.T
     L = jnp.linalg.cholesky(V)
-    Vinv = jnp.linalg.inv(V)
-
-    XTV_invX = X.T @ Vinv @ X
-    XTV_invy = X.T @ Vinv @ y
+    VinvX = cho_solve((L,True),X)
+    Vinvy = cho_solve((L,True),y)
+    XTV_invX = X.T @ VinvX
+    XTV_invy = X.T @ Vinvy
 
     beta = jnp.linalg.solve(XTV_invX, XTV_invy)
     r = y - X @ beta
+    Vinvr = cho_solve((L,True),r)
 
-    rTV_invr = (r.T @ Vinv @ r)[0, 0]
+    rTV_invr = (r.T @ Vinvr)[0, 0]
     log_detV = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
     sign, log_detXTV_invX = jnp.linalg.slogdet(XTV_invX)
     total_log = (n - p) * jnp.log(rTV_invr) + log_detV + log_detXTV_invX
@@ -54,7 +58,7 @@ def REML(
     c = (n - p) * (jnp.log(n - p) - 1 - jnp.log(2 * jnp.pi)) / 2.0
     return total_log / 2.0 - c
 
-def _testX(X:np.ndarray,n:int,) -> np.ndarray:
+def _testX(X:typing.Union[np.ndarray,None],n:int,) -> np.ndarray:
     if X is None:
         X = np.ones((n, 1))
     else:
@@ -174,10 +178,8 @@ class BLUP:
             self.result = None
             pass
         else:
-            Zstlist = [(z-self.onehot_info[num][1])/self.onehot_info[num][2] for num,z in enumerate(self.Z_list)]
-            SIGMAlist = [jnp.array(z@z.T/self.onehot_info[num][0]) for num,z in enumerate(Zstlist)]
-            SIGMAlist.append(jnp.eye(self.n))
-            theta0 = np.ones(len(SIGMAlist))
+            Zstlist = [jnp.array((z-self.onehot_info[num][1])/self.onehot_info[num][2]/np.sqrt(self.onehot_info[num][0])) for num,z in enumerate(self.Z_list)]
+            theta0 = np.ones(len(Zstlist)+1)
             gradfn = grad(REML)
 
             pbar = None
@@ -189,24 +191,26 @@ class BLUP:
                     pbar.update(1)
                     pbar.set_postfix({"theta": np.round(theta, 4)})
 
-            def jac(theta, y, X, SIGMAlist):
-                return np.asarray(gradfn(theta, y, X, SIGMAlist), dtype=float)
+            def jac(theta, y, X, Zstlist):
+                return jnp.asarray(gradfn(theta, y, X, Zstlist))
 
             result = minimize(
                 REML,
                 theta0,
-                args=(self.y, self.X, SIGMAlist),
+                args=(self.y, self.X, Zstlist),
                 jac=jac,
                 method="L-BFGS-B",
                 callback=callback,
-                options={"maxiter": self.maxiter, "disp": False},
+                options={"maxiter": self.maxiter},
             )
             theta = np.asarray(result.x, dtype=float)
             if pbar is not None:
                 pbar.close()
-
-            V = sum(theta[num]*G for num,G in enumerate(SIGMAlist))
-
+            
+            V = theta[-1]*jnp.eye(self.n)
+            for num,Z in enumerate(Zstlist):
+                V += theta[num] * Z@Z.T
+                
             VinvX = np.linalg.solve(V, self.X)
             Vinvy = np.linalg.solve(V, self.y)
             beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
@@ -222,7 +226,7 @@ class BLUP:
             u_by_Z = _split_u(u_hat, Zstlist)
 
             self.theta = theta
-            self.V = np.array([theta[ind]*np.diag(SIGMA).mean() for ind,SIGMA in enumerate(SIGMAlist)])
+            self.var = np.array([theta[ind]*np.diag(z@z.T).mean() for ind,z in enumerate(Zstlist)]+[theta[-1]])
             self.beta = beta_hat
             self.u = u_hat
             self.u_by_Z = u_by_Z
@@ -267,7 +271,7 @@ class BLUP:
         if len(self.Z_list) == 0:  # 训练集无随机协变量 进入一般线性模型
             return X @ self.beta
         else:
-            Z_list = [(z-self.onehot_info[num][1])/self.onehot_info[num][2] for num,z in enumerate(Z_list)]
+            Z_list = [(z-self.onehot_info[num][1])/self.onehot_info[num][2]/np.sqrt(self.onehot_info[num][0]) for num,z in enumerate(Z_list)]
             y_hat = X @ self.beta
             if len(Z_list) == 0:
                 return y_hat
@@ -293,11 +297,11 @@ if __name__ == "__main__":
     csample = list(set(geno.columns) & set(pheno.index))
     y = pheno.loc[csample].values.reshape(-1,1)
     Z = geno[csample].values.T
-    data = pd.read_csv('todo/blup.test2.tsv',sep='\t',).dropna().reset_index().iloc[:,1:]
+    data = pd.read_csv('/Users/jingxianfu/Public/SCR.test.tsv',sep='\t',).dropna().reset_index().iloc[:,1:]
     y = data.iloc[:,[1]].values
     Z = [pd.get_dummies(data.iloc[:,0]).astype(int).values,pd.get_dummies(data.iloc[:,2]).astype(int).values]
     model = BLUP(y, None, Z=Z, maxiter=50, progress=True)
     print(model.beta)
     print(model.u.shape)
-    print(model.V[0]/model.V.sum())
+    print(model.var[0]/model.var.sum())
     print(np.corrcoef(y.ravel(),model.predict(None,Z).ravel()))

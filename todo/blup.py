@@ -103,6 +103,11 @@ def _split_u(u: np.ndarray, Z_list: list[np.ndarray]) -> list[np.ndarray]:
         start = end
     return u_by_Z
 
+def dynamicEigh(Zlist:typing.List[np.ndarray]):
+    qdim = [z.shape[1] for z in Zlist]
+    idx2eigh = np.argmax(qdim)
+    
+    return
 
 class BLUP:
     def __init__(
@@ -179,7 +184,7 @@ class BLUP:
             pass
         else:
             Zstlist = [jnp.array((z-self.onehot_info[num][1])/self.onehot_info[num][2]/np.sqrt(self.onehot_info[num][0])) for num,z in enumerate(self.Z_list)]
-            theta0 = np.ones(len(Zstlist)+1)
+            theta0 = jnp.ones(len(Zstlist)+1)
             gradfn = grad(REML)
 
             pbar = None
@@ -207,15 +212,15 @@ class BLUP:
             if pbar is not None:
                 pbar.close()
             
-            V = theta[-1]*jnp.eye(self.n)
+            V = theta[-1]*np.eye(self.n)
             for num,Z in enumerate(Zstlist):
                 V += theta[num] * Z@Z.T
-                
-            VinvX = np.linalg.solve(V, self.X)
-            Vinvy = np.linalg.solve(V, self.y)
+            L = np.linalg.cholesky(V)
+            VinvX = cho_solve((L,True), self.X)
+            Vinvy = cho_solve((L,True), self.y)
             beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
             r = self.y - self.X @ beta_hat
-            Vinvr = np.linalg.solve(V, r)
+            Vinvr = cho_solve((L,True), r)
 
             Zall = np.concatenate(Zstlist, axis=1)
             Gall = np.concatenate(

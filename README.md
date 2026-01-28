@@ -2,34 +2,11 @@
 
 [简体中文](./doc/README_zh.md) | [English](./README.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
 
-## Overview
-
-JanusX is a high-performance, all-in-one suite for quantitative genetics that unifies genome-wide association studies (GWAS) and genomic selection (GS). It includes established GWAS methods (GLM, LMM, fastLMM, FarmCPU) and GS models (GBLUP, rrBLUP, BayesA/B/Cpi), plus routine analyses from data processing to publication-ready visualization.
+**JanusX** is a high-performance, all-in-one suite for quantitative genetics that unifies genome-wide association studies (GWAS) and genomic selection (GS). It includes established GWAS methods (GLM, LMM, fastLMM, FarmCPU) and GS models (GBLUP, rrBLUP, BayesA/B/Cpi), plus routine analyses from data processing to publication-ready visualization.
 
 It delivers strong performance gains compared with [GEMMA](https://github.com/genetics-statistics/GEMMA), [GCTA](https://yanglab.westlake.edu.cn/software/gcta), and [rMVP](https://github.com/xiaolei-lab/rMVP), especially for multi-threaded computation.
 
-## Table of Contents
-
-- [JanusX](#janusx)
-  - [Overview](#overview)
-  - [Table of Contents](#table-of-contents)
-  - [Quick Start](#quick-start)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-    - [From Source (Latest)](#from-source-latest)
-    - [PyPI (Stable)](#pypi-stable)
-    - [Pre-compiled Releases (Stable)](#pre-compiled-releases-stable)
-  - [Modules](#modules)
-  - [Input File Formats](#input-file-formats)
-    - [Phenotype File](#phenotype-file)
-    - [Genotype Files](#genotype-files)
-    - [GWAS Optional Matrices (GRM / Q / Covariate)](#gwas-optional-matrices-grm--q--covariate)
-  - [CLI Reference](#cli-reference)
-    - [GWAS (`gwas`)](#gwas-gwas)
-    - [Genomic Selection (`gs`)](#genomic-selection-gs)
-    - [postGWAS (`postGWAS`)](#postgwas-postgwas)
-    - [Simulation (`sim`)](#simulation-sim)
-  - [Citation](#citation)
+---
 
 ## Quick Start
 
@@ -68,12 +45,11 @@ jx grm -bfile data.vcf.gz
 jx pca -bfile data.vcf.gz
 ```
 
-## Requirements
-
-- Python 3.9+
-- Rust toolchain for source builds (maturin/PyO3)
+---
 
 ## Installation
+
+Build from source required Python 3.9+ and Rust toolchain.
 
 ### From Source (Latest)
 
@@ -115,7 +91,9 @@ jx -h
 We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows (build in Windows11) and Linux (build in Ubuntu20.04).
 Download and extract the archive, then run the executable directly.
 
-## Modules
+---
+
+## Modules in JanusX
 
 | Module | Description |
 | --- | --- |
@@ -125,6 +103,8 @@ Download and extract the archive, then run the executable directly.
 | `grm` | Genetic relationship matrix (GRM) |
 | `pca` | Principal component analysis |
 | `sim` | Genotype and phenotype simulation |
+
+---
 
 ## Input File Formats
 
@@ -186,6 +166,8 @@ indv3	8.6	0.92	0.04
 ```
 
 Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric only and aligned to the genotype sample order. Numbers are splited by space- or tab-delimited without row names or column headers.
+
+---
 
 ## CLI Reference
 
@@ -397,6 +379,8 @@ Generate synthetic genotype/phenotype data for workflow testing.
 ```bash
 jx sim [nsnp(k)] [nidv] [outprefix]
 ```
+
+---
 
 ## Citation
 

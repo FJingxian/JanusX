@@ -78,50 +78,49 @@ The first run may be slower while Python builds bytecode in `__pycache__`. Subse
 
 ```bash
 # Select one or more GWAS models
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm
 
 # Run multiple models at once
-jx gwas -vcf data.vcf.gz -p pheno.txt -lm -lmm -fastlmm -farmcpu -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lm -lmm -fastlmm -farmcpu
 
-# With PLINK format
-jx gwas -bfile genotypes -p phenotypes.txt -k 1 -qcov 3 -t 8 -o results
+# With PLINK format (Q&K model)
+jx gwas -bfile genotypes -p phenotypes.txt -k 2 -q 3 -lmm -o outfolder
 
 # With diagnostic plots (SVG)
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -plot -o results
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -plot -o outfolder -prefix outprefix
 
-# With precomputed GRM / Q (PC) / covariates
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -k path/to/grm.txt -q path/to/q.txt -c cov.txt -o results
+# With precomputed GRM / PC / covariates
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -k path/to/grm.txt -q path/to/q.txt -c cov.txt
 ```
 
 Notes:
+
 - GRM file: numeric N x N matrix aligned to genotype sample order.
-- Q (PC) file: numeric N x K matrix aligned to genotype sample order.
+- PC file: numeric N x K matrix aligned to genotype sample order.
 - Covariate file: numeric N x C matrix aligned to genotype sample order.
 
 ### Genomic Selection
 
 ```bash
 # Run both GS models
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -BayesA -BayesB -BayesCpi
 
 # Specific models
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -o results
-
-# Bayesian GS models
-jx gs -vcf data.vcf.gz -p pheno.txt -BayesA -BayesB -BayesCpi -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -o outfolder -prefix outprefix
 
 # With PCA-based dimensionality reduction
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -pcd -o results
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -pcd -o outfolder -prefix outprefix
 ```
 
 ### Visualization
 
 ```bash
 # Generate Manhattan and QQ plots
-jx postGWAS -f results/*.lmm.tsv --threshold 1e-6
+jx postGWAS -f results/test.lmm.tsv --threshold 1e-6
+jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 # "*" is unix-only usage.
 
 # With SNP annotation
-jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 50
+jx postGWAS -f results/test.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 50
 ```
 
 ![Manhattan and QQ plots](./fig/test0.png "Simple visualization")
@@ -132,10 +131,10 @@ Datasets used in the screenshots are in `example/` (sourced from [genetics-stati
 
 ```bash
 # Compute GRM
-jx grm --vcf data.vcf.gz -o results
+jx grm -vcf data.vcf.gz -o results
 
 # PCA analysis
-jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D -o results
+jx pca -vcf data.vcf.gz -plot -plot3D -o results
 ```
 
 ## Input File Formats
@@ -189,35 +188,118 @@ Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric on
 Unified GWAS runner supporting GLM, LMM, fastLMM (fixed lambda), and FarmCPU.
 
 ```bash
-# LM / LMM (streaming-friendly)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm -o out/
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lmm -o out/
+# LM / LMM (estimated variance parameter per snp) / fastLMM (fixed variance parameter) are streaming-friendly
+jx gwas -bfile data -p pheno.txt -lm -o out
+jx gwas -bfile data -p pheno.txt -lmm -o out
+jx gwas -bfile data -p pheno.txt -fastlmm -o out
 
-# fastLMM (fixed lambda) and FarmCPU (full-memory)
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --fastlmm -o out/
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --farmcpu -o out/
+# FarmCPU uses full-memory to load genotype matrix
+jx gwas -bfile data -p pheno.txt -farmcpu -o out
 
 # Run multiple models at once
-jx gwas --vcf data.vcf.gz --pheno pheno.txt --lm --lmm --fastlmm --farmcpu -o out/
+jx gwas -bfile data -p pheno.txt -lm -lmm -fastlmm -farmcpu -o out
 ```
-
-| Option | What it does | Default |
-| ------ | ------------ | ------- |
-| `-vcf/--vcf`, `-bfile/--bfile` | Genotype source (VCF or PLINK prefix) | required |
-| `-p/--pheno` | Phenotype file (tab-delimited) | required |
-| `-n/--ncol` | Zero-based phenotype column indices (repeatable) | all columns |
-| `-lm/--lm`, `-lmm/--lmm`, `-fastlmm/--fastlmm`, `-farmcpu/--farmcpu` | Choose GWAS model(s) | all `False` |
-| `-k/--grm` | GRM method: `1` (centered), `2` (standardized), or path to precomputed | `1` |
-| `-q/--qcov` | PC count or Q-matrix path for covariates | `0` |
-| `-c/--cov` | Covariate file (without intercept column) | `None` |
-| `-plot/--plot` | Generate Manhattan + QQ plots | `False` |
-| `-chunksize/--chunksize` | SNP block size for streaming | `100000` |
-| `-t/--thread` | CPU threads (`-1` for all cores) | `-1` |
-| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
 
 Select at least one GWAS model flag when running `gwas`.
 
-**Outputs**
+<details>
+<summary><b>Input</b></summary>
+
+- `-vcf, --vcf` / `-bfile, --bfile`  
+  Genotype source (VCF path or PLINK prefix).  
+  **Default:** required
+
+- `-p, --pheno`  
+  Phenotype file (tab-delimited).  
+  **Default:** required
+
+- `-n, --ncol`  
+  Phenotype column indices (**0-based**, repeatable).  
+  **Default:** all columns
+
+</details>
+
+<details>
+<summary><b>Models</b></summary>
+
+- `-lm, --lm`  
+  Run linear model (LM) GWAS.  
+  **Default:** `False`
+
+- `-lmm, --lmm`  
+  Run linear mixed model (LMM) GWAS.  
+  **Default:** `False`
+
+- `-fastlmm, --fastlmm`  
+  Run FaST-LMM style approximation.  
+  **Default:** `False`
+
+- `-farmcpu, --farmcpu`  
+  Run FarmCPU.  
+  **Default:** `False`
+
+</details>
+
+<details>
+<summary><b>Relatedness &amp; Covariates</b></summary>
+
+- `-k, --grm`  
+  GRM setting: `1` = centered, `2` = standardized, or a path to a precomputed GRM.  
+  **Default:** `1`
+
+- `-q, --qcov`  
+  Population covariates: PC count or Q-matrix path.  
+  **Default:** `0`
+
+- `-c, --cov`  
+  Covariate file (**without intercept column**).  
+  **Default:** `None`
+
+</details>
+
+<details>
+<summary><b>Variant QC</b></summary>
+
+- `-maf, --maf`  
+  Exclude variants with MAF &lt; threshold.  
+  **Default:** `0.02`
+
+- `-geno, --geno`  
+  Exclude variants with missing rate &gt; threshold.  
+  **Default:** `0.05`
+
+</details>
+
+<details>
+<summary><b>Output &amp; Performance</b></summary>
+
+- `-plot, --plot`  
+  Generate Manhattan + QQ plots.  
+  **Default:** `False`
+
+- `-chunksize, --chunksize`  
+  SNP block size for streaming.  
+  **Default:** `100000`
+
+- `-mmap-limit, --mmap-limit`  
+  Enable windowed mmap for BED inputs (benchmark only).  
+  **Default:** `False`
+
+- `-t, --thread`  
+  CPU threads (`-1` = all cores).  
+  **Default:** `-1`
+
+- `-o, --out`  
+  Output directory.  
+  **Default:** `"."`
+
+- `-prefix, --prefix`  
+  Output prefix (auto-generated if omitted).  
+  **Default:** auto
+
+</details>
+
+**Outputs**：
 
 | File | Description |
 | ---- | ----------- |

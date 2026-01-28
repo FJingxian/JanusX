@@ -1,6 +1,6 @@
 # JanusX
 
-[简体中文(推荐)](./doc/README_zh.md) | [English](./README.md)
+[简体中文](./doc/README_zh.md) | [English](./README.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
 
 ## Overview
 
@@ -10,20 +10,63 @@ It delivers strong performance gains compared with [GEMMA](https://github.com/ge
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Running the CLI](#running-the-cli)
-- [Modules](#modules)
-- [Quick Start](#quick-start)
-- [Input File Formats](#input-file-formats)
-- [CLI Reference](#cli-reference)
-- [FAQ](#faq)
-- [Architecture](#architecture)
-- [Key Features](#key-features)
-- [Key Algorithms](#key-algorithms)
-- [Example Data](#example-data)
-- [Citation](#citation)
+- [JanusX](#janusx)
+  - [Overview](#overview)
+  - [Table of Contents](#table-of-contents)
+  - [Quick Start](#quick-start)
+  - [Requirements](#requirements)
+  - [Installation](#installation)
+    - [From Source (Latest)](#from-source-latest)
+    - [PyPI (Stable)](#pypi-stable)
+    - [Pre-compiled Releases (Stable)](#pre-compiled-releases-stable)
+  - [Modules](#modules)
+  - [Input File Formats](#input-file-formats)
+    - [Phenotype File](#phenotype-file)
+    - [Genotype Files](#genotype-files)
+    - [GWAS Optional Matrices (GRM / Q / Covariate)](#gwas-optional-matrices-grm--q--covariate)
+  - [CLI Reference](#cli-reference)
+    - [GWAS (`gwas`)](#gwas-gwas)
+    - [Genomic Selection (`gs`)](#genomic-selection-gs)
+    - [postGWAS (`postGWAS`)](#postgwas-postgwas)
+    - [Simulation (`sim`)](#simulation-sim)
+  - [Citation](#citation)
+
+## Quick Start
+
+**GWAS Analysis**:
+
+```bash
+jx gwas -bfile data -p pheno.txt -lmm
+jx gwas -vcf data.vcf.gz -p pheno.txt -lmm
+```
+
+**Genomic Selection**:
+
+```bash
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP
+```
+
+**postGWAS**:
+
+```bash
+# Generate Manhattan and QQ plots
+jx postGWAS -f result.lmm.tsv
+# With SNP annotation
+jx postGWAS -f results/test.lmm.tsv -a annotation.gff -ab 30
+```
+
+![Manhattan and QQ plots](./fig/test0.png "Simple visualization")
+
+Datasets used in the screenshots are in `example/` (sourced from [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA)).
+
+**Population Structure**:
+
+```bash
+# Compute GRM
+jx grm -bfile data.vcf.gz
+# PCA
+jx pca -bfile data.vcf.gz
+```
 
 ## Requirements
 
@@ -34,32 +77,43 @@ It delivers strong performance gains compared with [GEMMA](https://github.com/ge
 
 ### From Source (Latest)
 
+Use Python to build
+
 ```bash
 git clone https://github.com/FJingxian/JanusX.git
 cd JanusX
+# build
 pip install .
+# test
+jx -h
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -o test -lm -lmm -fastlmm -farmcpu -n 0 -plot
+jx postGWAS -f test/mouse_hs1940.test0.lmm.tsv -threshold 1e-6 -format pdf -o test
+```
+
+Use docker to build
+
+```bash
+git clone https://github.com/FJingxian/JanusX.git
+cd JanusX
+# build
+docker build -t janusx:latest .
+# test
+docker run -v .:/mnt --rm janusx:latest -h
+docker run -v .:/mnt --rm janusx:latest gwas -vcf /mnt/example/mouse_hs1940.vcf.gz -p /mnt/example/mouse_hs1940.pheno -o /mnt/test -lm -lmm -fastlmm -farmcpu -n 0 -plot
+docker run -v .:/mnt --rm janusx:latest postGWAS -f /mnt/test/*.lmm.tsv -threshold 1e-6 -format pdf -o /mnt/test
 ```
 
 ### PyPI (Stable)
 
 ```bash
 pip install janusx
+jx -h
 ```
 
 ### Pre-compiled Releases (Stable)
 
-We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows and Linux.
+We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows (build in Windows11) and Linux (build in Ubuntu20.04).
 Download and extract the archive, then run the executable directly.
-
-## Running the CLI
-
-```bash
-jx -h
-jx <module> -h
-jx <module> [options]
-```
-
-The first run may be slower while Python builds bytecode in `__pycache__`. Subsequent runs load the cached bytecode and start faster.
 
 ## Modules
 
@@ -72,114 +126,66 @@ The first run may be slower while Python builds bytecode in `__pycache__`. Subse
 | `pca` | Principal component analysis |
 | `sim` | Genotype and phenotype simulation |
 
-## Quick Start
-
-### GWAS Analysis
-
-```bash
-# Select one or more GWAS models
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm
-
-# Run multiple models at once
-jx gwas -vcf data.vcf.gz -p pheno.txt -lm -lmm -fastlmm -farmcpu
-
-# With PLINK format (Q&K model)
-jx gwas -bfile genotypes -p phenotypes.txt -k 2 -q 3 -lmm -o outfolder
-
-# With diagnostic plots (SVG)
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -plot -o outfolder -prefix outprefix
-
-# With precomputed GRM / PC / covariates
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm -k path/to/grm.txt -q path/to/q.txt -c cov.txt
-```
-
-Notes:
-
-- GRM file: numeric N x N matrix aligned to genotype sample order.
-- PC file: numeric N x K matrix aligned to genotype sample order.
-- Covariate file: numeric N x C matrix aligned to genotype sample order.
-
-### Genomic Selection
-
-```bash
-# Run both GS models
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -BayesA -BayesB -BayesCpi
-
-# Specific models
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -o outfolder -prefix outprefix
-
-# With PCA-based dimensionality reduction
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -pcd -o outfolder -prefix outprefix
-```
-
-### Visualization
-
-```bash
-# Generate Manhattan and QQ plots
-jx postGWAS -f results/test.lmm.tsv --threshold 1e-6
-jx postGWAS -f results/*.lmm.tsv --threshold 1e-6 # "*" is unix-only usage.
-
-# With SNP annotation
-jx postGWAS -f results/test.lmm.tsv --threshold 1e-6 -a annotation.gff --annobroaden 50
-```
-
-![Manhattan and QQ plots](./fig/test0.png "Simple visualization")
-
-Datasets used in the screenshots are in `example/` (sourced from [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA)).
-
-### Population Structure
-
-```bash
-# Compute GRM
-jx grm -vcf data.vcf.gz -o results
-
-# PCA analysis
-jx pca -vcf data.vcf.gz -plot -plot3D -o results
-```
-
 ## Input File Formats
 
 ### Phenotype File
 
 Tab-delimited. First column is sample ID; remaining columns are phenotypes.
 
-| samples | trait1 | trait2 |
-|---------|--------|--------|
-| indv1   | 10.5   | 0.85   |
-| indv2   | 12.3   | 0.92   |
+```text
+samples	trait1	trait2	trait3
+indv1	10.5	0.85	0.05
+indv2	12.3	1.00	0.08
+indv3	8.6	0.92	0.04
+```
 
 ### Genotype Files
 
 - **VCF**: `.vcf` or `.vcf.gz`
-- **PLINK**: `.bed`/`.bim`/`.fam` (use file prefix)
+
+```text
+##fileformat=VCFv4.2
+##fileDate=20251201
+##source=JanusXv1.0.10
+##contig=<ID=1,length=2>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	A	B	C	D	E	F
+1	1	10000235	A	C	.	.	PR	GT	0/1	0/0	0/0	0/0	0/0	0/1
+1	1	10000345	A	G	.	.	PR	GT	0/0	0/0	0/0	0/0	1/1	1/1
+1	1	10004575	G	.	.	.	PR	GT	0/0	0/0	0/0	0/0	0/0	0/0
+1	1	10006974	C	T	.	.	PR	GT	0/0	0/0	0/1	1/1	0/1	1/1
+1	1	10006986	A	G	.	.	PR	GT	0/0	0/0	0/1	./.	1/1	1/1
+```
+
+- **PLINK**: `.bed`/`.bim`/`.fam` (use file prefix, details see http://zzz.bwh.harvard.edu/plink/data.shtml#bed)
 
 ### GWAS Optional Matrices (GRM / Q / Covariate)
 
-GRM (kinship) example (Idv in rows and columns should be aligned to genotype matirx):
+- **GRM**: A or G matrix (Kinship between individuals).
 
 ```text
-1.00   0.12   0.05
-0.12   1.00   0.08
-0.05   0.08   1.00
+1.00	0.12	0.05
+0.12	1.00	0.08
+0.05	0.08	1.00
 ```
 
-Q (PC) example (Idv in rows should be aligned to genotype matirx):
+- **Q**: Q matrix generated from admixture or principal components.
 
 ```text
-0.12   -0.03
--0.05  0.08
-0.02   -0.01
+0.12	-0.03
+-0.05	0.08
+0.02	-0.01
 ```
 
-Covariate example (Idv in rows should be aligned to genotype matirx):
+- **Covariate**: Sex, environments or date.
 
 ```text
-0    1
-1    1
-0    2
+0	1
+1	1
+0	2
 ```
 
-Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric only and aligned to the genotype sample order. Numbers are splited by space or `\t`.
+Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric only and aligned to the genotype sample order. Numbers are splited by space- or tab-delimited without row names or column headers.
 
 ## CLI Reference
 
@@ -200,106 +206,60 @@ jx gwas -bfile data -p pheno.txt -farmcpu -o out
 jx gwas -bfile data -p pheno.txt -lm -lmm -fastlmm -farmcpu -o out
 ```
 
-Select at least one GWAS model flag when running `gwas`.
+Note: Select at least one GWAS model flag when running `gwas`.
 
-<details>
-<summary><b>Input</b></summary>
+**Input**:
 
-- `-vcf, --vcf` / `-bfile, --bfile`  
-  Genotype source (VCF path or PLINK prefix).  
-  **Default:** required
+- `-vcf, --vcf` / `-bfile, --bfile` — Genotype source (VCF path or PLINK prefix).  
+  Default: required
+- `-p, --pheno` — Phenotype file (tab-delimited).  
+  Default: required
+- `-n, --ncol` — Phenotype column indices (0-based, repeatable).  
+  Default: all columns
 
-- `-p, --pheno`  
-  Phenotype file (tab-delimited).  
-  **Default:** required
+**Models**:
 
-- `-n, --ncol`  
-  Phenotype column indices (**0-based**, repeatable).  
-  **Default:** all columns
+- `-lm, --lm` — Run linear model (LM) GWAS.  
+  Default: `False`
+- `-lmm, --lmm` — Run linear mixed model (LMM) GWAS.  
+  Default: `False`
+- `-fastlmm, --fastlmm` — Run FaST-LMM style approximation.  
+  Default: `False`
+- `-farmcpu, --farmcpu` — Run FarmCPU.  
+  Default: `False`
 
-</details>
+**Relatedness &amp; Covariates**:
 
-<details>
-<summary><b>Models</b></summary>
+- `-k, --grm` — GRM setting: `1` = centered, `2` = standardized, or path to precomputed GRM.  
+  Default: `1`
+- `-q, --qcov` — Population covariates: PC count or Q-matrix path.  
+  Default: `0`
+- `-c, --cov` — Covariate file (without intercept column).  
+  Default: `None`
 
-- `-lm, --lm`  
-  Run linear model (LM) GWAS.  
-  **Default:** `False`
+**Variant QC**:
 
-- `-lmm, --lmm`  
-  Run linear mixed model (LMM) GWAS.  
-  **Default:** `False`
+- `-maf, --maf` — Exclude variants with MAF &lt; threshold.  
+  Default: `0.02`
+- `-geno, --geno` — Exclude variants with missing rate &gt; threshold.  
+  Default: `0.05`
 
-- `-fastlmm, --fastlmm`  
-  Run FaST-LMM style approximation.  
-  **Default:** `False`
+**Output &amp; Performance**:
 
-- `-farmcpu, --farmcpu`  
-  Run FarmCPU.  
-  **Default:** `False`
+- `-plot, --plot` — Generate Manhattan + QQ plots.  
+  Default: `False`
+- `-chunksize, --chunksize` — SNP block size for streaming.  
+  Default: `100000`
+- `-mmap-limit, --mmap-limit` — Enable windowed mmap for BED inputs (benchmark only).  
+  Default: `False`
+- `-t, --thread` — CPU threads (`-1` = all cores).  
+  Default: `-1`
+- `-o, --out` — Output directory.  
+  Default: `"."`
+- `-prefix, --prefix` — Output prefix (auto-generated if omitted).  
+  Default: auto
 
-</details>
-
-<details>
-<summary><b>Relatedness &amp; Covariates</b></summary>
-
-- `-k, --grm`  
-  GRM setting: `1` = centered, `2` = standardized, or a path to a precomputed GRM.  
-  **Default:** `1`
-
-- `-q, --qcov`  
-  Population covariates: PC count or Q-matrix path.  
-  **Default:** `0`
-
-- `-c, --cov`  
-  Covariate file (**without intercept column**).  
-  **Default:** `None`
-
-</details>
-
-<details>
-<summary><b>Variant QC</b></summary>
-
-- `-maf, --maf`  
-  Exclude variants with MAF &lt; threshold.  
-  **Default:** `0.02`
-
-- `-geno, --geno`  
-  Exclude variants with missing rate &gt; threshold.  
-  **Default:** `0.05`
-
-</details>
-
-<details>
-<summary><b>Output &amp; Performance</b></summary>
-
-- `-plot, --plot`  
-  Generate Manhattan + QQ plots.  
-  **Default:** `False`
-
-- `-chunksize, --chunksize`  
-  SNP block size for streaming.  
-  **Default:** `100000`
-
-- `-mmap-limit, --mmap-limit`  
-  Enable windowed mmap for BED inputs (benchmark only).  
-  **Default:** `False`
-
-- `-t, --thread`  
-  CPU threads (`-1` = all cores).  
-  **Default:** `-1`
-
-- `-o, --out`  
-  Output directory.  
-  **Default:** `"."`
-
-- `-prefix, --prefix`  
-  Output prefix (auto-generated if omitted).  
-  **Default:** auto
-
-</details>
-
-**Outputs**：
+**Output files**:
 
 | File | Description |
 | ---- | ----------- |
@@ -315,96 +275,51 @@ Run genomic prediction with linear and Bayesian models (GBLUP, rrBLUP, BayesA/B/
 
 ```bash
 # Run selected models
-jx gs --vcf data.vcf.gz --pheno pheno.txt --GBLUP --rrBLUP -o out/
-jx gs --vcf data.vcf.gz --pheno pheno.txt --BayesA --BayesB --BayesCpi -o out/
+jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -o out
+jx gs -vcf data.vcf.gz -p pheno.txt -BayesA -BayesB -BayesCpi -o out
 
-# Choose phenotype column and enable PCA-based dimensionality reduction and plotting
-jx gs --vcf data.vcf.gz --pheno pheno.txt --n 0 --GBLUP --pcd --plot -o out/
+# Choose phenotype column and enable PCA-based dimensionality reduction and plotting with 5-fold cross-validazation.
+jx gs -vcf data.vcf.gz -pheno pheno.txt -n 0 -GBLUP -pcd -plot -o out -cv 5
 ```
 
-| Option | What it does | Default |
-| ------ | ------------ | ------- |
-| `-vcf/--vcf`, `-bfile/--bfile` | Genotype source (VCF or PLINK prefix) | required (exclusive group) |
-| `-p/--pheno` | Phenotype file | required |
-| `-GBLUP/--GBLUP`, `-rrBLUP/--rrBLUP`, `-BayesA/--BayesA`, `-BayesB/--BayesB`, `-BayesCpi/--BayesCpi` | Models to run | all `False` |
-| `-pcd/--pcd` | Enable PCA-based dimensionality reduction | `False` |
-| `-n/--ncol` | Zero-based phenotype column index | all columns |
-| `-plot/--plot` | Scatter plots for predicted vs. observed | `False` |
-| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
+**Input**:
 
-**Outputs**
+- `-vcf, --vcf` / `-bfile, --bfile` — Genotype source (VCF path or PLINK prefix).  
+  Default: required
+- `-p, --pheno` — Phenotype file (tab-delimited).  
+  Default: required
+- `-n, --ncol` — Phenotype column indices (0-based, repeatable).  
+  Default: all columns
+
+**Models**:
+
+- `-GBLUP/--GBLUP`, `-rrBLUP/--rrBLUP`, `-BayesA/--BayesA`, `-BayesB/--BayesB`, `-BayesCpi/--BayesCpi` — Models to run.  
+  Default: all `False`
+
+**Variant QC**:
+
+- `-maf, --maf` — Exclude variants with MAF &lt; threshold.  
+  Default: `0.02`
+- `-geno, --geno` — Exclude variants with missing rate &gt; threshold.  
+  Default: `0.05`
+
+**Output &amp; Performance**:
+
+- `-cv/--cv` — Enable K fold of cross-validazation for models.  
+  Default: `None`
+- `-pcd/--pcd` — Enable PCA-based dimensionality reduction.  
+  Default: `False`
+- `-plot/--plot` — Scatter plots for predicted vs. observed.  
+  Default: `False`
+- `-o/--out`, `-prefix/--prefix` — Output directory/prefix.  
+  Default: `"."` / auto
+
+**Outputs**:
 
 | File | Description |
 | ---- | ----------- |
 | `{prefix}.{trait}.gs.tsv` | GEBV predictions per model |
 | `{prefix}.{trait}.gs.{model}.svg` | Prediction scatter plots (if `--plot`) |
-
-### Genetic Relationship Matrix (`grm`)
-
-Compute kinship matrices for LMM/GBLUP using centered (VanRaden) or standardized (Yang) formulas.
-
-```bash
-jx grm --vcf data.vcf.gz -o out/          # centered GRM
-jx grm --vcf data.vcf.gz --method 2 -o out/  # standardized GRM
-jx grm --vcf data.vcf.gz --npz -o out/       # compressed NPZ output
-```
-
-| Option | What it does | Default |
-| ------ | ------------ | ------- |
-| `-vcf/--vcf`, `-bfile/--bfile` | Genotype source | required (exclusive group) |
-| `-m/--method` | `1` centered, `2` standardized | `1` |
-| `-npz/--npz` | Save compressed NPZ matrix | `False` |
-| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
-
-**Outputs**
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.grm.id` | Sample IDs |
-| `{prefix}.grm.txt` | GRM matrix (text) |
-| `{prefix}.grm.npz` | GRM matrix (compressed, if enabled) |
-
-### PCA (`pca`)
-
-Principal component analysis for population structure, with 2D/3D visualization and grouping.
-
-```bash
-# From genotype or precomputed GRM/PCA
-jx pca --vcf data.vcf.gz -o out/
-jx pca --grm prefix -o out/
-jx pca --pcfile prefix --plot --plot3D -o out/
-
-# Control dimensions and grouping
-jx pca --vcf data.vcf.gz --dim 5 --plot --plot3D --group groups.txt -o out/
-```
-
-| Option | What it does | Default |
-| ------ | ------------ | ------- |
-| `-vcf/--vcf`, `-bfile/--bfile`, `-grm/--grm`, `-pcfile/--pcfile` | Input source (exclusive) | required |
-| `-dim/--dim` | Number of PCs to output | `3` |
-| `-plot/--plot`, `-plot3D/--plot3D` | 2D scatter; 3D rotating GIF | `False` |
-| `-group/--group` | Group file (`ID\tGroup\tLabel?`) | `None` |
-| `-color/--color` | Color palette index (0-6) | `1` |
-| `-o/--out`, `-prefix/--prefix` | Output directory/prefix | `"."` / auto |
-
-Group file format:
-
-```text
-ID      Group   Label (optional)
-indv1   PopA    Sample1
-indv2   PopA    Sample2
-indv3   PopB    Sample3
-```
-
-**Outputs**
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.eigenvec` | PC coordinates (samples × dims) |
-| `{prefix}.eigenvec.id` | Sample IDs |
-| `{prefix}.eigenval` | Eigenvalues |
-| `{prefix}.eigenvec.2D.pdf` | 2D scatter (if `--plot`) |
-| `{prefix}.eigenvec.3D.gif` | 3D rotating GIF (if `--plot3D`) |
 
 ### postGWAS (`postGWAS`)
 
@@ -412,28 +327,45 @@ Visualization and annotation of GWAS results (Manhattan, QQ, optional SNP annota
 
 ```bash
 # Basic plotting
-jx postGWAS -f result.assoc.tsv
+jx postGWAS -f result.lmm.tsv
 
 # Custom column names and threshold
-jx postGWAS -f result.tsv -chr "chr" -pos "pos" -pvalue "P_wald" --threshold 1e-6
+jx postGWAS -f result.tsv -chr "chr" -pos "ps" -pvalue "p_wald" -threshold 1e-6
 
 # Highlight regions and annotate significant SNPs
-jx postGWAS -f result.tsv --highlight snps.bed --anno annotation.gff --annobroaden 100
+jx postGWAS -f result.tsv -hl snps.bed -a annotation.gff -ab 100
 ```
 
-| Option | What it does | Default |
-| ------ | ------------ | ------- |
-| `-f/--file` | GWAS result files (supports glob) | required |
-| `-chr/--chr`, `-pos/--pos`, `-pvalue/--pvalue` | Column names | `"#CHROM"`, `"POS"`, `"p"` |
-| `-threshold/--threshold` | Significance cutoff | `0.05 / SNPs` |
-| `-noplot/--noplot` | Disable plots (annotation only) | `False` |
-| `-color/--color` | Color scheme (0-6) | `0` |
-| `-hl/--highlight` | BED file for highlighted regions | `None` |
-| `-format/--format` | Image format `pdf/png/svg/tif` | `"png"` |
-| `-a/--anno` | Annotation file (GFF/GTF/BED) | `None` |
-| `-ab/--annobroaden` | Annotation window (kb) | `None` |
-| `-descItem/--descItem` | GFF description key | `"description"` |
-| `-o/--out`, `-prefix/--prefix`, `-t/--thread` | Output dir/prefix; threads (`-1` all cores) | `"."` / `"JanusX"` / `-1` |
+**Input**:
+
+- `-f/--file` — GWAS result files (supports glob).  
+  Default: required
+
+**Name of columns**:
+
+- `-chr/--chr`, `-pos/--pos`, `-pvalue/--pvalue` — Column names.  
+  Default: `"chrom"`, `"pos"`, `"pwald"`
+
+**Other parameters**:
+
+- `-threshold/--threshold` — Significance cutoff.  
+  Default: `0.05 / SNPs`
+- `-noplot/--noplot` — Disable plots (annotation only).  
+  Default: `False`
+- `-color/--color` — Color scheme (0-6).  
+  Default: `0`
+- `-hl/--highlight` — BED file for highlighted regions.  
+  Default: `None`
+- `-format/--format` — Image format `pdf/png/svg/tif`.  
+  Default: `"png"`
+- `-a/--anno` — Annotation file (GFF/GTF/BED).  
+  Default: `None`
+- `-ab/--annobroaden` — Annotation window (kb).  
+  Default: `None`
+- `-descItem/--descItem` — GFF description key.  
+  Default: `"description"`
+- `-o/--out`, `-prefix/--prefix`, `-t/--thread` — Output dir/prefix; threads (`-1` all cores).  
+  Default: `"."` / `"JanusX"` / `-1`
 
 Highlight file format:
 
@@ -450,7 +382,7 @@ chr1    .       gene    1000000 2000000 .   +   .   ID=gene1;description=Example
 chr1    .       mRNA    1000000 2000000 .   +   .   ID=mRNA1;Parent=gene1
 ```
 
-**Outputs**
+**Outputs**:
 
 | File | Description |
 | ---- | ----------- |
@@ -463,103 +395,8 @@ chr1    .       mRNA    1000000 2000000 .   +   .   ID=mRNA1;Parent=gene1
 Generate synthetic genotype/phenotype data for workflow testing.
 
 ```bash
-# 100k SNPs, 500 individuals
-jx sim 100 500 output_prefix
-
-# 500k SNPs, 1000 individuals
-jx sim 500 1000 mydata
+jx sim [nsnp(k)] [nidv] [outprefix]
 ```
-
-| Argument | Description |
-| -------- | ----------- |
-| `nsnp(k)` | SNP count in thousands |
-| `nind` | Number of individuals |
-| `outprefix` | Output prefix |
-
-**Outputs**
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.vcf.gz` | Simulated genotypes |
-| `{prefix}.pheno` | Full phenotype file |
-| `{prefix}.pheno.txt` | Simplified phenotype (GS-friendly) |
-
-## FAQ
-
-- **Which GWAS model to pick?** Large, structure-free cohorts -> GLM; population structure/kinship -> LMM; need speed with acceptable approximation -> fastLMM; balance power/false positives with full genotype in memory -> FarmCPU.
-- **Memory pressure?** Prefer GLM/LMM (streaming), lower `--chunksize`, avoid FarmCPU unless full genotypes fit in memory.
-- **Intermediate caching** (auto-reused across runs): `{prefix}.k.{method}.npy` (GRM), `{prefix}.q.{dim}.txt` (PCA), `{prefix}.grm.bin` (binary GRM).
-- **Empty outputs?** Verify genotype/phenotype sample IDs align, check phenotype columns for missing values, try `--thread 1` for debugging, inspect log files.
-- **Covariates format** (no header, one row per sample, no intercept column):
-  ```text
-  0.1    -0.2     25
-  0.3     0.1     30
-  ```
-- **Reading QQ plots**: points along diagonal -> OK; upper-right inflation -> significant hits; overall deviation -> likely population structure or technical confounding.
-
-## Architecture
-
-### Core Libraries
-
-- `python/janusx/pyBLUP` - Core statistical engine
-  - GWAS implementations (GLM, LMM, FarmCPU)
-  - K/Q matrix calculation with memory-optimized chunking
-  - PCA computation with randomized SVD
-  - Cross-validation utilities
-
-- `python/janusx/gfreader` - Genotype file I/O
-  - VCF reader
-  - PLINK binary reader (.bed/.bim/.fam)
-  - NumPy format support
-
-- `python/janusx/bioplotkit` - Visualization
-  - Manhattan and QQ plots
-  - PCA visualization (2D and 3D GIF)
-  - LD block visualization
-
-### Native Core (`src/`)
-
-Rust kernels for fast linear algebra and association testing.
-
-### CLI Entry Points (`python/janusx/script/`)
-
-Each module corresponds to a CLI command. The launcher script (`jx`) dispatches to `script/<name>.py`.
-
-## Key Features
-
-- **Two Core Functions**: Unified GWAS and GS workflows in one tool
-- **Easy to Use**: Simple CLI interface, minimal configuration required
-- **High Performance**: Optimized LMM computation with multi-threading
-
-## Key Algorithms
-
-### GWAS Methods
-
-| Method | Description | Best For |
-| --- | --- | --- |
-| **Linear Model (GLM)** | Standard linear model for association testing | Large datasets without population structure |
-| **Linear Mixed Model (LMM)** | Incorporates kinship matrix to control population structure | Most GWAS scenarios |
-| **fastLMM** | Fixed-lambda mixed model for speed | Fast approximate screening |
-| **FarmCPU** | Iterative fixed/random effect alternation | High power with strict false positive control |
-
-### GS Methods
-
-| Method | Description | Best For |
-| --- | --- | --- |
-| **GBLUP** | Genomic Best Linear Unbiased Prediction | Baseline prediction |
-| **rrBLUP** | Ridge Regression BLUP | Additive genetic value estimation |
-| **BayesA** | Marker effects with scaled-t prior | Polygenic traits with heavier tails |
-| **BayesB** | Variable selection with marker-specific variance | Sparse genetic architecture |
-| **BayesCpi** | Variable selection with shared variance | Sparse architecture with shared variance |
-
-### Kinship Methods
-
-- **Method 1 (VanRaden)**: Centered GRM (default)
-- **Method 2 (Yang)**: Standardized/weighted GRM
-
-## Example Data
-
-Sample datasets live in `example/` (sourced from [GEMMA](https://github.com/genetics-statistics/GEMMA.git)). Additional fixtures and example outputs are in `test/`.
 
 ## Citation
 

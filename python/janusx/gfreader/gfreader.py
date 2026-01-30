@@ -163,12 +163,12 @@ def load_genotype_chunks(
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
 
-    Selection (PLINK only)
-    ----------------------
-    - snp_range: (start, end) 0-based, end exclusive
-    - snp_indices: list of 0-based SNP indices
-    - bim_range: (chrom, start_pos, end_pos), inclusive on positions
-    - sample_ids: list of IID strings from .fam
+    Selection
+    ---------
+    - snp_range: (start, end) 0-based, end exclusive (PLINK only)
+    - snp_indices: list of 0-based SNP indices (PLINK only)
+    - bim_range: (chrom, start_pos, end_pos), inclusive on positions (PLINK only)
+    - sample_ids: list of sample IDs (PLINK .fam IID or VCF #CHROM header)
     - sample_indices: list of 0-based sample indices
     - mmap_window_mb: window size (MB) for BED mmap; not supported for VCF
 
@@ -183,13 +183,15 @@ def load_genotype_chunks(
     if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
         if mmap_window_mb is not None:
             raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
-        if any(v is not None for v in (snp_range, snp_indices, bim_range, sample_ids, sample_indices)):
-            raise ValueError("SNP/sample selection is only supported for PLINK BED/BIM/FAM inputs.")
+        if any(v is not None for v in (snp_range, snp_indices, bim_range)):
+            raise ValueError("SNP selection is only supported for PLINK BED/BIM/FAM inputs.")
         reader = VcfChunkReader(
             path_or_prefix,
             float(maf),
             float(missing_rate),
             bool(impute),
+            sample_ids,
+            sample_indices,
         )
     else:
         # Otherwise treat it as PLINK BED prefix

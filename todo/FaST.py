@@ -1,10 +1,22 @@
 from typing import Any, Union
+from joblib import Parallel,delayed
 from numpy.typing import NDArray
 import numpy as np
 import scipy.linalg as la
+from scipy.stats import norm
 from scipy.optimize import minimize_scalar
 
 ArrayorNone = Union[NDArray[np.floating],None]
+
+def GRM(Mchunk:NDArray[np.floating],ridge: float=1e-6):
+    '''
+    GRM calculation
+    
+    :param Mchunk: (mchunk,n)
+    :type Mchunk: NDArray[np.floating]
+    '''
+    z:np.ndarray = (Mchunk-Mchunk.mean(axis=1,keepdims=True))/(Mchunk.std(axis=1,keepdims=True)+ridge)
+    return z.T@z/z.shape[0]
 
 def FaSTlogREML(
     loglbd: float,
@@ -52,7 +64,6 @@ def FaSTlogREML(
 
     XTV_invX = (U1tx.T * v1_inv) @ U1tx + v2_inv * (U2tx.T @ U2tx)
     XTV_invy = (U1tx.T * v1_inv) @ U1ty + v2_inv * (U2tx.T @ U2ty)
-
     beta = np.linalg.solve(XTV_invX, XTV_invy)
     r1: np.ndarray = U1ty - U1tx @ beta
     r2: np.ndarray = U2ty - U2tx @ beta
@@ -119,7 +130,7 @@ class LMM:
     def __init__(self,y:NDArray[np.float32],
                  X:ArrayorNone=None,
                  grm:ArrayorNone=None,
-                 Miter:ArrayorNone=None,
+                 Miter:Any=None,
                  M:ArrayorNone=None,
                  u:ArrayorNone=None,s:Any=None,
                  ridge:float=1e-8) -> None:
@@ -202,23 +213,46 @@ class LMM:
             X = np.ones(shape=(n,1),dtype='float32')
         self.result:Any
         if grm is not None or Miter is not None: # Full matrice for LMM: pre-computed GRM or Miter to build GRM
-            self.ss:NDArray;self.u:NDArray
-            ss, self.u = la.eigh(grm, overwrite_a=True, check_finite=False)
-            self.ss = np.maximum(ss, 0.0)
-            self.uty = self.u.T@y
-            self.utx = self.u.T@X
-            self.result = minimize_scalar(lambda loglbd: logREML(loglbd,
-                                                            None,
-                                                            self.uty,self.utx,
-                                                            self.ss),
-                                    bounds=(-6,6),method='bounded') # minimize -logREML
-            lbd = np.power(10,self.result.x)
-            vinv = 1/(self.ss+lbd)
-            XTVinvX = (self.utx.T * vinv) @ self.utx
-            XTVinvy = (self.utx.T * vinv) @ self.uty
-            self.beta = np.linalg.solve(XTVinvX, XTVinvy)
-            self.g = self.ss * vinv * self.u @ (self.uty-self.utx@self.beta)
+            self.FaST:bool = False
+            if grm is not None:
+                self.ss:NDArray;self.u:NDArray
+                ss, self.u = la.eigh(grm, overwrite_a=True, check_finite=False)
+                self.ss = np.maximum(ss, 0.0)
+                self.uty = self.u.T@y
+                self.utx = self.u.T@X
+                self.result = minimize_scalar(lambda loglbd: logREML(loglbd,
+                                                                None,
+                                                                self.uty,self.utx,
+                                                                self.ss),
+                                        bounds=(-6,6),method='bounded') # minimize -logREML
+                lbd = np.power(10,self.result.x)
+                vinv = 1/(self.ss+lbd)
+                XTVinvX = (self.utx.T * vinv) @ self.utx
+                XTVinvy = (self.utx.T * vinv) @ self.uty
+                self.beta = np.linalg.solve(XTVinvX, XTVinvy)
+                self.g = self.ss * vinv * self.u @ (self.uty-self.utx@self.beta)
+            elif Miter is not None:
+                grm = np.zeros(shape=(n,n),dtype='float32')
+                for chunk,site in Miter:
+                    grm = grm + GRM(chunk)
+                self.ss:NDArray;self.u:NDArray
+                ss, self.u = la.eigh(grm, overwrite_a=True, check_finite=False)
+                self.ss = np.maximum(ss, 0.0)
+                self.uty = self.u.T@y
+                self.utx = self.u.T@X
+                self.result = minimize_scalar(lambda loglbd: logREML(loglbd,
+                                                                None,
+                                                                self.uty,self.utx,
+                                                                self.ss),
+                                        bounds=(-6,6),method='bounded') # minimize -logREML
+                lbd = np.power(10,self.result.x)
+                vinv = 1/(self.ss+lbd)
+                XTVinvX = (self.utx.T * vinv) @ self.utx
+                XTVinvy = (self.utx.T * vinv) @ self.uty
+                self.beta = np.linalg.solve(XTVinvX, XTVinvy)
+                self.g = self.ss * vinv * self.u @ (self.uty-self.utx@self.beta)
         else:
+            self.FaST:bool = True
             if M is not None: # FaST for LMM
                 self.ss:NDArray;self.u:NDArray
                 try:
@@ -256,40 +290,90 @@ class LMM:
             XTVinvy = (self.utx.T * v1inv) @ self.uty + v2inv * (self.u2tx.T @ self.u2ty)
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
             self.g = self.ss * v1inv * self.u @ (self.uty-self.utx@self.beta)
-        varg = self.ss*self.u@self.u/n
+        varg = np.diag(self.ss*self.u@self.u).sum()/n
         vare = lbd
         self.pve = varg/(varg+vare)
     def gwas(self,SNPiter):
+        def _FaSTprocess(u1tsnp,u2tsnp):
+            result = minimize_scalar(lambda loglbd: FaSTlogREML(loglbd,
+                                                                u1tsnp,u2tsnp,
+                                                                self.uty,self.u2ty,self.utx,self.u2tx,
+                                                                self.ss),
+                                          bounds=(-8,8),method='bounded') # minimize -logREML
+            lbd = np.power(10,result.x)
+            v1inv = 1/(self.ss+lbd)
+            v2inv = 1/lbd
+            utx = np.column_stack([self.utx,u1tsnp])
+            u2tx = np.column_stack([self.u2tx,u2tsnp])
+            XTVinvX = (utx.T * v1inv) @ utx + v2inv * (u2tx.T @ u2tx)
+            XTVinvy = (utx.T * v1inv) @ self.uty + v2inv * (u2tx.T @ self.u2ty)
+            beta = np.linalg.solve(XTVinvX, XTVinvy)
+            # residual in rotated spaces
+            r1 = self.uty - utx @ beta;r2 = self.u2ty - u2tx @ beta                   # (n-k,1)
+
+            # r^T V^-1 r
+            rtv_invr = float(np.sum(v1inv * (r1.ravel() ** 2)) + v2inv * np.sum(r2.ravel() ** 2))
+
+            # sigma^2 hat
+            n = self.u2ty.shape[0]
+            p = utx.shape[1]
+            sigma2 = rtv_invr / (n - p)
+
+            # var(beta) = sigma2 * inv(XtVinvX)
+            XtVinvX_inv = np.linalg.inv(XTVinvX)
+            se = float(np.sqrt(sigma2 * XtVinvX_inv[-1, -1]))
+
+            alpha = float(beta[-1, 0])
+            z = alpha / se
+            pval = 2.0 * norm.sf(abs(z))  # two-sided
+
+            return alpha, se, pval
+        results = []
+        for Mchunk,site in SNPiter:
+            Mchunk:np.ndarray
+            Mchunk = (Mchunk - Mchunk.mean(axis=1,keepdims=True)) / Mchunk.std(axis=1,keepdims=True)
+            if self.FaST:
+                u1Mchunk = self.u.T@Mchunk.T
+                u2Mchunk = Mchunk.T-self.u@u1Mchunk
+                results.extend(Parallel(n_jobs=-1)
+                               (delayed(_FaSTprocess)(u1Mchunk[:,i],u2Mchunk[:,i]) for i in range(u1Mchunk.shape[1])))
+        print(np.array(results))
         return
 
 # ------------------------- quick test -------------------------
 if __name__ == "__main__":
-    from janusx.gfreader import vcfreader
-    from janusx.pyBLUP.QK2 import GRM
+    from janusx.gfreader import vcfreader,load_genotype_chunks
+    from janusx.pyBLUP.QK2 import GRM as GRMraw
     import pandas as pd
-    geno = vcfreader('example/mouse_hs1940.vcf.gz',maf=0.02,miss=0.05,dtype='float32').iloc[:,2:]
     pheno = pd.read_csv('example/mouse_hs1940.pheno',sep='\t',index_col=0).iloc[:,0].dropna()
-    csample = list(set(geno.columns) & set(pheno.index))
+    csample = pheno.index.unique().tolist()
+    geno = vcfreader('example/mouse_hs1940.vcf.gz',maf=0.02,miss=0.05,dtype='float32')[csample]
     y:np.ndarray = pheno.loc[csample].to_numpy()
     y = y.reshape(-1,1)
     X = None
     M = geno[csample].values
     M = (M-M.mean(axis=1,keepdims=True))/M.std(axis=1,keepdims=True)/np.sqrt(M.shape[0])
-    grm = GRM(M)
+    grm = GRMraw(M)
     u,s,vh = la.svd(M.T,full_matrices=False)
     print(u.shape,s.shape,vh.shape)
-    model = LMM(y,X,grm=grm)
+    genoIter = load_genotype_chunks('example/mouse_hs1940.vcf.gz',sample_ids=csample,chunk_size=1000,maf=0.02)
+    model = LMM(y,X,Miter=genoIter)
     print('* Full')
     print(model.result.fun)
     print(model.result.x)
-    print(model.beta)
-    print(model.g)
+    print(model.pve)
+    # print(model.beta)
+    # print(model.g)
     model = LMM(y,X,M=M.T)
     print('* Full (FaST-LMM)')
     print(model.result.fun)
     print(model.result.x)
-    print(model.beta)
-    print(model.g)
+    print(model.pve)
+    # print(model.beta)
+    # print(model.g)
+    
+    genoIter = load_genotype_chunks('example/mouse_hs1940.vcf.gz',sample_ids=csample,chunk_size=1000,maf=0.02)
+    model.gwas(genoIter)
     # for dim in range(20,1500,100):
     #     print('*',dim)
     #     model = LMM(y,X,u=u[:,:dim],s=s[:dim])

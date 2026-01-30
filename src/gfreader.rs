@@ -293,28 +293,44 @@ impl BedChunkReader {
 #[pyclass]
 pub struct VcfChunkReader {
     it: VcfSnpIter,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
 }
 
 #[pymethods]
 impl VcfChunkReader {
     #[new]
-    #[pyo3(signature = (path, maf_threshold=None, max_missing_rate=None, fill_missing=None))]
+    #[pyo3(signature = (
+        path,
+        maf_threshold=None,
+        max_missing_rate=None,
+        fill_missing=None,
+        sample_ids=None,
+        sample_indices=None,
+    ))]
     fn new(
         path: String,
         maf_threshold: Option<f32>,
         max_missing_rate: Option<f32>,
         fill_missing: Option<bool>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
         let it = VcfSnpIter::new_with_fill(&path, maf, miss, fill)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        Ok(Self { it })
+        let (sample_indices, sample_ids) = build_sample_selection(
+            &it.samples,
+            sample_ids,
+            sample_indices,
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        Ok(Self { it, sample_indices, sample_ids })
     }
 
     #[getter]
-    fn sample_ids(&self) -> Vec<String> { self.it.samples.clone() }
+    fn sample_ids(&self) -> Vec<String> { self.sample_ids.clone() }
 
     fn next_chunk<'py>(
         &mut self,
@@ -325,7 +341,8 @@ impl VcfChunkReader {
             return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
         }
 
-        let n = self.it.n_samples();
+        let n = self.sample_indices.len();
+        let full_samples = n == self.it.n_samples();
         let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let mut m: usize = 0;
@@ -333,7 +350,11 @@ impl VcfChunkReader {
         while m < chunk_size {
             match self.it.next_snp() {
                 Some((row, site)) => {
-                    data.extend_from_slice(&row);
+                    if full_samples {
+                        data.extend_from_slice(&row);
+                    } else {
+                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                    }
                     sites.push(site.into());
                     m += 1;
                 }

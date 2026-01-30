@@ -19,5 +19,6 @@ if __name__ == "__main__":
     genoIter = load_genotype_chunks('/Volumes/HP X306W/tmp/cubic_All.maf0.02',sample_ids=csample,chunk_size=chunksize,maf=0.02)
     ids,nsnp = inspect_genotype_file('/Volumes/HP X306W/tmp/cubic_All.maf0.02')
     for mchunk,site in tqdm(genoIter,total=nsnp//chunksize):
+        mchunk = mchunk-mchunk.mean(axis=1,keepdims=True)
         result = model.gwas(mchunk,plrt=True)
     print(result)

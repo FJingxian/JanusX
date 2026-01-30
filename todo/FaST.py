@@ -16,7 +16,7 @@ def GRM(Mchunk:NDArray[np.floating],ridge: float=1e-6):
     :type Mchunk: NDArray[np.floating]
     '''
     z:np.ndarray = (Mchunk-Mchunk.mean(axis=1,keepdims=True))/(Mchunk.std(axis=1,keepdims=True)+ridge)
-    return z.T@z/z.shape[0]
+    return z.T@z
 
 def FaSTlogREML(
     loglbd: float,
@@ -212,6 +212,7 @@ class LMM:
         else:
             X = np.ones(shape=(n,1),dtype='float32')
         self.result:Any
+        self.ridge = ridge
         if grm is not None or Miter is not None: # Full matrice for LMM: pre-computed GRM or Miter to build GRM
             self.FaST:bool = False
             if grm is not None:
@@ -231,10 +232,12 @@ class LMM:
                 XTVinvy = (self.utx.T * vinv) @ self.uty
                 self.beta = np.linalg.solve(XTVinvX, XTVinvy)
                 self.g = self.ss * vinv * self.u @ (self.uty-self.utx@self.beta)
-            elif Miter is not None:
-                grm = np.zeros(shape=(n,n),dtype='float32')
+            else:
+                grm = np.zeros(shape=(n,n),dtype='float32');nmarker=0
                 for chunk,site in Miter:
-                    grm = grm + GRM(chunk)
+                    grm = grm + GRM(chunk,self.ridge)
+                    nmarker+=chunk.shape[0]
+                grm = grm/nmarker
                 self.ss:NDArray;self.u:NDArray
                 ss, self.u = la.eigh(grm, overwrite_a=True, check_finite=False)
                 self.ss = np.maximum(ss, 0.0)
@@ -290,7 +293,7 @@ class LMM:
             XTVinvy = (self.utx.T * v1inv) @ self.uty + v2inv * (self.u2tx.T @ self.u2ty)
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
             self.g = self.ss * v1inv * self.u @ (self.uty-self.utx@self.beta)
-        varg = np.diag(self.ss*self.u@self.u).sum()/n
+        varg = varg = self.ss.sum()/n#(trace(K)/n)
         vare = lbd
         self.pve = varg/(varg+vare)
     def gwas(self,SNPiter):
@@ -331,7 +334,7 @@ class LMM:
         results = []
         for Mchunk,site in SNPiter:
             Mchunk:np.ndarray
-            Mchunk = (Mchunk - Mchunk.mean(axis=1,keepdims=True)) / Mchunk.std(axis=1,keepdims=True)
+            Mchunk = (Mchunk - Mchunk.mean(axis=1,keepdims=True)) / (Mchunk.std(axis=1,keepdims=True)+self.ridge)
             if self.FaST:
                 u1Mchunk = self.u.T@Mchunk.T
                 u2Mchunk = Mchunk.T-self.u@u1Mchunk

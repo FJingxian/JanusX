@@ -4,14 +4,14 @@ High-level Python APIs wrapping Rust-accelerated association tests.
 
 This module provides:
   - FEM(): fast fixed-effect model (LM / GLM-like) GWAS scan in chunks
-  - lmm_reml(): fast REML-based LMM GWAS scan on genotype chunks (rotated)
+  - lmm_reml(): REML-based LMM GWAS scan on rotated genotype chunks
+  - fastlmm_*(): FaST-LMM (rank-k + residual) wrappers
   - LMM / LM: convenient OO wrappers for repeated scans
   - FarmCPU utilities (REM / ll / SUPER / farmcpu)
 
 Notes
 -----
-- Rust backend functions are imported from the local extension module:
-    from ..janusx import glmf32, lmm_reml_chunk_f32, lmm_reml_null_f32
+- Rust backend functions are imported from the local extension module.
 - Genotype matrix convention in THIS FILE:
     M (or snp_chunk) is SNP-major: shape = (m_snps, n_samples)
   i.e., rows are SNPs, columns are samples.
@@ -31,9 +31,7 @@ import time
 from typing import Optional, Tuple
 
 import numpy as np
-# from scipy.optimize import minimize_scalar
 from scipy.linalg import eigh
-from scipy.stats import chi2
 import warnings
 
 warnings.filterwarnings(
@@ -52,6 +50,9 @@ from janusx.janusx import (
     lmm_reml_null_f32,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
+    fastlmm_reml_chunk_f32,
+    fastlmm_reml_null_f32,
+    fastlmm_assoc_chunk_f32,
 )
 
 
@@ -134,7 +135,6 @@ def FEM(
             f"M must be shape (m, n). Got M.shape={M.shape}, but n=len(y)={y.shape[0]}"
         )
 
-    chunksize = 10_000
     result = []
     for start in range(0,M.shape[0],chunksize):
         end = min(start+chunksize,M.shape[0])
@@ -146,15 +146,15 @@ def FEM(
 
 def lmm_reml(
     S: np.ndarray,
-    Xcov: np.ndarray,
-    y_rot: np.ndarray,
-    Dh: np.ndarray,
-    snp_chunk: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    utsnp_chunk: np.ndarray,
     bounds: tuple,
     max_iter: int = 30,
     tol: float = 1e-2,
     threads: int = 4,
-) -> Tuple[np.ndarray, np.ndarray]:
+    nullml: Optional[float] = None,
+) -> np.ndarray:
     """
     REML-based LMM scan on a SNP chunk using a Rust kernel (chunked, parallel).
 
@@ -167,11 +167,11 @@ def lmm_reml(
            Dh : U^T  (often called "transpose of eigenvectors")
 
     2) Rotate phenotype/covariates once:
-           y_rot  = Dh @ y
-           Xcov   = Dh @ X
+           uty  = U^T @ y
+           utx  = U^T @ X
 
     3) For each genotype chunk (m_chunk x n) in SNP-major layout:
-           g_rot = snp_chunk @ Dh.T
+           g_rot = snp_chunk @ U
        Then pass g_rot to Rust for SNP-wise REML optimization.
 
     Parameters
@@ -179,19 +179,15 @@ def lmm_reml(
     S : np.ndarray, shape (n,)
         Eigenvalues of kinship matrix K. Must be float64 contiguous.
 
-    Xcov : np.ndarray, shape (n, q)
-        Rotated covariates (Dh @ X). Must be float64 contiguous.
+    utx : np.ndarray, shape (n, q)
+        Rotated covariates (U^T @ X). Must be float64 contiguous.
 
-    y_rot : np.ndarray, shape (n,)
-        Rotated phenotype (Dh @ y). Must be float64 contiguous.
+    uty : np.ndarray, shape (n,)
+        Rotated phenotype (U^T @ y). Must be float64 contiguous.
 
-    Dh : np.ndarray, shape (n, n)
-        U^T (transpose eigenvectors). In your class you store float32,
-        but here it is used in a matrix multiply: snp_chunk @ Dh.T.
-
-    snp_chunk : np.ndarray, shape (m_chunk, n)
-        Unrotated SNP-major genotype chunk. dtype can be int8/float32/float64.
-        Will be multiplied by Dh.T and converted to float32 for Rust.
+    g_rot_chunk : np.ndarray, shape (m_chunk, n)
+        Rotated SNP-major genotype chunk. dtype can be float32/float64.
+        Will be converted to float32 for Rust.
 
     bounds : tuple (low, high)
         Search bounds in log10(lambda) for Brent/1D optimization.
@@ -205,18 +201,19 @@ def lmm_reml(
     threads : int
         Number of Rust worker threads.
 
+    nullml : float, optional
+        Null-model ML log-likelihood. If provided, plrt is appended.
+
     Returns
     -------
-    beta_se_p : np.ndarray, shape (m_chunk, 5)
-        Per-SNP results: beta, standard error, p-value, REML, ML.
-
-    lambdas : np.ndarray, shape (m_chunk,)
-        Per-SNP estimated lambda (ratio ve/vg or similar, per your Rust model).
+    beta_se_p : np.ndarray, shape (m_chunk, 3) or (m_chunk, 4)
+        Per-SNP results: beta, standard error, pwald.
+        If nullml is provided, an extra column plrt is appended.
 
     Performance notes
     -----------------
-    - The bottleneck for large n is often the rotation:
-          g_rot_chunk = snp_chunk @ Dh.T
+    - The bottleneck for large n is often the rotation you do before calling:
+          g_rot_chunk = snp_chunk @ U
       This is an (m_chunk x n) by (n x n) multiply, i.e., O(m_chunk * n^2).
       For n=50,000 this is not feasible.
 
@@ -228,38 +225,35 @@ def lmm_reml(
 
     # ---- Normalize dtypes/contiguity ----
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
-    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
-
-    # ---- Rotate genotype chunk: (m, n) @ (n, n) -> (m, n) ----
-    # WARNING: This is extremely expensive for large n.
-    g_rot_chunk = snp_chunk @ Dh.T
-    g_rot_chunk = np.ascontiguousarray(g_rot_chunk, dtype=np.float32)
+    utx = np.ascontiguousarray(utx, dtype=np.float64)
+    uty = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    utsnp_chunk = np.ascontiguousarray(utsnp_chunk, dtype=np.float32)
 
     # ---- Call Rust kernel ----
-    beta_se_p, lambdas = lmm_reml_chunk_f32(
+    beta_se_p = lmm_reml_chunk_f32(
         S,
-        Xcov,
-        y_rot,
+        utx,
+        uty,
         float(low),
         float(high),
-        g_rot_chunk,
+        utsnp_chunk,
         int(max_iter),
         float(tol),
         int(threads),
+        None if nullml is None else float(nullml),
     )
 
-    return beta_se_p, lambdas
+    return beta_se_p
 
 
 def lmm_reml_null(
     S: np.ndarray,
-    Xcov: np.ndarray,
-    y_rot: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
     bounds: tuple,
     max_iter: int = 30,
     tol: float = 1e-2,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """
     Null-model REML optimization using the Rust kernel.
 
@@ -268,11 +262,11 @@ def lmm_reml_null(
     S : np.ndarray, shape (n,)
         Eigenvalues of kinship matrix K.
 
-    Xcov : np.ndarray, shape (n, q)
-        Rotated covariates (Dh @ X).
+    utx : np.ndarray, shape (n, q)
+        Rotated covariates (U^T @ X).
 
-    y_rot : np.ndarray, shape (n,)
-        Rotated phenotype (Dh @ y).
+    uty : np.ndarray, shape (n,)
+        Rotated phenotype (U^T @ y).
 
     bounds : tuple (low, high)
         Search bounds in log10(lambda).
@@ -288,70 +282,333 @@ def lmm_reml_null(
     lbd : float
         Null-model lambda (ve/vg).
 
+    ml : float
+        Null ML log-likelihood (higher is better).
+
     reml : float
         Null REML log-likelihood (higher is better).
     """
     low, high = bounds
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
-    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+    utx = np.ascontiguousarray(utx, dtype=np.float64)
+    uty = np.ascontiguousarray(uty, dtype=np.float64).ravel()
 
-    lbd, reml = lmm_reml_null_f32(
+    lbd, ml, reml = lmm_reml_null_f32(
         S,
-        Xcov,
-        y_rot,
+        utx,
+        uty,
         float(low),
         float(high),
         int(max_iter),
         float(tol),
     )
-    return lbd, reml
+    return lbd, ml, reml
+
+
+def fastlmm_reml_null(
+    S: np.ndarray,
+    u1tx: np.ndarray,
+    u2tx: np.ndarray,
+    u1ty: np.ndarray,
+    u2ty: np.ndarray,
+    bounds: tuple,
+    max_iter: int = 50,
+    tol: float = 1e-2,
+) -> Tuple[float, float, float]:
+    """
+    FaST-LMM null-model REML optimization (rank-k + residual space).
+
+    This is a thin wrapper over Rust `fastlmm_reml_null_f32`.
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (k,)
+        Eigenvalues (or s^2) corresponding to the low-rank space U (k components).
+
+    u1tx : np.ndarray, shape (k, p)
+        Projected covariates in U space (U^T @ X).
+
+    u2tx : np.ndarray, shape (n, p)
+        Residual covariates (X - U @ (U^T @ X)).
+
+    u1ty : np.ndarray, shape (k,)
+        Projected phenotype (U^T @ y).
+
+    u2ty : np.ndarray, shape (n,)
+        Residual phenotype (y - U @ (U^T @ y)).
+
+    bounds : tuple (low, high)
+        Search bounds in log10(lambda).
+
+    max_iter : int
+        Max iterations in Brent optimizer.
+
+    tol : float
+        Convergence tolerance in log10(lambda).
+
+    Returns
+    -------
+    lbd : float
+        Estimated lambda (ve/vg).
+
+    ml : float
+        ML log-likelihood (higher is better).
+
+    reml : float
+        REML log-likelihood (higher is better).
+    """
+    low, high = bounds
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
+    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
+    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
+    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
+
+    lbd, ml, reml = fastlmm_reml_null_f32(
+        S,
+        u1tx,
+        u2tx,
+        u1ty,
+        u2ty,
+        float(low),
+        float(high),
+        int(max_iter),
+        float(tol),
+    )
+    return lbd, ml, reml
+
+
+def fastlmm_reml(
+    S: np.ndarray,
+    u1tx: np.ndarray,
+    u2tx: np.ndarray,
+    u1ty: np.ndarray,
+    u2ty: np.ndarray,
+    u1tsnp_chunk: np.ndarray,
+    u2tsnp_chunk: np.ndarray,
+    bounds: tuple,
+    max_iter: int = 50,
+    tol: float = 1e-2,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+) -> np.ndarray:
+    """
+    FaST-LMM REML scan on a SNP chunk (rank-k + residual space).
+
+    This is a thin wrapper over Rust `fastlmm_reml_chunk_f32`.
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (k,)
+        Eigenvalues (or s^2) for the low-rank space.
+
+    u1tx : np.ndarray, shape (k, p)
+        Projected covariates in U space (U^T @ X).
+
+    u2tx : np.ndarray, shape (n, p)
+        Residual covariates (X - U @ (U^T @ X)).
+
+    u1ty : np.ndarray, shape (k,)
+        Projected phenotype (U^T @ y).
+
+    u2ty : np.ndarray, shape (n,)
+        Residual phenotype (y - U @ (U^T @ y)).
+
+    u1tsnp_chunk : np.ndarray, shape (m, k)
+        Projected SNP chunk in U space (SNP-major).
+
+    u2tsnp_chunk : np.ndarray, shape (m, n)
+        Residual SNP chunk (SNP-major).
+
+    bounds : tuple (low, high)
+        Search bounds in log10(lambda).
+
+    max_iter : int
+        Max iterations in Brent optimizer.
+
+    tol : float
+        Convergence tolerance in log10(lambda).
+
+    threads : int
+        Rust worker threads.
+
+    nullml : float, optional
+        Null-model ML log-likelihood. If provided, plrt is appended.
+
+    Returns
+    -------
+    beta_se_p : np.ndarray, shape (m, 3) or (m, 4)
+        Per-SNP beta, standard error, pwald.
+        If nullml is provided, an extra column plrt is appended.
+    """
+    low, high = bounds
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
+    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
+    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
+    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
+
+    u1tsnp_chunk = np.ascontiguousarray(u1tsnp_chunk, dtype=np.float32)
+    u2tsnp_chunk = np.ascontiguousarray(u2tsnp_chunk, dtype=np.float32)
+
+    beta_se_p = fastlmm_reml_chunk_f32(
+        S,
+        u1tx,
+        u2tx,
+        u1ty,
+        u2ty,
+        u1tsnp_chunk,
+        u2tsnp_chunk,
+        float(low),
+        float(high),
+        int(max_iter),
+        float(tol),
+        int(threads),
+        None if nullml is None else float(nullml),
+    )
+    return beta_se_p
+
+
+def fastlmm_assoc_chunk(
+    S: np.ndarray,
+    u1tx: np.ndarray,
+    u2tx: np.ndarray,
+    u1ty: np.ndarray,
+    u2ty: np.ndarray,
+    log10_lbd: float,
+    u1tsnp_chunk: np.ndarray,
+    u2tsnp_chunk: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+) -> np.ndarray:
+    """
+    FaST-LMM fixed-lambda association on a SNP chunk.
+
+    This is a thin wrapper over Rust `fastlmm_assoc_chunk_f32`.
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (k,)
+        Eigenvalues (or s^2) for the low-rank space.
+
+    u1tx : np.ndarray, shape (k, p)
+        Projected covariates in U space (U^T @ X).
+
+    u2tx : np.ndarray, shape (n, p)
+        Residual covariates (X - U @ (U^T @ X)).
+
+    u1ty : np.ndarray, shape (k,)
+        Projected phenotype (U^T @ y).
+
+    u2ty : np.ndarray, shape (n,)
+        Residual phenotype (y - U @ (U^T @ y)).
+
+    log10_lbd : float
+        Fixed log10(lambda) for all SNPs.
+
+    u1tsnp_chunk : np.ndarray, shape (m, k)
+        Projected SNP chunk in U space (SNP-major).
+
+    u2tsnp_chunk : np.ndarray, shape (m, n)
+        Residual SNP chunk (SNP-major).
+
+    threads : int
+        Rust worker threads.
+
+    nullml : float, optional
+        Null-model ML log-likelihood. If provided, plrt is appended.
+
+    Returns
+    -------
+    beta_se_p : np.ndarray, shape (m, 3) or (m, 4)
+        Per-SNP beta, standard error, pwald.
+        If nullml is provided, an extra column plrt is appended.
+    """
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
+    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
+    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
+    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
+
+    u1tsnp_chunk = np.ascontiguousarray(u1tsnp_chunk, dtype=np.float32)
+    u2tsnp_chunk = np.ascontiguousarray(u2tsnp_chunk, dtype=np.float32)
+
+    beta_se_p = fastlmm_assoc_chunk_f32(
+        S,
+        u1tx,
+        u2tx,
+        u1ty,
+        u2ty,
+        float(log10_lbd),
+        u1tsnp_chunk,
+        u2tsnp_chunk,
+        int(threads),
+        None if nullml is None else float(nullml),
+    )
+    return beta_se_p
 
 
 def ml_loglike_null(
     S: np.ndarray,
-    Xcov: np.ndarray,
-    y_rot: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
     log10_lbd: float,
 ) -> float:
     """
     ML log-likelihood for the null model at a given log10(lambda).
     """
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
-    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
     return ml_loglike_null_f32(S, Xcov, y_rot, float(log10_lbd))
 
 
 def lmm_assoc_fixed(
     S: np.ndarray,
-    Xcov: np.ndarray,
-    y_rot: np.ndarray,
-    Dh: np.ndarray,
-    snp_chunk: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
     log10_lbd: float,
+    utsnp_chunk: np.ndarray,
     threads: int = 4,
+    nullml: Optional[float] = None,
 ) -> np.ndarray:
     """
     Fixed-lambda LMM scan on a SNP chunk using a Rust kernel.
 
     This wraps `lmm_assoc_chunk_f32` and uses a single fixed log10(lambda)
-    for all SNPs in the chunk.
+    for all SNPs in the chunk. If nullml is provided, plrt is appended.
+
+    Parameters
+    ----------
+    S : np.ndarray, shape (n,)
+        Eigenvalues of kinship (same order as rotated data).
+
+    utx : np.ndarray, shape (n, p)
+        Rotated covariates (U^T @ X).
+
+    uty : np.ndarray, shape (n,)
+        Rotated phenotype (U^T @ y).
+
+    log10_lbd : float
+        Fixed log10(lambda) for all SNPs.
+
+    utsnp_chunk : np.ndarray, shape (m, n)
+        Rotated SNP chunk (U^T @ G), SNP-major.
     """
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    Xcov = np.ascontiguousarray(Xcov, dtype=np.float64)
-    y_rot = np.ascontiguousarray(y_rot, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
 
-    g_rot_chunk = snp_chunk @ Dh.T
-    g_rot_chunk = np.ascontiguousarray(g_rot_chunk, dtype=np.float32)
+    utsnp_chunk = np.ascontiguousarray(utsnp_chunk, dtype=np.float32)
 
     beta_se_p = lmm_assoc_chunk_f32(
         S,
         Xcov,
         y_rot,
         float(log10_lbd),
-        g_rot_chunk,
+        utsnp_chunk,
         int(threads),
+        None if nullml is None else float(nullml),
     )
     return beta_se_p
 
@@ -421,7 +678,7 @@ class LMM:
         self.y:np.ndarray = self.Dh @ y
 
         # ---- Estimate null lambda via scalar optimization (Python) ----
-        lbd_null,reml = lmm_reml_null(self.S,self.Xcov,self.y,(-5, 5),max_iter=50,tol=1e-3)
+        lbd_null, ml0, reml = lmm_reml_null(self.S, self.Xcov, self.y, (-5, 5), max_iter=50, tol=1e-3)
         # print(lbd_null,reml)
         # result = minimize_scalar(
         #     lambda lbd: -self._NULLREML(10 ** (lbd)),
@@ -437,13 +694,8 @@ class LMM:
 
         self.lbd_null = lbd_null
         self.pve = pve
-        self.LL0 = reml # LL value in null model
-        self.ML0 = ml_loglike_null_f32(
-            np.ascontiguousarray(self.S, dtype=np.float64),
-            np.ascontiguousarray(self.Xcov, dtype=np.float64),
-            np.ascontiguousarray(self.y, dtype=np.float64).ravel(),
-            float(np.log10(lbd_null)),
-        )
+        self.LL0 = reml
+        self.ML0 = ml0
         # Adaptive bounds around null (if PVE not degenerate)
         if pve > 0.95 or pve < 0.05:
             self.bounds = (-5, 5)
@@ -509,29 +761,22 @@ class LMM:
 
         Returns
         -------
-        beta_se_p : np.ndarray, shape (m, 6)
-            Per-SNP beta, se, pwald, plrt, reml, ml.
+        beta_se_p : np.ndarray, shape (m, 4)
+            Per-SNP beta, se, pwald, plrt.
         """
-        beta_se_p, lambdas = lmm_reml(
+        g_rot_chunk = snp @ self.Dh.T
+        beta_se_p = lmm_reml(
             self.S,
             self.Xcov,
             self.y,
-            self.Dh,
-            snp,
+            g_rot_chunk,
             self.bounds,
             max_iter=30,
             tol=1e-2,
             threads=threads,
+            nullml=self.ML0,
         )
-        self.lbd = lambdas
-        stat = 2.0 * (beta_se_p[:, 4] - self.ML0)
-        stat = np.maximum(stat, 0.0)
-        plrt = chi2.sf(stat, df=1)
-
-        out = np.empty((beta_se_p.shape[0], 6), dtype=beta_se_p.dtype)
-        out[:, 0:3] = beta_se_p[:, 0:3]
-        out[:, 3] = plrt
-        return out
+        return beta_se_p
 
 
 class FastLMM(LMM):
@@ -544,16 +789,16 @@ class FastLMM(LMM):
             return super().gwas(snp, threads=threads)
 
         log10_lbd = float(np.log10(self.lbd_null))
+        g_rot_chunk = snp @ self.Dh.T
         beta_se_p = lmm_assoc_fixed(
             self.S,
             self.Xcov,
             self.y,
-            self.Dh,
-            snp,
             log10_lbd,
+            g_rot_chunk,
             threads=threads,
+            nullml=self.ML0,
         )
-        self.lbd = np.full(beta_se_p.shape[0], self.lbd_null, dtype=np.float64)
         return beta_se_p
 
 

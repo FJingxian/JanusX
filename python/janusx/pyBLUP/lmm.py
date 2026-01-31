@@ -5,7 +5,7 @@ import numpy as np
 import scipy.linalg as la
 from scipy.stats import norm
 from scipy.optimize import minimize_scalar
-
+from janusx.pyBLUP.tdata import _testX,_testY
 from janusx.pyBLUP.assoc import (
     lmm_reml,
     lmm_reml_null,
@@ -157,7 +157,6 @@ def logREML(
     c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2.0
     return total_log / 2.0 - c
 
-
 class LMM:
     def __init__(self,y:NDArray[np.float32],
                  X:ArrayorNone=None,
@@ -239,13 +238,9 @@ class LMM:
             If none of ``grm``, ``M``, or (``u``, ``s``) is provided, or if input
             shapes are incompatible (e.g., ``X.shape[0] != n``).
         """
-        y = y.reshape(-1,1) if y.ndim == 1 else y
-        n = y.size
-        if X is not None:
-            assert X.shape[0] == n, ValueError(f"Shape 0 of X is {X.shape}, and not same with y.")
-            X = np.column_stack([X,np.ones(shape=(n,1),dtype='float32')])
-        else:
-            X = np.ones(shape=(n,1),dtype='float32')
+        y = _testY(y)
+        n = y.shape[0]
+        X = _testX(X, n, add_intercept=True)
         result:Any
         self.engine = engine
         self.threads = threads
@@ -272,11 +267,11 @@ class LMM:
                 lbd,_reml = np.power(10,result.x),result.fun
             elif self.engine == 'rust':
                 lbd, self.ml, _reml = lmm_reml_null(self.ss, self.utx, self.uty, bounds)
-            vinv = 1/(self.ss+lbd)
-            XTVinvX = (self.utx.T * vinv) @ self.utx
-            XTVinvy = (self.utx.T * vinv) @ self.uty
+            self.vinv = 1/(self.ss+lbd)
+            XTVinvX = (self.utx.T * self.vinv) @ self.utx
+            XTVinvy = (self.utx.T * self.vinv) @ self.uty
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
-            self.g = self.ss * vinv * self.u @ (self.uty-self.utx@self.beta)
+            self.r = self.uty-self.utx@self.beta
         else:
             self.FaST:bool = True
             self.ss:NDArray;self.u:NDArray
@@ -304,12 +299,13 @@ class LMM:
                 lbd,_reml = np.power(10,result.x),result.fun
             elif self.engine == 'rust':
                 lbd, self.ml, _reml = fastlmm_reml_null(self.ss, self.utx, self.u2tx, self.uty, self.u2ty, bounds)
-            v1inv = 1/(self.ss+lbd)
-            v2inv = 1/lbd
-            XTVinvX = (self.utx.T * v1inv) @ self.utx + v2inv * (self.u2tx.T @ self.u2tx)
-            XTVinvy = (self.utx.T * v1inv) @ self.uty + v2inv * (self.u2tx.T @ self.u2ty)
+            self.v1inv = 1/(self.ss+lbd)
+            self.v2inv = 1/lbd
+            XTVinvX = (self.utx.T * self.v1inv) @ self.utx + self.v2inv * (self.u2tx.T @ self.u2tx)
+            XTVinvy = (self.utx.T * self.v1inv) @ self.uty + self.v2inv * (self.u2tx.T @ self.u2ty)
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
-            self.g = self.ss * v1inv * self.u @ (self.uty-self.utx@self.beta)
+            self.r1 = self.uty-self.utx@self.beta
+            self.r2 = self.u2ty-self.u2tx@self.beta
         varg = varg = self.ss.sum()/n#(trace(K)/n)
         vare = lbd
         self.loglbd = np.log10(lbd)

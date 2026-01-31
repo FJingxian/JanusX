@@ -1,9 +1,11 @@
+from typing import Union
 import time
 from janusx.pyBLUP.lmm import LMM
 from janusx.pyBLUP.kfold import kfold
 import numpy as np
-import matplotlib.pyplot as plt
-import scipy.linalg as la
+from numpy.typing import NDArray
+from janusx.pyBLUP.bayes import BAYES
+from janusx.pyBLUP.gblup import GBLUP
 
 if __name__ == "__main__":
     from janusx.gfreader import vcfreader
@@ -19,16 +21,9 @@ if __name__ == "__main__":
         ytrain = y[train]
         Mtrain = M[:,train]
         Mtest = M[:,test]
-        Ztrain:np.ndarray = (Mtrain-Mtrain.mean(axis=1,keepdims=True))/Mtrain.std(axis=1,keepdims=True)/np.sqrt(m)
-        Ztest:np.ndarray = (Mtest-Mtrain.mean(axis=1,keepdims=True))/Mtrain.std(axis=1,keepdims=True)/np.sqrt(m)
-        Ktt = Ztrain.T@Ztrain
-        model = LMM(ytrain,grm=Ktt)
-        np.fill_diagonal(Ktt,np.diag(Ktt)+np.power(10,model.loglbd))
-        Knt = Ztest.T@Ztrain
-        r = ytrain - model.beta   # (t,1)
-        c, low = la.cho_factor(Ktt, lower=True, check_finite=False)
-        alpha = la.cho_solve((c, low), r, check_finite=False)
-        g_hat = Knt @ alpha
-        y_hat = g_hat + model.beta
-        print(np.corrcoef(y_hat.ravel(),y[test].ravel())[0,1])
-        print(f'{time.time()-t:.3f}')
+        model = GBLUP(ytrain,Mtrain,)
+        print('Pearsonr:',np.corrcoef(model.predict(Mtest).ravel(),y[test].ravel())[0,1])
+        print(f'Time costed: {time.time()-t:.3f}')
+        model = BAYES(ytrain,Mtrain)
+        print('Pearsonr:',np.corrcoef(model.predict(Mtest).ravel(),y[test].ravel())[0,1])
+        print(f'Time costed: {time.time()-t:.3f}')

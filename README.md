@@ -53,30 +53,20 @@ Build from source required Python 3.9+ and Rust toolchain.
 
 ### From Source (Latest)
 
-Use Python to build
+Build via Python
 
 ```bash
-git clone https://github.com/FJingxian/JanusX.git
-cd JanusX
-# build
-pip install .
-# test
+pip install git+https://github.com/FJingxian/JanusX.git
 jx -h
-jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -o test -lm -lmm -fastlmm -farmcpu -n 0 -plot
-jx postGWAS -f test/mouse_hs1940.test0.lmm.tsv -threshold 1e-6 -format pdf -o test
 ```
 
-Use docker to build
+or docker
 
 ```bash
 git clone https://github.com/FJingxian/JanusX.git
 cd JanusX
-# build
 docker build -t janusx:latest .
-# test
-docker run -v .:/mnt --rm janusx:latest -h
-docker run -v .:/mnt --rm janusx:latest gwas -vcf /mnt/example/mouse_hs1940.vcf.gz -p /mnt/example/mouse_hs1940.pheno -o /mnt/test -lm -lmm -fastlmm -farmcpu -n 0 -plot
-docker run -v .:/mnt --rm janusx:latest postGWAS -f /mnt/test/*.lmm.tsv -threshold 1e-6 -format pdf -o /mnt/test
+docker run --rm janusx:latest -h
 ```
 
 ### PyPI (Stable)

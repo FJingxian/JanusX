@@ -52,7 +52,7 @@ def indexREF(reference:Pathlike):
     bwaidx = f'samtools faidx {reference}'
     gatkidx = (f"gatk CreateSequenceDictionary -R {reference} -O "
                f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict")
-    if Path(f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict").exists:
+    if Path(f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict").exists():
         return f"echo 'all index exist'"
     else:
         return (f'{samtoolsidx} && '

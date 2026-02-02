@@ -55,9 +55,9 @@ def indexREF(reference:Pathlike, singularity: str = ""):
     prefix = _singularity_prefix(singularity)
     samtoolsidx = f'{prefix}samtools faidx {reference}'
     bwaidx = f'{prefix}samtools faidx {reference}'
-    gatkidx = (f"{prefix}gatk CreateSequenceDictionary -R {reference} -O "
-               f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict")
-    if Path(f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict").exists():
+    outdict = f"{str(reference).replace('.fasta.gz','').replace('.fa.gz','').replace('.fasta','').replace('.fasta','')}.dict"
+    gatkidx = f"{prefix}gatk CreateSequenceDictionary -R {reference} -O {outdict}"
+    if Path(gatkidx).exists():
         return f"{prefix}echo 'all index exist'"
     else:
         return (f'{samtoolsidx} && '

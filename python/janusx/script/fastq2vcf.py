@@ -251,9 +251,10 @@ def main():
     index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
     subprocess.run(index_job, shell=True, check=True, cwd=workdir)
     fai_path = Path(f"{reference}.fai")
-    if not fai_path.exists():
+    ann_path = Path(f"{reference}.ann")
+    if not fai_path.exists() and not ann_path:
         logger.info("Waiting for FASTA index (.fai) to be ready...")
-        while not fai_path.exists():
+        while not fai_path.exists() and not ann_path:
             time.sleep(5)
 
     chrom = read_chroms_from_fai(reference)

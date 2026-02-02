@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, List, Union, Literal, Dict
 import itertools
 from janusx.pipeline.pipeline import pipeline,wrap_cmd
-from _fastq2gvcf import (
+from janusx.pipeline._fastq2gvcf import (
     filtersnp, gvcf2vcf, fastp, bwamem, markdup, bam2gvcf, cgvcf,
     selectfiltersnp, vcf2snpvcf, vcf2table
 )

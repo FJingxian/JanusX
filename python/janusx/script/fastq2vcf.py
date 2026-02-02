@@ -240,7 +240,7 @@ def main():
                 raise SystemExit(f"SIF path not found: {src}")
             shutil.copy2(src, tmp_path)
 
-        subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
+        # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
         os.replace(tmp_path, sif_path)
 
     singularity_prefix = f"singularity exec {sif_path} "

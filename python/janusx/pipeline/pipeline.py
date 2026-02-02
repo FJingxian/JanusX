@@ -6,7 +6,7 @@ PathLike = Union[Path, str]
 
 
 
-def wrap_cmd(cmd: str, job: str, threads: int, scheduler: str, queue: str = "c01",singularity:str="") -> str:
+def wrap_cmd(cmd: str, job: str, threads: int, scheduler: Literal["nohup", "csub"]='nohup', queue: str = "c01",singularity:str="") -> str:
     
     if scheduler == "nohup":
         safe_cmd = cmd.replace('"', '\\"')
@@ -14,7 +14,8 @@ def wrap_cmd(cmd: str, job: str, threads: int, scheduler: str, queue: str = "c01
             f'nohup bash -c "{singularity} {safe_cmd}" '
             f'> ./log/{job}.o 2> ./log/{job}.e'
         )
-    return f'csub -J {job} -o ./log/%J.o -e ./log/%J.e -q {queue} -n {threads} "{singularity} {cmd}"'
+    elif scheduler == "csub":
+        return f'csub -J {job} -o ./log/%J.o -e ./log/%J.e -q {queue} -n {threads} "{singularity} {cmd}"'
 
 def node(ifiles: List[PathLike], ofiles: List[PathLike]) -> Literal[-1, 0, 1]:
     outexists = all(Path(p).exists() for p in ofiles)

@@ -1,6 +1,6 @@
-import yaml
 from pathlib import Path
-from typing import Any, List, Union, Literal, Dict
+from readline import backend
+from typing import Any, Literal, Union, Dict
 import itertools
 from janusx.pipeline.pipeline import pipeline,wrap_cmd
 from janusx.pipeline._fastq2gvcf import (
@@ -11,28 +11,25 @@ from janusx.pipeline._fastq2gvcf import (
 PathLike = Union[Path, str]
 
 
-def main(yamlpath:PathLike):
-    with open(yamlpath, "r", encoding="utf-8") as f:
-        data = yaml.load(f, Loader=yaml.FullLoader)
-
+def main(yamlpath:PathLike,workdir:PathLike=".",metadata:dict=None,backbend:Literal["nohup","csub"]="csub",nohup_max_jobs:int=2,singularity:str=''):
     Path("log").mkdir(exist_ok=True)
-    scheduler = str(data.get("scheduler", "csub")).lower()
-    nohup_max_jobs = int(data.get("nohup_max_jobs", 0))
+    scheduler = str(backbend).lower()
+    nohup_max_jobs = int(nohup_max_jobs)
 
-    cleanfolder = Path(data["outdirs"]["clean"])
-    mappingfolder = Path(data["outdirs"]["mapping"])
-    gvcffolder = Path(data["outdirs"]["gvcf"])
-    mergefolder = Path(data["outdirs"]["merge"])
+    cleanfolder = Path(workdir / '1.clean')
+    mappingfolder = Path(workdir / '2.mapping')
+    gvcffolder = Path(workdir / '3.gvcf')
+    mergefolder = Path(workdir / '4.merge')
 
     cleanfolder.mkdir(0o755, exist_ok=True)
     mappingfolder.mkdir(0o755, exist_ok=True)
     gvcffolder.mkdir(0o755, exist_ok=True)
     mergefolder.mkdir(0o755, exist_ok=True)
 
-    reference = Path(data["reference"])
-    samples_fq: Dict[str, Dict[str, Any]] = data["samples"]
+    reference = Path(metadata["reference"])
+    samples_fq: Dict[str, Dict[str, Any]] = metadata["samples"]
     samples = list(samples_fq.keys())
-    CHROM = list(data["chrom"])
+    CHROM = list(metadata["chrom"])
 
     # -------- step1: fastp -------- 15 mins
     step1_lines = []
@@ -42,7 +39,7 @@ def main(yamlpath:PathLike):
         fq2 = samples_fq[sample]["fq2"]
         cmd_fastp = fastp(sample, fq1, fq2, cleanfolder, core)
         step1_lines.append(
-            wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler)
+            wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler,singularity)
         )
     step1 = "\n".join(step1_lines)
 
@@ -60,7 +57,7 @@ def main(yamlpath:PathLike):
         r2 = cleanfolder / f"{sample}.R2.clean.fastq.gz"
         cmd_bwa = bwamem(reference, sample, r1, r2, mappingfolder, 64)
         step2_lines.append(
-            wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler)
+            wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler,singularity)
         )
     step2 = "\n".join(step2_lines)
 
@@ -74,7 +71,7 @@ def main(yamlpath:PathLike):
         bam = mappingfolder / f"{sample}.sorted.bam"
         cmd_md = markdup(sample, bam, mappingfolder, 16, 200)
         step3_lines.append(
-            wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler)
+            wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler,singularity)
         )
     step3 = "\n".join(step3_lines)
 
@@ -89,7 +86,7 @@ def main(yamlpath:PathLike):
         for chrom in CHROM:
             cmd_g = bam2gvcf(reference, sample, md_bam, chrom, gvcffolder, 2)
             step4_lines.append(
-                wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler)
+                wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler,singularity)
             )
     step4 = "\n".join(step4_lines)
 
@@ -104,7 +101,7 @@ def main(yamlpath:PathLike):
         gvcfs = [gvcffolder / f"{s}.{chrom}.g.vcf.gz" for s in samples]
         cmd_c = cgvcf(reference, chrom, gvcfs, mergefolder)
         step5_lines.append(
-            wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler)
+            wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler,singularity)
         )
     step5 = "\n".join(step5_lines)
 
@@ -123,7 +120,7 @@ def main(yamlpath:PathLike):
             f'{vcf2table(reference, chrom, mergefolder)}'
         )
         step6_lines.append(
-            wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler)
+            wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler,singularity)
         )
     step6 = "\n".join(step6_lines)
 

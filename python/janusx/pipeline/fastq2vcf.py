@@ -152,8 +152,8 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     step1_lines = []
     core = 16
     for sample in samples:
-        fq1 = samples_fq[sample]["fq1"]
-        fq2 = samples_fq[sample]["fq2"]
+        fq1 = samples_fq[sample][0]
+        fq2 = samples_fq[sample][1]
         cmd_fastp = fastp(sample, fq1, fq2, cleanfolder, core)
         step1_lines.append(
             wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler,singularity)
@@ -161,7 +161,7 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     step1 = "\n".join(step1_lines)
 
     step1in = list(itertools.chain.from_iterable(
-        [[samples_fq[s]["fq1"], samples_fq[s]["fq2"]] for s in samples]
+        [[samples_fq[s][0], samples_fq[s][1]] for s in samples]
     ))
     step1out = list(itertools.chain.from_iterable(
         [[cleanfolder / f"{s}.R1.clean.fastq.gz", cleanfolder / f"{s}.R2.clean.fastq.gz", cleanfolder / f"{s}.html", cleanfolder / f"{s}.json"] for s in samples]

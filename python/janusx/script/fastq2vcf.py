@@ -26,6 +26,7 @@ import time
 import socket
 import argparse
 import subprocess
+import shutil
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
@@ -35,6 +36,7 @@ from tqdm import tqdm
 
 import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
+from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
@@ -221,21 +223,38 @@ def main():
     binary_path.mkdir(parents=True, exist_ok=True)
     sif_path = binary_path / "janusxext.sif"
     if not sif_path.exists():
-        if input("Download JanusX Singularity Image (~800MB)? [y/N]: ").lower() != "y":
+        user_input = input(
+            "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
+        ).strip()
+        if not user_input or user_input.lower() == "n":
             raise SystemExit(1)
-        downloader(
-            "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
-            binary_path / "janusxext.tmp.sif",
-        )
-        os.replace(binary_path / "janusxext.tmp.sif", sif_path)
-        raise SystemExit("Retry running the script now that the Singularity image is downloaded.")
+        tmp_path = binary_path / "janusxext.tmp.sif"
+        if user_input.lower() == "y":
+            downloader(
+                "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+                tmp_path,
+            )
+        else:
+            src = Path(user_input).expanduser().resolve()
+            if not src.exists():
+                raise SystemExit(f"SIF path not found: {src}")
+            shutil.copy2(src, tmp_path)
+
+        subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
+        os.replace(tmp_path, sif_path)
 
     singularity_prefix = f"singularity exec {sif_path} "
     logger.info(f"Singularity: {singularity_prefix}")
 
     cmd = indexREF(str(reference), singularity=singularity_prefix)
     logger.info(f"Indexing reference: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
+    subprocess.run(index_job, shell=True, check=True, cwd=workdir)
+    fai_path = Path(f"{reference}.fai")
+    if not fai_path.exists():
+        logger.info("Waiting for FASTA index (.fai) to be ready...")
+        while not fai_path.exists():
+            time.sleep(5)
 
     chrom = read_chroms_from_fai(reference)
     logger.info(f"Chromosomes: {len(chrom)}")

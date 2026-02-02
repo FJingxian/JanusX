@@ -26,15 +26,38 @@ import time
 import socket
 import argparse
 import subprocess
+import urllib.request
 from pathlib import Path
 from collections import defaultdict
 from typing import List
 
+from tqdm import tqdm
+
+import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
 from ._common.log import setup_logging
 
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
 FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+
+
+def downloader(url: str, dst: Path) -> None:
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+
+    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+        total = r.headers.get("Content-Length")
+        total = int(total) if total is not None else None
+        with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024) as pbar:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                pbar.update(len(chunk))
+
+    os.replace(tmp, dst)
 
 
 def _fastq_read_info(name: str):
@@ -137,7 +160,7 @@ def read_chroms_from_fai(reference: Path) -> List[str]:
     return chroms
 
 
-def main(log: bool = True):
+def main():
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
@@ -193,7 +216,23 @@ def main(log: bool = True):
     logger.info(f"Backend: {args.backend}")
     logger.info(f"Max tasks (nohup): {args.maxtask}")
 
-    cmd = indexREF(str(reference))
+    binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
+    binary_path.mkdir(parents=True, exist_ok=True)
+    sif_path = binary_path / "janusxext.sif"
+    if not sif_path.exists():
+        if input("Download JanusX Singularity Image (~800MB)? [y/N]: ").lower() != "y":
+            raise SystemExit(1)
+        downloader(
+            "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+            binary_path / "janusxext.tmp.sif",
+        )
+        os.replace(binary_path / "janusxext.tmp.sif", sif_path)
+        raise SystemExit("Retry running the script now that the Singularity image is downloaded.")
+
+    singularity_prefix = f"singularity exec {sif_path} "
+    logger.info(f"Singularity: {singularity_prefix}")
+
+    cmd = indexREF(str(reference), singularity=singularity_prefix)
     logger.info(f"Indexing reference: {cmd}")
     subprocess.run(cmd, shell=True, check=True)
 
@@ -223,6 +262,7 @@ def main(log: bool = True):
         workdir=workdir,
         backbend=args.backend,
         nohup_max_jobs=args.maxtask,
+        singularity=singularity_prefix,
     )
 
     logger.info(f"Pipeline finished in {time.time() - t_start:.1f}s")

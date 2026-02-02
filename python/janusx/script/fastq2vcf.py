@@ -247,13 +247,13 @@ def main():
     singularity_prefix = f"singularity exec {sif_path} "
     logger.info(f"Singularity: {singularity_prefix}")
 
-    cmd = indexREF(str(reference), singularity=singularity_prefix)
-    logger.info(f"Indexing reference: {cmd}")
-    index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
-    subprocess.run(index_job, shell=True, check=True, cwd=workdir)
     fai_path = Path(f"{reference}.fai")
     ann_path = Path(f"{reference}.ann")
     if not fai_path.exists() and not ann_path:
+        cmd = indexREF(str(reference), singularity=singularity_prefix)
+        logger.info(f"Indexing reference: {cmd}")
+        index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
+        subprocess.run(index_job, shell=True, check=True, cwd=workdir)
         logger.info("Waiting for FASTA index (.fai) to be ready...")
         while not fai_path.exists() and not ann_path:
             time.sleep(5)

@@ -181,14 +181,15 @@ def main():
         "-w", "--workdir", required=True, type=str,
         help="Working directory for outputs.",
     )
-    required_group.add_argument(
-        "-b", "--backend", required=True, type=str,
+    optional_group = parser.add_argument_group("Optional Arguments")
+    optional_group.add_argument(
+        "-b", "--backend", required=False, type=str,default='nohup',
         choices=["nohup", "csub"],
-        help="Execution backend for the pipeline.",
+        help=f"Execution backend for the pipeline. (default: nohup)",
     )
-    required_group.add_argument(
-        "-m", "--maxtask", required=True, type=int,
-        help="Max concurrent jobs when backend=nohup.",
+    optional_group.add_argument(
+        "-m", "--maxtask", required=False, type=int,default=1,
+        help="Max concurrent jobs when backend=nohup. (default: 1)",
     )
 
     args = parser.parse_args()

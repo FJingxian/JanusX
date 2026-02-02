@@ -19,8 +19,7 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     extracts SNPs, filters them, and finally exports SNP tables (TSV) per chromosome.
 
     The pipeline is executed through `janusx.pipeline.pipeline.pipeline()` and each step command is
-    wrapped by `wrap_cmd()` to support different execution backends (e.g. cluster submission or nohup)
-    and optional Singularity container execution.
+    wrapped by `wrap_cmd()` to support different execution backends (e.g. cluster submission or nohup).
 
     Parameters
     ----------
@@ -63,8 +62,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         Max number of concurrent jobs when `backbend="nohup"`.
 
     singularity : str, default=""
-        Optional Singularity execution prefix passed to `wrap_cmd()`. If provided, commands
-        will be executed inside the container. Typical value example:
+        Optional Singularity execution prefix. If provided, it will be injected before each
+        tool command (including piped/chained commands) so they run inside the container.
+        Typical value example:
             singularity="singularity exec /path/image.sif"
         or empty string to run on host.
 
@@ -154,9 +154,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     for sample in samples:
         fq1 = samples_fq[sample][0]
         fq2 = samples_fq[sample][1]
-        cmd_fastp = fastp(sample, fq1, fq2, cleanfolder, core)
+        cmd_fastp = fastp(sample, fq1, fq2, cleanfolder, core, singularity=singularity)
         step1_lines.append(
-            wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler,singularity)
+            wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler)
         )
     step1 = "\n".join(step1_lines)
 
@@ -172,9 +172,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     for sample in samples:
         r1 = cleanfolder / f"{sample}.R1.clean.fastq.gz"
         r2 = cleanfolder / f"{sample}.R2.clean.fastq.gz"
-        cmd_bwa = bwamem(reference, sample, r1, r2, mappingfolder, 64)
+        cmd_bwa = bwamem(reference, sample, r1, r2, mappingfolder, 64, singularity=singularity)
         step2_lines.append(
-            wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler,singularity)
+            wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler)
         )
     step2 = "\n".join(step2_lines)
 
@@ -186,9 +186,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     step3_lines = []
     for sample in samples:
         bam = mappingfolder / f"{sample}.sorted.bam"
-        cmd_md = markdup(sample, bam, mappingfolder, 16, 200)
+        cmd_md = markdup(sample, bam, mappingfolder, 16, 200, singularity=singularity)
         step3_lines.append(
-            wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler,singularity)
+            wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler)
         )
     step3 = "\n".join(step3_lines)
 
@@ -201,9 +201,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     for sample in samples:
         md_bam = mappingfolder / f"{sample}.Markdup.bam"
         for chrom in CHROM:
-            cmd_g = bam2gvcf(reference, sample, md_bam, chrom, gvcffolder, 2)
+            cmd_g = bam2gvcf(reference, sample, md_bam, chrom, gvcffolder, 2, singularity=singularity)
             step4_lines.append(
-                wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler,singularity)
+                wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler)
             )
     step4 = "\n".join(step4_lines)
 
@@ -216,9 +216,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     step5_lines = []
     for chrom in CHROM:
         gvcfs = [gvcffolder / f"{s}.{chrom}.g.vcf.gz" for s in samples]
-        cmd_c = cgvcf(reference, chrom, gvcfs, mergefolder)
+        cmd_c = cgvcf(reference, chrom, gvcfs, mergefolder, singularity=singularity)
         step5_lines.append(
-            wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler,singularity)
+            wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler)
         )
     step5 = "\n".join(step5_lines)
 
@@ -229,15 +229,15 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     # -------- step6: gvcf2vcf + snp + filter + table per chrom -------- 32 mins
     step6_lines = []
     for chrom in CHROM:
-        cmd6 = (
-            f'{gvcf2vcf(reference, chrom, mergefolder, 1, 50)} && '
-            f'{vcf2snpvcf(reference, chrom, mergefolder)} && '
-            f'{filtersnp(reference, chrom, mergefolder)} && '
-            f'{selectfiltersnp(reference, chrom, mergefolder)} && '
-            f'{vcf2table(reference, chrom, mergefolder)}'
-        )
+        cmd6 = " && ".join([
+            gvcf2vcf(reference, chrom, mergefolder, 1, 50, singularity=singularity),
+            vcf2snpvcf(reference, chrom, mergefolder, singularity=singularity),
+            filtersnp(reference, chrom, mergefolder, singularity=singularity),
+            selectfiltersnp(reference, chrom, mergefolder, singularity=singularity),
+            vcf2table(reference, chrom, mergefolder, singularity=singularity),
+        ])
         step6_lines.append(
-            wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler,singularity)
+            wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler)
         )
     step6 = "\n".join(step6_lines)
 

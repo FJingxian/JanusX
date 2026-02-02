@@ -3,6 +3,10 @@ from typing import List,Union,Literal
 
 Pathlike = Union[Path,str]
 
+def _singularity_prefix(singularity: str) -> str:
+    singularity = str(singularity or "").strip()
+    return f"{singularity} " if singularity else ""
+
 # def node(ifiles:List[Pathlike],ofiles:List[Pathlike],cmd:str) -> tuple[str, Literal[-1,0,1]]:
 #     '''
 #     Docstring of node
@@ -28,7 +32,7 @@ Pathlike = Union[Path,str]
 #         else:
 #             return f"Back to previous node, because input files is not exists:\n"+'\n'.join(map(str,ifiles)), -1
 
-def indexREF(reference:Pathlike):
+def indexREF(reference:Pathlike, singularity: str = ""):
     """
     Build all basic indexes for a reference genome.
 
@@ -48,19 +52,20 @@ def indexREF(reference:Pathlike):
         Shell command string that can be submitted to a scheduler or run via `os.system`.
     """
     reference = Path(reference)
-    samtoolsidx = f'samtools faidx {reference}'
-    bwaidx = f'samtools faidx {reference}'
-    gatkidx = (f"gatk CreateSequenceDictionary -R {reference} -O "
+    prefix = _singularity_prefix(singularity)
+    samtoolsidx = f'{prefix}samtools faidx {reference}'
+    bwaidx = f'{prefix}samtools faidx {reference}'
+    gatkidx = (f"{prefix}gatk CreateSequenceDictionary -R {reference} -O "
                f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict")
     if Path(f"{str(reference).replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict").exists():
-        return f"echo 'all index exist'"
+        return f"{prefix}echo 'all index exist'"
     else:
         return (f'{samtoolsidx} && '
                 f'{bwaidx} && '
                 f'{gatkidx}')
 
 def fastp(sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
-          out:Pathlike='.',core=4):
+          out:Pathlike='.',core=4, singularity: str = ""):
     """
     Generate fastp command for read trimming and QC.
 
@@ -94,6 +99,7 @@ def fastp(sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
       - `fastp` uses `-w {core}` and scales well with CPU cores.
     """
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     out.mkdir(mode=0o755, exist_ok=True)
     outclean1 = out / f'{sample}.R1.clean.fastq.gz'
     outhtml = out / f'{sample}.html'
@@ -101,9 +107,9 @@ def fastp(sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
     fastq1 = Path(fastq1)
     if fastq2 is None:
         if outhtml.exists() and outclean1.exists():
-            return f"echo '{outclean1} exists'"
+            return f"{prefix}echo '{outclean1} exists'"
         else:
-            return (f'fastp -i {fastq1}  '
+            return (f'{prefix}fastp -i {fastq1}  '
                     f'-o {outclean1} '
                     f'--html {outhtml} --json {outjson} '
                     f'-w {core}')
@@ -111,16 +117,16 @@ def fastp(sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
         fastq2 = Path(fastq2)
         outclean2 = out / f'{sample}.R2.clean.fastq.gz'
         if outhtml.exists() and outclean1.exists() and outclean2.exists():
-            return f"echo '{outclean1} and {outclean2} exist'"
+            return f"{prefix}echo '{outclean1} and {outclean2} exist'"
         else:
-            return (f'fastp -i {fastq1} -I {fastq2}  '
+            return (f'{prefix}fastp -i {fastq1} -I {fastq2}  '
                     f'-o {outclean1} -O {outclean2} '
                     f'--html {outhtml} --json {outjson} '
                     f'-w {core}')
         
 
 def bwamem(reference:Pathlike, sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
-            out:Pathlike='.',core:int=4):
+            out:Pathlike='.',core:int=4, singularity: str = ""):
     """
     Run `bwa mem` followed by `samtools sort` to generate a sorted BAM.
 
@@ -154,23 +160,26 @@ def bwamem(reference:Pathlike, sample:str, fastq1:Pathlike, fastq2:Union[Pathlik
       - `samtools sort -@ {core}` uses multiple threads for compression.
     """
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     out.mkdir(mode=0o755, exist_ok=True)
     outbam = out / f'{sample}.sorted.bam'
     rg = rf"'@RG\tID:{sample}\tPL:illumina\tLB:{sample}\tSM:{sample}'"
     if outbam.exists() and (out / f'{sample}.sorted.bam.finished').exists():
-        return f"echo '{outbam} exists'"
+        return f"{prefix}echo '{outbam} exists'"
     else:
         if fastq2 is None:
-            return (f'bwa mem -t {core} -R {rg} '
-                    f'{reference} {fastq1} | '
-                    f'samtools sort -@ {core} -o {outbam} && touch {outbam}.finished')
+            bwa_cmd = f'{prefix}bwa mem -t {core} -R {rg} {reference} {fastq1}'
+            sort_cmd = f'{prefix}samtools sort -@ {core} -o {outbam}'
+            touch_cmd = f'{prefix}touch {outbam}.finished'
+            return f'{bwa_cmd} | {sort_cmd} && {touch_cmd}'
         else:
-            return (f'bwa mem -t {core} -R {rg} '
-                    f'{reference} {fastq1} {fastq2} | '
-                    f'samtools sort -@ {core} -o {outbam} && touch {outbam}.finished')
+            bwa_cmd = f'{prefix}bwa mem -t {core} -R {rg} {reference} {fastq1} {fastq2}'
+            sort_cmd = f'{prefix}samtools sort -@ {core} -o {outbam}'
+            touch_cmd = f'{prefix}touch {outbam}.finished'
+            return f'{bwa_cmd} | {sort_cmd} && {touch_cmd}'
 
 def markdup(sample:str, bam:Pathlike,
-            out:Pathlike='.',core:int=4,mem:int=50):
+            out:Pathlike='.',core:int=4,mem:int=50, singularity: str = ""):
     """
     Mark / remove PCR duplicates and generate QC statistics.
 
@@ -210,23 +219,27 @@ def markdup(sample:str, bam:Pathlike,
       - `samtools coverage -@ {core}`: multi-threaded coverage computation.
     """
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     out.mkdir(mode=0o755, exist_ok=True)
     outbam = out / f'{sample}.Markdup.bam'
     outflagstats = out / f'{sample}.flagstat'
     outcoverage = out / f'{sample}.coverage'
     outmetric = out / f'{sample}.Markdup.metrics.txt'
     if outmetric.exists() and outbam.exists():
-        return f"echo '{outbam} exists'"
+        return f"{prefix}echo '{outbam} exists'"
     else:
-        return (f"gatk --java-options '-Xmx{int(mem)}G -XX:ParallelGCThreads={core}' MarkDuplicates "
-        f'-I {bam} -O {outbam} '
-        '--CREATE_INDEX true --REMOVE_DUPLICATES false '
-        f'--METRICS_FILE {outmetric} && '
-        f'samtools flagstat {outbam} > {outflagstats} && '
-        f'samtools coverage {outbam} > {outcoverage}')
+        gatk_cmd = (
+            f"{prefix}gatk --java-options '-Xmx{int(mem)}G -XX:ParallelGCThreads={core}' "
+            f"MarkDuplicates -I {bam} -O {outbam} "
+            "--CREATE_INDEX true --REMOVE_DUPLICATES false "
+            f"--METRICS_FILE {outmetric}"
+        )
+        flagstat_cmd = f'{prefix}samtools flagstat {outbam} > {outflagstats}'
+        coverage_cmd = f'{prefix}samtools coverage {outbam} > {outcoverage}'
+        return f'{gatk_cmd} && {flagstat_cmd} && {coverage_cmd}'
 
 def bam2gvcf(reference:Pathlike, sample:str, bam:Pathlike, chrom:Union[str,int],
-            out:Pathlike='.',core:int=4):
+            out:Pathlike='.',core:int=4, singularity: str = ""):
     """
     Call variants per-sample, per-chromosome (or interval) in GVCF mode.
 
@@ -257,15 +270,16 @@ def bam2gvcf(reference:Pathlike, sample:str, bam:Pathlike, chrom:Union[str,int],
         Shell command string for GVCF calling.
     """
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     out.mkdir(mode=0o755, exist_ok=True)
     outgvcf = out / f'{sample}.{chrom}.g.vcf.gz'
     if (out / f'{sample}.{chrom}.g.vcf.gz.tbi').exists() and outgvcf.exists():
-        return f"echo '{outgvcf} exists'"
+        return f"{prefix}echo '{outgvcf} exists'"
     else:
-        return (f'gatk HaplotypeCaller -R {reference} --native-pair-hmm-threads {core} '
+        return (f'{prefix}gatk HaplotypeCaller -R {reference} --native-pair-hmm-threads {core} '
                 f'-ERC GVCF -I {bam} -O {outgvcf} -L {chrom}')
 
-def cgvcf(reference:Pathlike, chrom: str, gvcfs: List[Pathlike], out: Pathlike):
+def cgvcf(reference:Pathlike, chrom: str, gvcfs: List[Pathlike], out: Pathlike, singularity: str = ""):
     """
     Merge multiple per-sample GVCFs into a single GVCF for one chromosome.
 
@@ -296,16 +310,17 @@ def cgvcf(reference:Pathlike, chrom: str, gvcfs: List[Pathlike], out: Pathlike):
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     out.mkdir(mode=0o755, exist_ok=True)
     out_g = out / f"Merge.{chrom}.g.vcf.gz"
     variants_str = " ".join(f"--variant {p}" for p in map(str, gvcfs))
     if out_g.exists() and (out / f"Merge.{chrom}.g.vcf.gz.tbi").exists():
-        return f"echo '{out_g} exists'"
+        return f"{prefix}echo '{out_g} exists'"
     else:
-        return f"gatk CombineGVCFs -R {reference} {variants_str} -O {out_g}"
+        return f"{prefix}gatk CombineGVCFs -R {reference} {variants_str} -O {out_g}"
 
 def gvcf2vcf(reference: Pathlike, chrom: str, out: Pathlike,
-             core: int = 4, mem: int = 50) -> str:
+             core: int = 4, mem: int = 50, singularity: str = "") -> str:
     """
     Genotype the merged GVCF to produce a multi-sample VCF.
 
@@ -336,17 +351,18 @@ def gvcf2vcf(reference: Pathlike, chrom: str, out: Pathlike,
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     in_g = out / f"Merge.{chrom}.g.vcf.gz"
     out_vcf = out / f"Merge.{chrom}.vcf.gz"
     if out_vcf.exists() and (out / f"Merge.{chrom}.vcf.gz.tbi").exists():
-        return f"echo '{out_vcf} exists'"
+        return f"{prefix}echo '{out_vcf} exists'"
     else:
         return (
-            f"gatk --java-options '-Xmx{mem}G -XX:ParallelGCThreads={core}' "
+            f"{prefix}gatk --java-options '-Xmx{mem}G -XX:ParallelGCThreads={core}' "
             f"GenotypeGVCFs -R {reference} -V {in_g} -O {out_vcf}"
         )
 
-def vcf2snpvcf(reference: Pathlike, chrom: str, out: Pathlike) -> str:
+def vcf2snpvcf(reference: Pathlike, chrom: str, out: Pathlike, singularity: str = "") -> str:
     """
     Extract bi-allelic SNPs from the multi-sample VCF.
 
@@ -372,19 +388,20 @@ def vcf2snpvcf(reference: Pathlike, chrom: str, out: Pathlike) -> str:
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     in_vcf = out / f"Merge.{chrom}.vcf.gz"
     out_snp = out / f"Merge.{chrom}.SNP.vcf.gz"
     if out_snp.exists() and (out / f"Merge.{chrom}.SNP.vcf.gz.tbi").exists():
-        return f"echo '{out_snp} exists'"
+        return f"{prefix}echo '{out_snp} exists'"
     else:
-        return ("gatk SelectVariants "
+        return (f"{prefix}gatk SelectVariants "
                 f"-R {reference} "
                 f"-V {in_vcf} "
                 "--select-type SNP "
                 "--restrict-alleles-to BIALLELIC "
                 f"-O {out_snp}")
 
-def filtersnp(reference: Pathlike, chrom: str, out: Pathlike) -> str:
+def filtersnp(reference: Pathlike, chrom: str, out: Pathlike, singularity: str = "") -> str:
     """
     Apply hard filters to SNP VCF.
 
@@ -410,12 +427,13 @@ def filtersnp(reference: Pathlike, chrom: str, out: Pathlike) -> str:
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     in_snp = out / f"Merge.{chrom}.SNP.vcf.gz"
     out_filtered = out / f"Merge.{chrom}.SNP.filter.vcf.gz"
     if out_filtered.exists() and (out / f"Merge.{chrom}.SNP.filter.vcf.gz.tbi").exists():
-        return f"echo '{out_filtered} exists'"
+        return f"{prefix}echo '{out_filtered} exists'"
     else:
-        return ("gatk VariantFiltration "
+        return (f"{prefix}gatk VariantFiltration "
                 f"-R {reference} "
                 f"-V {in_snp} "
                 f"-O {out_filtered} "
@@ -427,7 +445,7 @@ def filtersnp(reference: Pathlike, chrom: str, out: Pathlike) -> str:
                 "--filter-name 'ReadPosRankSum-8' --filter-expression 'ReadPosRankSum < -8.0' "
                 "--filter-name 'MQRankSum-12.5' --filter-expression 'MQRankSum < -12.5'")
         
-def selectfiltersnp(reference: Pathlike, chrom: str, out: Pathlike) -> str:
+def selectfiltersnp(reference: Pathlike, chrom: str, out: Pathlike, singularity: str = "") -> str:
     """
     Select only PASS SNPs from the filtered SNP VCF.
 
@@ -453,17 +471,18 @@ def selectfiltersnp(reference: Pathlike, chrom: str, out: Pathlike) -> str:
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     in_filtered = out / f"Merge.{chrom}.SNP.filter.vcf.gz"
     out_pass = out / f"Merge.{chrom}.SNP.filtered.vcf.gz"
     if out_pass.exists() and (out / f"Merge.{chrom}.SNP.filtered.vcf.gz.tbi").exists():
-        return f"echo '{out_pass} exists'"
+        return f"{prefix}echo '{out_pass} exists'"
     else:
-        return ("gatk SelectVariants "
+        return (f"{prefix}gatk SelectVariants "
                 f"-R {reference} -V {in_filtered} "
                 "--exclude-filtered "
                 f"-O {out_pass}")
 
-def vcf2table(reference: Pathlike, chrom: str, out: Pathlike) -> str:
+def vcf2table(reference: Pathlike, chrom: str, out: Pathlike, singularity: str = "") -> str:
     """
     Convert final filtered SNP VCF into a tabular format.
 
@@ -490,9 +509,10 @@ def vcf2table(reference: Pathlike, chrom: str, out: Pathlike) -> str:
     """
     reference = Path(reference)
     out = Path(out)
+    prefix = _singularity_prefix(singularity)
     in_pass = out / f"Merge.{chrom}.SNP.filtered.vcf.gz"
     out_tsv = out / f"Merge.{chrom}.SNP.tsv"
-    return ("gatk VariantsToTable "
+    return (f"{prefix}gatk VariantsToTable "
             f"-R {reference} "
             f"-V {in_pass} "
             "-F CHROM -F POS -F REF -F ALT "

@@ -1,90 +1,14 @@
-import time
 import yaml
-import subprocess
 from pathlib import Path
 from typing import Any, List, Union, Literal, Dict
 import itertools
-
+from janusx.pipeline.pipeline import pipeline,wrap_cmd
 from _fastq2gvcf import (
     filtersnp, gvcf2vcf, fastp, bwamem, markdup, bam2gvcf, cgvcf,
     selectfiltersnp, vcf2snpvcf, vcf2table
 )
 
 PathLike = Union[Path, str]
-
-def _wrap_cmd(cmd: str, job: str, threads: int, scheduler: str, queue: str = "c01",singularity:str="") -> str:
-    
-    if scheduler == "nohup":
-        safe_cmd = cmd.replace('"', '\\"')
-        return (
-            f'nohup bash -c "{singularity} {safe_cmd}" '
-            f'> ./log/{job}.o 2> ./log/{job}.e'
-        )
-    return f'csub -J {job} -o ./log/%J.o -e ./log/%J.e -q {queue} -n {threads} "{singularity} {cmd}"'
-
-
-def node(ifiles: List[PathLike], ofiles: List[PathLike]) -> Literal[-1, 0, 1]:
-    outexists = all(Path(p).exists() for p in ofiles)
-    if outexists:
-        return 1  # pass
-
-    inexists = all(Path(p).exists() for p in ifiles)
-    if inexists:
-        return 0  # run
-    return -1     # back
-
-
-def pipeline(AllCMD: List[str],
-             Alli: List[List[PathLike]],
-             Allo: List[List[PathLike]],
-             scheduler: str = "csub",
-             nohup_max_jobs: int = 0) -> None:
-    Path("tmp").mkdir(mode=0o755, parents=True, exist_ok=True)
-
-    for num, cmd in enumerate(AllCMD):
-        ifiles = Alli[num]
-        ofiles = Allo[num]
-
-        status = node(ifiles, ofiles)
-
-        sh = Path(f"./tmp/{num}.sh")
-        if scheduler == "nohup":
-            lines = [line.strip() for line in cmd.splitlines() if line.strip()]
-            if nohup_max_jobs > 0:
-                parts = [f"MAX_JOBS={nohup_max_jobs}"]
-                for line in lines:
-                    parts.append('while [ "$(jobs -pr | wc -l)" -ge "$MAX_JOBS" ]; do sleep 2; done')
-                    parts.append(f"{line} &")
-                parts.append("wait")
-                text = "\n".join(parts) + "\n"
-            else:
-                text = "\n".join([f"{line} &" for line in lines] + ["wait"]) + "\n"
-        else:
-            text = cmd if cmd.endswith("\n") else (cmd + "\n")
-        sh.write_text(text, encoding="utf-8")
-        sh.chmod(0o755)
-
-        tstart = time.time()
-
-        if status == 1:
-            print(f"Step-{num} completed! (skip)")
-            continue
-
-        if status == -1:
-            raise ValueError(f"Step-{num} inputs not exists: {ifiles}")
-
-        # status == 0
-        print(f"Run Step-{num}: {sh}")
-        # 真实执行 + 检查退出码
-        subprocess.run(["bash", str(sh)], check=True)
-
-        # 等待输出出现（如果命令同步产生输出，这里一般很快结束）
-        while True:
-            if node(ifiles, ofiles) == 1:
-                print(f"\nStep-{num} completed!")
-                break
-            print(f"\rWaiting outputs... time={time.time() - tstart:.1f}s", end="")
-            time.sleep(60)
 
 
 def main(yamlpath:PathLike):
@@ -118,7 +42,7 @@ def main(yamlpath:PathLike):
         fq2 = samples_fq[sample]["fq2"]
         cmd_fastp = fastp(sample, fq1, fq2, cleanfolder, core)
         step1_lines.append(
-            _wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler)
+            wrap_cmd(cmd_fastp, f"fastp.{sample}", core, scheduler)
         )
     step1 = "\n".join(step1_lines)
 
@@ -136,7 +60,7 @@ def main(yamlpath:PathLike):
         r2 = cleanfolder / f"{sample}.R2.clean.fastq.gz"
         cmd_bwa = bwamem(reference, sample, r1, r2, mappingfolder, 64)
         step2_lines.append(
-            _wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler)
+            wrap_cmd(cmd_bwa, f"bwamem.{sample}", 64, scheduler)
         )
     step2 = "\n".join(step2_lines)
 
@@ -150,7 +74,7 @@ def main(yamlpath:PathLike):
         bam = mappingfolder / f"{sample}.sorted.bam"
         cmd_md = markdup(sample, bam, mappingfolder, 16, 200)
         step3_lines.append(
-            _wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler)
+            wrap_cmd(cmd_md, f"markdup.{sample}", 16, scheduler)
         )
     step3 = "\n".join(step3_lines)
 
@@ -165,7 +89,7 @@ def main(yamlpath:PathLike):
         for chrom in CHROM:
             cmd_g = bam2gvcf(reference, sample, md_bam, chrom, gvcffolder, 2)
             step4_lines.append(
-                _wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler)
+                wrap_cmd(cmd_g, f"bam2gvcf.{sample}.{chrom}", 2, scheduler)
             )
     step4 = "\n".join(step4_lines)
 
@@ -180,7 +104,7 @@ def main(yamlpath:PathLike):
         gvcfs = [gvcffolder / f"{s}.{chrom}.g.vcf.gz" for s in samples]
         cmd_c = cgvcf(reference, chrom, gvcfs, mergefolder)
         step5_lines.append(
-            _wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler)
+            wrap_cmd(cmd_c, f"cgvcf.{chrom}", 1, scheduler)
         )
     step5 = "\n".join(step5_lines)
 
@@ -199,7 +123,7 @@ def main(yamlpath:PathLike):
             f'{vcf2table(reference, chrom, mergefolder)}'
         )
         step6_lines.append(
-            _wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler)
+            wrap_cmd(cmd6, f"gvcf2vcf.{chrom}", 1, scheduler)
         )
     step6 = "\n".join(step6_lines)
 

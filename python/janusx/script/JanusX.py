@@ -11,7 +11,7 @@ import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.backends.backend_pdf # pdf support
 import matplotlib.backends.backend_svg # svg support
-from janusx.script import gwas,gs,postGWAS,grm,pca,sim,gmerge
+from janusx.script import gwas,gs,postGWAS,grm,pca,sim,gmerge,fastq2vcf
 from importlib.metadata import version, PackageNotFoundError
 try:
     v = version("janusx")
@@ -36,8 +36,10 @@ __version__ = (
 )
 
 def main():
-    module = dict(zip(['gwas','postGWAS','grm','pca','gs','sim','gmerge'],
-                      [gwas,postGWAS,grm,pca,gs,sim,gmerge]))
+    module = dict(zip(
+        ['gwas','postGWAS','grm','pca','gs','sim','gmerge','fastq2vcf'],
+        [gwas,postGWAS,grm,pca,gs,sim,gmerge,fastq2vcf],
+    ))
     print(__logo__)
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':

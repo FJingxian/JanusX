@@ -3,30 +3,30 @@ from typing import List,Union,Literal
 
 Pathlike = Union[Path,str]
 
-def node(ifiles:List[Pathlike],ofiles:List[Pathlike],cmd:str) -> tuple[str, Literal[-1,0,1]]:
-    '''
-    Docstring of node
+# def node(ifiles:List[Pathlike],ofiles:List[Pathlike],cmd:str) -> tuple[str, Literal[-1,0,1]]:
+#     '''
+#     Docstring of node
     
-    :param ifiles: Input files
-    :type ifiles: List[PathLike]
-    :param ofiles: Output files
-    :type ofiles: List[PathLike]
-    :param cmd: One cmd of pipelines
-    :type cmd: str
-    :param nodename: Nodename
-    :type nodename: str
-    :return: cmd, status number {-1: back to pre-node, 0: run cmd, 1: go to next-node}
-    :rtype: tuple[str, Literal[-1, 0, 1]]
-    '''
-    outexists = all(Path(ofile).exists() for ofile in ofiles)
-    inexists = all(Path(ifile).exists() for ifile in ifiles)
-    if outexists:
-        return f"Go to next node, because output files is exists:\n"+'\n'.join(map(str,ofiles)), 1
-    else:
-        if inexists:
-            return f"Runing: {cmd}", 0
-        else:
-            return f"Back to previous node, because input files is not exists:\n"+'\n'.join(map(str,ifiles)), -1
+#     :param ifiles: Input files
+#     :type ifiles: List[PathLike]
+#     :param ofiles: Output files
+#     :type ofiles: List[PathLike]
+#     :param cmd: One cmd of pipelines
+#     :type cmd: str
+#     :param nodename: Nodename
+#     :type nodename: str
+#     :return: cmd, status number {-1: back to pre-node, 0: run cmd, 1: go to next-node}
+#     :rtype: tuple[str, Literal[-1, 0, 1]]
+#     '''
+#     outexists = all(Path(ofile).exists() for ofile in ofiles)
+#     inexists = all(Path(ifile).exists() for ifile in ifiles)
+#     if outexists:
+#         return f"Go to next node, because output files is exists:\n"+'\n'.join(map(str,ofiles)), 1
+#     else:
+#         if inexists:
+#             return f"Runing: {cmd}", 0
+#         else:
+#             return f"Back to previous node, because input files is not exists:\n"+'\n'.join(map(str,ifiles)), -1
 
 def indexREF(reference:Pathlike):
     """
@@ -48,9 +48,16 @@ def indexREF(reference:Pathlike):
         Shell command string that can be submitted to a scheduler or run via `os.system`.
     """
     reference = Path(reference)
-    return (f'samtools faidx {reference} && '
-            f'bwa index {reference} && '
-            f'gatk CreateSequenceDictionary -R {reference} -O {reference}.dict')
+    samtoolsidx = f'samtools faidx {reference}'
+    bwaidx = f'samtools faidx {reference}'
+    gatkidx = (f"gatk CreateSequenceDictionary -R {reference} -O "
+               f"{reference.replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict")
+    if Path(f"{reference.replace('fasta.gz','').replace('fa.gz','').replace('fasta','').replace('fasta','')}.dict").exists:
+        return f"echo 'all index exist'"
+    else:
+        return (f'{samtoolsidx} && '
+                f'{bwaidx} && '
+                f'{gatkidx}')
 
 def fastp(sample:str, fastq1:Pathlike, fastq2:Union[Pathlike,None]=None,
           out:Pathlike='.',core=4):

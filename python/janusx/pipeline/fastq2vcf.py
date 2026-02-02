@@ -1,5 +1,4 @@
 from pathlib import Path
-from readline import backend
 from typing import Any, Literal, Union, Dict
 import itertools
 from janusx.pipeline.pipeline import pipeline,wrap_cmd
@@ -12,6 +11,124 @@ PathLike = Union[Path, str]
 
 
 def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","csub"]="csub",nohup_max_jobs:int=2,singularity:str=''):
+    """
+    Run an end-to-end FASTQ→VCF pipeline (fastp → bwa-mem → markdup → gVCF → joint-calling → SNP filtering → TSV).
+
+    This function generates per-sample QC/clean FASTQ files, maps reads to a reference genome,
+    marks duplicates, calls gVCF per sample per chromosome, performs per-chromosome joint genotyping,
+    extracts SNPs, filters them, and finally exports SNP tables (TSV) per chromosome.
+
+    The pipeline is executed through `janusx.pipeline.pipeline.pipeline()` and each step command is
+    wrapped by `wrap_cmd()` to support different execution backends (e.g. cluster submission or nohup)
+    and optional Singularity container execution.
+
+    Parameters
+    ----------
+    metadata : dict, optional
+        A configuration dictionary describing reference, chromosomes and FASTQ inputs.
+        Required keys:
+          - "reference": str | Path
+              Path to the reference genome FASTA.
+          - "chrom": list[str]
+              Chromosome/contig names to process (e.g. ["Chr01", "Chr02", ...]).
+          - "samples": dict[str, dict[str, Any]]
+              Sample FASTQ mapping. Each sample must include:
+                - "fq1": str | Path  (R1 fastq.gz)
+                - "fq2": str | Path  (R2 fastq.gz)
+
+        Example:
+            metadata = {
+              "reference": "/path/ref.fa",
+              "chrom": ["Chr01", "Chr02"],
+              "samples": {
+                "S1": {"fq1": "S1_R1.fq.gz", "fq2": "S1_R2.fq.gz"},
+                "S2": {"fq1": "S2_R1.fq.gz", "fq2": "S2_R2.fq.gz"},
+              }
+            }
+
+    workdir : PathLike, default="."
+        Working directory for all outputs. The function creates the following subdirectories
+        under `workdir`:
+          - 1.clean/   : cleaned FASTQs + fastp reports
+          - 2.mapping/ : sorted BAMs, markdup BAMs, metrics
+          - 3.gvcf/    : per-sample per-chrom gVCFs and indexes
+          - 4.merge/   : joint-called per-chrom merged gVCFs/VCFs and SNP tables
+
+    backbend : {"nohup", "csub"}, default="csub"
+        Execution backend passed to `wrap_cmd()` and `pipeline()`.
+        - "csub": submit jobs to a cluster scheduler (implementation depends on your wrapper).
+        - "nohup": run commands locally with nohup, using `nohup_max_jobs` to limit concurrency.
+
+    nohup_max_jobs : int, default=2
+        Max number of concurrent jobs when `backbend="nohup"`.
+
+    singularity : str, default=""
+        Optional Singularity execution prefix passed to `wrap_cmd()`. If provided, commands
+        will be executed inside the container. Typical value example:
+            singularity="singularity exec /path/image.sif"
+        or empty string to run on host.
+
+    Outputs
+    -------
+    Directory structure (under `workdir`):
+      - 1.clean/
+          {sample}.R1.clean.fastq.gz
+          {sample}.R2.clean.fastq.gz
+          {sample}.html
+          {sample}.json
+      - 2.mapping/
+          {sample}.sorted.bam
+          {sample}.sorted.bam.finished
+          {sample}.Markdup.bam
+          {sample}.Markdup.metrics.txt
+      - 3.gvcf/
+          {sample}.{chrom}.g.vcf.gz
+          {sample}.{chrom}.g.vcf.gz.tbi
+      - 4.merge/
+          Merge.{chrom}.g.vcf.gz
+          Merge.{chrom}.g.vcf.gz.tbi
+          Merge.{chrom}.vcf.gz / related outputs (depending on helper functions)
+          Merge.{chrom}.SNP.tsv
+
+    Pipeline Steps
+    --------------
+    1) fastp (per-sample)
+       - Input: raw fq1/fq2
+       - Output: cleaned FASTQs + HTML/JSON reports
+
+    2) bwa-mem mapping (per-sample)
+       - Input: cleaned FASTQs + reference
+       - Output: sorted BAM + ".finished" marker
+
+    3) mark duplicates (per-sample)
+       - Input: sorted BAM
+       - Output: Markdup BAM + metrics file
+
+    4) gVCF calling (per-sample × per-chrom)
+       - Input: Markdup BAM + reference
+       - Output: {sample}.{chrom}.g.vcf.gz + .tbi
+
+    5) joint genotyping / merge (per-chrom)
+       - Input: all samples' gVCF of one chrom
+       - Output: Merge.{chrom}.g.vcf.gz + .tbi
+
+    6) VCF conversion + SNP extraction + filtering + table export (per-chrom)
+       - Converts merged gVCF → VCF, extracts SNPs, applies filters, selects filtered SNPs,
+         and exports per-chromosome SNP table.
+
+    Notes
+    -----
+    - This function expects all helper command builders (`fastp`, `bwamem`, `markdup`, `bam2gvcf`,
+      `cgvcf`, `gvcf2vcf`, `vcf2snpvcf`, `filtersnp`, `selectfiltersnp`, `vcf2table`) to be
+      available and correctly configured for your environment (tools in PATH or inside container).
+    - `workdir` should be a filesystem location with sufficient space for intermediate BAM/gVCF files.
+    - Make sure `metadata["chrom"]` matches contig names in the reference FASTA.
+
+    Returns
+    -------
+    None
+        The function dispatches jobs via `pipeline()` and does not return a value.
+    """
     Path("log").mkdir(exist_ok=True)
     scheduler = str(backbend).lower()
     nohup_max_jobs = int(nohup_max_jobs)

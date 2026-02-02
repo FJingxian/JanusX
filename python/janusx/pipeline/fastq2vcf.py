@@ -4,7 +4,7 @@ import itertools
 from janusx.pipeline.pipeline import pipeline,wrap_cmd
 from janusx.pipeline._fastq2gvcf import (
     filtersnp, gvcf2vcf, fastp, bwamem, markdup, bam2gvcf, cgvcf,
-    selectfiltersnp, vcf2snpvcf, vcf2table
+    selectfiltersnp, vcf2snpvcf, vcf2table,indexREF
 )
 
 PathLike = Union[Path, str]

@@ -54,7 +54,7 @@ def indexREF(reference:Pathlike, singularity: str = ""):
     reference = Path(reference)
     prefix = _singularity_prefix(singularity)
     samtoolsidx = f'{prefix}samtools faidx {reference}'
-    bwaidx = f'{prefix}samtools faidx {reference}'
+    bwaidx = f'{prefix}bwa index {reference}'
     outdict = f"{str(reference).replace('.fasta.gz','').replace('.fa.gz','').replace('.fasta','').replace('.fasta','')}.dict"
     gatkidx = f"{prefix}gatk CreateSequenceDictionary -R {reference} -O {outdict}"
     if Path(gatkidx).exists():

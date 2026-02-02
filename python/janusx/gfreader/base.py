@@ -1,15 +1,12 @@
-import time
 from importlib.metadata import version, PackageNotFoundError
 from typing import Literal
 try:
     v = version("janusx")
 except PackageNotFoundError:
     v = "0.0.0"
-from itertools import takewhile,repeat
 from .gfreader import load_genotype_chunks, inspect_genotype_file
 import numpy as np
 import pandas as pd
-import gzip
 import psutil
 from tqdm import tqdm
 import os

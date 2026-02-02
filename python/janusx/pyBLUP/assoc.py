@@ -46,6 +46,7 @@ from tqdm import trange
 # Rust core kernels (PyO3 extension)
 from janusx.janusx import (
     glmf32,
+    glmf32_full,
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
     ml_loglike_null_f32,
@@ -1209,5 +1210,27 @@ def farmcpu(
     beta_se = FEMresult[:, [0, 1]]
     p = FEMresult[:, -1]
     p[QTNidx] = QTNpval
+
+    # Sync beta/se for QTNs using the SNP rows that minimize each QTN p-value.
+    if QTNidx.size > 0:
+        qtn_cols = slice(2 + X.shape[1], -1)
+        min_idx = np.nanargmin(FEMresult[:, qtn_cols], axis=0)
+        M_sub = np.ascontiguousarray(M[min_idx], dtype=np.float32)
+        ixx = np.ascontiguousarray(np.linalg.pinv(X_QTN.T @ X_QTN), dtype=np.float64)
+        full = glmf32_full(
+            np.ascontiguousarray(y, dtype=np.float64).ravel(),
+            np.ascontiguousarray(X_QTN, dtype=np.float64),
+            ixx,
+            M_sub,
+            int(M_sub.shape[0]),
+            int(threads),
+        )
+        full = np.asarray(full)
+        qtn_offset = X.shape[1]
+        for j, qidx in enumerate(QTNidx):
+            coef_idx = qtn_offset + j
+            base = 3 * coef_idx
+            beta_se[qidx, 0] = full[j, base]
+            beta_se[qidx, 1] = full[j, base + 1]
 
     return np.concatenate([beta_se, p.reshape(-1, 1)], axis=1)

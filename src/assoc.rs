@@ -377,6 +377,168 @@ pub fn glmf32<'py>(
     Ok(out)
 }
 
+/// Full GLM interface (returns beta/se/p for all coefficients).
+///
+/// Returns: (m, 3 * (q0 + 1)) float64
+///   For each coefficient j (0..q0 covariates, q0 is SNP):
+///     col[3*j+0] = beta_j
+///     col[3*j+1] = se_j
+///     col[3*j+2] = p_j
+#[pyfunction]
+#[pyo3(signature = (y, x, ixx, g, step=10000, threads=0))]
+pub fn glmf32_full<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    ixx: PyReadonlyArray2<'py, f64>,
+    g: PyReadonlyArray2<'py, f32>,
+    step: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let y = y.as_slice()?;
+    let x_arr = x.as_array();
+    let ixx_arr = ixx.as_array();
+    let g_arr = g.as_array();
+
+    let n = y.len();
+    let (xn, q0) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+    }
+    if g_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "G must be shape (m, n) for float32 fast path",
+        ));
+    }
+    if n <= q0 + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n too small: require n > q0+1, got n={n}, q0={q0}"
+        )));
+    }
+
+    let m = g_arr.shape()[0];
+    let dim = q0 + 1;
+    let row_stride = dim * 3;
+
+    let x_flat: Vec<f64> = x_arr.iter().cloned().collect();
+    let ixx_flat: Vec<f64> = ixx_arr.iter().cloned().collect();
+
+    let mut xy = vec![0.0; q0];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x_flat[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
+        }
+    }
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+
+    let out = PyArray2::<f64>::zeros(py, [m, row_stride], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+
+    let pool = if threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    py.detach(|| {
+        let mut runner = || {
+            let mut i_marker = 0usize;
+            while i_marker < m {
+                let cnt = std::cmp::min(step, m - i_marker);
+                let block = &mut out_slice[i_marker * row_stride..(i_marker + cnt) * row_stride];
+
+                block
+                    .par_chunks_mut(row_stride)
+                    .enumerate()
+                    .for_each_init(
+                        || GlmScratch::new(q0),
+                        |scr, (l, row_out)| {
+                            let idx = i_marker + l;
+                            scr.reset_xs();
+
+                            let mut sy = 0.0_f64;
+                            let mut ss = 0.0_f64;
+
+                            for k in 0..n {
+                                let gv = g_arr[(idx, k)] as f64;
+                                sy += gv * y[k];
+                                ss += gv * gv;
+
+                                let row = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += row[j] * gv;
+                                }
+                            }
+
+                            xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
+                            let t2 = dot(&scr.b21, &scr.xs);
+                            let b22 = ss - t2;
+
+                            let (invb22, df) = if b22 < 1e-8 {
+                                (0.0, (n as i32) - (q0 as i32))
+                            } else {
+                                (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                            };
+                            if df <= 0 {
+                                row_out.fill(f64::NAN);
+                                return;
+                            }
+
+                            build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+
+                            scr.rhs[..q0].copy_from_slice(&xy);
+                            scr.rhs[q0] = sy;
+
+                            matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+
+                            let beta_rhs = dot(&scr.beta, &scr.rhs);
+                            let ve = (yy - beta_rhs) / (df as f64);
+
+                            for ff in 0..dim {
+                                let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+                                let t = scr.beta[ff] / se;
+                                let base = 3 * ff;
+                                row_out[base] = scr.beta[ff];
+                                row_out[base + 1] = se;
+                                row_out[base + 2] = student_t_p_two_sided(t, df);
+                            }
+
+                            if invb22 == 0.0 {
+                                let base = 3 * q0;
+                                row_out[base] = f64::NAN;
+                                row_out[base + 1] = f64::NAN;
+                                row_out[base + 2] = f64::NAN;
+                            }
+                        },
+                    );
+
+                i_marker += cnt;
+            }
+        };
+
+        if let Some(p) = &pool {
+            p.install(runner);
+        } else {
+            runner();
+        }
+    });
+
+    Ok(out)
+}
+
 // =============================================================================
 // LMM REML chunk (lmm_reml_chunk_f32)
 // =============================================================================

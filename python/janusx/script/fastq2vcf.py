@@ -242,6 +242,7 @@ def main():
 
         # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
         os.replace(tmp_path, sif_path)
+        print(f'Saved in {sif_path}')
 
     singularity_prefix = f"singularity exec {sif_path} "
     logger.info(f"Singularity: {singularity_prefix}")

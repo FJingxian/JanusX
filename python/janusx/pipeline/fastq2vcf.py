@@ -11,7 +11,7 @@ from janusx.pipeline._fastq2gvcf import (
 PathLike = Union[Path, str]
 
 
-def main(yamlpath:PathLike,workdir:PathLike=".",metadata:dict=None,backbend:Literal["nohup","csub"]="csub",nohup_max_jobs:int=2,singularity:str=''):
+def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","csub"]="csub",nohup_max_jobs:int=2,singularity:str=''):
     Path("log").mkdir(exist_ok=True)
     scheduler = str(backbend).lower()
     nohup_max_jobs = int(nohup_max_jobs)

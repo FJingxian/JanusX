@@ -40,3 +40,6 @@ ext/bin/*
 
 # Webapp test
 webapp
+
+# binaries
+bin

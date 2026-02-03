@@ -1,32 +1,13 @@
-"""Logic regression (Rust backend) Python interface.
+"""AND/NOT logic regression (Rust backend) Python interface.
 
-This module wraps the PyO3-exported function ``janusx.janusx.logregfit``.
-
-Quick start:
-    import numpy as np
-    from janusx.garfield.logreg import logreg_fit
-
-    x = np.array([
-        [0, 0],
-        [0, 1],
-        [1, 0],
-        [1, 1],
-    ], dtype=np.uint8)
-    y = np.array([0.0, 0.0, 1.0, 0.0], dtype=float)
-
-    model = logreg_fit(x, y, response="binary", select="anneal", ntrees=1, nleaves=4)
-    print(model.expression, model.score)
-
-Notes:
-- x must be a binary matrix (0/1). Shape: (n_samples, n_features)
-- For response="binary", y must be 0/1; for response="continuous", y is float.
-- seps is optional: a list of float covariate vectors (each length n_samples).
-- weights is optional: a length n_samples non-negative vector.
+This module wraps the PyO3-exported function ``janusx.janusx.fit_best_and_not``.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Literal, Optional, Sequence
+
+import numpy as np
 
 try:
     import numpy as _np  # optional
@@ -35,26 +16,24 @@ except Exception:  # pragma: no cover
 
 _backend_error = None
 try:
-    from janusx.janusx import logregfit as _logregfit
+    from janusx.janusx import fit_best_and_not as _fit_best_and_not
 except Exception as _exc:  # pragma: no cover
     _backend_error = _exc
-    _logregfit = None
+    _fit_best_and_not = None
 else:
     _backend_error = None
-
-__all__ = ["backend_available", "logregfit", "logreg_fit"]
 
 
 def backend_available() -> bool:
     """Return True if the Rust backend (janusx.janusx) is importable."""
-    return _logregfit is not None
+    return _fit_best_and_not is not None
 
 
 def _require_backend() -> None:
-    if _logregfit is None:
+    if _fit_best_and_not is None:
         raise ImportError(
             "janusx.janusx (Rust extension) is not available. "
-            "Build/install the extension before calling logregfit."
+            "Build/install the extension before calling fit_best_and_not."
         ) from _backend_error
 
 
@@ -82,85 +61,75 @@ def _to_f64_vector(y: Any) -> List[float]:
     return vec
 
 
-def _to_f64_matrix(seps: Optional[Sequence[Any]]) -> Optional[List[List[float]]]:
-    if seps is None:
-        return None
-    out: List[List[float]] = []
-    for col in seps:
-        out.append(_to_f64_vector(col))
-    return out
-
-
-def logregfit(
+def logreg(
     x: Any,
     y: Any,
     *,
-    response: str = "binary",
-    score: str = "loglik",
-    ntrees: int = 1,
-    nleaves: int = 8,
-    treesize: int = 8,
-    select: str = "anneal",
-    anneal_start: float = 0.0,
-    anneal_end: float = 0.0,
-    anneal_iter: int = 0,
-    anneal_earlyout: int = 0,
-    anneal_update: int = 0,
-    minmass: int = 0,
-    penalty: float = 0.0,
-    seed: int = 42,
-    allow_or: bool = True,
+    response: Literal['binary','continuous'] = "binary",
+    max_literals: int = 0,
+    allow_empty: bool = True,
     weights: Optional[Any] = None,
-    seps: Optional[Sequence[Any]] = None,
+    tags: Optional[Sequence[str]] = None,
 ):
-    """Fit a logic regression model via the Rust backend.
+    """Fit the best AND/NOT conjunction.
 
     Parameters
-    - x: binary matrix (list-of-lists or numpy array) of shape (n_samples, n_features)
-    - y: response vector (list or numpy array) length n_samples
+    - x: binary matrix (list-of-lists or numpy array) shape (n_samples, n_features)
+    - y: response vector length n_samples
     - response: "binary" or "continuous"
-    - score: "loglik" or "mse"
-    - ntrees, nleaves, treesize: tree structure parameters
-    - select: "anneal", "greedy", or "fast"
-    - anneal_*: annealing controls (if select="anneal")
-    - minmass: minimum support per literal (binary only)
-    - penalty: leaf penalty term
-    - seed: RNG seed
-    - allow_or: allow OR operators in the tree
-    - weights: optional sample weights
-    - seps: optional covariates (list of float vectors)
+    - max_literals: maximum number of literals in the conjunction (0 = no limit)
+    - allow_empty: allow empty conjunction (always true)
+    - weights: optional non-negative sample weights length n_samples
 
     Returns
-    - PyLogicRegModel with fields: expression, score, xcombine, betas, trace
+    - dict with keys: indices, expression, xcombine, score
+
+    Notes
+    - For response="binary", y must be 0/1 and score uses log-likelihood.
+    - For response="continuous", score uses mean squared error.
+    - xcombine is the predicted conjunction output (0/1) for each sample.
+    - tags can be used to render expression with custom feature names. If omitted,
+      default tags are X0..X{p-1} based on the number of features.
     """
     _require_backend()
     x_list = _to_u8_matrix(x)
     y_list = _to_f64_vector(y)
     w_list = _to_f64_vector(weights) if weights is not None else None
-    seps_list = _to_f64_matrix(seps)
-    return _logregfit(
+    if response == 'binary':
+        score = 'loglik'
+    elif response == 'continuous':
+        score = 'mse'
+    else:
+        raise ValueError(f'{response} is not continuous or binary.')
+    result = _fit_best_and_not(
         x_list,
         y_list,
         response=response,
         score=score,
-        ntrees=ntrees,
-        nleaves=nleaves,
-        treesize=treesize,
-        select=select,
-        anneal_start=anneal_start,
-        anneal_end=anneal_end,
-        anneal_iter=anneal_iter,
-        anneal_earlyout=anneal_earlyout,
-        anneal_update=anneal_update,
-        minmass=minmass,
-        penalty=penalty,
-        seed=seed,
-        allow_or=allow_or,
+        max_literals=max_literals,
+        allow_empty=allow_empty,
         weights=w_list,
-        seps=seps_list,
     )
+    if tags is None:
+        if not x_list or not x_list[0]:
+            tags = []
+        else:
+            tags = [f"X{i}" for i in range(len(x_list[0]))]
+    else:
+        if len(tags) == 0:
+            raise ValueError("tags must not be empty when provided")
 
-
-def logreg_fit(*args: Any, **kwargs: Any):
-    """Alias for logregfit (PEP8-friendly name)."""
-    return logregfit(*args, **kwargs)
+    literals = result["literals"]
+    parts = []
+    for idx, negated in literals:
+        if idx >= len(tags):
+            raise ValueError("tags length must cover all feature indices")
+        name = str(tags[idx])
+        parts.append(f"!{name}" if negated else name)
+    expression = " & ".join(parts) if parts else "1"
+    return {
+        "indices": result["indices"],
+        "expression": expression,
+        "xcombine": np.array([int(v) for v in result["xcombine"]]),
+        "score": float(result["score"]),
+    }

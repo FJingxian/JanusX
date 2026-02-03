@@ -1,14 +1,14 @@
 import time
+from typing import Any
 import pandas as pd
 from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
-import xgboost as xgb
-import typing
 from janusx.gfreader import load_genotype_chunks
-from janusx.pyBLUP.mlm import BLUP
-from janusx.pyBLUP.assoc import SUPER, FEM
-from janusx.garfield.logreg import logregfit
+from janusx.pyBLUP.assoc import SUPER
+from janusx.garfield.logreg import logreg
+from joblib import Parallel,delayed
+
 def timer(func):
     def wrapper(*args,**kwargs):
         t = time.time()
@@ -17,50 +17,72 @@ def timer(func):
         return result
     return wrapper
 
-@timer
-def getImp(y: np.ndarray, M: np.ndarray,
-           nsnp: int = 5, n_estimators: int = 100, threads: int = -1,
-           engine: typing.Literal['rf','blup','xgb']='rf'):
+# @timer
+def getLogicgate(y: np.ndarray, M: np.ndarray,
+           nsnp: int = 5, n_estimators: int = 200,
+           sites:Any=None):
+    '''
+    chrom
+    pos
+    ref_allele
+    alt_allele
+    '''
+    if sites is not None:
+        sites = np.array([f'{i.chrom}_{i.pos}' for i in sites])
+    else:
+        sites = np.arange(M.shape[0])
+    keep = SUPER(np.corrcoef(M),np.ones(M.shape[0]),thr=0.8)
+    M = M[keep]
+    sites = sites[keep]
     y = y.ravel()
-    M = M - M.mean(axis=1,keepdims=True)
     Imp = None
-    if engine == 'rf':
-        rf = RandomForestRegressor(n_estimators=n_estimators,min_samples_leaf=nsnp,bootstrap=True,n_jobs=threads)
-        rf.fit(M.T,y)
-        PI = permutation_importance(rf,M.T,y,scoring='r2',n_jobs=threads)
-        Imp = PI.importances_mean
-    elif engine == 'blup':
-        model = BLUP(y,M,kinship=None)
-        Imp = np.abs(model.u.ravel())
-    elif engine == 'xgb':
-        model = xgb.XGBRegressor(n_estimators=n_estimators,max_depth=3,
-                                learning_rate=0.05,
-                                subsample=0.8,
-                                colsample_bytree=0.8,
-                                objective="reg:squarederror",
-                                n_jobs=threads,
-                                tree_method="hist")
-        model = model.fit(M.T,y,)
-        PI = permutation_importance(
-            model, M.T, y,
-            scoring='r2',
-            n_jobs=threads,
-            random_state=222
-        )
-        Imp = PI.importances_mean
-    return Imp
+    rf = RandomForestRegressor(n_estimators=n_estimators,max_depth=nsnp,bootstrap=True,n_jobs=1)
+    rf.fit(M.T,y)
+    PI = permutation_importance(rf,M.T,y,scoring='r2',n_jobs=1)
+    Imp = PI.importances_mean
+    topk = nsnp
+    idx = np.argsort(Imp)[::-1][:topk]
+    Mchoice = (M[idx]/2).astype(int).T
+    return logreg(Mchoice, y, response="continuous",tags=sites[idx])
 
+def process(ChromPos:tuple,genofile,sampleid,y):
+    chrom,start,end = ChromPos
+    chunks = load_genotype_chunks(genofile,chunk_size=1e6,maf=0.02,missing_rate=0.05,impute=True,bim_range=(str(chrom),start,end),sample_ids=sampleid)
+    for chunk,sites in chunks:
+        result = getLogicgate(y,chunk,sites=sites)
+    return
+
+def main():
+    phenofile = "../Garfield/example/test.trait.txt"
+    genofile = "../Garfield/example/test.genotype"
+    bedfile = "../Garfield/example/test.geneAnno.bed"
+    windowsize = 100_000
+    threads = 4
+    bed = pd.read_csv(bedfile,sep='\t',header=None,index_col=0)
+    if bed.size == 0:
+        # space split?
+        bed = pd.read_csv(bedfile,sep=' ',header=None,index_col=0)
+        if bed.size == 0:
+            raise ValueError(f"Error in Phenotype file:\n{bed}")
+    bed = bed.reset_index()
+    bed[1]-=windowsize
+    bed[2]+=windowsize
+    bedlist = [(bed.loc[i,0],bed.loc[i,1],bed.loc[i,2]) for i in bed.index]
+    pheno = pd.read_csv(phenofile,sep='\t',header=None,index_col=0)
+    if pheno.size == 0:
+        # space split?
+        pheno = pd.read_csv(phenofile,sep=' ',header=None,index_col=0)
+        if pheno.size == 0:
+            raise ValueError(f"Error in Phenotype file:\n{pheno}")
+    if all(pheno.index==pheno[1]):
+        # Phenotype format of plink
+        pheno = pheno.iloc[:,1:]
+    else:
+        # Phenotype format of normal excel
+        pheno.columns = pheno.iloc[0,:]
+        pheno = pheno.iloc[1:,:]
+    pheno = pheno.iloc[:,0].dropna().to_frame()
+    Parallel(n_jobs=threads,backend='loky')(delayed(process)(ChromPos,genofile,pheno.index,pheno.values) for ChromPos in bedlist)
 
 if __name__ == '__main__':
-    pheno = pd.read_csv('/Users/jingxianfu/script/JanusX/example/mouse_hs1940.pheno',sep='\t',index_col=0).iloc[:,0].dropna().to_frame()
-    chunks = load_genotype_chunks("./test/mouse_hs1940",chunk_size=1e6,maf=0.02,missing_rate=0.05,impute=True,bim_range=('1',0,50_000_000),sample_ids=pheno.index)
-    for chunk,sites in chunks:
-        keep = SUPER(np.corrcoef(chunk),np.ones(chunk.shape[0]),thr=0.8)
-        chunk = chunk[keep]/2 # 去除彼此之间最相关的
-        print(chunk.shape)
-        Imp = getImp(pheno.values, chunk)
-        topk = 5
-        idx = np.argsort(Imp)[::-1][:topk]
-        top_imps = Imp[idx]
-        result = logregfit(chunk[idx].astype(int).T,pheno.values.ravel(),response="continuous",score='mse')
-        print(result)
+    main()

@@ -24,7 +24,7 @@ use gfreader::{SiteInfo, BedChunkReader, VcfChunkReader, PlinkStreamWriter, VcfS
 use gmerge::{merge_genotypes, PyMergeStats, convert_genotypes, PyConvertStats};
 use bayes::{bayesa, bayesb, bayescpi};
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
-use logreg::{PyLogicRegModel,logregfit};
+use logreg::fit_best_and_not_py;
 // ============================================================
 // PyO3 module exports
 // ============================================================
@@ -38,7 +38,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SiteInfo>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
-    m.add_class::<PyLogicRegModel>()?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
@@ -54,6 +53,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi, m)?)?;
-    m.add_function(wrap_pyfunction!(logregfit, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
     Ok(())
 }

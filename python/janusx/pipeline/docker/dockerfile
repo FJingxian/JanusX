@@ -2,7 +2,7 @@ FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-ARG GATK_VER="4.6.1.0"
+ARG GATK_VER="4.6.2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget unzip git \
@@ -16,11 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel
 
 WORKDIR /opt
-
+# https://github.com/broadinstitute/gatk.git
 RUN mkdir -p /opt/gatk \
-    && wget -O /opt/gatk/gatk-${GATK_VER}.zip \
-        https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip \
-    && unzip /opt/gatk/gatk-${GATK_VER}.zip -d /opt/gatk \
+    && git clone https://github.com/broadinstitute/gatk.git /opt/gatk \
+    && (cd /opt/gatk && ./gradlew bundle) \
     && rm -f /opt/gatk/gatk-${GATK_VER}.zip
 
 ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH"

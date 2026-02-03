@@ -1,7 +1,6 @@
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-
 ARG GATK_VER="4.6.2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,19 +9,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     openjdk-17-jre-headless \
     bwa samtools fastp \
+    libgomp1 \
  && ln -sf /usr/bin/python3 /usr/local/bin/python \
  && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel
 
 WORKDIR /opt
-# https://github.com/broadinstitute/gatk.git
+
 RUN mkdir -p /opt/gatk \
-    && git clone https://github.com/broadinstitute/gatk.git /opt/gatk \
-    && (cd /opt/gatk && ./gradlew bundle) \
+    && wget -O /opt/gatk/gatk-${GATK_VER}.zip \
+        https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip \
+    && unzip /opt/gatk/gatk-${GATK_VER}.zip -d /opt/gatk \
     && rm -f /opt/gatk/gatk-${GATK_VER}.zip
 
-ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH"
+ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH" \
+    GATK_LOCAL_JAR="/opt/gatk/gatk-${GATK_VER}/gatk-package-${GATK_VER}-local.jar" \
+    MALLOC_ARENA_MAX=2 \
+    JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
 
 WORKDIR /work
 

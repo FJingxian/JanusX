@@ -5,7 +5,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
 from janusx.gfreader import load_genotype_chunks
-from janusx.pyBLUP.assoc import SUPER
+from janusx.pyBLUP.assoc import SUPER,FEM
 from janusx.garfield.logreg import logreg
 from joblib import Parallel,delayed
 
@@ -43,14 +43,20 @@ def getLogicgate(y: np.ndarray, M: np.ndarray,
     topk = nsnp
     idx = np.argsort(Imp)[::-1][:topk]
     Mchoice = (M[idx]/2).astype(int).T
-    return logreg(Mchoice, y, response="continuous",tags=sites[idx])
+    resdict = logreg(Mchoice, y, response="continuous",tags=sites[idx])
+    XcombineM = np.concatenate([resdict['xcombine'].reshape(1,-1),M/2],axis=0)
+    print(XcombineM.shape)
+    print(resdict['expression'])
+    pval = FEM(y.reshape(-1,1),np.ones((y.size, 1)),XcombineM,threads=4)
+    print(pval[:,-1])
+    return resdict
 
 def process(ChromPos:tuple,genofile,sampleid,y):
     chrom,start,end = ChromPos
     chunks = load_genotype_chunks(genofile,chunk_size=1e6,maf=0.02,missing_rate=0.05,impute=True,bim_range=(str(chrom),start,end),sample_ids=sampleid)
     for chunk,sites in chunks:
         result = getLogicgate(y,chunk,sites=sites)
-    return
+    return result
 
 def main():
     phenofile = "../Garfield/example/test.trait.txt"
@@ -82,7 +88,8 @@ def main():
         pheno.columns = pheno.iloc[0,:]
         pheno = pheno.iloc[1:,:]
     pheno = pheno.iloc[:,0].dropna().to_frame()
-    Parallel(n_jobs=threads,backend='loky')(delayed(process)(ChromPos,genofile,pheno.index,pheno.values) for ChromPos in bedlist)
+    results = Parallel(n_jobs=1,backend='loky')(delayed(process)(ChromPos,genofile,pheno.index,pheno.values) for ChromPos in bedlist)
+    # print(results)
 
 if __name__ == '__main__':
     main()

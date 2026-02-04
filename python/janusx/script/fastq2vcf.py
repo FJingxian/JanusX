@@ -242,20 +242,20 @@ def main():
 
         # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
         os.replace(tmp_path, sif_path)
-        print(f'Saved in {sif_path}')
+        logger.info(f'Saved in {sif_path}')
 
     singularity_prefix = f"singularity exec {sif_path} "
     logger.info(f"Singularity: {singularity_prefix}")
 
     fai_path = Path(f"{reference}.fai")
     ann_path = Path(f"{reference}.ann")
-    if not fai_path.exists() and not ann_path:
+    if not fai_path.exists() or not ann_path.exists():
         cmd = indexREF(str(reference), singularity=singularity_prefix)
         logger.info(f"Indexing reference: {cmd}")
         index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
         subprocess.run(index_job, shell=True, check=True, cwd=workdir)
         logger.info("Waiting for FASTA index (.fai) to be ready...")
-        while not fai_path.exists() and not ann_path:
+        while not fai_path.exists() or not ann_path.exists:
             time.sleep(5)
 
     chrom = read_chroms_from_fai(reference)

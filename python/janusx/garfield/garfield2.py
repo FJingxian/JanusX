@@ -1,7 +1,13 @@
 from typing import Any, Iterable, List, Tuple, Union
+import warnings
 import numpy as np
 
 from sklearn.ensemble import RandomForestRegressor
+
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`*",
+)
 
 from janusx.gfreader import load_genotype_chunks
 from janusx.pyBLUP.assoc import SUPER
@@ -35,8 +41,9 @@ def getLogicgate(
     rf = RandomForestRegressor(
         n_estimators=n_estimators,
         max_depth=nsnp,
+        min_samples_leaf=nsnp,
         bootstrap=True,
-        n_jobs=-1,
+        n_jobs=1,
         random_state=0,
     )
     rf.fit(M.T, y)

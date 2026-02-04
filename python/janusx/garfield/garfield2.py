@@ -1,8 +1,6 @@
-from ctypes import Union
-from typing import Any, Iterable, List, Tuple
+from typing import Any, Iterable, List, Tuple, Union
 import numpy as np
 
-from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestRegressor
 
 from janusx.gfreader import load_genotype_chunks
@@ -38,20 +36,11 @@ def getLogicgate(
         n_estimators=n_estimators,
         max_depth=nsnp,
         bootstrap=True,
-        n_jobs=1,
+        n_jobs=-1,
         random_state=0,
     )
     rf.fit(M.T, y)
-
-    PI = permutation_importance(
-        rf,
-        M.T,
-        y,
-        scoring="r2",
-        n_jobs=1,
-        random_state=0,
-    )
-    Imp = PI.importances_mean
+    Imp = rf.feature_importances_
 
     topk = nsnp
     idx = np.argsort(Imp)[::-1][:topk]
@@ -134,7 +123,6 @@ def process_one_region(
         # 某个区间出错时，不让整个并行崩掉
         print(f"[WARN] process {ChromPos} failed: {e}")
         return None
-    chrom, start, end = ChromPos[0]
     mid = int((start + end) / 2)
 
     site = (str(chrom), int(mid), "A", "T")

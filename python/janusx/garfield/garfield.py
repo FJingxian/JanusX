@@ -1,31 +1,19 @@
-import time
 from typing import Any
 import pandas as pd
 from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
 from janusx.gfreader import load_genotype_chunks
-from janusx.pyBLUP.assoc import SUPER,FEM
+from janusx.pyBLUP.assoc import SUPER
 from janusx.garfield.logreg import logreg
 from joblib import Parallel,delayed
 
-def timer(func):
-    def wrapper(*args,**kwargs):
-        t = time.time()
-        result = func(*args,**kwargs)
-        print(f'Time cost: {time.time()-t:.2f} secs')
-        return result
-    return wrapper
-
-# @timer
 def getLogicgate(y: np.ndarray, M: np.ndarray,
            nsnp: int = 5, n_estimators: int = 200,
            sites:Any=None):
     '''
-    chrom
-    pos
-    ref_allele
-    alt_allele
+    通过随机森林 + permutation importance + 逻辑回归
+    在一段基因型矩阵中寻找逻辑组合 (xcombine)
     '''
     if sites is not None:
         sites = np.array([f'{i.chrom}_{i.pos}' for i in sites])
@@ -44,12 +32,14 @@ def getLogicgate(y: np.ndarray, M: np.ndarray,
     idx = np.argsort(Imp)[::-1][:topk]
     Mchoice = (M[idx]/2).astype(int).T
     resdict = logreg(Mchoice, y, response="continuous",tags=sites[idx])
-    XcombineM = np.concatenate([resdict['xcombine'].reshape(1,-1),M/2],axis=0)
-    print(XcombineM.shape)
-    print(resdict['expression'])
-    pval = FEM(y.reshape(-1,1),np.ones((y.size, 1)),XcombineM,threads=4)
-    print(pval[:,-1])
-    return resdict
+    # XcombineM = np.concatenate([resdict['xcombine'].reshape(1,-1),M/2],axis=0)
+    # candiSNP = sites[idx][resdict['indices']]
+    # pval = FEM(y.reshape(-1,1),np.ones((y.size, 1)),XcombineM,threads=4)
+    # testshow = pd.DataFrame([-np.log10(pval[:,-1]).round(3),np.append([resdict['expression']],sites)],).T.sort_values(0)
+    # testshow[2] = list(map(lambda x:'*' if x in candiSNP else '',testshow[1]))
+    # print(testshow[[1,2,0]])
+    # print('mse:',resdict['score'])
+    return resdict['xcombine']
 
 def process(ChromPos:tuple,genofile,sampleid,y):
     chrom,start,end = ChromPos

@@ -272,6 +272,7 @@ class LMM:
             XTVinvy = (self.utx.T * self.vinv) @ self.uty
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
             self.r = self.uty-self.utx@self.beta
+            self.g = self.ss * self.vinv * self.u @ self.r
         else:
             self.FaST:bool = True
             self.ss:NDArray;self.u:NDArray
@@ -306,6 +307,7 @@ class LMM:
             self.beta = np.linalg.solve(XTVinvX, XTVinvy)
             self.r1 = self.uty-self.utx@self.beta
             self.r2 = self.u2ty-self.u2tx@self.beta
+            self.g = self.ss * self.v1inv * self.u @ self.r1 + self.v2inv * self.r2
         varg = varg = self.ss.sum()/n#(trace(K)/n)
         vare = lbd
         self.loglbd = np.log10(lbd)

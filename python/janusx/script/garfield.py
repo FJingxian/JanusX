@@ -1,35 +1,9 @@
+import os
 from pathlib import Path
-import numpy as np
 import pandas as pd
-from multiprocessing import freeze_support
-from tqdm import tqdm
-from janusx.garfield.garfield2 import iter_main
-from janusx.gfreader import SiteInfo,save_genotype_streaming
-
-def main(bfile,y,sampleid,bimranges,threads=1):
-    SNPIter = iter_main(bfile, y, sampleid, bimranges, threads=threads)
-    Sites2Genofile = []
-    G2Genofile = []
-    pbar = tqdm(total=len(bimranges), desc="Processing regions", mininterval=0, miniters=1)
-    try:
-        for res in SNPIter:
-            pbar.update(1)
-            pbar.refresh()
-            if res is None:
-                continue
-            g, site = res
-            Sites2Genofile.append(SiteInfo(*site))
-            G2Genofile.append(g)
-            if len(Sites2Genofile) > 100:
-                yield np.concatenate(G2Genofile,axis=0),Sites2Genofile
-                Sites2Genofile = []
-                G2Genofile = []
-    finally:
-        pbar.close()
-        yield np.concatenate(G2Genofile,axis=0),Sites2Genofile
+from janusx.garfield.garfield2 import main
 
 if __name__ == "__main__":
-    freeze_support()
     bfile = "./test/mouse_hs1940"
     phenofile = "./test/mouse_hs1940.pheno"
     bedfile = ""
@@ -51,7 +25,7 @@ if __name__ == "__main__":
     pheno = pheno.iloc[:, 0].dropna().to_frame()
     y = pheno.values  # (n,1)
     sampleid = pheno.index.to_list()
-    if not Path(bedfile).exists():
+    if not os.path.isfile(bedfile):
         bim = pd.read_csv(f'{bfile}.bim',sep=r'\s+',index_col=None,header=None)
         step = 1_000_000
         window = 5_000_000
@@ -64,5 +38,5 @@ if __name__ == "__main__":
                 bimranges.append((str(chrom),loc-window,loc+window))
     else:
         bimranges = []
-    chunks = main(bfile,y,sampleid,bimranges,1)
-    save_genotype_streaming('test/garfield.vcf',sample_ids=sampleid,chunks=chunks,)
+    results = main(bfile,sampleid,y,bimranges,4,5,50)
+    print(results)

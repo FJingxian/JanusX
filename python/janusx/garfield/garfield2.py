@@ -1,7 +1,9 @@
 import gc
+import os
 from typing import Any, List, Literal, Tuple, Union
 from joblib import Parallel, delayed
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from janusx.gfreader import load_genotype_chunks
 from janusx.garfield.logreg import logreg
@@ -125,17 +127,23 @@ def getLogicgate(
     Mchoice = (M[idx] / 2).astype(int).T
 
     resdict = logreg(Mchoice, y, response="continuous", tags=sites[idx])
+    if resdict is None:
+        return None
+    indices = resdict.get("indices", [])
+    if indices is None or len(indices) <= 1:
+        return None
+    if resdict.get("expression", "") == "1":
+        return None
     return resdict
 
 
-chrposTuple = Tuple[str, int, int]
 # ---------- 遍历全基因组 ----------
 def _window_task(
     task: Tuple[str, int, int, np.ndarray, List[str]],
     y: np.ndarray,
     nsnp: int,
     n_estimators: int,
-) -> Union[Tuple[str, int, int, Any], None]:
+) -> Union[dict[str,Any], None]:
     chrom, start, end, M_win, tags = task
     try:
         resdict = getLogicgate(
@@ -147,6 +155,8 @@ def _window_task(
         )
     except Exception as e:
         print(f"[WARN] window {chrom}:{start}-{end} failed: {e}")
+        return None
+    if resdict is None:
         return None
     return resdict
 
@@ -163,7 +173,8 @@ def window(
     nsnp: int = 5,
     n_estimators: int = 200,
     threads: int = 4,
-) -> List[Tuple[str, int, int, Any]]:
+    batch_size: int = 128,
+):
     """
     全基因组滑窗遍历 (按 chunksize 顺序加载，减少重复 IO)。
 
@@ -176,10 +187,26 @@ def window(
       - 读完两个窗口后丢弃第一个窗口，再加载第三个窗口
 
     Returns:
-      list of (chrom, start, end, resdict)
+      list of dict
     """
     y = np.asarray(y, dtype=float).ravel()
     tasks: List[Tuple[str, int, int, np.ndarray, List[str]]] = []
+    results: List[dict[str,Any]] = []
+
+    total_windows = None
+    step_int = int(step) if step else 0
+    if step_int > 0 and not (str(genofile).endswith(".vcf") or str(genofile).endswith(".vcf.gz")):
+        bim_path = f"{genofile}.bim"
+        if os.path.isfile(bim_path):
+            try:
+                bim = pd.read_csv(bim_path, sep=r"\s+", header=None, usecols=[0, 3])
+                if not bim.empty:
+                    chr_minmax = bim.groupby(0)[3].agg(["min", "max"])
+                    counts = (chr_minmax["max"] - chr_minmax["min"]) // step_int + 1
+                    total_windows = int(counts.sum())
+            except Exception:
+                total_windows = None
+    pbar = tqdm(total=total_windows, desc="Windows", unit="win")
 
     buffer_M = None
     buffer_sites: List[Any] = []
@@ -234,74 +261,122 @@ def window(
         sample_ids=sampleid,
     )
 
-    for chunk, sites in chunks:
-        if not sites:
-            continue
-        # split by chromosome boundaries within the chunk
-        idx = 0
-        while idx < len(sites):
-            chrom = str(sites[idx].chrom)
-            j = idx + 1
-            while j < len(sites) and str(sites[j].chrom) == chrom:
-                j += 1
-            seg_sites = sites[idx:j]
-            seg_M = chunk[idx:j]
+    try:
+        for chunk, sites in chunks:
+            if not sites:
+                continue
+            # split by chromosome boundaries within the chunk
+            idx = 0
+            while idx < len(sites):
+                chrom = str(sites[idx].chrom)
+                j = idx + 1
+                while j < len(sites) and str(sites[j].chrom) == chrom:
+                    j += 1
+                seg_sites = sites[idx:j]
+                seg_M = chunk[idx:j]
 
-            if current_chrom is None or chrom != current_chrom:
-                # flush remaining windows for previous chromosome
-                if current_chrom is not None and buffer_pos is not None:
-                    max_pos = int(buffer_pos.max())
-                    while window_start is not None and window_start <= max_pos:
-                        res = _emit_window(window_start)
-                        if res is not None:
-                            tasks.append(res)
-                        window_start += step
-                # reset buffers for new chromosome
-                buffer_M = None
-                buffer_sites = []
-                buffer_pos = None
-                current_chrom = chrom
-                window_start = int(seg_sites[0].pos)
-                next_start = window_start + step
+                if current_chrom is None or chrom != current_chrom:
+                    # flush remaining windows for previous chromosome
+                    if current_chrom is not None and buffer_pos is not None:
+                        max_pos = int(buffer_pos.max())
+                        while window_start is not None and window_start <= max_pos:
+                            res = _emit_window(window_start)
+                            pbar.update(1)
+                            if res is not None:
+                                tasks.append(res)
+                                if len(tasks) >= batch_size:
+                                    if threads <= 1:
+                                        batch = [
+                                            out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                            if out is not None
+                                        ]
+                                    else:
+                                        batch = Parallel(n_jobs=threads, backend="loky")(
+                                            delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                                        )
+                                        batch = [r for r in batch if r is not None]
+                                    results.extend(batch)
+                                    tasks.clear()
+                            window_start += step
+                    # reset buffers for new chromosome
+                    buffer_M = None
+                    buffer_sites = []
+                    buffer_pos = None
+                    current_chrom = chrom
+                    window_start = int(seg_sites[0].pos)
+                    next_start = window_start + step
 
-            _append_segment(seg_M, seg_sites)
+                _append_segment(seg_M, seg_sites)
 
-            # process windows when we have two windows worth of data
-            while buffer_pos is not None and buffer_pos.max() >= window_start + windowsize + step:
+                # process windows when we have two windows worth of data
+                while buffer_pos is not None and buffer_pos.max() >= window_start + windowsize + step:
+                    res = _emit_window(window_start)
+                    pbar.update(1)
+                    if res is not None:
+                        tasks.append(res)
+                        if len(tasks) >= batch_size:
+                            if threads <= 1:
+                                batch = [
+                                    out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                    if out is not None
+                                ]
+                            else:
+                                batch = Parallel(n_jobs=threads, backend="loky")(
+                                    delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                                )
+                                batch = [r for r in batch if r is not None]
+                            results.extend(batch)
+                            tasks.clear()
+                    # drop the first window, advance
+                    _drop_before(next_start)
+                    window_start = next_start
+                    next_start = window_start + step
+
+                idx = j
+
+        # flush remaining windows at end
+        if current_chrom is not None and buffer_pos is not None:
+            max_pos = int(buffer_pos.max())
+            while window_start is not None and window_start <= max_pos:
                 res = _emit_window(window_start)
+                pbar.update(1)
                 if res is not None:
                     tasks.append(res)
-                # drop the first window, advance
-                _drop_before(next_start)
-                window_start = next_start
-                next_start = window_start + step
+                    if len(tasks) >= batch_size:
+                        if threads <= 1:
+                            batch = [
+                                out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                if out is not None
+                            ]
+                        else:
+                            batch = Parallel(n_jobs=threads, backend="loky")(
+                                delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                            )
+                            batch = [r for r in batch if r is not None]
+                        results.extend(batch)
+                        tasks.clear()
+                window_start += step
 
-            idx = j
+        if tasks:
+            if threads <= 1:
+                batch = [
+                    out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                    if out is not None
+                ]
+            else:
+                batch = Parallel(n_jobs=threads, backend="loky")(
+                    delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                )
+                batch = [r for r in batch if r is not None]
+            results.extend(batch)
+    finally:
+        pbar.close()
 
-    # flush remaining windows at end
-    if current_chrom is not None and buffer_pos is not None:
-        max_pos = int(buffer_pos.max())
-        while window_start is not None and window_start <= max_pos:
-            res = _emit_window(window_start)
-            if res is not None:
-                tasks.append(res)
-            window_start += step
-
-    if not tasks:
-        return []
-    if threads <= 1:
-        results = [
-            out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks) if out is not None
-        ]
-        return results
-
-    results = Parallel(n_jobs=threads, backend="loky")(
-        delayed(_window_task)(t, y, nsnp, n_estimators) for t in tqdm(tasks)
-    )
-    return [r for r in results if r is not None]
+    return results
 
 
 # ---------- 自定义遍历 ----------
+chrposTuple = Tuple[str, int, int]
 def _process(
     ChromPos: Union[chrposTuple,List[chrposTuple]],
     genofile: str,
@@ -373,6 +448,8 @@ def _process(
     except Exception as e:
         # 某个区间出错时，不让整个并行崩掉
         print(f"[WARN] process {ChromPos} failed: {e}")
+        return None
+    if resdict is None:
         return None
     return resdict
 

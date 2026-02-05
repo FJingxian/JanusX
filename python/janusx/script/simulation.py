@@ -21,7 +21,7 @@ import argparse
 from typing import Literal, Optional, List, Tuple
 
 import numpy as np
-
+from janusx.garfield.garfield2 import ldprune
 from janusx.gfreader import load_genotype_chunks
 from janusx.gfreader import inspect_genotype_file
 from ._common.log import setup_logging
@@ -129,6 +129,7 @@ def simulate_phenotype_from_genofile(
                 bim_range=siteslistrc,
             ):
                 # 0/1/2 -> 0/1
+                Mchunk,sites = ldprune(Mchunk,sites,0.75)
                 G01 = (Mchunk / 2).astype(np.int32)  # (m,n)
                 m = G01.shape[0]
                 if m == 0:
@@ -295,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write causal sites file "
              "(default: %(default)s).",
     )
-    optional_group.add_argument("--seed", type=int, default=1, help="Random seed.")
+    optional_group.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     return parser
 

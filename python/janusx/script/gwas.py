@@ -154,19 +154,103 @@ def genotype_cache_prefix(genofile: str) -> str:
     return os.path.join(cache_dir, base).replace("\\", "/")
 
 
-def load_phenotype(phenofile: str, ncol: Union[list[int] , None], logger) -> pd.DataFrame:
+def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
+    if not os.path.isfile(path):
+        logger.warning(f"{label} ID file not found: {path}")
+        return None
+    try:
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    except Exception:
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    if not df.empty and df.iloc[0, 0] == "":
+        # sep=None can mis-parse single-column ID files; fallback to whitespace
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    if df.empty:
+        logger.warning(f"{label} ID file is empty: {path}")
+        return None
+    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+    if ids.size == 0:
+        logger.warning(f"{label} ID file has no usable IDs: {path}")
+        return None
+    return ids
+
+
+def _read_matrix_with_ids(path: str, logger, label: str) -> tuple[Union[np.ndarray, None], np.ndarray]:
+    try:
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None,
+            dtype={0: str}, keep_default_na=False
+        )
+    except Exception:
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None,
+            dtype={0: str}, keep_default_na=False
+        )
+    if df.shape[1] < 2:
+        raise ValueError(f"{label} file must have IDs in column 1 and data in columns 2+.")
+    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+    data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    return ids, data
+
+
+def load_phenotype(
+    phenofile: str,
+    ncol: Union[list[int] , None],
+    logger,
+    id_col: int = 0,
+) -> pd.DataFrame:
     """
     Load and preprocess phenotype table.
 
     Assumptions
     -----------
-      - First column contains sample IDs.
-      - Duplicated IDs are averaged.
+      - By default, the first column contains sample IDs.
+      - If needed, set id_col=1 to use the second column as IDs (PLINK FID/IID).
+    - Duplicated IDs are averaged.
     """
     logger.info(f"Loading phenotype from {phenofile}...")
-    pheno = pd.read_csv(phenofile, sep="\t")
-    pheno = pheno.groupby(pheno.columns[0]).mean()
-    pheno.index = pheno.index.astype(str)
+    try:
+        df = pd.read_csv(phenofile, sep=None, engine="python", header=None)
+    except Exception:
+        df = pd.read_csv(phenofile, sep=r"\s+", header=None)
+
+    if df.empty:
+        raise ValueError("Phenotype file is empty.")
+    if id_col >= df.shape[1]:
+        raise ValueError(f"Phenotype file has no column {id_col + 1} for sample IDs.")
+
+    # Detect header-like first row (non-numeric phenotype columns).
+    header_like = False
+    header_names = None
+    if df.shape[0] > 1 and df.shape[1] > 1:
+        row0 = pd.to_numeric(df.iloc[0, 1:], errors="coerce")
+        row1 = pd.to_numeric(df.iloc[1, 1:], errors="coerce")
+        if row0.isna().all() and row1.notna().any():
+            header_like = True
+            header_names = df.iloc[0, 1:].astype(str).tolist()
+            df = df.iloc[1:, :].reset_index(drop=True)
+
+    ids = df.iloc[:, id_col].astype(str)
+    data = df.drop(columns=[id_col])
+    # If using IID (column 2), drop FID (column 1) as well.
+    if id_col == 1 and data.shape[1] >= 2:
+        data = data.drop(columns=[0])
+    if header_like and header_names is not None and len(header_names) == data.shape[1]:
+        data.columns = header_names
+
+    data = data.apply(pd.to_numeric, errors="coerce")
+    pheno = data
+    pheno.index = ids
+    pheno = pheno.groupby(pheno.index).mean()
 
     assert pheno.shape[1] > 0, (
         "No phenotype data found. Please check the phenotype file format.\n"
@@ -176,7 +260,9 @@ def load_phenotype(phenofile: str, ncol: Union[list[int] , None], logger) -> pd.
     if ncol is not None:
         assert np.min(ncol) < pheno.shape[1], "Phenotype column index out of range."
         ncol = [i for i in ncol if i in range(pheno.shape[1])]
-        logger.info("Phenotypes to be analyzed: " + "\t".join(pheno.columns[ncol]))
+        logger.info(
+            "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol]))
+        )
         pheno = pheno.iloc[:, ncol]
 
     return pheno
@@ -258,7 +344,7 @@ def load_or_build_grm_with_cache(
     chunk_size: int,
     mmap_limit: bool,
     logger:logging.Logger,
-) -> tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int, Union[np.ndarray, None]]:
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
     """
@@ -266,12 +352,19 @@ def load_or_build_grm_with_cache(
     n_samples = len(ids)
     method_is_builtin = mgrm in ["1", "2"]
 
+    grm_ids = None
     if method_is_builtin:
         km_path = f"{cache_prefix}.k.{mgrm}"
+        id_path = f"{km_path}.npy.id"
         if os.path.exists(f'{km_path}.npy'):
             logger.info(f"Loading cached GRM from {km_path}.npy...")
             grm = np.load(f'{km_path}.npy',mmap_mode='r')
             grm = grm.reshape(n_samples, n_samples)
+            grm_ids = _read_id_file(id_path, logger, "GRM")
+            if grm_ids is not None and len(grm_ids) != n_samples:
+                raise ValueError(
+                    f"GRM ID count ({len(grm_ids)}) does not match GRM shape ({n_samples})."
+                )
             eff_m = n_snps  # approximate; exact effective M not critical here
         else:
             method_int = int(mgrm)
@@ -289,20 +382,32 @@ def load_or_build_grm_with_cache(
                 logger=logger,
             )
             np.save(f'{km_path}.npy', grm)
+            pd.Series(ids).to_csv(id_path, sep="\t", index=False, header=False)
+            grm_ids = ids
             grm = np.load(f'{km_path}.npy',mmap_mode='r')
             logger.info(f"Cached GRM written to {km_path}.npy")
     else:
         assert os.path.isfile(mgrm), f"GRM file not found: {mgrm}"
         logger.info(f"Loading GRM from {mgrm}...")
-        grm = np.genfromtxt(mgrm, dtype="float32")
-        assert grm.size == n_samples * n_samples, (
-            f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
-        )
-        grm = grm.reshape(n_samples, n_samples)
+        if mgrm.endswith('.npy'):
+            grm = np.load(mgrm,mmap_mode='r')
+        else:
+            grm = np.genfromtxt(mgrm, dtype="float32")
+        grm_ids = _read_id_file(f"{mgrm}.id", logger, "GRM")
+        if grm_ids is None:
+            assert grm.size == n_samples * n_samples, (
+                f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
+            )
+            grm = grm.reshape(n_samples, n_samples)
+        else:
+            assert grm.size == len(grm_ids) * len(grm_ids), (
+                f"GRM size mismatch: expected {len(grm_ids)*len(grm_ids)}, got {grm.size}"
+            )
+            grm = grm.reshape(len(grm_ids), len(grm_ids))
         eff_m = n_snps
 
     logger.info(f"GRM shape: {grm.shape}")
-    return grm, eff_m
+    return grm, eff_m, grm_ids
 
 
 def build_pcs_from_grm(grm: np.ndarray, dim: int, logger: logging.Logger) -> np.ndarray:
@@ -320,65 +425,74 @@ def load_or_build_q_with_cache(
     grm: np.ndarray,
     cache_prefix: str,
     pcdim: str,
+    ids: np.ndarray,
     logger,
-) -> np.ndarray:
+) -> tuple[np.ndarray, Union[np.ndarray, None]]:
     """
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
+    When loading from file, the first column is treated as sample IDs and
+    the remaining columns are PCs.
     """
     n = grm.shape[0]
 
+    q_ids = None
     if pcdim in np.arange(1, n).astype(str):
         dim = int(pcdim)
         q_path = f"{cache_prefix}.q.{pcdim}.txt"
         if os.path.exists(q_path):
             logger.info(f"Loading cached Q matrix from {q_path}...")
-            qmatrix = np.genfromtxt(q_path, dtype="float32")
+            try:
+                q_ids, qmatrix = _read_matrix_with_ids(q_path, logger, "Q")
+            except Exception:
+                qmatrix = np.genfromtxt(q_path, dtype="float32")
+                q_ids = None
+                logger.warning("Q cache has no IDs; assuming genotype order.")
         else:
             qmatrix = build_pcs_from_grm(grm, dim, logger)
-            np.savetxt(q_path, qmatrix, fmt="%.6f")
+            df = pd.DataFrame(np.column_stack([ids.astype(str), qmatrix]))
+            df.to_csv(q_path, sep="\t", header=False, index=False)
+            q_ids = ids
             logger.info(f"Cached Q matrix written to {q_path}")
     elif pcdim == "0":
         logger.info("PC dimension set to 0; using empty Q matrix.")
         qmatrix = np.zeros((n, 0), dtype="float32")
+        q_ids = ids
     elif os.path.isfile(pcdim):
         logger.info(f"Loading Q matrix from {pcdim}...")
-        qmatrix = np.genfromtxt(pcdim, dtype="float32")
-        assert qmatrix.shape[0] == n, (
-            f"Q matrix row count mismatch: expected {n}, got {qmatrix.shape[0]}"
-        )
+        q_ids, qmatrix = _read_matrix_with_ids(pcdim, logger, "Q")
     else:
         raise ValueError(f"Unknown Q/PC option: {pcdim}")
 
     logger.info(f"Q matrix shape: {qmatrix.shape}")
-    return qmatrix
+    return qmatrix, q_ids
 
 
 def _load_covariate_for_streaming(
     cov_path: Union[str , None],
-    n_samples: int,
     logger,
-) -> Union[np.ndarray , None]:
+) -> tuple[Union[np.ndarray , None], Union[np.ndarray, None]]:
     """
     Load covariate matrix for streaming LMM/LM.
 
     Assumptions
     -----------
-      - The covariate file is aligned with the genotype sample order
-        given by inspect_genotype_file (one row per sample).
+      - The first column contains sample IDs.
+      - Remaining columns are covariates.
     """
     if cov_path is None:
-        return None
+        logger.info("No covariate file provided; skipping covariates.")
+        return None, None
+
+    if not os.path.isfile(cov_path):
+        logger.warning(f"Covariate file not found: {cov_path}; skipping covariates.")
+        return None, None
 
     logger.info(f"Loading covariate matrix for streaming models from {cov_path}...")
-    cov_all = np.genfromtxt(cov_path, dtype="float32")
+    cov_ids, cov_all = _read_matrix_with_ids(cov_path, logger, "Covariate")
     if cov_all.ndim == 1:
         cov_all = cov_all.reshape(-1, 1)
-    assert cov_all.shape[0] == n_samples, (
-        f"Covariate rows ({cov_all.shape[0]}) do not match sample count "
-        f"({n_samples}) from genotype metadata."
-    )
     logger.info(f"Covariate matrix (streaming) shape: {cov_all.shape}")
-    return cov_all
+    return cov_all, cov_ids
 
 
 def prepare_streaming_context(
@@ -401,7 +515,7 @@ def prepare_streaming_context(
       - GRM + Q (cached)
       - covariates (optional)
     """
-    pheno = load_phenotype(phenofile, pheno_cols, logger)
+    pheno = load_phenotype(phenofile, pheno_cols, logger, id_col=0)
 
     ids, n_snps = inspect_genotype_file(genofile)
     ids = np.array(ids).astype(str)
@@ -410,8 +524,8 @@ def prepare_streaming_context(
 
     cache_prefix = genotype_cache_prefix(genofile)
     logger.info(f"Cache prefix (genotype folder): {cache_prefix}")
-
-    grm, eff_m = load_or_build_grm_with_cache(
+    # GRM stream...
+    grm, eff_m, grm_ids = load_or_build_grm_with_cache(
         genofile=genofile,
         cache_prefix=cache_prefix,
         mgrm=mgrm,
@@ -421,15 +535,132 @@ def prepare_streaming_context(
         mmap_limit=mmap_limit,
         logger=logger,
     )
-
-    qmatrix = load_or_build_q_with_cache(
+    # PCA stream...
+    qmatrix, q_ids = load_or_build_q_with_cache(
         grm=grm,
         cache_prefix=cache_prefix,
         pcdim=pcdim,
+        ids=ids,
         logger=logger,
     )
 
-    cov_all = _load_covariate_for_streaming(cov_path, n_samples, logger)
+    cov_all, cov_ids = _load_covariate_for_streaming(cov_path, logger)
+
+    # -----------------------------------------
+    # Align all data sources to shared IDs
+    # -----------------------------------------
+    geno_ids = ids.astype(str)
+    pheno_ids = pheno.index.astype(str).to_numpy()
+
+    # If optional ID files are missing, inherit genotype order
+    if grm_ids is None:
+        if grm.shape[0] != n_samples:
+            raise ValueError(
+                f"GRM size mismatch: {grm.shape[0]} != genotype samples {n_samples} "
+                "and no GRM ID file was provided."
+            )
+        logger.warning("GRM IDs not provided; assuming genotype order.")
+        grm_ids = ids
+    else:
+        grm_ids = np.asarray(grm_ids, dtype=str)
+    if q_ids is None:
+        if qmatrix.shape[0] != n_samples:
+            raise ValueError(
+                f"Q matrix size mismatch: {qmatrix.shape[0]} != genotype samples {n_samples} "
+                "and no Q ID file was provided."
+            )
+        logger.warning("Q IDs not provided; assuming genotype order.")
+        q_ids = ids
+    else:
+        q_ids = np.asarray(q_ids, dtype=str)
+    if cov_ids is None and cov_all is not None:
+        if cov_all.shape[0] != n_samples:
+            raise ValueError(
+                f"Covariate size mismatch: {cov_all.shape[0]} != genotype samples {n_samples} "
+                "and no covariate ID file was provided."
+            )
+        logger.warning("Covariate IDs not provided; assuming genotype order.")
+        cov_ids = ids
+    elif cov_ids is not None:
+        cov_ids = np.asarray(cov_ids, dtype=str)
+
+    common = set(geno_ids) & set(pheno_ids)
+    if grm_ids is not None:
+        common &= set(grm_ids.astype(str))
+    if q_ids is not None:
+        common &= set(q_ids.astype(str))
+    if cov_ids is not None:
+        common &= set(cov_ids.astype(str))
+
+    common_ids = [i for i in geno_ids if i in common]
+    if len(common_ids) == 0:
+        # Try using IID (second column) for PLINK-style phenotype files
+        try:
+            pheno_alt = load_phenotype(phenofile, pheno_cols, logger, id_col=1)
+            pheno_ids_alt = pheno_alt.index.astype(str).to_numpy()
+            common_alt = set(geno_ids) & set(pheno_ids_alt)
+            if grm_ids is not None:
+                common_alt &= set(grm_ids.astype(str))
+            if q_ids is not None:
+                common_alt &= set(q_ids.astype(str))
+            if cov_ids is not None:
+                common_alt &= set(cov_ids.astype(str))
+            if len(common_alt) > 0:
+                logger.warning("Using phenotype column 2 (IID) as sample IDs.")
+                pheno = pheno_alt
+                pheno_ids = pheno_ids_alt
+                common = common_alt
+        except Exception as e:
+            logger.warning(f"Failed to parse phenotype with IID column: {e}")
+
+    common_ids = [i for i in geno_ids if i in common]
+    if len(common_ids) == 0:
+        logger.error("No overlapping samples across genotype/phenotype/GRM/Q/cov.")
+        logger.error(f"Genotype IDs (first 5): {list(geno_ids[:5])}")
+        logger.error(f"Phenotype IDs (first 5): {list(pheno_ids[:5])}")
+        if grm_ids is not None:
+            logger.error(f"GRM IDs (first 5): {list(grm_ids[:5])}")
+        if q_ids is not None:
+            logger.error(f"Q IDs (first 5): {list(q_ids[:5])}")
+        if cov_ids is not None:
+            logger.error(f"Covariate IDs (first 5): {list(cov_ids[:5])}")
+        raise ValueError("No overlapping samples across genotype/phenotype/GRM/Q/cov.")
+
+    logger.info(
+        f"Sample intersection: geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
+        f"grm={'NA' if grm_ids is None else len(grm_ids)}, "
+        f"q={'NA' if q_ids is None else len(q_ids)}, "
+        f"cov={'NA' if cov_ids is None else len(cov_ids)} -> {len(common_ids)}"
+    )
+
+    # index maps
+    geno_index = {sid: i for i, sid in enumerate(geno_ids)}
+    if grm_ids is not None:
+        grm_index = {sid: i for i, sid in enumerate(grm_ids.astype(str))}
+    else:
+        grm_index = geno_index
+    if q_ids is not None:
+        q_index = {sid: i for i, sid in enumerate(q_ids.astype(str))}
+    else:
+        q_index = geno_index
+    if cov_ids is not None:
+        cov_index = {sid: i for i, sid in enumerate(cov_ids.astype(str))}
+    else:
+        cov_index = geno_index
+
+    # reorder/trim
+    ids = np.array(common_ids)
+    pheno = pheno.loc[ids]
+
+    grm_idx = [grm_index[sid] for sid in ids]
+    grm = grm[np.ix_(grm_idx, grm_idx)]
+
+    q_idx = [q_index[sid] for sid in ids]
+    qmatrix = qmatrix[q_idx]
+
+    if cov_all is not None:
+        cov_idx = [cov_index[sid] for sid in ids]
+        cov_all = cov_all[cov_idx]
 
     return pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m
 
@@ -666,29 +897,76 @@ def build_qmatrix_farmcpu(
     qdim: str,
     cov_path: Union[str , None],
     logger,
+    sample_ids: Union[np.ndarray, None] = None,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
     """
+    def _maybe_load_with_ids(path: str, expect_rows: int):
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None,
+            dtype=str, keep_default_na=False
+        )
+        if df.shape[0] != expect_rows:
+            raise ValueError(
+                f"Q matrix rows ({df.shape[0]}) do not match sample count ({expect_rows})."
+            )
+        if sample_ids is not None:
+            col0 = df.iloc[:, 0].astype(str).str.strip()
+            overlap = len(set(col0) & set(sample_ids))
+            if overlap >= int(0.9 * len(sample_ids)) and df.shape[1] > 1:
+                data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+                index = {sid: i for i, sid in enumerate(col0)}
+                missing = [sid for sid in sample_ids if sid not in index]
+                if missing:
+                    raise ValueError(f"Q matrix missing {len(missing)} sample IDs (e.g. {missing[:5]}).")
+                return data[[index[sid] for sid in sample_ids]]
+        # Fallback: treat all columns as numeric Q matrix
+        q = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+        return q
+
     if qdim in np.arange(0, 30).astype(str):
         q_path = f"{gfile_prefix}.q.{qdim}.txt"
         if os.path.exists(q_path):
             logger.info(f"* Loading Q matrix from {q_path}...")
-            qmatrix = np.genfromtxt(q_path,dtype="float32")
+            qmatrix = _maybe_load_with_ids(q_path, geno.shape[1])
         elif qdim == "0":
             qmatrix = np.array([]).reshape(geno.shape[1], 0)
         else:
             logger.info(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
-            qmatrix, _eigval = np.linalg.eigh(GRM(geno))
-            qmatrix = qmatrix[:, -int(qdim):]
-            np.savetxt(q_path, qmatrix, fmt="%.6f")
+            _eigval, eigvec = np.linalg.eigh(GRM(geno))
+            qmatrix = eigvec[:, -int(qdim):]
+            if sample_ids is not None:
+                df = pd.DataFrame(np.column_stack([sample_ids.astype(str), qmatrix]))
+                df.to_csv(q_path, sep="\t", header=False, index=False)
+            else:
+                np.savetxt(q_path, qmatrix, fmt="%.6f")
             logger.info(f"Cached Q matrix written to {q_path}")
     else:
         logger.info(f"* Loading Q matrix from {qdim}...")
-        qmatrix = np.genfromtxt(qdim, dtype="float32")
+        qmatrix = _maybe_load_with_ids(qdim, geno.shape[1])
 
     if cov_path:
-        cov_arr = np.genfromtxt(cov_path, dtype=float)
+        # cov file may contain IDs in the first column
+        df = pd.read_csv(
+            cov_path, sep=None, engine="python", header=None,
+            dtype=str, keep_default_na=False
+        )
+        if sample_ids is not None:
+            col0 = df.iloc[:, 0].astype(str).str.strip()
+            overlap = len(set(col0) & set(sample_ids))
+            if overlap >= int(0.9 * len(sample_ids)) and df.shape[1] > 1:
+                cov_arr = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+                index = {sid: i for i, sid in enumerate(col0)}
+                missing = [sid for sid in sample_ids if sid not in index]
+                if missing:
+                    raise ValueError(f"Covariate file missing {len(missing)} sample IDs (e.g. {missing[:5]}).")
+                cov_arr = cov_arr[[index[sid] for sid in sample_ids]]
+            else:
+                cov_arr = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+        else:
+            cov_arr = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+
         if cov_arr.ndim == 1:
             cov_arr = cov_arr.reshape(-1, 1)
         assert cov_arr.shape[0] == geno.shape[1], (
@@ -744,6 +1022,7 @@ def run_farmcpu_fullmem(
         qdim=qdim,
         cov_path=cov,
         logger=logger,
+        sample_ids=famid.astype(str),
     )
 
     for phename in pheno.columns:

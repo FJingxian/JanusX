@@ -18,8 +18,8 @@ Implementation:
 
 Output:
   - {prefix}.grm.id   : sample IDs
-  - {prefix}.grm.txt  : GRM as plain text (if --npz is not used)
-  - {prefix}.grm.npz  : compressed GRM (if --npz is used; stored as arr_0)
+  - {prefix}.grm.txt  : GRM as plain text (if --npy is not used)
+  - {prefix}.grm.npy  : binary GRM (if --npy is used)
 """
 
 import os
@@ -197,12 +197,17 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "-chunksize", "--chunksize", type=int, default=100_000,
+        help="Number of SNPs per chunk for streaming GRM "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-mmap-limit", "--mmap-limit", action="store_true", default=False,
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
     optional_group.add_argument(
-        "-npz", "--npz", action="store_true", default=False,
-        help="Save GRM as compressed NPZ instead of plain text (default: %(default)s).",
+        "-npy", "--npy", action="store_true", default=False,
+        help="Save GRM as binary NPY instead of plain text (default: %(default)s).",
     )
 
     args = parser.parse_args()
@@ -245,8 +250,9 @@ def main(log: bool = True):
         )
         logger.info(f"MAF threshold: {args.maf}")
         logger.info(f"Missing rate:  {args.geno}")
+        logger.info(f"Chunk size:    {args.chunksize}")
         logger.info(f"Mmap limit:    {args.mmap_limit}")
-        logger.info(f"Save as NPZ: {args.npz}")
+        logger.info(f"Save as NPY: {args.npy}")
         logger.info(f"Output prefix: {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
 
@@ -261,7 +267,7 @@ def main(log: bool = True):
     # Defaults match GWAS; can be overridden via CLI.
     maf_threshold = args.maf
     max_missing_rate = args.geno
-    chunk_size = 100_000
+    chunk_size = int(args.chunksize)
     mmap_window_mb = (
         auto_mmap_window_mb(gfile, n_samples, n_snps, chunk_size)
         if args.mmap_limit else None
@@ -287,13 +293,15 @@ def main(log: bool = True):
     # Save results
     # ------------------------------------------------------------------
     id_path = f"{args.out}/{args.prefix}.grm.id"
-    if args.npz:
-        grm_path = f"{args.out}/{args.prefix}.grm.npz"
+    if args.npy:
         np.savetxt(id_path, sample_ids, fmt="%s")
-        # Store matrix as arr_0, consistent with PCA module loading
-        np.savez_compressed(f"{args.out}/{args.prefix}.grm", grm)
+        grm_path = f"{args.out}/{args.prefix}.grm.npy"
+        np.save(grm_path, grm)
+        id_path_alt = f"{grm_path}.id"
+        if id_path_alt != id_path:
+            np.savetxt(id_path_alt, sample_ids, fmt="%s")
         logger.info(
-            f"Saved GRM in NPZ format:\n"
+            f"Saved GRM in NPY format:\n"
             f"  {id_path}\n"
             f"  {grm_path}"
         )
@@ -301,6 +309,9 @@ def main(log: bool = True):
         grm_path = f"{args.out}/{args.prefix}.grm.txt"
         np.savetxt(id_path, sample_ids, fmt="%s")
         np.savetxt(grm_path, grm, fmt="%.6f")
+        id_path_alt = f"{grm_path}.id"
+        if id_path_alt != id_path:
+            np.savetxt(id_path_alt, sample_ids, fmt="%s")
         logger.info(
             f"Saved GRM in text format:\n"
             f"  {id_path}\n"

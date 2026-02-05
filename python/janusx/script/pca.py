@@ -19,7 +19,7 @@ PCA computation strategy
       * Perform eigendecomposition of the GRM using numpy.linalg.eigh.
 
   - For GRM:
-      * Read the precomputed GRM from .grm.txt or .grm.npz.
+      * Read the precomputed GRM from .grm.txt or .grm.npy.
       * Perform eigendecomposition using numpy.linalg.eigh.
 
   - For PCFILE:
@@ -71,6 +71,52 @@ from ._common.log import setup_logging
 # ======================================================================
 # Helpers: GRM-based PCA (aligned with GWAS module)
 # ======================================================================
+
+def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
+    if not os.path.isfile(path):
+        logger.warning(f"{label} ID file not found: {path}")
+        return None
+    try:
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    except Exception:
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    if not df.empty and df.iloc[0, 0] == "":
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None, usecols=[0],
+            dtype=str, keep_default_na=False
+        )
+    if df.empty:
+        logger.warning(f"{label} ID file is empty: {path}")
+        return None
+    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+    if ids.size == 0:
+        logger.warning(f"{label} ID file has no usable IDs: {path}")
+        return None
+    return ids
+
+
+def _read_matrix_with_ids(path: str, logger, label: str) -> tuple[Union[np.ndarray, None], np.ndarray]:
+    try:
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None,
+            dtype={0: str}, keep_default_na=False
+        )
+    except Exception:
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None,
+            dtype={0: str}, keep_default_na=False
+        )
+    if df.shape[1] < 2:
+        raise ValueError(f"{label} file must have IDs in column 1 and data in columns 2+.")
+    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+    data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    return ids, data
 
 def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
     group_df = pd.read_csv(group_path, sep="\t", header=None, index_col=0)
@@ -215,7 +261,7 @@ def main(log: bool = True):
         "-grm", "--grm", type=str,
         help=(
             "GRM prefix for PCA (expects {prefix}.grm.id and "
-            "{prefix}.grm.txt or {prefix}.grm.npz)."
+            "{prefix}.grm.txt or {prefix}.grm.npy)."
         ),
     )
     geno_group.add_argument(
@@ -252,6 +298,11 @@ def main(log: bool = True):
     optional_group.add_argument(
         "-geno", "--geno", type=float, default=0.05,
         help="Exclude variants with missing call frequencies greater than a threshold "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-chunksize", "--chunksize", type=int, default=100_000,
+        help="Number of SNPs per chunk for streaming GRM "
              "(default: %(default)s).",
     )
     optional_group.add_argument(
@@ -324,6 +375,7 @@ def main(log: bool = True):
             logger.info(f"Output PCs:       top {args.dim}")
             logger.info(f"MAF threshold:    {args.maf}")
             logger.info(f"Missing rate:     {args.geno}")
+            logger.info(f"Chunk size:       {args.chunksize}")
             logger.info(f"Mmap limit:       {args.mmap_limit}")
         elif args.grm:
             logger.info(f"GRM prefix:       {gfile}")
@@ -358,7 +410,7 @@ def main(log: bool = True):
             genofile=gfile,
             maf_threshold=args.maf,
             max_missing_rate=args.geno,
-            chunk_size=100_000,
+            chunk_size=int(args.chunksize),
             mmap_limit=args.mmap_limit,
             logger=logger,
         )
@@ -377,6 +429,12 @@ def main(log: bool = True):
             eigenvec[:, : args.dim],
             fmt="%.6f",
         )
+        # Write Q matrix with IDs in first column (GWAS-compatible)
+        q_path = f"{args.out}/{args.prefix}.q.{args.dim}.txt"
+        df_q = pd.DataFrame(
+            np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
+        )
+        df_q.to_csv(q_path, sep="\t", header=False, index=False)
         np.savetxt(
             f"{args.out}/{args.prefix}.eigenval",
             eigenval,
@@ -387,22 +445,47 @@ def main(log: bool = True):
             f'"{args.prefix}.eigenvec", "{args.prefix}.eigenvec.id", '
             f'"{args.prefix}.eigenval"'
         )
+        logger.info(f'GWAS-compatible Q matrix saved to "{q_path}"')
 
     # --- Case 2: GRM prefix -> load GRM -> PCA ---
     elif args.grm:
         logger.info("* PCA from precomputed GRM.")
-        assert os.path.exists(f"{gfile}.grm.id"), "GRM ID file (.grm.id) not found."
-        assert os.path.exists(f"{gfile}.grm.txt") or os.path.exists(f"{gfile}.grm.npz"), \
-            "GRM matrix (.grm.txt or .grm.npz) not found."
-
-        if os.path.exists(f"{gfile}.grm.txt"):
-            logger.info(f"Loading GRM from {gfile}.grm.txt and {gfile}.grm.id ...")
-            grm = np.genfromtxt(f"{gfile}.grm.txt")
+        # Support both prefix-based GRM and direct GRM file paths
+        grm_file = None
+        if os.path.isfile(gfile):
+            grm_file = gfile
         else:
-            logger.info(f"Loading GRM from {gfile}.grm.npz and {gfile}.grm.id ...")
-            grm = np.load(f"{gfile}.grm.npz")["arr_0"]
+        if os.path.exists(f"{gfile}.grm.txt"):
+            grm_file = f"{gfile}.grm.txt"
+        elif os.path.exists(f"{gfile}.grm.npy"):
+            grm_file = f"{gfile}.grm.npy"
 
-        samples = np.genfromtxt(f"{gfile}.grm.id", dtype=str)
+        if grm_file is None:
+            raise ValueError("GRM matrix (.grm.txt/.grm.npy or direct path) not found.")
+
+        logger.info(f"Loading GRM from {grm_file} ...")
+        if grm_file.endswith(".npy"):
+            grm = np.load(grm_file)
+        else:
+            grm = np.genfromtxt(grm_file)
+
+        id_candidates = [
+            f"{gfile}.grm.id",
+            f"{grm_file}.id",
+            f"{gfile}.id",
+        ]
+        samples = None
+        for id_path in id_candidates:
+            samples = _read_id_file(id_path, logger, "GRM")
+            if samples is not None:
+                break
+        if samples is None:
+            raise ValueError("GRM ID file not found.")
+
+        if grm.shape[0] != len(samples):
+            raise ValueError(
+                f"GRM size mismatch: {grm.shape[0]} != {len(samples)} (ID count)."
+            )
 
         # Eigen decomposition
         eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
@@ -417,6 +500,11 @@ def main(log: bool = True):
             eigenvec[:, : args.dim],
             fmt="%.6f",
         )
+        q_path = f"{args.out}/{args.prefix}.q.{args.dim}.txt"
+        df_q = pd.DataFrame(
+            np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
+        )
+        df_q.to_csv(q_path, sep="\t", header=False, index=False)
         np.savetxt(
             f"{args.out}/{args.prefix}.eigenval",
             eigenval,
@@ -431,8 +519,11 @@ def main(log: bool = True):
     # --- Case 3: PCFILE prefix -> load PC results only for plotting ---
     elif args.pcfile:
         logger.info("* Loading existing PC results for visualization only.")
-        eigenvec = np.genfromtxt(f"{gfile}.eigenvec")
-        samples = np.genfromtxt(f"{gfile}.eigenvec.id", dtype=str)
+        if os.path.exists(f"{gfile}.eigenvec.id"):
+            samples = _read_id_file(f"{gfile}.eigenvec.id", logger, "Eigenvec")
+            eigenvec = np.genfromtxt(f"{gfile}.eigenvec")
+        else:
+            samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
         eigenval = np.genfromtxt(f"{gfile}.eigenval")
         logger.info(
             f"Loaded PC results from {gfile}.eigenvec(.id/.eigenval) in "

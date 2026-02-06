@@ -1,6 +1,5 @@
-import gc
 import os
-from typing import Any, List, Literal, Tuple, Union
+from typing import Any, List, Literal, Tuple, Union, Optional
 from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
@@ -81,7 +80,10 @@ def getLogicgate(
     nsnp: int = 5,
     n_estimators: int = 200,
     sites: Any = None,
-    core:Literal['rf','gbdt']='gbdt'
+    core:Literal['rf','gbdt']='gbdt',
+    response:Literal['binary', 'continuous']="continuous",
+    gsetmode:bool = True,
+    gset_groups: Union[None, List[np.ndarray], List[list[int]]] = None,
 ):
     """
     通过随机森林 + permutation importance + 逻辑回归
@@ -99,7 +101,45 @@ def getLogicgate(
     else:
         sites = np.arange(M.shape[0])
 
-    M,sites = ldprune(M,sites)
+    # If gset_groups are provided, normalize and apply ldprune within each group.
+    if gset_groups is not None:
+        group_indices: List[np.ndarray] = []
+        for g in gset_groups:
+            arr = np.asarray(g, dtype=int)
+            if arr.size > 0:
+                group_indices.append(arr)
+        if len(group_indices) == 0:
+            return None
+
+        kept_union: List[int] = []
+        for g_idx in group_indices:
+            g_idx = g_idx[(g_idx >= 0) & (g_idx < M.shape[0])]
+            if g_idx.size == 0:
+                continue
+            M_sub = M[g_idx]
+            sites_sub = sites[g_idx]
+            M_kept, sites_kept = ldprune(M_sub, sites_sub)
+            # Map kept indices back to global indices via site strings
+            kept_set = set(sites_kept.tolist())
+            kept_global = [int(i) for i, s in enumerate(sites) if s in kept_set]
+            kept_union.extend(kept_global)
+
+        kept_union = sorted(set(kept_union))
+        if len(kept_union) == 0:
+            return None
+        M = M[kept_union]
+        sites = sites[kept_union]
+        # Remap group indices to new local indices
+        index_map = {old: new for new, old in enumerate(kept_union)}
+        gset_groups = [
+            np.array([index_map[i] for i in g if i in index_map], dtype=int)
+            for g in gset_groups
+        ]
+        gset_groups = [g for g in gset_groups if g.size > 0]
+        if len(gset_groups) == 0:
+            return None
+    else:
+        M,sites = ldprune(M,sites)
     if core == 'rf':
         model = RandomForestRegressor(
             n_estimators=n_estimators,
@@ -121,12 +161,24 @@ def getLogicgate(
     Imp = model.feature_importances_
 
     topk = nsnp
-    idx = np.argsort(Imp)[::-1][:topk]
-
+    if gsetmode and gset_groups is not None:
+        order = np.argsort(Imp)[::-1]
+        idx = []
+        for g in gset_groups:
+            if g.size == 0:
+                continue
+            # pick highest-importance SNP within this group
+            best = g[np.argmax(Imp[g])]
+            idx.append(best)
+        idx = np.array(sorted(set(idx)), dtype=int)[:topk] # 最多 k 个互作检验
+        if idx.size == 0:
+            return None
+    else:
+        idx = np.argsort(Imp)[::-1][:topk]
     # 0/1/2 → 0/1
     Mchoice = (M[idx] / 2).astype(int).T
 
-    resdict = logreg(Mchoice, y, response="continuous", tags=sites[idx])
+    resdict = logreg(Mchoice, y, response=response, tags=sites[idx])
     if resdict is None:
         return None
     indices = resdict.get("indices", [])
@@ -143,6 +195,8 @@ def _window_task(
     y: np.ndarray,
     nsnp: int,
     n_estimators: int,
+    response: Literal['binary', 'continuous'],
+    gsetmode: bool,
 ) -> Union[dict[str,Any], None]:
     chrom, start, end, M_win, tags = task
     try:
@@ -152,6 +206,8 @@ def _window_task(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=tags,
+            response=response,
+            gsetmode=gsetmode,
         )
     except Exception as e:
         print(f"[WARN] window {chrom}:{start}-{end} failed: {e}")
@@ -172,6 +228,8 @@ def window(
     missing_rate: float = 0.05,
     nsnp: int = 5,
     n_estimators: int = 200,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = False,
     threads: int = 4,
     batch_size: int = 128,
 ):
@@ -287,12 +345,12 @@ def window(
                                 if len(tasks) >= batch_size:
                                     if threads <= 1:
                                         batch = [
-                                            out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                            out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
                                             if out is not None
                                         ]
                                     else:
                                         batch = Parallel(n_jobs=threads, backend="loky")(
-                                            delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                                            delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                                         )
                                         batch = [r for r in batch if r is not None]
                                     results.extend(batch)
@@ -317,12 +375,12 @@ def window(
                         if len(tasks) >= batch_size:
                             if threads <= 1:
                                 batch = [
-                                    out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                    out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
                                     if out is not None
                                 ]
                             else:
                                 batch = Parallel(n_jobs=threads, backend="loky")(
-                                    delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                                 )
                                 batch = [r for r in batch if r is not None]
                             results.extend(batch)
@@ -345,12 +403,12 @@ def window(
                     if len(tasks) >= batch_size:
                         if threads <= 1:
                             batch = [
-                                out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                                out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
                                 if out is not None
                             ]
                         else:
                             batch = Parallel(n_jobs=threads, backend="loky")(
-                                delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                                delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                             )
                             batch = [r for r in batch if r is not None]
                         results.extend(batch)
@@ -360,12 +418,12 @@ def window(
         if tasks:
             if threads <= 1:
                 batch = [
-                    out for out in (_window_task(t, y, nsnp, n_estimators) for t in tasks)
+                    out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
                     if out is not None
                 ]
             else:
                 batch = Parallel(n_jobs=threads, backend="loky")(
-                    delayed(_window_task)(t, y, nsnp, n_estimators) for t in tasks
+                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                 )
                 batch = [r for r in batch if r is not None]
             results.extend(batch)
@@ -386,6 +444,8 @@ def _process(
     missing_rate: float = 0.05,
     nsnp: int = 5,
     n_estimators: int = 200,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
 ):
     """
     对一个 bed 区间执行:
@@ -417,6 +477,8 @@ def _process(
     elif isinstance(ChromPos,list):
         M_list = []
         sites_list = []
+        gset_groups: List[np.ndarray] = []
+        offset = 0
         for chrom, start, end in ChromPos:
             chunks = load_genotype_chunks(
                 genofile,
@@ -431,6 +493,8 @@ def _process(
                 # chunk: (m_chunk, n_samples)
                 M_list.append(chunk)
                 sites_list.extend(sites)
+                gset_groups.append(np.arange(offset, offset + chunk.shape[0], dtype=int))
+                offset += chunk.shape[0]
         if not M_list:
             return None
 
@@ -444,6 +508,9 @@ def _process(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=sites_list,
+            response=response,
+            gsetmode=gsetmode,
+            gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
         )
     except Exception as e:
         # 某个区间出错时，不让整个并行崩掉
@@ -455,12 +522,36 @@ def _process(
 
 # ---------- 一次性收集结果的 main ----------
 
-def main(genofile, sampleid, y, bedlist,
-    maf: float = 0.02,missing_rate: float = 0.05, 
-    nsnp=5, n_estimators=200,threads=4):
+def main(
+    genofile,
+    sampleid,
+    y,
+    bedlist,
+    maf: float = 0.02,
+    missing_rate: float = 0.05,
+    nsnp=5,
+    n_estimators=200,
+    threads=4,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
+    gsetmodes: Optional[List[bool]] = None,
+):
     y = np.asarray(y, dtype=float).ravel()
+    if gsetmodes is not None and len(gsetmodes) != len(bedlist):
+        raise ValueError("gsetmodes length must match bedlist length")
     results = Parallel(n_jobs=threads)(
-        delayed(_process)(ChromPos, genofile, sampleid, y, maf, missing_rate, nsnp, n_estimators)
-        for ChromPos in tqdm(bedlist)
+        delayed(_process)(
+            ChromPos,
+            genofile,
+            sampleid,
+            y,
+            maf,
+            missing_rate,
+            nsnp,
+            n_estimators,
+            response,
+            gsetmodes[i] if gsetmodes is not None else gsetmode,
+        )
+        for i, ChromPos in enumerate(tqdm(bedlist))
     )
     return results

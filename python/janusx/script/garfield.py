@@ -3,7 +3,6 @@ import time
 import socket
 import argparse
 import numpy as np
-import pandas as pd
 from joblib import cpu_count
 from janusx.garfield.garfield2 import main as garfield_main, window as garfield_window
 from janusx.gfreader import SiteInfo, inspect_genotype_file
@@ -87,6 +86,15 @@ def main() -> None:
         help="Optional GFF3 file for gene coordinates.",
     )
     optional_group.add_argument(
+        "-forceset", "--forceset", action="store_true", default=False,
+        help="Enable gene-set mode when a line has >1 gene (default: off).",
+    )
+    optional_group.add_argument(
+        "-vartype", "--vartype", type=str, default="continuous",
+        choices=["continuous", "binary"],
+        help="Phenotype type: continuous or binary (default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-step", "--step", type=int, default=25_000,
         help="Step size for sliding windows (default: %(default)s).",
     )
@@ -134,7 +142,9 @@ def main() -> None:
     logger.info(f"Phenotype:     {args.pheno}")
     logger.info(f"Gene file:     {args.genefile}")
     logger.info(f"GFF3:          {args.gff3}")
-    logger.info(f"Step:          {args.step}")
+    logger.info(f"VarType:       {args.vartype}")
+    if not (args.genefile and args.gff3):
+        logger.info(f"Step:          {args.step}")
     logger.info(f"Extension:     {args.extension}")
     logger.info(f"Top SNPs:      {args.nsnp}")
     logger.info(f"Estimators:    {args.nestimators}")
@@ -156,6 +166,7 @@ def main() -> None:
     pheno = pheno.loc[common]
     y = pheno.iloc[:, 0].values.reshape(-1, 1)
 
+    gsetmode = False
     # Gene/gff3 mode
     if args.genefile and args.gff3 and os.path.isfile(args.genefile) and os.path.isfile(args.gff3):
         genesets = _read_geneset_lines(args.genefile)
@@ -166,8 +177,10 @@ def main() -> None:
         dfgff3 = dfgff3.loc[~dupgenemask]
 
         bimranges = []
+        gset_flags = []
         for geneset in genesets:
             ranges = []
+            use_gset = args.forceset and len(geneset) > 1
             for gene in geneset:
                 if gene not in dfgff3.index:
                     logger.warning(f"Gene not found in GFF3: {gene}")
@@ -179,6 +192,7 @@ def main() -> None:
                 ranges.append((chrom, start, end))
             if ranges:
                 bimranges.append(ranges)
+                gset_flags.append(use_gset)
 
         results = garfield_main(
             bfile,
@@ -188,9 +202,12 @@ def main() -> None:
             nsnp=args.nsnp,
             n_estimators=args.nestimators,
             threads=threads,
+            response=args.vartype,
+            gsetmodes=gset_flags,
         )
     else:
         # Window mode
+        gsetmode = False
         results = garfield_window(
             bfile,
             common,
@@ -199,6 +216,8 @@ def main() -> None:
             args.extension,
             nsnp=args.nsnp,
             n_estimators=args.nestimators,
+            response=args.vartype,
+            gsetmode=gsetmode,
             threads=threads,
         )
 

@@ -208,6 +208,8 @@ def main() -> None:
                 bimranges.append(ranges)
                 gset_flags.append(use_gset)
 
+        if args.mmap_limit:
+            logger.warning("mmap-limit is ignored in gene/gset mode (uses bim_range).")
         results = garfield_main(
             bfile,
             common,
@@ -218,7 +220,7 @@ def main() -> None:
             threads=threads,
             response=args.vartype,
             gsetmodes=gset_flags,
-            mmap_window_mb=mmap_window_mb,
+            mmap_window_mb=None,
         )
     else:
         # Window mode

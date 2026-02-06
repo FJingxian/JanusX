@@ -456,6 +456,8 @@ def _process(
       2) 调用 getLogicgate
       3) 返回 (xcombine, site_tuple) 或 None
     """
+    # mmap_window_mb is not supported with bim_range; disable it here
+    mmap_window_mb = None
     if isinstance(ChromPos,tuple):
         chrom, start, end = ChromPos
         chunks = load_genotype_chunks(
@@ -466,7 +468,6 @@ def _process(
             impute=True,
             bim_range=(str(chrom), int(start), int(end)),
             sample_ids=sampleid,
-            mmap_window_mb=mmap_window_mb,
         )
 
         M_list = []
@@ -483,6 +484,8 @@ def _process(
         sites_list = []
         gset_groups: List[np.ndarray] = []
         offset = 0
+        # limit per-gene SNPs to bound memory
+        max_gene_snps = max(200, int(nsnp) * 60)
         for chrom, start, end in ChromPos:
             chunks = load_genotype_chunks(
                 genofile,
@@ -492,14 +495,39 @@ def _process(
                 impute=True,
                 bim_range=(str(chrom), int(start), int(end)),
                 sample_ids=sampleid,
-                mmap_window_mb=mmap_window_mb,
             )
+            M_gene = None
+            sites_gene: List[Any] = []
             for chunk, sites in chunks:
-                # chunk: (m_chunk, n_samples)
-                M_list.append(chunk)
-                sites_list.extend(sites)
-                gset_groups.append(np.arange(offset, offset + chunk.shape[0], dtype=int))
-                offset += chunk.shape[0]
+                if chunk.size == 0:
+                    continue
+                if M_gene is None:
+                    M_gene = chunk
+                    sites_gene = list(sites)
+                else:
+                    M_gene = np.vstack([M_gene, chunk])
+                    sites_gene.extend(sites)
+                # prune periodically to bound memory per gene
+                if M_gene.shape[0] > max_gene_snps:
+                    M_gene, sites_kept = ldprune(
+                        M_gene, np.array(sites_gene), max_snps=max_gene_snps
+                    )
+                    sites_gene = list(sites_kept)
+            if M_gene is None or M_gene.shape[0] == 0:
+                continue
+            # final prune to limit per-gene SNPs
+            if M_gene.shape[0] > max_gene_snps:
+                M_gene, sites_kept = ldprune(
+                    M_gene, np.array(sites_gene), max_snps=max_gene_snps
+                )
+                sites_gene = list(sites_kept)
+            if M_gene.shape[0] == 0:
+                continue
+
+            M_list.append(M_gene)
+            sites_list.extend(sites_gene)
+            gset_groups.append(np.arange(offset, offset + M_gene.shape[0], dtype=int))
+            offset += M_gene.shape[0]
         if not M_list:
             return None
 

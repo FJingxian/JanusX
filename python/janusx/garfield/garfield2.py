@@ -457,7 +457,7 @@ def _process(
 
 def main(genofile, sampleid, y, bedlist,
     maf: float = 0.02,missing_rate: float = 0.05, 
-    threads=4, nsnp=5, n_estimators=200):
+    nsnp=5, n_estimators=200,threads=4):
     y = np.asarray(y, dtype=float).ravel()
     results = Parallel(n_jobs=threads)(
         delayed(_process)(ChromPos, genofile, sampleid, y, maf, missing_rate, nsnp, n_estimators)

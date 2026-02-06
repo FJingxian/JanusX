@@ -11,6 +11,8 @@ def readanno(annofile:str,descItem:str='description'):
             anno[5] = ['NA' for _ in anno.index]
     elif suffix == 'gff' or suffix == 'gff3':
         anno = pd.read_csv(annofile,sep='\t',header=None,comment='#',low_memory=False,usecols=[0,2,3,4,8])
+        # Drop any remaining rows containing '#' in the attribute column
+        anno = anno[~anno[8].astype(str).str.contains('#', na=False)]
         anno = anno[(anno[2]=='gene')&(anno[0].astype(str).isin(np.arange(1,50).astype(str)))]
         del anno[2]
         anno[0] = anno[0].astype(int)
@@ -18,5 +20,7 @@ def readanno(annofile:str,descItem:str='description'):
         anno.columns = range(anno.shape[1])
         anno[4] = anno[3].str.extract(fr'{descItem}=(.*?);').fillna('NA')
         anno[3] = anno[3].str.extract(r'ID=(.*?);').fillna('NA')
+        # Strip prefix like "gene:" -> "Zm00001d027230"
+        anno[3] = anno[3].str.replace(r'^[^:]*:', '', regex=True)
         anno[5] = ['NA' for _ in anno.index]
     return anno

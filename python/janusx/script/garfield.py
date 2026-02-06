@@ -86,6 +86,10 @@ def main() -> None:
         help="Optional GFF3 file for gene coordinates.",
     )
     optional_group.add_argument(
+        "-n", "--ncol", action="extend", nargs="*", default=None, type=int,
+        help="Zero-based phenotype column indices to analyze (same as gwas.py).",
+    )
+    optional_group.add_argument(
         "-forceset", "--forceset", action="store_true", default=False,
         help="Enable gene-set mode when a line has >1 gene (default: off).",
     )
@@ -158,7 +162,7 @@ def main() -> None:
     sample_ids = np.array(sample_ids, dtype=str)
 
     # Load phenotype and align to genotype order
-    pheno = load_phenotype(args.pheno, None, logger, id_col=0)
+    pheno = load_phenotype(args.pheno, args.ncol, logger, id_col=0)
     pheno_ids = pheno.index.astype(str).to_numpy()
     common = [sid for sid in sample_ids if sid in set(pheno_ids)]
     if len(common) == 0:

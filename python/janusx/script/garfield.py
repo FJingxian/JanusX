@@ -87,11 +87,11 @@ def main() -> None:
         help="Optional GFF3 file for gene coordinates.",
     )
     optional_group.add_argument(
-        "-step", "--step", type=int, default=1_000_000,
+        "-step", "--step", type=int, default=25_000,
         help="Step size for sliding windows (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-ext", "--extension", type=int, default=5_000_000,
+        "-ext", "--extension", type=int, default=50_000,
         help="Window extension length (default: %(default)s).",
     )
     optional_group.add_argument(

@@ -77,12 +77,12 @@ def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
         return None
     try:
         df = pd.read_csv(
-            path, sep=None, engine="python", header=None, usecols=[0],
+            path, sep=r"\s+", header=None, usecols=[0],
             dtype=str, keep_default_na=False
         )
     except Exception:
         df = pd.read_csv(
-            path, sep=r"\s+", header=None, usecols=[0],
+            path, sep=None, engine="python", header=None, usecols=[0],
             dtype=str, keep_default_na=False
         )
     if not df.empty and df.iloc[0, 0] == "":

@@ -17,9 +17,10 @@ Implementation:
   - Memory usage is low and independent of the total SNP count.
 
 Output:
-  - {prefix}.grm.id   : sample IDs
-  - {prefix}.grm.txt  : GRM as plain text (if --npy is not used)
-  - {prefix}.grm.npy  : binary GRM (if --npy is used)
+  - {prefix}.grm.txt     : GRM as plain text (if --npy is not used)
+  - {prefix}.grm.txt.id  : sample IDs for text GRM
+  - {prefix}.grm.npy     : binary GRM (if --npy is used)
+  - {prefix}.grm.npy.id  : sample IDs for NPY GRM
 """
 
 import os
@@ -292,14 +293,11 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
-    id_path = f"{args.out}/{args.prefix}.grm.id"
     if args.npy:
-        np.savetxt(id_path, sample_ids, fmt="%s")
         grm_path = f"{args.out}/{args.prefix}.grm.npy"
         np.save(grm_path, grm)
-        id_path_alt = f"{grm_path}.id"
-        if id_path_alt != id_path:
-            np.savetxt(id_path_alt, sample_ids, fmt="%s")
+        id_path = f"{grm_path}.id"
+        np.savetxt(id_path, sample_ids, fmt="%s")
         logger.info(
             f"Saved GRM in NPY format:\n"
             f"  {id_path}\n"
@@ -307,11 +305,9 @@ def main(log: bool = True):
         )
     else:
         grm_path = f"{args.out}/{args.prefix}.grm.txt"
-        np.savetxt(id_path, sample_ids, fmt="%s")
         np.savetxt(grm_path, grm, fmt="%.6f")
-        id_path_alt = f"{grm_path}.id"
-        if id_path_alt != id_path:
-            np.savetxt(id_path_alt, sample_ids, fmt="%s")
+        id_path = f"{grm_path}.id"
+        np.savetxt(id_path, sample_ids, fmt="%s")
         logger.info(
             f"Saved GRM in text format:\n"
             f"  {id_path}\n"

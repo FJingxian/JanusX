@@ -8,7 +8,7 @@ Input modes:
   - VCF    : genotype in VCF/VCF.GZ format
   - BFILE  : genotype in PLINK binary format (.bed/.bim/.fam prefix)
   - GRM    : precomputed genetic relationship matrix (GRM) plus ID file
-  - PCFILE : precomputed PCA results (eigenvec/eigenval/eigenvec.id) for
+  - QCOV : precomputed PCA results (eigenvec/eigenval) for
              visualization only
 
 PCA computation strategy
@@ -22,13 +22,12 @@ PCA computation strategy
       * Read the precomputed GRM from .grm.txt or .grm.npy.
       * Perform eigendecomposition using numpy.linalg.eigh.
 
-  - For PCFILE:
+  - For QCOV:
       * Load PC coordinates and eigenvalues directly.
       * Produce only visualization outputs.
 
 Output:
-  - {prefix}.eigenvec      : PC coordinates (samples, dim)
-  - {prefix}.eigenvec.id   : sample IDs
+  - {prefix}.eigenvec      : sample IDs + PC coordinates (first column is ID)
   - {prefix}.eigenval      : eigenvalues (variance along each PC)
   - Optional plots:
       * {prefix}.eigenvec.2D.pdf
@@ -258,17 +257,17 @@ def main(log: bool = True):
         ),
     )
     geno_group.add_argument(
-        "-grm", "--grm", type=str,
+        "-k", "--grm", type=str,
         help=(
             "GRM prefix for PCA (expects {prefix}.grm.id and "
             "{prefix}.grm.txt or {prefix}.grm.npy)."
         ),
     )
     geno_group.add_argument(
-        "-pcfile", "--pcfile", type=str,
+        "-q", "--qcov", type=str,
         help=(
             "Prefix of existing PCA result files for visualization only "
-            "({prefix}.eigenval, {prefix}.eigenvec, {prefix}.eigenvec.id)."
+            "({prefix}.eigenval, {prefix}.eigenvec)."
         ),
     )
 
@@ -341,11 +340,11 @@ def main(log: bool = True):
     elif args.grm:
         gfile = args.grm
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    elif args.pcfile:
-        gfile = args.pcfile
+    elif args.qcov:
+        gfile = args.qcov
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
     else:
-        raise ValueError("No valid input found; one of --vcf/--bfile/--grm/--pcfile must be provided.")
+        raise ValueError("No valid input found; one of --vcf/--bfile/--grm/--qcov must be provided.")
 
     gfile = gfile.replace("\\", "/")
     args.out = args.out if args.out is not None else "."
@@ -380,7 +379,7 @@ def main(log: bool = True):
         elif args.grm:
             logger.info(f"GRM prefix:       {gfile}")
             logger.info(f"Output PCs:       top {args.dim}")
-        elif args.pcfile:
+        elif args.qcov:
             logger.info(f"PCA prefix:       {gfile} (visualization only)")
         if args.plot or args.plot3D:
             logger.info(f"2D visualization: {args.plot}")
@@ -423,18 +422,16 @@ def main(log: bool = True):
         )
 
         # Save core PCA results
-        np.savetxt(f"{args.out}/{args.prefix}.eigenvec.id", samples, fmt="%s")
-        np.savetxt(
-            f"{args.out}/{args.prefix}.eigenvec",
-            eigenvec[:, : args.dim],
-            fmt="%.6f",
-        )
-        # Write Q matrix with IDs in first column (GWAS-compatible)
-        q_path = f"{args.out}/{args.prefix}.q.{args.dim}.txt"
-        df_q = pd.DataFrame(
+        df_vec = pd.DataFrame(
             np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
         )
-        df_q.to_csv(q_path, sep="\t", header=False, index=False)
+        df_vec.to_csv(
+            f"{args.out}/{args.prefix}.eigenvec",
+            sep="\t",
+            header=False,
+            index=False,
+            float_format="%.6f",
+        )
         np.savetxt(
             f"{args.out}/{args.prefix}.eigenval",
             eigenval,
@@ -442,10 +439,9 @@ def main(log: bool = True):
         )
         logger.info(
             f'Saved eigen results in "{args.out}" with files '
-            f'"{args.prefix}.eigenvec", "{args.prefix}.eigenvec.id", '
+            f'"{args.prefix}.eigenvec", '
             f'"{args.prefix}.eigenval"'
         )
-        logger.info(f'GWAS-compatible Q matrix saved to "{q_path}"')
 
     # --- Case 2: GRM prefix -> load GRM -> PCA ---
     elif args.grm:
@@ -455,10 +451,10 @@ def main(log: bool = True):
         if os.path.isfile(gfile):
             grm_file = gfile
         else:
-        if os.path.exists(f"{gfile}.grm.txt"):
-            grm_file = f"{gfile}.grm.txt"
-        elif os.path.exists(f"{gfile}.grm.npy"):
-            grm_file = f"{gfile}.grm.npy"
+            if os.path.exists(f"{gfile}.grm.txt"):
+                grm_file = f"{gfile}.grm.txt"
+            elif os.path.exists(f"{gfile}.grm.npy"):
+                grm_file = f"{gfile}.grm.npy"
 
         if grm_file is None:
             raise ValueError("GRM matrix (.grm.txt/.grm.npy or direct path) not found.")
@@ -469,18 +465,11 @@ def main(log: bool = True):
         else:
             grm = np.genfromtxt(grm_file)
 
-        id_candidates = [
-            f"{gfile}.grm.id",
-            f"{grm_file}.id",
-            f"{gfile}.id",
-        ]
-        samples = None
-        for id_path in id_candidates:
-            samples = _read_id_file(id_path, logger, "GRM")
-            if samples is not None:
-                break
+        id_path = f"{grm_file}.id"
+        samples = _read_id_file(id_path, logger, "GRM")
         if samples is None:
-            raise ValueError("GRM ID file not found.")
+            raise ValueError(f"GRM ID file not found: {id_path}")
+        logger.info(f"Loaded GRM sample IDs from {id_path}")
 
         if grm.shape[0] != len(samples):
             raise ValueError(
@@ -494,17 +483,16 @@ def main(log: bool = True):
         )
 
         # Save core PCA results
-        np.savetxt(f"{args.out}/{args.prefix}.eigenvec.id", samples, fmt="%s")
-        np.savetxt(
-            f"{args.out}/{args.prefix}.eigenvec",
-            eigenvec[:, : args.dim],
-            fmt="%.6f",
-        )
-        q_path = f"{args.out}/{args.prefix}.q.{args.dim}.txt"
-        df_q = pd.DataFrame(
+        df_vec = pd.DataFrame(
             np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
         )
-        df_q.to_csv(q_path, sep="\t", header=False, index=False)
+        df_vec.to_csv(
+            f"{args.out}/{args.prefix}.eigenvec",
+            sep="\t",
+            header=False,
+            index=False,
+            float_format="%.6f",
+        )
         np.savetxt(
             f"{args.out}/{args.prefix}.eigenval",
             eigenval,
@@ -512,18 +500,14 @@ def main(log: bool = True):
         )
         logger.info(
             f'Saved eigen results in "{args.out}" with files '
-            f'"{args.prefix}.eigenvec", "{args.prefix}.eigenvec.id", '
+            f'"{args.prefix}.eigenvec", '
             f'"{args.prefix}.eigenval"'
         )
 
-    # --- Case 3: PCFILE prefix -> load PC results only for plotting ---
-    elif args.pcfile:
+    # --- Case 3: qcov prefix -> load PC results only for plotting ---
+    elif args.qcov:
         logger.info("* Loading existing PC results for visualization only.")
-        if os.path.exists(f"{gfile}.eigenvec.id"):
-            samples = _read_id_file(f"{gfile}.eigenvec.id", logger, "Eigenvec")
-            eigenvec = np.genfromtxt(f"{gfile}.eigenvec")
-        else:
-            samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
+        samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
         eigenval = np.genfromtxt(f"{gfile}.eigenval")
         logger.info(
             f"Loaded PC results from {gfile}.eigenvec(.id/.eigenval) in "

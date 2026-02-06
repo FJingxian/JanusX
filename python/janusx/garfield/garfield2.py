@@ -232,6 +232,7 @@ def window(
     gsetmode: bool = False,
     threads: int = 4,
     batch_size: int = 128,
+    mmap_window_mb: Union[int, None] = None,
 ):
     """
     全基因组滑窗遍历 (按 chunksize 顺序加载，减少重复 IO)。
@@ -317,6 +318,7 @@ def window(
         missing_rate=missing_rate,
         impute=True,
         sample_ids=sampleid,
+        mmap_window_mb=mmap_window_mb,
     )
 
     try:
@@ -446,6 +448,7 @@ def _process(
     n_estimators: int = 200,
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
+    mmap_window_mb: Union[int, None] = None,
 ):
     """
     对一个 bed 区间执行:
@@ -463,6 +466,7 @@ def _process(
             impute=True,
             bim_range=(str(chrom), int(start), int(end)),
             sample_ids=sampleid,
+            mmap_window_mb=mmap_window_mb,
         )
 
         M_list = []
@@ -488,6 +492,7 @@ def _process(
                 impute=True,
                 bim_range=(str(chrom), int(start), int(end)),
                 sample_ids=sampleid,
+                mmap_window_mb=mmap_window_mb,
             )
             for chunk, sites in chunks:
                 # chunk: (m_chunk, n_samples)
@@ -535,6 +540,7 @@ def main(
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
+    mmap_window_mb: Union[int, None] = None,
 ):
     y = np.asarray(y, dtype=float).ravel()
     if gsetmodes is not None and len(gsetmodes) != len(bedlist):
@@ -551,6 +557,7 @@ def main(
             n_estimators,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
+            mmap_window_mb,
         )
         for i, ChromPos in enumerate(tqdm(bedlist))
     )

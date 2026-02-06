@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 from joblib import cpu_count
 from janusx.garfield.garfield2 import main as garfield_main, window as garfield_window
-from janusx.gfreader import SiteInfo, inspect_genotype_file
+from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
 from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.script._common.readanno import readanno
 from janusx.script.gwas import load_phenotype
@@ -126,6 +126,10 @@ def main() -> None:
         "-prefix", "--prefix", type=str, default=None,
         help="Output prefix (default: inferred from bfile).",
     )
+    optional_group.add_argument(
+        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
+        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+    )
 
     args = parser.parse_args()
 
@@ -155,20 +159,26 @@ def main() -> None:
     threads = cpu_count() if args.threads == -1 else int(args.threads)
     logger.info(f"Threads:       {threads}")
     logger.info(f"Output prefix: {outprefix}")
+    logger.info(f"Mmap limit:    {args.mmap_limit}")
     logger.info("*" * 60 + "\n")
 
     # Load genotype meta
-    sample_ids, _n_snps = inspect_genotype_file(bfile)
+    sample_ids, n_snps = inspect_genotype_file(bfile)
     sample_ids = np.array(sample_ids, dtype=str)
+    chunk_size = 100_000
+    mmap_window_mb = (
+        auto_mmap_window_mb(bfile, len(sample_ids), n_snps, chunk_size)
+        if args.mmap_limit else None
+    )
 
-    # Load phenotype and align to genotype order
+    # Load phenotype and align to genotype order (drop NaNs)
     pheno = load_phenotype(args.pheno, args.ncol, logger, id_col=0)
-    pheno_ids = pheno.index.astype(str).to_numpy()
+    pheno_col = pheno.iloc[:, 0].dropna()
+    pheno_ids = pheno_col.index.astype(str).to_numpy()
     common = [sid for sid in sample_ids if sid in set(pheno_ids)]
     if len(common) == 0:
-        raise ValueError("No overlapping samples between genotype and phenotype.")
-    pheno = pheno.loc[common]
-    y = pheno.iloc[:, 0].values.reshape(-1, 1)
+        raise ValueError("No overlapping samples between genotype and phenotype after dropna.")
+    y = pheno_col.loc[common].values.reshape(-1, 1)
 
     gsetmode = False
     # Gene/gff3 mode
@@ -208,6 +218,7 @@ def main() -> None:
             threads=threads,
             response=args.vartype,
             gsetmodes=gset_flags,
+            mmap_window_mb=mmap_window_mb,
         )
     else:
         # Window mode
@@ -223,6 +234,7 @@ def main() -> None:
             response=args.vartype,
             gsetmode=gsetmode,
             threads=threads,
+            mmap_window_mb=mmap_window_mb,
         )
 
     write_xcombine_results(f"{outprefix}.garfield", list(common), results)

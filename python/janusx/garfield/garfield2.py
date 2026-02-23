@@ -8,6 +8,60 @@ from janusx.gfreader import load_genotype_chunks
 from janusx.garfield.logreg import logreg
 from tqdm import tqdm
 
+def _to_i8_snp_major(geno_chunk: np.ndarray) -> np.ndarray:
+    """
+    Convert SNP-major genotype chunk to int8 encoding.
+    """
+    g = np.asarray(geno_chunk)
+    if g.ndim != 2:
+        raise ValueError("geno_chunk must be 2D (m_chunk, n_samples)")
+    if g.dtype == np.int8:
+        return np.ascontiguousarray(g)
+
+    miss = g < 0
+    gi = np.rint(g).astype(np.int16, copy=False)
+    gi = np.clip(gi, 0, 2).astype(np.int8, copy=False)
+    gi = np.ascontiguousarray(gi)
+    if np.any(miss):
+        gi = gi.copy()
+        gi[miss] = np.int8(-9)
+    return gi
+
+def load_all_genotype_int8(
+    genofile: str,
+    sampleid: np.ndarray,
+    chunk_size: int = int(1e6),
+    maf: float = 0.02,
+    missing_rate: float = 0.05,
+    mmap_window_mb: Union[int, None] = None,
+) -> tuple[np.ndarray, List[Any]]:
+    """
+    Load all filtered genotypes once and store them in memory as int8.
+    Returns SNP-major matrix (m_snps, n_samples) and corresponding sites.
+    """
+    chunks = load_genotype_chunks(
+        genofile,
+        chunk_size=int(chunk_size),
+        maf=maf,
+        missing_rate=missing_rate,
+        impute=True,
+        sample_ids=sampleid,
+        mmap_window_mb=mmap_window_mb,
+    )
+
+    M_list: List[np.ndarray] = []
+    sites_list: List[Any] = []
+    for chunk, sites in tqdm(chunks, desc="Loading genotype", unit="chunk"):
+        if chunk.size == 0 or len(sites) == 0:
+            continue
+        M_list.append(_to_i8_snp_major(chunk))
+        sites_list.extend(sites)
+
+    if not M_list:
+        return np.empty((0, len(sampleid)), dtype=np.int8), []
+    M = np.vstack(M_list)
+    return np.ascontiguousarray(M, dtype=np.int8), sites_list
+
 def ldprune(
     M: np.ndarray,
     sites,
@@ -553,6 +607,118 @@ def _process(
         return None
     return resdict
 
+def _build_site_index(
+    sites: List[Any],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """
+    Build per-chromosome positional index for fast range query.
+    Returns {chrom: (pos, global_indices)} in original SNP order.
+    """
+    by_chrom: dict[str, list[tuple[int, int]]] = {}
+    for i, site in enumerate(sites):
+        chrom = str(site.chrom)
+        pos = int(site.pos)
+        if chrom not in by_chrom:
+            by_chrom[chrom] = []
+        by_chrom[chrom].append((pos, i))
+
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, pairs in by_chrom.items():
+        pos = np.fromiter((p for p, _ in pairs), dtype=np.int64, count=len(pairs))
+        idx = np.fromiter((j for _, j in pairs), dtype=np.int64, count=len(pairs))
+        out[chrom] = (pos, idx)
+    return out
+
+def _select_range_indices(
+    site_index: dict[str, tuple[np.ndarray, np.ndarray]],
+    chrom: str,
+    start: int,
+    end: int,
+) -> np.ndarray:
+    item = site_index.get(str(chrom))
+    if item is None:
+        return np.empty(0, dtype=np.int64)
+    pos, idx = item
+    if pos.size > 1 and np.any(pos[1:] < pos[:-1]):
+        mask = (pos >= int(start)) & (pos <= int(end))
+        return idx[mask]
+    lo = int(np.searchsorted(pos, int(start), side="left"))
+    hi = int(np.searchsorted(pos, int(end), side="right"))
+    if hi <= lo:
+        return np.empty(0, dtype=np.int64)
+    return idx[lo:hi]
+
+def _process_inmemory(
+    ChromPos: Union[chrposTuple, List[chrposTuple]],
+    all_genotype_i8: np.ndarray,
+    all_sites: List[Any],
+    site_index: dict[str, tuple[np.ndarray, np.ndarray]],
+    y: np.ndarray,
+    nsnp: int = 5,
+    n_estimators: int = 200,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
+):
+    if isinstance(ChromPos, tuple):
+        chrom, start, end = ChromPos
+        idx = _select_range_indices(site_index, str(chrom), int(start), int(end))
+        if idx.size == 0:
+            return None
+        M = all_genotype_i8[idx]
+        sites_list = [all_sites[int(i)] for i in idx]
+        gset_groups = None
+    elif isinstance(ChromPos, list):
+        M_list: List[np.ndarray] = []
+        sites_list: List[Any] = []
+        gset_groups: List[np.ndarray] = []
+        offset = 0
+        max_gene_snps = max(200, int(nsnp) * 60)
+
+        for chrom, start, end in ChromPos:
+            idx = _select_range_indices(site_index, str(chrom), int(start), int(end))
+            if idx.size == 0:
+                continue
+            M_gene = all_genotype_i8[idx]
+            sites_gene: List[Any] = [all_sites[int(i)] for i in idx]
+            if M_gene.shape[0] > max_gene_snps:
+                M_gene, sites_kept = ldprune(
+                    M_gene, np.array(sites_gene), max_snps=max_gene_snps
+                )
+                sites_gene = list(sites_kept)
+            if M_gene.shape[0] == 0:
+                continue
+
+            M_list.append(M_gene)
+            sites_list.extend(sites_gene)
+            gset_groups.append(np.arange(offset, offset + M_gene.shape[0], dtype=int))
+            offset += M_gene.shape[0]
+
+        if not M_list:
+            return None
+        M = np.vstack(M_list)
+    else:
+        return None
+
+    if M.shape[0] < 2:
+        return None
+    try:
+        resdict = getLogicgate(
+            y,
+            M,
+            nsnp=nsnp,
+            n_estimators=n_estimators,
+            sites=sites_list,
+            response=response,
+            gsetmode=gsetmode,
+            gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
+        )
+    except Exception as e:
+        print(f"[WARN] process {ChromPos} failed: {e}")
+        return None
+    if resdict is None:
+        return None
+    return resdict
+
 # ---------- 一次性收集结果的 main ----------
 
 def main(
@@ -586,6 +752,47 @@ def main(
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             mmap_window_mb,
+        )
+        for i, ChromPos in enumerate(tqdm(bedlist))
+    )
+    return results
+
+def main_inmemory(
+    all_genotype_i8: np.ndarray,
+    all_sites: List[Any],
+    y: np.ndarray,
+    bedlist,
+    nsnp: int = 5,
+    n_estimators: int = 200,
+    threads: int = 4,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
+    gsetmodes: Optional[List[bool]] = None,
+):
+    """
+    Run GARFIELD search from preloaded in-memory int8 genotype matrix.
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    all_genotype_i8 = np.asarray(all_genotype_i8, dtype=np.int8)
+    if all_genotype_i8.ndim != 2:
+        raise ValueError("all_genotype_i8 must be a 2D SNP-major matrix.")
+    if len(all_sites) != all_genotype_i8.shape[0]:
+        raise ValueError("all_sites length must match all_genotype_i8.shape[0].")
+    if gsetmodes is not None and len(gsetmodes) != len(bedlist):
+        raise ValueError("gsetmodes length must match bedlist length")
+
+    site_index = _build_site_index(all_sites)
+    results = Parallel(n_jobs=threads, backend="threading")(
+        delayed(_process_inmemory)(
+            ChromPos,
+            all_genotype_i8,
+            all_sites,
+            site_index,
+            y,
+            nsnp,
+            n_estimators,
+            response,
+            gsetmodes[i] if gsetmodes is not None else gsetmode,
         )
         for i, ChromPos in enumerate(tqdm(bedlist))
     )

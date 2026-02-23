@@ -4,7 +4,11 @@ import socket
 import argparse
 import numpy as np
 from joblib import cpu_count
-from janusx.garfield.garfield2 import main as garfield_main, window as garfield_window
+from janusx.garfield.garfield2 import (
+    load_all_genotype_int8,
+    main_inmemory as garfield_main_inmemory,
+    window as garfield_window,
+)
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
 from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.script._common.readanno import readanno
@@ -162,6 +166,13 @@ def main() -> None:
     logger.info(f"Mmap limit:    {args.mmap_limit}")
     logger.info("*" * 60 + "\n")
 
+    only_one_gene_arg = bool(args.genefile) ^ bool(args.gff3)
+    if only_one_gene_arg:
+        logger.warning(
+            "Only one of --genefile/-g and --gff3/-gff was provided. "
+            "Gene/gff3 mode requires both; falling back to window mode."
+        )
+
     # Load genotype meta
     sample_ids, n_snps = inspect_genotype_file(bfile)
     sample_ids = np.array(sample_ids, dtype=str)
@@ -208,11 +219,23 @@ def main() -> None:
                 bimranges.append(ranges)
                 gset_flags.append(use_gset)
 
-        if args.mmap_limit:
-            logger.warning("mmap-limit is ignored in gene/gset mode (uses bim_range).")
-        results = garfield_main(
+        logger.info("Gene/gff3 mode: loading all genotype as int8 into memory.")
+        all_genotype_i8, all_sites = load_all_genotype_int8(
             bfile,
-            common,
+            np.asarray(common, dtype=str),
+            chunk_size=chunk_size,
+            maf=0.02,
+            missing_rate=0.05,
+            mmap_window_mb=mmap_window_mb,
+        )
+        logger.info(
+            "Loaded genotype matrix for gene/gset mode: "
+            f"{all_genotype_i8.shape[0]} SNPs x {all_genotype_i8.shape[1]} samples, "
+            f"dtype={all_genotype_i8.dtype}"
+        )
+        results = garfield_main_inmemory(
+            all_genotype_i8,
+            all_sites,
             y,
             bimranges,
             nsnp=args.nsnp,
@@ -220,7 +243,6 @@ def main() -> None:
             threads=threads,
             response=args.vartype,
             gsetmodes=gset_flags,
-            mmap_window_mb=None,
         )
     else:
         # Window mode

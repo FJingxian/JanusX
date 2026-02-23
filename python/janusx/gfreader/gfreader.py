@@ -1,14 +1,37 @@
 from typing import Union
+import os
 import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
     BedChunkReader,
     VcfChunkReader,
+    TxtChunkReader,
     count_vcf_snps,
     PlinkStreamWriter,
     VcfStreamWriter,
     SiteInfo,
 )
+
+
+def _is_vcf_input(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix).lower()
+    return p.endswith(".vcf") or p.endswith(".vcf.gz")
+
+
+def _is_plink_prefix(path_or_prefix: str) -> bool:
+    return all(
+        os.path.exists(f"{path_or_prefix}.{ext}") for ext in ("bed", "bim", "fam")
+    )
+
+
+def _is_text_matrix_input(path_or_prefix: str) -> bool:
+    if _is_vcf_input(path_or_prefix):
+        return False
+    if _is_plink_prefix(path_or_prefix):
+        return False
+    if os.path.isfile(path_or_prefix):
+        return True
+    return False
 
 def calc_mmap_window_mb(
     n_samples: int,
@@ -38,9 +61,9 @@ def auto_mmap_window_mb(
     min_chunks: int = 2,
 ) -> Union[int,None]:
     """
-    Compute mmap window size for BED inputs; return None for VCF inputs.
+    Compute mmap window size for BED inputs; return None for VCF/TXT inputs.
     """
-    if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
+    if _is_vcf_input(path_or_prefix) or _is_text_matrix_input(path_or_prefix):
         return None
     return calc_mmap_window_mb(n_samples, n_snps, chunk_size, min_chunks=min_chunks)
 
@@ -93,6 +116,45 @@ def bed_chunk_reader(
         geno_np = np.asarray(geno, dtype=np.float32)
         yield geno_np, sites
 
+
+def txt_chunk_reader(
+    path: str,
+    chunk_size: int = 50000,
+    *,
+    delimiter: Union[str , None] = None,
+    snp_range: Union[tuple[int, int] , None] = None,
+    snp_indices: Union[list[int] , None] = None,
+    bim_range: Union[tuple[str, int, int] , None] = None,
+    sample_ids: Union[list[str] , None] = None,
+    sample_indices: Union[list[int] , None] = None,
+):
+    """
+    Stream numeric TXT matrix chunks (float32) via Rust TXT->NPY->mmap backend.
+
+    - The first non-empty row is sample IDs (header).
+    - Remaining rows are SNP-major numeric values (float32-compatible).
+    - Site metadata is always defaulted by Rust:
+      chrom='N', pos=1..m, ref='N', alt='N'.
+    """
+    reader = TxtChunkReader(
+        path,
+        delimiter,
+        snp_range,
+        snp_indices,
+        bim_range,
+        sample_ids,
+        sample_indices,
+    )
+
+    while True:
+        out = reader.next_chunk(chunk_size)
+        if out is None:
+            break
+        geno, sites = out
+        geno_np = np.asarray(geno, dtype=np.float32)
+        yield geno_np, sites
+
+
 def load_genotype_chunks(
     path_or_prefix: str,
     chunk_size: int = 50000,
@@ -106,6 +168,7 @@ def load_genotype_chunks(
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
+    delimiter: Union[str , None] = None,
 ):
     """
     High-level Python interface for reading genotype data in chunks
@@ -117,6 +180,7 @@ def load_genotype_chunks(
     It works for:
       - PLINK BED/BIM/FAM (SNP-major, on-disk)
       - VCF / VCF.GZ (text or compressed)
+      - Numeric TXT matrix (float32 via TXT->NPY->mmap)
 
     Parameters
     ----------
@@ -124,6 +188,7 @@ def load_genotype_chunks(
         Genotype source.
         - PLINK: prefix without extension, e.g. "data/QC"
         - VCF  : full path, e.g. "data/QC.vcf.gz"
+        - TXT  : matrix path, e.g. "data/matrix.txt" (header = sample IDs)
 
     chunk_size : int
         Number of SNPs (rows) decoded per iteration.
@@ -170,7 +235,8 @@ def load_genotype_chunks(
     - bim_range: (chrom, start_pos, end_pos), inclusive on positions (PLINK only)
     - sample_ids: list of sample IDs (PLINK .fam IID or VCF #CHROM header)
     - sample_indices: list of 0-based sample indices
-    - mmap_window_mb: window size (MB) for BED mmap; not supported for VCF
+    - mmap_window_mb: window size (MB) for BED mmap; not supported for VCF/TXT
+    - delimiter: optional token delimiter used for TXT matrix inputs
 
     Example
     -------
@@ -179,8 +245,8 @@ def load_genotype_chunks(
     ...     print(sites[0].chrom, sites[0].pos)
     """
     chunk_size = int(chunk_size)
-    # 1) Determine file type: BED or VCF
-    if path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz"):
+    # 1) Determine file type: BED, VCF, or numeric TXT matrix
+    if _is_vcf_input(path_or_prefix):
         if mmap_window_mb is not None:
             raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
         if any(v is not None for v in (snp_range, snp_indices, bim_range)):
@@ -190,6 +256,18 @@ def load_genotype_chunks(
             float(maf),
             float(missing_rate),
             bool(impute),
+            sample_ids,
+            sample_indices,
+        )
+    elif _is_text_matrix_input(path_or_prefix):
+        if mmap_window_mb is not None:
+            raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
+        reader = TxtChunkReader(
+            path_or_prefix,
+            delimiter,
+            snp_range,
+            snp_indices,
+            bim_range,
             sample_ids,
             sample_indices,
         )
@@ -224,7 +302,11 @@ def load_genotype_chunks(
 
         yield geno_np, sites
 
-def inspect_genotype_file(path_or_prefix: str):
+def inspect_genotype_file(
+    path_or_prefix: str,
+    *,
+    delimiter: Union[str , None] = None,
+):
     """
     Inspect the genotype input and return sample IDs and the SNP count.
 
@@ -239,21 +321,41 @@ def inspect_genotype_file(path_or_prefix: str):
         Number of SNPs in the file.
         - For PLINK BED: exact count from BIM.
         - For VCF     : counted by scanning variant lines.
+        - For TXT     : matrix row count from cached NPY metadata.
 
     Notes
     -----
     - sample_ids correspond to:
         * .fam IID column (PLINK)
         * VCF #CHROM header columns
+        * TXT header row tokens
     - sample_ids do NOT contain SNP / site information.
     """
+    if _is_vcf_input(path_or_prefix):
+        reader = VcfChunkReader(path_or_prefix, 0.0, 1.0)
+        return reader.sample_ids, count_vcf_snps(path_or_prefix)
+
+    if _is_text_matrix_input(path_or_prefix):
+        reader = TxtChunkReader(
+            path_or_prefix,
+            delimiter,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return reader.sample_ids, reader.n_snps
+
     # BED
-    if not (path_or_prefix.endswith(".vcf") or path_or_prefix.endswith(".vcf.gz")):
+    if _is_plink_prefix(path_or_prefix):
         reader = BedChunkReader(path_or_prefix, 0.0, 1.0)
         return reader.sample_ids, reader.n_snps
-    # VCF
-    reader = VcfChunkReader(path_or_prefix, 0.0, 1.0)
-    return reader.sample_ids, count_vcf_snps(path_or_prefix)
+
+    raise ValueError(
+        "Unable to infer genotype input type. Provide a VCF path, "
+        "a PLINK prefix (.bed/.bim/.fam), or a TXT matrix path (with header sample IDs)."
+    )
 
 
 def _to_i8_snp_major(geno_chunk: np.ndarray) -> np.ndarray:

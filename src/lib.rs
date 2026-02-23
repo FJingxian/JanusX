@@ -1,28 +1,26 @@
 use pyo3::prelude::*;
 use pyo3::Bound;
 
+mod assoc;
+mod bayes;
+mod brent;
 mod gfcore;
 mod gfreader;
 mod gmerge;
-mod assoc;
-mod bayes;
-mod lmm;
 mod linalg;
-mod brent;
+mod lmm;
 mod logreg;
 
 use assoc::{
-    glmf32,
-    glmf32_full,
-    lmm_reml_chunk_f32,
-    lmm_reml_null_f32,
-    ml_loglike_null_f32,
-    lmm_assoc_chunk_f32,
-    fastlmm_assoc_chunk_f32,
+    fastlmm_assoc_chunk_f32, glmf32, glmf32_full, lmm_assoc_chunk_f32, lmm_reml_chunk_f32,
+    lmm_reml_null_f32, ml_loglike_null_f32,
 };
-use gfreader::{SiteInfo, BedChunkReader, VcfChunkReader, PlinkStreamWriter, VcfStreamWriter,count_vcf_snps};
-use gmerge::{merge_genotypes, PyMergeStats, convert_genotypes, PyConvertStats};
 use bayes::{bayesa, bayesb, bayescpi};
+use gfreader::{
+    count_vcf_snps, BedChunkReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
+    VcfStreamWriter,
+};
+use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use logreg::fit_best_and_not_py;
 // ============================================================
@@ -33,6 +31,7 @@ use logreg::fit_best_and_not_py;
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<BedChunkReader>()?;
     m.add_class::<VcfChunkReader>()?;
+    m.add_class::<TxtChunkReader>()?;
     m.add_class::<PlinkStreamWriter>()?;
     m.add_class::<VcfStreamWriter>()?;
     m.add_class::<SiteInfo>()?;

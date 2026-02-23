@@ -1,6 +1,6 @@
-use pyo3::BoundObject;
-use pyo3::prelude::*;
 use pyo3::exceptions::*;
+use pyo3::prelude::*;
+use pyo3::BoundObject;
 
 use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray2};
@@ -13,22 +13,31 @@ use std::path::Path;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-use crate::gfcore::{BedSnpIter, VcfSnpIter};
 use crate::gfcore as core;
+use crate::gfcore::{BedSnpIter, TxtSnpIter, VcfSnpIter};
 
 // -------- Py-exposed SiteInfo (wrapper) --------
 #[pyclass]
 #[derive(Clone)]
 pub struct SiteInfo {
-    #[pyo3(get)] pub chrom: String,
-    #[pyo3(get)] pub pos: i32,
-    #[pyo3(get)] pub ref_allele: String,
-    #[pyo3(get)] pub alt_allele: String,
+    #[pyo3(get)]
+    pub chrom: String,
+    #[pyo3(get)]
+    pub pos: i32,
+    #[pyo3(get)]
+    pub ref_allele: String,
+    #[pyo3(get)]
+    pub alt_allele: String,
 }
 
 impl From<core::SiteInfo> for SiteInfo {
     fn from(s: core::SiteInfo) -> Self {
-        Self { chrom: s.chrom, pos: s.pos, ref_allele: s.ref_allele, alt_allele: s.alt_allele }
+        Self {
+            chrom: s.chrom,
+            pos: s.pos,
+            ref_allele: s.ref_allele,
+            alt_allele: s.alt_allele,
+        }
     }
 }
 
@@ -36,7 +45,12 @@ impl From<core::SiteInfo> for SiteInfo {
 impl SiteInfo {
     #[new]
     fn new(chrom: String, pos: i32, ref_allele: String, alt_allele: String) -> Self {
-        SiteInfo { chrom, pos, ref_allele, alt_allele }
+        SiteInfo {
+            chrom,
+            pos,
+            ref_allele,
+            alt_allele,
+        }
     }
 }
 
@@ -97,9 +111,15 @@ pub(crate) fn build_snp_indices(
     bim_range: Option<(String, i32, i32)>,
 ) -> Result<Option<Vec<usize>>, String> {
     let mut count = 0;
-    if snp_range.is_some() { count += 1; }
-    if snp_indices.is_some() { count += 1; }
-    if bim_range.is_some() { count += 1; }
+    if snp_range.is_some() {
+        count += 1;
+    }
+    if snp_indices.is_some() {
+        count += 1;
+    }
+    if bim_range.is_some() {
+        count += 1;
+    }
     if count > 1 {
         return Err("Provide only one of snp_range, snp_indices, or bim_range".into());
     }
@@ -199,17 +219,11 @@ impl BedChunkReader {
             BedSnpIter::new_with_fill(&prefix, maf, miss, fill)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         };
-        let (sample_indices, sample_ids) = build_sample_selection(
-            &it.samples,
-            sample_ids,
-            sample_indices,
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        let snp_indices = build_snp_indices(
-            &it.sites,
-            snp_range,
-            snp_indices,
-            bim_range,
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&it.samples, sample_ids, sample_indices)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let snp_indices = build_snp_indices(&it.sites, snp_range, snp_indices, bim_range)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         Ok(Self {
             it,
@@ -221,15 +235,22 @@ impl BedChunkReader {
     }
 
     #[getter]
-    fn n_samples(&self) -> usize { self.sample_indices.len() }
-
-    #[getter]
-    fn n_snps(&self) -> usize {
-        self.snp_indices.as_ref().map(|v| v.len()).unwrap_or(self.it.sites.len())
+    fn n_samples(&self) -> usize {
+        self.sample_indices.len()
     }
 
     #[getter]
-    fn sample_ids(&self) -> Vec<String> { self.sample_ids.clone() }
+    fn n_snps(&self) -> usize {
+        self.snp_indices
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(self.it.sites.len())
+    }
+
+    #[getter]
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
 
     fn next_chunk<'py>(
         &mut self,
@@ -237,7 +258,9 @@ impl BedChunkReader {
         chunk_size: usize,
     ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
         if chunk_size == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
         }
 
         let n = self.sample_indices.len();
@@ -279,7 +302,9 @@ impl BedChunkReader {
                 }
             }
         }
-        if m == 0 { return Ok(None); }
+        if m == 0 {
+            return Ok(None);
+        }
 
         let mat = Array2::from_shape_vec((m, n), data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -321,16 +346,20 @@ impl VcfChunkReader {
         let fill = fill_missing.unwrap_or(true);
         let it = VcfSnpIter::new_with_fill(&path, maf, miss, fill)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        let (sample_indices, sample_ids) = build_sample_selection(
-            &it.samples,
-            sample_ids,
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&it.samples, sample_ids, sample_indices)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        Ok(Self {
+            it,
             sample_indices,
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        Ok(Self { it, sample_indices, sample_ids })
+            sample_ids,
+        })
     }
 
     #[getter]
-    fn sample_ids(&self) -> Vec<String> { self.sample_ids.clone() }
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
 
     fn next_chunk<'py>(
         &mut self,
@@ -338,7 +367,9 @@ impl VcfChunkReader {
         chunk_size: usize,
     ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
         if chunk_size == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("chunk_size must be > 0"));
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
         }
 
         let n = self.sample_indices.len();
@@ -361,7 +392,140 @@ impl VcfChunkReader {
                 None => break,
             }
         }
-        if m == 0 { return Ok(None); }
+        if m == 0 {
+            return Ok(None);
+        }
+
+        let mat = Array2::from_shape_vec((m, n), data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
+        Ok(Some((py_mat, sites)))
+    }
+}
+
+// -------- TxtChunkReader --------
+#[pyclass]
+pub struct TxtChunkReader {
+    it: TxtSnpIter,
+    snp_indices: Option<Vec<usize>>,
+    snp_pos: usize,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
+}
+
+#[pymethods]
+impl TxtChunkReader {
+    #[new]
+    #[pyo3(signature = (
+        path,
+        delimiter=None,
+        snp_range=None,
+        snp_indices=None,
+        bim_range=None,
+        sample_ids=None,
+        sample_indices=None,
+    ))]
+    fn new(
+        path: String,
+        delimiter: Option<String>,
+        snp_range: Option<(usize, usize)>,
+        snp_indices: Option<Vec<usize>>,
+        bim_range: Option<(String, i32, i32)>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
+    ) -> PyResult<Self> {
+        let it = TxtSnpIter::new(&path, delimiter.as_deref())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&it.samples, sample_ids, sample_indices)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        let snp_indices = build_snp_indices(&it.sites, snp_range, snp_indices, bim_range)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+        Ok(Self {
+            it,
+            snp_indices,
+            snp_pos: 0,
+            sample_indices,
+            sample_ids,
+        })
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.snp_indices
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(self.it.sites.len())
+    }
+
+    #[getter]
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
+
+    fn next_chunk<'py>(
+        &mut self,
+        py: Python<'py>,
+        chunk_size: usize,
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
+        }
+
+        let n = self.sample_indices.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let full_samples = n == self.it.n_samples();
+        let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut m: usize = 0;
+
+        if let Some(ref snp_indices) = self.snp_indices {
+            while m < chunk_size && self.snp_pos < snp_indices.len() {
+                let snp_idx = snp_indices[self.snp_pos];
+                self.snp_pos += 1;
+                if let Some((row, site)) = self.it.get_snp_row(snp_idx) {
+                    if full_samples {
+                        data.extend_from_slice(&row);
+                    } else {
+                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                    }
+                    sites.push(site.into());
+                    m += 1;
+                }
+            }
+        } else {
+            while m < chunk_size {
+                match self.it.next_snp() {
+                    Some((row, site)) => {
+                        if full_samples {
+                            data.extend_from_slice(&row);
+                        } else {
+                            data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                        }
+                        sites.push(site.into());
+                        m += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        if m == 0 {
+            return Ok(None);
+        }
 
         let mat = Array2::from_shape_vec((m, n), data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -375,17 +539,22 @@ impl VcfChunkReader {
 #[pyfunction]
 pub fn count_vcf_snps(path: String) -> PyResult<usize> {
     let p = Path::new(&path);
-    let mut reader = core::open_text_maybe_gz(p)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let mut reader =
+        core::open_text_maybe_gz(p).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
     let mut n: usize = 0;
     let mut line = String::new();
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line)
+        let bytes = reader
+            .read_line(&mut line)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        if bytes == 0 { break; }
-        if line.starts_with('#') || line.trim().is_empty() { continue; }
+        if bytes == 0 {
+            break;
+        }
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
         n += 1;
     }
     Ok(n)
@@ -395,7 +564,11 @@ pub fn count_vcf_snps(path: String) -> PyResult<usize> {
 // Streaming PLINK writer: write .fam once, then stream .bim and .bed
 // ============================================================
 
-fn write_fam_simple(path: &Path, sample_ids: &[String], phenotype: Option<&[f64]>) -> Result<(), String> {
+fn write_fam_simple(
+    path: &Path,
+    sample_ids: &[String],
+    phenotype: Option<&[f64]>,
+) -> Result<(), String> {
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     for (i, sid) in sample_ids.iter().enumerate() {
         let ph = phenotype.map(|p| p[i]).unwrap_or(-9.0);
@@ -485,11 +658,17 @@ impl PlinkStreamWriter {
     ///
     /// geno_chunk: ndarray[int8], shape (m_chunk, n_samples), SNP-major, -9 for missing
     /// sites: Vec<SiteInfo>, length m_chunk
-    fn write_chunk(&mut self, geno_chunk: PyReadonlyArray2<i8>, sites: Vec<SiteInfo>) -> PyResult<()> {
+    fn write_chunk(
+        &mut self,
+        geno_chunk: PyReadonlyArray2<i8>,
+        sites: Vec<SiteInfo>,
+    ) -> PyResult<()> {
         let arr = geno_chunk.as_array();
         let shape = arr.shape();
         if shape.len() != 2 {
-            return Err(PyValueError::new_err("geno_chunk must be 2D (m_chunk, n_samples)"));
+            return Err(PyValueError::new_err(
+                "geno_chunk must be 2D (m_chunk, n_samples)",
+            ));
         }
 
         let m_chunk = shape[0];
@@ -527,7 +706,7 @@ impl PlinkStreamWriter {
         let strides = arr.strides();
         let s0 = strides[0] as isize; // row stride
         let s1 = strides[1] as isize; // col stride
-        let base = arr.as_ptr();      // *const i8
+        let base = arr.as_ptr(); // *const i8
 
         unsafe {
             for snp in 0..m_chunk {
@@ -562,8 +741,12 @@ impl PlinkStreamWriter {
 
     /// Flush buffered bytes to disk.
     fn flush(&mut self) -> PyResult<()> {
-        self.bed.flush().map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
-        self.bim.flush().map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        self.bed
+            .flush()
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        self.bim
+            .flush()
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
         Ok(())
     }
 
@@ -694,7 +877,11 @@ impl VcfStreamWriter {
     ///
     /// geno_chunk: ndarray[int8] shape (m_chunk, n_samples), SNP-major, -9 missing
     /// sites: Vec[SiteInfo] length m_chunk
-    fn write_chunk(&mut self, geno_chunk: PyReadonlyArray2<i8>, sites: Vec<SiteInfo>) -> PyResult<()> {
+    fn write_chunk(
+        &mut self,
+        geno_chunk: PyReadonlyArray2<i8>,
+        sites: Vec<SiteInfo>,
+    ) -> PyResult<()> {
         let out = self
             .out
             .as_mut()
@@ -703,7 +890,9 @@ impl VcfStreamWriter {
         let arr = geno_chunk.as_array();
         let shape = arr.shape();
         if shape.len() != 2 {
-            return Err(PyValueError::new_err("geno_chunk must be 2D (m_chunk, n_samples)"));
+            return Err(PyValueError::new_err(
+                "geno_chunk must be 2D (m_chunk, n_samples)",
+            ));
         }
         let m_chunk = shape[0];
         let n_samples = shape[1];
@@ -768,14 +957,16 @@ impl VcfStreamWriter {
             .out
             .as_mut()
             .ok_or_else(|| PyErr::new::<PyRuntimeError, _>("writer is closed"))?;
-        out.flush().map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        out.flush()
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
         Ok(())
     }
 
     /// Close writer. For gzip output, this finalizes the gzip stream (writes trailer).
     fn close(&mut self) -> PyResult<()> {
         if let Some(out) = self.out.take() {
-            out.finish().map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+            out.finish()
+                .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
         }
         Ok(())
     }

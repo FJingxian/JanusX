@@ -211,6 +211,110 @@ fn split_line_tokens<'a>(line: &'a str, delimiter: Option<char>) -> Vec<&'a str>
     }
 }
 
+struct TxtPaths {
+    prefix: PathBuf,
+    txt_path: Option<PathBuf>,
+    npy_path: PathBuf,
+}
+
+fn cache_prefix_path(prefix: &Path) -> PathBuf {
+    let name = prefix.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name.starts_with('~') {
+        return prefix.to_path_buf();
+    }
+    let mut cached = prefix.to_path_buf();
+    cached.set_file_name(format!("~{name}"));
+    cached
+}
+
+fn strip_cache_prefix(prefix: &Path) -> Option<PathBuf> {
+    let name = prefix.file_name()?.to_str()?;
+    if !name.starts_with('~') {
+        return None;
+    }
+    let mut original = prefix.to_path_buf();
+    original.set_file_name(&name[1..]);
+    Some(original)
+}
+
+fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let txt = prefix.with_extension("txt");
+    if txt.exists() {
+        return Some(txt);
+    }
+    let tsv = prefix.with_extension("tsv");
+    if tsv.exists() {
+        return Some(tsv);
+    }
+    let csv = prefix.with_extension("csv");
+    if csv.exists() {
+        return Some(csv);
+    }
+    None
+}
+
+fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
+    let input = Path::new(path_or_prefix);
+    let ext = input
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    if let Some(ext) = ext.as_deref() {
+        if matches!(ext, "txt" | "tsv" | "csv") {
+            if !input.exists() {
+                return Err(format!("text matrix file not found: {}", input.display()));
+            }
+            let prefix = input.with_extension("");
+            let cache_prefix = cache_prefix_path(&prefix);
+            let npy_path = cache_prefix.with_extension("npy");
+            return Ok(TxtPaths {
+                prefix,
+                txt_path: Some(input.to_path_buf()),
+                npy_path,
+            });
+        }
+        if ext == "npy" {
+            if !input.exists() {
+                return Err(format!("NPY file not found: {}", input.display()));
+            }
+            let prefix = input.with_extension("");
+            let txt_path = find_txt_with_prefix(&prefix)
+                .or_else(|| strip_cache_prefix(&prefix).and_then(|p| find_txt_with_prefix(&p)));
+            return Ok(TxtPaths {
+                prefix,
+                txt_path,
+                npy_path: input.to_path_buf(),
+            });
+        }
+    }
+
+    if input.exists() && input.is_file() {
+        // Unknown extension: treat as text matrix path, cache to "<path>.npy".
+        let cache_prefix = cache_prefix_path(input);
+        let npy_path = cache_prefix.with_extension("npy");
+        return Ok(TxtPaths {
+            prefix: input.to_path_buf(),
+            txt_path: Some(input.to_path_buf()),
+            npy_path,
+        });
+    }
+
+    let prefix = input.to_path_buf();
+    let txt_path = find_txt_with_prefix(&prefix)
+        .or_else(|| strip_cache_prefix(&prefix).and_then(|p| find_txt_with_prefix(&p)));
+    let cache_prefix = cache_prefix_path(&prefix);
+    let npy_path = cache_prefix.with_extension("npy");
+    if !npy_path.exists() && txt_path.is_none() {
+        return Err(format!("text matrix not found: {path_or_prefix}"));
+    }
+    Ok(TxtPaths {
+        prefix,
+        txt_path,
+        npy_path,
+    })
+}
+
 fn read_txt_header_samples(path: &Path, delimiter: Option<char>) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
@@ -918,15 +1022,15 @@ pub struct TxtSnpIter {
 
 impl TxtSnpIter {
     pub fn new(path: &str, delimiter: Option<&str>) -> Result<Self, String> {
-        let txt_path = Path::new(path);
-        if !txt_path.exists() {
-            return Err(format!(
-                "text matrix file not found: {}",
-                txt_path.display()
-            ));
-        }
+        let paths = resolve_txt_paths(path)?;
 
         let delimiter = parse_delimiter_char(delimiter)?;
+        let txt_path = paths.txt_path.as_ref().ok_or_else(|| {
+            format!(
+                "text matrix header not found for prefix: {}",
+                paths.prefix.display()
+            )
+        })?;
         let samples = read_txt_header_samples(txt_path, delimiter)?;
         let n_samples = samples.len();
         if n_samples == 0 {
@@ -941,8 +1045,8 @@ impl TxtSnpIter {
             }
         }
 
-        let npy_path = PathBuf::from(format!("{path}.f32.npy"));
-        let (n_snps, n_cols) = ensure_cached_text_npy(txt_path, &npy_path, delimiter, n_samples)?;
+        let (n_snps, n_cols) =
+            ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?;
         if n_cols != n_samples {
             return Err(format!(
                 "header sample count mismatch: header={}, matrix columns={}",
@@ -951,13 +1055,13 @@ impl TxtSnpIter {
         }
         let sites = default_sites(n_snps);
 
-        let file = File::open(&npy_path).map_err(|e| e.to_string())?;
+        let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
         let (rows, cols, data_offset) = parse_npy_f32_header(&mmap[..])?;
         if rows != n_snps || cols != n_samples {
             return Err(format!(
                 "cached NPY shape mismatch for {}: expected ({}, {}), got ({}, {})",
-                npy_path.display(),
+                paths.npy_path.display(),
                 n_snps,
                 n_samples,
                 rows,
@@ -969,8 +1073,8 @@ impl TxtSnpIter {
             .ok_or_else(|| "row byte size overflow".to_string())?;
 
         Ok(Self {
-            path: path.to_string(),
-            npy_path: npy_path.to_string_lossy().to_string(),
+            path: paths.prefix.to_string_lossy().to_string(),
+            npy_path: paths.npy_path.to_string_lossy().to_string(),
             samples,
             sites,
             mmap,

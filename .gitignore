@@ -43,3 +43,6 @@ webapp
 
 # binaries
 bin
+
+# cache
+~*

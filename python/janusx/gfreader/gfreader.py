@@ -4,18 +4,19 @@ import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
     BedChunkReader,
-    VcfChunkReader,
     TxtChunkReader,
-    count_vcf_snps,
+    convert_genotypes,
     PlinkStreamWriter,
     VcfStreamWriter,
     SiteInfo,
 )
 
 
-def _is_vcf_input(path_or_prefix: str) -> bool:
-    p = str(path_or_prefix).lower()
-    return p.endswith(".vcf") or p.endswith(".vcf.gz")
+def _cache_prefix(prefix: str) -> str:
+    base = os.path.basename(prefix)
+    if base.startswith("~"):
+        return prefix
+    return os.path.join(os.path.dirname(prefix), f"~{base}")
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
@@ -24,14 +25,70 @@ def _is_plink_prefix(path_or_prefix: str) -> bool:
     )
 
 
-def _is_text_matrix_input(path_or_prefix: str) -> bool:
-    if _is_vcf_input(path_or_prefix):
-        return False
-    if _is_plink_prefix(path_or_prefix):
-        return False
-    if os.path.isfile(path_or_prefix):
-        return True
-    return False
+def _strip_known_suffix(path_or_prefix: str) -> str:
+    p = str(path_or_prefix)
+    low = p.lower()
+    if low.endswith(".vcf.gz"):
+        return p[: -len(".vcf.gz")]
+    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+        if low.endswith(ext):
+            return p[: -len(ext)]
+    return p
+
+
+def _resolve_input(path_or_prefix: str):
+    """
+    Resolve input kind and prefix.
+    Returns (kind, prefix, src_path_or_none).
+    kind: "plink" | "vcf" | "txt" | "npy" | "unknown"
+    """
+    p = str(path_or_prefix)
+    low = p.lower()
+
+    if _is_plink_prefix(p):
+        return "plink", p, None
+
+    if low.endswith(".vcf.gz") or low.endswith(".vcf"):
+        return "vcf", _strip_known_suffix(p), p
+
+    if low.endswith((".txt", ".tsv", ".csv")):
+        return "txt", _strip_known_suffix(p), p
+
+    if low.endswith(".npy"):
+        return "npy", _strip_known_suffix(p), p
+
+    prefix = p
+    if _is_plink_prefix(prefix):
+        return "plink", prefix, None
+    if os.path.exists(f"{prefix}.vcf.gz"):
+        return "vcf", prefix, f"{prefix}.vcf.gz"
+    if os.path.exists(f"{prefix}.vcf"):
+        return "vcf", prefix, f"{prefix}.vcf"
+    if os.path.exists(f"{prefix}.txt"):
+        return "txt", prefix, f"{prefix}.txt"
+    if os.path.exists(f"{prefix}.tsv"):
+        return "txt", prefix, f"{prefix}.tsv"
+    if os.path.exists(f"{prefix}.csv"):
+        return "txt", prefix, f"{prefix}.csv"
+    cache_prefix = _cache_prefix(prefix)
+    if os.path.exists(f"{cache_prefix}.npy"):
+        return "npy", prefix, f"{cache_prefix}.npy"
+    if os.path.isfile(prefix):
+        return "txt", prefix, prefix
+
+    return "unknown", prefix, None
+
+
+def _ensure_plink_cache(prefix: str, vcf_path: str):
+    cache_prefix = _cache_prefix(prefix)
+    if _is_plink_prefix(cache_prefix):
+        return
+    convert_genotypes(vcf_path, cache_prefix, out_fmt="plink")
+    if not _is_plink_prefix(cache_prefix):
+        raise RuntimeError(
+            f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
+        )
+
 
 def calc_mmap_window_mb(
     n_samples: int,
@@ -63,7 +120,8 @@ def auto_mmap_window_mb(
     """
     Compute mmap window size for BED inputs; return None for VCF/TXT inputs.
     """
-    if _is_vcf_input(path_or_prefix) or _is_text_matrix_input(path_or_prefix):
+    kind, _, _ = _resolve_input(path_or_prefix)
+    if kind != "plink":
         return None
     return calc_mmap_window_mb(n_samples, n_snps, chunk_size, min_chunks=min_chunks)
 
@@ -179,16 +237,16 @@ def load_genotype_chunks(
 
     It works for:
       - PLINK BED/BIM/FAM (SNP-major, on-disk)
-      - VCF / VCF.GZ (text or compressed)
-      - Numeric TXT matrix (float32 via TXT->NPY->mmap)
+      - VCF / VCF.GZ (converted once to cached PLINK BED/BIM/FAM: ~prefix.*)
+      - Numeric TXT matrix (converted once to cached NPY: ~prefix.npy)
 
     Parameters
     ----------
     path_or_prefix : str
         Genotype source.
         - PLINK: prefix without extension, e.g. "data/QC"
-        - VCF  : full path, e.g. "data/QC.vcf.gz"
-        - TXT  : matrix path, e.g. "data/matrix.txt" (header = sample IDs)
+        - VCF  : full path, e.g. "data/QC.vcf.gz" (cached as "data/~QC.*")
+        - TXT  : matrix path, e.g. "data/matrix.txt" (cached as "data/~matrix.npy")
 
     chunk_size : int
         Number of SNPs (rows) decoded per iteration.
@@ -227,6 +285,7 @@ def load_genotype_chunks(
     -----
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
+    - VCF/TXT caching does not perform filtering or imputation.
 
     Selection
     ---------
@@ -235,7 +294,7 @@ def load_genotype_chunks(
     - bim_range: (chrom, start_pos, end_pos), inclusive on positions (PLINK only)
     - sample_ids: list of sample IDs (PLINK .fam IID or VCF #CHROM header)
     - sample_indices: list of 0-based sample indices
-    - mmap_window_mb: window size (MB) for BED mmap; not supported for VCF/TXT
+    - mmap_window_mb: window size (MB) for BED mmap; supported for PLINK (incl. cached VCF), not TXT
     - delimiter: optional token delimiter used for TXT matrix inputs
 
     Example
@@ -245,36 +304,15 @@ def load_genotype_chunks(
     ...     print(sites[0].chrom, sites[0].pos)
     """
     chunk_size = int(chunk_size)
-    # 1) Determine file type: BED, VCF, or numeric TXT matrix
-    if _is_vcf_input(path_or_prefix):
-        if mmap_window_mb is not None:
-            raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
-        if any(v is not None for v in (snp_range, snp_indices, bim_range)):
-            raise ValueError("SNP selection is only supported for PLINK BED/BIM/FAM inputs.")
-        reader = VcfChunkReader(
-            path_or_prefix,
-            float(maf),
-            float(missing_rate),
-            bool(impute),
-            sample_ids,
-            sample_indices,
-        )
-    elif _is_text_matrix_input(path_or_prefix):
-        if mmap_window_mb is not None:
-            raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
-        reader = TxtChunkReader(
-            path_or_prefix,
-            delimiter,
-            snp_range,
-            snp_indices,
-            bim_range,
-            sample_ids,
-            sample_indices,
-        )
-    else:
-        # Otherwise treat it as PLINK BED prefix
+    kind, prefix, src_path = _resolve_input(path_or_prefix)
+    # 1) Resolve caches and dispatch
+    if kind == "vcf":
+        if src_path is None:
+            raise ValueError("VCF source path not found.")
+        _ensure_plink_cache(prefix, src_path)
+        cache_prefix = _cache_prefix(prefix)
         yield from bed_chunk_reader(
-            path_or_prefix,
+            cache_prefix,
             chunk_size=chunk_size,
             maf=maf,
             missing_rate=missing_rate,
@@ -288,19 +326,54 @@ def load_genotype_chunks(
         )
         return
 
-    # 2) Iterate until exhausted
-    while True:
-        out = reader.next_chunk(chunk_size)
-        if out is None:
-            break
+    if kind == "plink":
+        yield from bed_chunk_reader(
+            prefix,
+            chunk_size=chunk_size,
+            maf=maf,
+            missing_rate=missing_rate,
+            impute=impute,
+            snp_range=snp_range,
+            snp_indices=snp_indices,
+            bim_range=bim_range,
+            sample_ids=sample_ids,
+            sample_indices=sample_indices,
+            mmap_window_mb=mmap_window_mb,
+        )
+        return
 
-        geno, sites = out
+    if kind in ("txt", "npy"):
+        if mmap_window_mb is not None:
+            raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
+        txt_input = src_path if src_path is not None else prefix
+        reader = TxtChunkReader(
+            txt_input,
+            delimiter,
+            snp_range,
+            snp_indices,
+            bim_range,
+            sample_ids,
+            sample_indices,
+        )
+        # 2) Iterate until exhausted
+        while True:
+            out = reader.next_chunk(chunk_size)
+            if out is None:
+                break
 
-        # geno is already float32 C-contiguous memory managed by Rust
-        # Convert to NumPy array (zero-copy)
-        geno_np = np.asarray(geno, dtype=np.float32)
+            geno, sites = out
 
-        yield geno_np, sites
+            # geno is already float32 C-contiguous memory managed by Rust
+            # Convert to NumPy array (zero-copy)
+            geno_np = np.asarray(geno, dtype=np.float32)
+
+            yield geno_np, sites
+        return
+
+    raise ValueError(
+        "Unable to infer genotype input type. Provide a VCF path, "
+        "a PLINK prefix (.bed/.bim/.fam), or a TXT matrix path (with header sample IDs)."
+    )
 
 def inspect_genotype_file(
     path_or_prefix: str,
@@ -320,24 +393,31 @@ def inspect_genotype_file(
     n_snps : int
         Number of SNPs in the file.
         - For PLINK BED: exact count from BIM.
-        - For VCF     : counted by scanning variant lines.
+        - For VCF     : count from cached PLINK BIM after conversion.
         - For TXT     : matrix row count from cached NPY metadata.
 
     Notes
     -----
     - sample_ids correspond to:
         * .fam IID column (PLINK)
-        * VCF #CHROM header columns
+        * VCF #CHROM header columns (after PLINK cache is created)
         * TXT header row tokens
     - sample_ids do NOT contain SNP / site information.
     """
-    if _is_vcf_input(path_or_prefix):
-        reader = VcfChunkReader(path_or_prefix, 0.0, 1.0)
-        return reader.sample_ids, count_vcf_snps(path_or_prefix)
+    kind, prefix, src_path = _resolve_input(path_or_prefix)
 
-    if _is_text_matrix_input(path_or_prefix):
+    if kind == "vcf":
+        if src_path is None:
+            raise ValueError("VCF source path not found.")
+        _ensure_plink_cache(prefix, src_path)
+        cache_prefix = _cache_prefix(prefix)
+        reader = BedChunkReader(cache_prefix, 0.0, 1.0)
+        return reader.sample_ids, reader.n_snps
+
+    if kind in ("txt", "npy"):
+        txt_input = src_path if src_path is not None else prefix
         reader = TxtChunkReader(
-            path_or_prefix,
+            txt_input,
             delimiter,
             None,
             None,
@@ -347,9 +427,8 @@ def inspect_genotype_file(
         )
         return reader.sample_ids, reader.n_snps
 
-    # BED
-    if _is_plink_prefix(path_or_prefix):
-        reader = BedChunkReader(path_or_prefix, 0.0, 1.0)
+    if kind == "plink":
+        reader = BedChunkReader(prefix, 0.0, 1.0)
         return reader.sample_ids, reader.n_snps
 
     raise ValueError(

@@ -59,30 +59,8 @@ pub fn read_fam(prefix: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn read_bim(prefix: &str) -> Result<Vec<SiteInfo>, String> {
-    let bim_path = format!("{prefix}.bim");
-    let file = File::open(&bim_path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-
-    let mut sites = Vec::new();
-    for line in reader.lines() {
-        let l = line.map_err(|e| e.to_string())?;
-        let cols: Vec<&str> = l.split_whitespace().collect();
-        if cols.len() < 6 {
-            return Err(format!("Malformed BIM line: {l}"));
-        }
-        let chrom = cols[0].to_string();
-        let pos: i32 = cols[3].parse().unwrap_or(0);
-        let a1 = cols[4].to_string();
-        let a2 = cols[5].to_string();
-
-        sites.push(SiteInfo {
-            chrom,
-            pos,
-            ref_allele: a1,
-            alt_allele: a2,
-        });
-    }
-    Ok(sites)
+    let bim_path = PathBuf::from(format!("{prefix}.bim"));
+    read_bim_file(&bim_path)
 }
 
 // ---------------------------
@@ -215,6 +193,8 @@ struct TxtPaths {
     prefix: PathBuf,
     txt_path: Option<PathBuf>,
     npy_path: PathBuf,
+    src_bim_path: Option<PathBuf>,
+    cache_bim_path: PathBuf,
 }
 
 fn cache_prefix_path(prefix: &Path) -> PathBuf {
@@ -253,6 +233,14 @@ fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
+fn find_bim_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let bim = prefix.with_extension("bim");
+    if bim.exists() {
+        return Some(bim);
+    }
+    None
+}
+
 fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
     let input = Path::new(path_or_prefix);
     let ext = input
@@ -265,46 +253,66 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             if !input.exists() {
                 return Err(format!("text matrix file not found: {}", input.display()));
             }
-            let prefix = input.with_extension("");
+            let mut prefix = input.with_extension("");
+            if let Some(p) = strip_cache_prefix(&prefix) {
+                prefix = p;
+            }
             let cache_prefix = cache_prefix_path(&prefix);
             let npy_path = cache_prefix.with_extension("npy");
+            let src_bim_path = find_bim_with_prefix(&prefix);
+            let cache_bim_path = cache_prefix.with_extension("bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path: Some(input.to_path_buf()),
                 npy_path,
+                src_bim_path,
+                cache_bim_path,
             });
         }
         if ext == "npy" {
             if !input.exists() {
                 return Err(format!("NPY file not found: {}", input.display()));
             }
-            let prefix = input.with_extension("");
+            let cache_prefix = input.with_extension("");
+            let prefix = strip_cache_prefix(&cache_prefix).unwrap_or_else(|| cache_prefix.clone());
             let txt_path = find_txt_with_prefix(&prefix)
-                .or_else(|| strip_cache_prefix(&prefix).and_then(|p| find_txt_with_prefix(&p)));
+                .or_else(|| find_txt_with_prefix(&cache_prefix));
+            let src_bim_path = find_bim_with_prefix(&prefix);
+            let cache_bim_path = cache_prefix_path(&prefix).with_extension("bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path,
                 npy_path: input.to_path_buf(),
+                src_bim_path,
+                cache_bim_path,
             });
         }
     }
 
     if input.exists() && input.is_file() {
         // Unknown extension: treat as text matrix path, cache to "<path>.npy".
-        let cache_prefix = cache_prefix_path(input);
+        let prefix = strip_cache_prefix(input).unwrap_or_else(|| input.to_path_buf());
+        let cache_prefix = cache_prefix_path(&prefix);
         let npy_path = cache_prefix.with_extension("npy");
+        let src_bim_path = find_bim_with_prefix(&prefix);
+        let cache_bim_path = cache_prefix.with_extension("bim");
         return Ok(TxtPaths {
-            prefix: input.to_path_buf(),
+            prefix,
             txt_path: Some(input.to_path_buf()),
             npy_path,
+            src_bim_path,
+            cache_bim_path,
         });
     }
 
-    let prefix = input.to_path_buf();
+    let raw_prefix = input.to_path_buf();
+    let prefix = strip_cache_prefix(&raw_prefix).unwrap_or(raw_prefix.clone());
     let txt_path = find_txt_with_prefix(&prefix)
-        .or_else(|| strip_cache_prefix(&prefix).and_then(|p| find_txt_with_prefix(&p)));
+        .or_else(|| find_txt_with_prefix(&raw_prefix));
     let cache_prefix = cache_prefix_path(&prefix);
     let npy_path = cache_prefix.with_extension("npy");
+    let src_bim_path = find_bim_with_prefix(&prefix);
+    let cache_bim_path = cache_prefix.with_extension("bim");
     if !npy_path.exists() && txt_path.is_none() {
         return Err(format!("text matrix not found: {path_or_prefix}"));
     }
@@ -312,6 +320,8 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
         prefix,
         txt_path,
         npy_path,
+        src_bim_path,
+        cache_bim_path,
     })
 }
 
@@ -349,6 +359,133 @@ fn default_sites(n_rows: usize) -> Vec<SiteInfo> {
         });
     }
     sites
+}
+
+fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+
+    let mut sites = Vec::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if cols.len() < 6 {
+            return Err(format!("Malformed BIM line at {}:{}: {l}", path.display(), line_no + 1));
+        }
+        let chrom = cols[0].to_string();
+        let pos: i32 = cols[3].parse().unwrap_or(0);
+        let a1 = cols[4].to_string();
+        let a2 = cols[5].to_string();
+
+        sites.push(SiteInfo {
+            chrom,
+            pos,
+            ref_allele: a1,
+            alt_allele: a2,
+        });
+    }
+    Ok(sites)
+}
+
+fn write_bim_file(path: &Path, sites: &[SiteInfo]) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::new(file);
+    for (i, s) in sites.iter().enumerate() {
+        let sid = format!("SNP{}", i + 1);
+        writeln!(
+            writer,
+            "{}\t{}\t0\t{}\t{}\t{}",
+            s.chrom, sid, s.pos, s.ref_allele, s.alt_allele
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())
+}
+
+fn resolve_txt_sites(paths: &TxtPaths, n_snps: usize) -> Result<Vec<SiteInfo>, String> {
+    if let Some(src_bim) = paths.src_bim_path.as_ref() {
+        let sites = read_bim_file(src_bim)?;
+        if sites.len() != n_snps {
+            return Err(format!(
+                "bim row count mismatch: {} has {} rows, expected {}",
+                src_bim.display(),
+                sites.len(),
+                n_snps
+            ));
+        }
+        write_bim_file(&paths.cache_bim_path, &sites)?;
+        return Ok(sites);
+    }
+
+    if paths.cache_bim_path.exists() {
+        let sites = read_bim_file(&paths.cache_bim_path)?;
+        if sites.len() != n_snps {
+            return Err(format!(
+                "cached bim row count mismatch: {} has {} rows, expected {}",
+                paths.cache_bim_path.display(),
+                sites.len(),
+                n_snps
+            ));
+        }
+        return Ok(sites);
+    }
+
+    let sites = default_sites(n_snps);
+    write_bim_file(&paths.cache_bim_path, &sites)?;
+    Ok(sites)
+}
+
+fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
+    // Only compare freshness when the original text matrix is available.
+    if paths.txt_path.is_none() {
+        return Ok(());
+    }
+
+    let mut source_files: Vec<&Path> = Vec::with_capacity(2);
+    if let Some(txt_path) = paths.txt_path.as_ref() {
+        source_files.push(txt_path.as_path());
+    }
+    if let Some(src_bim_path) = paths.src_bim_path.as_ref() {
+        source_files.push(src_bim_path.as_path());
+    }
+    if source_files.is_empty() {
+        return Ok(());
+    }
+
+    let cache_files = [paths.npy_path.as_path(), paths.cache_bim_path.as_path()];
+    let existing_cache_files: Vec<&Path> = cache_files
+        .iter()
+        .copied()
+        .filter(|p| p.exists())
+        .collect();
+    if existing_cache_files.is_empty() {
+        return Ok(());
+    }
+
+    let newest_source = source_files
+        .iter()
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    let oldest_cache = existing_cache_files
+        .iter()
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .min();
+
+    if matches!((newest_source, oldest_cache), (Some(src), Some(cache)) if cache < src) {
+        eprintln!(
+            "warning: detected stale TXT cache for {} (cache older than genotype files); removing and rebuilding.",
+            paths.prefix.display()
+        );
+        for path in cache_files {
+            if path.exists() {
+                fs::remove_file(path).map_err(|e| {
+                    format!("failed to remove stale cache file {}: {}", path.display(), e)
+                })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn write_npy_f32_header(w: &mut File, rows: usize, cols: usize) -> Result<usize, String> {
@@ -1045,6 +1182,8 @@ impl TxtSnpIter {
             }
         }
 
+        purge_stale_txt_cache(&paths)?;
+
         let (n_snps, n_cols) =
             ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?;
         if n_cols != n_samples {
@@ -1053,7 +1192,7 @@ impl TxtSnpIter {
                 n_samples, n_cols
             ));
         }
-        let sites = default_sites(n_snps);
+        let sites = resolve_txt_sites(&paths, n_snps)?;
 
         let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
@@ -1128,7 +1267,7 @@ impl TxtSnpIter {
 
 #[cfg(test)]
 mod tests {
-    use super::TxtSnpIter;
+    use super::{read_bim, TxtSnpIter};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1190,6 +1329,39 @@ mod tests {
         assert_eq!(it.sites[0].pos, 1);
         assert_eq!(it.sites[0].ref_allele, "N");
         assert_eq!(it.sites[0].alt_allele, "N");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn txt_iter_prefers_source_bim_and_writes_cache_bim() {
+        let dir = make_temp_dir("txt_bim_cache");
+        let txt_path = dir.join("g.txt");
+        let bim_path = dir.join("g.bim");
+        let cache_prefix = dir.join("~g");
+        let cache_bim_path = dir.join("~g.bim");
+
+        fs::write(&txt_path, "s1 s2\n0.1 0.2\n0.3 0.4\n").unwrap();
+        fs::write(&bim_path, "2 rsA 0 101 A G\n5 rsB 0 202 C T\n").unwrap();
+
+        let it = TxtSnpIter::new(txt_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(it.sites.len(), 2);
+        assert_eq!(it.sites[0].chrom, "2");
+        assert_eq!(it.sites[0].pos, 101);
+        assert_eq!(it.sites[0].ref_allele, "A");
+        assert_eq!(it.sites[0].alt_allele, "G");
+        assert_eq!(it.sites[1].chrom, "5");
+        assert_eq!(it.sites[1].pos, 202);
+        assert_eq!(it.sites[1].ref_allele, "C");
+        assert_eq!(it.sites[1].alt_allele, "T");
+
+        assert!(cache_bim_path.exists());
+        let cached_sites = read_bim(cache_prefix.to_str().unwrap()).unwrap();
+        assert_eq!(cached_sites.len(), 2);
+        assert_eq!(cached_sites[0].chrom, "2");
+        assert_eq!(cached_sites[0].pos, 101);
+        assert_eq!(cached_sites[0].ref_allele, "A");
+        assert_eq!(cached_sites[0].alt_allele, "G");
 
         let _ = fs::remove_dir_all(&dir);
     }

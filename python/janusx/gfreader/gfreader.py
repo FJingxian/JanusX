@@ -1,5 +1,6 @@
 from typing import Union
 import os
+import warnings
 import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
@@ -81,6 +82,24 @@ def _resolve_input(path_or_prefix: str):
 
 def _ensure_plink_cache(prefix: str, vcf_path: str):
     cache_prefix = _cache_prefix(prefix)
+    cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
+
+    if any(os.path.exists(p) for p in cache_files):
+        src_mtime = os.path.getmtime(vcf_path)
+        cache_mtime = min(os.path.getmtime(p) for p in cache_files if os.path.exists(p))
+        if cache_mtime < src_mtime:
+            warnings.warn(
+                (
+                    f"Detected stale VCF cache for '{prefix}': cache files are older than "
+                    f"source VCF '{vcf_path}'. Removing and rebuilding."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            for path in cache_files:
+                if os.path.exists(path):
+                    os.remove(path)
+
     if _is_plink_prefix(cache_prefix):
         return
     convert_genotypes(vcf_path, cache_prefix, out_fmt="plink")

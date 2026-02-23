@@ -67,7 +67,6 @@ from tqdm import tqdm
 import psutil
 from janusx.bioplotkit import GWASPLOT
 from janusx.pyBLUP import QK
-from janusx.gfreader import breader, vcfreader
 from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
@@ -125,14 +124,26 @@ def determine_genotype_source(args) -> tuple[str, str]:
     """
     Resolve genotype input and output prefix from CLI arguments.
     """
+    def _strip_geno_suffix(name: str) -> str:
+        low = name.lower()
+        if low.endswith(".vcf.gz"):
+            return name[: -len(".vcf.gz")]
+        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+            if low.endswith(ext):
+                return name[: -len(ext)]
+        return name
+
     if args.vcf:
         gfile = args.vcf
-        prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "")
+        prefix = _strip_geno_suffix(os.path.basename(gfile))
+    elif args.file:
+        gfile = args.file
+        prefix = _strip_geno_suffix(os.path.basename(gfile))
     elif args.bfile:
         gfile = args.bfile
         prefix = os.path.basename(gfile)
     else:
-        raise ValueError("No genotype input specified. Use -vcf or -bfile.")
+        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
 
     if args.prefix is not None:
         prefix = args.prefix
@@ -146,10 +157,14 @@ def genotype_cache_prefix(genofile: str) -> str:
     Construct a cache prefix within the genotype directory.
     """
     base = os.path.basename(genofile)
-    if base.endswith(".vcf.gz"):
+    low = base.lower()
+    if low.endswith(".vcf.gz"):
         base = base[: -len(".vcf.gz")]
-    elif base.endswith(".vcf"):
-        base = base[: -len(".vcf")]
+    else:
+        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+            if low.endswith(ext):
+                base = base[: -len(ext)]
+                break
     cache_dir = os.path.dirname(genofile) or "."
     return os.path.join(cache_dir, base).replace("\\", "/")
 
@@ -422,7 +437,8 @@ def build_pcs_from_grm(grm: np.ndarray, dim: int, logger: logging.Logger) -> np.
 
 
 def load_or_build_q_with_cache(
-    grm: np.ndarray,
+    grm: Union[np.ndarray, None],
+    n_samples: int,
     cache_prefix: str,
     pcdim: str,
     ids: np.ndarray,
@@ -433,7 +449,7 @@ def load_or_build_q_with_cache(
     When loading from file, the first column is treated as sample IDs and
     the remaining columns are PCs.
     """
-    n = grm.shape[0]
+    n = int(n_samples)
 
     q_ids = None
     if pcdim in np.arange(1, n).astype(str):
@@ -448,6 +464,10 @@ def load_or_build_q_with_cache(
                 q_ids = None
                 logger.warning("Q cache has no IDs; assuming genotype order.")
         else:
+            if grm is None:
+                raise ValueError(
+                    "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
+                )
             qmatrix = build_pcs_from_grm(grm, dim, logger)
             df = pd.DataFrame(np.column_stack([ids.astype(str), qmatrix]))
             df.to_csv(q_path, sep="\t", header=False, index=False)
@@ -506,6 +526,7 @@ def prepare_streaming_context(
     pcdim: str,
     cov_path: Union[str , None],
     mmap_limit: bool,
+    require_kinship: bool,
     logger,
 ):
     """
@@ -524,20 +545,34 @@ def prepare_streaming_context(
 
     cache_prefix = genotype_cache_prefix(genofile)
     logger.info(f"Cache prefix (genotype folder): {cache_prefix}")
-    # GRM stream...
-    grm, eff_m, grm_ids = load_or_build_grm_with_cache(
-        genofile=genofile,
-        cache_prefix=cache_prefix,
-        mgrm=mgrm,
-        maf_threshold=maf_threshold,
-        max_missing_rate=max_missing_rate,
-        chunk_size=chunk_size,
-        mmap_limit=mmap_limit,
-        logger=logger,
+    need_generate_q = (
+        pcdim in np.arange(1, n_samples).astype(str)
+        and not os.path.exists(f"{cache_prefix}.q.{pcdim}.txt")
     )
+    need_grm = bool(require_kinship or need_generate_q)
+
+    grm: Union[np.ndarray, None] = None
+    eff_m = n_snps
+    grm_ids = None
+    if need_grm:
+        # GRM stream...
+        grm, eff_m, grm_ids = load_or_build_grm_with_cache(
+            genofile=genofile,
+            cache_prefix=cache_prefix,
+            mgrm=mgrm,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            chunk_size=chunk_size,
+            mmap_limit=mmap_limit,
+            logger=logger,
+        )
+    else:
+        logger.info("Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.")
+
     # PCA stream...
     qmatrix, q_ids = load_or_build_q_with_cache(
         grm=grm,
+        n_samples=n_samples,
         cache_prefix=cache_prefix,
         pcdim=pcdim,
         ids=ids,
@@ -553,16 +588,17 @@ def prepare_streaming_context(
     pheno_ids = pheno.index.astype(str).to_numpy()
 
     # If optional ID files are missing, inherit genotype order
-    if grm_ids is None:
-        if grm.shape[0] != n_samples:
-            raise ValueError(
-                f"GRM size mismatch: {grm.shape[0]} != genotype samples {n_samples} "
-                "and no GRM ID file was provided."
-            )
-        logger.warning("GRM IDs not provided; assuming genotype order.")
-        grm_ids = ids
-    else:
-        grm_ids = np.asarray(grm_ids, dtype=str)
+    if grm is not None:
+        if grm_ids is None:
+            if grm.shape[0] != n_samples:
+                raise ValueError(
+                    f"GRM size mismatch: {grm.shape[0]} != genotype samples {n_samples} "
+                    "and no GRM ID file was provided."
+                )
+            logger.warning("GRM IDs not provided; assuming genotype order.")
+            grm_ids = ids
+        else:
+            grm_ids = np.asarray(grm_ids, dtype=str)
     if q_ids is None:
         if qmatrix.shape[0] != n_samples:
             raise ValueError(
@@ -652,8 +688,9 @@ def prepare_streaming_context(
     ids = np.array(common_ids)
     pheno = pheno.loc[ids]
 
-    grm_idx = [grm_index[sid] for sid in ids]
-    grm = grm[np.ix_(grm_idx, grm_idx)]
+    if grm is not None:
+        grm_idx = [grm_index[sid] for sid in ids]
+        grm = grm[np.ix_(grm_idx, grm_idx)]
 
     q_idx = [q_index[sid] for sid in ids]
     qmatrix = qmatrix[q_idx]
@@ -676,7 +713,7 @@ def run_chunked_gwas_lmm_lm(
     max_missing_rate: float,
     chunk_size: int,
     mmap_limit: bool,
-    grm: np.ndarray,
+    grm: Union[np.ndarray, None],
     qmatrix: np.ndarray,
     cov_all: Union[np.ndarray , None],
     eff_m: int,
@@ -723,6 +760,8 @@ def run_chunked_gwas_lmm_lm(
             X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
 
         if model_key in ("lmm", "fastlmm"):
+            if grm is None:
+                raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
             Ksub = grm[np.ix_(sameidx, sameidx)]
             mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
             logger.info(
@@ -902,6 +941,54 @@ def build_qmatrix_farmcpu(
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
     """
+    def _load_or_build_grm_cache_for_pca() -> np.ndarray:
+        grm_path = f"{gfile_prefix}.k.1.npy"
+        id_path = f"{grm_path}.id"
+        n = geno.shape[1]
+
+        if os.path.exists(grm_path):
+            logger.info(f"* Loading GRM cache for FarmCPU PCA from {grm_path}...")
+            grm = np.load(grm_path, mmap_mode="r")
+            if grm.size != n * n:
+                logger.warning(
+                    f"GRM cache shape mismatch ({grm.size} elements) for sample size {n}; rebuilding."
+                )
+            else:
+                grm = grm.reshape(n, n)
+                if sample_ids is not None and os.path.exists(id_path):
+                    grm_ids = _read_id_file(id_path, logger, "GRM")
+                    if grm_ids is None or len(grm_ids) != n:
+                        logger.warning("GRM cache IDs are invalid; rebuilding GRM cache.")
+                    else:
+                        grm_ids = np.asarray(grm_ids, dtype=str)
+                        sid = sample_ids.astype(str)
+                        if np.array_equal(grm_ids, sid):
+                            return np.asarray(grm, dtype="float32")
+                        index = {s: i for i, s in enumerate(grm_ids)}
+                        missing = [s for s in sid if s not in index]
+                        if missing:
+                            logger.warning(
+                                f"GRM cache missing {len(missing)} sample IDs; rebuilding GRM cache."
+                            )
+                        else:
+                            ord_idx = [index[s] for s in sid]
+                            grm = grm[np.ix_(ord_idx, ord_idx)]
+                            return np.asarray(grm, dtype="float32")
+                else:
+                    if sample_ids is not None and not os.path.exists(id_path):
+                        logger.warning("GRM cache ID file not found; assuming genotype sample order.")
+                    return np.asarray(grm, dtype="float32")
+
+        logger.info("* Building GRM cache for FarmCPU PCA...")
+        grm = GRM(geno).astype("float32")
+        np.save(grm_path, grm)
+        if sample_ids is not None:
+            pd.Series(sample_ids.astype(str)).to_csv(
+                id_path, sep="\t", index=False, header=False
+            )
+        logger.info(f"Cached GRM written to {grm_path}")
+        return grm
+
     def _maybe_load_with_ids(path: str, expect_rows: int):
         df = pd.read_csv(
             path, sep=None, engine="python", header=None,
@@ -934,7 +1021,8 @@ def build_qmatrix_farmcpu(
             qmatrix = np.array([]).reshape(geno.shape[1], 0)
         else:
             logger.info(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
-            _eigval, eigvec = np.linalg.eigh(GRM(geno))
+            grm = _load_or_build_grm_cache_for_pca()
+            _eigval, eigvec = np.linalg.eigh(grm)
             qmatrix = eigvec[:, -int(qdim):]
             if sample_ids is not None:
                 df = pd.DataFrame(np.column_stack([sample_ids.astype(str), qmatrix]))
@@ -1003,19 +1091,40 @@ def run_farmcpu_fullmem(
     pheno = pheno_preloaded if pheno_preloaded is not None else load_phenotype(
         phenofile, args.ncol, logger
     )
-    if gfile.endswith('vcf') or gfile.endswith('vcf.gz'):
-        geno = vcfreader(gfile, args.chunksize,maf=args.maf,miss=args.geno,impute=True)
-    else:
-        geno = breader(gfile, args.chunksize,maf=args.maf,miss=args.geno,impute=True)
-    ref_alt = geno.iloc[:,:2]
-    famid = geno.columns[2:]
-    geno = geno.iloc[:,2:].values    
+    famid, n_snps = inspect_genotype_file(gfile)
+    famid = np.asarray(famid, dtype=str)
+    geno_chunks = []
+    site_rows = []
+    pbar = tqdm(total=n_snps, desc="Loading genotype (FarmCPU)", ascii=False)
+    for chunk, sites in load_genotype_chunks(
+        gfile,
+        chunk_size=args.chunksize,
+        maf=args.maf,
+        missing_rate=args.geno,
+        impute=True,
+    ):
+        if chunk.shape[0] == 0:
+            continue
+        geno_chunks.append(np.asarray(chunk, dtype="float32"))
+        site_rows.extend(
+            [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
+        )
+        pbar.update(chunk.shape[0])
+    pbar.n = pbar.total
+    pbar.refresh()
+    pbar.close()
+
+    assert len(geno_chunks) > 0, "After filtering, number of SNPs is zero for FarmCPU."
+    geno = np.concatenate(geno_chunks, axis=0)
+    ref_alt = pd.DataFrame(site_rows, columns=["chrom", "pos", "allele0", "allele1"])
+    ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
+
     logger.info(
         f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
     )
     assert geno.size > 0, "After filtering, number of SNPs is zero for FarmCPU."
 
-    gfile_prefix = gfile.replace(".vcf", "").replace(".gz", "")
+    gfile_prefix = genotype_cache_prefix(gfile)
     qmatrix = build_qmatrix_farmcpu(
         gfile_prefix=gfile_prefix,
         geno=geno,
@@ -1045,16 +1154,14 @@ def run_farmcpu_fullmem(
             y=p_sub,
             M=snp_sub,
             X=q_sub,
-            chrlist=ref_alt.reset_index().iloc[:, 0].values,
-            poslist=ref_alt.reset_index().iloc[:, 1].values,
+            chrlist=ref_alt["chrom"].values,
+            poslist=ref_alt["pos"].values,
             iter=20,
             threads=args.thread,
         )
-        res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"], index=ref_alt.index)
+        res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"])
         res_df['maf'] = maf
-        res_df = pd.concat([ref_alt, res_df], axis=1)
-        res_df = res_df.reset_index()
-        res_df.columns = ['chrom','pos','allele0','allele1','beta','se','pwald','maf']
+        res_df = pd.concat([ref_alt.reset_index(drop=True), res_df], axis=1)
         res_df = res_df[['chrom','pos','allele0','allele1','maf','beta','se','pwald']]
 
         if args.plot:
@@ -1090,6 +1197,10 @@ def parse_args():
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-file", "--file", type=str,
+        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
@@ -1264,6 +1375,7 @@ def main(log: bool = True):
                 pcdim=args.qcov,
                 cov_path=args.cov,
                 mmap_limit=args.mmap_limit,
+                require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,
             )
 

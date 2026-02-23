@@ -25,6 +25,11 @@ from janusx.garfield.garfield2 import ldprune
 from janusx.gfreader import load_genotype_chunks
 from janusx.gfreader import inspect_genotype_file
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 # -----------------------------
@@ -351,6 +356,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(f"Write sites:       {args.write_sites}")
     logger.info(f"Seed:              {args.seed}")
     logger.info("*" * 60)
+
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
 
     if not (0.0 < args.pve < 1.0):
         logger.error("--pve must be in (0, 1).")

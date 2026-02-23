@@ -26,6 +26,11 @@ import socket
 import argparse
 
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 from janusx.gfreader.gmerge import merge
 
 
@@ -150,6 +155,19 @@ def main(log: bool = True):
         logger.info(f"Log file: {log_path}")
         logger.info("*" * 60 + "\n")
 
+    if args.no_check:
+        logger.warning("--no-check is ignored in CLI mode; input existence is always validated.")
+
+    checks: list[bool] = []
+    for src in inputs:
+        low = src.lower()
+        if low.endswith(".vcf") or low.endswith(".vcf.gz"):
+            checks.append(ensure_file_exists(logger, src, "Input VCF file"))
+        else:
+            checks.append(ensure_plink_prefix_exists(logger, src, "Input PLINK prefix"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
+
     # ------------------------------------------------------------------
     # Run merge (call your Python API)
     # ------------------------------------------------------------------
@@ -158,7 +176,7 @@ def main(log: bool = True):
         inputs=inputs,
         out=out,
         out_fmt=out_fmt,
-        check_exists=(not args.no_check),
+        check_exists=True,
         return_dict=True,
     )
     logger.info(f"Merge completed in {round(time.time() - t0, 3)} seconds")

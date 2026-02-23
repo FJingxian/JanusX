@@ -38,6 +38,7 @@ import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
 from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
+from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
 
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
 FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
@@ -204,12 +205,12 @@ def main():
     logger = setup_logging(str(log_path))
 
     reference = Path(args.reference).expanduser().resolve()
-    if not reference.exists():
-        raise FileNotFoundError(f"Reference file does not exist: {reference}")
+    if not ensure_file_exists(logger, str(reference), "Reference file"):
+        raise SystemExit(1)
 
     fastq_dir = Path(args.fastq_dir).expanduser().resolve()
-    if not fastq_dir.exists():
-        raise FileNotFoundError(f"FASTQ directory does not exist: {fastq_dir}")
+    if not ensure_dir_exists(logger, str(fastq_dir), "FASTQ directory"):
+        raise SystemExit(1)
 
     logger.info("JanusX: FASTQ -> VCF pipeline")
     logger.info(f"Host: {socket.gethostname()}")
@@ -267,7 +268,8 @@ def main():
         if p.is_file() and p.name.lower().endswith(FASTQ_SUFFIXES)
     )
     if not fastqlist:
-        raise FileNotFoundError(f"No FASTQ files found in {fastq_dir}")
+        logger.error(f"No FASTQ files found in {fastq_dir}")
+        raise SystemExit(1)
 
     level1, level2 = two_level_cluster(fastqlist)
     samples = build_samples(level1, level2)

@@ -26,6 +26,11 @@ import pandas as pd
 
 from janusx.garfield.decode import decode
 from janusx.script._common.log import setup_logging
+from janusx.script._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 def _determine_genotype(args) -> tuple[str, str]:
@@ -200,6 +205,26 @@ def main() -> None:
     logger.info(f"Output prefix: {outprefix}")
     logger.info("*" * 60 + "\n")
 
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
+    checks.append(ensure_file_exists(logger, args.grm, "GRM file"))
+    if args.qcov:
+        checks.append(ensure_file_exists(logger, args.qcov, "Q matrix file"))
+    if args.cov:
+        checks.append(ensure_file_exists(logger, args.cov, "Covariate file"))
+    pseudo_path = args.pseudo or f"{gfile}.pseudo"
+    checks.append(ensure_file_exists(logger, pseudo_path, "Pseudo mapping file"))
+    if args.highlight:
+        checks.append(ensure_file_exists(logger, args.highlight, "Highlight file"))
+    if args.anno:
+        checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
+
     # ------------------------- Run GWAS -------------------------
     cmd = [
         "jx", "gwas",
@@ -228,15 +253,11 @@ def main() -> None:
     _run_subprocess(cmd, logger, "Running GWAS")
 
     # ------------------------- Decode pseudo SNPs -------------------------
-    pseudo_path = args.pseudo or f"{gfile}.pseudo"
-    if not os.path.isfile(pseudo_path):
-        raise FileNotFoundError(f"Pseudo mapping file not found: {pseudo_path}")
-
     pseudodf = pd.read_csv(pseudo_path, sep="\t")
     gwas_files = _find_gwas_results(outprefix, "lmm")
     if not gwas_files:
         raise FileNotFoundError(
-            f"No GWAS result files found under {outprefix} for model {args.model}"
+            f"No GWAS result files found under {outprefix} for model lmm"
         )
 
     decoded_files: list[str] = []

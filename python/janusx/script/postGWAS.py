@@ -24,6 +24,7 @@ Citation
 
 import os
 from ._common.log import setup_logging
+from ._common.pathcheck import ensure_all_true, ensure_file_exists
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -405,6 +406,14 @@ def main():
         f"({'All cores' if args.thread == -1 else 'User-specified'})"
     )
     logger.info("*" * 60 + "\n")
+
+    checks: list[bool] = [ensure_file_exists(logger, f, "GWAS result file") for f in args.file]
+    if args.highlight:
+        checks.append(ensure_file_exists(logger, args.highlight, "Highlight file"))
+    if args.anno:
+        checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
 
     # ------------------------------------------------------------------
     # Parallel processing of all input files

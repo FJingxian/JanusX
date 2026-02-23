@@ -38,6 +38,11 @@ from janusx.gfreader import (
     auto_mmap_window_mb,
 )
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 def build_grm_streaming(
@@ -256,6 +261,14 @@ def main(log: bool = True):
         logger.info(f"Save as NPY: {args.npy}")
         logger.info(f"Output prefix: {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
+
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
 
     # ------------------------------------------------------------------
     # Inspect genotype and build GRM in streaming mode

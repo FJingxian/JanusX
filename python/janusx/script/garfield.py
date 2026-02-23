@@ -12,6 +12,11 @@ from janusx.garfield.garfield2 import (
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
 from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.script._common.readanno import readanno
+from janusx.script._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 
@@ -64,6 +69,34 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
     return genesets
 
 
+def determine_genotype_source(args) -> tuple[str, str]:
+    def _strip_geno_suffix(name: str) -> str:
+        low = name.lower()
+        if low.endswith(".vcf.gz"):
+            return name[: -len(".vcf.gz")]
+        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+            if low.endswith(ext):
+                return name[: -len(ext)]
+        return name
+
+    if args.vcf:
+        gfile = args.vcf
+        prefix = _strip_geno_suffix(os.path.basename(gfile))
+    elif args.file:
+        gfile = args.file
+        prefix = _strip_geno_suffix(os.path.basename(gfile))
+    elif args.bfile:
+        gfile = args.bfile
+        prefix = os.path.basename(gfile)
+    else:
+        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
+
+    if args.prefix is not None:
+        prefix = args.prefix
+
+    return gfile.replace("\\", "/"), prefix
+
+
 def main() -> None:
     t_start = time.time()
     parser = argparse.ArgumentParser(
@@ -71,9 +104,18 @@ def main() -> None:
     )
 
     required_group = parser.add_argument_group("Required Arguments")
-    required_group.add_argument(
-        "-bfile", "--bfile", type=str, required=True,
+    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group.add_argument(
+        "-bfile", "--bfile", type=str,
         help="Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).",
+    )
+    geno_group.add_argument(
+        "-vcf", "--vcf", type=str,
+        help="Input genotype in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-file", "--file", type=str,
+        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
     )
     required_group.add_argument(
         "-p", "--pheno", type=str, required=True,
@@ -128,7 +170,7 @@ def main() -> None:
     )
     optional_group.add_argument(
         "-prefix", "--prefix", type=str, default=None,
-        help="Output prefix (default: inferred from bfile).",
+        help="Output prefix (default: inferred from genotype input).",
     )
     optional_group.add_argument(
         "-mmap-limit", "--mmap-limit", action="store_true", default=False,
@@ -137,8 +179,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    bfile = args.bfile.replace("\\", "/")
-    prefix = args.prefix or os.path.basename(bfile)
+    gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
     os.makedirs(args.out, mode=0o755, exist_ok=True)
 
@@ -150,7 +191,7 @@ def main() -> None:
     logger.info("*" * 60)
     logger.info("GARFIELD CONFIGURATION")
     logger.info("*" * 60)
-    logger.info(f"Bfile:         {bfile}")
+    logger.info(f"Genotype:      {gfile}")
     logger.info(f"Phenotype:     {args.pheno}")
     logger.info(f"Gene file:     {args.genefile}")
     logger.info(f"GFF3:          {args.gff3}")
@@ -173,12 +214,25 @@ def main() -> None:
             "Gene/gff3 mode requires both; falling back to window mode."
         )
 
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
+    if args.genefile:
+        checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
+    if args.gff3:
+        checks.append(ensure_file_exists(logger, args.gff3, "GFF3 file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
+
     # Load genotype meta
-    sample_ids, n_snps = inspect_genotype_file(bfile)
+    sample_ids, n_snps = inspect_genotype_file(gfile)
     sample_ids = np.array(sample_ids, dtype=str)
     chunk_size = 100_000
     mmap_window_mb = (
-        auto_mmap_window_mb(bfile, len(sample_ids), n_snps, chunk_size)
+        auto_mmap_window_mb(gfile, len(sample_ids), n_snps, chunk_size)
         if args.mmap_limit else None
     )
 
@@ -198,7 +252,9 @@ def main() -> None:
         dfgff3 = readanno(args.gff3, "ID").iloc[:, :4].set_index(3)
         dupgenemask = dfgff3.index.duplicated()
         if any(dupgenemask):
-            logger.warning(f"Duplicated genes in GFF3: {np.unique(dfgff3.index[dupgenemask])}")
+            logger.warning(
+                f"Duplicated genes in GFF3: {np.unique(dfgff3.index[dupgenemask])}"
+            )
         dfgff3 = dfgff3.loc[~dupgenemask]
 
         bimranges = []
@@ -221,7 +277,7 @@ def main() -> None:
 
         logger.info("Gene/gff3 mode: loading all genotype as int8 into memory.")
         all_genotype_i8, all_sites = load_all_genotype_int8(
-            bfile,
+            gfile,
             np.asarray(common, dtype=str),
             chunk_size=chunk_size,
             maf=0.02,
@@ -248,7 +304,7 @@ def main() -> None:
         # Window mode
         gsetmode = False
         results = garfield_window(
-            bfile,
+            gfile,
             common,
             y,
             args.step,

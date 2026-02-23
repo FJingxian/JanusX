@@ -74,6 +74,11 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 # ======================================================================
@@ -1342,16 +1347,26 @@ def main(log: bool = True):
         logger.info(f"Output prefix:    {outprefix}")
         logger.info("*" * 60 + "\n")
 
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
+    if args.grm not in ["1", "2"]:
+        checks.append(ensure_file_exists(logger, args.grm, "GRM file"))
+    if args.qcov not in np.arange(0, 30).astype(str):
+        checks.append(ensure_file_exists(logger, args.qcov, "Q matrix file"))
+    if args.cov is not None:
+        checks.append(ensure_file_exists(logger, args.cov, "Covariate file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
+
+    if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
+        logger.error("No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu.")
+        raise SystemExit(1)
+
     try:
-        assert os.path.isfile(args.pheno), f"Cannot find phenotype file {args.pheno}"
-        grm_is_valid = args.grm in ["1", "2"] or os.path.isfile(args.grm)
-        q_is_valid = args.qcov in np.arange(0, 30).astype(str) or os.path.isfile(args.qcov)
-        assert grm_is_valid, f"{args.grm} is neither GRM method nor an existing GRM file."
-        assert q_is_valid, f"{args.qcov} is neither PC dimension nor Q matrix file."
-        assert args.cov is None or os.path.isfile(args.cov), f"Covariate file {args.cov} does not exist."
-        assert (args.lm or args.lmm or args.fastlmm or args.farmcpu), (
-            "No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu."
-        )
 
         # --- prepare streaming context once if needed ---
         pheno = None

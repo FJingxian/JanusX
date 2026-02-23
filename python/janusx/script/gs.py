@@ -79,6 +79,11 @@ from janusx.gfreader import breader, vcfreader
 from janusx.pyBLUP import BLUP, kfold
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 # ======================================================================
@@ -349,6 +354,15 @@ def main(log: bool = True) -> None:
             logger.info(f"Plot mode:       {args.plot}")
         logger.info(f"Output prefix:   {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
+
+    checks: list[bool] = []
+    if args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    else:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
 
     # ------------------------------------------------------------------
     # Load phenotype

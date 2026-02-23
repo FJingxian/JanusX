@@ -237,7 +237,8 @@ def main():
         else:
             src = Path(user_input).expanduser().resolve()
             if not src.exists():
-                raise SystemExit(f"SIF path not found: {src}")
+                logger.error(f"SIF path not found: {src}")
+                raise SystemExit(1)
             shutil.copy2(src, tmp_path)
 
         # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)

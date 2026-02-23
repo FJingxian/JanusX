@@ -353,7 +353,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("*" * 60)
 
     if not (0.0 < args.pve < 1.0):
-        raise SystemExit("ERROR: --pve must be in (0, 1).")
+        logger.error("--pve must be in (0, 1).")
+        raise SystemExit(1)
 
     t_start = time.time()
     logger.info(f"Simulating phenotype from genotype: {gfile}")

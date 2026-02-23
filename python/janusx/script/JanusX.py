@@ -50,7 +50,9 @@ def main():
         else:
             module_name = sys.argv[1]
             if sys.argv[1] in module.keys():
-                sys.argv.remove(sys.argv[1])
+                # Keep argparse usage as "jx <module> ..."
+                sys.argv[0] = f"jx {module_name}"
+                del sys.argv[1]
                 module[module_name].main() # Process of Target Module
             elif sys.argv[1] not in module.keys():
                 print(f"Unknown module: {sys.argv[1]}")

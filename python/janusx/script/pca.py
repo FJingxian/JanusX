@@ -65,6 +65,11 @@ from janusx.gfreader import (
     auto_mmap_window_mb,
 )
 from ._common.log import setup_logging
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+)
 
 
 # ======================================================================
@@ -391,6 +396,37 @@ def main(log: bool = True):
             )
         logger.info(f"Output prefix:    {args.out}/{args.prefix}")
         logger.info("*" * 60 + "\n")
+
+    checks: list[bool] = []
+    if args.vcf:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    elif args.bfile:
+        checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.grm:
+        if os.path.isfile(gfile):
+            grm_input = gfile
+        elif os.path.isfile(f"{gfile}.grm.txt"):
+            grm_input = f"{gfile}.grm.txt"
+        elif os.path.isfile(f"{gfile}.grm.npy"):
+            grm_input = f"{gfile}.grm.npy"
+        else:
+            logger.error(
+                "GRM matrix not found: "
+                f"{gfile} (or {gfile}.grm.txt / {gfile}.grm.npy)"
+            )
+            grm_input = None
+            checks.append(False)
+        if grm_input is not None:
+            checks.append(ensure_file_exists(logger, f"{grm_input}.id", "GRM ID file"))
+    elif args.qcov:
+        checks.append(ensure_file_exists(logger, f"{gfile}.eigenvec", "Eigenvec file"))
+        checks.append(ensure_file_exists(logger, f"{gfile}.eigenval", "Eigenval file"))
+
+    if args.group:
+        checks.append(ensure_file_exists(logger, args.group, "Group file"))
+
+    if not ensure_all_true(checks):
+        raise SystemExit(1)
 
     # ------------------------- PCA core logic -------------------------
     t_loading = time.time()

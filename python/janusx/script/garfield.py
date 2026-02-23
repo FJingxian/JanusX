@@ -20,6 +20,14 @@ from janusx.script._common.pathcheck import (
 from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 
+
+def _safe_trait_label(label: object) -> str:
+    name = str(label).strip()
+    if name == "":
+        return "trait"
+    return name.replace("/", "_").replace("\\", "_")
+
+
 def write_xcombine_results(
     outprefix: str,
     sample_ids: list[str],
@@ -238,14 +246,23 @@ def main() -> None:
 
     # Load phenotype and align to genotype order (drop NaNs)
     pheno = load_phenotype(args.pheno, args.ncol, logger, id_col=0)
-    pheno_col = pheno.iloc[:, 0].dropna()
-    pheno_ids = pheno_col.index.astype(str).to_numpy()
-    common = [sid for sid in sample_ids if sid in set(pheno_ids)]
-    if len(common) == 0:
-        raise ValueError("No overlapping samples between genotype and phenotype after dropna.")
-    y = pheno_col.loc[common].values.reshape(-1, 1)
+    if pheno.shape[1] == 0:
+        raise ValueError("No phenotype columns to analyze.")
+    trait_names = [str(c) for c in pheno.columns]
+    logger.info(f"Phenotype columns ({len(trait_names)}): {', '.join(trait_names)}")
 
-    gsetmode = False
+    pheno_all_ids = set(pheno.index.astype(str).to_numpy())
+    sample_pool = [sid for sid in sample_ids if sid in pheno_all_ids]
+    if len(sample_pool) == 0:
+        raise ValueError("No overlapping samples between genotype and phenotype.")
+
+    bimranges = []
+    gset_flags = []
+    all_genotype_i8 = None
+    all_sites = None
+    sample_pool_arr = np.asarray(sample_pool, dtype=str)
+    sample_pool_index = {sid: i for i, sid in enumerate(sample_pool)}
+
     # Gene/gff3 mode
     if args.genefile and args.gff3 and os.path.isfile(args.genefile) and os.path.isfile(args.gff3):
         genesets = _read_geneset_lines(args.genefile)
@@ -275,49 +292,95 @@ def main() -> None:
                 bimranges.append(ranges)
                 gset_flags.append(use_gset)
 
-        logger.info("Gene/gff3 mode: loading all genotype as int8 into memory.")
+        logger.info(
+            "Gene/gff3 mode: loading all genotype as int8 into memory "
+            "(supports PLINK/VCF/TXT; VCF/TXT use cache conversion)."
+        )
         all_genotype_i8, all_sites = load_all_genotype_int8(
             gfile,
-            np.asarray(common, dtype=str),
+            sample_pool_arr,
             chunk_size=chunk_size,
             maf=0.02,
             missing_rate=0.05,
             mmap_window_mb=mmap_window_mb,
+            total_snps=n_snps,
         )
         logger.info(
             "Loaded genotype matrix for gene/gset mode: "
             f"{all_genotype_i8.shape[0]} SNPs x {all_genotype_i8.shape[1]} samples, "
             f"dtype={all_genotype_i8.dtype}"
         )
-        results = garfield_main_inmemory(
-            all_genotype_i8,
-            all_sites,
-            y,
-            bimranges,
-            nsnp=args.nsnp,
-            n_estimators=args.nestimators,
-            threads=threads,
-            response=args.vartype,
-            gsetmodes=gset_flags,
-        )
     else:
-        # Window mode
-        gsetmode = False
-        results = garfield_window(
-            gfile,
-            common,
-            y,
-            args.step,
-            args.extension,
-            nsnp=args.nsnp,
-            n_estimators=args.nestimators,
-            response=args.vartype,
-            gsetmode=gsetmode,
-            threads=threads,
-            mmap_window_mb=mmap_window_mb,
+        logger.info(
+            "Window mode: streaming genotype loading "
+            "(VCF->PLINK cache, TXT->NPY cache)."
         )
 
-    write_xcombine_results(f"{outprefix}.garfield", list(common), results)
+    multi_trait = pheno.shape[1] > 1
+    used_trait_labels: dict[str, int] = {}
+    saved = 0
+
+    for trait in pheno.columns:
+        trait_name = str(trait)
+        pheno_col = pheno[trait].dropna()
+        pheno_ids = set(pheno_col.index.astype(str).to_numpy())
+        common = [sid for sid in sample_pool if sid in pheno_ids]
+        if len(common) == 0:
+            logger.warning(
+                f"No overlapping samples for trait '{trait_name}' after dropna; skipped."
+            )
+            continue
+
+        y = pheno_col.loc[common].values.reshape(-1, 1)
+        logger.info(f"Running GARFIELD for trait '{trait_name}' (n={len(common)}).")
+
+        if all_genotype_i8 is not None and all_sites is not None:
+            idx = np.asarray([sample_pool_index[sid] for sid in common], dtype=np.int64)
+            geno_trait = np.ascontiguousarray(all_genotype_i8[:, idx], dtype=np.int8)
+            results = garfield_main_inmemory(
+                geno_trait,
+                all_sites,
+                y,
+                bimranges,
+                nsnp=args.nsnp,
+                n_estimators=args.nestimators,
+                threads=threads,
+                response=args.vartype,
+                gsetmodes=gset_flags,
+            )
+        else:
+            results = garfield_window(
+                gfile,
+                common,
+                y,
+                args.step,
+                args.extension,
+                nsnp=args.nsnp,
+                n_estimators=args.nestimators,
+                response=args.vartype,
+                gsetmode=False,
+                threads=threads,
+                mmap_window_mb=mmap_window_mb,
+            )
+
+        if multi_trait:
+            base_trait = _safe_trait_label(trait_name)
+            count = used_trait_labels.get(base_trait, 0) + 1
+            used_trait_labels[base_trait] = count
+            suffix = base_trait if count == 1 else f"{base_trait}.{count}"
+            trait_outprefix = f"{outprefix}.{suffix}"
+        else:
+            trait_outprefix = outprefix
+
+        write_xcombine_results(f"{trait_outprefix}.garfield", list(common), results)
+        logger.info(
+            f"Saved GARFIELD output for trait '{trait_name}': {trait_outprefix}.garfield"
+        )
+        saved += 1
+
+    if saved == 0:
+        raise ValueError("No GARFIELD outputs were generated for the selected phenotype columns.")
+
     lt = time.localtime()
     logger.info(
         f"\nFinished GARFIELD. Total wall time: {round(time.time() - t_start, 2)} seconds\n"

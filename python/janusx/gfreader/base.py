@@ -1,5 +1,5 @@
 from importlib.metadata import version, PackageNotFoundError
-from typing import Literal
+from typing import Literal, Union
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -99,61 +99,69 @@ def vcfreader(vcfPath:str,chunk_size=50_000,
     genotype = genotype.set_index(['#CHROM','POS'])
     return genotype.dropna()
 
-def hmpreader(hmp:str,sample_start:int=None,chr:str='chrom',ps:str='position',ref:str='ref',chunksize=10_000,ref_adjust:str=None):
-    raws = pd.read_csv(hmp,sep='\t',chunksize=chunksize)
-    _ = []
-    for raw in raws:
-        samples = raw.columns[sample_start:raw.shape[0]]
-        genotype = raw[samples].fillna('XX')
-        def filterindel(col:pd.Series):
-            col[col.str.len()!=2] = 'XX'
-            return col
-        genotype = genotype.apply(filterindel,axis=0)
-        ref_alt:pd.Series = genotype.sum(axis=1).apply(set).apply(''.join).str.replace('X','')
-        biallele = ref_alt[ref_alt.str.len()==2]
-        moallele = ref_alt[ref_alt.str.len()==1]
-        moallele+=moallele
-        mbiallele = pd.concat([biallele,moallele])
-        mbiallele = mbiallele.str.split('',expand=True)[[1,2]]
-        alt:pd.Series = mbiallele[1]*(mbiallele[1]!=raw.loc[mbiallele.index,ref])+mbiallele[2]*(mbiallele[2]!=raw.loc[mbiallele.index,ref])
-        alt.loc[moallele.index] = raw.loc[moallele.index,ref]
-        ref_alt:pd.DataFrame = pd.concat([raw[ref],alt],axis=1).dropna()
-        ref_alt.columns = ['A0','A1']
-        rr = ref_alt['A0']+ref_alt['A0']
-        ra = ref_alt['A0']+ref_alt['A1']
-        ar = ref_alt['A1']+ref_alt['A0']
-        aa = ref_alt['A1']+ref_alt['A1']
-        def hmp2genotype(col:pd.Series):
-            return ((col==ra)|(col==ar)).astype('int8')+2*(col==aa).astype('int8')
-        genotype = genotype.loc[ref_alt.index]
-        xxmask = (genotype=='XX')
-        genotype = genotype.apply(hmp2genotype,axis=0)
-        genotype[xxmask] = -9
-        genotype[genotype==3] = 0 # Fixed some bugs: 3 is combination of REF+REF
-        chr_loc = raw.loc[genotype.index,[chr,ps]]
-        chr_loc.columns = ['#CHROM','POS']
-        genotype = pd.concat([chr_loc,ref_alt,genotype],axis=1)
-        _.append(genotype.set_index(['#CHROM','POS']))
-    genotype = pd.concat(_)
-    if ref_adjust is not None:
-        adjust_m = GENOMETOOL(ref_adjust)
-        genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
-        genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
-        genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
-    return genotype
 
-def npyreader(prefix:str,ref_adjust:str=None):
-    genotype = np.load(f'{prefix}.npz')
-    samples = pd.read_csv(f'{prefix}.idv',sep='\t',header=None)[0].values
-    ref_alt = pd.read_csv(f'{prefix}.snp',sep='\t',header=None,dtype={0:'category',1:'int32',2:'category',3:'category'})
-    ref_alt.columns = ['#CHROM','POS','A0','A1']
-    genotype:pd.DataFrame = pd.concat([ref_alt,pd.DataFrame(genotype['arr_0'],columns=samples)],axis=1).set_index(["#CHROM","POS"])
-    if ref_adjust is not None:
-        adjust_m = GENOMETOOL(ref_adjust)
-        genotype.iloc[:,:2] = adjust_m.refalt_adjust(genotype.iloc[:,:2])
-        genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]] = 2 - genotype.loc[adjust_m.exchange_loc,genotype.columns[2:]]
-        genotype.columns = ['REF','ALT']+genotype.columns[2:].to_list()
-    return genotype
+def greader(
+    txtPath: str,
+    delimiter: Union[str, None] = None,
+    dtype: Literal['int8', 'float32'] = 'int8',
+) -> pd.DataFrame:
+    """
+    Load genotype TXT matrix by NumPy.
+
+    Assumption:
+      - first line is sample IDs
+      - remaining lines are SNP-major numeric genotypes
+    """
+    with open(txtPath, "r", encoding="utf-8") as f:
+        header = ""
+        for line in f:
+            line = line.strip()
+            if line:
+                header = line
+                break
+    if header == "":
+        raise ValueError(f"Empty genotype TXT file: {txtPath}")
+
+    if delimiter is None:
+        if "," in header and ("\t" not in header):
+            delimiter = ","
+        elif "\t" in header:
+            delimiter = "\t"
+        else:
+            delimiter = None
+
+    tokens = header.split(delimiter) if delimiter is not None else header.split()
+    sample_ids = [str(x).strip() for x in tokens if str(x).strip() != ""]
+
+    genotype = np.loadtxt(
+        txtPath,
+        dtype=dtype,
+        delimiter=delimiter,
+        skiprows=1,
+    )
+    genotype = np.atleast_2d(genotype)
+
+    if genotype.shape[1] != len(sample_ids):
+        if len(sample_ids) == genotype.shape[1] + 1:
+            sample_ids = sample_ids[1:]
+        else:
+            sample_ids = [f"S{i+1}" for i in range(genotype.shape[1])]
+
+    genotype = np.asarray(genotype, dtype=dtype)
+    nsnp = genotype.shape[0]
+    bim = pd.DataFrame(
+        {
+            '#CHROM': np.repeat("N", nsnp),
+            'POS': np.arange(1, nsnp + 1, dtype=np.int64),
+            'A0': np.repeat("N", nsnp),
+            'A1': np.repeat("N", nsnp),
+        }
+    )
+    genotype = pd.DataFrame(genotype, columns=sample_ids)
+    genotype = pd.concat([bim[['#CHROM', 'POS', 'A0', 'A1']], genotype], axis=1)
+    genotype = genotype.set_index(['#CHROM', 'POS'])
+    return genotype.dropna()
+
 
 def vcfinfo():
     import time
@@ -164,7 +172,8 @@ def vcfinfo():
 ##INFO=<ID=PR,Number=0,Type=Flag,Description="Provisional reference allele, may not be based on real reference genome">
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'''
     return vcf_info
-    
+
+
 def genotype2vcf(geno:pd.DataFrame,outPrefix:str=None,chunksize:int=10_000):
     import warnings
     warnings.filterwarnings('ignore')

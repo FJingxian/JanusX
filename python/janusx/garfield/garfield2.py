@@ -4,28 +4,9 @@ from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from janusx.gfreader import load_genotype_chunks
+from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
 from janusx.garfield.logreg import logreg
 from tqdm import tqdm
-
-def _to_i8_snp_major(geno_chunk: np.ndarray) -> np.ndarray:
-    """
-    Convert SNP-major genotype chunk to int8 encoding.
-    """
-    g = np.asarray(geno_chunk)
-    if g.ndim != 2:
-        raise ValueError("geno_chunk must be 2D (m_chunk, n_samples)")
-    if g.dtype == np.int8:
-        return np.ascontiguousarray(g)
-
-    miss = g < 0
-    gi = np.rint(g).astype(np.int16, copy=False)
-    gi = np.clip(gi, 0, 2).astype(np.int8, copy=False)
-    gi = np.ascontiguousarray(gi)
-    if np.any(miss):
-        gi = gi.copy()
-        gi[miss] = np.int8(-9)
-    return gi
 
 def load_all_genotype_int8(
     genofile: str,
@@ -34,31 +15,64 @@ def load_all_genotype_int8(
     maf: float = 0.02,
     missing_rate: float = 0.05,
     mmap_window_mb: Union[int, None] = None,
+    total_snps: Union[int, None] = None,
 ) -> tuple[np.ndarray, List[Any]]:
     """
-    Load all filtered genotypes once and store them in memory as int8.
-    Returns SNP-major matrix (m_snps, n_samples) and corresponding sites.
+    Load all filtered genotypes once into memory as SNP-major int8 matrix.
+
+    Supported input: PLINK / VCF(.gz) / TXT matrix.
     """
+    sample_arr = np.asarray(sampleid, dtype=str)
+    low = str(genofile).lower()
+    if low.endswith(".vcf") or low.endswith(".vcf.gz"):
+        all_ids, n_all_snps = inspect_genotype_file(genofile)
+        all_ids = np.asarray(all_ids, dtype=str)
+        sameidx = np.isin(all_ids, sample_arr)
+        if not np.any(sameidx):
+            raise ValueError(
+                "No overlapping samples between genotype input and selected sample IDs."
+            )
+        sample_sub = None
+        n_use = int(np.sum(sameidx))
+    else:
+        _all_ids, n_all_snps = inspect_genotype_file(genofile)
+        sameidx = None
+        sample_sub = sample_arr.tolist()
+        n_use = len(sample_sub)
+
+    chunk_size = max(1, int(chunk_size))
+    if total_snps is None:
+        total_snps = int(n_all_snps)
+    total_chunks = None
+    if total_snps is not None and int(total_snps) > 0:
+        total_chunks = (int(total_snps) + chunk_size - 1) // chunk_size
+
     chunks = load_genotype_chunks(
         genofile,
-        chunk_size=int(chunk_size),
+        chunk_size=chunk_size,
         maf=maf,
         missing_rate=missing_rate,
         impute=True,
-        sample_ids=sampleid,
+        sample_ids=sample_sub,
         mmap_window_mb=mmap_window_mb,
     )
-
     M_list: List[np.ndarray] = []
     sites_list: List[Any] = []
-    for chunk, sites in tqdm(chunks, desc="Loading genotype", unit="chunk"):
+    for chunk, sites in tqdm(
+        chunks,
+        total=total_chunks,
+        desc="Loading genotype",
+        unit="chunk",
+    ):
         if chunk.size == 0 or len(sites) == 0:
             continue
-        M_list.append(_to_i8_snp_major(chunk))
+        if sameidx is not None:
+            chunk = chunk[:, sameidx]
+        M_list.append(np.asarray(np.rint(chunk), dtype=np.int8))
         sites_list.extend(sites)
 
     if not M_list:
-        return np.empty((0, len(sampleid)), dtype=np.int8), []
+        return np.empty((0, n_use), dtype=np.int8), []
     M = np.vstack(M_list)
     return np.ascontiguousarray(M, dtype=np.int8), sites_list
 
@@ -271,6 +285,29 @@ def _window_task(
     return resdict
 
 
+def _resolve_stream_sample_subset(
+    genofile: str,
+    sampleid: np.ndarray,
+) -> tuple[Union[list[str], None], Union[np.ndarray, None]]:
+    """
+    Keep streaming sample handling consistent with gwas.py:
+    - For VCF input: read all samples in chunk reader, then subset by boolean mask.
+    - For non-VCF input: pass sample_ids directly to chunk reader.
+    """
+    sample_arr = np.asarray(sampleid, dtype=str)
+    low = str(genofile).lower()
+    if low.endswith(".vcf") or low.endswith(".vcf.gz"):
+        all_ids, _ = inspect_genotype_file(genofile)
+        all_ids = np.asarray(all_ids, dtype=str)
+        sameidx = np.isin(all_ids, sample_arr)
+        if not np.any(sameidx):
+            raise ValueError(
+                "No overlapping samples between genotype input and selected sample IDs."
+            )
+        return None, sameidx
+    return sample_arr.tolist(), None
+
+
 def window(
     genofile: str,
     sampleid: np.ndarray,
@@ -320,6 +357,7 @@ def window(
             except Exception:
                 total_windows = None
     pbar = tqdm(total=total_windows, desc="Windows", unit="win")
+    sample_sub, sameidx = _resolve_stream_sample_subset(genofile, sampleid)
 
     buffer_M = None
     buffer_sites: List[Any] = []
@@ -371,7 +409,7 @@ def window(
         maf=maf,
         missing_rate=missing_rate,
         impute=True,
-        sample_ids=sampleid,
+        sample_ids=sample_sub,
         mmap_window_mb=mmap_window_mb,
     )
 
@@ -379,6 +417,8 @@ def window(
         for chunk, sites in chunks:
             if not sites:
                 continue
+            if sameidx is not None:
+                chunk = chunk[:, sameidx]
             # split by chromosome boundaries within the chunk
             idx = 0
             while idx < len(sites):
@@ -494,7 +534,8 @@ chrposTuple = Tuple[str, int, int]
 def _process(
     ChromPos: Union[chrposTuple,List[chrposTuple]],
     genofile: str,
-    sampleid: np.ndarray,
+    sample_sub: Union[list[str], None],
+    sameidx: Union[np.ndarray, None],
     y: np.ndarray,
     maf: float = 0.02,
     missing_rate: float = 0.05,
@@ -521,7 +562,7 @@ def _process(
             missing_rate=missing_rate,
             impute=True,
             bim_range=(str(chrom), int(start), int(end)),
-            sample_ids=sampleid,
+            sample_ids=sample_sub,
         )
 
         M_list = []
@@ -529,6 +570,8 @@ def _process(
 
         for chunk, sites in chunks:
             # chunk: (m_chunk, n_samples)
+            if sameidx is not None:
+                chunk = chunk[:, sameidx]
             M_list.append(chunk)
             sites_list.extend(sites)
         if not M_list:
@@ -548,13 +591,15 @@ def _process(
                 missing_rate=missing_rate,
                 impute=True,
                 bim_range=(str(chrom), int(start), int(end)),
-                sample_ids=sampleid,
+                sample_ids=sample_sub,
             )
             M_gene = None
             sites_gene: List[Any] = []
             for chunk, sites in chunks:
                 if chunk.size == 0:
                     continue
+                if sameidx is not None:
+                    chunk = chunk[:, sameidx]
                 if M_gene is None:
                     M_gene = chunk
                     sites_gene = list(sites)
@@ -739,11 +784,13 @@ def main(
     y = np.asarray(y, dtype=float).ravel()
     if gsetmodes is not None and len(gsetmodes) != len(bedlist):
         raise ValueError("gsetmodes length must match bedlist length")
+    sample_sub, sameidx = _resolve_stream_sample_subset(genofile, sampleid)
     results = Parallel(n_jobs=threads)(
         delayed(_process)(
             ChromPos,
             genofile,
-            sampleid,
+            sample_sub,
+            sameidx,
             y,
             maf,
             missing_rate,

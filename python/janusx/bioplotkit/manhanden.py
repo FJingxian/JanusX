@@ -1,4 +1,5 @@
 import time
+import re
 from typing import Union
 import numpy as np
 import pandas as pd
@@ -15,6 +16,52 @@ def ppoints(n: int) -> np.ndarray:
         q_i = i / (n + 1), i = 1..n
     """
     return np.arange(1, n + 1) / (n + 1)
+
+
+def _natural_tokens(text: str) -> list[tuple[int, Union[int, str]]]:
+    """
+    Tokenize string for natural sorting with comparable typed tokens.
+    """
+    tokens: list[tuple[int, Union[int, str]]] = []
+    for part in re.split(r"(\d+)", text):
+        if not part:
+            continue
+        if part.isdigit():
+            tokens.append((0, int(part)))
+        else:
+            tokens.append((1, part.lower()))
+    return tokens
+
+
+def _chrom_sort_key(label: object) -> tuple[int, object]:
+    """
+    Natural ordering for chromosome labels:
+      1) numeric chromosomes (1,2,...)
+      2) X/Y/M/MT
+      3) other contigs by natural sort
+      4) missing values last
+    """
+    if pd.isna(label):
+        return (3, "")
+
+    if isinstance(label, (int, np.integer)):
+        return (0, int(label))
+
+    if isinstance(label, (float, np.floating)) and float(label).is_integer():
+        return (0, int(label))
+
+    text = str(label).strip()
+    no_chr_prefix = text[3:] if text.lower().startswith("chr") else text
+    upper = no_chr_prefix.upper()
+
+    if no_chr_prefix.isdigit():
+        return (0, int(no_chr_prefix))
+
+    special_chr = {"X": 23, "Y": 24, "M": 25, "MT": 25}
+    if upper in special_chr:
+        return (1, special_chr[upper])
+
+    return (2, _natural_tokens(no_chr_prefix))
 
 
 class GWASPLOT:
@@ -39,6 +86,9 @@ class GWASPLOT:
           - keep all highly significant points (p <= 10000 / n),
           - for the rest, partition into chunks and keep only the most significant
             SNP per chunk.
+    chr_order : list or None, default None
+        Optional chromosome order. If None, chromosome labels are ordered
+        automatically by natural chromosome order (1..N, X/Y/M/MT, then others).
 
     Notes
     -----
@@ -56,6 +106,7 @@ class GWASPLOT:
         pvalue: str = "pwald",
         interval_rate: float = 0.1,
         compression: bool = True,
+        chr_order: Union[list[object], None] = None,
     ) -> None:
         self.t_start = time.time()
 
@@ -110,7 +161,17 @@ class GWASPLOT:
         df = df[[chr, pos, pvalue]].copy()
 
         # ---- (3) Map chromosome labels to integers 1..K ----
-        self.chr_labels = df[chr].unique()
+        observed_labels = df[chr].drop_duplicates().tolist()
+
+        if chr_order is None:
+            self.chr_labels = sorted(observed_labels, key=_chrom_sort_key)
+        else:
+            observed_set = set(observed_labels)
+            ordered_present = [label for label in chr_order if label in observed_set]
+            ordered_set = set(ordered_present)
+            missing = [label for label in observed_labels if label not in ordered_set]
+            self.chr_labels = ordered_present + sorted(missing, key=_chrom_sort_key)
+
         chr_map = dict(zip(self.chr_labels, range(1, 1 + len(self.chr_labels))))
         df[chr] = df[chr].map(chr_map).astype(int)
 

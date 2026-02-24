@@ -512,22 +512,24 @@ def _apply_multi_bimrange_manhattan_axis(
     last = layout[-1]
     ax._janusx_loc_left_label = f"{first['chrom']}:{int(first['start']) / 1_000_000:g}Mb"   # type: ignore[attr-defined]
     ax._janusx_loc_right_label = f"{last['chrom']}:{int(last['end']) / 1_000_000:g}Mb"      # type: ignore[attr-defined]
-    ax.set_xlabel("Selected loci")
+    ax.set_xlabel(None)
 
 
-def _extract_significant_site_set(
+def _extract_ld_site_set(
     df: pd.DataFrame,
     chr_col: str,
     pos_col: str,
     p_col: str,
     threshold: float,
+    use_all_sites: bool,
 ) -> set[tuple[str, int]]:
     pvals = pd.to_numeric(df[p_col], errors="coerce")
     pos = pd.to_numeric(df[pos_col], errors="coerce")
-    # Default LD input filter: keep only SNPs with -log10(p) >= 0.5.
-    # Equivalent p-value cutoff is p <= 10^(-0.5).
-    p_cut_logp = float(10 ** (-0.5))
-    mask = (pvals <= threshold) & (pvals <= p_cut_logp) & pos.notna()
+    mask_valid = pos.notna() & pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    if use_all_sites:
+        mask = mask_valid
+    else:
+        mask = mask_valid & (pvals <= threshold)
     out: set[tuple[str, int]] = set()
     if not bool(mask.any()):
         return out
@@ -618,6 +620,63 @@ def _format_bimrange_summary(
     return f"{_format_bimrange_tuple(bimranges[0])},...({len(bimranges)} ranges)"
 
 
+def _overlay_manhattan_threshold_points(
+    ax: plt.Axes,
+    plotmodel: GWASPLOT,
+    *,
+    threshold: float,
+    base_size: float,
+    rasterized: bool,
+    min_logp: float = 0.5,
+    ignore: Optional[list[object]] = None,
+) -> None:
+    """
+    Overlay threshold line and significant points on top of Manhattan base points.
+    Significant points are enlarged by 1.5x.
+    """
+    if not np.isfinite(threshold) or threshold <= 0:
+        return
+
+    if ignore is None:
+        ignore = []
+    ignore_set = set(ignore)
+
+    dfp = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
+    pvals = pd.to_numeric(dfp["y"], errors="coerce")
+    keep = pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    if not bool(keep.any()):
+        return
+    dfp = dfp.loc[keep].copy()
+    dfp["ylog"] = -np.log10(pd.to_numeric(dfp["y"], errors="coerce"))
+    dfp = dfp[dfp["ylog"] >= float(min_logp)]
+    if dfp.shape[0] == 0:
+        return
+
+    thr_log = float(-np.log10(threshold))
+    if not np.isfinite(thr_log):
+        return
+
+    sig_mask = dfp["ylog"] >= thr_log
+    if len(ignore_set) > 0:
+        sig_mask = sig_mask & (~dfp.index.isin(ignore_set))
+
+    if bool(sig_mask.any()):
+        ax.scatter(
+            dfp.loc[sig_mask, "x"],
+            dfp.loc[sig_mask, "ylog"],
+            color="red",
+            s=float(base_size) * 1.5,
+            rasterized=rasterized,
+            zorder=6,
+        )
+    ax.axhline(
+        y=thr_log,
+        linestyle="dashed",
+        color="grey",
+        linewidth=1.0,
+    )
+
+
 def GWASplot(file: str, args, logger:logging.Logger) -> None:
     """
     Plot Manhattan/QQ figures and optionally annotate significant hits
@@ -689,7 +748,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     effective_ldblock_ratio = args.ldblock_ratio
     if effective_ldblock_ratio is not None and args.bimrange_tuples is None:
         logger.warning(
-            "Warning: --ldblock requires --bimrange; LD block and Manhattan+LD plotting are skipped."
+            "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."
         )
         effective_ldblock_ratio = None
 
@@ -699,6 +758,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     if args.manh_ratio is not None or args.qq_ratio is not None or effective_ldblock_ratio is not None:
         t_plot = time.time()
         logger.info("* Visualizing GWAS results...")
+        ld_use_all_sites = bool(args.ldblock_all is not None)
 
         need_manh_panel = args.manh_ratio is not None or effective_ldblock_ratio is not None
         plotmodel = None
@@ -721,6 +781,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         manh_yticks = None
         manh_axes_bounds = None
         hide_axis_labels = args.manh_ratio is not None and args.manh_ratio > 4.0
+        manh_min_logp = 0.0 if args.bimrange_tuples is not None else 0.5
+        manh_ymin = 0.0 if args.bimrange_tuples is not None else 0.5
 
         plot_colors = None
         if plotmodel is not None:
@@ -758,11 +820,21 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 if len(df_hl_idx) == 0:
                     logger.warning("Nothing to highlight. Check the BED file.")
                     plotmodel.manhattan(
-                        -np.log10(threshold),
+                        None,
                         ax=ax,
                         color_set=plot_colors,
+                        min_logp=manh_min_logp,
+                        y_min=manh_ymin,
                         s=args.scatter_size,
                         rasterized=rasterized,
+                    )
+                    _overlay_manhattan_threshold_points(
+                        ax,
+                        plotmodel,
+                        threshold=threshold,
+                        base_size=args.scatter_size,
+                        rasterized=rasterized,
+                        min_logp=manh_min_logp,
                     )
                 else:
                     ax.scatter(
@@ -774,12 +846,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         s=args.scatter_size,
                         edgecolors="black",
                     )
-                    ax.axhline(
-                        y=-np.log10(threshold),
-                        linestyle="dashed",
-                        color="grey",
-                    )
-
                     for idx in df_hl_idx:
                         text = df_hl.loc[idx, 3]
                         ax.text(
@@ -794,17 +860,38 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         None,
                         ax=ax,
                         color_set=plot_colors,
+                        min_logp=manh_min_logp,
+                        y_min=manh_ymin,
                         s=args.scatter_size,
                         ignore=df_hl_idx,
                         rasterized=rasterized,
                     )
+                    _overlay_manhattan_threshold_points(
+                        ax,
+                        plotmodel,
+                        threshold=threshold,
+                        base_size=args.scatter_size,
+                        rasterized=rasterized,
+                        min_logp=manh_min_logp,
+                        ignore=list(df_hl_idx),
+                    )
             else:
                 plotmodel.manhattan(
-                    -np.log10(threshold),
+                    None,
                     ax=ax,
                     color_set=plot_colors,
+                    min_logp=manh_min_logp,
+                    y_min=manh_ymin,
                     s=args.scatter_size,
                     rasterized=rasterized,
+                )
+                _overlay_manhattan_threshold_points(
+                    ax,
+                    plotmodel,
+                    threshold=threshold,
+                    base_size=args.scatter_size,
+                    rasterized=rasterized,
+                    min_logp=manh_min_logp,
                 )
 
             if args.bimrange_tuples is not None:
@@ -918,40 +1005,53 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         # ----------------- LD block -----------------
         if effective_ldblock_ratio is not None:
-            sig_sites = _extract_significant_site_set(df, chr_col, pos_col, p_col, threshold)
-            n_sig_sites = max(2, len(sig_sites))
+            ld_sites = _extract_ld_site_set(
+                df,
+                chr_col,
+                pos_col,
+                p_col,
+                threshold,
+                use_all_sites=ld_use_all_sites,
+            )
+            n_sig_sites = max(2, len(ld_sites))
             ld_overlay_text = None
-            ld_site_keys: list[tuple[str, int]] = sorted(sig_sites, key=lambda x: (x[0], x[1]))
+            ld_site_keys: list[tuple[str, int]] = sorted(ld_sites, key=lambda x: (x[0], x[1]))
 
             if args.genofile is None:
                 logger.warning(
-                    "Warning: --ldblock enabled but no genotype file provided; drawing zero-correlation LD block."
+                    "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; drawing zero-correlation LD block."
                 )
                 ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                 ld_overlay_text = "No genotype"
             else:
-                if len(sig_sites) < 2:
-                    logger.warning(
-                        "Warning: Fewer than 2 significant SNPs in selected region; drawing empty LD block."
-                    )
+                if len(ld_sites) < 2:
+                    if ld_use_all_sites:
+                        logger.warning(
+                            "Warning: Fewer than 2 valid SNPs in selected region; drawing empty LD block."
+                        )
+                    else:
+                        logger.warning(
+                            "Warning: Fewer than 2 threshold-passing SNPs in selected region; drawing empty LD block."
+                        )
                     ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
-                    ld_overlay_text = "Not enough significant SNPs"
+                    ld_overlay_text = "Not enough SNPs"
                 else:
                     geno_sig, sig_keys = _collect_genotypes_for_sites(
                         args.genofile,
                         args.bimrange_tuples if args.bimrange_tuples is not None else [],
-                        sig_sites,
+                        ld_sites,
                     )
                     ld_site_keys = sig_keys
                     if geno_sig.shape[0] < 2:
                         logger.warning(
-                            "Warning: Significant SNPs were not found in genotype data; drawing empty LD block."
+                            "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
                         )
                         ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
-                        ld_overlay_text = "No matched significant SNPs"
+                        ld_overlay_text = "No matched SNPs"
                     else:
                         ld_mat = _compute_ld_from_genotypes(geno_sig)
-                        logger.info(f"LD block built from {len(sig_keys)} significant SNPs.")
+                        mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
+                        logger.info(f"LD block built from {len(sig_keys)} {mode_text}.")
 
             def _draw_ld_axis(ax: plt.Axes) -> None:
                 LDblock(ld_mat.copy(), ax=ax, vmin=0, vmax=1, cmap="Greys")
@@ -964,10 +1064,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     return []
 
                 # Keep mapping behavior consistent with Manhattan plotting:
-                # use compressed subset (minidx) and default -log10(p) >= 0.5 filter.
+                # use compressed subset (minidx), then select by ld mode.
                 map_df = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
                 p_vals = pd.to_numeric(map_df["y"], errors="coerce").to_numpy(dtype=float)
-                keep_mask = np.isfinite(p_vals) & (p_vals > 0.0) & ((-np.log10(p_vals)) >= 0.5)
+                keep_mask = np.isfinite(p_vals) & (p_vals > 0.0)
+                if not ld_use_all_sites:
+                    keep_mask = keep_mask & (p_vals <= threshold)
                 if not bool(np.any(keep_mask)):
                     return []
 
@@ -1321,11 +1423,19 @@ def main():
             "Examples: --manh (default 2), --manh 2, --manh 3/2."
         ),
     )
-    optional_group.add_argument(
+    ldblock_group = optional_group.add_mutually_exclusive_group(required=False)
+    ldblock_group.add_argument(
         "-ldblock", "--ldblock", type=str, nargs="?", const="2", default=None,
         help=(
-            "Enable LD block inverted triangle plotting with aspect ratio (width/height). "
-            "Requires --bimrange."
+            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
+            "using only threshold-passing SNPs. Requires --bimrange."
+        ),
+    )
+    ldblock_group.add_argument(
+        "-ldblock-all", "--ldblock-all", dest="ldblock_all", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
+            "using all SNPs in selected bimrange. Requires --bimrange."
         ),
     )
     optional_group.add_argument(
@@ -1335,15 +1445,15 @@ def main():
     geno_group = optional_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-bfile", "--bfile", type=str, default=None,
-        help="Optional genotype PLINK prefix for --ldblock.",
+        help="Optional genotype PLINK prefix for --ldblock/--ldblock-all.",
     )
     geno_group.add_argument(
         "-vcf", "--vcf", type=str, default=None,
-        help="Optional genotype VCF/VCF.GZ file for --ldblock.",
+        help="Optional genotype VCF/VCF.GZ file for --ldblock/--ldblock-all.",
     )
     geno_group.add_argument(
         "-file", "--file", dest="geno", type=str, default=None,
-        help="Optional genotype TXT file for --ldblock.",
+        help="Optional genotype TXT file for --ldblock/--ldblock-all.",
     )
     optional_group.add_argument(
         "-qq", "--qq", type=str, nargs="?", const="5/4", default=None,
@@ -1445,7 +1555,15 @@ def main():
     try:
         args.manh_ratio = _parse_ratio(args.manh, "Manhattan") if args.manh is not None else None
         args.qq_ratio = _parse_ratio(args.qq, "QQ") if args.qq is not None else None
-        args.ldblock_ratio = _parse_ratio(args.ldblock, "LDBlock") if args.ldblock is not None else None
+        if args.ldblock_all is not None:
+            args.ldblock_ratio = _parse_ratio(args.ldblock_all, "LDBlock-all")
+            args.ldblock_mode = "all"
+        elif args.ldblock is not None:
+            args.ldblock_ratio = _parse_ratio(args.ldblock, "LDBlock")
+            args.ldblock_mode = "threshold"
+        else:
+            args.ldblock_ratio = None
+            args.ldblock_mode = None
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
@@ -1468,25 +1586,23 @@ def main():
         args.bimrange_tuples = None
     if args.ldblock_ratio is not None and args.bimrange_tuples is None:
         logger.warning(
-            "Warning: --ldblock requires --bimrange; LD block and Manhattan+LD plotting are skipped."
+            "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."
         )
         args.ldblock_ratio = None
+        args.ldblock_mode = None
 
     args.genofile = args.bfile or args.vcf or args.geno
     if args.ldblock_ratio is not None and args.genofile is None:
         logger.warning(
-            "Warning: --ldblock enabled but no genotype file provided; zero-correlation LD block will be drawn."
+            "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; zero-correlation LD block will be drawn."
         )
 
-    if (
+    no_plot_or_anno = (
         args.manh_ratio is None
         and args.qq_ratio is None
         and args.ldblock_ratio is None
         and args.anno is None
-    ):
-        logger.warning(
-            "Warning: No --manh/--qq/--ldblock/--anno provided. Nothing will be plotted or annotated."
-        )
+    )
 
     # ------------------------------------------------------------------
     # Configuration summary
@@ -1531,7 +1647,11 @@ def main():
             f"  Manhattan ylim max: {args.manh_ylim if args.manh_ylim is not None else 'auto'}"
         )
         logger.info(f"  QQ:          {args.qq_ratio if args.qq_ratio is not None else 'off'}")
-        logger.info(f"  LDBlock:     {args.ldblock_ratio if args.ldblock_ratio is not None else 'off'}")
+        if args.ldblock_ratio is None:
+            logger.info("  LDBlock:     off")
+        else:
+            ld_mode_text = "all SNPs" if args.ldblock_mode == "all" else "threshold SNPs"
+            logger.info(f"  LDBlock:     {args.ldblock_ratio} ({ld_mode_text})")
     else:
         logger.info("Visualization: disabled")
     if args.anno:
@@ -1544,6 +1664,10 @@ def main():
         f"({'All cores' if args.thread == -1 else 'User-specified'})"
     )
     logger.info("*" * 60 + "\n")
+    if no_plot_or_anno:
+        logger.warning(
+            "Warning: No --manh/--qq/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
+        )
 
     checks: list[bool] = [ensure_file_exists(logger, f, "GWAS result file") for f in args.gwasfile]
     if args.highlight:

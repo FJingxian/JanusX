@@ -214,6 +214,8 @@ class GWASPLOT:
         color_set: Union[list[str],None] = None,
         ax: Union[plt.Axes,None] = None,
         ignore: Union[list[str],None] = None,
+        min_logp: Union[float, None] = 0.5,
+        y_min: Union[float, None] = None,
         **kwargs,
     ) -> plt.Axes:
         """
@@ -245,12 +247,20 @@ class GWASPLOT:
         # subset to plotting SNPs
         df = self.df.iloc[self.minidx, -3:].copy()
         df["y"] = -np.log10(df["y"])
-        df = df[df["y"] >= 0.5]  # basic cutoff to avoid extreme low points
+        if min_logp is not None:
+            df = df[df["y"] >= float(min_logp)]
 
         if ax is None:
             fig = plt.figure(figsize=[12, 6], dpi=300)
             gs = GridSpec(12, 1, figure=fig)
             ax = fig.add_subplot(gs[0:12, 0])
+
+        if df.shape[0] == 0:
+            ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks(self.ticks_loc, self.chr_labels)
+            ax.set_xlabel("Chromosome")
+            ax.set_ylabel("-log10(p-value)")
+            return ax
 
         # color per chromosome (alternating colors)
         chr_color_map = dict(
@@ -289,7 +299,13 @@ class GWASPLOT:
         ax.set_xticks(self.ticks_loc, self.chr_labels)
         ax.set_xlim([-self.interval, df["x"].max() + self.interval])
         ymax = df["y"].max()
-        ax.set_ylim([0.5, ymax + 0.1 * ymax])
+        base_ymin = float(min_logp) if min_logp is not None else 0.0
+        if y_min is not None:
+            base_ymin = float(y_min)
+        top = ymax + 0.1 * ymax if ymax > 0 else (base_ymin + 1.0)
+        if top <= base_ymin:
+            top = base_ymin + 1.0
+        ax.set_ylim([base_ymin, top])
         ax.set_xlabel("Chromosome")
         ax.set_ylabel("-log10(p-value)")
         return ax

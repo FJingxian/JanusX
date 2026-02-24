@@ -3,6 +3,8 @@ import matplotlib.patches as mpathes
 import itertools
 import matplotlib.pyplot as plt
 
+from janusx.gfreader.gfreader import load_genotype_chunks
+
 def LDblock(C:np.ndarray,ax:plt.Axes,vmin:float=0,vmax:float=1,cmap:str='Greys'):
     '''
     ax.set_xlim(0,n), 0.5 ~ n-0.5 n points, n=C.shape[0]=C.shape[1]
@@ -20,16 +22,30 @@ def LDblock(C:np.ndarray,ax:plt.Axes,vmin:float=0,vmax:float=1,cmap:str='Greys')
     rect = mpathes.Rectangle((n/4,-n-cbar_rate*n),n/2,cbar_rate*n,fill=False, edgecolor='black', linewidth=.5)
     ax.add_patch(rect)
     gradient = np.linspace(vmin, vmax, 10).reshape(1, -1)
-    clabel = np.linspace(vmin, vmax, 2).round(2)
-    cticks = np.linspace(n/4, 3*n/4, 2)
+    clabel = np.round(np.arange(vmin, vmax + 1e-9, 0.2), 2)
+    if clabel.size == 0 or not np.isclose(clabel[-1], vmax):
+        clabel = np.append(clabel, round(vmax, 2))
+    cticks = n/4 + (clabel - vmin) / max(vmax - vmin, 1e-12) * (n/2)
     for i in range(len(clabel)):
         ax.text(cticks[i],-n,clabel[i],ha='center')
     ax.imshow(gradient, cmap=cmap, aspect='auto', extent=[n/4, 3*n/4, -n - cbar_rate * n, -n], origin='lower')
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_ylim(-n-cbar_rate*n,0)
-    ax.set_xlim(0,n)
+    ax.set_xlim(0.5,n-0.5)
     ax.spines['right'].set_visible(False)
     ax.spines['top'].set_visible(False)
     ax.spines['left'].set_visible(False)
     ax.spines['bottom'].set_visible(False)
+    ax.set_aspect(0.5, adjustable="box")  # 对应当前 t 的 x 压缩
+
+    
+if __name__ == '__main__':
+    chunks = load_genotype_chunks('example/mouse_hs1940.vcf.gz')
+    for chunk,site in chunks:
+        pass
+    cor = np.corrcoef(chunk[:1000])
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    LDblock(cor,ax)
+    plt.show()

@@ -109,6 +109,8 @@ class GWASPLOT:
         chr_order: Union[list[object], None] = None,
     ) -> None:
         self.t_start = time.time()
+        # Ensure positional indices are contiguous for downstream iloc usage.
+        df = df.reset_index(drop=True)
 
         # ---- (1) Optional down-sampling for plotting ----
         if compression:
@@ -262,7 +264,6 @@ class GWASPLOT:
         ax.scatter(
             df.loc[mask_ignore, "x"],
             df.loc[mask_ignore, "y"],
-            s=8,
             color=df.loc[mask_ignore, "z"].map(chr_color_map),
             **kwargs,
         )
@@ -274,17 +275,14 @@ class GWASPLOT:
             ax.scatter(
                 df_sig.loc[sig_mask, "x"],
                 df_sig.loc[sig_mask, "y"],
-                s=16,
                 color="red",
                 **kwargs,
             )
-            ax.hlines(
+            ax.axhline(
                 y=threshold,
-                xmin=0,
-                xmax=df["x"].max(),
                 color="grey",
                 linewidth=1,
-                linestyles="--",
+                linestyle="--",
             )
 
         # axis cosmetics
@@ -299,7 +297,13 @@ class GWASPLOT:
     # ------------------------------------------------------------------
     # QQ plot
     # ------------------------------------------------------------------
-    def qq(self, ax: plt.Axes = None, ci: int = 95, color_set: list[str] = None) -> plt.Axes:
+    def qq(
+        self,
+        ax: plt.Axes = None,
+        ci: int = 95,
+        color_set: list[str] = None,
+        scatter_size: float = 8.0,
+    ) -> plt.Axes:
         """
         Draw a QQ plot of observed vs expected -log10(p) with a beta-based
         confidence band.
@@ -317,6 +321,8 @@ class GWASPLOT:
             Confidence interval (in percent) for the null band.
         color_set : list[str], optional
             Color settings; first color is used for band and points.
+        scatter_size : float, default 8.0
+            Marker size for QQ scatter points.
 
         Returns
         -------
@@ -384,7 +390,7 @@ class GWASPLOT:
         ax.scatter(
             o_e.iloc[self.minidx, 1],
             o_e.iloc[self.minidx, 0],
-            s=16,
+            s=scatter_size,
             alpha=0.8,
             rasterized=True,
             color=color_set[0],

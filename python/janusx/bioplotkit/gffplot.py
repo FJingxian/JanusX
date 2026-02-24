@@ -43,4 +43,5 @@ if __name__ == "__main__":
     ax = fig.add_subplot(111)
     plotmodel = CHRPLOT(gffpath)
     plotmodel.plotchr(color_dict={1:'red',4:'red',7:'red',},ax=ax)
-    plt.savefig('test.png')
+    fig.tight_layout()
+    fig.savefig('test.png')

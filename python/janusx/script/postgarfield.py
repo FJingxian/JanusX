@@ -185,6 +185,10 @@ def main() -> None:
         help="P-value threshold for postgwas (default: 0.05 / nSNP).",
     )
     optional_group.add_argument(
+        "-bimrange", "--bimrange", type=str, default=None,
+        help="Plotting range passed to postgwas in Mb, format chr:start-end.",
+    )
+    optional_group.add_argument(
         "-format", "--format", type=str, default="png",
         help="Output figure format for postgwas (default: %(default)s).",
     )
@@ -209,8 +213,11 @@ def main() -> None:
         help="GFF attribute key used for description (postgwas).",
     )
     optional_group.add_argument(
-        "-color", "--color", type=int, default=0,
-        help="Color set index for postgwas (0-6; -1 uses auto).",
+        "-pallete", "--pallete", type=str, default=None,
+        help=(
+            "Manhattan color palette passed to postgwas. "
+            "Supports cmap name or ';'-separated colors."
+        ),
     )
     optional_group.add_argument(
         "--only-set",
@@ -254,6 +261,7 @@ def main() -> None:
     logger.info(f"Threads: {args.thread}")
     logger.info(f"Pseudo map: {args.pseudo or f'{gfile}.pseudo'}")
     logger.info(f"Only-set filter (bp): {args.only_set}")
+    logger.info(f"Bimrange: {args.bimrange}")
     logger.info(f"Output prefix: {outprefix}")
     logger.info("*" * 60 + "\n")
 
@@ -356,7 +364,7 @@ def main() -> None:
     for decode_path in decoded_files:
         cmd = [
             "jx", "postgwas",
-            "-f", decode_path,
+            "-file", decode_path,
             "-o", args.out,
             "-prefix", prefix,
             "-format", args.format,
@@ -364,8 +372,10 @@ def main() -> None:
         ]
         if args.threshold is not None:
             cmd.extend(["-threshold", str(args.threshold)])
-        if args.noplot:
-            cmd.append("-noplot")
+        if args.bimrange is not None:
+            cmd.extend(["-bimrange", args.bimrange])
+        if not args.noplot:
+            cmd.extend(["--manh", "--qq"])
         if args.highlight:
             cmd.extend(["-hl", args.highlight])
         if args.anno:
@@ -374,8 +384,8 @@ def main() -> None:
             cmd.extend(["-ab", str(args.annobroaden)])
         if args.descItem:
             cmd.extend(["-descItem", args.descItem])
-        if args.color is not None:
-            cmd.extend(["-color", str(args.color)])
+        if args.pallete is not None:
+            cmd.extend(["-pallete", args.pallete])
 
         _run_subprocess(cmd, logger, "Running postgwas")
 

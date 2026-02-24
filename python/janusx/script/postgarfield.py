@@ -19,6 +19,7 @@ import time
 import socket
 import argparse
 import subprocess
+import re
 from glob import glob
 from typing import List
 
@@ -74,6 +75,42 @@ def _run_subprocess(cmd: List[str], logger, desc: str) -> None:
         if stderr:
             logger.error(stderr)
         raise RuntimeError(f"{desc} failed with exit code {res.returncode}")
+
+
+_EXPR_SITE_PATTERN = re.compile(r"(?P<flag>!)?(?P<chrom>\d+)_(?P<pos>\d+)")
+
+
+def _is_local_pseudo_set(expr: object, max_span_bp: int) -> bool:
+    """
+    Return True if expression is a multi-site pseudoSNP where all sites:
+      - are on the same chromosome, and
+      - lie within max_span_bp (max(pos) - min(pos) <= max_span_bp).
+    """
+    if max_span_bp < 0 or not isinstance(expr, str):
+        return False
+
+    matches = _EXPR_SITE_PATTERN.findall(expr)
+    if len(matches) < 2:
+        return False
+
+    chroms = {chrom for _, chrom, _ in matches}
+    if len(chroms) != 1:
+        return False
+
+    positions = [int(pos) for _, _, pos in matches]
+    return (max(positions) - min(positions)) <= max_span_bp
+
+
+def _filter_pseudomap_by_set_distance(pseudodf: pd.DataFrame, max_span_bp: int) -> tuple[pd.DataFrame, int]:
+    """
+    Remove pseudoSNP rows composed of nearby loci on one chromosome.
+    """
+    if "expression" not in pseudodf.columns:
+        raise ValueError("Pseudo mapping file must contain an 'expression' column.")
+
+    local_mask = pseudodf["expression"].map(lambda x: _is_local_pseudo_set(x, max_span_bp))
+    removed = int(local_mask.sum())
+    return pseudodf.loc[~local_mask].copy(), removed
 
 
 def main() -> None:
@@ -175,8 +212,22 @@ def main() -> None:
         "-color", "--color", type=int, default=0,
         help="Color set index for postGWAS (0-6; -1 uses auto).",
     )
+    optional_group.add_argument(
+        "--only-set",
+        type=int,
+        nargs="?",
+        const=50_000,
+        default=None,
+        metavar="BP",
+        help=(
+            "Filter out pseudoSNPs composed of loci within a short same-chromosome span. "
+            "If provided without value, uses 50000 bp."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.only_set is not None and args.only_set < 0:
+        raise ValueError("--only-set must be >= 0.")
 
     gfile, prefix = _determine_genotype(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
@@ -202,6 +253,7 @@ def main() -> None:
     logger.info(f"Chunk size: {args.chunksize}")
     logger.info(f"Threads: {args.thread}")
     logger.info(f"Pseudo map: {args.pseudo or f'{gfile}.pseudo'}")
+    logger.info(f"Only-set filter (bp): {args.only_set}")
     logger.info(f"Output prefix: {outprefix}")
     logger.info("*" * 60 + "\n")
 
@@ -254,6 +306,21 @@ def main() -> None:
 
     # ------------------------- Decode pseudo SNPs -------------------------
     pseudodf = pd.read_csv(pseudo_path, sep="\t")
+    if args.only_set is not None:
+        pseudodf, n_removed = _filter_pseudomap_by_set_distance(pseudodf, args.only_set)
+        logger.info(
+            f"Applied --only-set {args.only_set}: removed {n_removed} pseudoSNP(s), "
+            f"kept {pseudodf.shape[0]}."
+        )
+        if pseudodf.shape[0] == 0:
+            raise ValueError(
+                f"All pseudoSNPs were removed by --only-set {args.only_set}. "
+                "Increase the threshold or disable --only-set."
+            )
+
+    pseudo_key_cols = pseudodf.columns[[0, 1]].tolist()
+    pseudo_idx = set(map(tuple, pseudodf[pseudo_key_cols].itertuples(index=False, name=None)))
+
     gwas_files = _find_gwas_results(outprefix, "lmm")
     if not gwas_files:
         raise FileNotFoundError(
@@ -263,6 +330,22 @@ def main() -> None:
     decoded_files: list[str] = []
     for gwas_file in gwas_files:
         df = pd.read_csv(gwas_file, sep="\t")
+        gwas_key_cols = df.columns[[0, 1]].tolist()
+        gwas_keys = list(df[gwas_key_cols].itertuples(index=False, name=None))
+        keep_mask = pd.Series([key in pseudo_idx for key in gwas_keys], index=df.index)
+        dropped_rows = int((~keep_mask).sum())
+        if dropped_rows > 0:
+            logger.info(
+                f"{os.path.basename(gwas_file)}: dropped {dropped_rows} GWAS row(s) "
+                "not present in filtered pseudo map."
+            )
+        df = df.loc[keep_mask].copy()
+        if df.empty:
+            logger.warning(
+                f"{os.path.basename(gwas_file)}: no GWAS rows remain after pseudo filtering; skipped."
+            )
+            continue
+
         dfdecode = decode(df, pseudodf, args.pseudochrom)
         decode_path = gwas_file.replace(".lmm.tsv", ".decode.lmm.tsv")
         dfdecode.to_csv(decode_path, sep="\t", index=False)

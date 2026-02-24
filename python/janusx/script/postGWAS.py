@@ -213,11 +213,12 @@ def GWASplot(file: str, args, logger) -> None:
             #   anno[3] = gene ID
             #   anno[4], anno[5] = description fields
             anno = readanno(args.anno, args.descItem)
+            anno_chr = anno[0].astype(str)
 
             # Exact overlap annotation
             desc_exact = [
                 anno.loc[
-                    (anno[0] == idx[0])
+                    (anno_chr == str(idx[0]))
                     & (anno[1] <= idx[1])
                     & (anno[2] >= idx[1])
                 ]
@@ -233,11 +234,11 @@ def GWASplot(file: str, args, logger) -> None:
             ]
 
             # Optional broadened window around SNP (± annobroaden kb)
-            if args.annobroaden:
+            if args.annobroaden is not None:
                 kb = args.annobroaden * 1_000
                 desc_broad = [
                     anno.loc[
-                        (anno[0] == idx[0])
+                        (anno_chr == str(idx[0]))
                         & (anno[1] <= idx[1] + kb)
                         & (anno[2] >= idx[1] - kb)
                     ]
@@ -253,6 +254,9 @@ def GWASplot(file: str, args, logger) -> None:
                     )
                     for x in desc_broad
                 ]
+            else:
+                if "broaden" in df_filter.columns:
+                    df_filter = df_filter.drop(columns=["broaden"])
 
             logger.info(df_filter)
 

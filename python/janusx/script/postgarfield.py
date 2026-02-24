@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-JanusX: Post-GARFIELD Pipeline (GWAS -> Decode -> PostGWAS)
+JanusX: Post-GARFIELD Pipeline (GWAS -> Decode -> postgwas)
 
 Examples
 --------
@@ -170,7 +170,7 @@ def main() -> None:
     )
     optional_group.add_argument(
         "-t", "--thread", type=int, default=-1,
-        help="Threads for GWAS/postGWAS (-1 uses all cores; default: %(default)s).",
+        help="Threads for GWAS/postgwas (-1 uses all cores; default: %(default)s).",
     )
     optional_group.add_argument(
         "--pseudo", type=str, default=None,
@@ -182,35 +182,35 @@ def main() -> None:
     )
     optional_group.add_argument(
         "-threshold", "--threshold", type=float, default=None,
-        help="P-value threshold for postGWAS (default: 0.05 / nSNP).",
+        help="P-value threshold for postgwas (default: 0.05 / nSNP).",
     )
     optional_group.add_argument(
         "-format", "--format", type=str, default="png",
-        help="Output figure format for postGWAS (default: %(default)s).",
+        help="Output figure format for postgwas (default: %(default)s).",
     )
     optional_group.add_argument(
         "-noplot", "--noplot", action="store_true", default=False,
-        help="Disable Manhattan/QQ plotting in postGWAS.",
+        help="Disable Manhattan/QQ plotting in postgwas.",
     )
     optional_group.add_argument(
         "-hl", "--highlight", type=str, default=None,
-        help="BED-like file for highlighting SNPs in postGWAS.",
+        help="BED-like file for highlighting SNPs in postgwas.",
     )
     optional_group.add_argument(
         "-a", "--anno", type=str, default=None,
-        help="Annotation file for postGWAS (GFF/BED).",
+        help="Annotation file for postgwas (GFF/BED).",
     )
     optional_group.add_argument(
         "-ab", "--annobroaden", type=float, default=None,
-        help="Annotation window around SNPs in Kb (postGWAS).",
+        help="Annotation window around SNPs in Kb (postgwas).",
     )
     optional_group.add_argument(
         "-descItem", "--descItem", type=str, default="description",
-        help="GFF attribute key used for description (postGWAS).",
+        help="GFF attribute key used for description (postgwas).",
     )
     optional_group.add_argument(
         "-color", "--color", type=int, default=0,
-        help="Color set index for postGWAS (0-6; -1 uses auto).",
+        help="Color set index for postgwas (0-6; -1 uses auto).",
     )
     optional_group.add_argument(
         "--only-set",
@@ -352,10 +352,10 @@ def main() -> None:
         decoded_files.append(decode_path)
         logger.info(f"Decoded result saved to {decode_path}")
 
-    # ------------------------- PostGWAS plotting -------------------------
+    # ------------------------- postgwas plotting -------------------------
     for decode_path in decoded_files:
         cmd = [
-            "jx", "postGWAS",
+            "jx", "postgwas",
             "-f", decode_path,
             "-o", args.out,
             "-prefix", prefix,
@@ -377,7 +377,7 @@ def main() -> None:
         if args.color is not None:
             cmd.extend(["-color", str(args.color)])
 
-        _run_subprocess(cmd, logger, "Running postGWAS")
+        _run_subprocess(cmd, logger, "Running postgwas")
 
     lt = time.localtime()
     endinfo = (

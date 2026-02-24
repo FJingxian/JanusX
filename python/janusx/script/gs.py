@@ -374,15 +374,17 @@ def main(log: bool = True) -> None:
     pheno = pheno.groupby(pheno.columns[0]).mean()
     pheno.index = pheno.index.astype(str)
 
-    assert pheno.shape[1] > 0, (
-        "No phenotype data found. Please check the phenotype file format.\n"
-        f"{pheno.head()}"
-    )
+    if pheno.shape[1] <= 0:
+        logger.error(
+            "No phenotype data found. Please check the phenotype file format.\n"
+            f"{pheno.head()}"
+        )
+        raise SystemExit(1)
 
     if args.ncol is not None:
-        assert 0 <= args.ncol < pheno.shape[1], (
-            "IndexError: phenotype column index out of range."
-        )
+        if not (0 <= args.ncol < pheno.shape[1]):
+            logger.error("IndexError: phenotype column index out of range.")
+            raise SystemExit(1)
         pheno = pheno.iloc[:, [args.ncol]]
 
     # ------------------------------------------------------------------
@@ -399,9 +401,11 @@ def main(log: bool = True) -> None:
         methods.append("BayesB")
     if args.BayesCpi:
         methods.append("BayesCpi")
-    assert len(methods) > 0, (
-        "No model selected. Use --GBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
-    )
+    if len(methods) == 0:
+        logger.error(
+            "No model selected. Use --GBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
+        )
+        raise SystemExit(1)
 
     # ------------------------------------------------------------------
     # Load genotype

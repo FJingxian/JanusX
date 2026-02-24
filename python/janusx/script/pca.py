@@ -354,18 +354,21 @@ def main(log: bool = True):
     gfile = gfile.replace("\\", "/")
     args.out = args.out if args.out is not None else "."
 
-    # Keep index for logging but convert to actual color palette
-    palette_idx = args.color
-    if args.color == -1:
-        args.color = None
-    else:
-        assert 0 <= args.color <= 6, "Color set index out of range; please use 0-6."
-        args.color = color_set[palette_idx]
+    # Keep index for logging and validate after logger is ready
+    palette_idx = int(args.color)
 
     # ------------------------- Logging -------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
     log_path = f"{args.out}/{args.prefix}.pca.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
+
+    if palette_idx == -1:
+        args.color = None
+    elif 0 <= palette_idx <= 6:
+        args.color = color_set[palette_idx]
+    else:
+        logger.error("Color set index out of range; please use 0-6 or -1.")
+        raise SystemExit(1)
 
     logger.info("JanusX - Principal Component Analysis Module")
     logger.info(f"Host: {socket.gethostname()}\n")

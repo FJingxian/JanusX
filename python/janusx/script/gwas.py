@@ -272,13 +272,19 @@ def load_phenotype(
     pheno.index = ids
     pheno = pheno.groupby(pheno.index).mean()
 
-    assert pheno.shape[1] > 0, (
-        "No phenotype data found. Please check the phenotype file format.\n"
-        f"{pheno.head()}"
-    )
+    if pheno.shape[1] <= 0:
+        msg = (
+            "No phenotype data found. Please check the phenotype file format.\n"
+            f"{pheno.head()}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
 
     if ncol is not None:
-        assert np.min(ncol) < pheno.shape[1], "Phenotype column index out of range."
+        if len(ncol) == 0 or np.min(ncol) >= pheno.shape[1]:
+            msg = "Phenotype column index out of range."
+            logger.error(msg)
+            raise ValueError(msg)
         ncol = [i for i in ncol if i in range(pheno.shape[1])]
         logger.info(
             "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol]))
@@ -407,7 +413,10 @@ def load_or_build_grm_with_cache(
             grm = np.load(f'{km_path}.npy',mmap_mode='r')
             logger.info(f"Cached GRM written to {km_path}.npy")
     else:
-        assert os.path.isfile(mgrm), f"GRM file not found: {mgrm}"
+        if not os.path.isfile(mgrm):
+            msg = f"GRM file not found: {mgrm}"
+            logger.error(msg)
+            raise ValueError(msg)
         logger.info(f"Loading GRM from {mgrm}...")
         if mgrm.endswith('.npy'):
             grm = np.load(mgrm,mmap_mode='r')
@@ -415,14 +424,19 @@ def load_or_build_grm_with_cache(
             grm = np.genfromtxt(mgrm, dtype="float32")
         grm_ids = _read_id_file(f"{mgrm}.id", logger, "GRM")
         if grm_ids is None:
-            assert grm.size == n_samples * n_samples, (
-                f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
-            )
+            if grm.size != n_samples * n_samples:
+                msg = f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
+                logger.error(msg)
+                raise ValueError(msg)
             grm = grm.reshape(n_samples, n_samples)
         else:
-            assert grm.size == len(grm_ids) * len(grm_ids), (
-                f"GRM size mismatch: expected {len(grm_ids)*len(grm_ids)}, got {grm.size}"
-            )
+            if grm.size != len(grm_ids) * len(grm_ids):
+                msg = (
+                    f"GRM size mismatch: expected {len(grm_ids)*len(grm_ids)}, "
+                    f"got {grm.size}"
+                )
+                logger.error(msg)
+                raise ValueError(msg)
             grm = grm.reshape(len(grm_ids), len(grm_ids))
         eff_m = n_snps
 
@@ -1062,10 +1076,13 @@ def build_qmatrix_farmcpu(
 
         if cov_arr.ndim == 1:
             cov_arr = cov_arr.reshape(-1, 1)
-        assert cov_arr.shape[0] == geno.shape[1], (
-            f"Covariate rows ({cov_arr.shape[0]}) do not match sample count "
-            f"({geno.shape[1]}) in genotype matrix."
-        )
+        if cov_arr.shape[0] != geno.shape[1]:
+            msg = (
+                f"Covariate rows ({cov_arr.shape[0]}) do not match sample count "
+                f"({geno.shape[1]}) in genotype matrix."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
         logger.info(f"Appending covariate matrix for FarmCPU: shape={cov_arr.shape}")
         qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
 
@@ -1119,7 +1136,10 @@ def run_farmcpu_fullmem(
     pbar.refresh()
     pbar.close()
 
-    assert len(geno_chunks) > 0, "After filtering, number of SNPs is zero for FarmCPU."
+    if len(geno_chunks) == 0:
+        msg = "After filtering, number of SNPs is zero for FarmCPU."
+        logger.error(msg)
+        raise ValueError(msg)
     geno = np.concatenate(geno_chunks, axis=0)
     ref_alt = pd.DataFrame(site_rows, columns=["chrom", "pos", "allele0", "allele1"])
     ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
@@ -1127,7 +1147,10 @@ def run_farmcpu_fullmem(
     logger.info(
         f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
     )
-    assert geno.size > 0, "After filtering, number of SNPs is zero for FarmCPU."
+    if geno.size == 0:
+        msg = "After filtering, number of SNPs is zero for FarmCPU."
+        logger.error(msg)
+        raise ValueError(msg)
 
     gfile_prefix = genotype_cache_prefix(gfile)
     qmatrix = build_qmatrix_farmcpu(

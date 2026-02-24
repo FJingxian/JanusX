@@ -22,6 +22,7 @@ Citation
   https://github.com/FJingxian/JanusX/
 """
 
+import logging
 import os
 from ._common.log import setup_logging
 from ._common.pathcheck import ensure_all_true, ensure_file_exists
@@ -58,7 +59,7 @@ def _auto_colors(n: int) -> list[str]:
     return [mcolors.to_hex(cmap(i / max(1, n - 1))) for i in range(n)]
 
 
-def GWASplot(file: str, args, logger) -> None:
+def GWASplot(file: str, args, logger:logging.Logger) -> None:
     """
     Plot Manhattan/QQ figures and optionally annotate significant hits
     for a single GWAS result file.
@@ -122,45 +123,52 @@ def GWASplot(file: str, args, logger) -> None:
 
             # Intersect highlight positions with SNPs in the plot model
             df_hl_idx = df_hl.index[df_hl.index.isin(plotmodel.df.index)]
-            assert len(df_hl_idx) > 0, "Nothing to highlight. Check the BED file."
-
-            # Highlight points
-            ax.scatter(
-                plotmodel.df.loc[df_hl_idx, "x"],
-                -np.log10(plotmodel.df.loc[df_hl_idx, "y"]),
-                marker="D",
-                color="red",
-                zorder=10,
-                s=32,
-                edgecolors="black",
-            )
-            ax.hlines(
-                y=-np.log10(threshold),
-                xmin=-1e10,
-                xmax=1e10,
-                linestyle="dashed",
-                color="grey",
-            )
-
-            # Add gene labels
-            for idx in df_hl_idx:
-                text = df_hl.loc[idx, 3]
-                ax.text(
-                    plotmodel.df.loc[idx, "x"],
-                    -np.log10(plotmodel.df.loc[idx, "y"]),
-                    s=text,
-                    ha="center",
-                    zorder=11,
+            if len(df_hl_idx) == 0:
+                logger.warning("Nothing to highlight. Check the BED file.")
+                plotmodel.manhattan(
+                    -np.log10(threshold),
+                    ax=ax,
+                    color_set=plot_colors,
+                    rasterized=rasterized,
+                )
+            else:
+                # Highlight points
+                ax.scatter(
+                    plotmodel.df.loc[df_hl_idx, "x"],
+                    -np.log10(plotmodel.df.loc[df_hl_idx, "y"]),
+                    marker="D",
+                    color="red",
+                    zorder=10,
+                    s=32,
+                    edgecolors="black",
+                )
+                ax.hlines(
+                    y=-np.log10(threshold),
+                    xmin=-1e10,
+                    xmax=1e10,
+                    linestyle="dashed",
+                    color="grey",
                 )
 
-            # Plot background Manhattan points, excluding the highlighted ones
-            plotmodel.manhattan(
-                None,
-                ax=ax,
-                color_set=plot_colors,
-                ignore=df_hl_idx,
-                rasterized=rasterized,
-            )
+                # Add gene labels
+                for idx in df_hl_idx:
+                    text = df_hl.loc[idx, 3]
+                    ax.text(
+                        plotmodel.df.loc[idx, "x"],
+                        -np.log10(plotmodel.df.loc[idx, "y"]),
+                        s=text,
+                        ha="center",
+                        zorder=11,
+                    )
+
+                # Plot background Manhattan points, excluding highlighted ones
+                plotmodel.manhattan(
+                    None,
+                    ax=ax,
+                    color_set=plot_colors,
+                    ignore=df_hl_idx,
+                    rasterized=rasterized,
+                )
         else:
             # Standard Manhattan with threshold line
             plotmodel.manhattan(
@@ -352,19 +360,6 @@ def main():
 
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Basic checks and configuration
-    # ------------------------------------------------------------------
-    assert args.color <= 6, "Color set index out of range; please use 0-6 or -1."
-    assert args.format in ["pdf", "png", "svg", "tif"], (
-        f"Unsupported figure format: {args.format} "
-        "(choose from: pdf, png, svg, tif)"
-    )
-
-    if args.color == -1:
-        args.color = None
-    else:
-        args.color = color_set[args.color]
     args.out = args.out if args.out is not None else "."
     args.prefix = "JanusX" if args.prefix is None else args.prefix
 
@@ -376,6 +371,26 @@ def main():
 
     log_path = f"{args.out}/{args.prefix}.postGWAS.log".replace("//", "/")
     logger = setup_logging(log_path)
+
+    # ------------------------------------------------------------------
+    # Basic checks and configuration
+    # ------------------------------------------------------------------
+    if not (-1 <= int(args.color) <= 6):
+        logger.error("Color set index out of range; please use 0-6 or -1.")
+        raise SystemExit(1)
+
+    args.format = str(args.format).lower()
+    if args.format not in ["pdf", "png", "svg", "tif"]:
+        logger.error(
+            f"Unsupported figure format: {args.format} "
+            "(choose from: pdf, png, svg, tif)"
+        )
+        raise SystemExit(1)
+
+    if args.color == -1:
+        args.color = None
+    else:
+        args.color = color_set[args.color]
 
     # ------------------------------------------------------------------
     # Configuration summary

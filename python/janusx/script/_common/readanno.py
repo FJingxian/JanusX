@@ -1,5 +1,6 @@
 import pandas as pd
 import re
+import gzip
 from urllib.parse import unquote
 
 
@@ -13,7 +14,34 @@ def _extract_attr_value(attr_series: pd.Series, key: str) -> pd.Series:
     pattern = rf"(?:^|;){key_pat}=([^;]*)(?:;|$)"
     out = attr_series.astype(str).str.extract(pattern, expand=False)
     out = out.fillna("NA")
-    return out.map(lambda x: unquote(x) if isinstance(x, str) else x)
+    def _normalize_text(x: object) -> object:
+        if not isinstance(x, str):
+            return x
+        text = unquote(x).strip()
+        # Normalize tabs/newlines inside malformed attributes to single spaces.
+        return re.sub(r"\s+", " ", text)
+    return out.map(_normalize_text)
+
+
+def _read_gff_basic(annofile: str) -> pd.DataFrame:
+    """
+    Read GFF/GFF3 robustly and keep full attribute column (field 9).
+    Uses split('\\t', 8) to avoid truncation when extra tabs appear inside attributes.
+    """
+    opener = gzip.open if annofile.endswith(".gz") else open
+    rows: list[list[object]] = []
+    with opener(annofile, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                continue
+            line = line.rstrip("\n")
+            parts = line.split("\t", 8)
+            if len(parts) < 9:
+                continue
+            rows.append([parts[0], parts[2], parts[3], parts[4], parts[8]])
+    if not rows:
+        return pd.DataFrame(columns=[0, 2, 3, 4, 8])
+    return pd.DataFrame(rows, columns=[0, 2, 3, 4, 8])
 
 
 def readanno(annofile:str,descItem:str='description'):
@@ -26,7 +54,7 @@ def readanno(annofile:str,descItem:str='description'):
         if anno.shape[1]<=5:
             anno[5] = ['NA' for _ in anno.index]
     elif suffix == 'gff' or suffix == 'gff3':
-        anno = pd.read_csv(annofile,sep='\t',header=None,comment='#',low_memory=False,usecols=[0,2,3,4,8])
+        anno = _read_gff_basic(annofile)
         anno = anno[anno[2] == 'gene']
         del anno[2]
         anno[0] = anno[0].astype(str).str.strip()

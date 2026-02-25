@@ -931,7 +931,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             fig.tight_layout()
             manh_axes_bounds = ax.get_position().bounds
             manh_path = f"{args.out}/{args.prefix}.manh.{args.format}"
-            fig.savefig(manh_path, transparent=False, facecolor="white")
+            fig.savefig(manh_path, transparent=True)
             plt.close(fig)
         else:
             manh_path = None
@@ -998,7 +998,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax2.set_ylabel("")
                 fig.tight_layout()
                 qq_path = f"{args.out}/{args.prefix}.qq.{args.format}"
-                fig.savefig(qq_path, transparent=False, facecolor="white")
+                fig.savefig(qq_path, transparent=True)
                 plt.close(fig)
         else:
             qq_path = None
@@ -1220,7 +1220,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 mx0, _my0, mw, _mh = manh_axes_bounds
                 _cx0, cy0, _cw, ch = ax_ld.get_position().bounds
                 ax_ld.set_position([mx0, cy0, mw, ch])
-            fig_ld.savefig(ld_path, transparent=False, facecolor="white")
+            fig_ld.savefig(ld_path, transparent=True)
             plt.close(fig_ld)
 
             # Combined Manhattan + LD panel
@@ -1271,7 +1271,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             _show_end_locs_without_xticks(ax_manhld_top)
 
             manhld_path = f"{args.out}/{args.prefix}.manhld.{args.format}"
-            fig_manhld.savefig(manhld_path, transparent=False, facecolor="white")
+            fig_manhld.savefig(manhld_path, transparent=True)
             plt.close(fig_manhld)
         else:
             ld_path = None

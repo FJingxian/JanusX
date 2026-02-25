@@ -769,7 +769,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 pos_col,
                 p_col,
                 0.1,
-                compression=(not args.fullscatter),
+                compression=(not args.disable_compression),
             )
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
@@ -1603,6 +1603,7 @@ def main():
         and args.ldblock_ratio is None
         and args.anno is None
     )
+    args.disable_compression = bool(args.fullscatter or (args.bimrange_tuples is not None))
 
     # ------------------------------------------------------------------
     # Configuration summary
@@ -1637,9 +1638,16 @@ def main():
         )
         logger.info("  QQ pallete:        default (black/grey)")
         logger.info(f"  Scatter size:      {args.scatter_size}")
-        logger.info(
-            f"  Compression:       {'off (--fullscatter)' if args.fullscatter else 'on'}"
-        )
+        if args.disable_compression:
+            if args.fullscatter and args.bimrange_tuples is not None:
+                comp_text = "off (--fullscatter, auto for --bimrange)"
+            elif args.fullscatter:
+                comp_text = "off (--fullscatter)"
+            else:
+                comp_text = "off (auto for --bimrange)"
+        else:
+            comp_text = "on"
+        logger.info(f"  Compression:       {comp_text}")
         logger.info(f"  Highlight:   {args.highlight}")
         logger.info(f"  Format:      {args.format}")
         logger.info(f"  Manhattan:   {args.manh_ratio if args.manh_ratio is not None else 'off'}")

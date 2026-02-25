@@ -391,8 +391,12 @@ class LMM:
             return alpha, se, pval
         Mchunk = (Mchunk - Mchunk.mean(axis=1,keepdims=True)) / (Mchunk.std(axis=1,keepdims=True)+self.ridge)
         if self.FaST:
-            u1Mchunk = Mchunk@self.u
-            u2Mchunk = Mchunk-u1Mchunk@self.u.T
+            need_projected = (self.engine == 'python') or self.fixedlbd
+            u1Mchunk = None
+            u2Mchunk = None
+            if need_projected:
+                u1Mchunk = Mchunk @ self.u
+                u2Mchunk = Mchunk - u1Mchunk @ self.u.T
             if self.engine == 'python':
                 beta_se_p = list(Parallel(n_jobs=self.threads)
                             (delayed(_FaSTprocess)(u1Mchunk[i],u2Mchunk[i]) for i in range(u1Mchunk.shape[0])))
@@ -400,9 +404,12 @@ class LMM:
                 if not self.fixedlbd:
                     beta_se_p = fastlmm_reml(self.ss, self.utx, self.u2tx,
                                                 self.uty, self.u2ty,
-                                                u1Mchunk, u2Mchunk,
+                                                Mchunk, self.u.T,
                                                 bounds=self.bounds,threads=self.threads,nullml=self.ml)
                 else:
+                    if u1Mchunk is None or u2Mchunk is None:
+                        u1Mchunk = Mchunk @ self.u
+                        u2Mchunk = Mchunk - u1Mchunk @ self.u.T
                     beta_se_p = fastlmm_assoc_chunk(self.ss,self.utx,self.u2tx,self.uty,self.u2ty,self.loglbd,
                                         u1Mchunk, u2Mchunk,
                                         threads=self.threads,nullml=self.ml)

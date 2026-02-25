@@ -85,14 +85,20 @@ pub fn process_snp_row(
     maf_threshold: f32,
     max_missing_rate: f32,
     fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
 ) -> bool {
     let mut alt_sum: f64 = 0.0;
     let mut non_missing: i64 = 0;
+    let mut het_count: i64 = 0;
 
     for &g in row.iter() {
         if g >= 0.0 {
             alt_sum += g as f64;
             non_missing += 1;
+            if apply_het_filter && (g - 1.0).abs() < 1e-6 {
+                het_count += 1;
+            }
         }
     }
 
@@ -114,6 +120,15 @@ pub fn process_snp_row(
                 row.fill(0.0);
             }
             return true;
+        }
+    }
+
+    if apply_het_filter {
+        let het_rate = het_count as f64 / non_missing as f64;
+        let low = het_threshold as f64;
+        let high = 1.0 - low;
+        if het_rate < low || het_rate > high {
+            return false;
         }
     }
 
@@ -738,6 +753,8 @@ pub struct BedSnpIter {
     maf: f32,
     miss: f32,
     fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
 }
 
 impl BedSnpIter {
@@ -746,6 +763,8 @@ impl BedSnpIter {
         maf: f32,
         miss: f32,
         fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
     ) -> Result<Self, String> {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
@@ -784,6 +803,8 @@ impl BedSnpIter {
             maf,
             miss,
             fill_missing,
+            apply_het_filter,
+            het_threshold,
         })
     }
 
@@ -792,6 +813,8 @@ impl BedSnpIter {
         maf: f32,
         miss: f32,
         fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
         mmap_window_mb: usize,
     ) -> Result<Self, String> {
         if mmap_window_mb == 0 {
@@ -836,6 +859,8 @@ impl BedSnpIter {
             maf,
             miss,
             fill_missing,
+            apply_het_filter,
+            het_threshold,
         })
     }
 
@@ -950,6 +975,8 @@ impl BedSnpIter {
             self.maf,
             self.miss,
             self.fill_missing,
+            self.apply_het_filter,
+            self.het_threshold,
         );
         if keep {
             Some((row, site))
@@ -1008,6 +1035,8 @@ impl BedSnpIter {
                 self.maf,
                 self.miss,
                 self.fill_missing,
+                self.apply_het_filter,
+                self.het_threshold,
             );
             if keep {
                 return Some((row, site));
@@ -1026,6 +1055,8 @@ pub struct VcfSnpIter {
     maf: f32,
     miss: f32,
     fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
     finished: bool,
 }
 
@@ -1035,6 +1066,8 @@ impl VcfSnpIter {
         maf: f32,
         miss: f32,
         fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
     ) -> Result<Self, String> {
         let p = Path::new(path);
         let mut reader = open_text_maybe_gz(p)?;
@@ -1066,6 +1099,8 @@ impl VcfSnpIter {
             maf,
             miss,
             fill_missing,
+            apply_het_filter,
+            het_threshold,
             finished: false,
         })
     }
@@ -1128,6 +1163,8 @@ impl VcfSnpIter {
                 self.maf,
                 self.miss,
                 self.fill_missing,
+                self.apply_het_filter,
+                self.het_threshold,
             );
             if keep {
                 return Some((row, site));

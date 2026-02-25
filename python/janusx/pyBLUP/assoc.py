@@ -315,6 +315,7 @@ def fastlmm_reml_null(
     bounds: tuple,
     max_iter: int = 50,
     tol: float = 1e-2,
+    model: str = "add",
 ) -> Tuple[float, float, float]:
     """
     FaST-LMM null-model REML optimization (rank-k + residual space).
@@ -347,6 +348,9 @@ def fastlmm_reml_null(
     tol : float
         Convergence tolerance in log10(lambda).
 
+    model : {"add", "dom", "rec", "het"}
+        Genetic effect coding mode. Passed through to Rust kernel.
+
     Returns
     -------
     lbd : float
@@ -375,6 +379,7 @@ def fastlmm_reml_null(
         float(high),
         int(max_iter),
         float(tol),
+        str(model),
     )
     return lbd, ml, reml
 
@@ -385,13 +390,14 @@ def fastlmm_reml(
     u2tx: np.ndarray,
     u1ty: np.ndarray,
     u2ty: np.ndarray,
-    u1tsnp_chunk: np.ndarray,
-    u2tsnp_chunk: np.ndarray,
+    snp_chunk: np.ndarray,
+    u1t: np.ndarray,
     bounds: tuple,
     max_iter: int = 50,
     tol: float = 1e-2,
     threads: int = 4,
     nullml: Optional[float] = None,
+    model: str = "add",
 ) -> np.ndarray:
     """
     FaST-LMM REML scan on a SNP chunk (rank-k + residual space).
@@ -415,11 +421,11 @@ def fastlmm_reml(
     u2ty : np.ndarray, shape (n,)
         Residual phenotype (y - U @ (U^T @ y)).
 
-    u1tsnp_chunk : np.ndarray, shape (m, k)
-        Projected SNP chunk in U space (SNP-major).
+    snp_chunk : np.ndarray, shape (m, n)
+        Raw SNP chunk (SNP-major), before projection.
 
-    u2tsnp_chunk : np.ndarray, shape (m, n)
-        Residual SNP chunk (SNP-major).
+    u1t : np.ndarray, shape (k, n)
+        Projection matrix U^T used by Rust to project SNPs internally.
 
     bounds : tuple (low, high)
         Search bounds in log10(lambda).
@@ -436,6 +442,9 @@ def fastlmm_reml(
     nullml : float, optional
         Null-model ML log-likelihood. If provided, plrt is appended.
 
+    model : {"add", "dom", "rec", "het"}
+        Genetic effect coding mode applied in Rust before projection.
+
     Returns
     -------
     beta_se_p : np.ndarray, shape (m, 3) or (m, 4)
@@ -449,8 +458,8 @@ def fastlmm_reml(
     u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
     u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
 
-    u1tsnp_chunk = np.ascontiguousarray(u1tsnp_chunk, dtype=np.float32)
-    u2tsnp_chunk = np.ascontiguousarray(u2tsnp_chunk, dtype=np.float32)
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u1t = np.ascontiguousarray(u1t, dtype=np.float32)
 
     beta_se_p = fastlmm_reml_chunk_f32(
         S,
@@ -458,14 +467,15 @@ def fastlmm_reml(
         u2tx,
         u1ty,
         u2ty,
-        u1tsnp_chunk,
-        u2tsnp_chunk,
+        snp_chunk,
+        u1t,
         float(low),
         float(high),
         int(max_iter),
         float(tol),
         int(threads),
         None if nullml is None else float(nullml),
+        str(model),
     )
     return beta_se_p
 

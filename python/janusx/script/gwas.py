@@ -306,6 +306,8 @@ def build_grm_streaming(
     max_missing_rate: float,
     chunk_size: int,
     method: int,
+    genetic_model: str,
+    het_threshold: float,
     mmap_window_mb: Union[int , None],
     logger,
 ) -> tuple[np.ndarray, int]:
@@ -319,13 +321,34 @@ def build_grm_streaming(
 
     varsum = 0.0
     eff_m = 0
+
+    def _heter_keep_mask(geno_chunk: np.ndarray, het: float) -> np.ndarray:
+        valid = geno_chunk >= 0
+        non_missing = np.sum(valid, axis=1)
+        keep = non_missing > 0
+        if not np.any(keep):
+            return keep
+        het_count = np.sum(np.isclose(geno_chunk, 1.0, atol=1e-6) & valid, axis=1)
+        het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
+        idx = non_missing > 0
+        het_rate[idx] = het_count[idx] / non_missing[idx]
+        keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
+        return keep
+
     for genosub, _sites in load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
+        model=genetic_model,
+        het=het_threshold,
         mmap_window_mb=mmap_window_mb,
     ):
+        if genetic_model != "add":
+            keep_mask = _heter_keep_mask(genosub, het_threshold)
+            genosub = genosub[keep_mask]
+            if genosub.shape[0] == 0:
+                continue
         # genosub: (m_chunk, n_samples)
         genosub:np.ndarray
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
@@ -367,6 +390,8 @@ def load_or_build_grm_with_cache(
     mgrm: str,
     maf_threshold: float,
     max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
     chunk_size: int,
     mmap_limit: bool,
     logger:logging.Logger,
@@ -380,7 +405,11 @@ def load_or_build_grm_with_cache(
 
     grm_ids = None
     if method_is_builtin:
-        km_path = f"{cache_prefix}.k.{mgrm}"
+        if genetic_model == "add":
+            km_path = f"{cache_prefix}.k.{mgrm}"
+        else:
+            het_tag = str(het_threshold).replace(".", "p")
+            km_path = f"{cache_prefix}.k.{mgrm}.{genetic_model}.het{het_tag}"
         id_path = f"{km_path}.npy.id"
         if os.path.exists(f'{km_path}.npy'):
             logger.info(f"Loading cached GRM from {km_path}.npy...")
@@ -402,6 +431,8 @@ def load_or_build_grm_with_cache(
                 max_missing_rate=max_missing_rate,
                 chunk_size=chunk_size,
                 method=method_int,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
                 mmap_window_mb=auto_mmap_window_mb(
                     genofile, n_samples, n_snps, chunk_size
                 ) if mmap_limit else None,
@@ -540,6 +571,8 @@ def prepare_streaming_context(
     pheno_cols: Union[list[int] , None],
     maf_threshold: float,
     max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
     chunk_size: int,
     mgrm: str,
     pcdim: str,
@@ -581,6 +614,8 @@ def prepare_streaming_context(
             mgrm=mgrm,
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
+            genetic_model=genetic_model,
+            het_threshold=het_threshold,
             chunk_size=chunk_size,
             mmap_limit=mmap_limit,
             logger=logger,
@@ -730,6 +765,8 @@ def run_chunked_gwas_lmm_lm(
     outprefix: str,
     maf_threshold: float,
     max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
     chunk_size: int,
     mmap_limit: bool,
     grm: Union[np.ndarray, None],
@@ -752,6 +789,59 @@ def run_chunked_gwas_lmm_lm(
     model_label = {"lmm": "LMM", "lm": "LM", "fastlmm": "fastLMM"}[model_key]
     # Keep output file suffixes consistent and lowercase.
     model_tag = model_label.lower()
+
+    def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
+        m = model.lower()
+        if m == "add":
+            return geno_chunk
+        if m == "dom":
+            return (
+                np.isclose(geno_chunk, 1.0, atol=1e-6)
+                | np.isclose(geno_chunk, 2.0, atol=1e-6)
+            ).astype(np.float32, copy=False)
+        if m == "rec":
+            return np.isclose(geno_chunk, 2.0, atol=1e-6).astype(np.float32, copy=False)
+        if m == "het":
+            return np.isclose(geno_chunk, 1.0, atol=1e-6).astype(np.float32, copy=False)
+        raise ValueError(f"Unsupported genetic model: {model}")
+
+    def _transform_allele_labels(
+        allele0_list: list[str], allele1_list: list[str], model: str
+    ) -> tuple[list[str], list[str]]:
+        m = model.lower()
+        if m == "add":
+            return allele0_list, allele1_list
+        out0: list[str] = []
+        out1: list[str] = []
+        for a0, a1 in zip(allele0_list, allele1_list):
+            hom0 = f"{a0}{a0}"
+            het = f"{a0}{a1}"
+            hom1 = f"{a1}{a1}"
+            if m == "dom":
+                out0.append(hom0)
+                out1.append(f"{het}/{hom1}")
+            elif m == "rec":
+                out0.append(f"{het}/{hom0}")
+                out1.append(hom1)
+            elif m == "het":
+                out0.append(f"{hom0}/{hom1}")
+                out1.append(het)
+            else:
+                raise ValueError(f"Unsupported genetic model: {model}")
+        return out0, out1
+
+    def _heter_keep_mask(geno_chunk: np.ndarray, het: float) -> np.ndarray:
+        valid = geno_chunk >= 0
+        non_missing = np.sum(valid, axis=1)
+        keep = non_missing > 0
+        if not np.any(keep):
+            return keep
+        het_count = np.sum(np.isclose(geno_chunk, 1.0, atol=1e-6) & valid, axis=1)
+        het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
+        idx = non_missing > 0
+        het_rate[idx] = het_count[idx] / non_missing[idx]
+        keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
+        return keep
 
     process = psutil.Process()
     n_cores = psutil.cpu_count(logical=True) or cpu_count()
@@ -792,7 +882,7 @@ def run_chunked_gwas_lmm_lm(
 
         done_snps = 0
         has_results = False
-        out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
+        out_tsv = f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv"
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (
@@ -809,17 +899,32 @@ def run_chunked_gwas_lmm_lm(
             chunk_size,
             maf_threshold,
             max_missing_rate,
+            model=genetic_model,
+            het=het_threshold,
             sample_ids=sample_sub,
             mmap_window_mb=mmap_window_mb,
         ):
             genosub:np.ndarray
             genosub = genosub[:, sameidx]  if sample_sub is None else genosub # (m_chunk, n_use)
+            if genetic_model != "add":
+                keep_mask = _heter_keep_mask(genosub, het_threshold)
+                if not np.any(keep_mask):
+                    continue
+                genosub = genosub[keep_mask]
+                sites = [s for s, k in zip(sites, keep_mask) if k]
             m_chunk = genosub.shape[0]
             if m_chunk == 0:
                 continue
 
-            maf_chunk = np.mean(genosub, axis=1) / 2
-            results = mod.gwas(genosub-2*maf_chunk.reshape(-1,1), threads=threads) # Centralization of input genotype
+            geno_model = _apply_genetic_model(genosub, genetic_model)
+            if genetic_model == "add":
+                maf_chunk = np.mean(genosub, axis=1) / 2
+            else:
+                maf_chunk = np.mean(geno_model, axis=1)
+            geno_center = geno_model - np.mean(
+                geno_model, axis=1, dtype=np.float32, keepdims=True
+            )
+            results = mod.gwas(geno_center, threads=threads)
             info_chunk = [
                 (s.chrom, s.pos, s.ref_allele, s.alt_allele) for s in sites
             ]
@@ -827,12 +932,18 @@ def run_chunked_gwas_lmm_lm(
                 continue
 
             chroms, poss, allele0, allele1 = zip(*info_chunk)
+            allele0_list = list(allele0)
+            allele1_list = list(allele1)
+            if genetic_model != "add":
+                allele0_list, allele1_list = _transform_allele_labels(
+                    allele0_list, allele1_list, genetic_model
+                )
             chunk_df = pd.DataFrame(
                 {
                     "chrom": chroms,
                     "pos": poss,
-                    "allele0": allele0,
-                    "allele1": allele1,
+                    "allele0": allele0_list,
+                    "allele1": allele1_list,
                     "maf": maf_chunk,
                     "beta": results[:, 0],
                     "se": results[:, 1],
@@ -909,7 +1020,7 @@ def run_chunked_gwas_lmm_lm(
                 plot_df,
                 y_vec,
                 xlabel=pname,
-                outpdf=f"{outprefix}.{pname}.{model_tag}.svg",
+                outpdf=f"{outprefix}.{pname}.{genetic_model}.{model_tag}.svg",
             )
 
         os.replace(tmp_tsv, out_tsv)
@@ -1258,6 +1369,10 @@ def parse_args():
         "-lm", "--lm", action="store_true", default=False,
         help="Run the linear model (streaming, low-memory; default: %(default)s).",
     )
+    models_group.add_argument(
+        "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
+        help="Genetic effect coding model for streaming LM/LMM/fastLMM (default: %(default)s).",
+    )
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
@@ -1296,6 +1411,11 @@ def parse_args():
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "-het", "--het", type=float, default=0.02,
+        help="Heterozygosity filter threshold for non-additive models. "
+             "Sites with het rate outside [het, 1-het] are removed (default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-plot", "--plot", action="store_true", default=False,
         help="Generate diagnostic plots (histogram, Manhattan, QQ; default: %(default)s).",
     )
@@ -1330,6 +1450,9 @@ def main(log: bool = True):
 
     if args.thread <= 0:
         args.thread = cpu_count()
+    args.model = args.model.lower()
+    if not (0.0 <= args.het <= 0.5):
+        raise ValueError("--het must be within [0, 0.5].")
 
     gfile, prefix = determine_genotype_source(args)
 
@@ -1359,6 +1482,9 @@ def main(log: bool = True):
             f"{'LM ' if args.lm else ''}"
             f"{'FarmCPU' if args.farmcpu else ''}"
         )
+        logger.info(f"Genetic model:    {args.model}")
+        if args.model != "add":
+            logger.info(f"Het filter:       {args.het} (keep [{args.het}, {1.0 - args.het}])")
         logger.info(f"GRM option:       {args.grm}")
         logger.info(f"Q option:         {args.qcov}")
         if args.cov:
@@ -1388,6 +1514,11 @@ def main(log: bool = True):
     if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
         logger.error("No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu.")
         raise SystemExit(1)
+    if args.farmcpu and args.model != "add":
+        logger.warning(
+            "Warning: --model/--het currently apply to streaming LM/LMM/fastLMM; "
+            "FarmCPU keeps additive coding."
+        )
 
     try:
 
@@ -1408,6 +1539,8 @@ def main(log: bool = True):
                 pheno_cols=args.ncol,
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
+                genetic_model=args.model,
+                het_threshold=args.het,
                 chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
@@ -1429,6 +1562,8 @@ def main(log: bool = True):
                 outprefix=outprefix,
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
+                genetic_model=args.model,
+                het_threshold=args.het,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
                 grm=grm,
@@ -1452,6 +1587,8 @@ def main(log: bool = True):
                 outprefix=outprefix,
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
+                genetic_model=args.model,
+                het_threshold=args.het,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
                 grm=grm,
@@ -1474,6 +1611,8 @@ def main(log: bool = True):
                 outprefix=outprefix,
                 maf_threshold=args.maf,
                 max_missing_rate=args.geno,
+                genetic_model=args.model,
+                het_threshold=args.het,
                 chunk_size=args.chunksize,
                 mmap_limit=args.mmap_limit,
                 grm=grm,

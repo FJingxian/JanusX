@@ -189,6 +189,8 @@ impl BedChunkReader {
         sample_ids=None,
         sample_indices=None,
         mmap_window_mb=None,
+        model=None,
+        het_threshold=None,
     ))]
     fn new(
         prefix: String,
@@ -201,10 +203,28 @@ impl BedChunkReader {
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
         mmap_window_mb: Option<usize>,
+        model: Option<String>,
+        het_threshold: Option<f32>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
+        let model_key = model
+            .as_deref()
+            .unwrap_or("add")
+            .to_ascii_lowercase();
+        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "model must be one of: add, dom, rec, het",
+            ));
+        }
+        let het = het_threshold.unwrap_or(0.02);
+        if !(0.0..=0.5).contains(&het) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "het_threshold must be within [0, 0.5]",
+            ));
+        }
+        let apply_het_filter = model_key != "add";
         if mmap_window_mb.is_some()
             && (snp_range.is_some() || snp_indices.is_some() || bim_range.is_some())
         {
@@ -213,10 +233,18 @@ impl BedChunkReader {
             ));
         }
         let it = if let Some(window_mb) = mmap_window_mb {
-            BedSnpIter::new_with_fill_window(&prefix, maf, miss, fill, window_mb)
+            BedSnpIter::new_with_fill_window(
+                &prefix,
+                maf,
+                miss,
+                fill,
+                apply_het_filter,
+                het,
+                window_mb,
+            )
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         } else {
-            BedSnpIter::new_with_fill(&prefix, maf, miss, fill)
+            BedSnpIter::new_with_fill(&prefix, maf, miss, fill, apply_het_filter, het)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         };
         let (sample_indices, sample_ids) =
@@ -332,6 +360,8 @@ impl VcfChunkReader {
         fill_missing=None,
         sample_ids=None,
         sample_indices=None,
+        model=None,
+        het_threshold=None,
     ))]
     fn new(
         path: String,
@@ -340,11 +370,29 @@ impl VcfChunkReader {
         fill_missing: Option<bool>,
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
+        model: Option<String>,
+        het_threshold: Option<f32>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let it = VcfSnpIter::new_with_fill(&path, maf, miss, fill)
+        let model_key = model
+            .as_deref()
+            .unwrap_or("add")
+            .to_ascii_lowercase();
+        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "model must be one of: add, dom, rec, het",
+            ));
+        }
+        let het = het_threshold.unwrap_or(0.02);
+        if !(0.0..=0.5).contains(&het) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "het_threshold must be within [0, 0.5]",
+            ));
+        }
+        let apply_het_filter = model_key != "add";
+        let it = VcfSnpIter::new_with_fill(&path, maf, miss, fill, apply_het_filter, het)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)

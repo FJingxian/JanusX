@@ -12,6 +12,8 @@ from janusx.janusx import (
     SiteInfo,
 )
 
+_WARNED_BED_MODEL_FALLBACK = False
+
 
 def _cache_prefix(prefix: str) -> str:
     base = os.path.basename(prefix)
@@ -150,6 +152,8 @@ def bed_chunk_reader(
     maf: float = 0.0,
     missing_rate: float = 1.0,
     impute: bool = True,
+    model: str = "add",
+    het: float = 0.02,
     *,
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int],None ]= None,
@@ -172,18 +176,41 @@ def bed_chunk_reader(
     mmap_window_mb:
       - limit BED mmap window size (MB); disables snp_range/snp_indices/bim_range
     """
-    reader = BedChunkReader(
-        prefix,
-        float(maf),
-        float(missing_rate),
-        bool(impute),
-        snp_range,
-        snp_indices,
-        bim_range,
-        sample_ids,
-        sample_indices,
-        mmap_window_mb,
+    global _WARNED_BED_MODEL_FALLBACK
+    base_kwargs = dict(
+        prefix=prefix,
+        maf_threshold=float(maf),
+        max_missing_rate=float(missing_rate),
+        fill_missing=bool(impute),
+        snp_range=snp_range,
+        snp_indices=snp_indices,
+        bim_range=bim_range,
+        sample_ids=sample_ids,
+        sample_indices=sample_indices,
+        mmap_window_mb=mmap_window_mb,
     )
+    try:
+        reader = BedChunkReader(
+            **base_kwargs,
+            model=model,
+            het_threshold=float(het),
+        )
+    except TypeError:
+        # Backward-compat for older compiled extensions that do not yet
+        # expose model/het_threshold in BedChunkReader.
+        reader = BedChunkReader(**base_kwargs)
+        if (model != "add") and (not _WARNED_BED_MODEL_FALLBACK):
+            warnings.warn(
+                (
+                    "BedChunkReader extension does not support model/het_threshold yet; "
+                    "falling back to legacy reader signature. "
+                    "Please rebuild/reinstall janusx Rust extension to enable "
+                    "Rust-side heterozygosity filtering."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _WARNED_BED_MODEL_FALLBACK = True
 
     while True:
         out = reader.next_chunk(chunk_size)
@@ -238,6 +265,8 @@ def load_genotype_chunks(
     maf: float = 0.0,
     missing_rate: float = 1.0,
     impute: bool = True,
+    model: str = "add",
+    het: float = 0.02,
     *,
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int] , None] = None,
@@ -281,6 +310,14 @@ def load_genotype_chunks(
     impute : bool
         Whether to mean-impute missing genotypes.
         If False, missing values remain negative (e.g. -9).
+
+    model : {"add", "dom", "rec", "het"}
+        Genetic effect model flag used by Rust-side SNP filtering.
+        Non-additive models enable heterozygosity filtering.
+
+    het : float
+        Heterozygosity filter threshold for non-additive models.
+        SNPs with het rate outside [het, 1-het] are filtered.
 
     Yields
     ------
@@ -336,6 +373,8 @@ def load_genotype_chunks(
             maf=maf,
             missing_rate=missing_rate,
             impute=impute,
+            model=model,
+            het=het,
             snp_range=snp_range,
             snp_indices=snp_indices,
             bim_range=bim_range,
@@ -352,6 +391,8 @@ def load_genotype_chunks(
             maf=maf,
             missing_rate=missing_rate,
             impute=impute,
+            model=model,
+            het=het,
             snp_range=snp_range,
             snp_indices=snp_indices,
             bim_range=bim_range,

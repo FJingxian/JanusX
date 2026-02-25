@@ -10,6 +10,80 @@ use std::f64::consts::PI;
 use crate::brent::brent_minimize;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf};
 
+#[derive(Clone, Copy)]
+enum GeneticModel {
+    Add,
+    Dom,
+    Rec,
+    Het,
+}
+
+impl GeneticModel {
+    fn parse(text: &str) -> PyResult<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "add" => Ok(Self::Add),
+            "dom" => Ok(Self::Dom),
+            "rec" => Ok(Self::Rec),
+            "het" => Ok(Self::Het),
+            _ => Err(PyRuntimeError::new_err(
+                "model must be one of: add, dom, rec, het",
+            )),
+        }
+    }
+
+    #[inline]
+    fn apply(self, g: f32) -> f32 {
+        match self {
+            Self::Add => g,
+            Self::Dom => {
+                if g > 0.0 { 1.0 } else { 0.0 }
+            }
+            Self::Rec => {
+                if (g - 2.0).abs() < 1e-6 { 1.0 } else { 0.0 }
+            }
+            Self::Het => {
+                if (g - 1.0).abs() < 1e-6 { 1.0 } else { 0.0 }
+            }
+        }
+    }
+}
+
+#[inline]
+fn transform_snp_row(src: &[f32], model: GeneticModel, dst: &mut [f32]) {
+    for i in 0..src.len() {
+        dst[i] = model.apply(src[i]);
+    }
+}
+
+#[inline]
+fn project_snp_row_u1_u2(
+    snp_raw: &[f32],      // len n
+    u1t: &[f32],          // shape (k, n), row-major
+    k: usize,
+    n: usize,
+    out_u1: &mut [f32],   // len k
+    out_u2: &mut [f32],   // len n
+) {
+    // u1 = snp @ U, where U1t = U^T (k,n)
+    for r in 0..k {
+        let row = &u1t[r * n..(r + 1) * n];
+        let mut s = 0.0_f32;
+        for i in 0..n {
+            s += snp_raw[i] * row[i];
+        }
+        out_u1[r] = s;
+    }
+    // u2 = snp - u1 @ U^T
+    out_u2.copy_from_slice(snp_raw);
+    for r in 0..k {
+        let coef = out_u1[r];
+        let row = &u1t[r * n..(r + 1) * n];
+        for i in 0..n {
+            out_u2[i] -= coef * row[i];
+        }
+    }
+}
+
 fn array1_to_cow<'py, T: Copy + Element>(
     arr: &'py PyReadonlyArray1<'py, T>,
 ) -> PyResult<Cow<'py, [T]>> {
@@ -69,6 +143,9 @@ impl FastLmmScratch {
 struct ThreadScratch {
     core: FastLmmScratch,
     u2_xtsnp: Vec<f64>,
+    snp_model: Vec<f32>,
+    u1_snp: Vec<f32>,
+    u2_snp: Vec<f32>,
 }
 
 struct SnpPrecomp<'a> {
@@ -427,7 +504,7 @@ fn fast_reml_beta_se(
 }
 
 #[pyfunction]
-#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter=50, tol=1e-2))]
+#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter=50, tol=1e-2, model="add"))]
 pub fn fastlmm_reml_null_f32<'py>(
     _py: Python<'py>,
     s: PyReadonlyArray1<'py, f64>,
@@ -439,10 +516,13 @@ pub fn fastlmm_reml_null_f32<'py>(
     high: f64,
     max_iter: usize,
     tol: f64,
+    model: &str,
 ) -> PyResult<(f64, f64, f64)> {
     if low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
     }
+    // Keep API consistent with chunk function; null model has no SNP term.
+    let _gm = GeneticModel::parse(model)?;
 
     let s_cow = array1_to_cow(&s)?;
     let u1ty_cow = array1_to_cow(&u1ty)?;
@@ -514,7 +594,7 @@ pub fn fastlmm_reml_null_f32<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, u1tsnp_chunk, u2tsnp_chunk, low, high, max_iter=50, tol=1e-2, threads=0, nullml=None))]
+#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, snp_chunk, u1t, low, high, max_iter=50, tol=1e-2, threads=0, nullml=None, model="add"))]
 pub fn fastlmm_reml_chunk_f32<'py>(
     py: Python<'py>,
     s: PyReadonlyArray1<'py, f64>,
@@ -522,18 +602,20 @@ pub fn fastlmm_reml_chunk_f32<'py>(
     u2tx: PyReadonlyArray2<'py, f64>,
     u1ty: PyReadonlyArray1<'py, f64>,
     u2ty: PyReadonlyArray1<'py, f64>,
-    u1tsnp_chunk: PyReadonlyArray2<'py, f32>,
-    u2tsnp_chunk: PyReadonlyArray2<'py, f32>,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u1t: PyReadonlyArray2<'py, f32>,
     low: f64,
     high: f64,
     max_iter: usize,
     tol: f64,
     threads: usize,
     nullml: Option<f64>,
+    model: &str,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     if low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
     }
+    let gm = GeneticModel::parse(model)?;
 
     let s_cow = array1_to_cow(&s)?;
     let u1ty_cow = array1_to_cow(&u1ty)?;
@@ -541,8 +623,8 @@ pub fn fastlmm_reml_chunk_f32<'py>(
 
     let (u1tx_cow, k1, p1) = array2_to_cow(&u1tx)?;
     let (u2tx_cow, n2, p2) = array2_to_cow(&u2tx)?;
-    let (u1tsnp_cow, m1, k2) = array2_to_cow(&u1tsnp_chunk)?;
-    let (u2tsnp_cow, m2, n3) = array2_to_cow(&u2tsnp_chunk)?;
+    let (snp_cow, m1, n3) = array2_to_cow(&snp_chunk)?;
+    let (u1t_cow, k2, n4) = array2_to_cow(&u1t)?;
 
     let k = s_cow.len();
     if k == 0 {
@@ -566,14 +648,15 @@ pub fn fastlmm_reml_chunk_f32<'py>(
         return Err(PyRuntimeError::new_err("u2tx rows must equal len(u2ty)"));
     }
 
-    if k2 != k {
-        return Err(PyRuntimeError::new_err("u1tsnp_chunk must have k columns (m, k)"));
+    if k2 != k || n4 != n {
+        return Err(PyRuntimeError::new_err(
+            "u1t must have shape (k, n) where k=len(s), n=len(u2ty)",
+        ));
     }
     if n3 != n {
-        return Err(PyRuntimeError::new_err("u2tsnp_chunk must have n columns (m, n)"));
-    }
-    if m1 != m2 {
-        return Err(PyRuntimeError::new_err("u1tsnp_chunk and u2tsnp_chunk must have same row count"));
+        return Err(PyRuntimeError::new_err(
+            "snp_chunk must have shape (m, n) where n=len(u2ty)",
+        ));
     }
 
     let n_minus_p = (n as isize) - (p1 as isize) - 1;
@@ -632,23 +715,34 @@ pub fn fastlmm_reml_chunk_f32<'py>(
                     || ThreadScratch {
                         core: FastLmmScratch::new(k, p1 + 1),
                         u2_xtsnp: vec![0.0; p1],
+                        snp_model: vec![0.0; n],
+                        u1_snp: vec![0.0; k],
+                        u2_snp: vec![0.0; n],
                     },
                     |scratch, idx| {
-                        let u1_row = &u1tsnp_cow.as_ref()[idx * k..(idx + 1) * k];
-                        let u2_row = &u2tsnp_cow.as_ref()[idx * n..(idx + 1) * n];
+                        let raw_row = &snp_cow.as_ref()[idx * n..(idx + 1) * n];
+                        transform_snp_row(raw_row, gm, &mut scratch.snp_model);
+                        project_snp_row_u1_u2(
+                            &scratch.snp_model,
+                            u1t_cow.as_ref(),
+                            k,
+                            n,
+                            &mut scratch.u1_snp,
+                            &mut scratch.u2_snp,
+                        );
 
                         let (u2_snp_snp, u2_snp_ty) = precompute_u2_snp(
                             data.u2tx,
                             data.u2ty,
-                            u2_row,
+                            &scratch.u2_snp,
                             n,
                             data.p,
                             &mut scratch.u2_xtsnp,
                         );
 
                         let snp = SnpPrecomp {
-                            u1: u1_row,
-                            u2: u2_row,
+                            u1: &scratch.u1_snp,
+                            u2: &scratch.u2_snp,
                             u2_xtsnp: &scratch.u2_xtsnp,
                             u2_snp_snp,
                             u2_snp_ty,

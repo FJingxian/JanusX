@@ -173,6 +173,22 @@ def genotype_cache_prefix(genofile: str) -> str:
     cache_dir = os.path.dirname(genofile) or "."
     return os.path.join(cache_dir, base).replace("\\", "/")
 
+def latest_genotype_mtime(genofile: str) -> Union[float, None]:
+    """
+    Return the latest modification time of genotype input files.
+
+    - PLINK prefix: max mtime of .bed/.bim/.fam (if all exist)
+    - File input  : mtime of the file path itself
+    """
+    bed = f"{genofile}.bed"
+    bim = f"{genofile}.bim"
+    fam = f"{genofile}.fam"
+    if all(os.path.isfile(p) for p in (bed, bim, fam)):
+        return max(os.path.getmtime(bed), os.path.getmtime(bim), os.path.getmtime(fam))
+    if os.path.isfile(genofile):
+        return os.path.getmtime(genofile)
+    return None
+
 
 def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
     if not os.path.isfile(path):
@@ -306,8 +322,6 @@ def build_grm_streaming(
     max_missing_rate: float,
     chunk_size: int,
     method: int,
-    genetic_model: str,
-    het_threshold: float,
     mmap_window_mb: Union[int , None],
     logger,
 ) -> tuple[np.ndarray, int]:
@@ -322,33 +336,14 @@ def build_grm_streaming(
     varsum = 0.0
     eff_m = 0
 
-    def _heter_keep_mask(geno_chunk: np.ndarray, het: float) -> np.ndarray:
-        valid = geno_chunk >= 0
-        non_missing = np.sum(valid, axis=1)
-        keep = non_missing > 0
-        if not np.any(keep):
-            return keep
-        het_count = np.sum(np.isclose(geno_chunk, 1.0, atol=1e-6) & valid, axis=1)
-        het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
-        idx = non_missing > 0
-        het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
-        return keep
-
     for genosub, _sites in load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
-        model=genetic_model,
-        het=het_threshold,
+        model="add",
         mmap_window_mb=mmap_window_mb,
     ):
-        if genetic_model != "add":
-            keep_mask = _heter_keep_mask(genosub, het_threshold)
-            genosub = genosub[keep_mask]
-            if genosub.shape[0] == 0:
-                continue
         # genosub: (m_chunk, n_samples)
         genosub:np.ndarray
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
@@ -390,8 +385,6 @@ def load_or_build_grm_with_cache(
     mgrm: str,
     maf_threshold: float,
     max_missing_rate: float,
-    genetic_model: str,
-    het_threshold: float,
     chunk_size: int,
     mmap_limit: bool,
     logger:logging.Logger,
@@ -405,13 +398,20 @@ def load_or_build_grm_with_cache(
 
     grm_ids = None
     if method_is_builtin:
-        if genetic_model == "add":
-            km_path = f"{cache_prefix}.k.{mgrm}"
-        else:
-            het_tag = str(het_threshold).replace(".", "p")
-            km_path = f"{cache_prefix}.k.{mgrm}.{genetic_model}.het{het_tag}"
+        # GRM is always additive and shared by add/dom/rec/het scans.
+        km_path = f"{cache_prefix}.k.{mgrm}"
         id_path = f"{km_path}.npy.id"
-        if os.path.exists(f'{km_path}.npy'):
+        cache_npy = f"{km_path}.npy"
+        cache_is_stale = False
+        if os.path.exists(cache_npy):
+            g_mtime = latest_genotype_mtime(genofile)
+            k_mtime = os.path.getmtime(cache_npy)
+            if g_mtime is not None and g_mtime > k_mtime:
+                cache_is_stale = True
+                logger.warning(
+                    "Warning: Genotype input is newer than cached GRM; rebuilding GRM cache."
+                )
+        if os.path.exists(cache_npy) and (not cache_is_stale):
             logger.info(f"Loading cached GRM from {km_path}.npy...")
             grm = np.load(f'{km_path}.npy',mmap_mode='r')
             grm = grm.reshape(n_samples, n_samples)
@@ -431,8 +431,6 @@ def load_or_build_grm_with_cache(
                 max_missing_rate=max_missing_rate,
                 chunk_size=chunk_size,
                 method=method_int,
-                genetic_model=genetic_model,
-                het_threshold=het_threshold,
                 mmap_window_mb=auto_mmap_window_mb(
                     genofile, n_samples, n_snps, chunk_size
                 ) if mmap_limit else None,
@@ -614,8 +612,6 @@ def prepare_streaming_context(
             mgrm=mgrm,
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
-            genetic_model=genetic_model,
-            het_threshold=het_threshold,
             chunk_size=chunk_size,
             mmap_limit=mmap_limit,
             logger=logger,

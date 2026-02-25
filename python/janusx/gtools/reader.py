@@ -266,12 +266,26 @@ def bedreader(annofile: pathlike) -> pd.DataFrame:
     return anno
 
 
-def readanno(annofile: str, descItem: str = "description") -> pd.DataFrame:
+def readanno(
+    annofile: str,
+    descItem: str = "description",
+    gff_data: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     Read BED/GFF annotation into JanusX unified schema.
 
     Output columns after processing:
       0 = chr, 1 = start, 2 = end, 3 = geneID, 4 = desc1, 5 = desc2
+
+    Parameters
+    ----------
+    annofile : str
+        Annotation file path.
+    descItem : str, default "description"
+        GFF attribute key used as description.
+    gff_data : pd.DataFrame or None, default None
+        Optional preloaded GFF DataFrame from `gffreader` / `GFFQuery.gff`.
+        When provided for GFF/GFF3 input, file parsing is skipped.
     """
     suffix = str(annofile).replace(".gz", "").split(".")[-1].lower()
 
@@ -279,7 +293,17 @@ def readanno(annofile: str, descItem: str = "description") -> pd.DataFrame:
         return bedreader(annofile)
 
     if suffix in {"gff", "gff3"}:
-        gff = gffreader(annofile)
+        if gff_data is None:
+            gff = gffreader(annofile)
+        else:
+            gff = gff_data
+            required = {"chrom", "feature", "start", "end", "attributes"}
+            missing = required.difference(gff.columns)
+            if len(missing) > 0:
+                raise ValueError(
+                    "gff_data is missing required columns: "
+                    f"{sorted(missing)}"
+                )
         if gff.shape[0] == 0:
             return pd.DataFrame(columns=[0, 1, 2, 3, 4, 5])
 

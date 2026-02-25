@@ -273,6 +273,7 @@ class GWASPLOT:
         ci: int = 95,
         color_set: list[str] = None,
         scatter_size: float = 8.0,
+        line_color: str = "black",
     ) -> plt.Axes:
         """
         Draw a QQ plot of observed vs expected -log10(p) with a beta-based
@@ -290,9 +291,14 @@ class GWASPLOT:
         ci : int, default 95
             Confidence interval (in percent) for the null band.
         color_set : list[str], optional
-            Color settings; first color is used for band and points.
+            QQ colors. If >=2 colors are given:
+            - color_set[0]: scatter points
+            - color_set[1]: confidence band
+            If only one color is provided, it is used for both.
         scatter_size : float, default 8.0
             Marker size for QQ scatter points.
+        line_color : str, default "black"
+            Color of the ideal diagonal line y=x.
 
         Returns
         -------
@@ -300,6 +306,12 @@ class GWASPLOT:
         """
         if color_set is None or len(color_set) == 0:
             color_set = ["black", "grey"]
+        if len(color_set) >= 2:
+            point_color = color_set[0]
+            band_color = color_set[1]
+        else:
+            point_color = color_set[0]
+            band_color = color_set[0]
 
         # Use a fresh copy so we don't accidentally modify self.df
         df = self.df.copy()
@@ -345,14 +357,14 @@ class GWASPLOT:
             e_theoretical,
             lower,
             upper,
-            color=color_set[0],
+            color=band_color,
             alpha=0.3,
             rasterized=True,
         )
 
         # Diagonal reference line y = x
         max_lim = np.min(o_e.max(axis=0))
-        ax.plot([0, max_lim], [0, max_lim], lw=1, color="grey")
+        ax.plot([0, max_lim], [0, max_lim], lw=1, color=line_color)
 
         # Scatter observed vs expected for the same subset used in Manhattan plot
         #   o_e.iloc[self.minidx, 1] -> expected -log10(p)
@@ -363,7 +375,7 @@ class GWASPLOT:
             s=scatter_size,
             alpha=0.8,
             rasterized=True,
-            color=color_set[0],
+            color=point_color,
         )
 
         ax.set_xlabel("Expected -log10(p-value)")

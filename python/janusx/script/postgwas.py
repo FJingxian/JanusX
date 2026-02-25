@@ -43,6 +43,7 @@ from janusx.gfreader import load_genotype_chunks
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
+from matplotlib.patches import ConnectionPatch, FancyArrowPatch, Rectangle
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import pandas as pd
 import numpy as np
@@ -51,7 +52,7 @@ import re
 import time
 import socket
 from typing import Any, Optional, Tuple
-from janusx.gtools.reader import readanno
+from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
 import warnings
 
@@ -77,6 +78,44 @@ def _parse_ratio(value: object, name: str) -> float:
     if ratio <= 0:
         raise ValueError(f"{name} ratio must be > 0.")
     return ratio
+
+
+def _parse_ldblock_spec(
+    value: object,
+    name: str,
+    logger: logging.Logger,
+) -> tuple[float, Optional[tuple[float, float]]]:
+    """
+    Parse ldblock option payload.
+    Supports:
+      - ratio only: "2", "5/4"
+      - x-span only (fraction of Manhattan width): "0.2:0.8" or "0.2-0.8"
+        -> ratio defaults to 2.0
+    """
+    if value is None:
+        raise ValueError(f"{name} is None.")
+    text = str(value).strip()
+    if text == "":
+        raise ValueError(f"{name} is empty.")
+
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*(?:-|:)\s*([0-9]*\.?[0-9]+)$", text)
+    if m is not None:
+        x0 = float(m.group(1))
+        x1 = float(m.group(2))
+        if x0 < 0 or x1 < 0 or x0 > 1 or x1 > 1:
+            raise ValueError(
+                f"{name} x-span must be within [0, 1]: {text}."
+            )
+        if np.isclose(x0, x1):
+            raise ValueError(f"{name} x-span start and end cannot be equal: {text}.")
+        if x0 > x1:
+            logger.warning(
+                f"Warning: {name} x-span start > end ({x0} > {x1}); swapped to {x1}-{x0}."
+            )
+            x0, x1 = x1, x0
+        return 2.0, (float(x0), float(x1))
+
+    return _parse_ratio(text, name), None
 
 
 def _parse_rgb_triplet(token: str) -> str:
@@ -116,6 +155,28 @@ def _parse_custom_pallete(text: str) -> list[str]:
     return colors
 
 
+def _expand_single_pallete_color(base_color: str) -> list[str]:
+    """
+    Expand one color to two colors by grayscale(lightness) direction.
+    - dark input  -> generate a darker mate
+    - light input -> generate a lighter mate
+    Returns [light, dark].
+    """
+    base = mcolors.to_hex(mcolors.to_rgba(base_color))
+    gray = _relative_luminance(base)
+    # Grayscale threshold for light/dark split.
+    # Use stronger contrast so generated light/dark are visually distinct.
+    if gray < 0.5:
+        # dark input: push a clearly lighter mate + a deeper dark mate
+        light = _blend_hex_color(base, "#ffffff", 0.85)
+        dark = _blend_hex_color(base, "#000000", 0.35)
+    else:
+        # light input: push a clearly darker mate + an even lighter mate
+        light = _blend_hex_color(base, "#ffffff", 0.35)
+        dark = _blend_hex_color(base, "#000000", 0.85)
+    return [light, dark]
+
+
 def _parse_pallete_spec(value: object) -> Optional[Tuple[str, Any]]:
     """
     Parse --pallete into:
@@ -144,6 +205,71 @@ def _parse_pallete_spec(value: object) -> Optional[Tuple[str, Any]]:
                 f"Invalid --pallete: {text}. "
                 "Use a cmap name (e.g. tab10) or ';'-separated colors."
             ) from e
+
+
+def _blend_hex_color(c1: str, c2: str, ratio_to_c2: float) -> str:
+    """Blend c1->c2 with ratio in [0, 1], return hex color."""
+    t = float(np.clip(float(ratio_to_c2), 0.0, 1.0))
+    rgb1 = np.asarray(mcolors.to_rgb(c1), dtype=float)
+    rgb2 = np.asarray(mcolors.to_rgb(c2), dtype=float)
+    out = (1.0 - t) * rgb1 + t * rgb2
+    return mcolors.to_hex(out)
+
+
+def _relative_luminance(color: str) -> float:
+    """Simple RGB luminance in [0, 1] for light/dark ordering."""
+    r, g, b = mcolors.to_rgb(color)
+    return float(0.2126 * r + 0.7152 * g + 0.0722 * b)
+
+
+def _resolve_two_color_style(
+    spec: Optional[Tuple[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """
+    Return two-color style for LD/gene:
+      - exactly two colors -> use as-is
+      - single color       -> auto-expand by grayscale direction
+    """
+    if spec is None:
+        return None
+
+    mode, payload = spec
+    colors: list[str]
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 1:
+            colors = _expand_single_pallete_color(colors[0])
+        elif len(colors) != 2:
+            return None
+    elif mode == "cmap":
+        cmap = plt.get_cmap(str(payload))
+        if int(getattr(cmap, "N", 256)) != 2:
+            return None
+        colors = [mcolors.to_hex(cmap(0)), mcolors.to_hex(cmap(1))]
+    else:
+        return None
+
+    lum0 = _relative_luminance(colors[0])
+    lum1 = _relative_luminance(colors[1])
+    if lum0 >= lum1:
+        light, dark = colors[0], colors[1]
+    else:
+        light, dark = colors[1], colors[0]
+
+    # Avoid fully-white fill in gene rectangles by nudging it 20% toward dark.
+    if _relative_luminance(light) >= 0.98:
+        light = _blend_hex_color(light, dark, 0.2)
+
+    ld_cmap = mcolors.LinearSegmentedColormap.from_list(
+        "janusx_ld_bicolor",
+        [colors[0], colors[1]],
+    )
+    return {
+        "colors": colors,
+        "ld_cmap": ld_cmap,
+        "gene_block_color": light,
+        "gene_line_color": dark,
+    }
 
 
 def _resolve_manhattan_colors(spec: Optional[Tuple[str, Any]], n_chr: int) -> Optional[list[str]]:
@@ -446,8 +572,9 @@ def _apply_bimrange_manhattan_axis(
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1_000_000:g}Mb"))
     ax.set_xlabel(str(chrom_label))
-    ax._janusx_loc_left_label = f"{left / 1_000_000:g}Mb"   # type: ignore[attr-defined]
-    ax._janusx_loc_right_label = f"{right / 1_000_000:g}Mb"  # type: ignore[attr-defined]
+    c = str(chrom_label)
+    ax._janusx_loc_left_label = f"{c}:{left / 1_000_000:g}Mb"   # type: ignore[attr-defined]
+    ax._janusx_loc_right_label = f"{c}:{right / 1_000_000:g}Mb"  # type: ignore[attr-defined]
 
 
 def _apply_multi_bimrange_manhattan_axis(
@@ -604,6 +731,378 @@ def _draw_empty_ldblock(
         ax.text(n / 2.0, -n / 2.0, text, ha="center", va="center", fontsize=6)
 
 
+def _build_layout_from_bimrange_tuples(
+    bimrange_tuples: list[tuple[str, int, int]],
+) -> list[dict[str, object]]:
+    if len(bimrange_tuples) == 0:
+        return []
+    seg_defs: list[dict[str, object]] = []
+    for i, (chrom, start, end) in enumerate(bimrange_tuples):
+        seg_defs.append(
+            {
+                "id": int(i),
+                "chrom": str(chrom),
+                "chrom_norm": _normalize_chr(chrom),
+                "start": int(start),
+                "end": int(end),
+                "length": float(max(1, int(end) - int(start))),
+            }
+        )
+    return _build_bimrange_layout(seg_defs)
+
+
+def _load_gene_like_records_from_anno(
+    annofile: str,
+    bimrange_tuples: list[tuple[str, int, int]],
+    logger: logging.Logger,
+    gff_query: Optional[GFFQuery] = None,
+) -> pd.DataFrame:
+    """
+    Load gene-structure-like records from GFF/BED for selected bimranges.
+
+    Output columns:
+      chrom_norm, feature, start, end, strand, attribute
+    """
+    out_cols = ["chrom_norm", "feature", "start", "end", "strand", "attribute"]
+    if not annofile or len(bimrange_tuples) == 0:
+        return pd.DataFrame(columns=out_cols)
+
+    suffix = str(annofile).replace(".gz", "").split(".")[-1].lower()
+    features = ["gene", "five_prime_UTR", "three_prime_UTR", "CDS"]
+
+    if suffix in {"gff", "gff3"}:
+        q = gff_query if gff_query is not None else GFFQuery.from_file(annofile)
+        chunks: list[pd.DataFrame] = []
+        for chrom, start, end in bimrange_tuples:
+            hit = q.query_range(
+                chrom=chrom,
+                start=int(start),
+                end=int(end),
+                features=features,
+                attr="ID",
+            )
+            if hit.shape[0] == 0:
+                continue
+            chunk = hit.loc[:, ["chrom_norm", "feature", "start", "end", "strand", "attribute"]].copy()
+            chunks.append(chunk)
+        if len(chunks) == 0:
+            return pd.DataFrame(columns=out_cols)
+        out = pd.concat(chunks, axis=0, ignore_index=True)
+        out["start"] = pd.to_numeric(out["start"], errors="coerce").astype("Int64")
+        out["end"] = pd.to_numeric(out["end"], errors="coerce").astype("Int64")
+        out = out.dropna(subset=["start", "end"]).copy()
+        out["start"] = out["start"].astype(int)
+        out["end"] = out["end"].astype(int)
+        return out[out_cols]
+
+    if suffix == "bed":
+        bed = bedreader(annofile)
+        if bed.shape[0] == 0:
+            return pd.DataFrame(columns=out_cols)
+        s = pd.to_numeric(bed[1], errors="coerce")
+        e = pd.to_numeric(bed[2], errors="coerce")
+        valid = s.notna() & e.notna()
+        if not bool(valid.any()):
+            return pd.DataFrame(columns=out_cols)
+
+        bed_v = bed.loc[valid].copy()
+        s_v = s.loc[valid].astype(int)
+        e_v = e.loc[valid].astype(int)
+        starts = np.minimum(s_v.to_numpy(dtype=np.int64), e_v.to_numpy(dtype=np.int64))
+        ends = np.maximum(s_v.to_numpy(dtype=np.int64), e_v.to_numpy(dtype=np.int64))
+        chroms = bed_v[0].astype(str).map(_normalize_chr).to_numpy(dtype=object)
+        if 3 in bed_v.columns:
+            names = bed_v[3].astype(str).to_numpy(dtype=object)
+        else:
+            names = np.array([""] * len(bed_v), dtype=object)
+
+        rows: list[dict[str, object]] = []
+        for chrom, start, end, name in zip(chroms, starts, ends, names):
+            gene_id = str(name).strip()
+            if gene_id == "" or gene_id.lower() == "nan":
+                gene_id = f"{chrom}:{int(start)}-{int(end)}"
+            attr = [gene_id]
+            # BED has no canonical feature segmentation; build gene+CDS proxy.
+            # Strand is explicitly kept as '.' per requirement.
+            rows.append(
+                {
+                    "chrom_norm": str(chrom),
+                    "feature": "gene",
+                    "start": int(start),
+                    "end": int(end),
+                    "strand": ".",
+                    "attribute": attr,
+                }
+            )
+            rows.append(
+                {
+                    "chrom_norm": str(chrom),
+                    "feature": "CDS",
+                    "start": int(start),
+                    "end": int(end),
+                    "strand": ".",
+                    "attribute": attr,
+                }
+            )
+        return pd.DataFrame(rows, columns=out_cols)
+
+    logger.warning(
+        f"Warning: Unsupported annotation format for gene-structure plotting: {annofile}. "
+        "Only .gff/.gff3/.bed are supported."
+    )
+    return pd.DataFrame(columns=out_cols)
+
+
+def _project_gene_records_to_plot_x(
+    records: pd.DataFrame,
+    bimrange_tuples: list[tuple[str, int, int]],
+    layout: list[dict[str, object]],
+    *,
+    use_segmented_x: bool,
+) -> pd.DataFrame:
+    """
+    Clip records to selected bimranges and project start/end into plot-x coordinates.
+    """
+    out_cols = ["feature", "strand", "attribute", "x_start", "x_end"]
+    if records.shape[0] == 0 or len(bimrange_tuples) == 0:
+        return pd.DataFrame(columns=out_cols)
+
+    seg_by_key: dict[tuple[str, int], dict[str, object]] = {}
+    if use_segmented_x:
+        for seg in layout:
+            sid = int(seg["id"])
+            seg_by_key[(str(seg["chrom_norm"]), sid)] = seg
+
+    rows: list[dict[str, object]] = []
+    for _, row in records.iterrows():
+        chrom = _normalize_chr(row["chrom_norm"])
+        r_start = int(min(int(row["start"]), int(row["end"])))
+        r_end = int(max(int(row["start"]), int(row["end"])))
+        feature = str(row["feature"])
+        strand = str(row["strand"])
+        attr = row["attribute"]
+
+        for sid, (bchrom, bstart, bend) in enumerate(bimrange_tuples):
+            bchrom_norm = _normalize_chr(bchrom)
+            if chrom != bchrom_norm:
+                continue
+            ov_start = max(r_start, int(bstart))
+            ov_end = min(r_end, int(bend))
+            if ov_end < ov_start:
+                continue
+            if use_segmented_x:
+                seg = seg_by_key.get((bchrom_norm, int(sid)))
+                if seg is None:
+                    continue
+                offset = float(seg["offset"])
+                seg_start = int(seg["start"])
+                x_start = offset + float(ov_start - seg_start)
+                x_end = offset + float(ov_end - seg_start)
+            else:
+                x_start = float(ov_start)
+                x_end = float(ov_end)
+            rows.append(
+                {
+                    "feature": feature,
+                    "strand": strand,
+                    "attribute": attr,
+                    "x_start": float(min(x_start, x_end)),
+                    "x_end": float(max(x_start, x_end)),
+                }
+            )
+    if len(rows) == 0:
+        return pd.DataFrame(columns=out_cols)
+    return pd.DataFrame(rows, columns=out_cols)
+
+
+def _draw_gene_structure_axis(
+    ax: plt.Axes,
+    gene_df: pd.DataFrame,
+    *,
+    arrow_color: str = "black",
+    block_color: str = "grey",
+    line_width: float = 0.5,
+    arrow_step: float = 1_000.0,
+    thickness_scale: float = 1.0,
+) -> None:
+    """
+    Draw gene/CDS/UTR structure into `ax` using projected x coordinates.
+    """
+    scale = max(0.2, float(thickness_scale))
+    cds_bottom = -0.1 * scale
+    cds_height = 0.2 * scale
+    utr_bottom = -0.05 * scale
+    utr_height = 0.1 * scale
+
+    if gene_df.shape[0] > 0:
+        cds = gene_df[gene_df["feature"] == "CDS"]
+        utr = gene_df[
+            (gene_df["feature"] == "five_prime_UTR")
+            | (gene_df["feature"] == "three_prime_UTR")
+        ]
+        genes = gene_df[gene_df["feature"] == "gene"]
+
+        if not cds.empty:
+            for _, r in cds.iterrows():
+                x1 = float(r["x_start"])
+                x2 = float(r["x_end"])
+                rect = Rectangle(
+                    (x1, cds_bottom),
+                    width=max(0.0, x2 - x1),
+                    height=cds_height,
+                    color=block_color,
+                    linewidth=0.0,
+                )
+                ax.add_patch(rect)
+
+        if not utr.empty:
+            for _, r in utr.iterrows():
+                x1 = float(r["x_start"])
+                x2 = float(r["x_end"])
+                rect = Rectangle(
+                    (x1, utr_bottom),
+                    width=max(0.0, x2 - x1),
+                    height=utr_height,
+                    color=block_color,
+                    linewidth=0.0,
+                )
+                ax.add_patch(rect)
+
+        if not genes.empty:
+            for _, r in genes.iterrows():
+                x1 = float(r["x_start"])
+                x2 = float(r["x_end"])
+                left = min(x1, x2)
+                right = max(x1, x2)
+                strand = str(r["strand"]).strip()
+                attr = r["attribute"]
+                if isinstance(attr, (list, tuple, np.ndarray)) and len(attr) > 0:
+                    gene_name = str(attr[0])
+                else:
+                    gene_name = str(attr)
+
+                ax.plot([left, right], [0.0, 0.0], color=arrow_color, linewidth=line_width)
+                ax.plot(
+                    [left, left],
+                    [-0.05 * scale, 0.05 * scale],
+                    color=arrow_color,
+                    linewidth=line_width,
+                )
+                ax.plot(
+                    [right, right],
+                    [-0.05 * scale, 0.05 * scale],
+                    color=arrow_color,
+                    linewidth=line_width,
+                )
+                ax.text(
+                    0.5 * (left + right),
+                    0.0,
+                    gene_name,
+                    ha="center",
+                    va="center",
+                    fontsize=5,
+                    zorder=30,
+                    clip_on=False,
+                    bbox={
+                        "facecolor": "white",
+                        "alpha": 0.55,
+                        "edgecolor": "none",
+                        "pad": 0.2,
+                    },
+                )
+
+                step = max(1.0, float(arrow_step))
+                if strand == "-":
+                    for seg_end in np.arange(right, left, -step):
+                        seg_start = max(seg_end - step, left)
+                        arrow = FancyArrowPatch(
+                            (seg_end, 0.0),
+                            (seg_start, 0.0),
+                            arrowstyle="->",
+                            mutation_scale=10,
+                            linewidth=line_width,
+                            color=arrow_color,
+                        )
+                        ax.add_patch(arrow)
+                elif strand == "+":
+                    for seg_start in np.arange(left, right, step):
+                        seg_end = min(seg_start + step, right)
+                        arrow = FancyArrowPatch(
+                            (seg_start, 0.0),
+                            (seg_end, 0.0),
+                            arrowstyle="->",
+                            mutation_scale=10,
+                            linewidth=line_width,
+                            color=arrow_color,
+                        )
+                        ax.add_patch(arrow)
+
+    ax.set_ylim(-0.15 * scale, 0.15 * scale)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ["right", "left", "bottom", "top"]:
+        ax.spines[s].set_visible(False)
+
+
+def _draw_manh_gene_ld_links(
+    fig: plt.Figure,
+    ax_gene: plt.Axes,
+    ax_manh: plt.Axes,
+    ax_ld: plt.Axes,
+    pairs: list[tuple[float, float, bool]],
+    *,
+    gene_cds_bottom: float = -0.05,
+) -> None:
+    """
+    Draw connectors:
+      1) y=0.2 -> y=gene_cds_bottom vertical line at Manhattan SNP x
+      2) y=gene_cds_bottom -> y=-0.2 diagonal line from gene x to LD-mapped x
+    Significant SNP lines are red; others are black.
+    """
+    if len(pairs) == 0:
+        return
+    gx0, gx1 = ax_gene.get_xlim()
+    tx0, tx1 = ax_manh.get_xlim()
+    dt = float(tx1 - tx0)
+    if np.isclose(dt, 0.0):
+        return
+
+    edge_margin_n = 0.004
+    for x_top, x_ld, is_sig in pairs:
+        if not (np.isfinite(x_top) and np.isfinite(x_ld)):
+            continue
+        # Map Manhattan x into gene-axis data coordinates.
+        x_top_n = (float(x_top) - tx0) / dt
+        if not np.isfinite(x_top_n):
+            continue
+        x_top_n = float(np.clip(x_top_n, edge_margin_n, 1.0 - edge_margin_n))
+        x_top_g = gx0 + x_top_n * float(gx1 - gx0)
+        line_color = "red" if bool(is_sig) else "black"
+        ax_gene.plot(
+            [x_top_g, x_top_g],
+            [0.2, float(gene_cds_bottom)],
+            color=line_color,
+            linewidth=0.5,
+            alpha=0.8,
+            clip_on=False,
+            zorder=-20,
+        )
+        # Draw diagonal segment in real cross-axes geometry so mapping
+        # remains correct even if LD panel width is narrower than middle panel.
+        diag = ConnectionPatch(
+            xyA=(x_top_g, float(gene_cds_bottom)),
+            xyB=(float(x_ld), 0.0),
+            coordsA=ax_gene.transData,
+            coordsB=ax_ld.transData,
+            color=line_color,
+            linewidth=0.5,
+            alpha=0.8,
+            clip_on=False,
+            zorder=-20,
+        )
+        fig.add_artist(diag)
+
+
 def _format_input_files(files: list[str]) -> str:
     if len(files) <= 1:
         return files[0]
@@ -702,6 +1201,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     )
 
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
+    anno_suffix = (
+        str(args.anno).replace(".gz", "").split(".")[-1].lower()
+        if args.anno
+        else None
+    )
+    gff_query_cache: Optional[GFFQuery] = None
 
     df_all = pd.read_csv(file, sep="\t", usecols=[chr_col, pos_col, p_col])
     full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
@@ -779,20 +1284,29 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         manh_height_in = None
         manh_fontsize = None
         manh_yticks = None
+        manh_xlim = None
         manh_axes_bounds = None
         hide_axis_labels = args.manh_ratio is not None and args.manh_ratio > 4.0
         manh_min_logp = 0.0 if args.bimrange_tuples is not None else 0.5
         manh_ymin = 0.0 if args.bimrange_tuples is not None else 0.5
 
         plot_colors = None
+        two_color_style = _resolve_two_color_style(args.pallete_spec)
         if plotmodel is not None:
             plot_colors = _manhattan_colors_for_subset(
                 args.pallete_spec,
                 full_chr_labels,
                 df[chr_col].drop_duplicates().tolist(),
             )
+        qq_point_color = "black"
+        qq_band_color = "grey"
+        if two_color_style is not None:
+            qq_point_color = str(two_color_style["gene_line_color"])   # dark
+            qq_band_color = str(two_color_style["gene_block_color"])   # light
 
-        def _draw_manhattan_axis(ax: plt.Axes) -> tuple[tuple[float, float], np.ndarray, float]:
+        def _draw_manhattan_axis(
+            ax: plt.Axes,
+        ) -> tuple[tuple[float, float], np.ndarray, float, tuple[float, float]]:
             if plotmodel is None:
                 ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([])
@@ -800,7 +1314,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 if hide_axis_labels:
                     ax.set_xlabel("")
                     ax.set_ylabel("")
-                return ax.get_ylim(), np.asarray(ax.get_yticks(), dtype=float), float(ax.xaxis.label.get_size())
+                return (
+                    ax.get_ylim(),
+                    np.asarray(ax.get_yticks(), dtype=float),
+                    float(ax.xaxis.label.get_size()),
+                    ax.get_xlim(),
+                )
 
             rasterized = False if args.format == "pdf" else True
 
@@ -916,6 +1435,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax.get_ylim(),
                 np.asarray(ax.get_yticks(), dtype=float),
                 float(ax.xaxis.label.get_size()),
+                ax.get_xlim(),
             )
 
         # ----------------- Manhattan plot -----------------
@@ -926,7 +1446,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 dpi=dpi,
             )
             ax = fig.add_subplot(111)
-            manh_ylim, manh_yticks, manh_fontsize = _draw_manhattan_axis(ax)
+            manh_ylim, manh_yticks, manh_fontsize, manh_xlim = _draw_manhattan_axis(ax)
             manh_height_in = fig.get_figheight()
             fig.tight_layout()
             manh_axes_bounds = ax.get_position().bounds
@@ -953,7 +1473,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax2 = fig.add_subplot(111)
                 plotmodel.qq(
                     ax=ax2,
-                    color_set=["black", "grey"],
+                    color_set=[qq_point_color, qq_band_color],
+                    line_color="black",
                     scatter_size=args.scatter_size,
                 )
                 qq_xmax = float(np.log10(plotmodel.df.shape[0] + 1))
@@ -1004,7 +1525,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             qq_path = None
 
         # ----------------- LD block -----------------
+        gene_path = None
         if effective_ldblock_ratio is not None:
+            ld_panel_xspan = args.ldblock_xspan
             ld_sites = _extract_ld_site_set(
                 df,
                 chr_col,
@@ -1041,7 +1564,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         args.bimrange_tuples if args.bimrange_tuples is not None else [],
                         ld_sites,
                     )
-                    ld_site_keys = sig_keys
+                    # Keep Manhattan->gene/LD mapping lines even when genotype lookup fails:
+                    # fallback to GWAS-derived ld_site_keys if no matched genotype SNP is returned.
+                    if len(sig_keys) > 0:
+                        ld_site_keys = sig_keys
                     if geno_sig.shape[0] < 2:
                         logger.warning(
                             "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
@@ -1053,13 +1579,54 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
                         logger.info(f"LD block built from {len(sig_keys)} {mode_text}.")
 
+            region_ranges = args.bimrange_tuples if args.bimrange_tuples is not None else []
+            region_layout = bim_layout if len(bim_layout) > 0 else _build_layout_from_bimrange_tuples(region_ranges)
+            use_segmented_gene_x = len(region_layout) > 1
+            gene_track_df = pd.DataFrame(
+                columns=["feature", "strand", "attribute", "x_start", "x_end"]
+            )
+            use_gene_bridge = False
+            if args.anno:
+                if anno_suffix in {"gff", "gff3"} and gff_query_cache is None:
+                    gff_query_cache = GFFQuery.from_file(args.anno)
+                gene_raw = _load_gene_like_records_from_anno(
+                    args.anno,
+                    region_ranges,
+                    logger,
+                    gff_query=gff_query_cache,
+                )
+                gene_track_df = _project_gene_records_to_plot_x(
+                    gene_raw,
+                    region_ranges,
+                    region_layout,
+                    use_segmented_x=use_segmented_gene_x,
+                )
+                if gene_track_df.shape[0] == 0:
+                    logger.warning(
+                        "Warning: No gene-structure records found in selected --bimrange; "
+                        "gene panel and gene-overlaid Manhattan+LD transition are skipped."
+                    )
+                else:
+                    use_gene_bridge = True
+
+            ld_cmap = "Greys"
+            gene_block_color = "grey"
+            gene_line_color = "black"
+            if two_color_style is not None:
+                ld_cmap = two_color_style["ld_cmap"]
+                gene_block_color = str(two_color_style["gene_block_color"])
+                gene_line_color = str(two_color_style["gene_line_color"])
+
             def _draw_ld_axis(ax: plt.Axes) -> None:
-                LDblock(ld_mat.copy(), ax=ax, vmin=0, vmax=1, cmap="Greys")
+                LDblock(ld_mat.copy(), ax=ax, vmin=0, vmax=1, cmap=ld_cmap)
                 if ld_overlay_text:
                     n_ld = int(ld_mat.shape[0])
                     ax.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
 
-            def _build_manh_ld_pairs(ax_manh: plt.Axes, ax_ld: plt.Axes) -> list[tuple[float, float]]:
+            def _build_manh_ld_pairs(
+                ax_manh: plt.Axes,
+                ax_ld: plt.Axes,
+            ) -> list[tuple[float, float, bool]]:
                 if plotmodel is None or len(ld_site_keys) == 0:
                     return []
 
@@ -1079,27 +1646,33 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 chr_ids = np.asarray(map_df.index.get_level_values(0), dtype=np.int64)
                 pos_vals = np.asarray(map_df.index.get_level_values(1), dtype=np.int64)
                 x_vals = np.asarray(map_df["x"], dtype=float)
-                key_to_x: dict[tuple[str, int], float] = {}
-                for cid, p, x, keep in zip(chr_ids, pos_vals, x_vals, keep_mask):
+                key_to_meta: dict[tuple[str, int], tuple[float, bool]] = {}
+                for cid, p, x, keep, pv in zip(chr_ids, pos_vals, x_vals, keep_mask, p_vals):
                     if not keep:
                         continue
                     chrom_norm = chr_id_to_norm.get(int(cid))
                     if chrom_norm is None:
                         continue
                     key = (chrom_norm, int(p))
-                    if key not in key_to_x:
-                        key_to_x[key] = float(x)
+                    is_sig = bool(np.isfinite(pv) and (pv <= threshold))
+                    if key not in key_to_meta:
+                        key_to_meta[key] = (float(x), is_sig)
+                    else:
+                        old_x, old_sig = key_to_meta[key]
+                        # For duplicated SNP keys, keep x and merge significance with OR.
+                        key_to_meta[key] = (old_x, bool(old_sig or is_sig))
 
                 n_ld = int(ld_mat.shape[0])
                 keys = ld_site_keys[:n_ld]
-                pairs: list[tuple[float, float]] = []
+                pairs: list[tuple[float, float, bool]] = []
                 for i, key in enumerate(keys):
-                    x_top = key_to_x.get((str(key[0]), int(key[1])))
-                    if x_top is None:
+                    meta = key_to_meta.get((str(key[0]), int(key[1])))
+                    if meta is None:
                         continue
+                    x_top, is_sig = meta
                     # In LDblock, SNP i is centered around x=i+0.5 on the top border.
                     x_ld = float(i) + 0.5
-                    pairs.append((x_top, x_ld))
+                    pairs.append((x_top, x_ld, bool(is_sig)))
                 return pairs
 
             def _draw_bridge_axis(
@@ -1117,18 +1690,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 if len(pairs) == 0:
                     return
 
-                manh_x0, manh_x1 = ax_manh.get_xlim()
-                ld_x0, ld_x1 = ax_ld.get_xlim()
-                d_manh = float(manh_x1 - manh_x0)
-                d_ld = float(ld_x1 - ld_x0)
-                if np.isclose(d_manh, 0.0) or np.isclose(d_ld, 0.0):
-                    return
-
                 slashes_x: list[float] = []
                 edge_margin_n = 0.006
+                y_manh_ref = float(ax_manh.get_ylim()[0])
+                y_ld_ref = 0.0
+                to_bridge = ax_bridge.transAxes.inverted()
                 for x_top, x_ld in pairs:
-                    x_top_n = (float(x_top) - manh_x0) / d_manh
-                    x_ld_n = (float(x_ld) - ld_x0) / d_ld
+                    p_top_disp = ax_manh.transData.transform((float(x_top), y_manh_ref))
+                    p_ld_disp = ax_ld.transData.transform((float(x_ld), y_ld_ref))
+                    x_top_n = float(to_bridge.transform(p_top_disp)[0])
+                    x_ld_n = float(to_bridge.transform(p_ld_disp)[0])
                     if not (np.isfinite(x_top_n) and np.isfinite(x_ld_n)):
                         continue
                     x_top_n = float(np.clip(x_top_n, edge_margin_n, 1.0 - edge_margin_n))
@@ -1170,14 +1741,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
                 ax.set_xticks([])
                 ax.tick_params(axis="x", which="both", length=0, labelbottom=False)
-                trans = ax.get_xaxis_transform()
+                trans = ax.transAxes
+                loc_fontsize = 5
                 ax.text(
-                    float(x0),
+                    0.0,
                     -0.06,
                     left_lab,
                     transform=trans,
                     ha="left",
                     va="top",
+                    fontsize=loc_fontsize,
                     clip_on=False,
                     zorder=40,
                     bbox={
@@ -1189,12 +1762,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
                 if not np.isclose(float(x0), float(x1)):
                     ax.text(
-                        float(x1),
+                        1.0,
                         -0.06,
                         right_lab,
                         transform=trans,
                         ha="right",
                         va="top",
+                        fontsize=loc_fontsize,
                         clip_on=False,
                         zorder=40,
                         bbox={
@@ -1204,6 +1778,20 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             "pad": 0.2,
                         },
                     )
+
+            if use_segmented_gene_x and len(region_layout) > 0:
+                gene_xlim = (
+                    float(region_layout[0]["x_start"]),
+                    float(region_layout[-1]["x_end"]),
+                )
+            elif len(region_ranges) > 0:
+                gene_xlim = (
+                    float(min(int(x[1]) for x in region_ranges)),
+                    float(max(int(x[2]) for x in region_ranges)),
+                )
+            else:
+                gene_xlim = (0.0, 1.0)
+            gene_plot_xlim = manh_xlim if manh_xlim is not None else gene_xlim
 
             ld_h_in = width_in / effective_ldblock_ratio
             fig_ld = plt.figure(
@@ -1215,19 +1803,72 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             _draw_ld_axis(ax_ld)
 
             fig_ld.tight_layout()
-            # Keep LD block x-axis drawable length consistent with Manhattan.
-            if manh_axes_bounds is not None:
-                mx0, _my0, mw, _mh = manh_axes_bounds
+            # Keep LD block x-axis drawable length consistent with Manhattan;
+            # optionally constrain to user-specified x-span of Manhattan width.
+            if manh_axes_bounds is not None or ld_panel_xspan is not None:
                 _cx0, cy0, _cw, ch = ax_ld.get_position().bounds
-                ax_ld.set_position([mx0, cy0, mw, ch])
+                if manh_axes_bounds is not None:
+                    mx0, _my0, mw, _mh = manh_axes_bounds
+                    ref_x0 = float(mx0)
+                    ref_w = float(mw)
+                else:
+                    ref_x0 = float(_cx0)
+                    ref_w = float(_cw)
+                if ld_panel_xspan is None:
+                    fx0, fx1 = (0.0, 1.0)
+                else:
+                    fx0, fx1 = ld_panel_xspan
+                new_x0 = ref_x0 + ref_w * float(fx0)
+                new_w = ref_w * float(fx1 - fx0)
+                ax_ld.set_position([new_x0, cy0, new_w, ch])
+                ax_ld.set_anchor("N")
             fig_ld.savefig(ld_path, transparent=True)
             plt.close(fig_ld)
+
+            if use_gene_bridge:
+                gene_h_in = 1.0
+                fig_gene = plt.figure(
+                    figsize=(width_in, gene_h_in),
+                    dpi=dpi,
+                )
+                ax_gene = fig_gene.add_subplot(111)
+                _draw_gene_structure_axis(
+                    ax_gene,
+                    gene_track_df,
+                    arrow_color=gene_line_color,
+                    block_color=gene_block_color,
+                    line_width=0.5,
+                    arrow_step=1_000.0,
+                )
+                ax_gene.set_xlim(gene_plot_xlim)
+                fig_gene.tight_layout()
+                if manh_axes_bounds is not None:
+                    mx0, _my0, mw, _mh = manh_axes_bounds
+                    _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
+                    ax_gene.set_position([mx0, cy0, mw, ch])
+                gene_path = f"{args.out}/{args.prefix}.gene.{args.format}"
+                fig_gene.savefig(gene_path, transparent=True)
+                plt.close(fig_gene)
+            else:
+                gene_path = None
 
             # Combined Manhattan + LD panel
             manhld_manh_ratio = args.manh_ratio if args.manh_ratio is not None else 2.0
             manhld_manh_h_in = width_in / manhld_manh_ratio
-            bridge_h_in = 0.3
-            manhld_total_h_in = manhld_manh_h_in + bridge_h_in + ld_h_in
+            gene_bridge_scale = 0.5
+            mid_gene_ymin = -0.15
+            mid_gene_ymax = 0.2
+            mid_h_in = 0.7 if use_gene_bridge else 0.22
+            # LD row height should follow actual LD panel width;
+            # otherwise narrowed x-span leaves large vertical blanks.
+            manh_drawable_frac = 0.90  # from subplots_adjust(left=0.08, right=0.98)
+            if ld_panel_xspan is None:
+                ld_panel_frac_in_manh = 0.90
+            else:
+                ld_panel_frac_in_manh = float(ld_panel_xspan[1] - ld_panel_xspan[0])
+            ld_h_in_combo = width_in * manh_drawable_frac * ld_panel_frac_in_manh / effective_ldblock_ratio
+            ld_h_in_combo = max(0.5, float(ld_h_in_combo))
+            manhld_total_h_in = manhld_manh_h_in + mid_h_in + ld_h_in_combo
             fig_manhld = plt.figure(
                 figsize=(width_in, manhld_total_h_in),
                 dpi=dpi,
@@ -1235,7 +1876,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             gs_manhld = fig_manhld.add_gridspec(
                 3,
                 1,
-                height_ratios=[manhld_manh_h_in, bridge_h_in, ld_h_in],
+                height_ratios=[manhld_manh_h_in, mid_h_in, ld_h_in_combo],
                 hspace=0.04,
             )
             ax_manhld_top = fig_manhld.add_subplot(gs_manhld[0, 0])
@@ -1245,10 +1886,23 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             ax_manhld_top.set_zorder(5)
             ax_manhld_mid.set_zorder(2)
             ax_manhld_bot.set_zorder(1)
-            ax_manhld_mid.patch.set_visible(False)
+            if not use_gene_bridge:
+                ax_manhld_mid.patch.set_visible(False)
 
-            _draw_manhattan_axis(ax_manhld_top)
+            _tmp_ylim, _tmp_yticks, _tmp_fontsize, manhld_top_xlim = _draw_manhattan_axis(ax_manhld_top)
             _draw_ld_axis(ax_manhld_bot)
+            if use_gene_bridge:
+                _draw_gene_structure_axis(
+                    ax_manhld_mid,
+                    gene_track_df,
+                    arrow_color=gene_line_color,
+                    block_color=gene_block_color,
+                    line_width=0.4,
+                    arrow_step=1_000.0,
+                    thickness_scale=gene_bridge_scale,
+                )
+                ax_manhld_mid.set_xlim(manhld_top_xlim)
+                ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
             fig_manhld.subplots_adjust(
                 left=0.08,
                 right=0.98,
@@ -1258,16 +1912,42 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             )
 
             # Keep the two panels strictly left/right aligned.
-            # LD axis uses fixed aspect and may shrink during draw; align Manhattan to LD.
+            # Manh/Gene keep full width; optionally narrow only LD panel width.
             fig_manhld.canvas.draw()
-            _tx0, ty0, _tw, th = ax_manhld_top.get_position().bounds
-            _mx0, my0, _mw, mh = ax_manhld_mid.get_position().bounds
-            bx0, _by0, bw, _bh = ax_manhld_bot.get_position().bounds
-            ax_manhld_top.set_position([bx0, ty0, bw, th])
-            ax_manhld_mid.set_position([bx0, my0, bw, mh])
+            bx0, by0, bw, bh = ax_manhld_bot.get_position().bounds
+            tx0, _ty0, tw, _th = ax_manhld_top.get_position().bounds
+            if ld_panel_xspan is None:
+                ld_panel_width_scale = 0.9
+                new_bw = bw * float(ld_panel_width_scale)
+                new_bx0 = bx0 + 0.5 * (bw - new_bw)
+            else:
+                fx0, fx1 = ld_panel_xspan
+                new_bw = float(tw) * float(fx1 - fx0)
+                new_bx0 = float(tx0) + float(tw) * float(fx0)
+            ax_manhld_bot.set_position([new_bx0, by0, new_bw, bh])
+            ax_manhld_bot.set_anchor("N")
+            fig_manhld.canvas.draw()
 
             bridge_pairs = _build_manh_ld_pairs(ax_manhld_top, ax_manhld_bot)
-            _draw_bridge_axis(ax_manhld_mid, ax_manhld_top, ax_manhld_bot, bridge_pairs)
+            if use_gene_bridge:
+                ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
+                ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
+                _draw_manh_gene_ld_links(
+                    fig_manhld,
+                    ax_manhld_mid,
+                    ax_manhld_top,
+                    ax_manhld_bot,
+                    bridge_pairs,
+                    gene_cds_bottom=-0.1 * gene_bridge_scale,
+                )
+            else:
+                bridge_pairs_plain = [(x1, x2) for x1, x2, _ in bridge_pairs]
+                _draw_bridge_axis(
+                    ax_manhld_mid,
+                    ax_manhld_top,
+                    ax_manhld_bot,
+                    bridge_pairs_plain,
+                )
             _show_end_locs_without_xticks(ax_manhld_top)
 
             manhld_path = f"{args.out}/{args.prefix}.manhld.{args.format}"
@@ -1275,6 +1955,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             plt.close(fig_manhld)
         else:
             ld_path = None
+            gene_path = None
             manhld_path = None
 
         saved_paths: list[tuple[str, str]] = []
@@ -1284,6 +1965,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             saved_paths.append(("QQ", qq_path))
         if ld_path is not None:
             saved_paths.append(("LD block", ld_path))
+        if gene_path is not None:
+            saved_paths.append(("Gene structure", gene_path))
         if manhld_path is not None:
             saved_paths.append(("Manhattan+LD", manhld_path))
 
@@ -1316,7 +1999,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             #   anno[2] = end
             #   anno[3] = gene ID
             #   anno[4], anno[5] = description fields
-            anno = readanno(args.anno, args.descItem)
+            if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
+                anno = readanno(args.anno, args.descItem, gff_data=gff_query_cache.gff)
+            else:
+                anno = readanno(args.anno, args.descItem)
             anno_chr = anno[0].astype(str)
 
             # Exact overlap annotation
@@ -1428,14 +2114,18 @@ def main():
         "-ldblock", "--ldblock", type=str, nargs="?", const="2", default=None,
         help=(
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
-            "using only threshold-passing SNPs. Requires --bimrange."
+            "using only threshold-passing SNPs. Requires --bimrange. "
+            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
+            "(then ratio defaults to 2)."
         ),
     )
     ldblock_group.add_argument(
         "-ldblock-all", "--ldblock-all", dest="ldblock_all", type=str, nargs="?", const="2", default=None,
         help=(
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
-            "using all SNPs in selected bimrange. Requires --bimrange."
+            "using all SNPs in selected bimrange. Requires --bimrange. "
+            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
+            "(then ratio defaults to 2)."
         ),
     )
     optional_group.add_argument(
@@ -1468,6 +2158,8 @@ def main():
             "Manhattan color palette (QQ keeps black/grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
             "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
+            "A single color is also accepted and auto-expanded to light/dark pair "
+            "by grayscale direction for LD/gene (Manhattan keeps single-color). "
             "If omitted, use default black/grey."
         ),
     )
@@ -1555,18 +2247,29 @@ def main():
     try:
         args.manh_ratio = _parse_ratio(args.manh, "Manhattan") if args.manh is not None else None
         args.qq_ratio = _parse_ratio(args.qq, "QQ") if args.qq is not None else None
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+
+    try:
         if args.ldblock_all is not None:
-            args.ldblock_ratio = _parse_ratio(args.ldblock_all, "LDBlock-all")
+            args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
+                args.ldblock_all, "LDBlock-all", logger
+            )
             args.ldblock_mode = "all"
         elif args.ldblock is not None:
-            args.ldblock_ratio = _parse_ratio(args.ldblock, "LDBlock")
+            args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
+                args.ldblock, "LDBlock", logger
+            )
             args.ldblock_mode = "threshold"
         else:
             args.ldblock_ratio = None
+            args.ldblock_xspan = None
             args.ldblock_mode = None
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
+
     if args.bimrange is not None:
         try:
             args.bimrange_tuples = [
@@ -1589,6 +2292,7 @@ def main():
             "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."
         )
         args.ldblock_ratio = None
+        args.ldblock_xspan = None
         args.ldblock_mode = None
 
     args.genofile = args.bfile or args.vcf or args.geno
@@ -1660,6 +2364,13 @@ def main():
         else:
             ld_mode_text = "all SNPs" if args.ldblock_mode == "all" else "threshold SNPs"
             logger.info(f"  LDBlock:     {args.ldblock_ratio} ({ld_mode_text})")
+            if args.ldblock_xspan is None:
+                logger.info("  LDBlock x-span: full width (default)")
+            else:
+                logger.info(
+                    f"  LDBlock x-span: {args.ldblock_xspan[0]:g}-{args.ldblock_xspan[1]:g} "
+                    "(fraction of Manhattan width)"
+                )
     else:
         logger.info("Visualization: disabled")
     if args.anno:

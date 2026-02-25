@@ -11,7 +11,7 @@ from janusx.garfield.garfield2 import (
 )
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
 from janusx.gfreader.gfreader import save_genotype_streaming
-from janusx.script._common.readanno import readanno
+from janusx.gtools.reader import readanno
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,

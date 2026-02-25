@@ -51,7 +51,7 @@ import re
 import time
 import socket
 from typing import Any, Optional, Tuple
-from ._common.readanno import readanno
+from janusx.gtools.reader import readanno
 from joblib import Parallel, delayed
 import warnings
 

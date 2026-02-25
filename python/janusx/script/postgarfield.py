@@ -185,8 +185,11 @@ def main() -> None:
         help="P-value threshold for postgwas (default: 0.05 / nSNP).",
     )
     optional_group.add_argument(
-        "-bimrange", "--bimrange", type=str, default=None,
-        help="Plotting range passed to postgwas in Mb, format chr:start-end.",
+        "-bimrange", "--bimrange", type=str, action="append", default=None,
+        help=(
+            "Plotting range filter in Mb, format chr:start-end "
+            "(also accepts chr:start:end). Can be specified multiple times."
+        ),
     )
     optional_group.add_argument(
         "-format", "--format", type=str, default="png",
@@ -373,7 +376,8 @@ def main() -> None:
         if args.threshold is not None:
             cmd.extend(["-threshold", str(args.threshold)])
         if args.bimrange is not None:
-            cmd.extend(["-bimrange", args.bimrange])
+            for br in args.bimrange:
+                cmd.extend(["-bimrange", br])
         if not args.noplot:
             cmd.extend(["--manh", "--qq"])
         if args.highlight:

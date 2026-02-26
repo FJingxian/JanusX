@@ -83,27 +83,28 @@ def ldprune(
     max_snps: int = 600,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    轻量 LD 过滤：
-      1) 按方差从大到小排序 保留信息量大的 SNP
-      2) 依次尝试加入 kept 列表，只与已有 kept 算相关，>thr 则丢弃
-      3) 最多保留 max_snps 个 SNP
+    Lightweight LD pruning:
+      1) Sort SNPs by variance in descending order (prefer informative SNPs)
+      2) Iteratively add candidates and compute correlation only vs kept SNPs
+      3) If LD(|r|) >= thr with kept SNPs, keep the SNP with larger MAF
+      4) Keep at most ``max_snps`` SNPs
 
-    参数
-    ----
-    M : (m_snps, n_samples) 基因型矩阵
-    sites : 与 SNP 对应的位点信息数组
-    thr : 相关系数阈值（|r| >= thr 视为 LD 过高）
-    max_snps : 最多保留 SNP 数量
+    Parameters
+    ----------
+    M : (m_snps, n_samples) genotype matrix
+    sites : site metadata aligned with SNP rows
+    thr : correlation threshold (|r| >= thr is considered high LD)
+    max_snps : maximum number of SNPs to keep
 
-    返回
-    ----
+    Returns
+    -------
     M_kept, sites_kept
     """
     m, n = M.shape
     if m <= 1:
         return M, sites
 
-    # 1) 去掉方差为 0 的 SNP（完全无多态）
+    # 1) Remove zero-variance SNPs (monomorphic).
     var = M.var(axis=1)
     non_mono = var > 0
     M = M[non_mono]
@@ -113,12 +114,17 @@ def ldprune(
     if m <= 1:
         return M, sites
 
-    # 2) 按方差排序（方差越大越优先）
+    # 2) Compute MAF (larger means closer to 0.5).
+    af = np.clip(M.mean(axis=1, dtype=np.float64) / 2.0, 0.0, 1.0)
+    maf = np.minimum(af, 1.0 - af)
+
+    # 3) Sort by variance (larger variance first).
     order = np.argsort(var)[::-1]
     M = M[order]
     sites = sites[order]
+    maf = maf[order]
 
-    # 3) 标准化：每个 SNP 变成 0 均值、单位方差
+    # 4) Standardize each SNP row to zero mean and unit variance.
     mu = M.mean(axis=1, keepdims=True)
     sigma = M.std(axis=1, keepdims=True)
     sigma[sigma == 0] = 1.0
@@ -129,13 +135,22 @@ def ldprune(
         if len(kept_idx) == 0:
             kept_idx.append(i)
         else:
-            # 只与已保留 SNP 算相关
+            # Compute correlation only against already kept SNPs.
             z_i = Z[i]  # (n,)
             Z_kept = Z[kept_idx]  # (k, n)
-            # corr = dot / n，因为已经标准化了
+            # corr = dot / n because rows are standardized.
             corr = (Z_kept @ z_i) / n
-            if np.all(np.abs(corr) < thr):
+            conflict_mask = np.abs(corr) >= thr
+            if not np.any(conflict_mask):
                 kept_idx.append(i)
+            else:
+                # For high-LD redundancy, keep the SNP with larger MAF.
+                conflict_pos = np.flatnonzero(conflict_mask)
+                conflict_kept_idx = np.array([kept_idx[p] for p in conflict_pos], dtype=int)
+                if conflict_kept_idx.size > 0 and float(maf[i]) > float(np.max(maf[conflict_kept_idx])):
+                    for p in sorted(conflict_pos.tolist(), reverse=True):
+                        kept_idx.pop(p)
+                    kept_idx.append(i)
         if len(kept_idx) >= max_snps:
             break
 
@@ -154,8 +169,8 @@ def getLogicgate(
     gset_groups: Union[None, List[np.ndarray], List[list[int]]] = None,
 ):
     """
-    通过随机森林 + permutation importance + 逻辑回归
-    在一段基因型矩阵中寻找逻辑组合 (xcombine)
+    Find logic combinations (xcombine) in a genotype block using
+    random forest + permutation importance + logistic regression.
     """
     if sites is not None:
         if len(sites) == 0:
@@ -238,7 +253,7 @@ def getLogicgate(
             # pick highest-importance SNP within this group
             best = g[np.argmax(Imp[g])]
             idx.append(best)
-        idx = np.array(sorted(set(idx)), dtype=int)[:topk] # 最多 k 个互作检验
+        idx = np.array(sorted(set(idx)), dtype=int)[:topk]  # at most k interaction tests
         if idx.size == 0:
             return None
     else:
@@ -257,7 +272,7 @@ def getLogicgate(
     return resdict
 
 
-# ---------- 遍历全基因组 ----------
+# ---------- Whole-genome traversal ----------
 def _window_task(
     task: Tuple[str, int, int, np.ndarray, List[str]],
     y: np.ndarray,
@@ -326,15 +341,15 @@ def window(
     mmap_window_mb: Union[int, None] = None,
 ):
     """
-    全基因组滑窗遍历 (按 chunksize 顺序加载，减少重复 IO)。
+    Whole-genome sliding-window traversal (load by chunksize order to reduce repeated IO).
 
-    窗口定义：
-      - 窗口起点每次推进 loc
-      - 每个窗口区间为 [start, start + windowsize)
+    Window definition:
+      - Move window start by ``step`` each time
+      - Each window interval is [start, start + windowsize)
 
-    读取逻辑：
-      - 保持最多两个窗口的数据
-      - 读完两个窗口后丢弃第一个窗口，再加载第三个窗口
+    Streaming strategy:
+      - Keep at most two windows of data in memory
+      - After processing two windows, drop the first and load the next
 
     Returns:
       list of dict
@@ -529,7 +544,7 @@ def window(
     return results
 
 
-# ---------- 自定义遍历 ----------
+# ---------- Custom traversal ----------
 chrposTuple = Tuple[str, int, int]
 def _process(
     ChromPos: Union[chrposTuple,List[chrposTuple]],
@@ -546,10 +561,10 @@ def _process(
     mmap_window_mb: Union[int, None] = None,
 ):
     """
-    对一个 bed 区间执行:
-      1) 从 genofile 取出该区间所有 SNP 的基因型矩阵
-      2) 调用 getLogicgate
-      3) 返回 (xcombine, site_tuple) 或 None
+    Run on one BED region:
+      1) Extract all SNP genotypes from ``genofile`` in the region
+      2) Call ``getLogicgate``
+      3) Return ``(xcombine, site_tuple)`` or ``None``
     """
     # mmap_window_mb is not supported with bim_range; disable it here
     mmap_window_mb = None
@@ -645,7 +660,7 @@ def _process(
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
         )
     except Exception as e:
-        # 某个区间出错时，不让整个并行崩掉
+        # If one region fails, do not crash the whole parallel job.
         print(f"[WARN] process {ChromPos} failed: {e}")
         return None
     if resdict is None:
@@ -764,7 +779,7 @@ def _process_inmemory(
         return None
     return resdict
 
-# ---------- 一次性收集结果的 main ----------
+# ---------- Main (collect results in one pass) ----------
 
 def main(
     genofile,

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.colorbar import ColorbarBase
 from matplotlib.ticker import FixedLocator
+from typing import Optional
 
 from janusx.gfreader.gfreader import load_genotype_chunks
 
@@ -20,6 +21,8 @@ def LDblock(
     vmax: float = 1,
     cmap: str = "Greys",
     cbar_title: str = "LD (r-square)",
+    rasterized: Optional[bool] = None,
+    rasterize_threshold: Optional[int] = None,
 ):
     '''
     ax.set_xlim(0,n), 0.5 ~ n-0.5 n points, n=C.shape[0]=C.shape[1]
@@ -27,6 +30,12 @@ def LDblock(
     mask = np.triu(np.ones_like(C, dtype=bool), k=0) # 不包括对角线的上三角
     C[mask] = np.nan
     n = C.shape[0]
+    if rasterized is None:
+        do_rasterized = False
+        if rasterize_threshold is not None:
+            do_rasterized = bool(n > int(rasterize_threshold))
+    else:
+        do_rasterized = bool(rasterized)
     # 创建旋转/缩放矩阵 (45度旋转伴随缩放)
     t = np.array([[1, 0.5], [-1, 0.5]])
     # 创建坐标矩阵并变换它
@@ -48,6 +57,7 @@ def LDblock(
         cmap=cmap_obj,
         vmin=vmin,
         vmax=vmax,
+        rasterized=do_rasterized,
     )
     # Discrete 10-step vertical colorbar in a dedicated inset axis.
     # This avoids clipping/transform issues and guarantees visible tick labels.
@@ -82,7 +92,7 @@ def LDblock(
         ticks=label_ticks,
         spacing="proportional",
         orientation="vertical",
-        drawedges=True,
+        drawedges=False,
     )
     cb.outline.set_linewidth(0.5)
     cb.outline.set_edgecolor("black")

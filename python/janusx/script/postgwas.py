@@ -39,11 +39,12 @@ for key in ["MPLBACKEND"]:
 import matplotlib as mpl
 mpl.use("Agg")
 from janusx.bioplotkit import GWASPLOT, LDblock
+from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
-from matplotlib.patches import ConnectionPatch, FancyArrowPatch, Rectangle
+from matplotlib.patches import ConnectionPatch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import pandas as pd
 import numpy as np
@@ -89,6 +90,7 @@ def _parse_ldblock_spec(
     Parse ldblock option payload.
     Supports:
       - ratio only: "2", "5/4"
+        -> x-span defaults to 0:1 (full Manhattan width)
       - x-span only (fraction of Manhattan width): "0.2:0.8" or "0.2-0.8"
         -> ratio defaults to 2.0
     """
@@ -115,7 +117,7 @@ def _parse_ldblock_spec(
             x0, x1 = x1, x0
         return 2.0, (float(x0), float(x1))
 
-    return _parse_ratio(text, name), None
+    return _parse_ratio(text, name), (0.0, 1.0)
 
 
 def _parse_rgb_triplet(token: str) -> str:
@@ -571,7 +573,7 @@ def _apply_bimrange_manhattan_axis(
     ax.set_xlim(left, right)
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1_000_000:g}Mb"))
-    ax.set_xlabel(str(chrom_label))
+    ax.set_xlabel(None)
     c = str(chrom_label)
     ax._janusx_loc_left_label = f"{c}:{left / 1_000_000:g}Mb"   # type: ignore[attr-defined]
     ax._janusx_loc_right_label = f"{c}:{right / 1_000_000:g}Mb"  # type: ignore[attr-defined]
@@ -605,13 +607,14 @@ def _apply_multi_bimrange_manhattan_axis(
         trans = ax.get_xaxis_transform()
         ax.text(
             xb - x_shift,
-            -0.08,
+            -0.06,
             prev_end_lab,
             transform=trans,
             ha="right",
             va="top",
             fontsize=5,
             clip_on=False,
+            zorder=40,
             bbox={
                 "facecolor": "white",
                 "edgecolor": "none",
@@ -621,13 +624,14 @@ def _apply_multi_bimrange_manhattan_axis(
         )
         ax.text(
             xb + x_shift,
-            -0.08,
+            -0.06,
             next_start_lab,
             transform=trans,
             ha="left",
             va="top",
             fontsize=5,
             clip_on=False,
+            zorder=40,
             bbox={
                 "facecolor": "white",
                 "edgecolor": "none",
@@ -640,6 +644,69 @@ def _apply_multi_bimrange_manhattan_axis(
     ax._janusx_loc_left_label = f"{first['chrom']}:{int(first['start']) / 1_000_000:g}Mb"   # type: ignore[attr-defined]
     ax._janusx_loc_right_label = f"{last['chrom']}:{int(last['end']) / 1_000_000:g}Mb"      # type: ignore[attr-defined]
     ax.set_xlabel(None)
+
+
+def _show_end_locs_without_xticks(ax: plt.Axes) -> None:
+    x0, x1 = ax.get_xlim()
+    fmt = ax.xaxis.get_major_formatter()
+
+    def _fmt(v: float, i: int) -> str:
+        if callable(fmt):
+            try:
+                s = str(fmt(v, i)).strip()
+                if s != "":
+                    return s
+            except Exception:
+                pass
+        return f"{v:g}"
+
+    left_lab = getattr(ax, "_janusx_loc_left_label", None)
+    right_lab = getattr(ax, "_janusx_loc_right_label", None)
+    if left_lab is None:
+        left_lab = _fmt(float(x0), 0)
+    if right_lab is None:
+        right_lab = _fmt(float(x1), 1)
+
+    ax.set_xlabel(None)
+    ax.set_xticks([])
+    ax.tick_params(axis="x", which="both", length=0, labelbottom=False)
+    trans = ax.transAxes
+    loc_fontsize = 5
+    ax.text(
+        0.0,
+        -0.06,
+        left_lab,
+        transform=trans,
+        ha="left",
+        va="top",
+        fontsize=loc_fontsize,
+        clip_on=False,
+        zorder=40,
+        bbox={
+            "facecolor": "white",
+            "edgecolor": "none",
+            "alpha": 0.55,
+            "pad": 0.2,
+        },
+    )
+    if not np.isclose(float(x0), float(x1)):
+        ax.text(
+            1.0,
+            -0.06,
+            right_lab,
+            transform=trans,
+            ha="right",
+            va="top",
+            fontsize=loc_fontsize,
+            clip_on=False,
+            zorder=40,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.55,
+                "pad": 0.2,
+            },
+        )
 
 
 def _extract_ld_site_set(
@@ -924,124 +991,29 @@ def _draw_gene_structure_axis(
     line_width: float = 0.5,
     arrow_step: float = 1_000.0,
     thickness_scale: float = 1.0,
+    y_offset: float = 0.0,
 ) -> None:
     """
     Draw gene/CDS/UTR structure into `ax` using projected x coordinates.
     """
-    scale = max(0.2, float(thickness_scale))
-    cds_bottom = -0.1 * scale
-    cds_height = 0.2 * scale
-    utr_bottom = -0.05 * scale
-    utr_height = 0.1 * scale
-
-    if gene_df.shape[0] > 0:
-        cds = gene_df[gene_df["feature"] == "CDS"]
-        utr = gene_df[
-            (gene_df["feature"] == "five_prime_UTR")
-            | (gene_df["feature"] == "three_prime_UTR")
-        ]
-        genes = gene_df[gene_df["feature"] == "gene"]
-
-        if not cds.empty:
-            for _, r in cds.iterrows():
-                x1 = float(r["x_start"])
-                x2 = float(r["x_end"])
-                rect = Rectangle(
-                    (x1, cds_bottom),
-                    width=max(0.0, x2 - x1),
-                    height=cds_height,
-                    color=block_color,
-                    linewidth=0.0,
-                )
-                ax.add_patch(rect)
-
-        if not utr.empty:
-            for _, r in utr.iterrows():
-                x1 = float(r["x_start"])
-                x2 = float(r["x_end"])
-                rect = Rectangle(
-                    (x1, utr_bottom),
-                    width=max(0.0, x2 - x1),
-                    height=utr_height,
-                    color=block_color,
-                    linewidth=0.0,
-                )
-                ax.add_patch(rect)
-
-        if not genes.empty:
-            for _, r in genes.iterrows():
-                x1 = float(r["x_start"])
-                x2 = float(r["x_end"])
-                left = min(x1, x2)
-                right = max(x1, x2)
-                strand = str(r["strand"]).strip()
-                attr = r["attribute"]
-                if isinstance(attr, (list, tuple, np.ndarray)) and len(attr) > 0:
-                    gene_name = str(attr[0])
-                else:
-                    gene_name = str(attr)
-
-                ax.plot([left, right], [0.0, 0.0], color=arrow_color, linewidth=line_width)
-                ax.plot(
-                    [left, left],
-                    [-0.05 * scale, 0.05 * scale],
-                    color=arrow_color,
-                    linewidth=line_width,
-                )
-                ax.plot(
-                    [right, right],
-                    [-0.05 * scale, 0.05 * scale],
-                    color=arrow_color,
-                    linewidth=line_width,
-                )
-                ax.text(
-                    0.5 * (left + right),
-                    0.0,
-                    gene_name,
-                    ha="center",
-                    va="center",
-                    fontsize=5,
-                    zorder=30,
-                    clip_on=False,
-                    bbox={
-                        "facecolor": "white",
-                        "alpha": 0.55,
-                        "edgecolor": "none",
-                        "pad": 0.2,
-                    },
-                )
-
-                step = max(1.0, float(arrow_step))
-                if strand == "-":
-                    for seg_end in np.arange(right, left, -step):
-                        seg_start = max(seg_end - step, left)
-                        arrow = FancyArrowPatch(
-                            (seg_end, 0.0),
-                            (seg_start, 0.0),
-                            arrowstyle="->",
-                            mutation_scale=10,
-                            linewidth=line_width,
-                            color=arrow_color,
-                        )
-                        ax.add_patch(arrow)
-                elif strand == "+":
-                    for seg_start in np.arange(left, right, step):
-                        seg_end = min(seg_start + step, right)
-                        arrow = FancyArrowPatch(
-                            (seg_start, 0.0),
-                            (seg_end, 0.0),
-                            arrowstyle="->",
-                            mutation_scale=10,
-                            linewidth=line_width,
-                            color=arrow_color,
-                        )
-                        ax.add_patch(arrow)
-
-    ax.set_ylim(-0.15 * scale, 0.15 * scale)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for s in ["right", "left", "bottom", "top"]:
-        ax.spines[s].set_visible(False)
+    draw_gene_structure_records(
+        ax,
+        gene_df,
+        arrow_color=arrow_color,
+        block_color=block_color,
+        line_width=line_width,
+        arrow_step=arrow_step,
+        gene_text_size=5,
+        thickness_scale=thickness_scale,
+        y_offset=y_offset,
+        unknown_strand_as_plus=False,
+        label_bbox={
+            "facecolor": "white",
+            "alpha": 0.55,
+            "edgecolor": "none",
+            "pad": 0.2,
+        },
+    )
 
 
 def _draw_manh_gene_ld_links(
@@ -1052,6 +1024,7 @@ def _draw_manh_gene_ld_links(
     pairs: list[tuple[float, float, bool]],
     *,
     gene_cds_bottom: float = -0.05,
+    force_line_color: Optional[str] = None,
 ) -> None:
     """
     Draw connectors:
@@ -1077,12 +1050,15 @@ def _draw_manh_gene_ld_links(
             continue
         x_top_n = float(np.clip(x_top_n, edge_margin_n, 1.0 - edge_margin_n))
         x_top_g = gx0 + x_top_n * float(gx1 - gx0)
-        line_color = "red" if bool(is_sig) else "black"
+        if force_line_color is not None:
+            line_color = str(force_line_color)
+        else:
+            line_color = "red" if bool(is_sig) else "black"
         ax_gene.plot(
             [x_top_g, x_top_g],
             [0.2, float(gene_cds_bottom)],
             color=line_color,
-            linewidth=0.5,
+            linewidth=0.25,
             alpha=0.8,
             clip_on=False,
             zorder=-20,
@@ -1095,7 +1071,7 @@ def _draw_manh_gene_ld_links(
             coordsA=ax_gene.transData,
             coordsB=ax_ld.transData,
             color=line_color,
-            linewidth=0.5,
+            linewidth=0.25,
             alpha=0.8,
             clip_on=False,
             zorder=-20,
@@ -1279,6 +1255,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
         width_in = 8.0
+        gene_panel_h_in = width_in / 20.0
         dpi = 300
         manh_ylim = None
         manh_height_in = None
@@ -1419,6 +1396,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 elif len(args.bimrange_tuples) == 1:
                     bchrom, bstart, bend = args.bimrange_tuples[0]
                     _apply_bimrange_manhattan_axis(ax, bchrom, bstart, bend)
+                    _show_end_locs_without_xticks(ax)
             if args.manh_ylim is not None:
                 ymin_now, _ = ax.get_ylim()
                 if args.manh_ylim <= ymin_now:
@@ -1618,7 +1596,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 gene_line_color = str(two_color_style["gene_line_color"])
 
             def _draw_ld_axis(ax: plt.Axes) -> None:
-                LDblock(ld_mat.copy(), ax=ax, vmin=0, vmax=1, cmap=ld_cmap)
+                LDblock(
+                    ld_mat.copy(),
+                    ax=ax,
+                    vmin=0,
+                    vmax=1,
+                    cmap=ld_cmap,
+                    rasterize_threshold=100,
+                )
                 if ld_overlay_text:
                     n_ld = int(ld_mat.shape[0])
                     ax.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
@@ -1680,6 +1665,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax_manh: plt.Axes,
                 ax_ld: plt.Axes,
                 pairs: list[tuple[float, float]],
+                *,
+                line_color: str = "black",
             ) -> None:
                 ax_bridge.set_xlim(0.0, 1.0)
                 ax_bridge.set_ylim(0.0, 1.0)
@@ -1710,74 +1697,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax_bridge.plot(
                         [x_top_n, x_top_n, x_ld_n],
                         [1.04, joint_y, bottom_y],
-                        color="black",
-                        linewidth=0.5,
+                        color=line_color,
+                        linewidth=0.25,
                         alpha=0.8,
                         clip_on=False,
                         solid_joinstyle="round",
                     )
                     slashes_x.append(float(x_top))
-
-            def _show_end_locs_without_xticks(ax: plt.Axes) -> None:
-                x0, x1 = ax.get_xlim()
-                fmt = ax.xaxis.get_major_formatter()
-
-                def _fmt(v: float, i: int) -> str:
-                    if callable(fmt):
-                        try:
-                            s = str(fmt(v, i)).strip()
-                            if s != "":
-                                return s
-                        except Exception:
-                            pass
-                    return f"{v:g}"
-
-                left_lab = getattr(ax, "_janusx_loc_left_label", None)
-                right_lab = getattr(ax, "_janusx_loc_right_label", None)
-                if left_lab is None:
-                    left_lab = _fmt(float(x0), 0)
-                if right_lab is None:
-                    right_lab = _fmt(float(x1), 1)
-
-                ax.set_xticks([])
-                ax.tick_params(axis="x", which="both", length=0, labelbottom=False)
-                trans = ax.transAxes
-                loc_fontsize = 5
-                ax.text(
-                    0.0,
-                    -0.06,
-                    left_lab,
-                    transform=trans,
-                    ha="left",
-                    va="top",
-                    fontsize=loc_fontsize,
-                    clip_on=False,
-                    zorder=40,
-                    bbox={
-                        "facecolor": "white",
-                        "edgecolor": "none",
-                        "alpha": 0.55,
-                        "pad": 0.2,
-                    },
-                )
-                if not np.isclose(float(x0), float(x1)):
-                    ax.text(
-                        1.0,
-                        -0.06,
-                        right_lab,
-                        transform=trans,
-                        ha="right",
-                        va="top",
-                        fontsize=loc_fontsize,
-                        clip_on=False,
-                        zorder=40,
-                        bbox={
-                            "facecolor": "white",
-                            "edgecolor": "none",
-                            "alpha": 0.55,
-                            "pad": 0.2,
-                        },
-                    )
 
             if use_segmented_gene_x and len(region_layout) > 0:
                 gene_xlim = (
@@ -1802,7 +1728,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             ld_path = f"{args.out}/{args.prefix}.ldblock.{args.format}"
             _draw_ld_axis(ax_ld)
 
-            fig_ld.tight_layout()
+            fig_ld.subplots_adjust(
+                left=0.08,
+                right=0.98,
+                top=0.98,
+                bottom=0.08,
+            )
             # Keep LD block x-axis drawable length consistent with Manhattan;
             # optionally constrain to user-specified x-span of Manhattan width.
             if manh_axes_bounds is not None or ld_panel_xspan is not None:
@@ -1826,7 +1757,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             plt.close(fig_ld)
 
             if use_gene_bridge:
-                gene_h_in = 1.0
+                gene_h_in = gene_panel_h_in
                 fig_gene = plt.figure(
                     figsize=(width_in, gene_h_in),
                     dpi=dpi,
@@ -1837,7 +1768,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     gene_track_df,
                     arrow_color=gene_line_color,
                     block_color=gene_block_color,
-                    line_width=0.5,
+                    line_width=1.0,
                     arrow_step=1_000.0,
                 )
                 ax_gene.set_xlim(gene_plot_xlim)
@@ -1856,17 +1787,37 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             manhld_manh_ratio = args.manh_ratio if args.manh_ratio is not None else 2.0
             manhld_manh_h_in = width_in / manhld_manh_ratio
             gene_bridge_scale = 0.5
+            mid_gene_y_offset = 0.03
             mid_gene_ymin = -0.15
             mid_gene_ymax = 0.2
-            mid_h_in = 0.7 if use_gene_bridge else 0.22
+            mid_h_in = gene_panel_h_in if use_gene_bridge else 0.22
             # LD row height should follow actual LD panel width;
             # otherwise narrowed x-span leaves large vertical blanks.
-            manh_drawable_frac = 0.90  # from subplots_adjust(left=0.08, right=0.98)
+            sub_left = 0.08
+            sub_right = 0.98
+            sub_top = 0.98
+            sub_bottom = 0.07
+            sub_hspace = 0.04
+            manh_drawable_frac = float(sub_right - sub_left)
             if ld_panel_xspan is None:
-                ld_panel_frac_in_manh = 0.90
+                ld_panel_frac_in_manh = 1.0
             else:
                 ld_panel_frac_in_manh = float(ld_panel_xspan[1] - ld_panel_xspan[0])
-            ld_h_in_combo = width_in * manh_drawable_frac * ld_panel_frac_in_manh / effective_ldblock_ratio
+            # Compensate GridSpec/subplots spacing so LD axis keeps intended geometry
+            # under LDblock's fixed aspect (isosceles right triangle).
+            n_rows_combo = 3.0
+            ld_row_layout_factor = (
+                float(sub_top - sub_bottom) * n_rows_combo
+            ) / (
+                n_rows_combo + float(sub_hspace) * (n_rows_combo - 1.0)
+            )
+            ld_h_in_combo = (
+                width_in
+                * manh_drawable_frac
+                * ld_panel_frac_in_manh
+                / effective_ldblock_ratio
+                / ld_row_layout_factor
+            )
             ld_h_in_combo = max(0.5, float(ld_h_in_combo))
             manhld_total_h_in = manhld_manh_h_in + mid_h_in + ld_h_in_combo
             fig_manhld = plt.figure(
@@ -1897,18 +1848,19 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     gene_track_df,
                     arrow_color=gene_line_color,
                     block_color=gene_block_color,
-                    line_width=0.4,
+                    line_width=0.8,
                     arrow_step=1_000.0,
                     thickness_scale=gene_bridge_scale,
+                    y_offset=mid_gene_y_offset,
                 )
                 ax_manhld_mid.set_xlim(manhld_top_xlim)
                 ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
             fig_manhld.subplots_adjust(
-                left=0.08,
-                right=0.98,
-                top=0.98,
-                bottom=0.07,
-                hspace=0.04,
+                left=sub_left,
+                right=sub_right,
+                top=sub_top,
+                bottom=sub_bottom,
+                hspace=sub_hspace,
             )
 
             # Keep the two panels strictly left/right aligned.
@@ -1917,7 +1869,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             bx0, by0, bw, bh = ax_manhld_bot.get_position().bounds
             tx0, _ty0, tw, _th = ax_manhld_top.get_position().bounds
             if ld_panel_xspan is None:
-                ld_panel_width_scale = 0.9
+                ld_panel_width_scale = 1.0
                 new_bw = bw * float(ld_panel_width_scale)
                 new_bx0 = bx0 + 0.5 * (bw - new_bw)
             else:
@@ -1929,6 +1881,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             fig_manhld.canvas.draw()
 
             bridge_pairs = _build_manh_ld_pairs(ax_manhld_top, ax_manhld_bot)
+            transition_line_color = "grey"
             if use_gene_bridge:
                 ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
                 ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
@@ -1938,7 +1891,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax_manhld_top,
                     ax_manhld_bot,
                     bridge_pairs,
-                    gene_cds_bottom=-0.1 * gene_bridge_scale,
+                    gene_cds_bottom=-0.1 * gene_bridge_scale + mid_gene_y_offset,
+                    force_line_color=transition_line_color,
                 )
             else:
                 bridge_pairs_plain = [(x1, x2) for x1, x2, _ in bridge_pairs]
@@ -1947,8 +1901,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax_manhld_top,
                     ax_manhld_bot,
                     bridge_pairs_plain,
+                    line_color="grey",
                 )
-            _show_end_locs_without_xticks(ax_manhld_top)
+            if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
+                _show_end_locs_without_xticks(ax_manhld_top)
 
             manhld_path = f"{args.out}/{args.prefix}.manhld.{args.format}"
             fig_manhld.savefig(manhld_path, transparent=True)
@@ -2116,7 +2072,8 @@ def main():
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
             "using only threshold-passing SNPs. Requires --bimrange. "
             "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
-            "(then ratio defaults to 2)."
+            "(then ratio defaults to 2). "
+            "If only ratio is given, x-span defaults to 0:1."
         ),
     )
     ldblock_group.add_argument(
@@ -2125,7 +2082,8 @@ def main():
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
             "using all SNPs in selected bimrange. Requires --bimrange. "
             "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
-            "(then ratio defaults to 2)."
+            "(then ratio defaults to 2). "
+            "If only ratio is given, x-span defaults to 0:1."
         ),
     )
     optional_group.add_argument(

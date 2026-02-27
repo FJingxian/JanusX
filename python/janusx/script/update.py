@@ -25,11 +25,13 @@ def _run_update(spec: str) -> subprocess.CompletedProcess[str]:
         "pip",
         "install",
         "--upgrade",
+        "--force-reinstall",
+        "--no-cache-dir",
+        "--disable-pip-version-check",
         "--default-timeout",
         str(_PIP_TIMEOUT_SECONDS),
         spec,
     ]
-    print(f"Running: {' '.join(cmd)}")
     return subprocess.run(
         cmd,
         text=True,
@@ -51,11 +53,32 @@ def _looks_like_timeout(output: str) -> bool:
     return any(token in text for token in timeout_tokens)
 
 
-def main() -> None:
-    direct = _run_update(_GITHUB_SPEC)
-    if direct.stdout:
-        print(direct.stdout, end="")
+def _extract_error_reason(output: str) -> str:
+    lines = [line.strip() for line in str(output).splitlines() if line.strip()]
+    if not lines:
+        return "No pip output captured."
+    error_lines = [line for line in lines if "error" in line.lower()]
+    if error_lines:
+        return error_lines[-1]
+    return lines[-1]
 
+
+def _print_failure(label: str, proc: subprocess.CompletedProcess[str]) -> None:
+    cmd = " ".join(proc.args) if isinstance(proc.args, (list, tuple)) else str(proc.args)
+    print(f"{label}")
+    print(f"Command: {cmd}")
+    print("-" * 60)
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    else:
+        print("(no pip output)")
+    print("-" * 60)
+    print(f"Reason: {_extract_error_reason(proc.stdout)}")
+
+
+def main() -> None:
+    print("Updating JanusX from GitHub...")
+    direct = _run_update(_GITHUB_SPEC)
     if direct.returncode == 0:
         print("JanusX update completed.")
         return
@@ -63,18 +86,15 @@ def main() -> None:
     if _looks_like_timeout(direct.stdout):
         print("Direct GitHub update timed out, retrying with proxy...")
         proxied = _run_update(_GITHUB_PROXY_SPEC)
-        if proxied.stdout:
-            print(proxied.stdout, end="")
         if proxied.returncode == 0:
-            print("JanusX update completed.")
+            print("JanusX update completed (via proxy).")
             return
-        raise subprocess.CalledProcessError(
-            proxied.returncode, proxied.args, output=proxied.stdout
-        )
+        _print_failure("GitHub attempt timed out.", direct)
+        _print_failure("Proxy retry failed.", proxied)
+        raise SystemExit(1)
 
-    raise subprocess.CalledProcessError(
-        direct.returncode, direct.args, output=direct.stdout
-    )
+    _print_failure("GitHub update failed.", direct)
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

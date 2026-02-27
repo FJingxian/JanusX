@@ -1,5 +1,11 @@
 #[inline(always)]
-pub(crate) fn brent_minimize<F>(mut f: F, low: f64, high: f64, tol: f64, max_iter: usize) -> (f64, f64)
+pub(crate) fn brent_minimize<F>(
+    mut f: F,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+) -> (f64, f64)
 where
     F: FnMut(f64) -> f64,
 {

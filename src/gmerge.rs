@@ -1,6 +1,6 @@
 // src/gmerge.rs
-use pyo3::{BoundObject, prelude::*};
 use pyo3::types::PyDict;
+use pyo3::{prelude::*, BoundObject};
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -115,11 +115,23 @@ impl PyMergeStats {
         d.set_item("n_samples_total", self.n_samples_total)?;
         d.set_item("n_sites_written", self.n_sites_written)?;
         d.set_item("n_sites_union_seen", self.n_sites_union_seen)?;
-        d.set_item("n_sites_dropped_multiallelic", self.n_sites_dropped_multiallelic)?;
+        d.set_item(
+            "n_sites_dropped_multiallelic",
+            self.n_sites_dropped_multiallelic,
+        )?;
         d.set_item("n_sites_dropped_non_snp", self.n_sites_dropped_non_snp)?;
-        d.set_item("per_input_present_sites", self.per_input_present_sites.clone())?;
-        d.set_item("per_input_unaligned_sites", self.per_input_unaligned_sites.clone())?;
-        d.set_item("per_input_absent_sites", self.per_input_absent_sites.clone())?;
+        d.set_item(
+            "per_input_present_sites",
+            self.per_input_present_sites.clone(),
+        )?;
+        d.set_item(
+            "per_input_unaligned_sites",
+            self.per_input_unaligned_sites.clone(),
+        )?;
+        d.set_item(
+            "per_input_absent_sites",
+            self.per_input_absent_sites.clone(),
+        )?;
         Ok(d)
     }
 }
@@ -160,7 +172,10 @@ impl PyConvertStats {
         d.set_item("n_samples", self.n_samples)?;
         d.set_item("n_sites_seen", self.n_sites_seen)?;
         d.set_item("n_sites_written", self.n_sites_written)?;
-        d.set_item("n_sites_dropped_multiallelic", self.n_sites_dropped_multiallelic)?;
+        d.set_item(
+            "n_sites_dropped_multiallelic",
+            self.n_sites_dropped_multiallelic,
+        )?;
         d.set_item("n_sites_dropped_non_snp", self.n_sites_dropped_non_snp)?;
         Ok(d)
     }
@@ -332,11 +347,22 @@ impl BedSnpIterRaw {
         }
 
         let bytes_per_snp = (n_samples + 3) / 4;
-        Ok(Self { samples, sites, mmap, n_samples, bytes_per_snp, cur: 0 })
+        Ok(Self {
+            samples,
+            sites,
+            mmap,
+            n_samples,
+            bytes_per_snp,
+            cur: 0,
+        })
     }
 
-    fn sample_ids(&self) -> &[String] { &self.samples }
-    fn n_samples(&self) -> usize { self.n_samples }
+    fn sample_ids(&self) -> &[String] {
+        &self.samples
+    }
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
 
     fn decode_row(&self, snp_idx: usize) -> Vec<f32> {
         let data = &self.mmap[3..];
@@ -347,7 +373,9 @@ impl BedSnpIterRaw {
         for (byte_idx, byte) in snp_bytes.iter().enumerate() {
             for within in 0..4 {
                 let samp_idx = byte_idx * 4 + within;
-                if samp_idx >= self.n_samples { break; }
+                if samp_idx >= self.n_samples {
+                    break;
+                }
                 let code = (byte >> (within * 2)) & 0b11;
                 row[samp_idx] = match code {
                     0b00 => 0.0,
@@ -389,7 +417,9 @@ impl VcfSnpIterRaw {
         let samples: Vec<String>;
         loop {
             header_line.clear();
-            let n = reader.read_line(&mut header_line).map_err(|e| e.to_string())?;
+            let n = reader
+                .read_line(&mut header_line)
+                .map_err(|e| e.to_string())?;
             if n == 0 {
                 return Err("No #CHROM header found in VCF".into());
             }
@@ -403,14 +433,24 @@ impl VcfSnpIterRaw {
             }
         }
 
-        Ok(Self { samples, reader, finished: false })
+        Ok(Self {
+            samples,
+            reader,
+            finished: false,
+        })
     }
 
-    fn sample_ids(&self) -> &[String] { &self.samples }
-    fn n_samples(&self) -> usize { self.samples.len() }
+    fn sample_ids(&self) -> &[String] {
+        &self.samples
+    }
+    fn n_samples(&self) -> usize {
+        self.samples.len()
+    }
 
     fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
-        if self.finished { return None; }
+        if self.finished {
+            return None;
+        }
 
         let mut line = String::new();
         loop {
@@ -420,14 +460,20 @@ impl VcfSnpIterRaw {
                 self.finished = true;
                 return None;
             }
-            if line.starts_with('#') || line.trim().is_empty() { continue; }
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
 
             let parts: Vec<_> = line.trim_end().split('\t').collect();
-            if parts.len() < 10 { continue; }
+            if parts.len() < 10 {
+                continue;
+            }
 
             // require GT
             let format = parts[8];
-            if !format.split(':').any(|f| f == "GT") { continue; }
+            if !format.split(':').any(|f| f == "GT") {
+                continue;
+            }
 
             let site = SiteInfo {
                 chrom: parts[0].to_string(),
@@ -462,7 +508,9 @@ impl InputIter {
                 && p.with_extension("bim").exists()
                 && p.with_extension("fam").exists())
             {
-                return Err(format!("PLINK prefix not found or missing .bed/.bim/.fam: {path_or_prefix}"));
+                return Err(format!(
+                    "PLINK prefix not found or missing .bed/.bim/.fam: {path_or_prefix}"
+                ));
             }
             Ok(InputIter::Bed(BedSnpIterRaw::new(path_or_prefix)?))
         }
@@ -545,8 +593,10 @@ impl VcfWriter {
             VcfOut::Plain(BufWriter::new(f))
         };
 
-        out.write_all(b"##fileformat=VCFv4.2\n").map_err(|e| e.to_string())?;
-        out.write_all(b"##source=JanusX-merge\n").map_err(|e| e.to_string())?;
+        out.write_all(b"##fileformat=VCFv4.2\n")
+            .map_err(|e| e.to_string())?;
+        out.write_all(b"##source=JanusX-merge\n")
+            .map_err(|e| e.to_string())?;
         out.write_all(b"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")
             .map_err(|e| e.to_string())?;
 
@@ -558,23 +608,36 @@ impl VcfWriter {
         }
         out.write_all(b"\n").map_err(|e| e.to_string())?;
 
-        Ok(Self { out, n_samples_total: sample_ids.len() })
+        Ok(Self {
+            out,
+            n_samples_total: sample_ids.len(),
+        })
     }
 
-    fn write_site(&mut self, site: &SiteInfo, gref: &str, galt: &str, row_i8: &[i8]) -> Result<(), String> {
+    fn write_site(
+        &mut self,
+        site: &SiteInfo,
+        gref: &str,
+        galt: &str,
+        row_i8: &[i8],
+    ) -> Result<(), String> {
         let vid = format!("{}_{}", site.chrom, site.pos); // keep consistent with BIM style
         let prefix = format!(
             "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT",
             site.chrom, site.pos, vid, gref, galt
         );
-        self.out.write_all(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        self.out
+            .write_all(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
         if row_i8.len() != self.n_samples_total {
             return Err("Internal error: VCF row length mismatch".into());
         }
         for &g in row_i8 {
             self.out.write_all(b"\t").map_err(|e| e.to_string())?;
-            self.out.write_all(i8_to_vcf_gt(g).as_bytes()).map_err(|e| e.to_string())?;
+            self.out
+                .write_all(i8_to_vcf_gt(g).as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         self.out.write_all(b"\n").map_err(|e| e.to_string())?;
         Ok(())
@@ -609,10 +672,12 @@ impl PlinkBfileWriter {
     fn new(prefix: &str, samples: &[SampleKey]) -> Result<Self, String> {
         let fam = BufWriter::new(File::create(format!("{prefix}.fam")).map_err(|e| e.to_string())?);
         let bim = BufWriter::new(File::create(format!("{prefix}.bim")).map_err(|e| e.to_string())?);
-        let mut bed = BufWriter::new(File::create(format!("{prefix}.bed")).map_err(|e| e.to_string())?);
+        let mut bed =
+            BufWriter::new(File::create(format!("{prefix}.bed")).map_err(|e| e.to_string())?);
 
         // SNP-major BED header
-        bed.write_all(&[0x6C, 0x1B, 0x01]).map_err(|e| e.to_string())?;
+        bed.write_all(&[0x6C, 0x1B, 0x01])
+            .map_err(|e| e.to_string())?;
 
         // FAM: FID IID PID MID SEX PHENO
         {
@@ -626,7 +691,13 @@ impl PlinkBfileWriter {
             let n_samples = samples.len();
             let bytes_per_snp = (n_samples + 3) / 4;
 
-            Ok(Self { fam, bim, bed, n_samples, bytes_per_snp })
+            Ok(Self {
+                fam,
+                bim,
+                bed,
+                n_samples,
+                bytes_per_snp,
+            })
         }
     }
 
@@ -659,7 +730,13 @@ impl PlinkBfileWriter {
         out
     }
 
-    fn write_site_and_row(&mut self, site: &SiteInfo, gref: &str, galt: &str, row_i8: &[i8]) -> Result<(), String> {
+    fn write_site_and_row(
+        &mut self,
+        site: &SiteInfo,
+        gref: &str,
+        galt: &str,
+        row_i8: &[i8],
+    ) -> Result<(), String> {
         if row_i8.len() != self.n_samples {
             return Err("Internal error: PLINK row length mismatch".into());
         }
@@ -667,8 +744,12 @@ impl PlinkBfileWriter {
         // BIM: CHR SNP CM BP A1 A2
         // SNP id: chr_pos (as requested)
         let snp_id = format!("{}_{}", site.chrom, site.pos);
-        writeln!(self.bim, "{}\t{}\t0\t{}\t{}\t{}", site.chrom, snp_id, site.pos, gref, galt)
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            self.bim,
+            "{}\t{}\t0\t{}\t{}\t{}",
+            site.chrom, snp_id, site.pos, gref, galt
+        )
+        .map_err(|e| e.to_string())?;
 
         let bytes = self.encode_row_i8(row_i8);
         self.bed.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -688,7 +769,11 @@ impl PlinkBfileWriter {
 // ============================================================
 
 #[pyfunction(signature = (inputs, out, out_fmt=None))]
-pub fn merge_genotypes(inputs: Vec<String>, out: String, out_fmt: Option<String>) -> PyResult<PyMergeStats> {
+pub fn merge_genotypes(
+    inputs: Vec<String>,
+    out: String,
+    out_fmt: Option<String>,
+) -> PyResult<PyMergeStats> {
     if inputs.len() < 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "inputs must contain at least 2 items",
@@ -724,11 +809,15 @@ pub fn merge_genotypes(inputs: Vec<String>, out: String, out_fmt: Option<String>
         }
     }
 
-    let merged_sample_names_vcf: Vec<String> = merged_samples.iter().map(|s| s.vcf_name()).collect();
+    let merged_sample_names_vcf: Vec<String> =
+        merged_samples.iter().map(|s| s.vcf_name()).collect();
 
     let mut stats = PyMergeStats {
         n_inputs: iters.len(),
-        out_fmt: match fmt { OutFmt::Vcf => "vcf".into(), OutFmt::Plink => "plink".into() },
+        out_fmt: match fmt {
+            OutFmt::Vcf => "vcf".into(),
+            OutFmt::Plink => "plink".into(),
+        },
         out: out.clone(),
         sample_counts: sample_counts.clone(),
         n_samples_total: merged_samples.len(),
@@ -760,7 +849,8 @@ pub fn merge_genotypes(inputs: Vec<String>, out: String, out_fmt: Option<String>
     }
 
     // pull first record from each input
-    let mut cur: Vec<Option<(Vec<f32>, SiteInfo)>> = iters.iter_mut().map(|it| it.next_snp()).collect();
+    let mut cur: Vec<Option<(Vec<f32>, SiteInfo)>> =
+        iters.iter_mut().map(|it| it.next_snp()).collect();
 
     // k-way merge loop
     loop {
@@ -971,15 +1061,17 @@ pub fn convert_genotypes(
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
-    let mut it = InputIter::new(&input)
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let mut it = InputIter::new(&input).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
     let sample_ids: Vec<String> = it.sample_ids().iter().cloned().collect();
     let n_samples = it.n_samples();
 
     let mut stats = PyConvertStats {
         input: input.clone(),
-        out_fmt: match fmt { OutFmt::Vcf => "vcf".into(), OutFmt::Plink => "plink".into() },
+        out_fmt: match fmt {
+            OutFmt::Vcf => "vcf".into(),
+            OutFmt::Plink => "plink".into(),
+        },
         out: out.clone(),
         n_samples,
         n_sites_seen: 0,
@@ -1000,7 +1092,10 @@ pub fn convert_genotypes(
         OutFmt::Plink => {
             let samples: Vec<SampleKey> = sample_ids
                 .iter()
-                .map(|sid| SampleKey { fid: sid.clone(), iid: sid.clone() })
+                .map(|sid| SampleKey {
+                    fid: sid.clone(),
+                    iid: sid.clone(),
+                })
                 .collect();
             plink_w = Some(
                 PlinkBfileWriter::new(&out, &samples)
@@ -1082,7 +1177,9 @@ pub fn convert_genotypes(
                                     }
                                 }
                                 None => {
-                                    if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
+                                    if site.ref_allele.contains(',')
+                                        || site.alt_allele.contains(',')
+                                    {
                                         RowOutcome::DropMulti
                                     } else {
                                         RowOutcome::DropNonSnp
@@ -1104,7 +1201,12 @@ pub fn convert_genotypes(
                 }
 
                 match row {
-                    RowOutcome::Keep { site, gref, galt, row_i8 } => {
+                    RowOutcome::Keep {
+                        site,
+                        gref,
+                        galt,
+                        row_i8,
+                    } => {
                         match fmt {
                             OutFmt::Vcf => {
                                 vcf_w

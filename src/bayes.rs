@@ -1,9 +1,9 @@
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
-use pyo3::{BoundObject, prelude::*};
-use rand::rngs::{StdRng,OsRng};
+use pyo3::{prelude::*, BoundObject};
+use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng, TryRngCore};
-use rand_distr::{ChiSquared, Gamma, StandardNormal, Beta};
+use rand_distr::{Beta, ChiSquared, Gamma, StandardNormal};
 
 fn array1_to_vec(arr: PyReadonlyArray1<f64>) -> Vec<f64> {
     arr.as_array().iter().copied().collect()
@@ -92,9 +92,9 @@ fn bayesb_core_impl(
         None => {
             let mut seed_bytes = [0u8; 32]; // 生成 32 字节随机种子（适配 StdRng）
             if let Err(err) = OsRng.try_fill_bytes(&mut seed_bytes) {
-            eprintln!("False to generate random seed: {err}, try to use fixed seed");
-            seed_bytes = [42u8; 32];
-        }
+                eprintln!("False to generate random seed: {err}, try to use fixed seed");
+                seed_bytes = [42u8; 32];
+            }
             StdRng::from_seed(seed_bytes) // 用随机种子初始化 StdRng（无 Result，直接返回）
         }
     };
@@ -174,7 +174,11 @@ fn bayesb_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     for j in 0..p {
-        d[j] = if rng.random::<f64>() < prob_in_init { 1 } else { 0 };
+        d[j] = if rng.random::<f64>() < prob_in_init {
+            1
+        } else {
+            0
+        };
     }
     let mut var_b = vec![s0_b / (df0_b + 2.0); p];
     let mut s = s0_b;
@@ -401,9 +405,9 @@ fn bayescpi_core_impl(
         None => {
             let mut seed_bytes = [0u8; 32]; // 生成 32 字节随机种子（适配 StdRng）
             if let Err(err) = OsRng.try_fill_bytes(&mut seed_bytes) {
-            eprintln!("False to generate random seed: {err}, try to use fixed seed");
-            seed_bytes = [42u8; 32];
-        }
+                eprintln!("False to generate random seed: {err}, try to use fixed seed");
+                seed_bytes = [42u8; 32];
+            }
             StdRng::from_seed(seed_bytes) // 用随机种子初始化 StdRng（无 Result，直接返回）
         }
     };
@@ -470,7 +474,11 @@ fn bayescpi_core_impl(
     let mut beta = vec![0.0; p];
     let mut d = vec![0u8; p];
     for j in 0..p {
-        d[j] = if rng.random::<f64>() < prob_in_init { 1 } else { 0 };
+        d[j] = if rng.random::<f64>() < prob_in_init {
+            1
+        } else {
+            0
+        };
     }
     let mut var_b = s0_b;
     let mut prob_in = prob_in_init;
@@ -682,9 +690,9 @@ fn bayesa_core_impl(
         None => {
             let mut seed_bytes = [0u8; 32]; // 生成 32 字节随机种子（适配 StdRng）
             if let Err(err) = OsRng.try_fill_bytes(&mut seed_bytes) {
-            eprintln!("False to generate random seed: {err}, try to use fixed seed");
-            seed_bytes = [42u8; 32];
-        }
+                eprintln!("False to generate random seed: {err}, try to use fixed seed");
+                seed_bytes = [42u8; 32];
+            }
             StdRng::from_seed(seed_bytes) // 用随机种子初始化 StdRng（无 Result，直接返回）
         }
     };
@@ -1101,25 +1109,8 @@ pub fn bayesb(
 
     let result = py.detach(|| {
         bayesb_core_impl(
-            &y_vec,
-            &m_vec,
-            &x_vec,
-            n,
-            p,
-            q,
-            n_iter,
-            burnin,
-            thin,
-            r2,
-            df0_b,
-            shape0,
-            rate0,
-            s0_b,
-            prob_in,
-            counts,
-            df0_e,
-            s0_e,
-            seed,
+            &y_vec, &m_vec, &x_vec, n, p, q, n_iter, burnin, thin, r2, df0_b, shape0, rate0, s0_b,
+            prob_in, counts, df0_e, s0_e, seed,
         )
     });
 
@@ -1167,14 +1158,7 @@ pub fn bayescpi(
     df0_e: f64,
     s0_e: Option<f64>,
     seed: Option<u64>,
-) -> PyResult<(
-    Py<PyArray1<f64>>,
-    Py<PyArray1<f64>>,
-    f64,
-    f64,
-    f64,
-    f64,
-)> {
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>, f64, f64, f64, f64)> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
     }
@@ -1227,23 +1211,8 @@ pub fn bayescpi(
 
     let result = py.detach(|| {
         bayescpi_core_impl(
-            &y_vec,
-            &m_vec,
-            &x_vec,
-            n,
-            p,
-            q,
-            n_iter,
-            burnin,
-            thin,
-            r2,
-            df0_b,
-            s0_b,
-            prob_in,
-            counts,
-            df0_e,
-            s0_e,
-            seed,
+            &y_vec, &m_vec, &x_vec, n, p, q, n_iter, burnin, thin, r2, df0_b, s0_b, prob_in,
+            counts, df0_e, s0_e, seed,
         )
     });
 
@@ -1251,14 +1220,7 @@ pub fn bayescpi(
         Ok((beta, alpha, varb_mean, vare, h2_mean, var_h2)) => {
             let beta_py = beta.into_pyarray(py).into_bound().unbind();
             let alpha_py = alpha.into_pyarray(py).into_bound().unbind();
-            Ok((
-                beta_py,
-                alpha_py,
-                varb_mean,
-                vare,
-                h2_mean,
-                var_h2,
-            ))
+            Ok((beta_py, alpha_py, varb_mean, vare, h2_mean, var_h2))
         }
         Err(msg) => Err(PyValueError::new_err(msg)),
     }

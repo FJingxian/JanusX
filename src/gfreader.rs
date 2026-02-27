@@ -209,10 +209,7 @@ impl BedChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model
-            .as_deref()
-            .unwrap_or("add")
-            .to_ascii_lowercase();
+        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
         if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "model must be one of: add, dom, rec, het",
@@ -242,7 +239,7 @@ impl BedChunkReader {
                 het,
                 window_mb,
             )
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         } else {
             BedSnpIter::new_with_fill(&prefix, maf, miss, fill, apply_het_filter, het)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
@@ -376,10 +373,7 @@ impl VcfChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model
-            .as_deref()
-            .unwrap_or("add")
-            .to_ascii_lowercase();
+        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
         if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "model must be one of: add, dom, rec, het",

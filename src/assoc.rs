@@ -1,13 +1,15 @@
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyArrayMethods};
-use pyo3::BoundObject;
+use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
+use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
 use crate::brent::brent_minimize;
-use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf};
+use crate::linalg::{
+    chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+};
 
 // =============================================================================
 // Common utilities
@@ -125,7 +127,11 @@ fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
         return f64::NAN;
     }
     if !t.is_finite() {
-        return if t.is_nan() { f64::NAN } else { f64::MIN_POSITIVE };
+        return if t.is_nan() {
+            f64::NAN
+        } else {
+            f64::MIN_POSITIVE
+        };
     }
 
     let v = df as f64;
@@ -297,71 +303,68 @@ pub fn glmf32<'py>(
                 let cnt = std::cmp::min(step, m - i_marker);
                 let block = &mut out_slice[i_marker * row_stride..(i_marker + cnt) * row_stride];
 
-                block
-                    .par_chunks_mut(row_stride)
-                    .enumerate()
-                    .for_each_init(
-                        || GlmScratch::new(q0),
-                        |scr, (l, row_out)| {
-                            let idx = i_marker + l;
-                            scr.reset_xs();
+                block.par_chunks_mut(row_stride).enumerate().for_each_init(
+                    || GlmScratch::new(q0),
+                    |scr, (l, row_out)| {
+                        let idx = i_marker + l;
+                        scr.reset_xs();
 
-                            let mut sy = 0.0_f64;
-                            let mut ss = 0.0_f64;
+                        let mut sy = 0.0_f64;
+                        let mut ss = 0.0_f64;
 
-                            for k in 0..n {
-                                let gv = g_arr[(idx, k)] as f64; // float32 -> f64
-                                sy += gv * y[k];
-                                ss += gv * gv;
+                        for k in 0..n {
+                            let gv = g_arr[(idx, k)] as f64; // float32 -> f64
+                            sy += gv * y[k];
+                            ss += gv * gv;
 
-                                let row = &x_flat[k * q0..(k + 1) * q0];
-                                for j in 0..q0 {
-                                    scr.xs[j] += row[j] * gv;
-                                }
+                            let row = &x_flat[k * q0..(k + 1) * q0];
+                            for j in 0..q0 {
+                                scr.xs[j] += row[j] * gv;
                             }
+                        }
 
-                            xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
-                            let t2 = dot(&scr.b21, &scr.xs);
-                            let b22 = ss - t2;
+                        xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
+                        let t2 = dot(&scr.b21, &scr.xs);
+                        let b22 = ss - t2;
 
-                            let (invb22, df) = if b22 < 1e-8 {
-                                (0.0, (n as i32) - (q0 as i32))
-                            } else {
-                                (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-                            };
-                            if df <= 0 {
-                                row_out.fill(f64::NAN);
-                                return;
-                            }
+                        let (invb22, df) = if b22 < 1e-8 {
+                            (0.0, (n as i32) - (q0 as i32))
+                        } else {
+                            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                        };
+                        if df <= 0 {
+                            row_out.fill(f64::NAN);
+                            return;
+                        }
 
-                            build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                        build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
 
-                            scr.rhs[..q0].copy_from_slice(&xy);
-                            scr.rhs[q0] = sy;
+                        scr.rhs[..q0].copy_from_slice(&xy);
+                        scr.rhs[q0] = sy;
 
-                            matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+                        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
 
-                            let beta_rhs = dot(&scr.beta, &scr.rhs);
-                            let ve = (yy - beta_rhs) / (df as f64);
+                        let beta_rhs = dot(&scr.beta, &scr.rhs);
+                        let ve = (yy - beta_rhs) / (df as f64);
 
-                            for ff in 0..dim {
-                                let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
-                                let t = scr.beta[ff] / se;
-                                row_out[2 + ff] = student_t_p_two_sided(t, df);
-                            }
+                        for ff in 0..dim {
+                            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+                            let t = scr.beta[ff] / se;
+                            row_out[2 + ff] = student_t_p_two_sided(t, df);
+                        }
 
-                            if invb22 == 0.0 {
-                                row_out[0] = f64::NAN;
-                                row_out[1] = f64::NAN;
-                                row_out[2 + q0] = f64::NAN;
-                            } else {
-                                let beta_snp = scr.beta[q0];
-                                let se_snp = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
-                                row_out[0] = beta_snp;
-                                row_out[1] = se_snp;
-                            }
-                        },
-                    );
+                        if invb22 == 0.0 {
+                            row_out[0] = f64::NAN;
+                            row_out[1] = f64::NAN;
+                            row_out[2 + q0] = f64::NAN;
+                        } else {
+                            let beta_snp = scr.beta[q0];
+                            let se_snp = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+                            row_out[0] = beta_snp;
+                            row_out[1] = se_snp;
+                        }
+                    },
+                );
 
                 i_marker += cnt;
             }
@@ -460,70 +463,67 @@ pub fn glmf32_full<'py>(
                 let cnt = std::cmp::min(step, m - i_marker);
                 let block = &mut out_slice[i_marker * row_stride..(i_marker + cnt) * row_stride];
 
-                block
-                    .par_chunks_mut(row_stride)
-                    .enumerate()
-                    .for_each_init(
-                        || GlmScratch::new(q0),
-                        |scr, (l, row_out)| {
-                            let idx = i_marker + l;
-                            scr.reset_xs();
+                block.par_chunks_mut(row_stride).enumerate().for_each_init(
+                    || GlmScratch::new(q0),
+                    |scr, (l, row_out)| {
+                        let idx = i_marker + l;
+                        scr.reset_xs();
 
-                            let mut sy = 0.0_f64;
-                            let mut ss = 0.0_f64;
+                        let mut sy = 0.0_f64;
+                        let mut ss = 0.0_f64;
 
-                            for k in 0..n {
-                                let gv = g_arr[(idx, k)] as f64;
-                                sy += gv * y[k];
-                                ss += gv * gv;
+                        for k in 0..n {
+                            let gv = g_arr[(idx, k)] as f64;
+                            sy += gv * y[k];
+                            ss += gv * gv;
 
-                                let row = &x_flat[k * q0..(k + 1) * q0];
-                                for j in 0..q0 {
-                                    scr.xs[j] += row[j] * gv;
-                                }
+                            let row = &x_flat[k * q0..(k + 1) * q0];
+                            for j in 0..q0 {
+                                scr.xs[j] += row[j] * gv;
                             }
+                        }
 
-                            xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
-                            let t2 = dot(&scr.b21, &scr.xs);
-                            let b22 = ss - t2;
+                        xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
+                        let t2 = dot(&scr.b21, &scr.xs);
+                        let b22 = ss - t2;
 
-                            let (invb22, df) = if b22 < 1e-8 {
-                                (0.0, (n as i32) - (q0 as i32))
-                            } else {
-                                (1.0 / b22, (n as i32) - (q0 as i32) - 1)
-                            };
-                            if df <= 0 {
-                                row_out.fill(f64::NAN);
-                                return;
-                            }
+                        let (invb22, df) = if b22 < 1e-8 {
+                            (0.0, (n as i32) - (q0 as i32))
+                        } else {
+                            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                        };
+                        if df <= 0 {
+                            row_out.fill(f64::NAN);
+                            return;
+                        }
 
-                            build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                        build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
 
-                            scr.rhs[..q0].copy_from_slice(&xy);
-                            scr.rhs[q0] = sy;
+                        scr.rhs[..q0].copy_from_slice(&xy);
+                        scr.rhs[q0] = sy;
 
-                            matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+                        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
 
-                            let beta_rhs = dot(&scr.beta, &scr.rhs);
-                            let ve = (yy - beta_rhs) / (df as f64);
+                        let beta_rhs = dot(&scr.beta, &scr.rhs);
+                        let ve = (yy - beta_rhs) / (df as f64);
 
-                            for ff in 0..dim {
-                                let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
-                                let t = scr.beta[ff] / se;
-                                let base = 3 * ff;
-                                row_out[base] = scr.beta[ff];
-                                row_out[base + 1] = se;
-                                row_out[base + 2] = student_t_p_two_sided(t, df);
-                            }
+                        for ff in 0..dim {
+                            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+                            let t = scr.beta[ff] / se;
+                            let base = 3 * ff;
+                            row_out[base] = scr.beta[ff];
+                            row_out[base + 1] = se;
+                            row_out[base + 2] = student_t_p_two_sided(t, df);
+                        }
 
-                            if invb22 == 0.0 {
-                                let base = 3 * q0;
-                                row_out[base] = f64::NAN;
-                                row_out[base + 1] = f64::NAN;
-                                row_out[base + 2] = f64::NAN;
-                            }
-                        },
-                    );
+                        if invb22 == 0.0 {
+                            let base = 3 * q0;
+                            row_out[base] = f64::NAN;
+                            row_out[base + 1] = f64::NAN;
+                            row_out[base + 2] = f64::NAN;
+                        }
+                    },
+                );
 
                 i_marker += cnt;
             }
@@ -586,11 +586,19 @@ fn reml_loglike(
         let vi = vinv[i];
         let yi = y[i];
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xtv_inv_y[r] += vi * xir * yi;
 
             for c in 0..=r {
-                let xic = if c < p_cov { xcov[i * p_cov + c] } else { snp[i] };
+                let xic = if c < p_cov {
+                    xcov[i * p_cov + c]
+                } else {
+                    snp[i]
+                };
                 xtv_inv_x[r * dim + c] += vi * xir * xic;
             }
         }
@@ -615,7 +623,11 @@ fn reml_loglike(
     for i in 0..n {
         let mut xb = 0.0;
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xb += xir * beta[r];
         }
         r_vec[i] = y[i] - xb;
@@ -634,7 +646,11 @@ fn reml_loglike(
     let c = (n_f - p_f) * ((n_f - p_f).ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let reml = c - 0.5 * total_log;
 
-    if !reml.is_finite() { -1e8 } else { reml }
+    if !reml.is_finite() {
+        -1e8
+    } else {
+        reml
+    }
 }
 
 fn ml_loglike(
@@ -680,11 +696,19 @@ fn ml_loglike(
         let vi = vinv[i];
         let yi = y[i];
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xtv_inv_y[r] += vi * xir * yi;
 
             for c in 0..=r {
-                let xic = if c < p_cov { xcov[i * p_cov + c] } else { snp[i] };
+                let xic = if c < p_cov {
+                    xcov[i * p_cov + c]
+                } else {
+                    snp[i]
+                };
                 xtv_inv_x[r * dim + c] += vi * xir * xic;
             }
         }
@@ -708,7 +732,11 @@ fn ml_loglike(
     for i in 0..n {
         let mut xb = 0.0;
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xb += xir * beta[r];
         }
         let ri = y[i] - xb;
@@ -726,7 +754,11 @@ fn ml_loglike(
     let c = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let ml = c - 0.5 * total_log;
 
-    if !ml.is_finite() { -1e8 } else { ml }
+    if !ml.is_finite() {
+        -1e8
+    } else {
+        ml
+    }
 }
 
 fn final_beta_se(
@@ -764,11 +796,19 @@ fn final_beta_se(
         let vi = vinv[i];
         let yi = y[i];
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xtv_inv_y[r] += vi * xir * yi;
 
             for c in 0..=r {
-                let xic = if c < p_cov { xcov[i * p_cov + c] } else { snp[i] };
+                let xic = if c < p_cov {
+                    xcov[i * p_cov + c]
+                } else {
+                    snp[i]
+                };
                 xtv_inv_x[r * dim + c] += vi * xir * xic;
             }
         }
@@ -792,7 +832,11 @@ fn final_beta_se(
     for i in 0..n {
         let mut xb = 0.0;
         for r in 0..dim {
-            let xir = if r < p_cov { xcov[i * p_cov + r] } else { snp[i] };
+            let xir = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
             xb += xir * beta[r];
         }
         let ri = y[i] - xb;
@@ -974,15 +1018,8 @@ pub fn lmm_reml_chunk_f32<'py>(
                     };
 
                     let plrt = if with_plrt {
-                        let ml = ml_loglike(
-                            best_log10_lbd,
-                            s,
-                            &xcov_flat,
-                            y,
-                            Some(&snp_vec),
-                            n,
-                            p_cov,
-                        );
+                        let ml =
+                            ml_loglike(best_log10_lbd, s, &xcov_flat, y, Some(&snp_vec), n, p_cov);
                         if ml.is_finite() {
                             let mut stat = 2.0 * (ml - nullml_val);
                             if !stat.is_finite() || stat < 0.0 {
@@ -1020,7 +1057,6 @@ pub fn lmm_reml_chunk_f32<'py>(
 
     Ok(beta_se_p)
 }
-
 
 // ------------------------------------------------------------
 // Helpers: dot loops
@@ -1379,7 +1415,9 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
     }
     let (n, p2) = (u2tx_arr.shape()[0], u2tx_arr.shape()[1]);
     if p2 != p {
-        return Err(PyRuntimeError::new_err("u1tx/u2tx must have same column count"));
+        return Err(PyRuntimeError::new_err(
+            "u1tx/u2tx must have same column count",
+        ));
     }
     if u2ty.len() != n {
         return Err(PyRuntimeError::new_err("u2ty len must equal u2tx rows"));
@@ -1394,7 +1432,9 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
         return Err(PyRuntimeError::new_err("u2tsnp_chunk must be (m, n)"));
     }
     if m1 != m2 {
-        return Err(PyRuntimeError::new_err("u1tsnp_chunk and u2tsnp_chunk must have same row count"));
+        return Err(PyRuntimeError::new_err(
+            "u1tsnp_chunk and u2tsnp_chunk must have same row count",
+        ));
     }
     if n <= p + 1 {
         return Err(PyRuntimeError::new_err("n must be > p+1"));
@@ -1471,8 +1511,8 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
         }
     }
 
-    let log_det_v: f64 = s.iter().map(|v| (v + lbd).ln()).sum::<f64>()
-        + ((n - k) as f64) * lbd.ln();
+    let log_det_v: f64 =
+        s.iter().map(|v| (v + lbd).ln()).sum::<f64>() + ((n - k) as f64) * lbd.ln();
     let n_f = n as f64;
     let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
 
@@ -1561,12 +1601,7 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
                             return;
                         }
 
-                        cholesky_solve_into(
-                            &scr.xtv_inv_x,
-                            dim,
-                            &scr.xtv_inv_y,
-                            &mut scr.beta,
-                        );
+                        cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.xtv_inv_y, &mut scr.beta);
 
                         let mut r1_sum = 0.0_f64;
                         for i in 0..k {

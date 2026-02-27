@@ -290,8 +290,8 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             }
             let cache_prefix = input.with_extension("");
             let prefix = strip_cache_prefix(&cache_prefix).unwrap_or_else(|| cache_prefix.clone());
-            let txt_path = find_txt_with_prefix(&prefix)
-                .or_else(|| find_txt_with_prefix(&cache_prefix));
+            let txt_path =
+                find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&cache_prefix));
             let src_bim_path = find_bim_with_prefix(&prefix);
             let cache_bim_path = cache_prefix_path(&prefix).with_extension("bim");
             return Ok(TxtPaths {
@@ -322,8 +322,7 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
 
     let raw_prefix = input.to_path_buf();
     let prefix = strip_cache_prefix(&raw_prefix).unwrap_or(raw_prefix.clone());
-    let txt_path = find_txt_with_prefix(&prefix)
-        .or_else(|| find_txt_with_prefix(&raw_prefix));
+    let txt_path = find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&raw_prefix));
     let cache_prefix = cache_prefix_path(&prefix);
     let npy_path = cache_prefix.with_extension("npy");
     let src_bim_path = find_bim_with_prefix(&prefix);
@@ -385,7 +384,11 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
         let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
         let cols: Vec<&str> = l.split_whitespace().collect();
         if cols.len() < 6 {
-            return Err(format!("Malformed BIM line at {}:{}: {l}", path.display(), line_no + 1));
+            return Err(format!(
+                "Malformed BIM line at {}:{}: {l}",
+                path.display(),
+                line_no + 1
+            ));
         }
         let chrom = cols[0].to_string();
         let pos: i32 = cols[3].parse().unwrap_or(0);
@@ -468,11 +471,8 @@ fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
     }
 
     let cache_files = [paths.npy_path.as_path(), paths.cache_bim_path.as_path()];
-    let existing_cache_files: Vec<&Path> = cache_files
-        .iter()
-        .copied()
-        .filter(|p| p.exists())
-        .collect();
+    let existing_cache_files: Vec<&Path> =
+        cache_files.iter().copied().filter(|p| p.exists()).collect();
     if existing_cache_files.is_empty() {
         return Ok(());
     }
@@ -494,7 +494,11 @@ fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
         for path in cache_files {
             if path.exists() {
                 fs::remove_file(path).map_err(|e| {
-                    format!("failed to remove stale cache file {}: {}", path.display(), e)
+                    format!(
+                        "failed to remove stale cache file {}: {}",
+                        path.display(),
+                        e
+                    )
                 })?;
             }
         }

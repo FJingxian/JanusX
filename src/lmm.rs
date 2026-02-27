@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::f64::consts::PI;
 
 use crate::brent::brent_minimize;
-use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf};
+use crate::linalg::{
+    chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+};
 
 #[derive(Clone, Copy)]
 enum GeneticModel {
@@ -36,13 +38,25 @@ impl GeneticModel {
         match self {
             Self::Add => g,
             Self::Dom => {
-                if g > 0.0 { 1.0 } else { 0.0 }
+                if g > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Self::Rec => {
-                if (g - 2.0).abs() < 1e-6 { 1.0 } else { 0.0 }
+                if (g - 2.0).abs() < 1e-6 {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Self::Het => {
-                if (g - 1.0).abs() < 1e-6 { 1.0 } else { 0.0 }
+                if (g - 1.0).abs() < 1e-6 {
+                    1.0
+                } else {
+                    0.0
+                }
             }
         }
     }
@@ -57,12 +71,12 @@ fn transform_snp_row(src: &[f32], model: GeneticModel, dst: &mut [f32]) {
 
 #[inline]
 fn project_snp_row_u1_u2(
-    snp_raw: &[f32],      // len n
-    u1t: &[f32],          // shape (k, n), row-major
+    snp_raw: &[f32], // len n
+    u1t: &[f32],     // shape (k, n), row-major
     k: usize,
     n: usize,
-    out_u1: &mut [f32],   // len k
-    out_u2: &mut [f32],   // len n
+    out_u1: &mut [f32], // len k
+    out_u2: &mut [f32], // len n
 ) {
     // u1 = snp @ U, where U1t = U^T (k,n)
     for r in 0..k {
@@ -245,9 +259,7 @@ fn fill_xtv(
         for c in 0..=r {
             let mut sum = 0.0_f64;
             for i in 0..data.k {
-                sum += scratch.v1_inv[i]
-                    * data.u1tx[i * data.p + r]
-                    * data.u1tx[i * data.p + c];
+                sum += scratch.v1_inv[i] * data.u1tx[i * data.p + r] * data.u1tx[i * data.p + c];
             }
             sum += v2_inv * data.u2_xtx[r * data.p + c];
             scratch.xtv_inv_x[r * dim + c] = sum;
@@ -266,9 +278,7 @@ fn fill_xtv(
         for r in 0..data.p {
             let mut sum = 0.0_f64;
             for i in 0..data.k {
-                sum += scratch.v1_inv[i]
-                    * data.u1tx[i * data.p + r]
-                    * (snp.u1[i] as f64);
+                sum += scratch.v1_inv[i] * data.u1tx[i * data.p + r] * (snp.u1[i] as f64);
             }
             sum += v2_inv * snp.u2_xtsnp[r];
             scratch.xtv_inv_x[p * dim + r] = sum;
@@ -425,7 +435,11 @@ fn fast_ml_loglike(
     let total_log = n_f * rtv_invr.ln() + log_det_v;
     let ml = c_const - 0.5 * total_log;
 
-    if ml.is_finite() { ml } else { f64::NAN }
+    if ml.is_finite() {
+        ml
+    } else {
+        f64::NAN
+    }
 }
 
 fn fast_reml_beta_se(
@@ -440,7 +454,7 @@ fn fast_reml_beta_se(
         return (f64::NAN, f64::NAN);
     }
 
-    let ( _log_det_v, v2_inv) = match fill_xtv(log10_lbd, data, Some(snp), scratch) {
+    let (_log_det_v, v2_inv) = match fill_xtv(log10_lbd, data, Some(snp), scratch) {
         Some(v) => v,
         None => return (f64::NAN, f64::NAN),
     };
@@ -545,7 +559,9 @@ pub fn fastlmm_reml_null_f32<'py>(
         return Err(PyRuntimeError::new_err("u1tx must have at least 1 column"));
     }
     if p1 != p2 {
-        return Err(PyRuntimeError::new_err("u1tx and u2tx must have same column count"));
+        return Err(PyRuntimeError::new_err(
+            "u1tx and u2tx must have same column count",
+        ));
     }
 
     let n = u2ty_cow.len();
@@ -640,7 +656,9 @@ pub fn fastlmm_reml_chunk_f32<'py>(
         return Err(PyRuntimeError::new_err("u1tx must have at least 1 column"));
     }
     if p1 != p2 {
-        return Err(PyRuntimeError::new_err("u1tx and u2tx must have same column count"));
+        return Err(PyRuntimeError::new_err(
+            "u1tx and u2tx must have same column count",
+        ));
     }
 
     let n = u2ty_cow.len();

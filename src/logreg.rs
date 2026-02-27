@@ -78,11 +78,7 @@ pub fn fit_best_and_not_py<'py>(
     .map_err(PyRuntimeError::new_err)?;
 
     let d = PyDict::new(py).into_bound();
-    let literals: Vec<(usize, bool)> = result
-        .literals
-        .iter()
-        .map(|l| (l.idx, l.negated))
-        .collect();
+    let literals: Vec<(usize, bool)> = result.literals.iter().map(|l| (l.idx, l.negated)).collect();
     d.set_item("literals", literals)?;
     d.set_item("indices", result.indices)?;
     d.set_item("indices_1based", result.indices_1based)?;
@@ -129,7 +125,11 @@ pub fn fit_best_and_not(
     validate_x_y(x, y, response, weights)?;
     let n = x.len();
     let p = x[0].len();
-    let max_lits = if max_literals == 0 || max_literals > p { p } else { max_literals };
+    let max_lits = if max_literals == 0 || max_literals > p {
+        p
+    } else {
+        max_literals
+    };
 
     let mut best_score = f64::INFINITY;
     let mut best_literals: Vec<Literal> = Vec::new();
@@ -191,7 +191,14 @@ fn dfs_search(
     if pred.iter().all(|&v| v == 0) {
         if allow_empty || !literals.is_empty() {
             let score_val = score_prediction(y, pred, weights, response, score);
-            update_best(score_val, literals, pred, best_score, best_literals, best_pred);
+            update_best(
+                score_val,
+                literals,
+                pred,
+                best_score,
+                best_literals,
+                best_pred,
+            );
         }
         return;
     }
@@ -199,7 +206,14 @@ fn dfs_search(
     if var_idx == x[0].len() {
         if allow_empty || !literals.is_empty() {
             let score_val = score_prediction(y, pred, weights, response, score);
-            update_best(score_val, literals, pred, best_score, best_literals, best_pred);
+            update_best(
+                score_val,
+                literals,
+                pred,
+                best_score,
+                best_literals,
+                best_pred,
+            );
         }
         return;
     }
@@ -371,11 +385,7 @@ fn collect_indices(lits: &[Literal]) -> (Vec<usize>, Vec<usize>) {
     (idx, idx1)
 }
 
-fn group_stats(
-    y: &[f64],
-    pred: &[u8],
-    weights: Option<&[f64]>,
-) -> (f64, f64, f64, f64, f64) {
+fn group_stats(y: &[f64], pred: &[u8], weights: Option<&[f64]>) -> (f64, f64, f64, f64, f64) {
     let n = y.len();
     let mut w0 = 0.0;
     let mut w1 = 0.0;

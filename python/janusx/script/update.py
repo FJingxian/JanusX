@@ -16,10 +16,16 @@ from shutil import get_terminal_size
 from threading import Thread
 from time import sleep
 
+try:
+    from rich.console import Console
+except Exception:
+    Console = None
+
 
 _GITHUB_PROXY_SPEC = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git"
 _GITHUB_SPEC = "git+https://github.com/FJingxian/JanusX.git"
 _PIP_TIMEOUT_SECONDS = 30
+_RICH_CONSOLE = Console() if Console is not None else None
 
 
 class Loader:
@@ -127,9 +133,15 @@ def _print_failure(label: str, proc: subprocess.CompletedProcess[str]) -> None:
     print(f"Reason: {_extract_error_reason(proc.stdout)}")
 
 
+def _status(desc: str, enabled: bool):
+    if enabled and _RICH_CONSOLE is not None:
+        return _RICH_CONSOLE.status(f"[bold green]{desc}")
+    return Loader(desc, enabled=enabled)
+
+
 def main() -> None:
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    with Loader("Updating...", enabled=use_spinner):
+    with _status("Updating...", enabled=use_spinner):
         direct = _run_update(_GITHUB_SPEC)
     if direct.returncode == 0:
         print("JanusX update completed.")
@@ -140,7 +152,7 @@ def main() -> None:
     else:
         print("Direct GitHub update failed, retrying with proxy...")
 
-    with Loader("Updating via proxy...", enabled=use_spinner):
+    with _status("Updating via proxy...", enabled=use_spinner):
         proxied = _run_update(_GITHUB_PROXY_SPEC)
     if proxied.returncode == 0:
         print("JanusX update completed (via proxy).")

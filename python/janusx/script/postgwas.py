@@ -982,6 +982,8 @@ def _ldclump_significant_snps(
         out_empty = df_sig.set_index([chr_col, pos_col], drop=True)
         out_empty["start"] = pd.Series(dtype=int)
         out_empty["end"] = pd.Series(dtype=int)
+        out_empty["nsnps"] = pd.Series(dtype=int)
+        out_empty["MeanR2"] = pd.Series(dtype=float)
         out_empty["LDclump"] = pd.Series(dtype=str)
         return out_empty, {}
 
@@ -994,6 +996,8 @@ def _ldclump_significant_snps(
         out_empty = work.set_index([chr_col, pos_col], drop=True)
         out_empty["start"] = pd.Series(dtype=int)
         out_empty["end"] = pd.Series(dtype=int)
+        out_empty["nsnps"] = pd.Series(dtype=int)
+        out_empty["MeanR2"] = pd.Series(dtype=float)
         out_empty["LDclump"] = pd.Series(dtype=str)
         return out_empty, {}
 
@@ -1007,6 +1011,8 @@ def _ldclump_significant_snps(
         out_empty = work.set_index([chr_col, pos_col], drop=True)
         out_empty["start"] = pd.Series(dtype=int)
         out_empty["end"] = pd.Series(dtype=int)
+        out_empty["nsnps"] = pd.Series(dtype=int)
+        out_empty["MeanR2"] = pd.Series(dtype=float)
         out_empty["LDclump"] = pd.Series(dtype=str)
         return out_empty, {}
 
@@ -1056,7 +1062,7 @@ def _ldclump_significant_snps(
         (str(c), int(p)): float(v)
         for c, p, v in zip(work[chr_col].tolist(), work[pos_col].tolist(), work[p_col].tolist())
     }
-    kept_rows: list[tuple[str, int, float, int, int, str]] = []
+    kept_rows: list[tuple[str, int, float, int, int, int, float, str]] = []
     clump_dict: dict[tuple[str, int], list[tuple[str, int]]] = {}
 
     warn_count = 0
@@ -1120,6 +1126,7 @@ def _ldclump_significant_snps(
                         snps = [lead_key] + snps
 
                     clumped = [lead_key]
+                    mean_r2 = 1.0
                     if len(snps) > 1:
                         try:
                             if preloaded_geno is not None:
@@ -1150,6 +1157,10 @@ def _ldclump_significant_snps(
                                 ]
                                 if lead_key not in clumped:
                                     clumped.insert(0, lead_key)
+                                r2_map = {snps[i]: float(r2[i]) for i in range(len(snps))}
+                                mean_r2 = float(
+                                    np.mean([float(r2_map.get(k, 1.0)) for k in clumped])
+                                )
                             else:
                                 if warn_count < warn_limit:
                                     logger.warning(
@@ -1174,6 +1185,7 @@ def _ldclump_significant_snps(
                     clump_dict[lead_key] = clumped
                     ld_start = int(min([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
                     ld_end = int(max([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
+                    nsnps = int(len(clumped))
                     kept_rows.append(
                         (
                             lead_chr,
@@ -1181,6 +1193,8 @@ def _ldclump_significant_snps(
                             float(row[p_col]),
                             ld_start,
                             ld_end,
+                            nsnps,
+                            mean_r2,
                             _format_clump_sites(clumped),
                         )
                     )
@@ -1203,7 +1217,7 @@ def _ldclump_significant_snps(
 
     out_df = pd.DataFrame(
         kept_rows,
-        columns=[chr_col, pos_col, p_col, "start", "end", "LDclump"],
+        columns=[chr_col, pos_col, p_col, "start", "end", "nsnps", "MeanR2", "LDclump"],
     )
     out_df = out_df.set_index([chr_col, pos_col], drop=True)
     return out_df, clump_dict
@@ -2447,6 +2461,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 df_out["start"] = pd.to_numeric(df_out["start"], errors="coerce").fillna(df_out[pos_col]).astype(int)
             if "end" in df_out.columns:
                 df_out["end"] = pd.to_numeric(df_out["end"], errors="coerce").fillna(df_out[pos_col]).astype(int)
+            if "nsnps" in df_out.columns:
+                df_out["nsnps"] = pd.to_numeric(df_out["nsnps"], errors="coerce").fillna(0).astype(int)
+            if "MeanR2" in df_out.columns:
+                df_out["MeanR2"] = (
+                    pd.to_numeric(df_out["MeanR2"], errors="coerce")
+                    .fillna(0.0)
+                    .map(lambda x: f"{float(x):.2f}")
+                )
 
             # Output file is sorted by chromosome and position.
             if chr_col in df_out.columns and pos_col in df_out.columns:
@@ -2462,6 +2484,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 col_order.append("start")
             if "end" in df_out.columns:
                 col_order.append("end")
+            if "nsnps" in df_out.columns:
+                col_order.append("nsnps")
+            if "MeanR2" in df_out.columns:
+                col_order.append("MeanR2")
             if p_col in df_out.columns:
                 col_order.append(p_col)
             if "desc" in df_out.columns:

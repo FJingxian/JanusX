@@ -25,14 +25,13 @@ import re
 import time
 import socket
 import argparse
+import sys
 import subprocess
 import shutil
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
-from typing import List
-
-from tqdm import tqdm
+from typing import List, Optional
 
 import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
@@ -40,8 +39,101 @@ from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
 
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        BarColumn,
+        DownloadColumn,
+        TransferSpeedColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    DownloadColumn = None  # type: ignore[assignment]
+    TransferSpeedColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+    _HAS_TQDM = False
+
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
 FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+
+
+class _DownloadProgress:
+    """
+    Download progress adapter: rich first, tqdm fallback.
+    """
+    def __init__(self, total: Optional[int], desc: str = "Downloading") -> None:
+        self.total = total
+        self.desc = desc
+        self._backend = "none"
+        self._progress = None
+        self._task_id = None
+        self._tqdm = None
+
+        if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+            try:
+                self._progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold green]{task.description}"),
+                    BarColumn(),
+                    DownloadColumn(),
+                    TransferSpeedColumn(),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    transient=True,
+                )
+                self._progress.start()
+                self._task_id = self._progress.add_task(
+                    self.desc,
+                    total=self.total,
+                )
+                self._backend = "rich"
+            except Exception:
+                self._progress = None
+                self._task_id = None
+
+        if self._backend == "none" and _HAS_TQDM:
+            self._tqdm = tqdm(
+                total=self.total,
+                desc=self.desc,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            )
+            self._backend = "tqdm"
+
+    def update(self, n_bytes: int) -> None:
+        step = int(max(0, n_bytes))
+        if step == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=step)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.update(step)
+
+    def close(self) -> None:
+        if self._backend == "rich" and self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.close()
+            self._tqdm = None
 
 
 def downloader(url: str, dst: Path) -> None:
@@ -52,13 +144,16 @@ def downloader(url: str, dst: Path) -> None:
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
         total = r.headers.get("Content-Length")
         total = int(total) if total is not None else None
-        with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024) as pbar:
+        pbar = _DownloadProgress(total=total, desc="Downloading JanusX image")
+        try:
             while True:
                 chunk = r.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
                 pbar.update(len(chunk))
+        finally:
+            pbar.close()
 
     os.replace(tmp, dst)
 

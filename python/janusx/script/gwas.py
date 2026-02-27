@@ -41,7 +41,8 @@ import time
 import socket
 import argparse
 import logging
-from typing import Union
+import sys
+from typing import Union, Optional
 import uuid
 
 from janusx.pyBLUP.QK2 import GRM
@@ -63,7 +64,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from joblib import cpu_count
-from tqdm import tqdm
 import psutil
 from janusx.bioplotkit import GWASPLOT
 from janusx.pyBLUP import QK
@@ -80,6 +80,32 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+    _HAS_TQDM = False
+
 
 # ======================================================================
 # Basic utilities
@@ -91,6 +117,80 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * 60)
     logger.info(title)
     logger.info("=" * 60)
+
+
+class _ProgressAdapter:
+    """
+    Progress bar adapter with rich-first rendering and tqdm fallback.
+    """
+    def __init__(self, total: int, desc: str) -> None:
+        self.total = int(max(0, total))
+        self.desc = str(desc)
+        self._backend = "none"
+        self._progress = None
+        self._task_id = None
+        self._tqdm = None
+
+        if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+            try:
+                self._progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold green]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    TextColumn("{task.fields[postfix]}"),
+                    transient=True,
+                )
+                self._progress.start()
+                self._task_id = self._progress.add_task(
+                    self.desc,
+                    total=self.total,
+                    postfix="",
+                )
+                self._backend = "rich"
+            except Exception:
+                self._progress = None
+                self._task_id = None
+
+        if self._backend == "none" and _HAS_TQDM:
+            self._tqdm = tqdm(total=self.total, desc=self.desc, ascii=False)
+            self._backend = "tqdm"
+
+    def update(self, n: int) -> None:
+        step = int(max(0, n))
+        if step == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=step)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.update(step)
+
+    def set_postfix(self, **kwargs: object) -> None:
+        if len(kwargs) == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            text = " ".join([f"{k}={v}" for k, v in kwargs.items()])
+            self._progress.update(self._task_id, postfix=text)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.set_postfix(kwargs)
+
+    def finish(self) -> None:
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, completed=self.total)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.n = self._tqdm.total
+            self._tqdm.refresh()
+
+    def close(self) -> None:
+        if self._backend == "rich" and self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.close()
+            self._tqdm = None
 
 
 def fastplot(
@@ -330,7 +430,7 @@ def build_grm_streaming(
     """
     logger.info(f"Building GRM (streaming), method={method}")
     grm = np.zeros((n_samples, n_samples), dtype="float32")
-    pbar = tqdm(total=n_snps, desc="GRM (streaming)", ascii=False)
+    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
     process = psutil.Process()
 
     varsum = 0.0
@@ -366,8 +466,7 @@ def build_grm_streaming(
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
     # force bar to 100% even if SNPs were filtered in Rust
-    pbar.n = pbar.total
-    pbar.refresh()
+    pbar.finish()
     pbar.close()
 
     if method == 1:
@@ -887,7 +986,7 @@ def run_chunked_gwas_lmm_lm(
         )
 
         process.cpu_percent(interval=None)
-        pbar = tqdm(total=n_snps, desc=f"{model_label}-{pname}", ascii=False)
+        pbar = _ProgressAdapter(total=n_snps, desc=f"{model_label}-{pname}")
 
         sample_sub = None if genofile.endswith('.vcf') or genofile.endswith('.vcf.gz') else ids[sameidx]
         for genosub, sites in load_genotype_chunks(
@@ -972,8 +1071,7 @@ def run_chunked_gwas_lmm_lm(
                 mem_gb = mem_info.rss / 1024**3
                 pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
 
-        pbar.n = pbar.total
-        pbar.refresh()
+        pbar.finish()
         pbar.close()
 
         cpu_t1 = process.cpu_times()
@@ -1224,7 +1322,7 @@ def run_farmcpu_fullmem(
     famid = np.asarray(famid, dtype=str)
     geno_chunks = []
     site_rows = []
-    pbar = tqdm(total=n_snps, desc="Loading genotype (FarmCPU)", ascii=False)
+    pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (FarmCPU)")
     for chunk, sites in load_genotype_chunks(
         gfile,
         chunk_size=args.chunksize,
@@ -1239,8 +1337,7 @@ def run_farmcpu_fullmem(
             [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
         )
         pbar.update(chunk.shape[0])
-    pbar.n = pbar.total
-    pbar.refresh()
+    pbar.finish()
     pbar.close()
 
     if len(geno_chunks) == 0:

@@ -35,6 +35,7 @@ Output:
 """
 
 import os
+import sys
 from typing import Union
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -49,7 +50,6 @@ import numpy as np
 import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 import psutil
 
 mpl.use("Agg")
@@ -70,6 +70,32 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+    _HAS_TQDM = False
 
 
 # ======================================================================
@@ -133,6 +159,81 @@ def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], 
     group_df.columns = ["group", "label"]
     return group_df, "group", "label"
 
+
+class _ProgressAdapter:
+    """
+    Progress adapter for rich-first rendering with tqdm fallback.
+    """
+    def __init__(self, total: int, desc: str) -> None:
+        self.total = int(max(0, total))
+        self.desc = str(desc)
+        self._backend = "none"
+        self._progress = None
+        self._task_id = None
+        self._tqdm = None
+
+        if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+            try:
+                self._progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold green]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    TextColumn("{task.fields[postfix]}"),
+                    transient=True,
+                )
+                self._progress.start()
+                self._task_id = self._progress.add_task(
+                    self.desc,
+                    total=self.total,
+                    postfix="",
+                )
+                self._backend = "rich"
+            except Exception:
+                self._progress = None
+                self._task_id = None
+
+        if self._backend == "none" and _HAS_TQDM:
+            self._tqdm = tqdm(total=self.total, desc=self.desc, ascii=True)
+            self._backend = "tqdm"
+
+    def update(self, n: int) -> None:
+        step = int(max(0, n))
+        if step == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=step)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.update(step)
+
+    def set_postfix(self, **kwargs: object) -> None:
+        if len(kwargs) == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            text = " ".join([f"{k}={v}" for k, v in kwargs.items()])
+            self._progress.update(self._task_id, postfix=text)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.set_postfix(kwargs)
+
+    def finish(self) -> None:
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, completed=self.total)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.n = self._tqdm.total
+            self._tqdm.refresh()
+
+    def close(self) -> None:
+        if self._backend == "rich" and self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.close()
+            self._tqdm = None
+
+
 def build_grm_streaming_for_pca(
     genofile: str,
     maf_threshold: float = 0.02,
@@ -160,7 +261,7 @@ def build_grm_streaming_for_pca(
     n_samples = len(sample_ids)
 
     grm = np.zeros((n_samples, n_samples), dtype="float32")
-    pbar = tqdm(total=n_snps, desc="GRM (streaming)", ascii=True)
+    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
     process = psutil.Process()
 
     varsum = 0.0
@@ -195,8 +296,7 @@ def build_grm_streaming_for_pca(
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
     # Force progress bar to 100% even if some SNPs were filtered in Rust
-    pbar.n = pbar.total
-    pbar.refresh()
+    pbar.finish()
     pbar.close()
 
     if eff_m == 0 or varsum == 0:

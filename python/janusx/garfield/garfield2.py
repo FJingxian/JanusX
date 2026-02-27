@@ -86,14 +86,14 @@ def ldprune(
     Lightweight LD pruning:
       1) Sort SNPs by variance in descending order (prefer informative SNPs)
       2) Iteratively add candidates and compute correlation only vs kept SNPs
-      3) If LD(|r|) >= thr with kept SNPs, keep the SNP with larger MAF
+      3) If LD(r^2) >= thr with kept SNPs, keep the SNP with larger MAF
       4) Keep at most ``max_snps`` SNPs
 
     Parameters
     ----------
     M : (m_snps, n_samples) genotype matrix
     sites : site metadata aligned with SNP rows
-    thr : correlation threshold (|r| >= thr is considered high LD)
+    thr : LD threshold on r^2 (r^2 >= thr is considered high LD)
     max_snps : maximum number of SNPs to keep
 
     Returns
@@ -140,7 +140,8 @@ def ldprune(
             Z_kept = Z[kept_idx]  # (k, n)
             # corr = dot / n because rows are standardized.
             corr = (Z_kept @ z_i) / n
-            conflict_mask = np.abs(corr) >= thr
+            r2 = corr * corr
+            conflict_mask = r2 >= thr
             if not np.any(conflict_mask):
                 kept_idx.append(i)
             else:

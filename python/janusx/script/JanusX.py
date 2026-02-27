@@ -1,6 +1,9 @@
 #!/user/bin/env python
 # -*- coding: utf-8 -*-
 import sys
+import subprocess
+from datetime import date
+from pathlib import Path
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -18,6 +21,31 @@ try:
 except PackageNotFoundError:
     v = "0.0.0"
 
+__BUILD_DATE_FALLBACK__ = "2026-02-27"
+
+
+def _build_date() -> str:
+    """
+    Resolve build date from latest git commit date.
+    Fallback order:
+      1) release-tag-updated fallback date in source
+      2) local current date
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo_root), "log", "-1", "--date=format:%Y-%m-%d", "--format=%cd"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    if __BUILD_DATE_FALLBACK__:
+        return __BUILD_DATE_FALLBACK__
+    return date.today().isoformat()
+
 __logo__ = r'''
        _                      __   __
       | |                     \ \ / /
@@ -31,7 +59,7 @@ __version__ = (
     f"{_banner_line}\n"
     f">JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
     "Please report issues to <fujingxian@yzwlab.cn>\n"
-    "Build date: 2026-1-24\n"
+    f"Build date: {_build_date()}\n"
     f"{_banner_line}"
 )
 

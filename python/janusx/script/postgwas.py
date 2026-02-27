@@ -59,6 +59,8 @@ from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
 import warnings
 
+_LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
+
 try:
     from rich.progress import (
         Progress,
@@ -1621,7 +1623,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     )
     gff_query_cache: Optional[GFFQuery] = None
 
-    df_all = pd.read_csv(file, sep="\t", usecols=[chr_col, pos_col, p_col])
+    try:
+        header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
+    except Exception:
+        header_cols = [chr_col, pos_col, p_col]
+    lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
+    read_cols = [chr_col, pos_col, p_col] + lead_info_cols
+    read_cols = list(dict.fromkeys(read_cols))
+    df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
     full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
     df = df_all
     bim_layout: list[dict[str, object]] = []
@@ -2380,9 +2389,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             t_anno = time.time()
 
             # Keep SNPs passing threshold
+            lead_cols_present = [c for c in _LEAD_SNP_INFO_COLS if c in df.columns]
             df_filter_raw = df.loc[
                 df[p_col] <= threshold,
-                [chr_col, pos_col, p_col],
+                [chr_col, pos_col, p_col] + lead_cols_present,
             ].copy()
             df_filter = df_filter_raw.set_index([chr_col, pos_col])
 
@@ -2407,6 +2417,33 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 logger.info(
                     f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
                 )
+
+            # Attach lead SNP info columns (allele0/allele1/maf/beta/se) by lead index.
+            lead_map = df_filter_raw.loc[:, [chr_col, pos_col] + lead_cols_present].copy()
+            if lead_map.shape[0] > 0:
+                lead_map[chr_col] = lead_map[chr_col].astype(str)
+                lead_map[pos_col] = pd.to_numeric(lead_map[pos_col], errors="coerce")
+                lead_map = lead_map.dropna(subset=[pos_col]).copy()
+                lead_map[pos_col] = lead_map[pos_col].astype(int)
+                lead_map = lead_map.drop_duplicates(subset=[chr_col, pos_col], keep="first")
+                lead_map = lead_map.set_index([chr_col, pos_col], drop=True)
+
+                idx_chr = pd.Index(df_filter.index.get_level_values(0).astype(str))
+                idx_pos = pd.to_numeric(
+                    df_filter.index.get_level_values(1),
+                    errors="coerce",
+                ).fillna(0).astype(int)
+                df_filter.index = pd.MultiIndex.from_arrays(
+                    [idx_chr, idx_pos],
+                    names=[chr_col, pos_col],
+                )
+
+                for col in lead_cols_present:
+                    df_filter[col] = lead_map.reindex(df_filter.index)[col].values
+
+            for col in _LEAD_SNP_INFO_COLS:
+                if col not in df_filter.columns:
+                    df_filter[col] = "NA"
 
             # Read annotation (GFF/bed) into unified annotation table
             # After readanno:
@@ -2480,6 +2517,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ).drop(columns=["_chr_sort_key"])
 
             col_order: list[str] = [chr_col, pos_col]
+            for col in _LEAD_SNP_INFO_COLS:
+                if col in df_out.columns:
+                    col_order.append(col)
             if "start" in df_out.columns:
                 col_order.append("start")
             if "end" in df_out.columns:
@@ -2524,21 +2564,27 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         return
 
     if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+        n_total = len(files)
+        basenames = [os.path.basename(f) for f in files]
+        name_width = max((len(x) for x in basenames), default=0)
+        idx_width = len(str(n_total))
         progress = Progress(
             SpinnerColumn(),
-            TextColumn("Task: [bold]{task.fields[file]}[/bold]{task.fields[suffix]}"),
+            TextColumn(
+                "Task {task.fields[task_label]}: [bold]{task.fields[file_pad]}[/bold]{task.fields[suffix]}"
+            ),
             transient=False,
         )
         with progress:
-            task_map: dict[str, int] = {
-                f: progress.add_task(
+            task_map: dict[str, int] = {}
+            for i, f in enumerate(files, start=1):
+                task_map[f] = progress.add_task(
                     description="",
                     total=1,
-                    file=os.path.basename(f),
+                    task_label=f"{i:>{idx_width}}/{n_total}",
+                    file_pad=os.path.basename(f).ljust(name_width),
                     suffix="",
                 )
-                for f in files
-            }
             try:
                 done_iter = Parallel(
                     n_jobs=args.thread,

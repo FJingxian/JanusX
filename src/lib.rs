@@ -4,6 +4,7 @@ use pyo3::Bound;
 mod assoc;
 mod bayes;
 mod brent;
+mod bsa;
 mod gfcore;
 mod gfreader;
 mod gmerge;
@@ -16,6 +17,7 @@ use assoc::{
     lmm_reml_null_f32, ml_loglike_null_f32,
 };
 use bayes::{bayesa, bayesb, bayescpi};
+use bsa::preprocess_bsa;
 use gfreader::{
     count_vcf_snps, BedChunkReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
     VcfStreamWriter,
@@ -53,5 +55,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
+    m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
     Ok(())
 }

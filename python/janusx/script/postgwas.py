@@ -52,10 +52,38 @@ import argparse
 import re
 import time
 import socket
+import sys
+from contextlib import nullcontext
 from typing import Any, Optional, Tuple
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
 import warnings
+
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except Exception:
+    tqdm = None  # type: ignore[assignment]
+    _HAS_TQDM = False
 
 
 def _parse_ratio(value: object, name: str) -> float:
@@ -377,6 +405,64 @@ def _parse_bimrange(value: object, logger: logging.Logger) -> tuple[str, int, in
     start = int(round(start_mb * 1_000_000))
     end = int(round(end_mb * 1_000_000))
     return chrom, start, end
+
+
+def _parse_ldclump_window_bp(value: object) -> int:
+    """
+    Parse LD clump window size to bp.
+
+    Supported units:
+      - kb / k (default when unit omitted)
+      - mb / m
+      - bp / b
+    """
+    text = str(value).strip().lower()
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([a-z]*)$", text)
+    if m is None:
+        raise ValueError(
+            f"Invalid --LDclump window: {value}. "
+            "Use formats like 500kb, 0.5mb, or 200000bp."
+        )
+    raw_val = float(m.group(1))
+    unit = m.group(2)
+    if raw_val <= 0:
+        raise ValueError("--LDclump window must be > 0.")
+    if unit in {"", "kb", "k"}:
+        factor = 1_000.0
+    elif unit in {"mb", "m"}:
+        factor = 1_000_000.0
+    elif unit in {"bp", "b"}:
+        factor = 1.0
+    else:
+        raise ValueError(
+            f"Unsupported --LDclump window unit: {unit}. "
+            "Use kb/mb/bp."
+        )
+    out = int(round(raw_val * factor))
+    if out <= 0:
+        raise ValueError("--LDclump window must be > 0 bp.")
+    return out
+
+
+def _parse_ldclump_spec(value: object) -> tuple[int, float]:
+    """
+    Parse --LDclump payload: [window, r2].
+    """
+    if value is None:
+        raise ValueError("--LDclump is None.")
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(
+            "Invalid --LDclump format. Use: --LDclump <window> <r2> "
+            "(e.g. --LDclump 500kb 0.8)."
+        )
+    window_bp = _parse_ldclump_window_bp(value[0])
+    try:
+        r2_thr = float(value[1])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid --LDclump r2 threshold: {value[1]}") from e
+    if not (0.0 <= r2_thr <= 1.0):
+        raise ValueError("--LDclump r2 threshold must be within [0, 1].")
+    return window_bp, r2_thr
 
 
 def _format_bimrange_tuple(item: tuple[str, int, int]) -> str:
@@ -784,6 +870,343 @@ def _compute_ld_from_genotypes(geno_sig: np.ndarray) -> np.ndarray:
     corr = np.abs(corr).astype(np.float32)
     np.fill_diagonal(corr, 1.0)
     return corr
+
+
+def _lead_vs_all_r2(geno_block: np.ndarray) -> np.ndarray:
+    """
+    Compute r^2 between the lead SNP (row 0) and all SNP rows.
+
+    This avoids building a full correlation matrix and is much cheaper for
+    LD clumping where only lead-vs-window correlations are needed.
+    """
+    x = np.asarray(geno_block, dtype=np.float32)
+    if x.ndim != 2 or x.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    m, n = x.shape
+    if n <= 1:
+        out = np.zeros((m,), dtype=np.float32)
+        out[0] = 1.0
+        return out
+
+    x0 = x[0]  # lead SNP
+    n_f = float(n)
+
+    # Pearson correlation via sum products:
+    # r = (n*sum(xy)-sum(x)sum(y)) / sqrt((n*sum(x^2)-sum(x)^2)*(n*sum(y^2)-sum(y)^2))
+    sx = np.sum(x, axis=1, dtype=np.float64)
+    sx2 = np.einsum("ij,ij->i", x, x, dtype=np.float64, optimize=True)
+    s0 = float(sx[0])
+    s02 = float(sx2[0])
+    sxx0 = np.einsum("ij,j->i", x, x0, dtype=np.float64, optimize=True)
+
+    num = n_f * sxx0 - sx * s0
+    den_left = n_f * sx2 - np.square(sx)
+    den_right = max(0.0, n_f * s02 - s0 * s0)
+    den = np.sqrt(np.maximum(den_left, 0.0) * den_right)
+
+    corr = np.zeros((m,), dtype=np.float64)
+    valid = den > 0.0
+    corr[valid] = num[valid] / den[valid]
+    corr = np.clip(corr, -1.0, 1.0)
+    corr[0] = 1.0
+
+    r2 = np.square(corr)
+    r2 = np.nan_to_num(r2, nan=0.0, posinf=0.0, neginf=0.0)
+    return r2.astype(np.float32, copy=False)
+
+
+def _clean_anno_token(value: object) -> str:
+    if value is None:
+        return "NA"
+    if pd.isna(value):
+        return "NA"
+    text = str(value).strip()
+    if text == "" or text.lower() == "nan":
+        return "NA"
+    return text
+
+
+def _merge_anno_value(base: str, value: str) -> str:
+    if value == "NA":
+        return base
+    if base == "NA":
+        return value
+    existing = base.split("|")
+    if value in existing:
+        return base
+    return f"{base}|{value}"
+
+
+def _format_gene_annotation_dict(hits: pd.DataFrame) -> str:
+    """
+    Format annotation hits as:
+      {gene1:[description,additionaldesc], gene2:[description,additionaldesc]}
+    """
+    if hits is None or hits.shape[0] == 0:
+        return "{}"
+    out: dict[str, list[str]] = {}
+    for _, row in hits.iterrows():
+        gene = _clean_anno_token(row.iloc[3] if hits.shape[1] > 3 else "NA")
+        desc = _clean_anno_token(row.iloc[4] if hits.shape[1] > 4 else "NA")
+        add_desc = _clean_anno_token(row.iloc[5] if hits.shape[1] > 5 else "NA")
+        if gene not in out:
+            out[gene] = [desc, add_desc]
+        else:
+            out[gene][0] = _merge_anno_value(out[gene][0], desc)
+            out[gene][1] = _merge_anno_value(out[gene][1], add_desc)
+    return str(out)
+
+
+def _format_clump_sites(sites: list[tuple[str, int]]) -> str:
+    if sites is None or len(sites) == 0:
+        return ""
+    return ";".join([f"{str(chrom)}_{int(pos)}" for chrom, pos in sites])
+
+
+def _ldclump_significant_snps(
+    df_sig: pd.DataFrame,
+    *,
+    chr_col: str,
+    pos_col: str,
+    p_col: str,
+    genofile: str,
+    window_bp: int,
+    r2_thr: float,
+    logger: logging.Logger,
+    show_progress: bool = True,
+) -> tuple[pd.DataFrame, dict[tuple[str, int], list[tuple[str, int]]]]:
+    """
+    LD-clump threshold-passing SNPs and keep lead SNPs only in annotation output.
+    """
+    if df_sig.shape[0] == 0:
+        out_empty = df_sig.set_index([chr_col, pos_col], drop=True)
+        out_empty["start"] = pd.Series(dtype=int)
+        out_empty["end"] = pd.Series(dtype=int)
+        out_empty["LDclump"] = pd.Series(dtype=str)
+        return out_empty, {}
+
+    work = df_sig[[chr_col, pos_col, p_col]].copy()
+    work[chr_col] = work[chr_col].astype(str)
+    work[pos_col] = pd.to_numeric(work[pos_col], errors="coerce")
+    work[p_col] = pd.to_numeric(work[p_col], errors="coerce")
+    work = work.dropna(subset=[pos_col, p_col]).copy()
+    if work.shape[0] == 0:
+        out_empty = work.set_index([chr_col, pos_col], drop=True)
+        out_empty["start"] = pd.Series(dtype=int)
+        out_empty["end"] = pd.Series(dtype=int)
+        out_empty["LDclump"] = pd.Series(dtype=str)
+        return out_empty, {}
+
+    work[pos_col] = work[pos_col].astype(int)
+    work = (
+        work.sort_values(p_col, ascending=True)
+        .drop_duplicates(subset=[chr_col, pos_col], keep="first")
+        .reset_index(drop=True)
+    )
+    if work.shape[0] == 0:
+        out_empty = work.set_index([chr_col, pos_col], drop=True)
+        out_empty["start"] = pd.Series(dtype=int)
+        out_empty["end"] = pd.Series(dtype=int)
+        out_empty["LDclump"] = pd.Series(dtype=str)
+        return out_empty, {}
+
+    all_keys = [
+        (str(c), int(p))
+        for c, p in zip(work[chr_col].tolist(), work[pos_col].tolist())
+    ]
+    chrom_arr = work[chr_col].to_numpy(dtype=str)
+    pos_arr = work[pos_col].to_numpy(dtype=np.int64)
+
+    # Preload all threshold-passing SNP genotypes once, then reuse in memory.
+    # This avoids repeated random-access reads for each lead SNP.
+    preloaded_geno: Optional[np.ndarray] = None
+    key_to_row: dict[tuple[str, int], int] = {}
+    try:
+        logger.info(
+            f"Preloading genotype rows for LD clump: {len(all_keys)} SNPs..."
+        )
+        preloaded_chunks: list[np.ndarray] = []
+        for chunk, _sites in load_genotype_chunks(
+            genofile,
+            chunk_size=max(1, min(20_000, len(all_keys))),
+            maf=0.0,
+            missing_rate=1.0,
+            impute=True,
+            snp_sites=all_keys,
+        ):
+            preloaded_chunks.append(np.asarray(chunk, dtype=np.float32))
+        if len(preloaded_chunks) > 0:
+            preloaded_geno = np.vstack(preloaded_chunks).astype(np.float32, copy=False)
+        if preloaded_geno is None or preloaded_geno.shape[0] != len(all_keys):
+            raise RuntimeError(
+                "preloaded genotype row count does not match requested SNPs"
+            )
+        key_to_row = {k: i for i, k in enumerate(all_keys)}
+    except Exception as e:
+        preloaded_geno = None
+        key_to_row = {}
+        logger.warning(
+            "Warning: Failed to preload all LD-clump genotypes; "
+            "falling back to per-lead genotype loading. "
+            f"Reason: {e}"
+        )
+
+    remaining: set[tuple[str, int]] = set(all_keys)
+    key_to_p: dict[tuple[str, int], float] = {
+        (str(c), int(p)): float(v)
+        for c, p, v in zip(work[chr_col].tolist(), work[pos_col].tolist(), work[p_col].tolist())
+    }
+    kept_rows: list[tuple[str, int, float, int, int, str]] = []
+    clump_dict: dict[tuple[str, int], list[tuple[str, int]]] = {}
+
+    warn_count = 0
+    warn_limit = 5
+    use_rich_progress = bool(show_progress and _HAS_RICH_PROGRESS and sys.stdout.isatty())
+    progress = None
+    task_id = None
+    progress_tqdm = None
+    if use_rich_progress:
+        try:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold green]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                transient=True,
+            )
+        except Exception:
+            progress = None
+            use_rich_progress = False
+
+    with (progress if progress is not None else nullcontext()):
+        if progress is not None:
+            task_id = progress.add_task("LD clumping...", total=int(work.shape[0]))
+        elif bool(show_progress and _HAS_TQDM):
+            progress_tqdm = tqdm(
+                total=int(work.shape[0]),
+                desc="LD clumping",
+                unit="snp",
+                leave=False,
+                dynamic_ncols=True,
+            )
+
+        try:
+            for _, row in work.iterrows():
+                try:
+                    lead_chr = str(row[chr_col])
+                    lead_pos = int(row[pos_col])
+                    lead_key = (lead_chr, lead_pos)
+                    if lead_key not in remaining:
+                        continue
+
+                    start = int(lead_pos - window_bp)
+                    end = int(lead_pos + window_bp)
+                    win_mask = (
+                        (chrom_arr == lead_chr)
+                        & (pos_arr >= start)
+                        & (pos_arr <= end)
+                    )
+                    win_idx = np.flatnonzero(win_mask)
+                    snps = [
+                        all_keys[int(i)]
+                        for i in win_idx
+                        if all_keys[int(i)] in remaining
+                    ]
+                    if lead_key in snps:
+                        snps = [lead_key] + [x for x in snps if x != lead_key]
+                    else:
+                        snps = [lead_key] + snps
+
+                    clumped = [lead_key]
+                    if len(snps) > 1:
+                        try:
+                            if preloaded_geno is not None:
+                                idx_arr = np.fromiter(
+                                    (key_to_row[k] for k in snps),
+                                    dtype=np.int64,
+                                    count=len(snps),
+                                )
+                                geno_block = preloaded_geno[idx_arr, :]
+                            else:
+                                geno_block = None
+                                for chunk, _sites in load_genotype_chunks(
+                                    genofile,
+                                    chunk_size=max(1, len(snps)),
+                                    maf=0.0,
+                                    missing_rate=1.0,
+                                    impute=True,
+                                    snp_sites=snps,
+                                ):
+                                    geno_block = np.asarray(chunk, dtype=np.float32)
+                                    break
+                            if geno_block is not None and geno_block.shape[0] == len(snps):
+                                r2 = _lead_vs_all_r2(geno_block)
+                                clumped = [
+                                    snps[i]
+                                    for i, keep in enumerate(r2 >= float(r2_thr))
+                                    if bool(keep)
+                                ]
+                                if lead_key not in clumped:
+                                    clumped.insert(0, lead_key)
+                            else:
+                                if warn_count < warn_limit:
+                                    logger.warning(
+                                        "Warning: LDclump genotype rows do not match requested SNP count; "
+                                        f"fallback to keep lead SNP only for {lead_chr}:{lead_pos}."
+                                    )
+                                warn_count += 1
+                        except Exception as e:
+                            if warn_count < warn_limit:
+                                logger.warning(
+                                    "Warning: LDclump genotype lookup failed for "
+                                    f"{lead_chr}:{lead_pos}; fallback to keep lead SNP only. "
+                                    f"Reason: {e}"
+                                )
+                            warn_count += 1
+                            clumped = [lead_key]
+
+                    clumped = sorted(
+                        clumped,
+                        key=lambda k: (float(key_to_p.get(k, np.inf)), int(k[1])),
+                    )
+                    clump_dict[lead_key] = clumped
+                    ld_start = int(min([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
+                    ld_end = int(max([int(x[1]) for x in clumped])) if len(clumped) > 0 else int(lead_pos)
+                    kept_rows.append(
+                        (
+                            lead_chr,
+                            lead_pos,
+                            float(row[p_col]),
+                            ld_start,
+                            ld_end,
+                            _format_clump_sites(clumped),
+                        )
+                    )
+                    for key in clumped:
+                        if key in remaining:
+                            remaining.remove(key)
+                finally:
+                    if progress is not None and task_id is not None:
+                        progress.advance(task_id, 1)
+                    if progress_tqdm is not None:
+                        progress_tqdm.update(1)
+        finally:
+            if progress_tqdm is not None:
+                progress_tqdm.close()
+
+    if warn_count > warn_limit:
+        logger.warning(
+            f"Warning: LDclump warnings truncated; {warn_count - warn_limit} more similar warnings omitted."
+        )
+
+    out_df = pd.DataFrame(
+        kept_rows,
+        columns=[chr_col, pos_col, p_col, "start", "end", "LDclump"],
+    )
+    out_df = out_df.set_index([chr_col, pos_col], drop=True)
+    return out_df, clump_dict
 
 
 def _draw_empty_ldblock(
@@ -1943,10 +2366,33 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             t_anno = time.time()
 
             # Keep SNPs passing threshold
-            df_filter = df.loc[
+            df_filter_raw = df.loc[
                 df[p_col] <= threshold,
                 [chr_col, pos_col, p_col],
-            ].set_index([chr_col, pos_col])
+            ].copy()
+            df_filter = df_filter_raw.set_index([chr_col, pos_col])
+
+            if args.ldclump_window_bp is not None:
+                n_before = int(df_filter_raw.shape[0])
+                logger.info(
+                    "Applying LD clump on threshold-passing SNPs for annotation: "
+                    f"window={args.ldclump_window_bp} bp, r2>={args.ldclump_r2:g}"
+                )
+                df_filter, _clump_dict = _ldclump_significant_snps(
+                    df_filter_raw,
+                    chr_col=chr_col,
+                    pos_col=pos_col,
+                    p_col=p_col,
+                    genofile=args.genofile,
+                    window_bp=int(args.ldclump_window_bp),
+                    r2_thr=float(args.ldclump_r2),
+                    logger=logger,
+                    show_progress=(len(args.gwasfile) == 1),
+                )
+                n_after = int(df_filter.shape[0])
+                logger.info(
+                    f"LD clump completed: kept {n_after}/{n_before} threshold-passing SNPs."
+                )
 
             # Read annotation (GFF/bed) into unified annotation table
             # After readanno:
@@ -1971,11 +2417,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 for idx in df_filter.index
             ]
             df_filter["desc"] = [
-                (
-                    f"{x.iloc[0, 3]};{x.iloc[0, 4]};{x.iloc[0, 5]}"
-                    if not x.empty
-                    else "NA;NA;NA"
-                )
+                _format_gene_annotation_dict(x)
                 for x in desc_exact
             ]
 
@@ -1991,27 +2433,132 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     for idx in df_filter.index
                 ]
                 df_filter["broaden"] = [
-                    (
-                        f"{'|'.join(x.iloc[:, 3])};"
-                        f"{'|'.join(x.iloc[:, 4])};"
-                        f"{'|'.join(x.iloc[:, 5])}"
-                        if not x.empty
-                        else "NA;NA;NA"
-                    )
+                    _format_gene_annotation_dict(x)
                     for x in desc_broad
                 ]
             else:
                 if "broaden" in df_filter.columns:
                     df_filter = df_filter.drop(columns=["broaden"])
 
-            logger.info(df_filter)
+            df_out = df_filter.reset_index()
+            if pos_col in df_out.columns:
+                df_out[pos_col] = pd.to_numeric(df_out[pos_col], errors="coerce").fillna(0).astype(int)
+            if "start" in df_out.columns:
+                df_out["start"] = pd.to_numeric(df_out["start"], errors="coerce").fillna(df_out[pos_col]).astype(int)
+            if "end" in df_out.columns:
+                df_out["end"] = pd.to_numeric(df_out["end"], errors="coerce").fillna(df_out[pos_col]).astype(int)
+
+            # Output file is sorted by chromosome and position.
+            if chr_col in df_out.columns and pos_col in df_out.columns:
+                df_out["_chr_sort_key"] = df_out[chr_col].map(_chrom_sort_key)
+                df_out = df_out.sort_values(
+                    by=["_chr_sort_key", pos_col],
+                    ascending=[True, True],
+                    kind="mergesort",
+                ).drop(columns=["_chr_sort_key"])
+
+            col_order: list[str] = [chr_col, pos_col]
+            if "start" in df_out.columns:
+                col_order.append("start")
+            if "end" in df_out.columns:
+                col_order.append("end")
+            if p_col in df_out.columns:
+                col_order.append(p_col)
+            if "desc" in df_out.columns:
+                col_order.append("desc")
+            if "broaden" in df_out.columns:
+                col_order.append("broaden")
+            remain_cols = [c for c in df_out.columns if c not in col_order and c != "LDclump"]
+            if "LDclump" in df_out.columns:
+                df_out = df_out[col_order + remain_cols + ["LDclump"]]
+            else:
+                df_out = df_out[col_order + remain_cols]
+
+            logger.info(df_out)
 
             anno_path = f"{args.out}/{args.prefix}.{threshold}.anno.tsv"
-            df_filter.to_csv(anno_path, sep="\t")
+            df_out.to_csv(anno_path, sep="\t", index=False)
             logger.info(f"Annotation table saved to {anno_path}")
             logger.info(f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
         else:
             logger.info(f"Annotation file not found: {args.anno}\n")
+
+
+def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
+    GWASplot(file, args, logger)
+    return str(file)
+
+
+def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
+    files = [str(f) for f in args.gwasfile]
+    if len(files) == 0:
+        return
+    if len(files) == 1:
+        GWASplot(files[0], args, logger)
+        return
+
+    if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("Task: [bold]{task.fields[file]}[/bold]{task.fields[suffix]}"),
+            transient=False,
+        )
+        with progress:
+            task_map: dict[str, int] = {
+                f: progress.add_task(
+                    description="",
+                    total=1,
+                    file=os.path.basename(f),
+                    suffix="",
+                )
+                for f in files
+            }
+            try:
+                done_iter = Parallel(
+                    n_jobs=args.thread,
+                    backend="loky",
+                    return_as="generator_unordered",
+                )(
+                    delayed(_run_one_postgwas_task)(f, args, logger) for f in files
+                )
+                for done_file in done_iter:
+                    tid = task_map.get(str(done_file))
+                    if tid is not None:
+                        progress.update(tid, advance=1, suffix=" ...Finished")
+            except Exception:
+                for f, tid in task_map.items():
+                    task = progress.tasks[tid]
+                    if not task.finished:
+                        progress.update(tid, completed=1, suffix=" ...Failed")
+                raise
+        return
+
+    if _HAS_TQDM:
+        pbar = tqdm(
+            total=len(files),
+            desc="PostGWAS tasks",
+            unit="file",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        try:
+            done_iter = Parallel(
+                n_jobs=args.thread,
+                backend="loky",
+                return_as="generator_unordered",
+            )(
+                delayed(_run_one_postgwas_task)(f, args, logger) for f in files
+            )
+            for done_file in done_iter:
+                pbar.update(1)
+                pbar.set_postfix(file=os.path.basename(str(done_file)))
+        finally:
+            pbar.close()
+        return
+
+    Parallel(n_jobs=args.thread, backend="loky")(
+        delayed(GWASplot)(file, args, logger) for file in files
+    )
 
 
 def main():
@@ -2050,6 +2597,16 @@ def main():
     optional_group.add_argument(
         "-threshold", "--threshold", type=float, default=None,
         help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-LDclump", "--LDclump", dest="ldclump", nargs=2, default=None,
+        metavar=("WINDOW", "R2"),
+        help=(
+            "Enable LD clumping for annotation output using threshold-passing SNPs only. "
+            "Format: --LDclump <window> <r2>, e.g. --LDclump 500kb 0.8. "
+            "Window supports kb/mb/bp (no unit defaults to kb). "
+            "Requires genotype input via --bfile/--vcf/--file."
+        ),
     )
     optional_group.add_argument(
         "-bimrange", "--bimrange", type=str, action="append", default=None,
@@ -2228,6 +2785,16 @@ def main():
         logger.error(str(e))
         raise SystemExit(1)
 
+    try:
+        if args.ldclump is not None:
+            args.ldclump_window_bp, args.ldclump_r2 = _parse_ldclump_spec(args.ldclump)
+        else:
+            args.ldclump_window_bp = None
+            args.ldclump_r2 = None
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
+
     if args.bimrange is not None:
         try:
             args.bimrange_tuples = [
@@ -2258,6 +2825,23 @@ def main():
         logger.warning(
             "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; zero-correlation LD block will be drawn."
         )
+    if args.ldclump_window_bp is not None and args.genofile is None:
+        logger.warning(
+            "Warning: --LDclump enabled but no genotype file provided; LD clump is skipped."
+        )
+        args.ldclump_window_bp = None
+        args.ldclump_r2 = None
+    if args.ldclump_window_bp is not None and args.anno is None:
+        logger.warning(
+            "Warning: --LDclump only affects --anno output; --LDclump is ignored."
+        )
+        args.ldclump_window_bp = None
+        args.ldclump_r2 = None
+    if len(args.gwasfile) == 1 and int(args.thread) != 1:
+        logger.info(
+            "Single GWAS input detected; forcing --thread to 1."
+        )
+        args.thread = 1
 
     no_plot_or_anno = (
         args.manh_ratio is None
@@ -2335,6 +2919,12 @@ def main():
         logger.info("Annotation:")
         logger.info(f"  Anno file:   {args.anno}")
         logger.info(f"  Window (kb): {args.annobroaden}")
+        if args.ldclump_window_bp is None:
+            logger.info("  LD clump:    off")
+        else:
+            logger.info(
+                f"  LD clump:    on ({args.ldclump_window_bp / 1000.0:g} kb, r2>={args.ldclump_r2:g})"
+            )
     logger.info(f"Output prefix: {args.out}/{args.prefix}")
     logger.info(
         f"Threads:       {args.thread} "
@@ -2363,9 +2953,7 @@ def main():
     # ------------------------------------------------------------------
     # Parallel processing of all input files
     # ------------------------------------------------------------------
-    Parallel(n_jobs=args.thread, backend="loky")(
-        delayed(GWASplot)(file, args, logger) for file in args.gwasfile
-    )
+    _run_postgwas_tasks(args, logger)
 
     # ------------------------------------------------------------------
     # Final logging

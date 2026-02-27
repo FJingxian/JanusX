@@ -109,6 +109,7 @@ pub(crate) fn build_snp_indices(
     snp_range: Option<(usize, usize)>,
     snp_indices: Option<Vec<usize>>,
     bim_range: Option<(String, i32, i32)>,
+    snp_sites: Option<Vec<(String, i32)>>,
 ) -> Result<Option<Vec<usize>>, String> {
     let mut count = 0;
     if snp_range.is_some() {
@@ -120,8 +121,11 @@ pub(crate) fn build_snp_indices(
     if bim_range.is_some() {
         count += 1;
     }
+    if snp_sites.is_some() {
+        count += 1;
+    }
     if count > 1 {
-        return Err("Provide only one of snp_range, snp_indices, or bim_range".into());
+        return Err("Provide only one of snp_range, snp_indices, bim_range, or snp_sites".into());
     }
 
     if let Some((start, end)) = snp_range {
@@ -162,6 +166,32 @@ pub(crate) fn build_snp_indices(
         return Ok(Some(indices));
     }
 
+    if let Some(site_keys) = snp_sites {
+        if site_keys.is_empty() {
+            return Err("snp_sites is empty".into());
+        }
+        let mut site_map: HashMap<(String, i32), Vec<usize>> = HashMap::new();
+        for (i, site) in sites.iter().enumerate() {
+            site_map
+                .entry((site.chrom.clone(), site.pos))
+                .or_default()
+                .push(i);
+        }
+
+        let mut indices: Vec<usize> = Vec::new();
+        for (chrom, pos) in site_keys.into_iter() {
+            let key = (chrom.clone(), pos);
+            let matched = site_map
+                .get(&key)
+                .ok_or_else(|| format!("snp site not found: ({chrom}, {pos})"))?;
+            indices.extend(matched.iter().copied());
+        }
+        if indices.is_empty() {
+            return Err("no SNPs matched from snp_sites".into());
+        }
+        return Ok(Some(indices));
+    }
+
     Ok(None)
 }
 
@@ -186,6 +216,7 @@ impl BedChunkReader {
         snp_range=None,
         snp_indices=None,
         bim_range=None,
+        snp_sites=None,
         sample_ids=None,
         sample_indices=None,
         mmap_window_mb=None,
@@ -200,6 +231,7 @@ impl BedChunkReader {
         snp_range: Option<(usize, usize)>,
         snp_indices: Option<Vec<usize>>,
         bim_range: Option<(String, i32, i32)>,
+        snp_sites: Option<Vec<(String, i32)>>,
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
         mmap_window_mb: Option<usize>,
@@ -247,8 +279,9 @@ impl BedChunkReader {
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        let snp_indices = build_snp_indices(&it.sites, snp_range, snp_indices, bim_range)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let snp_indices =
+            build_snp_indices(&it.sites, snp_range, snp_indices, bim_range, snp_sites)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         Ok(Self {
             it,
@@ -465,6 +498,7 @@ impl TxtChunkReader {
         snp_range=None,
         snp_indices=None,
         bim_range=None,
+        snp_sites=None,
         sample_ids=None,
         sample_indices=None,
     ))]
@@ -474,6 +508,7 @@ impl TxtChunkReader {
         snp_range: Option<(usize, usize)>,
         snp_indices: Option<Vec<usize>>,
         bim_range: Option<(String, i32, i32)>,
+        snp_sites: Option<Vec<(String, i32)>>,
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
     ) -> PyResult<Self> {
@@ -484,8 +519,9 @@ impl TxtChunkReader {
             build_sample_selection(&it.samples, sample_ids, sample_indices)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-        let snp_indices = build_snp_indices(&it.sites, snp_range, snp_indices, bim_range)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let snp_indices =
+            build_snp_indices(&it.sites, snp_range, snp_indices, bim_range, snp_sites)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         Ok(Self {
             it,

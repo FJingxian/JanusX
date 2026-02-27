@@ -158,6 +158,7 @@ def bed_chunk_reader(
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int],None ]= None,
     bim_range: Union[tuple[str, int, int] , None] = None,
+    snp_sites: Union[list[tuple[str, int]], None] = None,
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
@@ -169,6 +170,7 @@ def bed_chunk_reader(
       - snp_range   : (start, end) with end exclusive (0-based)
       - snp_indices : explicit 0-based SNP indices
       - bim_range   : (chrom, start_pos, end_pos), inclusive on positions
+      - snp_sites   : list of (chrom, pos), preserving input order
 
     Samples (mutually exclusive):
       - sample_ids     : list of IID strings from .fam
@@ -185,6 +187,7 @@ def bed_chunk_reader(
         snp_range=snp_range,
         snp_indices=snp_indices,
         bim_range=bim_range,
+        snp_sites=snp_sites,
         sample_ids=sample_ids,
         sample_indices=sample_indices,
         mmap_window_mb=mmap_window_mb,
@@ -198,7 +201,21 @@ def bed_chunk_reader(
     except TypeError:
         # Backward-compat for older compiled extensions that do not yet
         # expose model/het_threshold in BedChunkReader.
-        reader = BedChunkReader(**base_kwargs)
+        legacy_kwargs = dict(base_kwargs)
+        # Older extensions may not support snp_sites.
+        legacy_kwargs.pop("snp_sites", None)
+        reader = BedChunkReader(**legacy_kwargs)
+        if (snp_sites is not None) and len(snp_sites) > 0:
+            warnings.warn(
+                (
+                    "BedChunkReader extension does not support snp_sites yet; "
+                    "falling back to legacy reader signature without snp_sites. "
+                    "Please rebuild/reinstall janusx Rust extension to enable "
+                    "chr/pos site-list selection."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if (model != "add") and (not _WARNED_BED_MODEL_FALLBACK):
             warnings.warn(
                 (
@@ -229,6 +246,7 @@ def txt_chunk_reader(
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int] , None] = None,
     bim_range: Union[tuple[str, int, int] , None] = None,
+    snp_sites: Union[list[tuple[str, int]], None] = None,
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
 ):
@@ -246,6 +264,7 @@ def txt_chunk_reader(
         snp_range,
         snp_indices,
         bim_range,
+        snp_sites,
         sample_ids,
         sample_indices,
     )
@@ -271,6 +290,7 @@ def load_genotype_chunks(
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int] , None] = None,
     bim_range: Union[tuple[str, int, int] , None] = None,
+    snp_sites: Union[list[tuple[str, int]], None] = None,
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
@@ -348,6 +368,7 @@ def load_genotype_chunks(
     - snp_range: (start, end) 0-based, end exclusive (PLINK only)
     - snp_indices: list of 0-based SNP indices (PLINK only)
     - bim_range: (chrom, start_pos, end_pos), inclusive on positions (PLINK only)
+    - snp_sites: list of (chrom, pos), preserving input order (PLINK/TXT cached backends)
     - sample_ids: list of sample IDs (PLINK .fam IID or VCF #CHROM header)
     - sample_indices: list of 0-based sample indices
     - mmap_window_mb: window size (MB) for BED mmap; supported for PLINK (incl. cached VCF), not TXT
@@ -378,6 +399,7 @@ def load_genotype_chunks(
             snp_range=snp_range,
             snp_indices=snp_indices,
             bim_range=bim_range,
+            snp_sites=snp_sites,
             sample_ids=sample_ids,
             sample_indices=sample_indices,
             mmap_window_mb=mmap_window_mb,
@@ -396,6 +418,7 @@ def load_genotype_chunks(
             snp_range=snp_range,
             snp_indices=snp_indices,
             bim_range=bim_range,
+            snp_sites=snp_sites,
             sample_ids=sample_ids,
             sample_indices=sample_indices,
             mmap_window_mb=mmap_window_mb,
@@ -412,6 +435,7 @@ def load_genotype_chunks(
             snp_range,
             snp_indices,
             bim_range,
+            snp_sites,
             sample_ids,
             sample_indices,
         )
@@ -479,6 +503,7 @@ def inspect_genotype_file(
         reader = TxtChunkReader(
             txt_input,
             delimiter,
+            None,
             None,
             None,
             None,

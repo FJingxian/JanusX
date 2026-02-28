@@ -27,6 +27,7 @@ import pandas as pd
 
 from janusx.garfield.decode import decode
 from janusx.script._common.log import setup_logging
+from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -246,27 +247,34 @@ def main() -> None:
     log_path = f"{args.out}/{prefix}.postGARFIELD.log".replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX - Post-GARFIELD pipeline")
-    logger.info(f"Host: {socket.gethostname()}\n")
-
-    logger.info("*" * 60)
-    logger.info("POST-GARFIELD CONFIGURATION")
-    logger.info("*" * 60)
-    logger.info(f"Genotype file: {gfile}")
-    logger.info(f"Phenotype file: {args.pheno}")
-    logger.info("Model: lmm")
-    logger.info(f"GRM: {args.grm}")
-    logger.info(f"Q/PC: {args.qcov}")
-    logger.info(f"Covariate: {args.cov}")
-    logger.info(f"MAF: {args.maf}")
-    logger.info(f"Missing rate: {args.geno}")
-    logger.info(f"Chunk size: {args.chunksize}")
-    logger.info(f"Threads: {args.thread}")
-    logger.info(f"Pseudo map: {args.pseudo or f'{gfile}.pseudo'}")
-    logger.info(f"Only-set filter (bp): {args.only_set}")
-    logger.info(f"Bimrange: {args.bimrange}")
-    logger.info(f"Output prefix: {outprefix}")
-    logger.info("*" * 60 + "\n")
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - Post-GARFIELD",
+        config_title="POST-GARFIELD CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                [
+                    ("Genotype file", gfile),
+                    ("Phenotype file", args.pheno),
+                    ("Model", "lmm"),
+                    ("GRM", args.grm),
+                    ("Q/PC", args.qcov),
+                    ("Covariate", args.cov),
+                    ("MAF", args.maf),
+                    ("Missing rate", args.geno),
+                    ("Chunk size", args.chunksize),
+                    ("Threads", args.thread),
+                    ("Pseudo map", args.pseudo or f"{gfile}.pseudo"),
+                    ("Only-set filter (bp)", args.only_set),
+                    ("Bimrange", args.bimrange),
+                ],
+            )
+        ],
+        footer_rows=[("Output prefix", outprefix)],
+        line_max_chars=60,
+    )
 
     checks: list[bool] = []
     if args.bfile:

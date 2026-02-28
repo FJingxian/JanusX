@@ -186,13 +186,14 @@ def _render_postgwas_config_rich(
                 show_header=False,
                 box=box.SIMPLE,
                 pad_edge=False,
-                expand=True,
+                expand=False,
             )
-            t.add_column(style="bold cyan", no_wrap=True, width=max(8, int(key_width)))
-            t.add_column(style="white", overflow="fold")
+            key_w = max(8, int(key_width))
+            t.add_column(style="bold cyan", no_wrap=True, width=key_w, justify="left")
+            t.add_column(style="white", no_wrap=True, justify="left")
             for k, v in rows:
                 k_txt = str(k)
-                v_max = max(1, _CONFIG_LINE_MAX_CHARS - len(k_txt) - 2)
+                v_max = max(1, _CONFIG_LINE_MAX_CHARS - key_w - 2)
                 v_txt = _truncate_config_line(v, max_chars=v_max)
                 t.add_row(k_txt, v_txt)
             return t
@@ -239,7 +240,7 @@ def _render_postgwas_config_rich(
 
         panel = Panel(
             Group(*parts),
-            title="POST-GWAS CONFIGURATION",
+            title="POST-GWAS CONFIG",
             border_style="green",
             expand=False,
         )
@@ -3907,7 +3908,7 @@ def main():
     # ------------------------------------------------------------------
     # Configuration summary
     # ------------------------------------------------------------------
-    config_title = "JanusX - Post-GWAS visualization and annotation"
+    config_title = "JanusX - Post-GWAS"
     host_text = socket.gethostname()
     input_files = args.merge_files if args.merge_mode else args.gwasfile
     input_files_text = _format_input_files(input_files)
@@ -4014,13 +4015,13 @@ def main():
 
     config_lines_full: list[str] = [
         divider_full,
-        "POST-GWAS CONFIGURATION",
+        "POST-GWAS CONFIG",
         divider_full,
         "General:",
     ]
     config_lines_terminal: list[str] = [
         divider,
-        "POST-GWAS CONFIGURATION",
+        "POST-GWAS CONFIG",
         divider,
         "General:",
     ]

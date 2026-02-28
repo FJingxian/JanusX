@@ -79,6 +79,7 @@ from janusx.gfreader import breader, vcfreader
 from janusx.pyBLUP import BLUP, kfold
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -316,44 +317,47 @@ def main(log: bool = True) -> None:
     log_path = f"{args.out}/{args.prefix}.gs.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("Genomic Selection Module")
-    logger.info(f"Host: {socket.gethostname()}\n")
-
     # Configuration summary
     if log:
-        logger.info("*" * 60)
-        logger.info("GENOMIC SELECTION CONFIGURATION")
-        logger.info("*" * 60)
-        logger.info(f"Genotype file:   {gfile}")
-        logger.info(f"Phenotype file:  {args.pheno}")
-        if args.ncol is not None:
-            logger.info(f"Analysis Pcol:   {args.ncol}")
-        else:
-            logger.info("Analysis Pcol:   All")
-
+        cfg_rows: list[tuple[str, object]] = [
+            ("Genotype file", gfile),
+            ("Phenotype file", args.pheno),
+            ("Analysis Pcol", args.ncol if args.ncol is not None else "All"),
+        ]
         model_count = 0
         if args.GBLUP:
             model_count += 1
-            logger.info(f"Used model{model_count}:     GBLUP")
+            cfg_rows.append((f"Used model{model_count}", "GBLUP"))
         if args.rrBLUP:
             model_count += 1
-            logger.info(f"Used model{model_count}:     rrBLUP")
+            cfg_rows.append((f"Used model{model_count}", "rrBLUP"))
         if args.BayesA:
             model_count += 1
-            logger.info(f"Used model{model_count}:     BayesA")
+            cfg_rows.append((f"Used model{model_count}", "BayesA"))
         if args.BayesB:
             model_count += 1
-            logger.info(f"Used model{model_count}:     BayesB")
+            cfg_rows.append((f"Used model{model_count}", "BayesB"))
         if args.BayesCpi:
             model_count += 1
-            logger.info(f"Used model{model_count}:     BayesCpi")
-        logger.info(f"Use PCA:         {args.pcd}")
-        logger.info(f"MAF threshold:   {args.maf}")
-        logger.info(f"Missing rate:    {args.geno}")
+            cfg_rows.append((f"Used model{model_count}", "BayesCpi"))
+        cfg_rows.extend(
+            [
+                ("Use PCA", args.pcd),
+                ("MAF threshold", args.maf),
+                ("Missing rate", args.geno),
+            ]
+        )
         if args.plot:
-            logger.info(f"Plot mode:       {args.plot}")
-        logger.info(f"Output prefix:   {args.out}/{args.prefix}")
-        logger.info("*" * 60 + "\n")
+            cfg_rows.append(("Plot mode", args.plot))
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX - GS",
+            config_title="GS CONFIG",
+            host=socket.gethostname(),
+            sections=[("General", cfg_rows)],
+            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            line_max_chars=60,
+        )
 
     checks: list[bool] = []
     if args.bfile:

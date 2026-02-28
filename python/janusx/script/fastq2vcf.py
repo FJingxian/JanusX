@@ -37,6 +37,7 @@ import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
 from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
 
 try:
@@ -307,13 +308,25 @@ def main():
     if not ensure_dir_exists(logger, str(fastq_dir), "FASTQ directory"):
         raise SystemExit(1)
 
-    logger.info("JanusX: FASTQ -> VCF pipeline")
-    logger.info(f"Host: {socket.gethostname()}")
-    logger.info(f"Reference: {reference}")
-    logger.info(f"FASTQ dir: {fastq_dir}")
-    logger.info(f"Workdir: {workdir}")
-    logger.info(f"Backend: {args.backend}")
-    logger.info(f"Max tasks (nohup): {args.maxtask}")
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - Fastq2VCF",
+        config_title="FASTQ2VCF CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                [
+                    ("Reference", reference),
+                    ("FASTQ dir", fastq_dir),
+                    ("Workdir", workdir),
+                    ("Backend", args.backend),
+                    ("Max tasks (nohup)", args.maxtask),
+                ],
+            )
+        ],
+        line_max_chars=60,
+    )
 
     binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
     binary_path.mkdir(parents=True, exist_ok=True)

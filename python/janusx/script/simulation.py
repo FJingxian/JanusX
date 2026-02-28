@@ -25,6 +25,7 @@ from janusx.garfield.garfield2 import ldprune
 from janusx.gfreader import load_genotype_chunks
 from janusx.gfreader import inspect_genotype_file
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -339,23 +340,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_path = f"{outprefix}.sim.log"
     logger = setup_logging(log_path)
 
-    logger.info("JanusX - Simulation CLI")
-    logger.info(f"Host: {socket.gethostname()}\n")
-    logger.info("*" * 60)
-    logger.info("SIMULATION CONFIGURATION")
-    logger.info("*" * 60)
-    logger.info(f"Genotype file:     {gfile}")
-    logger.info(f"Output prefix:     {outprefix}")
-    logger.info(f"Chunk size:        {args.chunksize}")
-    logger.info(f"MAF threshold:     {args.maf}")
-    logger.info(f"Missing threshold: {args.geno}")
-    logger.info(f"Sim mode:          {args.sim_mode}")
-    logger.info(f"Windows:           {args.windows}")
-    logger.info(f"PVE:               {args.pve}")
-    logger.info(f"VE:                {args.ve}")
-    logger.info(f"Write sites:       {args.write_sites}")
-    logger.info(f"Seed:              {args.seed}")
-    logger.info("*" * 60)
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - Simulation",
+        config_title="SIMULATION CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                [
+                    ("Genotype file", gfile),
+                    ("Chunk size", args.chunksize),
+                    ("MAF threshold", args.maf),
+                    ("Missing threshold", args.geno),
+                    ("Sim mode", args.sim_mode),
+                    ("Windows", args.windows),
+                    ("PVE", args.pve),
+                    ("VE", args.ve),
+                    ("Write sites", args.write_sites),
+                    ("Seed", args.seed),
+                ],
+            )
+        ],
+        footer_rows=[("Output prefix", outprefix)],
+        line_max_chars=60,
+    )
 
     checks: list[bool] = []
     if args.bfile:

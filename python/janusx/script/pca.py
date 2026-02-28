@@ -65,6 +65,7 @@ from janusx.gfreader import (
     auto_mmap_window_mb,
 )
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -470,35 +471,46 @@ def main(log: bool = True):
         logger.error("Color set index out of range; please use 0-6 or -1.")
         raise SystemExit(1)
 
-    logger.info("JanusX - Principal Component Analysis Module")
-    logger.info(f"Host: {socket.gethostname()}\n")
-
     if log:
-        logger.info("*" * 60)
-        logger.info("PCA CONFIGURATION")
-        logger.info("*" * 60)
+        cfg_rows: list[tuple[str, object]] = []
         if args.vcf or args.bfile:
-            logger.info(f"Genotype file:    {gfile}")
-            logger.info(f"Output PCs:       top {args.dim}")
-            logger.info(f"MAF threshold:    {args.maf}")
-            logger.info(f"Missing rate:     {args.geno}")
-            logger.info(f"Chunk size:       {args.chunksize}")
-            logger.info(f"Mmap limit:       {args.mmap_limit}")
-        elif args.grm:
-            logger.info(f"GRM prefix:       {gfile}")
-            logger.info(f"Output PCs:       top {args.dim}")
-        elif args.qcov:
-            logger.info(f"PCA prefix:       {gfile} (visualization only)")
-        if args.plot or args.plot3D:
-            logger.info(f"2D visualization: {args.plot}")
-            logger.info(f"3D visualization (GIF): {args.plot3D}")
-        if args.group:
-            logger.info(f"Group file:      {args.group}")
-            logger.info(
-                f"Color palette:   {'auto' if palette_idx == -1 else f'index {palette_idx}'}"
+            cfg_rows.extend(
+                [
+                    ("Genotype file", gfile),
+                    ("Output PCs", f"top {args.dim}"),
+                    ("MAF threshold", args.maf),
+                    ("Missing rate", args.geno),
+                    ("Chunk size", args.chunksize),
+                    ("Mmap limit", args.mmap_limit),
+                ]
             )
-        logger.info(f"Output prefix:    {args.out}/{args.prefix}")
-        logger.info("*" * 60 + "\n")
+        elif args.grm:
+            cfg_rows.extend([("GRM prefix", gfile), ("Output PCs", f"top {args.dim}")])
+        elif args.qcov:
+            cfg_rows.append(("PCA prefix", f"{gfile} (visualization only)"))
+        if args.plot or args.plot3D:
+            cfg_rows.extend(
+                [
+                    ("2D visualization", args.plot),
+                    ("3D visualization (GIF)", args.plot3D),
+                ]
+            )
+        if args.group:
+            cfg_rows.extend(
+                [
+                    ("Group file", args.group),
+                    ("Color palette", "auto" if palette_idx == -1 else f"index {palette_idx}"),
+                ]
+            )
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX - PCA",
+            config_title="PCA CONFIG",
+            host=socket.gethostname(),
+            sections=[("General", cfg_rows)],
+            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            line_max_chars=60,
+        )
 
     checks: list[bool] = []
     if args.vcf:

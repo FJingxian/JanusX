@@ -74,6 +74,7 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -1554,40 +1555,45 @@ def main(log: bool = True):
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
 
-    logger.info(
-        "JanusX - High Performance GWAS CLI "
-        "(LMM/LM: streaming low-memory; FarmCPU: full-memory)"
-    )
-    logger.info(f"Host: {socket.gethostname()}\n")
-
     if log:
-        logger.info("*" * 60)
-        logger.info("GWAS CONFIGURATION")
-        logger.info("*" * 60)
-        logger.info(f"Genotype file:    {gfile}")
-        logger.info(f"Phenotype file:   {args.pheno}")
-        logger.info(f"Phenotype cols:   {args.ncol if args.ncol is not None else 'All'}")
-        logger.info(f"Mmap limit:       {args.mmap_limit}")
-        logger.info(
-            f"Models:           "
-            f"{'LMM ' if args.lmm else ''}"
-            f"{'fastlmm ' if args.fastlmm else ''}"
-            f"{'LM ' if args.lm else ''}"
-            f"{'FarmCPU' if args.farmcpu else ''}"
-        )
-        logger.info(f"Genetic model:    {args.model}")
+        model_tokens: list[str] = []
+        if args.lmm:
+            model_tokens.append("LMM")
+        if args.fastlmm:
+            model_tokens.append("fastLMM")
+        if args.lm:
+            model_tokens.append("LM")
+        if args.farmcpu:
+            model_tokens.append("FarmCPU")
+        cfg_rows: list[tuple[str, object]] = [
+            ("Genotype file", gfile),
+            ("Phenotype file", args.pheno),
+            ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
+            ("Mmap limit", args.mmap_limit),
+            ("Models", " ".join(model_tokens) if len(model_tokens) > 0 else "None"),
+            ("Genetic model", args.model),
+            ("GRM option", args.grm),
+            ("Q option", args.qcov),
+            ("MAF threshold", args.maf),
+            ("Miss threshold", args.geno),
+            ("Chunk size", args.chunksize),
+        ]
         if args.model != "add":
-            logger.info(f"Het filter:       {args.het} (keep [{args.het}, {1.0 - args.het}])")
-        logger.info(f"GRM option:       {args.grm}")
-        logger.info(f"Q option:         {args.qcov}")
+            cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
         if args.cov:
-            logger.info(f"Covariate file:   {args.cov}")
-        logger.info(f"Maf threshold:    {args.maf}")
-        logger.info(f"Miss threshold:   {args.geno}")
-        logger.info(f"Chunk size:       {args.chunksize}")
-        logger.info(f"Threads:          {args.thread} ({cpu_count()} available)")
-        logger.info(f"Output prefix:    {outprefix}")
-        logger.info("*" * 60 + "\n")
+            cfg_rows.append(("Covariate file", args.cov))
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX - GWAS",
+            config_title="GWAS CONFIG",
+            host=socket.gethostname(),
+            sections=[("General", cfg_rows)],
+            footer_rows=[
+                ("Threads", f"{args.thread} ({cpu_count()} available)"),
+                ("Output prefix", outprefix),
+            ],
+            line_max_chars=60,
+        )
 
     checks: list[bool] = []
     if args.bfile:

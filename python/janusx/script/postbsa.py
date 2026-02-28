@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import ensure_all_true, ensure_file_exists
 
 for key in ["MPLBACKEND"]:
@@ -1028,27 +1029,37 @@ def main() -> None:
     log_path = f"{output_stem}.postbsa.log"
     logger = setup_logging(log_path)
 
-    logger.info("JanusX - Post-BSA visualization")
-    logger.info(f"Host: {socket.gethostname()}\n")
-    logger.info("*" * 60)
-    logger.info("POST-BSA CONFIGURATION")
-    logger.info("*" * 60)
-    logger.info(f"Input file:        {args.file}")
-    logger.info(f"Bulk1:             {args.bulk1}")
-    logger.info(f"Bulk2:             {args.bulk2}")
-    logger.info(f"Window (Mb):       {args.window}")
-    logger.info(f"Step (Mb):         {args.step}")
-    logger.info(f"Plot ratio:        {args.ratio}")
-    logger.info(f"Format:            {args.format}")
-    logger.info(f"Min DP:            {args.min_dp}")
-    logger.info(f"Min GQ:            {args.min_gq}")
-    logger.info(f"Total DP range:    {args.total_dp[0]}-{args.total_dp[1]}")
-    logger.info(f"Ref allele freq:   {args.ref_allele_freq}")
-    logger.info(f"Depth difference:  {args.depth_difference}")
-    logger.info(f"ED power:          {args.ed_power}")
-    logger.info(f"Threads:           {args.thread} ({cpu_count()} available)")
-    logger.info(f"Output stem:       {output_stem}")
-    logger.info("*" * 60 + "\n")
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - Post-BSA",
+        config_title="POST-BSA CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                [
+                    ("Input file", args.file),
+                    ("Bulk1", args.bulk1),
+                    ("Bulk2", args.bulk2),
+                    ("Window (Mb)", args.window),
+                    ("Step (Mb)", args.step),
+                    ("Plot ratio", args.ratio),
+                    ("Format", args.format),
+                    ("Min DP", args.min_dp),
+                    ("Min GQ", args.min_gq),
+                    ("Total DP range", f"{args.total_dp[0]}-{args.total_dp[1]}"),
+                    ("Ref allele freq", args.ref_allele_freq),
+                    ("Depth difference", args.depth_difference),
+                    ("ED power", args.ed_power),
+                ],
+            )
+        ],
+        footer_rows=[
+            ("Threads", f"{args.thread} ({cpu_count()} available)"),
+            ("Output stem", output_stem),
+        ],
+        line_max_chars=60,
+    )
 
     checks = [ensure_file_exists(logger, args.file, "Input BSA table")]
     if not ensure_all_true(checks):

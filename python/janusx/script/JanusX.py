@@ -68,15 +68,17 @@ def main():
         ['gwas','postgwas','postgarfield','postbsa','garfield','grm','pca','gs','sim','simulation','gmerge','fastq2vcf','update'],
         [gwas,postgwas,postgarfield,postbsa,garfield,grm,pca,gs,sim,simulation,gmerge,fastq2vcf,update],
     ))
-    print(__logo__)
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
+            print(__logo__)
             print("Usage: jx <module> [options]")
             print(f"Available modules: {' '.join(module.keys())}")
             print("Shortcut: jx -update / --update  (same as: jx update)")
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
+            print(__logo__)
             print(__version__)
         elif sys.argv[1] == '-update' or sys.argv[1] == '--update':
+            print(__logo__)
             # Keep argparse usage as "jx --update ..."
             sys.argv[0] = "jx update"
             del sys.argv[1]

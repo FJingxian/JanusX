@@ -38,6 +38,7 @@ from janusx.gfreader import (
     auto_mmap_window_mb,
 )
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -342,24 +343,29 @@ def main(log: bool = True):
     log_path = f"{args.out}/{args.prefix}.grm.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX: Efficient Genetic Relationship Matrix (GRM) Calculator")
-    logger.info(f"Host: {socket.gethostname()}\n")
-
     if log:
-        logger.info("*" * 60)
-        logger.info("GRM CONFIGURATION")
-        logger.info("*" * 60)
-        logger.info(f"Genotype file: {gfile}")
-        logger.info(
-            f"GRM method: {'Centered' if args.method == 1 else 'Standardized/weighted'}"
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX - GRM",
+            config_title="GRM CONFIG",
+            host=socket.gethostname(),
+            sections=[
+                (
+                    "General",
+                    [
+                        ("Genotype file", gfile),
+                        ("GRM method", "Centered" if args.method == 1 else "Standardized/weighted"),
+                        ("MAF threshold", args.maf),
+                        ("Missing rate", args.geno),
+                        ("Chunk size", args.chunksize),
+                        ("Mmap limit", args.mmap_limit),
+                        ("Save as NPY", args.npy),
+                    ],
+                )
+            ],
+            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            line_max_chars=60,
         )
-        logger.info(f"MAF threshold: {args.maf}")
-        logger.info(f"Missing rate:  {args.geno}")
-        logger.info(f"Chunk size:    {args.chunksize}")
-        logger.info(f"Mmap limit:    {args.mmap_limit}")
-        logger.info(f"Save as NPY: {args.npy}")
-        logger.info(f"Output prefix: {args.out}/{args.prefix}")
-        logger.info("*" * 60 + "\n")
 
     checks: list[bool] = []
     if args.bfile:

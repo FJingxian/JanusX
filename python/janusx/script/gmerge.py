@@ -26,6 +26,7 @@ import socket
 import argparse
 
 from ._common.log import setup_logging
+from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -138,22 +139,28 @@ def main(log: bool = True):
     log_path = f"{report_dir}/{prefix}.merge.log".replace("\\", "/").replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX: Efficient Genotype Merger (gmerge)")
-    logger.info(f"Host: {socket.gethostname()}\n")
-
     if log:
-        logger.info("*" * 60)
-        logger.info("GMERGE CONFIGURATION")
-        logger.info("*" * 60)
-        logger.info(f"Inputs ({len(inputs)}):")
-        for x in inputs:
-            logger.info(f"  - {x}")
-        logger.info(f"Output: {out}")
-        logger.info(f"Output format: {out_fmt}")
-        logger.info(f"Check inputs exist: {not args.no_check}")
-        logger.info(f"Report dir: {report_dir}")
-        logger.info(f"Log file: {log_path}")
-        logger.info("*" * 60 + "\n")
+        input_rows = [(f"Input {i + 1}", x) for i, x in enumerate(inputs)]
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX - gmerge",
+            config_title="GMERGE CONFIG",
+            host=socket.gethostname(),
+            sections=[
+                ("Inputs", input_rows),
+                (
+                    "General",
+                    [
+                        ("Output", out),
+                        ("Output format", out_fmt),
+                        ("Check inputs exist", (not args.no_check)),
+                        ("Report dir", report_dir),
+                        ("Log file", log_path),
+                    ],
+                ),
+            ],
+            line_max_chars=60,
+        )
 
     if args.no_check:
         logger.warning("--no-check is ignored in CLI mode; input existence is always validated.")

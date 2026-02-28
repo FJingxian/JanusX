@@ -19,6 +19,7 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
+from janusx.script._common.config_render import emit_cli_configuration
 
 
 def _safe_trait_label(label: object) -> str:
@@ -194,26 +195,36 @@ def main() -> None:
     log_path = f"{args.out}/{prefix}.garfield.log".replace("//", "/")
     logger = setup_logging(log_path)
 
-    logger.info("JanusX - GARFIELD")
-    logger.info(f"Host: {socket.gethostname()}\n")
-    logger.info("*" * 60)
-    logger.info("GARFIELD CONFIGURATION")
-    logger.info("*" * 60)
-    logger.info(f"Genotype:      {gfile}")
-    logger.info(f"Phenotype:     {args.pheno}")
-    logger.info(f"Gene file:     {args.genefile}")
-    logger.info(f"GFF3:          {args.gff3}")
-    logger.info(f"VarType:       {args.vartype}")
-    if not (args.genefile and args.gff3):
-        logger.info(f"Step:          {args.step}")
-    logger.info(f"Extension:     {args.extension}")
-    logger.info(f"Top SNPs:      {args.nsnp}")
-    logger.info(f"Estimators:    {args.nestimators}")
     threads = cpu_count() if args.threads == -1 else int(args.threads)
-    logger.info(f"Threads:       {threads}")
-    logger.info(f"Output prefix: {outprefix}")
-    logger.info(f"Mmap limit:    {args.mmap_limit}")
-    logger.info("*" * 60 + "\n")
+    cfg_rows: list[tuple[str, object]] = [
+        ("Genotype", gfile),
+        ("Phenotype", args.pheno),
+        ("Gene file", args.genefile),
+        ("GFF3", args.gff3),
+        ("VarType", args.vartype),
+    ]
+    if not (args.genefile and args.gff3):
+        cfg_rows.append(("Step", args.step))
+    cfg_rows.extend(
+        [
+            ("Extension", args.extension),
+            ("Top SNPs", args.nsnp),
+            ("Estimators", args.nestimators),
+            ("Mmap limit", args.mmap_limit),
+        ]
+    )
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - GARFIELD",
+        config_title="GARFIELD CONFIG",
+        host=socket.gethostname(),
+        sections=[("General", cfg_rows)],
+        footer_rows=[
+            ("Threads", threads),
+            ("Output prefix", outprefix),
+        ],
+        line_max_chars=60,
+    )
 
     only_one_gene_arg = bool(args.genefile) ^ bool(args.gff3)
     if only_one_gene_arg:

@@ -53,6 +53,7 @@ import re
 import time
 import socket
 import sys
+import colorsys
 from contextlib import nullcontext
 from typing import Any, Optional, Tuple
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
@@ -60,6 +61,9 @@ from joblib import Parallel, delayed
 import warnings
 
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
+_QQ_FIXED_RATIO = 5.0 / 4.0
+_CONFIG_LINE_MAX_CHARS = 60
+_CONFIG_OVERFLOW_MARK = "***"
 
 try:
     from rich.progress import (
@@ -87,6 +91,163 @@ except Exception:
     tqdm = None  # type: ignore[assignment]
     _HAS_TQDM = False
 
+try:
+    from rich.console import Console, Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+    _HAS_RICH_CONSOLE = True
+except Exception:
+    Console = None  # type: ignore[assignment]
+    Group = None  # type: ignore[assignment]
+    Panel = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
+    Text = None  # type: ignore[assignment]
+    box = None  # type: ignore[assignment]
+    _HAS_RICH_CONSOLE = False
+
+
+def _emit_info_to_file_handlers(logger: logging.Logger, message: str) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        __file__,
+        0,
+        message,
+        args=(),
+        exc_info=None,
+    )
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+
+
+def _emit_info_to_stream_handlers(logger: logging.Logger, message: str) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        __file__,
+        0,
+        message,
+        args=(),
+        exc_info=None,
+    )
+    for handler in logger.handlers:
+        if not isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+
+
+def _truncate_config_line(
+    text: object,
+    *,
+    max_chars: int = _CONFIG_LINE_MAX_CHARS,
+    overflow_mark: str = _CONFIG_OVERFLOW_MARK,
+) -> str:
+    s = str(text)
+    if max_chars <= 0:
+        return ""
+    if len(s) <= max_chars:
+        return s
+    mark = str(overflow_mark)
+    if mark == "":
+        return s[:max_chars]
+    if max_chars <= len(mark):
+        return mark[:max_chars]
+    keep = max_chars - len(mark)
+    return s[:keep] + mark
+
+
+def _render_postgwas_config_rich(
+    *,
+    title: str,
+    host: str,
+    base_rows: list[tuple[str, str]],
+    merge_map_rows: list[tuple[str, str]],
+    vis_rows: Optional[list[tuple[str, str]]],
+    anno_rows: Optional[list[tuple[str, str]]],
+    output_prefix: str,
+    threads_text: str,
+    key_width: int = 20,
+) -> bool:
+    if not (_HAS_RICH_CONSOLE and sys.stdout.isatty()):
+        return False
+
+    try:
+        assert Console is not None
+        assert Group is not None
+        assert Panel is not None
+        assert Table is not None
+        assert Text is not None
+        assert box is not None
+
+        def _kv_table(rows: list[tuple[str, str]]) -> Any:
+            t = Table(
+                show_header=False,
+                box=box.SIMPLE,
+                pad_edge=False,
+                expand=True,
+            )
+            t.add_column(style="bold cyan", no_wrap=True, width=max(8, int(key_width)))
+            t.add_column(style="white", overflow="fold")
+            for k, v in rows:
+                k_txt = str(k)
+                v_max = max(1, _CONFIG_LINE_MAX_CHARS - len(k_txt) - 2)
+                v_txt = _truncate_config_line(v, max_chars=v_max)
+                t.add_row(k_txt, v_txt)
+            return t
+
+        parts: list[Any] = [
+            Text(title, style="bold"),
+            Text(f"Host: {host}"),
+            Text(""),
+            Text("General", style="bold cyan"),
+            _kv_table(base_rows),
+        ]
+
+        if len(merge_map_rows) > 0:
+            map_table = Table(
+                show_header=True,
+                box=box.SIMPLE,
+                pad_edge=False,
+                expand=True,
+            )
+            map_table.add_column("ID", style="bold cyan", no_wrap=True, width=6)
+            map_table.add_column("GWAS file", style="white")
+            for idx, file in merge_map_rows:
+                idx_txt = str(idx)
+                file_max = max(1, _CONFIG_LINE_MAX_CHARS - len(idx_txt) - 1)
+                map_table.add_row(idx_txt, _truncate_config_line(file, max_chars=file_max))
+            parts.extend([Text(""), Text("Merge trait-id mapping", style="bold cyan"), map_table])
+
+        parts.append(Text(""))
+        if vis_rows is None:
+            parts.extend([Text("Visualization", style="bold cyan"), Text("disabled", style="white")])
+        else:
+            parts.extend([Text("Visualization", style="bold cyan"), _kv_table(vis_rows)])
+
+        if anno_rows is not None:
+            parts.extend([Text(""), Text("Annotation", style="bold cyan"), _kv_table(anno_rows)])
+
+        parts.extend(
+            [
+                Text(""),
+                Text(_truncate_config_line(f"Output prefix: {output_prefix}"), style="white"),
+                Text(_truncate_config_line(f"Threads: {threads_text}"), style="white"),
+            ]
+        )
+
+        panel = Panel(
+            Group(*parts),
+            title="POST-GWAS CONFIGURATION",
+            border_style="green",
+            expand=False,
+        )
+        Console().print(panel)
+        return True
+    except Exception:
+        return False
+
 
 def _parse_ratio(value: object, name: str) -> float:
     """Parse aspect ratio string/number: supports '2', '1.25', '5/4'."""
@@ -109,6 +270,36 @@ def _parse_ratio(value: object, name: str) -> float:
     if ratio <= 0:
         raise ValueError(f"{name} ratio must be > 0.")
     return ratio
+
+
+def _scaled_fontsize_for_manhattan(
+    manh_ratio: Optional[float],
+    *,
+    width_in: float = 8.0,
+    base_font: float = 6.0,
+    ref_ratio: float = 2.0,
+    min_scale: float = 0.55,
+) -> float:
+    """
+    Scale font size with Manhattan panel height.
+    As panel height decreases (ratio increases), font size decreases.
+    """
+    if manh_ratio is None:
+        return float(base_font)
+    try:
+        ratio = float(manh_ratio)
+    except Exception:
+        return float(base_font)
+    if not np.isfinite(ratio) or ratio <= 0:
+        return float(base_font)
+
+    ref_h = float(width_in) / float(ref_ratio)
+    now_h = float(width_in) / float(ratio)
+    if not (np.isfinite(ref_h) and ref_h > 0 and np.isfinite(now_h) and now_h > 0):
+        return float(base_font)
+    scale = float(np.sqrt(now_h / ref_h))
+    scale = float(np.clip(scale, float(min_scale), 1.0))
+    return float(base_font) * scale
 
 
 def _parse_ldblock_spec(
@@ -310,13 +501,63 @@ def _resolve_manhattan_colors(spec: Optional[Tuple[str, Any]], n_chr: int) -> Op
     mode, payload = spec
     if mode == "list":
         return list(payload)
-    cmap = plt.get_cmap(str(payload))
+    cmap_name = str(payload).strip()
+    cmap = plt.get_cmap(cmap_name)
     # For discrete palettes (tab10/tab20/Set*, etc.), cycle native bins directly.
     # This avoids adjacent duplicate colors when n_chr > number of bins.
     if getattr(cmap, "N", 256) <= 32:
         n_bins = max(1, int(cmap.N))
-        return [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_chr)]
-    return [mcolors.to_hex(cmap(i / max(1, n_chr - 1))) for i in range(n_chr)]
+        colors = [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_chr)]
+    else:
+        colors = [mcolors.to_hex(cmap(i / max(1, n_chr - 1))) for i in range(n_chr)]
+    if cmap_name.lower() == "tab10":
+        return [_desaturate_color(c, 0.80) for c in colors]
+    return colors
+
+
+def _desaturate_color(color: str, sat_scale: float = 0.80) -> str:
+    r, g, b = mcolors.to_rgb(color)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    s2 = float(np.clip(float(s) * float(sat_scale), 0.0, 1.0))
+    r2, g2, b2 = colorsys.hsv_to_rgb(h, s2, v)
+    return mcolors.to_hex((r2, g2, b2))
+
+
+def _resolve_merge_series_colors(
+    spec: Optional[Tuple[str, Any]],
+    n_series: int,
+) -> list[str]:
+    if n_series <= 0:
+        return []
+
+    if spec is None:
+        cmap_name = "tab10" if n_series <= 10 else "tab20"
+        cmap = plt.get_cmap(cmap_name)
+        n_bins = max(1, int(getattr(cmap, "N", 10 if n_series <= 10 else 20)))
+        colors = [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_series)]
+        if cmap_name.lower() == "tab10":
+            colors = [_desaturate_color(c, 0.90) for c in colors]
+        return colors
+
+    mode, payload = spec
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 0:
+            cmap = plt.get_cmap("tab20")
+            n_bins = max(1, int(getattr(cmap, "N", 20)))
+            return [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_series)]
+        return [colors[i % len(colors)] for i in range(n_series)]
+
+    cmap_name = str(payload).strip()
+    cmap = plt.get_cmap(cmap_name)
+    if getattr(cmap, "N", 256) <= 32:
+        n_bins = max(1, int(cmap.N))
+        colors = [mcolors.to_hex(cmap(i % n_bins)) for i in range(n_series)]
+    else:
+        colors = [mcolors.to_hex(cmap(i / max(1, n_series - 1))) for i in range(n_series)]
+    if cmap_name.lower() == "tab10":
+        colors = [_desaturate_color(c, 0.90) for c in colors]
+    return colors
 
 
 def _natural_tokens(text: str) -> list[tuple[int, object]]:
@@ -465,6 +706,62 @@ def _parse_ldclump_spec(value: object) -> tuple[int, float]:
     if not (0.0 <= r2_thr <= 1.0):
         raise ValueError("--LDclump r2 threshold must be within [0, 1].")
     return window_bp, r2_thr
+
+
+def _parse_ylim_spec(value: object) -> tuple[Optional[float], Optional[float]]:
+    """
+    Parse y-range spec for Manhattan plotting.
+    Supports:
+      - "6" -> (0.0, 6.0)
+      - "0:6" / "0-6" / "[0:6]" -> (0.0, 6.0)
+      - "2:" / "2-" -> (2.0, None)     # upper auto
+      - ":6" / "-6" -> (None, 6.0)     # lower auto
+    """
+    if value is None:
+        raise ValueError("--ylim is None.")
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("--ylim is empty.")
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+
+    # Range form: <lo:hi>, <lo:>, <:hi> (also accepts '-')
+    if (":" in text) or ("-" in text):
+        m = re.match(r"^\s*([0-9]*\.?[0-9]*)\s*(?:-|:)\s*([0-9]*\.?[0-9]*)\s*$", text)
+        if m is None:
+            raise ValueError(
+                f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, or <:max> "
+                "(e.g. 6, 0:6, 2:, :6)."
+            )
+        lo_txt = m.group(1).strip()
+        hi_txt = m.group(2).strip()
+        if lo_txt == "" and hi_txt == "":
+            raise ValueError("Invalid --ylim: at least one bound must be provided.")
+        lo = float(lo_txt) if lo_txt != "" else None
+        hi = float(hi_txt) if hi_txt != "" else None
+    else:
+        # Single number means [0, max]
+        try:
+            hi = float(text)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid --ylim format: {value}. Use <max>, <min:max>, <min:>, or <:max>."
+            ) from e
+        lo = 0.0
+
+    if lo is not None:
+        if not np.isfinite(lo):
+            raise ValueError("--ylim lower bound must be finite.")
+        if lo < 0:
+            raise ValueError("--ylim lower bound must be >= 0.")
+    if hi is not None:
+        if not np.isfinite(hi):
+            raise ValueError("--ylim upper bound must be finite.")
+        if hi <= 0:
+            raise ValueError("--ylim upper bound must be > 0.")
+    if lo is not None and hi is not None and hi <= lo:
+        raise ValueError("--ylim upper bound must be greater than lower bound.")
+    return (float(lo) if lo is not None else None, float(hi) if hi is not None else None)
 
 
 def _format_bimrange_tuple(item: tuple[str, int, int]) -> str:
@@ -670,6 +967,8 @@ def _apply_bimrange_manhattan_axis(
 def _apply_multi_bimrange_manhattan_axis(
     ax: plt.Axes,
     layout: list[dict[str, object]],
+    *,
+    label_fontsize: Optional[float] = None,
 ) -> None:
     if len(layout) == 0:
         return
@@ -682,6 +981,7 @@ def _apply_multi_bimrange_manhattan_axis(
     labels = [str(seg["label"]) for seg in layout]
     ax.set_xticks(centers)
     ax.set_xticklabels(labels)
+    loc_fontsize = 5.0 if label_fontsize is None else float(label_fontsize)
     for i in range(len(layout) - 1):
         x_end = float(layout[i]["x_end"])
         x_next = float(layout[i + 1]["x_start"])
@@ -700,7 +1000,7 @@ def _apply_multi_bimrange_manhattan_axis(
             transform=trans,
             ha="right",
             va="top",
-            fontsize=5,
+            fontsize=loc_fontsize,
             clip_on=False,
             zorder=40,
             bbox={
@@ -717,7 +1017,7 @@ def _apply_multi_bimrange_manhattan_axis(
             transform=trans,
             ha="left",
             va="top",
-            fontsize=5,
+            fontsize=loc_fontsize,
             clip_on=False,
             zorder=40,
             bbox={
@@ -734,7 +1034,11 @@ def _apply_multi_bimrange_manhattan_axis(
     ax.set_xlabel(None)
 
 
-def _show_end_locs_without_xticks(ax: plt.Axes) -> None:
+def _show_end_locs_without_xticks(
+    ax: plt.Axes,
+    *,
+    label_fontsize: Optional[float] = None,
+) -> None:
     x0, x1 = ax.get_xlim()
     fmt = ax.xaxis.get_major_formatter()
 
@@ -759,7 +1063,7 @@ def _show_end_locs_without_xticks(ax: plt.Axes) -> None:
     ax.set_xticks([])
     ax.tick_params(axis="x", which="both", length=0, labelbottom=False)
     trans = ax.transAxes
-    loc_fontsize = 5
+    loc_fontsize = 5.0 if label_fontsize is None else float(label_fontsize)
     ax.text(
         0.0,
         -0.06,
@@ -1542,6 +1846,7 @@ def _overlay_manhattan_threshold_points(
     base_size: float,
     rasterized: bool,
     min_logp: float = 0.5,
+    max_logp: Optional[float] = None,
     ignore: Optional[list[object]] = None,
 ) -> None:
     """
@@ -1563,6 +1868,8 @@ def _overlay_manhattan_threshold_points(
     dfp = dfp.loc[keep].copy()
     dfp["ylog"] = -np.log10(pd.to_numeric(dfp["y"], errors="coerce"))
     dfp = dfp[dfp["ylog"] >= float(min_logp)]
+    if max_logp is not None:
+        dfp = dfp[dfp["ylog"] <= float(max_logp)]
     if dfp.shape[0] == 0:
         return
 
@@ -1580,6 +1887,9 @@ def _overlay_manhattan_threshold_points(
             dfp.loc[sig_mask, "ylog"],
             color="red",
             s=float(base_size) * 1.5,
+            alpha=0.85,
+            edgecolors="none",
+            linewidths=0.0,
             rasterized=rasterized,
             zorder=6,
         )
@@ -1689,6 +1999,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         need_manh_panel = args.manh_ratio is not None or effective_ldblock_ratio is not None
         plotmodel = None
+        plotmodel_qq = None
         if (need_manh_panel or args.qq_ratio is not None) and df.shape[0] > 0:
             plotmodel = GWASPLOT(
                 df,
@@ -1700,9 +2011,25 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             )
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
+            if args.qq_ratio is not None:
+                # QQ should keep all SNPs to preserve expected quantiles.
+                plotmodel_qq = GWASPLOT(
+                    df,
+                    chr_col,
+                    pos_col,
+                    p_col,
+                    0.1,
+                    compression=False,
+                )
         width_in = 8.0
         gene_panel_h_in = width_in / 20.0
         dpi = 300
+        manh_ratio_for_font = float(args.manh_ratio) if args.manh_ratio is not None else 2.0
+        manh_fontsize_target = _scaled_fontsize_for_manhattan(
+            manh_ratio_for_font,
+            width_in=width_in,
+        )
+        manh_loc_fontsize = max(3.0, float(manh_fontsize_target) * 0.85)
         manh_ylim = None
         manh_height_in = None
         manh_fontsize = None
@@ -1710,8 +2037,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         manh_xlim = None
         manh_axes_bounds = None
         hide_axis_labels = args.manh_ratio is not None and args.manh_ratio > 4.0
-        manh_min_logp = 0.0 if args.bimrange_tuples is not None else 0.5
-        manh_ymin = 0.0 if args.bimrange_tuples is not None else 0.5
+        default_manh_min = 0.0
+        manh_min_logp = args.ylim_min if args.ylim_min is not None else default_manh_min
+        manh_max_logp = args.ylim_max
+        manh_ymin = manh_min_logp
 
         plot_colors = None
         two_color_style = _resolve_two_color_style(args.pallete_spec)
@@ -1734,13 +2063,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
                 ax.set_xticks([])
                 ax.set_yticks([])
+                ax.xaxis.label.set_size(manh_fontsize_target)
+                ax.yaxis.label.set_size(manh_fontsize_target)
+                ax.tick_params(axis="both", labelsize=manh_fontsize_target)
                 if hide_axis_labels:
                     ax.set_xlabel("")
                     ax.set_ylabel("")
                 return (
                     ax.get_ylim(),
                     np.asarray(ax.get_yticks(), dtype=float),
-                    float(ax.xaxis.label.get_size()),
+                    float(manh_fontsize_target),
                     ax.get_xlim(),
                 )
 
@@ -1766,6 +2098,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax=ax,
                         color_set=plot_colors,
                         min_logp=manh_min_logp,
+                        max_logp=manh_max_logp,
                         y_min=manh_ymin,
                         s=args.scatter_size,
                         rasterized=rasterized,
@@ -1777,18 +2110,32 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         base_size=args.scatter_size,
                         rasterized=rasterized,
                         min_logp=manh_min_logp,
+                        max_logp=manh_max_logp,
                     )
                 else:
+                    y_hl = -np.log10(
+                        pd.to_numeric(
+                            plotmodel.df.loc[df_hl_idx, "y"],
+                            errors="coerce",
+                        ).to_numpy(dtype=float)
+                    )
+                    keep_hl = np.isfinite(y_hl) & (y_hl >= float(manh_min_logp))
+                    if manh_max_logp is not None:
+                        keep_hl = keep_hl & (y_hl <= float(manh_max_logp))
+                    draw_hl_idx = df_hl_idx[keep_hl]
+                    draw_hl_y = y_hl[keep_hl]
                     ax.scatter(
-                        plotmodel.df.loc[df_hl_idx, "x"],
-                        -np.log10(plotmodel.df.loc[df_hl_idx, "y"]),
+                        plotmodel.df.loc[draw_hl_idx, "x"],
+                        draw_hl_y,
                         marker="D",
                         color="red",
+                        alpha=0.85,
                         zorder=10,
                         s=args.scatter_size,
-                        edgecolors="black",
+                        edgecolors="none",
+                        linewidths=0.0,
                     )
-                    for idx in df_hl_idx:
+                    for idx in draw_hl_idx:
                         text = df_hl.loc[idx, 3]
                         ax.text(
                             plotmodel.df.loc[idx, "x"],
@@ -1803,6 +2150,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax=ax,
                         color_set=plot_colors,
                         min_logp=manh_min_logp,
+                        max_logp=manh_max_logp,
                         y_min=manh_ymin,
                         s=args.scatter_size,
                         ignore=df_hl_idx,
@@ -1815,6 +2163,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         base_size=args.scatter_size,
                         rasterized=rasterized,
                         min_logp=manh_min_logp,
+                        max_logp=manh_max_logp,
                         ignore=list(df_hl_idx),
                     )
             else:
@@ -1823,6 +2172,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax=ax,
                     color_set=plot_colors,
                     min_logp=manh_min_logp,
+                    max_logp=manh_max_logp,
                     y_min=manh_ymin,
                     s=args.scatter_size,
                     rasterized=rasterized,
@@ -1834,23 +2184,33 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     base_size=args.scatter_size,
                     rasterized=rasterized,
                     min_logp=manh_min_logp,
+                    max_logp=manh_max_logp,
                 )
 
             if args.bimrange_tuples is not None:
                 if len(bim_layout) > 1:
-                    _apply_multi_bimrange_manhattan_axis(ax, bim_layout)
+                    _apply_multi_bimrange_manhattan_axis(
+                        ax,
+                        bim_layout,
+                        label_fontsize=manh_loc_fontsize,
+                    )
                 elif len(args.bimrange_tuples) == 1:
                     bchrom, bstart, bend = args.bimrange_tuples[0]
                     _apply_bimrange_manhattan_axis(ax, bchrom, bstart, bend)
-                    _show_end_locs_without_xticks(ax)
-            if args.manh_ylim is not None:
-                ymin_now, _ = ax.get_ylim()
-                if args.manh_ylim <= ymin_now:
-                    logger.warning(
-                        f"Warning: manh-ylim ({args.manh_ylim}) <= current ymin ({ymin_now:.4g}); ignored."
+                    _show_end_locs_without_xticks(
+                        ax,
+                        label_fontsize=manh_loc_fontsize,
                     )
-                else:
-                    ax.set_ylim(ymin_now, args.manh_ylim)
+            if args.ylim_min is not None or args.ylim_max is not None:
+                _y0, _y1 = ax.get_ylim()
+                lo = float(args.ylim_min) if args.ylim_min is not None else 0.0
+                hi = float(args.ylim_max) if args.ylim_max is not None else float(_y1)
+                if not (hi > lo):
+                    hi = lo + max(1e-9, abs(lo) * 1e-9)
+                ax.set_ylim(lo, hi)
+            ax.xaxis.label.set_size(manh_fontsize_target)
+            ax.yaxis.label.set_size(manh_fontsize_target)
+            ax.tick_params(axis="both", labelsize=manh_fontsize_target)
             if hide_axis_labels:
                 ax.set_xlabel("")
                 ax.set_ylabel("")
@@ -1858,7 +2218,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             return (
                 ax.get_ylim(),
                 np.asarray(ax.get_yticks(), dtype=float),
-                float(ax.xaxis.label.get_size()),
+                float(manh_fontsize_target),
                 ax.get_xlim(),
             )
 
@@ -1882,7 +2242,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         # ----------------- QQ plot -----------------
         if args.qq_ratio is not None:
-            if plotmodel is None:
+            if plotmodel_qq is None:
                 logger.warning("Warning: QQ plotting skipped because no SNPs are available.")
                 qq_path = None
             else:
@@ -1895,45 +2255,34 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     dpi=dpi,
                 )
                 ax2 = fig.add_subplot(111)
-                plotmodel.qq(
+                plotmodel_qq.qq(
                     ax=ax2,
                     color_set=[qq_point_color, qq_band_color],
                     line_color="black",
                     scatter_size=args.scatter_size,
                 )
-                qq_xmax = float(np.log10(plotmodel.df.shape[0] + 1))
+                qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
                 if np.isfinite(qq_xmax) and qq_xmax > 0:
-                    cur_left, _ = ax2.get_xlim()
-                    ax2.set_xlim(cur_left, qq_xmax)
+                    x_left = 0.0
+                    x_right = float(qq_xmax)
+                else:
+                    x_left, x_right = ax2.get_xlim()
+                    x_left = float(x_left)
+                    x_right = float(x_right)
+                if x_right <= x_left:
+                    x_left, x_right = (0.0, max(1.0, x_right))
+                x_pad = max(1e-9, 0.02 * float(x_right - x_left))
+                ax2.set_xlim(x_left - x_pad, x_right + x_pad)
                 if manh_ylim is not None:
                     ax2.set_ylim(manh_ylim)
-                xlim_now = ax2.get_xlim()
-                ylim_now = ax2.get_ylim()
-                shared_min = float(max(xlim_now[0], ylim_now[0]))
-                ax2.set_xlim(shared_min, xlim_now[1])
-                ax2.set_ylim(shared_min, ylim_now[1])
-                if manh_yticks is not None:
+                if manh_yticks is not None and manh_ylim is not None:
                     y0, y1 = ax2.get_ylim()
                     lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
                     yticks = [
                         float(t) for t in manh_yticks
                         if (t >= lo - 1e-12) and (t <= hi + 1e-12)
                     ]
-                    if not np.isclose(shared_min, 0.0):
-                        yticks = [t for t in yticks if not np.isclose(t, 0.0)]
                     ax2.set_yticks(yticks)
-                if not np.isclose(shared_min, 0.0):
-                    xticks = [
-                        t for t in ax2.get_xticks()
-                        if (not np.isclose(t, shared_min)) and (not np.isclose(t, 0.0))
-                    ]
-                    ax2.set_xticks(xticks)
-                    if manh_yticks is None:
-                        yticks = [
-                            t for t in ax2.get_yticks()
-                            if (not np.isclose(t, shared_min)) and (not np.isclose(t, 0.0))
-                        ]
-                        ax2.set_yticks(yticks)
                 if manh_fontsize is not None:
                     ax2.xaxis.label.set_size(manh_fontsize)
                     ax2.yaxis.label.set_size(manh_fontsize)
@@ -2350,7 +2699,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     line_color="grey",
                 )
             if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
-                _show_end_locs_without_xticks(ax_manhld_top)
+                _show_end_locs_without_xticks(
+                    ax_manhld_top,
+                    label_fontsize=max(3.0, float(_tmp_fontsize) * 0.85),
+                )
 
             manhld_path = f"{args.out}/{args.prefix}.manhld.{args.format}"
             fig_manhld.savefig(manhld_path, transparent=True)
@@ -2550,6 +2902,578 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             logger.info(f"Annotation file not found: {args.anno}\n")
 
 
+def _read_merge_gwas_table(
+    file: str,
+    chr_col: str,
+    pos_col: str,
+    p_col: str,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(file, sep="\t", usecols=[chr_col, pos_col, p_col])
+    except Exception as e:
+        logger.error(
+            f"Failed to read required columns from {file}: "
+            f"{chr_col}, {pos_col}, {p_col}"
+        )
+        raise SystemExit(1) from e
+
+    if df.shape[0] == 0:
+        return df
+
+    df = df.loc[:, [chr_col, pos_col, p_col]].copy()
+    df[chr_col] = df[chr_col].astype(str)
+    pos_num = pd.to_numeric(df[pos_col], errors="coerce")
+    p_num = pd.to_numeric(df[p_col], errors="coerce")
+    mask = (
+        pos_num.notna()
+        & np.isfinite(pos_num.to_numpy(dtype=float))
+        & p_num.notna()
+        & np.isfinite(p_num.to_numpy(dtype=float))
+        & (p_num > 0.0)
+    )
+    df = df.loc[mask, [chr_col, pos_col, p_col]].copy()
+    if df.shape[0] == 0:
+        return df
+
+    df[pos_col] = pd.to_numeric(df[pos_col], errors="coerce").astype(int)
+    df[p_col] = pd.to_numeric(df[p_col], errors="coerce").astype(float)
+    return df
+
+
+def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
+    files = [str(f) for f in args.merge_files]
+    if len(files) < 2:
+        logger.warning(
+            "Warning: --merge requires at least two input GWAS files in total; "
+            "falling back to normal postgwas flow."
+        )
+        _run_postgwas_tasks(args, logger)
+        return
+
+    chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
+    logger.info("* Visualizing merged Manhattan plot...")
+
+    series_colors = _resolve_merge_series_colors(args.pallete_spec, len(files))
+    two_color_style = _resolve_two_color_style(args.pallete_spec)
+
+    frames_raw: list[pd.DataFrame] = []
+    chrom_sets: list[tuple[int, str, set[str]]] = []
+    pvals_by_series: dict[int, np.ndarray] = {}
+    for i, file in enumerate(files):
+        df = _read_merge_gwas_table(file, chr_col, pos_col, p_col, logger)
+        if df.shape[0] == 0:
+            logger.warning(f"Warning: no valid SNP rows in merged file {i}: {file}; skipped.")
+            continue
+
+        chrom_set = set(df[chr_col].astype(str).tolist())
+        chrom_sets.append((i, file, chrom_set))
+        pvals = np.asarray(df[p_col], dtype=float)
+        pvals = np.clip(pvals, np.nextafter(0.0, 1.0), np.inf)
+        pvals_by_series[i] = pvals
+
+        dfi = pd.DataFrame(
+            {
+                chr_col: df[chr_col].astype(str).to_numpy(),
+                pos_col: np.asarray(df[pos_col], dtype=np.int64),
+                p_col: pvals,
+                "_series_idx": i,
+            }
+        )
+        frames_raw.append(dfi)
+
+    if len(frames_raw) == 0:
+        logger.error("No valid SNPs available for merged plotting.")
+        return
+
+    if len(chrom_sets) >= 2:
+        ref_i, ref_file, ref_chroms = chrom_sets[0]
+        mismatch_items: list[tuple[int, str, int, int]] = []
+        for i, file, chroms in chrom_sets[1:]:
+            if chroms != ref_chroms:
+                n_missing = int(len(ref_chroms - chroms))
+                n_extra = int(len(chroms - ref_chroms))
+                mismatch_items.append((i, file, n_missing, n_extra))
+        if len(mismatch_items) > 0:
+            ref_label = f"{ref_i}-{ref_file}"
+            logger.warning(
+                "Warning: Chromosome sets are inconsistent across merge GWAS files; "
+                "merge mode is ignored and fallback to single-GWAS plotting."
+            )
+            for i, file, n_missing, n_extra in mismatch_items[:3]:
+                logger.warning(
+                    f"  File {i}-{file}: missing {n_missing} / extra {n_extra} chromosomes "
+                    f"vs reference {ref_label}."
+                )
+            if len(mismatch_items) > 3:
+                logger.warning(
+                    f"  ... {len(mismatch_items) - 3} more mismatched files omitted."
+                )
+            fallback_file = str(args.gwasfile[0]) if len(args.gwasfile) > 0 else files[0]
+            logger.info(f"Fallback single GWAS plotting file: {fallback_file}")
+            GWASplot(fallback_file, args, logger)
+            return
+
+    plot_df = pd.concat(frames_raw, axis=0, ignore_index=True)
+    bim_layout: list[dict[str, object]] = []
+    if args.bimrange_tuples is not None:
+        df_sel, seg_defs, n_before = _filter_df_by_bimranges(
+            plot_df,
+            chr_col,
+            pos_col,
+            args.bimrange_tuples,
+            logger,
+            "merge",
+        )
+        n_after = int(df_sel.shape[0])
+        if n_after == 0:
+            logger.warning(
+                "No SNPs found in all bimrange settings for merged GWAS; merged Manhattan/LD/Gene plotting may be empty."
+            )
+            plot_df = df_sel
+        else:
+            plot_df = df_sel
+            bim_layout = _build_bimrange_layout(seg_defs)
+            logger.info(
+                f"Applied {len(args.bimrange_tuples)} bimrange settings in merge mode: kept {n_after}/{n_before} SNPs."
+            )
+
+    threshold_merge = (
+        args.threshold
+        if args.threshold is not None
+        else (0.05 / plot_df.shape[0] if plot_df.shape[0] > 0 else np.nan)
+    )
+
+    xticks: list[float] = []
+    xticklabels: list[str] = []
+    x_separators: list[float] = []
+    use_segmented_layout = len(bim_layout) > 0
+
+    if use_segmented_layout:
+        plot_df = plot_df.copy()
+        plot_df["_x"] = np.nan
+        for seg in bim_layout:
+            sid = int(seg["id"])
+            start = int(seg["start"])
+            offset = float(seg["offset"])
+            length = float(seg["length"])
+            mask = plot_df["__seg_id"].to_numpy(dtype=np.int64) == sid
+            if not bool(np.any(mask)):
+                continue
+            posv = pd.to_numeric(plot_df.loc[mask, pos_col], errors="coerce").to_numpy(dtype=float)
+            rel = np.clip(posv - float(start), 0.0, float(length))
+            plot_df.loc[mask, "_x"] = offset + rel
+        plot_df = plot_df[np.isfinite(pd.to_numeric(plot_df["_x"], errors="coerce"))].copy()
+        xticks = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in bim_layout]
+        xticklabels = [str(seg["label"]) for seg in bim_layout]
+        for i in range(len(bim_layout) - 1):
+            x_end = float(bim_layout[i]["x_end"])
+            x_next = float(bim_layout[i + 1]["x_start"])
+            x_separators.append(0.5 * (x_end + x_next))
+    else:
+        max_pos_by_chr: dict[str, int] = {}
+        if plot_df.shape[0] > 0:
+            chr_max = plot_df.groupby(chr_col)[pos_col].max()
+            for chrom, max_pos in chr_max.items():
+                max_pos_by_chr[str(chrom)] = int(max_pos)
+        chrom_order = sorted(max_pos_by_chr.keys(), key=_chrom_sort_key)
+        if len(chrom_order) == 0:
+            logger.error("No chromosome labels available for merged Manhattan plotting.")
+            return
+        chr_lens = np.asarray(
+            [max(1, int(max_pos_by_chr[c])) for c in chrom_order],
+            dtype=float,
+        )
+        gap = int(max(1.0, float(np.nanmedian(chr_lens)) * 0.02))
+        offsets: dict[str, int] = {}
+        cursor = 0
+        for i, chrom in enumerate(chrom_order):
+            length = max(1, int(max_pos_by_chr[chrom]))
+            offsets[chrom] = cursor
+            xticks.append(float(cursor) + float(length) / 2.0)
+            xticklabels.append(str(chrom))
+            if i < len(chrom_order) - 1:
+                x_separators.append(float(cursor) + float(length) + float(gap) / 2.0)
+            cursor += length + gap
+        plot_df = plot_df.copy()
+        plot_df["_x"] = (
+            plot_df[chr_col].astype(str).map(offsets).fillna(0).astype(float)
+            + pd.to_numeric(plot_df[pos_col], errors="coerce").fillna(0.0).astype(float)
+        )
+
+    if plot_df.shape[0] > 0:
+        pvals_draw = np.asarray(plot_df[p_col], dtype=float)
+        pvals_draw = np.clip(pvals_draw, np.nextafter(0.0, 1.0), np.inf)
+        plot_df["_ylog"] = -np.log10(pvals_draw)
+    else:
+        plot_df["_ylog"] = np.asarray([], dtype=float)
+
+    width_in = 8.0
+    # In merge mode, always rasterize dense scatter layers to keep output files
+    # lightweight and easier to edit in vector tools (e.g. Adobe Illustrator).
+    rasterized = True
+    manh_path = None
+    manh_height_in = None
+    manh_fontsize: Optional[float] = None
+    manh_ylim_pair: Optional[tuple[float, float]] = None
+    manh_xlim_pair: Optional[tuple[float, float]] = None
+    manh_axes_bounds: Optional[tuple[float, float, float, float]] = None
+
+    if args.manh_ratio is not None:
+        manh_ratio = float(args.manh_ratio)
+        manh_fontsize = _scaled_fontsize_for_manhattan(
+            manh_ratio,
+            width_in=width_in,
+        )
+        manh_loc_fontsize = max(3.0, float(manh_fontsize) * 0.85)
+        fig = plt.figure(figsize=(width_in, width_in / manh_ratio), dpi=300)
+        ax = fig.add_subplot(111)
+        draw_xmins: list[float] = []
+        draw_xmaxs: list[float] = []
+
+        for i, _file in enumerate(files):
+            dfi = plot_df.loc[plot_df["_series_idx"] == i]
+            if dfi.shape[0] == 0:
+                continue
+            yy = np.asarray(dfi["_ylog"], dtype=float)
+            keep = np.isfinite(yy)
+            if args.ylim_min is not None:
+                keep = keep & (yy >= float(args.ylim_min))
+            if args.ylim_max is not None:
+                keep = keep & (yy <= float(args.ylim_max))
+            if not bool(np.any(keep)):
+                continue
+            x_keep = np.asarray(dfi.loc[keep, "_x"], dtype=float)
+            ax.scatter(
+                x_keep,
+                yy[keep],
+                color=series_colors[i],
+                alpha=0.5,
+                s=args.scatter_size,
+                label=str(i),
+                edgecolors="none",
+                linewidths=0.0,
+                rasterized=rasterized,
+            )
+            if x_keep.size > 0:
+                draw_xmins.append(float(np.nanmin(x_keep)))
+                draw_xmaxs.append(float(np.nanmax(x_keep)))
+
+        ax.set_xlabel("chrom")
+        ax.set_ylabel("-log10(p)")
+        if len(draw_xmins) > 0 and len(draw_xmaxs) > 0:
+            xmin = float(np.nanmin(np.asarray(draw_xmins, dtype=float)))
+            xmax = float(np.nanmax(np.asarray(draw_xmaxs, dtype=float)))
+        else:
+            xall = pd.to_numeric(plot_df["_x"], errors="coerce").to_numpy(dtype=float)
+            xall = xall[np.isfinite(xall)]
+            if xall.size > 0:
+                xmin = float(np.nanmin(xall))
+                xmax = float(np.nanmax(xall))
+            else:
+                xmin, xmax = (0.0, 1.0)
+        if xmax > xmin:
+            ax.set_xlim(xmin, xmax)
+        else:
+            eps = max(1e-9, abs(xmin) * 1e-9)
+            ax.set_xlim(xmin - eps, xmax + eps)
+        ax.margins(x=0.0)
+
+        if use_segmented_layout and len(bim_layout) > 0:
+            _apply_multi_bimrange_manhattan_axis(
+                ax,
+                bim_layout,
+                label_fontsize=manh_loc_fontsize,
+            )
+        else:
+            for xsep in x_separators:
+                ax.axvline(
+                    xsep,
+                    ymin=0.0,
+                    ymax=1.0 / 3.0,
+                    linestyle="--",
+                    color="lightgrey",
+                    linewidth=0.6,
+                    alpha=0.8,
+                    zorder=8,
+                )
+            ax.set_xticks(xticks)
+            ax.set_xticklabels(xticklabels, rotation=0)
+        ax.xaxis.label.set_size(manh_fontsize)
+        ax.yaxis.label.set_size(manh_fontsize)
+        ax.tick_params(axis="both", labelsize=manh_fontsize)
+
+        ax.legend(
+            loc="upper center",
+            frameon=False,
+            ncol=min(4, max(1, len(files))),
+            markerscale=2.0,
+            fontsize=manh_fontsize,
+        )
+        _y0, _y1 = ax.get_ylim()
+        lo = float(args.ylim_min) if args.ylim_min is not None else 0.0
+        hi = float(args.ylim_max) if args.ylim_max is not None else float(_y1)
+        if not (hi > lo):
+            hi = lo + max(1e-9, abs(lo) * 1e-9)
+        ax.set_ylim(lo, hi)
+        _yy0, _yy1 = ax.get_ylim()
+        manh_ylim_pair = (float(_yy0), float(_yy1))
+        manh_xlim_pair = (float(ax.get_xlim()[0]), float(ax.get_xlim()[1]))
+
+        fig.tight_layout()
+        manh_axes_bounds = ax.get_position().bounds
+        manh_path = f"{args.out}/{args.prefix}.merge.manh.{args.format}".replace("//", "/")
+        fig.savefig(manh_path, transparent=True)
+        manh_height_in = fig.get_figheight()
+        plt.close(fig)
+
+    qq_path = None
+    if args.qq_ratio is not None:
+        qq_fontsize = float(manh_fontsize) if manh_fontsize is not None else 6.0
+        qq_y_in = manh_height_in if manh_height_in is not None else 4.0
+        qq_x_in = qq_y_in * float(args.qq_ratio)
+        fig = plt.figure(figsize=(qq_x_in, qq_y_in), dpi=300)
+        ax = fig.add_subplot(111)
+
+        exp_xmin = np.inf
+        exp_xmax = -np.inf
+        for i, _file in enumerate(files):
+            pvals = pvals_by_series.get(i)
+            if pvals is None or pvals.size == 0:
+                continue
+            pvals = np.asarray(pvals, dtype=float)
+            pvals = pvals[np.isfinite(pvals) & (pvals > 0.0)]
+            if pvals.size == 0:
+                continue
+            pvals = np.sort(pvals)
+            n = int(pvals.size)
+            exp = -np.log10(np.arange(1, n + 1, dtype=float) / (n + 1.0))
+            obs = -np.log10(pvals)
+            if exp.size > 0:
+                exp_xmin = min(exp_xmin, float(np.nanmin(exp)))
+                exp_xmax = max(exp_xmax, float(np.nanmax(exp)))
+            ax.scatter(
+                exp,
+                obs,
+                s=args.scatter_size,
+                alpha=0.5,
+                rasterized=rasterized,
+                color=series_colors[i],
+                label=str(i),
+                edgecolors="none",
+                linewidths=0.0,
+            )
+
+        if not np.isfinite(exp_xmin) or not np.isfinite(exp_xmax):
+            exp_xmin, exp_xmax = (0.0, 1.0)
+        if exp_xmax > exp_xmin:
+            x_pad = max(1e-9, 0.02 * float(exp_xmax - exp_xmin))
+            ax.set_xlim(exp_xmin - x_pad, exp_xmax + x_pad)
+        else:
+            eps = max(1e-9, abs(exp_xmin) * 1e-9)
+            x_pad = max(1e-9, 0.02 * float(eps))
+            ax.set_xlim(exp_xmin - eps - x_pad, exp_xmax + eps + x_pad)
+        ax.margins(x=0.0)
+        if manh_ylim_pair is not None:
+            ax.set_ylim(manh_ylim_pair)
+        line_left, line_right = ax.get_xlim()
+        ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")
+        ax.set_xlabel("Expected -log10(p-value)")
+        ax.set_ylabel("Observed -log10(p-value)")
+        ax.xaxis.label.set_size(qq_fontsize)
+        ax.yaxis.label.set_size(qq_fontsize)
+        ax.tick_params(axis="both", labelsize=qq_fontsize)
+        ax.legend(
+            loc="upper center",
+            frameon=False,
+            ncol=min(4, max(1, len(files))),
+            markerscale=2.0,
+            fontsize=qq_fontsize,
+        )
+        fig.tight_layout()
+        qq_path = f"{args.out}/{args.prefix}.merge.qq.{args.format}".replace("//", "/")
+        fig.savefig(qq_path, transparent=True)
+        plt.close(fig)
+
+    ld_path = None
+    gene_path = None
+    effective_ldblock_ratio = args.ldblock_ratio
+    region_ranges = args.bimrange_tuples if args.bimrange_tuples is not None else []
+    if effective_ldblock_ratio is not None:
+        ld_use_all_sites = bool(args.ldblock_all is not None)
+        ld_sites = _extract_ld_site_set(
+            plot_df,
+            chr_col,
+            pos_col,
+            p_col,
+            threshold_merge,
+            use_all_sites=ld_use_all_sites,
+        )
+        n_sig_sites = max(2, len(ld_sites))
+        ld_overlay_text = None
+        ld_site_keys: list[tuple[str, int]] = sorted(ld_sites, key=lambda x: (x[0], x[1]))
+
+        if args.genofile is None:
+            logger.warning(
+                "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; drawing zero-correlation LD block."
+            )
+            ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
+            ld_overlay_text = "No genotype"
+        else:
+            if len(ld_sites) < 2:
+                if ld_use_all_sites:
+                    logger.warning(
+                        "Warning: Fewer than 2 valid SNPs in selected region; drawing empty LD block."
+                    )
+                else:
+                    logger.warning(
+                        "Warning: Fewer than 2 threshold-passing SNPs in selected region; drawing empty LD block."
+                    )
+                ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
+                ld_overlay_text = "Not enough SNPs"
+            else:
+                geno_sig, sig_keys = _collect_genotypes_for_sites(
+                    args.genofile,
+                    region_ranges,
+                    ld_sites,
+                )
+                missing_n = int(len(ld_sites) - len(set(sig_keys)))
+                if missing_n > 0:
+                    logger.warning(
+                        f"Warning: {missing_n} requested LD sites are not in genotype data and were ignored."
+                    )
+                if len(sig_keys) > 0:
+                    ld_site_keys = sig_keys
+                if geno_sig.shape[0] < 2:
+                    logger.warning(
+                        "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
+                    )
+                    ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
+                    ld_overlay_text = "No matched SNPs"
+                else:
+                    ld_mat = _compute_ld_from_genotypes(geno_sig)
+                    mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
+                    logger.info(f"Merge LD block built from {len(sig_keys)} {mode_text}.")
+
+        ld_cmap = "Greys"
+        gene_block_color = "grey"
+        gene_line_color = "black"
+        if two_color_style is not None:
+            ld_cmap = two_color_style["ld_cmap"]
+            gene_block_color = str(two_color_style["gene_block_color"])
+            gene_line_color = str(two_color_style["gene_line_color"])
+
+        ld_h_in = width_in / effective_ldblock_ratio
+        fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
+        ax_ld = fig_ld.add_subplot(111)
+        LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+        if ld_overlay_text:
+            n_ld = int(ld_mat.shape[0])
+            ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
+        fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
+        if manh_axes_bounds is not None:
+            _cx0, cy0, _cw, ch = ax_ld.get_position().bounds
+            mx0, _my0, mw, _mh = manh_axes_bounds
+            if args.ldblock_xspan is None:
+                fx0, fx1 = (0.0, 1.0)
+            else:
+                fx0, fx1 = args.ldblock_xspan
+            new_x0 = float(mx0) + float(mw) * float(fx0)
+            new_w = float(mw) * float(fx1 - fx0)
+            ax_ld.set_position([new_x0, cy0, new_w, ch])
+            ax_ld.set_anchor("N")
+        ld_path = f"{args.out}/{args.prefix}.merge.ldblock.{args.format}".replace("//", "/")
+        fig_ld.savefig(ld_path, transparent=True)
+        plt.close(fig_ld)
+
+        if args.anno:
+            if len(region_ranges) == 0:
+                logger.warning(
+                    "Warning: --anno in merge mode requires --bimrange for gene-structure plotting; gene plot skipped."
+                )
+            else:
+                anno_suffix = str(args.anno).replace(".gz", "").split(".")[-1].lower()
+                gff_query_cache: Optional[GFFQuery] = None
+                if anno_suffix in {"gff", "gff3"}:
+                    gff_query_cache = GFFQuery.from_file(args.anno)
+                gene_raw = _load_gene_like_records_from_anno(
+                    args.anno,
+                    region_ranges,
+                    logger,
+                    gff_query=gff_query_cache,
+                )
+                region_layout = (
+                    bim_layout
+                    if len(bim_layout) > 0
+                    else _build_layout_from_bimrange_tuples(region_ranges)
+                )
+                use_segmented_gene_x = len(region_layout) > 1
+                gene_track_df = _project_gene_records_to_plot_x(
+                    gene_raw,
+                    region_ranges,
+                    region_layout,
+                    use_segmented_x=use_segmented_gene_x,
+                )
+                if gene_track_df.shape[0] == 0:
+                    logger.warning(
+                        "Warning: No gene-structure records found in selected --bimrange; gene plot is skipped."
+                    )
+                else:
+                    if len(region_layout) > 0:
+                        gene_xlim = (
+                            float(region_layout[0]["x_start"]),
+                            float(region_layout[-1]["x_end"]),
+                        )
+                    else:
+                        gene_xlim = (
+                            float(min(int(x[1]) for x in region_ranges)),
+                            float(max(int(x[2]) for x in region_ranges)),
+                        )
+                    gene_plot_xlim = manh_xlim_pair if manh_xlim_pair is not None else gene_xlim
+
+                    fig_gene = plt.figure(
+                        figsize=(width_in, width_in / 20.0),
+                        dpi=300,
+                    )
+                    ax_gene = fig_gene.add_subplot(111)
+                    _draw_gene_structure_axis(
+                        ax_gene,
+                        gene_track_df,
+                        arrow_color=gene_line_color,
+                        block_color=gene_block_color,
+                        line_width=1.0,
+                        arrow_step=1_000.0,
+                    )
+                    ax_gene.set_xlim(gene_plot_xlim)
+                    fig_gene.tight_layout()
+                    if manh_axes_bounds is not None:
+                        mx0, _my0, mw, _mh = manh_axes_bounds
+                        _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
+                        ax_gene.set_position([mx0, cy0, mw, ch])
+                    gene_path = f"{args.out}/{args.prefix}.merge.gene.{args.format}".replace("//", "/")
+                    fig_gene.savefig(gene_path, transparent=True)
+                    plt.close(fig_gene)
+
+    saved_paths: list[tuple[str, str]] = []
+    if manh_path is not None:
+        saved_paths.append(("Merged Manhattan", manh_path))
+    if qq_path is not None:
+        saved_paths.append(("Merged QQ", qq_path))
+    if ld_path is not None:
+        saved_paths.append(("Merged LD block", ld_path))
+    if gene_path is not None:
+        saved_paths.append(("Merged Gene structure", gene_path))
+
+    if len(saved_paths) == 0:
+        logger.warning("Warning: no merged figure was generated (both --manh and --qq are off).")
+    elif len(saved_paths) == 1:
+        logger.info(f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}\n")
+    else:
+        title = ", ".join([x[0] for x in saved_paths])
+        body = "\n".join([f"  {x[1]}" for x in saved_paths])
+        logger.info(f"{title} plots saved to:\n{body}\n")
+
+
 def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
     GWASplot(file, args, logger)
     return str(file)
@@ -2671,6 +3595,13 @@ def main():
         help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-merge", "--merge", nargs="+", action="append", type=str, default=None,
+        help=(
+            "Merge mode: add one or more GWAS files (option can be repeated) and plot all files in one Manhattan plot. "
+            "Column names follow --chr/--pos/--pvalue."
+        ),
+    )
+    optional_group.add_argument(
         "-LDclump", "--LDclump", dest="ldclump", nargs=2, default=None,
         metavar=("WINDOW", "R2"),
         help=(
@@ -2716,8 +3647,14 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-manh-ylim", "--manh-ylim", type=float, default=None,
-        help="Upper limit of Manhattan y-axis (default: auto).",
+        "-ylim", "--ylim", type=str, default=None,
+        help=(
+            "Y range for Manhattan as <max>, <min:max>, <min:>, or <:max> "
+            "(also accepts '-' as separator), e.g. --ylim 6, --ylim 0:6, "
+            "--ylim 2:, --ylim :6. Missing bound is auto-determined. "
+            "Points outside this range are filtered before Manhattan scatter "
+            "to speed plotting. QQ always keeps all points."
+        ),
     )
     geno_group = optional_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
@@ -2733,10 +3670,10 @@ def main():
         help="Optional genotype TXT file for --ldblock/--ldblock-all.",
     )
     optional_group.add_argument(
-        "-qq", "--qq", type=str, nargs="?", const="5/4", default=None,
+        "-qq", "--qq", type=str, nargs="?", const="on", default=None,
         help=(
-            "Enable QQ plotting with aspect ratio (width/height). "
-            "Examples: --qq (default 5/4), --qq 1.25, --qq 4/3."
+            "Enable QQ plotting in auto mode. "
+            "QQ width/height ratio is fixed at 5:4; user-provided ratio is ignored."
         ),
     )
     optional_group.add_argument(
@@ -2821,8 +3758,13 @@ def main():
     if args.scatter_size <= 0:
         logger.error("scatter-size must be > 0.")
         raise SystemExit(1)
-    if args.manh_ylim is not None and args.manh_ylim <= 0:
-        logger.error("manh-ylim must be > 0.")
+    try:
+        if args.ylim is not None:
+            args.ylim_min, args.ylim_max = _parse_ylim_spec(args.ylim)
+        else:
+            args.ylim_min, args.ylim_max = (None, None)
+    except ValueError as e:
+        logger.error(str(e))
         raise SystemExit(1)
 
     try:
@@ -2833,10 +3775,18 @@ def main():
 
     try:
         args.manh_ratio = _parse_ratio(args.manh, "Manhattan") if args.manh is not None else None
-        args.qq_ratio = _parse_ratio(args.qq, "QQ") if args.qq is not None else None
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
+    if args.qq is None:
+        args.qq_ratio = None
+    else:
+        qq_text = str(args.qq).strip().lower()
+        if qq_text not in {"", "on"}:
+            logger.info(
+                f"QQ ratio input '{args.qq}' is ignored; fixed ratio 5:4 is used."
+            )
+        args.qq_ratio = float(_QQ_FIXED_RATIO)
 
     try:
         if args.ldblock_all is not None:
@@ -2909,7 +3859,38 @@ def main():
         )
         args.ldclump_window_bp = None
         args.ldclump_r2 = None
-    if len(args.gwasfile) == 1 and int(args.thread) != 1:
+    merge_files_raw: list[str] = []
+    if args.merge is not None:
+        for item in args.merge:
+            if isinstance(item, (list, tuple)):
+                merge_files_raw.extend([str(x) for x in item])
+            elif item is not None:
+                merge_files_raw.append(str(item))
+
+    args.merge_mode = bool(len(merge_files_raw) > 0)
+    if args.merge_mode:
+        args.merge_files = [str(x) for x in list(args.gwasfile)] + merge_files_raw
+        if len(args.merge_files) < 2:
+            logger.warning(
+                "Warning: --merge requires at least two GWAS files in total; merge mode is disabled."
+            )
+            args.merge_mode = False
+            args.merge_files = []
+        else:
+            if args.manh_ratio is None:
+                logger.info("Merge mode detected; forcing --manh ratio to 2.")
+                args.manh_ratio = 2.0
+            if args.ldclump_window_bp is not None:
+                logger.warning("Warning: --LDclump is ignored in --merge mode.")
+                args.ldclump_window_bp = None
+                args.ldclump_r2 = None
+            if args.highlight is not None:
+                logger.warning("Warning: --highlight is ignored in --merge mode.")
+                args.highlight = None
+    else:
+        args.merge_files = []
+
+    if (not args.merge_mode) and len(args.gwasfile) == 1 and int(args.thread) != 1:
         logger.info(
             "Single GWAS input detected; forcing --thread to 1."
         )
@@ -2926,36 +3907,46 @@ def main():
     # ------------------------------------------------------------------
     # Configuration summary
     # ------------------------------------------------------------------
-    logger.info("JanusX - Post-GWAS visualization and annotation")
-    logger.info(f"Host: {socket.gethostname()}\n")
+    config_title = "JanusX - Post-GWAS visualization and annotation"
+    host_text = socket.gethostname()
+    input_files = args.merge_files if args.merge_mode else args.gwasfile
+    input_files_text = _format_input_files(input_files)
+    threshold_text = str(args.threshold if args.threshold is not None else "0.05 / nSNP")
+    bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
+    merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
+    output_prefix_text = f"{args.out}/{args.prefix}"
+    threads_text = (
+        f"{args.thread} "
+        f"({'All cores' if args.thread == -1 else 'User-specified'})"
+    )
 
-    logger.info("*" * 60)
-    logger.info("POST-GWAS CONFIGURATION")
-    logger.info("*" * 60)
-    logger.info(f"Input files:   {_format_input_files(args.gwasfile)}")
-    logger.info(f"Chr column:    {args.chr}")
-    logger.info(f"Pos column:    {args.pos}")
-    logger.info(f"P-value column:{args.pvalue}")
-    logger.info(f"Genotype file: {args.genofile}")
-    logger.info(
-        f"Threshold:     {args.threshold if args.threshold is not None else '0.05 / nSNP'}"
-    )
-    logger.info(
-        f"Bimrange:      "
-        f"{_format_bimrange_summary(args.bimrange_tuples)}"
-    )
+    base_rows: list[tuple[str, str]] = [
+        ("Input files", input_files_text),
+        ("Chr|Pos|Pvalue", f"{args.chr}|{args.pos}|{args.pvalue}"),
+        ("Genotype file", str(args.genofile)),
+        ("Threshold", threshold_text),
+        ("Bimrange", bimrange_text),
+    ]
+
+    vis_rows: Optional[list[tuple[str, str]]] = None
     if (
         args.manh_ratio is not None
         or args.qq_ratio is not None
         or args.ldblock_ratio is not None
     ):
-        logger.info("Visualization:")
-        logger.info(
-            f"  Manhattan pallete: "
-            f"{'default (black/grey)' if args.pallete_spec is None else args.pallete}"
-        )
-        logger.info("  QQ pallete:        default (black/grey)")
-        logger.info(f"  Scatter size:      {args.scatter_size}")
+        if args.merge_mode:
+            if args.pallete_spec is None:
+                merge_default_cmap = "tab10" if len(args.merge_files) <= 10 else "tab20"
+                manh_pal_text = f"default ({merge_default_cmap})"
+                qq_pal_text = f"default ({merge_default_cmap})"
+            else:
+                manh_pal_text = str(args.pallete)
+                qq_pal_text = str(args.pallete)
+        else:
+            manh_pal_text = (
+                "default (black/grey)" if args.pallete_spec is None else str(args.pallete)
+            )
+            qq_pal_text = "default (black/grey)"
         if args.disable_compression:
             if args.fullscatter and args.bimrange_tuples is not None:
                 comp_text = "off (--fullscatter, auto for --bimrange)"
@@ -2965,50 +3956,139 @@ def main():
                 comp_text = "off (auto for --bimrange)"
         else:
             comp_text = "on"
-        logger.info(f"  Compression:       {comp_text}")
-        logger.info(f"  Highlight:   {args.highlight}")
-        logger.info(f"  Format:      {args.format}")
-        logger.info(f"  Manhattan:   {args.manh_ratio if args.manh_ratio is not None else 'off'}")
-        logger.info(
-            f"  Manhattan ylim max: {args.manh_ylim if args.manh_ylim is not None else 'auto'}"
+        manh_text = (
+            f"ratio={args.manh_ratio if args.manh_ratio is not None else 'off'}, "
+            f"pallete={manh_pal_text}, "
+            f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
+            f"compression={comp_text}"
         )
-        logger.info(f"  QQ:          {args.qq_ratio if args.qq_ratio is not None else 'off'}")
+        qq_text = f"auto, pallete={qq_pal_text}"
+        vis_rows = [
+            ("Manhattan", manh_text),
+            ("QQ", qq_text),
+            ("Scatter", f"size={args.scatter_size}, highlight={args.highlight}"),
+            ("Format", str(args.format)),
+        ]
         if args.ldblock_ratio is None:
-            logger.info("  LDBlock:     off")
+            vis_rows.append(("LDBlock", "off"))
         else:
             ld_mode_text = "all SNPs" if args.ldblock_mode == "all" else "threshold SNPs"
-            logger.info(f"  LDBlock:     {args.ldblock_ratio} ({ld_mode_text})")
-            if args.ldblock_xspan is None:
-                logger.info("  LDBlock x-span: full width (default)")
-            else:
-                logger.info(
-                    f"  LDBlock x-span: {args.ldblock_xspan[0]:g}-{args.ldblock_xspan[1]:g} "
-                    "(fraction of Manhattan width)"
-                )
-    else:
-        logger.info("Visualization: disabled")
-    if args.anno:
-        logger.info("Annotation:")
-        logger.info(f"  Anno file:   {args.anno}")
-        logger.info(f"  Window (kb): {args.annobroaden}")
-        if args.ldclump_window_bp is None:
-            logger.info("  LD clump:    off")
-        else:
-            logger.info(
-                f"  LD clump:    on ({args.ldclump_window_bp / 1000.0:g} kb, r2>={args.ldclump_r2:g})"
+            ld_xspan_text = (
+                "full width (default)"
+                if args.ldblock_xspan is None
+                else f"{args.ldblock_xspan[0]:g}-{args.ldblock_xspan[1]:g} (fraction of Manhattan width)"
             )
-    logger.info(f"Output prefix: {args.out}/{args.prefix}")
-    logger.info(
-        f"Threads:       {args.thread} "
-        f"({'All cores' if args.thread == -1 else 'User-specified'})"
+            vis_rows.append(
+                ("LDBlock", f"ratio={args.ldblock_ratio}, mode={ld_mode_text}, x-span={ld_xspan_text}")
+            )
+    anno_rows: Optional[list[tuple[str, str]]] = None
+    if args.anno:
+        anno_rows = [
+            ("Anno file", str(args.anno)),
+            ("Window (kb)", str(args.annobroaden)),
+        ]
+        if args.ldclump_window_bp is None:
+            anno_rows.append(("LD clump", "off"))
+        else:
+            anno_rows.append(
+                (
+                    "LD clump",
+                    f"on ({args.ldclump_window_bp / 1000.0:g} kb, r2>={args.ldclump_r2:g})",
+                )
+            )
+
+    key_width = max(
+        [len(k) for k, _ in base_rows]
+        + ([len(k) for k, _ in vis_rows] if vis_rows is not None else [])
+        + ([len(k) for k, _ in anno_rows] if anno_rows is not None else [])
     )
-    logger.info("*" * 60 + "\n")
+    key_width = max(8, int(key_width))
+
+    def _fmt_kv(name: str, value: str, *, truncate: bool) -> str:
+        pad = max(1, key_width - len(name))
+        line = f"  {name}:{' ' * pad}{value}"
+        return _truncate_config_line(line) if truncate else line
+
+    divider_full = "*" * 60
+    divider = "*" * _CONFIG_LINE_MAX_CHARS
+
+    config_lines_full: list[str] = [
+        divider_full,
+        "POST-GWAS CONFIGURATION",
+        divider_full,
+        "General:",
+    ]
+    config_lines_terminal: list[str] = [
+        divider,
+        "POST-GWAS CONFIGURATION",
+        divider,
+        "General:",
+    ]
+    for name, value in base_rows:
+        config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
+        config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
+    if len(merge_map_rows) > 0:
+        config_lines_full.append("Merge trait-id mapping:")
+        config_lines_terminal.append("Merge trait-id mapping:")
+        for idx, file in merge_map_rows:
+            config_lines_full.append(f"  {idx}-{file}")
+            config_lines_terminal.append(_truncate_config_line(f"  {idx}-{file}"))
+    if vis_rows is None:
+        config_lines_full.append("Visualization: disabled")
+        config_lines_terminal.append(_truncate_config_line("Visualization: disabled"))
+    else:
+        config_lines_full.append("Visualization:")
+        config_lines_terminal.append("Visualization:")
+        for name, value in vis_rows:
+            config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
+            config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
+    if anno_rows is not None:
+        config_lines_full.append("Annotation:")
+        config_lines_terminal.append("Annotation:")
+        for name, value in anno_rows:
+            config_lines_full.append(_fmt_kv(str(name), str(value), truncate=False))
+            config_lines_terminal.append(_fmt_kv(str(name), str(value), truncate=True))
+    config_lines_full.append(f"Output prefix: {output_prefix_text}")
+    config_lines_full.append(f"Threads:       {threads_text}")
+    config_lines_full.append(divider_full + "\n")
+    config_lines_terminal.append(_truncate_config_line(f"Output prefix: {output_prefix_text}"))
+    config_lines_terminal.append(_truncate_config_line(f"Threads:       {threads_text}"))
+    config_lines_terminal.append(divider + "\n")
+
+    rich_rendered = _render_postgwas_config_rich(
+        title=config_title,
+        host=host_text,
+        base_rows=base_rows,
+        merge_map_rows=merge_map_rows,
+        vis_rows=vis_rows,
+        anno_rows=anno_rows,
+        output_prefix=output_prefix_text,
+        threads_text=threads_text,
+        key_width=key_width,
+    )
+    if rich_rendered:
+        _emit_info_to_file_handlers(logger, config_title)
+        _emit_info_to_file_handlers(logger, f"Host: {host_text}\n")
+        for line in config_lines_full:
+            _emit_info_to_file_handlers(logger, line)
+    else:
+        _emit_info_to_stream_handlers(logger, config_title)
+        _emit_info_to_stream_handlers(logger, f"Host: {host_text}\n")
+        for line in config_lines_terminal:
+            _emit_info_to_stream_handlers(logger, line)
+        _emit_info_to_file_handlers(logger, config_title)
+        _emit_info_to_file_handlers(logger, f"Host: {host_text}\n")
+        for line in config_lines_full:
+            _emit_info_to_file_handlers(logger, line)
     if no_plot_or_anno:
         logger.warning(
             "Warning: No --manh/--qq/--ldblock/--ldblock-all/--anno provided. Nothing will be plotted or annotated."
         )
 
-    checks: list[bool] = [ensure_file_exists(logger, f, "GWAS result file") for f in args.gwasfile]
+    check_gwas_files = args.merge_files if args.merge_mode else args.gwasfile
+    checks: list[bool] = [
+        ensure_file_exists(logger, f, "GWAS result file") for f in check_gwas_files
+    ]
     if args.highlight:
         checks.append(ensure_file_exists(logger, args.highlight, "Highlight file"))
     if args.anno:
@@ -3025,7 +4105,10 @@ def main():
     # ------------------------------------------------------------------
     # Parallel processing of all input files
     # ------------------------------------------------------------------
-    _run_postgwas_tasks(args, logger)
+    if args.merge_mode:
+        _run_postgwas_merge_manhattan(args, logger)
+    else:
+        _run_postgwas_tasks(args, logger)
 
     # ------------------------------------------------------------------
     # Final logging

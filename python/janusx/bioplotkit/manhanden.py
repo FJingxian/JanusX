@@ -169,6 +169,7 @@ class GWASPLOT:
         ax: Union[plt.Axes,None] = None,
         ignore: Union[list[str],None] = None,
         min_logp: Union[float, None] = 0.5,
+        max_logp: Union[float, None] = None,
         y_min: Union[float, None] = None,
         **kwargs,
     ) -> plt.Axes:
@@ -203,6 +204,8 @@ class GWASPLOT:
         df["y"] = -np.log10(df["y"])
         if min_logp is not None:
             df = df[df["y"] >= float(min_logp)]
+        if max_logp is not None:
+            df = df[df["y"] <= float(max_logp)]
 
         if ax is None:
             fig = plt.figure(figsize=[12, 6], dpi=300)
@@ -223,24 +226,32 @@ class GWASPLOT:
                 [color_set[i % len(color_set)] for i in range(len(self.chr_ids))],
             )
         )
+        plot_kwargs = dict(kwargs)
+        plot_kwargs.setdefault("alpha", 0.78)
+        plot_kwargs.setdefault("edgecolors", "none")
+        plot_kwargs.setdefault("linewidths", 0.0)
 
         mask_ignore = ~df.index.isin(ignore)
         ax.scatter(
             df.loc[mask_ignore, "x"],
             df.loc[mask_ignore, "y"],
             color=df.loc[mask_ignore, "z"].map(chr_color_map),
-            **kwargs,
+            **plot_kwargs,
         )
 
         # Highlight SNPs above genome-wide threshold
         if threshold is not None and df["y"].max() >= threshold:
             df_sig = df[df["y"] >= threshold]
             sig_mask = ~df_sig.index.isin(ignore)
+            sig_kwargs = dict(kwargs)
+            sig_kwargs.setdefault("alpha", 0.9)
+            sig_kwargs.setdefault("edgecolors", "none")
+            sig_kwargs.setdefault("linewidths", 0.0)
             ax.scatter(
                 df_sig.loc[sig_mask, "x"],
                 df_sig.loc[sig_mask, "y"],
                 color="red",
-                **kwargs,
+                **sig_kwargs,
             )
             ax.axhline(
                 y=threshold,
@@ -250,8 +261,37 @@ class GWASPLOT:
             )
 
         # axis cosmetics
+        chr_bounds = (
+            self.df.groupby("z")["x"]
+            .agg(["min", "max"])
+            .sort_index()
+        )
+        if chr_bounds.shape[0] > 1:
+            mins = chr_bounds["min"].to_numpy(dtype=float)
+            maxs = chr_bounds["max"].to_numpy(dtype=float)
+            separators = (maxs[:-1] + mins[1:]) / 2.0
+            for xsep in separators:
+                if np.isfinite(xsep):
+                    ax.axvline(
+                        float(xsep),
+                        ymin=0.0,
+                        ymax=1.0 / 3.0,
+                        linestyle="--",
+                        color="lightgrey",
+                        linewidth=0.6,
+                        alpha=0.8,
+                        zorder=0,
+                    )
+
         ax.set_xticks(self.ticks_loc, self.chr_labels)
-        ax.set_xlim([-self.interval, df["x"].max() + self.interval])
+        xmin = float(df["x"].min())
+        xmax = float(df["x"].max())
+        if xmax > xmin:
+            ax.set_xlim(xmin, xmax)
+        else:
+            eps = max(1e-9, abs(xmin) * 1e-9)
+            ax.set_xlim(xmin - eps, xmax + eps)
+        ax.margins(x=0.0)
         ymax = df["y"].max()
         base_ymin = float(min_logp) if min_logp is not None else 0.0
         if y_min is not None:
@@ -373,9 +413,11 @@ class GWASPLOT:
             o_e.iloc[self.minidx, 1],
             o_e.iloc[self.minidx, 0],
             s=scatter_size,
-            alpha=0.8,
+            alpha=0.75,
             rasterized=True,
             color=point_color,
+            edgecolors="none",
+            linewidths=0.0,
         )
 
         ax.set_xlabel("Expected -log10(p-value)")

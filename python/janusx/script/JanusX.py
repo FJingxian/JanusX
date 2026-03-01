@@ -65,22 +65,22 @@ __version__ = (
 
 def main():
     module = dict(zip(
-        ['gwas','postgwas','postgarfield','postbsa','garfield','grm','pca','gs','sim','simulation','gmerge','fastq2vcf','update'],
-        [gwas,postgwas,postgarfield,postbsa,garfield,grm,pca,gs,sim,simulation,gmerge,fastq2vcf,update],
+        ['gwas','postgwas','postgarfield','postbsa','garfield','grm','pca','gs','sim','simulation','gmerge','fastq2vcf'],
+        [gwas,postgwas,postgarfield,postbsa,garfield,grm,pca,gs,sim,simulation,gmerge,fastq2vcf],
     ))
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             print(__logo__)
             print("Usage: jx <module> [options]")
             print(f"Available modules: {' '.join(module.keys())}")
-            print("Shortcut: jx -update / --update  (same as: jx update)")
+            print("Options: -h/--help  -v/--version  -update/--update (update JanusX)")
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
             print(__logo__)
             print(__version__)
         elif sys.argv[1] == '-update' or sys.argv[1] == '--update':
             print(__logo__)
             # Keep argparse usage as "jx --update ..."
-            sys.argv[0] = "jx update"
+            sys.argv[0] = "jx --update"
             del sys.argv[1]
             update.main()
         else:
@@ -97,7 +97,7 @@ def main():
     else:
         print(f"Usage: {sys.argv[0]} <module> [options]")
         print(f"Available modules: {' '.join(module.keys())}")
-        print("Shortcut: jx -update / --update  (same as: jx update)")
+        print("Options: -h/--help  -v/--version  -update/--update (update JanusX)")
 
 if __name__ == "__main__":
     main()

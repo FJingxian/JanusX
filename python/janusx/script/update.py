@@ -4,7 +4,7 @@ JanusX updater.
 
 Examples
 --------
-  jx update
+  jx --update
 """
 
 from __future__ import annotations

@@ -10,7 +10,6 @@ All heavy matrix operations are kept in `float32` to reduce memory footprint.
 
 import numbers
 import sys
-import time
 import warnings
 
 import numpy as np
@@ -18,11 +17,18 @@ import pandas as pd
 from tqdm import tqdm
 from typing import Literal, List, Union
 from scipy.stats import linregress
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage
 
 try:
     from rich.progress import track as rich_track
 except Exception:
     rich_track = None
+
+try:
+    from dynamicTreeCut import cutreeHybrid as _cutree_hybrid
+except Exception:
+    _cutree_hybrid = None
 
 
 def _progress_iter(iterable, *, total=None, desc:str='', enable:bool=True):
@@ -164,7 +170,6 @@ def adj(cov:np.ndarray, sft:Union[List[int], int],
         maxk = [stats_by_power[p][4] for p in sft_values]
 
         sftresult = pd.DataFrame({'sft':sft_values, 'rsqr':rsqr, 'slope':slope, 'meank':meank, 'mediank':mediank, 'maxk':maxk})
-        print(sftresult)
         passed = sftresult.loc[sftresult['rsqr']>=thr,'sft']
         if len(passed) > 0:
             sft = passed.iloc[0]
@@ -183,17 +188,15 @@ def adj(cov:np.ndarray, sft:Union[List[int], int],
                     f'No power reached rsqr>={thr}; fallback to power {sft} (max rsqr={fallback_row["rsqr"]:.4f}).',
                     RuntimeWarning
                 )
-        print(f'Chosen power: {sft}')
-        return adj(cov, sft)
+        return np.power(cov,sft).astype(np.float32, copy=False), sftresult
     elif isinstance(sft, numbers.Integral):
-        matrix_adj = np.power(cov,sft).astype(np.float32, copy=False)
-        return matrix_adj
+        return np.power(cov,sft).astype(np.float32, copy=False), None
     else:
         raise TypeError(f'sft should be int or list of int, now is {type(sft)}')
 
 ## 共轭矩阵
 # Ω=[wij],wij=(lij+aij)/(minki,kj+1−aij)
-def TOM(adj:np.ndarray):
+def tom(adj:np.ndarray):
     """Compute topological overlap matrix (TOM) from adjacency matrix.
 
     Parameters
@@ -240,17 +243,217 @@ def TOM(adj:np.ndarray):
     np.fill_diagonal(tom, np.float32(1.0))
     return tom
 
+def cluster(
+    tom: np.ndarray,
+    *,
+    method: str = "average",
+    min_cluster_size: int = 30,
+    deep_split: int = 2,
+    pam_stage: bool = False,
+    cut_height: Union[float, None] = None,
+    num_modules: Union[int, None] = None,
+    return_linkage: bool = False,
+):
+    """Cluster genes from TOM matrix.
+
+    Parameters
+    ----------
+    tom : np.ndarray
+        Topological overlap matrix (square).
+    method : str, default='average'
+        Linkage method passed to `scipy.cluster.hierarchy.linkage`.
+    min_cluster_size : int, default=30
+        Minimum module size for dynamic tree cut.
+    deep_split : int, default=2
+        Dynamic split level for dynamic tree cut.
+    pam_stage : bool, default=False
+        Whether to enable PAM stage in dynamic tree cut.
+    cut_height : float | None, default=None
+        Optional dynamicTreeCut `cutHeight`. If None, dynamicTreeCut chooses a
+        default value and may print a message about the inferred cut height.
+    num_modules : int | None, default=None
+        Target number of final modules (excluding label 0). When provided,
+        `cut_height` is ignored and the function automatically searches a
+        suitable `cutHeight` value.
+    return_linkage : bool, default=False
+        If True, return `(labels, Z)`; otherwise return `labels`.
+
+    Returns
+    -------
+    np.ndarray | tuple[np.ndarray, np.ndarray]
+        Cluster labels from dynamic tree cut, optionally with linkage.
+    """
+    if _cutree_hybrid is None:
+        raise ImportError(
+            "dynamicTreeCut is required for cluster(). Please install dynamicTreeCut."
+        )
+
+    tom = np.asarray(tom, dtype=np.float32)
+    if tom.ndim != 2 or tom.shape[0] != tom.shape[1]:
+        raise ValueError(f"tom must be square 2D, got shape={tom.shape}")
+    n = tom.shape[0]
+
+    # Keep float32 to reduce memory; assume TOM is already symmetric.
+    dist = np.subtract(np.float32(1.0), tom, dtype=np.float32)
+    np.fill_diagonal(dist, np.float32(0.0))
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method=method)
+
+    def _labels_from_result(dynamic_res):
+        if isinstance(dynamic_res, dict):
+            labels_local = None
+            for key in ("labels", "label", "clusters", "cluster"):
+                if key in dynamic_res:
+                    labels_local = np.asarray(dynamic_res[key], dtype=np.int32)
+                    break
+            if labels_local is None:
+                raise RuntimeError(
+                    "dynamicTreeCut returned a dict without labels/cluster fields."
+                )
+        else:
+            labels_local = np.asarray(dynamic_res, dtype=np.int32)
+        if labels_local.shape[0] != n:
+            raise RuntimeError(
+                f"dynamicTreeCut returned invalid label length {labels_local.shape[0]} (expect {n})."
+            )
+        return labels_local
+
+    def _run_dynamic(ch):
+        dynamic_res = _cutree_hybrid(
+            Z,
+            distM=dist,
+            deepSplit=deep_split,
+            minClusterSize=min_cluster_size,
+            pamStage=pam_stage,
+            cutHeight=ch,
+            verbose=0,
+        )
+        labels_local = _labels_from_result(dynamic_res)
+        n_mod_local = int(np.unique(labels_local[labels_local > 0]).size)
+        return labels_local, n_mod_local
+
+    if num_modules is not None:
+        target = int(num_modules)
+        if target <= 0:
+            raise ValueError(f"num_modules must be positive, got {num_modules}")
+        if cut_height is not None:
+            warnings.warn(
+                "num_modules is set; ignoring cut_height and auto-searching cutHeight.",
+                RuntimeWarning,
+            )
+
+        heights = Z[:, 2]
+        lo = float(np.min(heights))
+        hi = float(np.max(heights))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise RuntimeError("Invalid linkage heights for cutHeight search.")
+        if hi <= lo:
+            hi = lo + 1e-8
+
+        cache = {}
+
+        def _eval(ch):
+            key = round(float(ch), 12)
+            if key not in cache:
+                cache[key] = _run_dynamic(float(ch))
+            return cache[key]
+
+        labels_lo, n_lo = _eval(lo)
+        labels_hi, n_hi = _eval(hi)
+
+        # Track the closest solution found.
+        best_labels = labels_lo
+        best_n_mod = n_lo
+        best_cut_height = lo
+        best_diff = abs(n_lo - target)
+        if abs(n_hi - target) < best_diff:
+            best_labels = labels_hi
+            best_n_mod = n_hi
+            best_cut_height = hi
+            best_diff = abs(n_hi - target)
+
+        # Determine monotonic direction: as cutHeight increases, module count
+        # is usually non-increasing, but we infer from boundary evaluations.
+        decreasing = n_lo >= n_hi
+
+        # If target is outside reachable boundary counts, return closest bound.
+        lo_n, hi_n = (n_lo, n_hi) if decreasing else (n_hi, n_lo)
+        if target < hi_n or target > lo_n:
+            labels = best_labels
+        else:
+            # Binary search on cutHeight.
+            for _ in range(16):
+                mid = (lo + hi) / 2.0
+                cand_labels, cand_n_mod = _eval(mid)
+                diff = abs(cand_n_mod - target)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_labels = cand_labels
+                    best_n_mod = cand_n_mod
+                    best_cut_height = mid
+                if cand_n_mod == target or (hi - lo) < 1e-6:
+                    break
+
+                if decreasing:
+                    # Higher cutHeight => fewer modules.
+                    if cand_n_mod > target:
+                        lo = mid
+                    else:
+                        hi = mid
+                else:
+                    # Fallback for rare non-decreasing response.
+                    if cand_n_mod < target:
+                        lo = mid
+                    else:
+                        hi = mid
+
+            labels = best_labels
+
+        print(
+            f"[cluster] num_modules target={target}, obtained={best_n_mod}, cutHeight={best_cut_height:.6g}"
+        )
+        if best_n_mod != target:
+            warnings.warn(
+                f"Could not hit num_modules={target} exactly; closest={best_n_mod}, cutHeight={best_cut_height:.6g}.",
+                RuntimeWarning,
+            )
+    else:
+        dynamic_res = _cutree_hybrid(
+            Z,
+            distM=dist,
+            deepSplit=deep_split,
+            minClusterSize=min_cluster_size,
+            pamStage=pam_stage,
+            cutHeight=cut_height,
+            verbose=0,
+        )
+        labels = _labels_from_result(dynamic_res)
+
+    return (labels, Z) if return_linkage else labels
+
 if __name__ == "__main__":
+    import numpy as np
+    from janusx.gtools.wgcna import cor, adj, tom, cluster
+    import pandas as pd
     tpm = pd.read_csv('~/Public/test.tpm.tsv',sep='\t',index_col=0)
     tpm = tpm.loc[tpm.mean(axis=1)>1]
-    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False)
+    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:15000]
     tpm = tpm.loc[cv.index]
     print(tpm.shape)
-    print(tpm.iloc[:4,:4])
-    mcor = cor(tpm)
-    madj = adj(mcor,list(range(2,10,1))+list(range(10,21,2)))
-    tst = time.time()
-    mtom = TOM(madj)
-    print(mtom[:4,:4])
-    print(f'TOM computed in {time.time()-tst:.3f} seconds')
-    tst = time.time()
+    mcor = cor(tpm,'signed')
+    madj,sftresult = adj(mcor,list(range(1,10,1))+list(range(10,21,2)))
+    if sftresult is not None:
+        print(sftresult.set_index('sft'))
+    mtom = tom(madj)
+    labels = cluster(mtom, num_modules=10,min_cluster_size=30)
+    for i in range(1,11): # 计算ME
+        print(f"Module {i}:")
+        tpm_module = tpm.loc[labels==i].T
+        gene = tpm_module.T.iloc[29].values
+        tpm_module = (tpm_module - tpm_module.values.mean(axis=1, keepdims=True)).values / tpm_module.values.std(axis=1, keepdims=True)
+        eigval,eigvec = np.linalg.eigh(tpm_module@tpm_module.T)
+        me = eigvec[:,-1]
+        print(np.corrcoef(me,gene)[0,1])
+        # break
+    
+    

@@ -12,6 +12,7 @@ dependencies = [
     "psutil",
     "tqdm",
     "rich",
+    "dynamicTreeCut",
     "joblib>=1.5",
 ]
 authors = [

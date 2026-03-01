@@ -1,3 +1,13 @@
+"""WGCNA helper functions for correlation, adjacency, and TOM construction.
+
+This module implements a lightweight WGCNA-style workflow:
+1. Build gene-gene correlation matrix (`cor`)
+2. Convert correlation to adjacency matrix (`adj`)
+3. Compute topological overlap matrix (`TOM`)
+
+All heavy matrix operations are kept in `float32` to reduce memory footprint.
+"""
+
 import numbers
 import sys
 import time
@@ -16,6 +26,27 @@ except Exception:
 
 
 def _progress_iter(iterable, *, total=None, desc:str='', enable:bool=True):
+    """Return a progress-enabled iterator.
+
+    Rich progress is preferred when available on a TTY. Otherwise it falls back
+    to tqdm. When `enable=False`, the raw iterable is returned.
+
+    Parameters
+    ----------
+    iterable : iterable
+        Source iterable.
+    total : int, optional
+        Expected number of iterations.
+    desc : str, default=''
+        Progress description text.
+    enable : bool, default=True
+        Whether to enable progress rendering.
+
+    Returns
+    -------
+    iterable
+        Wrapped iterator with progress behavior when enabled.
+    """
     if not enable:
         return iterable
     if rich_track is not None and sys.stderr.isatty():
@@ -28,10 +59,22 @@ def _progress_iter(iterable, *, total=None, desc:str='', enable:bool=True):
 
 ## covariation matrix
 def cor(expr:np.ndarray, cortype:Literal['signed', 'unsigned']='unsigned'):
-    '''
-    matrix: raw data, correlationship of row variation will be calculated.
-    model: 'signed' or 'unsigned', default: 'unsigned'
-    '''
+    """Compute correlation matrix from expression matrix.
+
+    Parameters
+    ----------
+    expr : np.ndarray
+        Input matrix with genes on rows and samples on columns.
+    cortype : {'signed', 'unsigned'}, default='unsigned'
+        Correlation transformation mode:
+        - 'signed': transform r -> 0.5 * r + 0.5
+        - 'unsigned': use absolute correlation |r|
+
+    Returns
+    -------
+    np.ndarray
+        Correlation matrix in float32.
+    """
     gcor = np.corrcoef(expr, dtype=np.float32)
     if cortype == 'signed':
         gcor = .5*gcor+.5
@@ -44,6 +87,35 @@ def adj(cov:np.ndarray, sft:Union[List[int], int],
         *,
         thr:float=0.8,eps:float=1e-8,bins:int=10,
         show_progress:bool=True):
+    """Build adjacency matrix or select soft-threshold power.
+
+    Parameters
+    ----------
+    cov : np.ndarray
+        Correlation matrix (typically output of :func:`cor`).
+    sft : list[int] | range | int
+        Soft-threshold power specification.
+        - If `int`, return `cov ** sft` directly.
+        - If list/range, evaluate candidate powers and select one by `rsqr`.
+    thr : float, default=0.8
+        Minimum R^2 threshold for choosing soft-threshold power.
+    eps : float, default=1e-8
+        Small value added to histogram frequency before `log`.
+    bins : int, default=10
+        Histogram bins used for scale-free topology fit.
+    show_progress : bool, default=True
+        Whether to display progress while scanning candidate powers.
+
+    Returns
+    -------
+    np.ndarray
+        Adjacency matrix in float32 for the selected power.
+
+    Notes
+    -----
+    When no candidate reaches `thr`, the function falls back to the power with
+    maximal `rsqr` and emits a runtime warning.
+    """
     if isinstance(sft, list) or isinstance(sft, range):
         sft_values = [int(i) for i in sft]
         if len(sft_values) == 0:
@@ -122,6 +194,25 @@ def adj(cov:np.ndarray, sft:Union[List[int], int],
 ## 共轭矩阵
 # Ω=[wij],wij=(lij+aij)/(minki,kj+1−aij)
 def TOM(adj:np.ndarray):
+    """Compute topological overlap matrix (TOM) from adjacency matrix.
+
+    Parameters
+    ----------
+    adj : np.ndarray
+        Square adjacency matrix (float-like). Diagonal is forced to 1.
+
+    Returns
+    -------
+    np.ndarray
+        TOM matrix in float32 with diagonal fixed to 1.
+
+    Notes
+    -----
+    This implementation keeps memory usage low by:
+    - reusing `adj`
+    - allocating one TOM matrix (`n x n`)
+    - computing denominator row-wise with a 1D buffer
+    """
     adj = np.asarray(adj, dtype=np.float32)
     if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
         raise ValueError(f'Adjacency matrix must be square 2D, got shape={adj.shape}')

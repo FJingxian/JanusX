@@ -193,23 +193,7 @@ class CliStatus:
         if not self.show_elapsed:
             return base
         elapsed_text = self._format_elapsed(self._elapsed_seconds())
-        if not getattr(sys.stdout, "isatty", lambda: False)():
-            return f"{base} [{elapsed_text}]"
-        width = None
-        if self._backend == "rich" and self._console is not None:
-            try:
-                width = int(self._console.width)
-            except Exception:
-                width = None
-        if width is None:
-            try:
-                width = int(get_terminal_size((80, 20)).columns)
-            except Exception:
-                width = 80
-        gap = int(width) - len(base) - len(elapsed_text) - 1
-        if gap >= 1:
-            return f"{base}{' ' * gap}{elapsed_text}"
-        return f"{base} {elapsed_text}"
+        return f"{base} [{elapsed_text}]"
 
     def _running_line(self) -> str:
         if not self.show_elapsed:

@@ -42,6 +42,7 @@ import socket
 import argparse
 import logging
 import sys
+import concurrent.futures as cf
 from typing import Union, Optional
 import uuid
 
@@ -1007,47 +1008,35 @@ def run_chunked_gwas_lmm_lm(
             if mmap_limit else None
         )
 
+        sample_sub = None if genofile.endswith('.vcf') or genofile.endswith('.vcf.gz') else ids[sameidx]
+        scan_threads = int(threads)
+        if scan_threads <= 0:
+            scan_threads = int(n_cores)
+        max_inflight = 2 if scan_threads >= 2 else 1
+        workers = max(1, max_inflight)
+        threads_per_worker = max(1, scan_threads // workers)
+        if max_inflight > 1:
+            logger.info(
+                f"Chunk pipeline: in-flight={max_inflight}, "
+                f"threads/worker={threads_per_worker}"
+            )
+
         process.cpu_percent(interval=None)
         pbar = _ProgressAdapter(total=n_snps, desc=f"{model_label}-{pname}")
 
-        sample_sub = None if genofile.endswith('.vcf') or genofile.endswith('.vcf.gz') else ids[sameidx]
-        for genosub, sites in load_genotype_chunks(
-            genofile,
-            chunk_size,
-            maf_threshold,
-            max_missing_rate,
-            model=genetic_model,
-            het=het_threshold,
-            sample_ids=sample_sub,
-            mmap_window_mb=mmap_window_mb,
-        ):
-            genosub:np.ndarray
-            genosub = genosub[:, sameidx]  if sample_sub is None else genosub # (m_chunk, n_use)
-            if genetic_model != "add":
-                keep_mask = _heter_keep_mask(genosub, het_threshold)
-                if not np.any(keep_mask):
-                    continue
-                genosub = genosub[keep_mask]
-                sites = [s for s, k in zip(sites, keep_mask) if k]
-            m_chunk = genosub.shape[0]
-            if m_chunk == 0:
-                continue
+        inflight: dict[
+            int,
+            tuple[cf.Future, int, list[tuple[str, int, str, str]], np.ndarray],
+        ] = {}
+        ready_rows: dict[int, tuple[pd.DataFrame, int]] = {}
+        chunk_seq = 0
+        next_write_seq = 0
 
-            geno_model = _apply_genetic_model(genosub, genetic_model)
-            if genetic_model == "add":
-                maf_chunk = np.mean(genosub, axis=1) / 2
-            else:
-                maf_chunk = np.mean(geno_model, axis=1)
-            geno_center = geno_model - np.mean(
-                geno_model, axis=1, dtype=np.float32, keepdims=True
-            )
-            results = mod.gwas(geno_center, threads=threads)
-            info_chunk = [
-                (s.chrom, s.pos, s.ref_allele, s.alt_allele) for s in sites
-            ]
-            if not info_chunk:
-                continue
-
+        def _build_chunk_df(
+            results: np.ndarray,
+            info_chunk: list[tuple[str, int, str, str]],
+            maf_chunk: np.ndarray,
+        ) -> pd.DataFrame:
             chroms, poss, allele0, allele1 = zip(*info_chunk)
             allele0_list = list(allele0)
             allele1_list = list(allele1)
@@ -1071,27 +1060,110 @@ def run_chunked_gwas_lmm_lm(
                 chunk_df["plrt"] = results[:, 3]
                 chunk_df["plrt"] = chunk_df["plrt"].map(lambda x: f"{x:.4e}")
             chunk_df["pos"] = chunk_df["pos"].astype(int)
-
             chunk_df["pwald"] = chunk_df["pwald"].map(lambda x: f"{x:.4e}")
-            chunk_df.to_csv(
-                tmp_tsv,
-                sep="\t",
-                float_format="%.4f",
-                index=False,
-                header=not wrote_header,
-                mode="w" if not wrote_header else "a",
+            return chunk_df
+
+        def _write_ready_chunks() -> None:
+            nonlocal next_write_seq, wrote_header, has_results, done_snps, peak_rss
+            while next_write_seq in ready_rows:
+                chunk_df, m_chunk = ready_rows.pop(next_write_seq)
+                chunk_df.to_csv(
+                    tmp_tsv,
+                    sep="\t",
+                    float_format="%.4f",
+                    index=False,
+                    header=not wrote_header,
+                    mode="w" if not wrote_header else "a",
+                )
+                wrote_header = True
+                has_results = True
+
+                done_snps += m_chunk
+                pbar.update(m_chunk)
+
+                mem_info = process.memory_info()
+                peak_rss = max(peak_rss, mem_info.rss)
+                if done_snps % (10 * chunk_size) == 0:
+                    mem_gb = mem_info.rss / 1024**3
+                    pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
+                next_write_seq += 1
+
+        def _drain_completed(*, wait_for_one: bool) -> None:
+            if len(inflight) == 0:
+                return
+            futures = [x[0] for x in inflight.values()]
+            if wait_for_one:
+                done_set, _ = cf.wait(futures, return_when=cf.FIRST_COMPLETED)
+            else:
+                done_set = {f for f in futures if f.done()}
+                if len(done_set) == 0:
+                    return
+
+            done_seq = sorted(
+                [
+                    seq
+                    for seq, (fut, _m, _info, _maf) in inflight.items()
+                    if fut in done_set
+                ]
             )
-            wrote_header = True
-            has_results = True
+            for seq in done_seq:
+                fut, m_chunk, info_chunk, maf_chunk = inflight.pop(seq)
+                results = fut.result()
+                ready_rows[seq] = (_build_chunk_df(results, info_chunk, maf_chunk), m_chunk)
+            _write_ready_chunks()
 
-            done_snps += m_chunk
-            pbar.update(m_chunk)
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            for genosub, sites in load_genotype_chunks(
+                genofile,
+                chunk_size,
+                maf_threshold,
+                max_missing_rate,
+                model=genetic_model,
+                het=het_threshold,
+                sample_ids=sample_sub,
+                mmap_window_mb=mmap_window_mb,
+            ):
+                genosub: np.ndarray
+                genosub = genosub[:, sameidx] if sample_sub is None else genosub
+                if genetic_model != "add":
+                    keep_mask = _heter_keep_mask(genosub, het_threshold)
+                    if not np.any(keep_mask):
+                        continue
+                    genosub = genosub[keep_mask]
+                    sites = [s for s, k in zip(sites, keep_mask) if k]
+                m_chunk = genosub.shape[0]
+                if m_chunk == 0:
+                    continue
 
-            mem_info = process.memory_info()
-            peak_rss = max(peak_rss, mem_info.rss)
-            if done_snps % (10 * chunk_size) == 0:
-                mem_gb = mem_info.rss / 1024**3
-                pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
+                info_chunk = [
+                    (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
+                    for s in sites
+                ]
+                if len(info_chunk) == 0:
+                    continue
+
+                geno_model = _apply_genetic_model(genosub, genetic_model)
+                if genetic_model == "add":
+                    maf_chunk = np.mean(genosub, axis=1)
+                    maf_chunk = (maf_chunk / 2).astype(np.float32, copy=False)
+                else:
+                    maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
+                geno_center = geno_model - np.mean(
+                    geno_model, axis=1, dtype=np.float32, keepdims=True
+                )
+
+                fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
+                inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
+                chunk_seq += 1
+
+                if len(inflight) >= max_inflight:
+                    _drain_completed(wait_for_one=True)
+                else:
+                    _drain_completed(wait_for_one=False)
+
+            while len(inflight) > 0:
+                _drain_completed(wait_for_one=True)
+            _write_ready_chunks()
 
         pbar.finish()
         pbar.close()

@@ -622,6 +622,14 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
                 "gvcf2vcf",
             ],
             use_rich=True,
+            step_items=[
+                step1_items,
+                step2_items,
+                step3_items,
+                step4_items,
+                step5_items,
+                step6_items,
+            ],
         )
     except Exception as e:
         disk_state = _load_json_or_empty(state_path)

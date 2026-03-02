@@ -186,7 +186,7 @@ class _ProgressAdapter:
                     ),
                     TextColumn("[green]{task.description}"),
                     BarColumn(),
-                    TextColumn("{task.completed}/{task.total}"),
+                    TextColumn("{task.percentage:>6.1f}%"),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
                     TextColumn("{task.fields[postfix]}"),
@@ -204,7 +204,14 @@ class _ProgressAdapter:
                 self._task_id = None
 
         if self._backend == "none" and _HAS_TQDM:
-            self._tqdm = tqdm(total=self.total, desc=self.desc, ascii=True, leave=False)
+            self._tqdm = tqdm(
+                total=self.total,
+                desc=self.desc,
+                ascii=True,
+                leave=False,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            )
             self._backend = "tqdm"
 
     def update(self, n: int) -> None:

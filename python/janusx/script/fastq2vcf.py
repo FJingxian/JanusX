@@ -104,6 +104,7 @@ class _DownloadProgress:
                     ),
                     TextColumn("[green]{task.description}"),
                     BarColumn(),
+                    TextColumn("{task.percentage:>6.1f}%"),
                     DownloadColumn(),
                     TransferSpeedColumn(),
                     TimeElapsedColumn(),
@@ -128,6 +129,8 @@ class _DownloadProgress:
                 unit_scale=True,
                 unit_divisor=1024,
                 leave=False,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             )
             self._backend = "tqdm"
 

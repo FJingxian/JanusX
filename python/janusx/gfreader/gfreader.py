@@ -646,6 +646,8 @@ def save_genotype_streaming(
         unit="SNP",
         desc=desc,
         disable=(total_snps is None),
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                   "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
     )
 
     written = 0

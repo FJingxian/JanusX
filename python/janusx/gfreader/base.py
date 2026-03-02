@@ -75,7 +75,7 @@ class _LoadProgressAdapter:
                     ),
                     TextColumn("[green]{task.description}"),
                     BarColumn(),
-                    TextColumn("{task.completed}/{task.total}"),
+                    TextColumn("{task.percentage:>6.1f}%"),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
                     transient=True,
@@ -94,6 +94,8 @@ class _LoadProgressAdapter:
                 ascii=True,
                 leave=False,
                 dynamic_ncols=True,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             )
             self._backend = "tqdm"
 
@@ -323,7 +325,13 @@ def genotype2vcf(geno:pd.DataFrame,outPrefix:str=None,chunksize:int=10_000):
     assert sample_duploc.sum()==0, f'Duplicated samples: {dupsamples}'
     with open(f'{outPrefix}.vcf','w') as f:
         f.writelines(vcfinfo())
-    pbar = tqdm(total=m, desc="Saving as VCF",ascii=True)
+    pbar = tqdm(
+        total=m,
+        desc="Saving as VCF",
+        ascii=True,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                   "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+    )
     for i in range(0,m,chunksize):
         i_end = np.min([i+chunksize,m])
         g_chunk = np.full((i_end-i,n-2), './.', dtype=object)

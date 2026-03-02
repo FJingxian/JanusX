@@ -1397,7 +1397,7 @@ def _ldclump_significant_snps(
                 ),
                 TextColumn("[green]{task.description}"),
                 BarColumn(),
-                TextColumn("{task.completed}/{task.total}"),
+                TextColumn("{task.percentage:>6.1f}%"),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
                 transient=True,
@@ -1416,6 +1416,8 @@ def _ldclump_significant_snps(
                 unit="snp",
                 leave=False,
                 dynamic_ncols=True,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             )
 
         try:
@@ -3636,6 +3638,8 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             unit="file",
             leave=False,
             dynamic_ncols=True,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                       "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
         task_start_ts = {f: time.monotonic() for f in files}
         try:

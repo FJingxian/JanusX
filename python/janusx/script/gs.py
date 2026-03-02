@@ -337,7 +337,7 @@ def _run_methods_parallel(
             ),
             TextColumn("Method: {task.fields[method]}"),
             BarColumn(),
-            TextColumn("{task.fields[fold_done]}/{task.fields[fold_total]}{task.fields[suffix]}"),
+            TextColumn("{task.percentage:>6.1f}%{task.fields[suffix]}"),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             transient=True,
@@ -444,6 +444,8 @@ def _run_methods_parallel(
             unit="method",
             leave=False,
             dynamic_ncols=True,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                       "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
         method_start_ts = {m: time.monotonic() for m in methods}
         manager = mp.Manager()

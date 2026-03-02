@@ -71,6 +71,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 
 try:
@@ -289,13 +290,15 @@ def build_grm_streaming_for_pca(
         auto_mmap_window_mb(genofile, n_samples, n_snps, chunk_size)
         if mmap_limit else None
     )
-    for genosub, _sites in load_genotype_chunks(
+    prefetch_depth = 2
+    chunk_iter = load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
         mmap_window_mb=mmap_window_mb,
-    ):
+    )
+    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
         # genosub: (m_chunk, n_samples)
         # MAF per SNP
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
@@ -471,14 +474,15 @@ def main(log: bool = True):
         raise ValueError("No valid input found; one of --vcf/--bfile/--grm/--qcov must be provided.")
 
     gfile = gfile.replace("\\", "/")
-    args.out = args.out if args.out is not None else "."
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
 
     # Keep index for logging and validate after logger is ready
     palette_idx = int(args.color)
 
     # ------------------------- Logging -------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
-    log_path = f"{args.out}/{args.prefix}.pca.log".replace("\\", "/").replace("//", "/")
+    log_path = f"{outprefix}.pca.log".replace("//", "/")
     logger = setup_logging(log_path)
 
     if palette_idx == -1:
@@ -526,7 +530,7 @@ def main(log: bool = True):
             config_title="PCA CONFIG",
             host=socket.gethostname(),
             sections=[("General", cfg_rows)],
-            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            footer_rows=[("Output prefix", outprefix)],
             line_max_chars=60,
         )
 
@@ -595,14 +599,14 @@ def main(log: bool = True):
             np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
         )
         df_vec.to_csv(
-            f"{args.out}/{args.prefix}.eigenvec",
+            f"{outprefix}.eigenvec",
             sep="\t",
             header=False,
             index=False,
             float_format="%.6f",
         )
         np.savetxt(
-            f"{args.out}/{args.prefix}.eigenval",
+            f"{outprefix}.eigenval",
             eigenval,
             fmt="%.2f",
         )
@@ -656,14 +660,14 @@ def main(log: bool = True):
             np.column_stack([samples.astype(str), eigenvec[:, : args.dim]])
         )
         df_vec.to_csv(
-            f"{args.out}/{args.prefix}.eigenvec",
+            f"{outprefix}.eigenvec",
             sep="\t",
             header=False,
             index=False,
             float_format="%.6f",
         )
         np.savetxt(
-            f"{args.out}/{args.prefix}.eigenval",
+            f"{outprefix}.eigenval",
             eigenval,
             fmt="%.2f",
         )
@@ -734,7 +738,7 @@ def main(log: bool = True):
         )
 
         plt.tight_layout()
-        out_pdf = f"{args.out}/{args.prefix}.eigenvec.2D.pdf"
+        out_pdf = f"{outprefix}.eigenvec.2D.pdf"
         plt.savefig(out_pdf, transparent=True)
         plt.close()
         logger.info(f"2D PCA figure saved to {out_pdf.replace('//', '/')}")
@@ -742,7 +746,7 @@ def main(log: bool = True):
     if args.plot3D:
         logger.info("* Generating 3D PCA rotating GIF...")
         pcshow = PCSHOW(df_pc)
-        out_gif = f"{args.out}/{args.prefix}.eigenvec.3D.gif"
+        out_gif = f"{outprefix}.eigenvec.3D.gif"
         pcshow.pcplot3D_gif(
             df_pc.columns[0],
             df_pc.columns[1],

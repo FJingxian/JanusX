@@ -44,6 +44,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 
 try:
@@ -217,13 +218,15 @@ def build_grm_streaming(
 
     varsum = 0.0
     eff_m = 0
-    for genosub, _sites in load_genotype_chunks(
+    prefetch_depth = 2
+    chunk_iter = load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
         mmap_window_mb=mmap_window_mb,
-    ):
+    )
+    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
         # genosub: (m_chunk, n_samples)
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2  # (m_chunk,1)
         genosub = genosub - 2 * maf  # center by 2p
@@ -352,13 +355,14 @@ def main(log: bool = True):
         raise ValueError("One of --vcf or --bfile must be provided.")
 
     gfile = gfile.replace("\\", "/")
-    args.out = args.out if args.out is not None else "."
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
-    log_path = f"{args.out}/{args.prefix}.grm.log".replace("\\", "/").replace("//", "/")
+    log_path = f"{outprefix}.grm.log".replace("//", "/")
     logger = setup_logging(log_path)
 
     if log:
@@ -381,7 +385,7 @@ def main(log: bool = True):
                     ],
                 )
             ],
-            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            footer_rows=[("Output prefix", outprefix)],
             line_max_chars=60,
         )
 
@@ -430,7 +434,7 @@ def main(log: bool = True):
     # Save results
     # ------------------------------------------------------------------
     if args.npy:
-        grm_path = f"{args.out}/{args.prefix}.grm.npy"
+        grm_path = f"{outprefix}.grm.npy"
         np.save(grm_path, grm)
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
@@ -440,7 +444,7 @@ def main(log: bool = True):
             f"  {grm_path}"
         )
     else:
-        grm_path = f"{args.out}/{args.prefix}.grm.txt"
+        grm_path = f"{outprefix}.grm.txt"
         np.savetxt(grm_path, grm, fmt="%.6f")
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")

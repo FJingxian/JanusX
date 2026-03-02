@@ -666,13 +666,14 @@ def main(log: bool = True) -> None:
         raise ValueError("No genotype input detected. Use -vcf or -bfile.")
 
     gfile = gfile.replace("\\", "/")  # Normalize Windows-style paths
-    args.out = args.out if args.out is not None else "."
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
 
     # ------------------------------------------------------------------
     # Logger
     # ------------------------------------------------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
-    log_path = f"{args.out}/{args.prefix}.gs.log".replace("\\", "/").replace("//", "/")
+    log_path = f"{outprefix}.gs.log".replace("//", "/")
     logger = setup_logging(log_path)
 
     # Configuration summary
@@ -713,7 +714,7 @@ def main(log: bool = True) -> None:
             config_title="GS CONFIG",
             host=socket.gethostname(),
             sections=[("General", cfg_rows)],
-            footer_rows=[("Output prefix", f"{args.out}/{args.prefix}")],
+            footer_rows=[("Output prefix", outprefix)],
             line_max_chars=60,
         )
 
@@ -874,7 +875,7 @@ def main(log: bool = True) -> None:
                     continue
                 fig = plt.figure(figsize=(5, 4), dpi=300)
                 gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
-                out_svg = f"{args.out}/{args.prefix}.{trait_name}.gs.{method}.svg"
+                out_svg = f"{outprefix}.{trait_name}.gs.{method}.svg"
                 fig.tight_layout()
                 fig.savefig(out_svg, transparent=False, facecolor="white")
                 plt.close(fig)
@@ -892,7 +893,7 @@ def main(log: bool = True) -> None:
             columns=methods,
             index=samples[testmask],
         )
-        out_tsv = f"{args.out}/{args.prefix}.{trait_name}.gs.tsv"
+        out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
         logger.info(f"Saved predictions to {out_tsv}".replace("//", "/"))
         logger.info(f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")

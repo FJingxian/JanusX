@@ -81,6 +81,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 
 try:
@@ -455,15 +456,16 @@ def build_grm_streaming(
 
     varsum = 0.0
     eff_m = 0
-
-    for genosub, _sites in load_genotype_chunks(
+    prefetch_depth = 2
+    chunk_iter = load_genotype_chunks(
         genofile,
         chunk_size,
         maf_threshold,
         max_missing_rate,
         model="add",
         mmap_window_mb=mmap_window_mb,
-    ):
+    )
+    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
         # genosub: (m_chunk, n_samples)
         genosub:np.ndarray
         maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
@@ -1015,11 +1017,6 @@ def run_chunked_gwas_lmm_lm(
         max_inflight = 2 if scan_threads >= 2 else 1
         workers = max(1, max_inflight)
         threads_per_worker = max(1, scan_threads // workers)
-        if max_inflight > 1:
-            logger.info(
-                f"Chunk pipeline: in-flight={max_inflight}, "
-                f"threads/worker={threads_per_worker}"
-            )
 
         process.cpu_percent(interval=None)
         pbar = _ProgressAdapter(total=n_snps, desc=f"{model_label}-{pname}")
@@ -1646,6 +1643,7 @@ def main(log: bool = True):
 
     gfile, prefix = determine_genotype_source(args)
 
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
     os.makedirs(args.out, 0o755, exist_ok=True)
     outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
     log_path = f"{outprefix}.gwas.log"

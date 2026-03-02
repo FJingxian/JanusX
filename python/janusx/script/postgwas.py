@@ -3842,7 +3842,7 @@ def main():
 
     args = parser.parse_args()
 
-    args.out = args.out if args.out is not None else "."
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
     args.prefix = "JanusX" if args.prefix is None else args.prefix
 
     # Create output directory if needed
@@ -3851,7 +3851,8 @@ def main():
     else:
         args.out = "."
 
-    log_path = f"{args.out}/{args.prefix}.postGWAS.log".replace("//", "/")
+    outprefix_base = os.path.join(args.out, args.prefix).replace("\\", "/")
+    log_path = f"{outprefix_base}.postGWAS.log".replace("//", "/")
     logger = setup_logging(log_path)
 
     # ------------------------------------------------------------------
@@ -4023,7 +4024,7 @@ def main():
     threshold_text = str(args.threshold if args.threshold is not None else "0.05 / nSNP")
     bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
     merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
-    output_prefix_text = f"{args.out}/{args.prefix}"
+    output_prefix_text = outprefix_base
     threads_text = (
         f"{args.thread} "
         f"({'All cores' if args.thread == -1 else 'User-specified'})"

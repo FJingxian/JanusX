@@ -436,27 +436,39 @@ if __name__ == "__main__":
     import numpy as np
     from janusx.gtools.wgcna import cor, adj, tom, cluster
     import pandas as pd
+    from janusx.pyBLUP.mlm import BLUP
     tpm = pd.read_csv('~/Public/test.tpm.tsv',sep='\t',index_col=0)
+    tpmid = pd.read_csv('~/Public/test.id.tsv',sep='\t',index_col=0,header=None)
+    tpm = tpm.loc[:,tpm.columns.isin(tpmid.index)]
     tpm = tpm.loc[tpm.mean(axis=1)>1]
-    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:15000]
+    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:10000]
     tpm = tpm.loc[cv.index]
-    print(tpm.shape)
+    
+    tpm.columns = tpm.columns.map(tpmid[1])
+    tpm = tpm.T.reset_index().groupby('index').mean().T
+    kinid:np.ndarray = np.genfromtxt("/Volumes/HP X306W/genotype/AMP_WGS_SNP.grm.npy.id",dtype=str)
+    kin:np.ndarray = np.load("/Volumes/HP X306W/genotype/AMP_WGS_SNP.grm.npy")
+    inmask = np.isin(kinid,tpm.columns)
+    kin = kin[np.ix_(inmask,inmask)]
+    tpm = tpm.loc[:,kinid[inmask]]
+
     mcor = cor(tpm,'signed')
     madj,sftresult = adj(mcor,list(range(1,10,1))+list(range(10,21,2)))
     if sftresult is not None:
         print(sftresult.set_index('sft'))
     mtom = tom(madj)
-    labels = cluster(mtom, num_modules=5,min_cluster_size=30)
+    labels = cluster(mtom, num_modules=5,min_cluster_size=50)
     outjson = {}
     for i in sorted(set(labels))[1:]: # 计算模块和表型的相关性 (ME-trait)
-        tpm_module = tpm.loc[labels==i].T
+        tpm_module:pd.DataFrame = tpm.loc[labels==i].T
         genes = tpm_module.columns.astype(str).tolist()
         gene = tpm_module.T.iloc[29].values
         tpm_module = (tpm_module - tpm_module.values.mean(axis=0)).values / tpm_module.values.std(axis=0)
         eigval,eigvec = np.linalg.eigh(tpm_module@tpm_module.T)
         me = eigvec[:,-1]
+        model = BLUP(me.reshape(-1,1),kin)
         outjson[f'Mod{i}'] = sorted(genes)
-        print(f'Mod{i}: {len(genes)} genes, ME-trait cor={np.corrcoef(me,gene)[0,1]:.4f}')
+        print(f'Mod{i}: {len(genes)} genes, MVE={model.pve:.4f}, hub={genes[np.argmax(mtom[labels==i].sum(axis=1))]}')
         # break
     with open('test.json', 'w') as f:
         json.dump(outjson, f, indent=4)

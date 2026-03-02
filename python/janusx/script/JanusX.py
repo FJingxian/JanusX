@@ -1,5 +1,39 @@
 #!/user/bin/env python
 # -*- coding: utf-8 -*-
+'''
+Usage:
+    jx <module> [options]
+
+Options:
+    -h, --help             Show this help message
+    -v, --version          Show version/build information
+    -update, --update      Update JanusX from GitHub via pip
+
+Modules:
+    Genome-wide Association Studies (GWAS):
+    grm           Build genomic relationship matrix
+    pca           Principal component analysis for population structure
+    gwas          Run genome-wide association analysis
+    postgwas      Post-process GWAS results and downstream plots
+
+    Genomic Selection (GS):
+    gs            Genomic prediction and model-based selection
+
+    GARFIELD:
+    garfield      Random-forest based marker-trait association
+    postgarfield  Summarize and visualize GARFIELD outputs
+
+    Bulk Segregation Analysis (BSA):
+    postbsa       Post-process and visualize BSA results
+
+    Pipeline and utility:
+    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
+    gmerge        Merge genotype/variant tables
+
+    Benchmark:
+    sim           Quick simulation workflow
+    simulation    Extended simulation and benchmarking workflow
+'''
 import sys
 import subprocess
 from datetime import date
@@ -53,15 +87,19 @@ __logo__ = r'''
   _   | |/ _` | '_ \| | | / __| > <  
  | |__| | (_| | | | | |_| \__ \/ . \ 
   \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
+  ---------------------------------------------------------
 '''
-_banner_line = "*" * 60
 __version__ = (
-    f"{_banner_line}\n"
-    f">JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
+    f"JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
     "Please report issues to <fujingxian@yzwlab.cn>\n"
     f"Build date: {_build_date()}\n"
-    f"{_banner_line}"
 )
+
+def _print_help() -> None:
+    print(__logo__)
+    if __doc__:
+        print(__doc__.strip())
+
 
 def main():
     module = dict(zip(
@@ -70,10 +108,7 @@ def main():
     ))
     if len(sys.argv)>1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
-            print(__logo__)
-            print("Usage: jx <module> [options]")
-            print(f"Available modules: {' '.join(module.keys())}")
-            print("Options: -h/--help  -v/--version  -update/--update (update JanusX)")
+            _print_help()
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
             print(__logo__)
             print(__version__)
@@ -92,12 +127,9 @@ def main():
                 module[module_name].main() # Process of Target Module
             elif sys.argv[1] not in module.keys():
                 print(f"Unknown module: {sys.argv[1]}")
-                print(f"Usage: {sys.argv[0]} <module> [options]")
-                print(f"Available modules: {' '.join(module.keys())}")
+                _print_help()
     else:
-        print(f"Usage: {sys.argv[0]} <module> [options]")
-        print(f"Available modules: {' '.join(module.keys())}")
-        print("Options: -h/--help  -v/--version  -update/--update (update JanusX)")
+        _print_help()
 
 if __name__ == "__main__":
     main()

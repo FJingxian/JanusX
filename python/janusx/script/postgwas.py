@@ -1391,7 +1391,7 @@ def _ldclump_significant_snps(
                 TextColumn("{task.completed}/{task.total}"),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
-                transient=True,
+                transient=False,
             )
         except Exception:
             progress = None
@@ -1405,7 +1405,7 @@ def _ldclump_significant_snps(
                 total=int(work.shape[0]),
                 desc="LD clumping",
                 unit="snp",
-                leave=False,
+                leave=True,
                 dynamic_ncols=True,
             )
 
@@ -3542,7 +3542,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             total=len(files),
             desc="PostGWAS tasks",
             unit="file",
-            leave=False,
+            leave=True,
             dynamic_ncols=True,
         )
         try:

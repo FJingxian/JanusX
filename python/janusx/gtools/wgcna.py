@@ -11,6 +11,7 @@ All heavy matrix operations are kept in `float32` to reduce memory footprint.
 import numbers
 import sys
 import warnings
+import json
 
 import numpy as np
 import pandas as pd
@@ -437,7 +438,7 @@ if __name__ == "__main__":
     import pandas as pd
     tpm = pd.read_csv('~/Public/test.tpm.tsv',sep='\t',index_col=0)
     tpm = tpm.loc[tpm.mean(axis=1)>1]
-    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:15000]
+    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:5000]
     tpm = tpm.loc[cv.index]
     print(tpm.shape)
     mcor = cor(tpm,'signed')
@@ -445,15 +446,17 @@ if __name__ == "__main__":
     if sftresult is not None:
         print(sftresult.set_index('sft'))
     mtom = tom(madj)
-    labels = cluster(mtom, num_modules=10,min_cluster_size=30)
-    for i in range(1,11): # 计算ME
-        print(f"Module {i}:")
+    labels = cluster(mtom, num_modules=5,min_cluster_size=30)
+    outjson = {}
+    for i in sorted(set(labels)): # 计算模块和表型的相关性 (ME-trait)
         tpm_module = tpm.loc[labels==i].T
+        genes = tpm_module.columns.astype(str).tolist()
         gene = tpm_module.T.iloc[29].values
-        tpm_module = (tpm_module - tpm_module.values.mean(axis=1, keepdims=True)).values / tpm_module.values.std(axis=1, keepdims=True)
+        tpm_module = (tpm_module - tpm_module.values.mean(axis=0)).values / tpm_module.values.std(axis=0)
         eigval,eigvec = np.linalg.eigh(tpm_module@tpm_module.T)
         me = eigvec[:,-1]
-        print(np.corrcoef(me,gene)[0,1])
+        outjson[f'Mod{i}'] = sorted(genes)
         # break
-    
+    with open('test.json', 'w') as f:
+        json.dump(outjson, f, indent=4)
     

@@ -98,7 +98,7 @@ class _ProgressAdapter:
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
                     TextColumn("{task.fields[postfix]}"),
-                    transient=True,
+                    transient=False,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(

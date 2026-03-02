@@ -100,7 +100,7 @@ class _DownloadProgress:
                     TransferSpeedColumn(),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
-                    transient=True,
+                    transient=False,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(

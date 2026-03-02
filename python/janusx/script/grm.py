@@ -44,6 +44,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.status import get_rich_spinner_name, print_success
 
 try:
     from rich.progress import (
@@ -87,7 +88,10 @@ class _ProgressAdapter:
         if _HAS_RICH_PROGRESS and sys.stdout.isatty():
             try:
                 self._progress = Progress(
-                    SpinnerColumn(),
+                    SpinnerColumn(
+                        spinner_name=get_rich_spinner_name(),
+                        style="cyan",
+                    ),
                     TextColumn("[bold green]{task.description}"),
                     BarColumn(),
                     TextColumn("{task.completed}/{task.total}"),
@@ -137,13 +141,30 @@ class _ProgressAdapter:
             self._tqdm.refresh()
 
     def close(self) -> None:
+        closed = False
+        finished = False
         if self._backend == "rich" and self._progress is not None:
+            if self._task_id is not None:
+                try:
+                    task = self._progress.tasks[self._task_id]
+                    finished = bool(task.finished)
+                except Exception:
+                    finished = False
             self._progress.stop()
             self._progress = None
             self._task_id = None
+            closed = True
         elif self._backend == "tqdm" and self._tqdm is not None:
+            try:
+                total = float(self._tqdm.total or 0)
+                finished = float(self._tqdm.n or 0) >= total
+            except Exception:
+                finished = False
             self._tqdm.close()
             self._tqdm = None
+            closed = True
+        if closed and finished:
+            print_success(f"{self.desc} ...Finished")
 
 
 def build_grm_streaming(

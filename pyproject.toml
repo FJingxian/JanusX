@@ -6,9 +6,9 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "pandas<3.0",
+    "matplotlib",
     "scipy",
     "scikit-learn",
-    "matplotlib",
     "psutil",
     "tqdm",
     "rich",

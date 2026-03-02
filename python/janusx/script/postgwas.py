@@ -30,6 +30,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.status import get_rich_spinner_name
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -1381,7 +1382,10 @@ def _ldclump_significant_snps(
     if use_rich_progress:
         try:
             progress = Progress(
-                SpinnerColumn(),
+                SpinnerColumn(
+                    spinner_name=get_rich_spinner_name(),
+                    style="cyan",
+                ),
                 TextColumn("[bold green]{task.description}"),
                 BarColumn(),
                 TextColumn("{task.completed}/{task.total}"),
@@ -3494,7 +3498,10 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         name_width = max((len(x) for x in basenames), default=0)
         idx_width = len(str(n_total))
         progress = Progress(
-            SpinnerColumn(),
+            SpinnerColumn(
+                spinner_name=get_rich_spinner_name(),
+                style="cyan",
+            ),
             TextColumn(
                 "Task {task.fields[task_label]}: [bold]{task.fields[file_pad]}[/bold]{task.fields[suffix]}"
             ),

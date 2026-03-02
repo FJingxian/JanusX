@@ -20,6 +20,7 @@ import socket
 import argparse
 import subprocess
 import re
+import sys
 from glob import glob
 from typing import List
 
@@ -33,6 +34,7 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from janusx.script._common.status import CliStatus
 
 
 def _determine_genotype(args) -> tuple[str, str]:
@@ -65,12 +67,18 @@ def _find_gwas_results(outprefix: str, model: str) -> list[str]:
 
 def _run_subprocess(cmd: List[str], logger, desc: str) -> None:
     logger.info(f"* {desc}: {' '.join(cmd)}")
-    res = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    with CliStatus(desc, enabled=use_spinner) as task:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if res.returncode == 0:
+            task.complete(f"{desc} ...Finished")
+        else:
+            task.fail(f"{desc} ...Failed")
     if res.returncode != 0:
         stderr = (res.stderr or "").strip()
         if stderr:

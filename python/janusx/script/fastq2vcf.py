@@ -39,6 +39,7 @@ from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
+from ._common.status import CliStatus, get_rich_spinner_name, print_success
 
 try:
     from rich.progress import (
@@ -89,7 +90,10 @@ class _DownloadProgress:
         if _HAS_RICH_PROGRESS and sys.stdout.isatty():
             try:
                 self._progress = Progress(
-                    SpinnerColumn(),
+                    SpinnerColumn(
+                        spinner_name=get_rich_spinner_name(),
+                        style="cyan",
+                    ),
                     TextColumn("[bold green]{task.description}"),
                     BarColumn(),
                     DownloadColumn(),
@@ -128,13 +132,30 @@ class _DownloadProgress:
             self._tqdm.update(step)
 
     def close(self) -> None:
+        closed = False
+        finished = False
         if self._backend == "rich" and self._progress is not None:
+            if self._task_id is not None:
+                try:
+                    task = self._progress.tasks[self._task_id]
+                    finished = bool(task.finished)
+                except Exception:
+                    finished = False
             self._progress.stop()
             self._progress = None
             self._task_id = None
+            closed = True
         elif self._backend == "tqdm" and self._tqdm is not None:
+            try:
+                total = float(self._tqdm.total or 0)
+                finished = float(self._tqdm.n or 0) >= total
+            except Exception:
+                finished = False
             self._tqdm.close()
             self._tqdm = None
+            closed = True
+        if closed and finished:
+            print_success(f"{self.desc} ...Finished")
 
 
 def downloader(url: str, dst: Path) -> None:
@@ -261,6 +282,7 @@ def read_chroms_from_fai(reference: Path) -> List[str]:
 
 def main():
     t_start = time.time()
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -363,10 +385,17 @@ def main():
         cmd = indexREF(str(reference), singularity=singularity_prefix)
         logger.info(f"Indexing reference: {cmd}")
         index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
-        subprocess.run(index_job, shell=True, check=True, cwd=workdir)
-        logger.info("Waiting for FASTA index (.fai) to be ready...")
-        while not fai_path.exists() or not ann_path.exists:
-            time.sleep(5)
+        with CliStatus("Indexing reference...", enabled=use_spinner) as task:
+            try:
+                subprocess.run(index_job, shell=True, check=True, cwd=workdir)
+            except Exception:
+                task.fail("Reference indexing ...Failed")
+                raise
+            task.complete("Reference indexing started")
+        with CliStatus("Waiting for FASTA index files...", enabled=use_spinner) as task:
+            while (not fai_path.exists()) or (not ann_path.exists()):
+                time.sleep(5)
+            task.complete("Reference index files ready")
 
     chrom = read_chroms_from_fai(reference)
     logger.info(f"Chromosomes: {len(chrom)}")

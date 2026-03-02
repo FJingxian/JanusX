@@ -11,68 +11,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from itertools import cycle
-from shutil import get_terminal_size
-from threading import Thread
-from time import sleep
-
-try:
-    from rich.console import Console
-except Exception:
-    Console = None
+from janusx.script._common.status import CliStatus
 
 
 _GITHUB_PROXY_SPEC = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git"
 _GITHUB_SPEC = "git+https://github.com/FJingxian/JanusX.git"
 _PIP_TIMEOUT_SECONDS = 30
-_RICH_CONSOLE = Console() if Console is not None else None
-
-
-class Loader:
-    def __init__(
-        self,
-        desc: str = "Updating...",
-        end: str = "",
-        timeout: float = 0.1,
-        enabled: bool = True,
-    ) -> None:
-        self.desc = desc
-        self.end = end
-        self.timeout = timeout
-        self.enabled = enabled
-        self.steps = ("|", "/", "-", "\\")
-        self.done = False
-        self._thread = Thread(target=self._animate, daemon=True)
-
-    def _animate(self) -> None:
-        for c in cycle(self.steps):
-            if self.done:
-                break
-            print(f"\r[{c}] {self.desc}", flush=True, end="")
-            sleep(self.timeout)
-
-    def start(self) -> "Loader":
-        if not self.enabled:
-            print(self.desc)
-            return self
-        self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        if self.enabled:
-            self.done = True
-            self._thread.join(timeout=self.timeout * 4)
-            cols = get_terminal_size((80, 20)).columns
-            print("\r" + " " * cols, end="", flush=True)
-            print("\r", end="", flush=True)
-        if self.end:
-            print(self.end, flush=True)
-
-    def __enter__(self) -> "Loader":
-        return self.start()
-
-    def __exit__(self, exc_type, exc_value, tb) -> None:
-        self.stop()
 
 
 def _run_update(spec: str) -> subprocess.CompletedProcess[str]:
@@ -133,18 +77,13 @@ def _print_failure(label: str, proc: subprocess.CompletedProcess[str]) -> None:
     print(f"Reason: {_extract_error_reason(proc.stdout)}")
 
 
-def _status(desc: str, enabled: bool):
-    if enabled and _RICH_CONSOLE is not None:
-        return _RICH_CONSOLE.status(f"[bold green]{desc}")
-    return Loader(desc, enabled=enabled)
-
-
 def main() -> None:
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    with _status("Updating...", enabled=use_spinner):
+    with CliStatus("Updating...", enabled=use_spinner) as task:
         direct = _run_update(_GITHUB_SPEC)
+        if direct.returncode == 0:
+            task.complete("JanusX update completed.")
     if direct.returncode == 0:
-        print("JanusX update completed.")
         return
 
     if _looks_like_timeout(direct.stdout):
@@ -152,10 +91,11 @@ def main() -> None:
     else:
         print("Direct GitHub update failed, retrying with proxy...")
 
-    with _status("Updating via proxy...", enabled=use_spinner):
+    with CliStatus("Updating via proxy...", enabled=use_spinner) as task:
         proxied = _run_update(_GITHUB_PROXY_SPEC)
+        if proxied.returncode == 0:
+            task.complete("JanusX update completed (via proxy).")
     if proxied.returncode == 0:
-        print("JanusX update completed (via proxy).")
         return
 
     _print_failure("GitHub attempt failed.", direct)

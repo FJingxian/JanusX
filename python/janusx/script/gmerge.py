@@ -24,6 +24,7 @@ import time
 import json
 import socket
 import argparse
+import sys
 
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
@@ -32,6 +33,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.status import CliStatus
 from janusx.gfreader.gmerge import merge
 
 
@@ -179,13 +181,20 @@ def main(log: bool = True):
     # Run merge (call your Python API)
     # ------------------------------------------------------------------
     t0 = time.time()
-    stats, d = merge(
-        inputs=inputs,
-        out=out,
-        out_fmt=out_fmt,
-        check_exists=True,
-        return_dict=True,
-    )
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    with CliStatus("Merging genotype datasets...", enabled=use_spinner) as task:
+        try:
+            stats, d = merge(
+                inputs=inputs,
+                out=out,
+                out_fmt=out_fmt,
+                check_exists=True,
+                return_dict=True,
+            )
+        except Exception:
+            task.fail("Merging genotype datasets ...Failed")
+            raise
+        task.complete("Merging genotype datasets ...Finished")
     logger.info(f"Merge completed in {round(time.time() - t0, 3)} seconds")
 
     # ------------------------------------------------------------------

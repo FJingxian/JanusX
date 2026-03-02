@@ -28,10 +28,11 @@ import argparse
 import sys
 import subprocess
 import shutil
+import shlex
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
@@ -79,6 +80,85 @@ except Exception:
 
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
 FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+REQUIRED_LOCAL_TOOLS = ("fastp", "bwa", "samtools", "gatk")
+DOCKER_IMAGE_TAG = "janusx-fastq2vcf:latest"
+
+
+def _missing_binaries(commands: Sequence[str]) -> List[str]:
+    return [cmd for cmd in commands if shutil.which(cmd) is None]
+
+
+def _dockerfile_path() -> Path:
+    pipeline_dir = Path(janusx.pipeline.__file__).resolve().parent
+    return pipeline_dir / "docker" / "dockerfile"
+
+
+def _collect_docker_mounts(reference: Path, fastq_dir: Path, workdir: Path) -> List[Path]:
+    mounts: List[Path] = []
+    seen: set[str] = set()
+    for p in (reference.parent, fastq_dir, workdir):
+        rp = Path(p).expanduser().resolve()
+        key = str(rp)
+        if key in seen:
+            continue
+        seen.add(key)
+        mounts.append(rp)
+    return mounts
+
+
+def _docker_exec_prefix(image_tag: str, workdir: Path, mounts: Sequence[Path]) -> str:
+    parts: List[str] = ["docker", "run", "--rm"]
+    try:
+        uid = int(os.getuid())
+        gid = int(os.getgid())
+        parts.extend(["--user", f"{uid}:{gid}"])
+    except Exception:
+        pass
+
+    for mount in mounts:
+        m = str(Path(mount).expanduser().resolve())
+        parts.extend(["-v", f"{m}:{m}"])
+
+    parts.extend(["-w", str(workdir), image_tag])
+    return " ".join(shlex.quote(x) for x in parts)
+
+
+def _build_docker_image(dockerfile: Path, image_tag: str, use_spinner: bool, logger) -> None:
+    cmd = [
+        "docker",
+        "build",
+        "-f",
+        str(dockerfile),
+        "-t",
+        image_tag,
+        str(dockerfile.parent),
+    ]
+    logger.info("Docker build: %s", " ".join(shlex.quote(x) for x in cmd))
+    with CliStatus("Building Docker image...", enabled=use_spinner) as task:
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception:
+            task.fail("Docker image build ...Failed")
+            raise
+        task.complete("Docker image build ...Finished")
+
+
+def _docker_daemon_running(docker_bin: str) -> tuple[bool, str]:
+    cmd = [str(docker_bin), "info"]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except Exception as e:
+        return False, str(e)
+    if p.returncode == 0:
+        return True, ""
+    err = (p.stderr or "").strip()
+    return False, err if err else "docker daemon unavailable"
 
 
 class _DownloadProgress:
@@ -357,39 +437,101 @@ def main():
         line_max_chars=60,
     )
 
-    binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
-    binary_path.mkdir(parents=True, exist_ok=True)
-    sif_path = binary_path / "janusxext.sif"
-    if not sif_path.exists():
-        user_input = input(
-            "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
-        ).strip()
-        if not user_input or user_input.lower() == "n":
-            raise SystemExit(1)
-        tmp_path = binary_path / "janusxext.tmp.sif"
-        if user_input.lower() == "y":
-            downloader(
-                "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
-                tmp_path,
-            )
-        else:
-            src = Path(user_input).expanduser().resolve()
-            if not src.exists():
-                logger.error(f"SIF path not found: {src}")
+    exec_prefix = ""
+    runtime_mode = "local"
+    missing_tools = _missing_binaries(REQUIRED_LOCAL_TOOLS)
+    if len(missing_tools) == 0:
+        logger.info(
+            "Using local runtime. Found dependencies: %s",
+            ", ".join(REQUIRED_LOCAL_TOOLS),
+        )
+    else:
+        logger.warning("Missing local dependencies: %s", ", ".join(missing_tools))
+        docker_bin = shutil.which("docker")
+        docker_ready = False
+        docker_err = ""
+        if docker_bin is not None:
+            docker_ready, docker_err = _docker_daemon_running(docker_bin)
+
+        if docker_bin is not None and docker_ready:
+            dockerfile = _dockerfile_path()
+            if not dockerfile.exists():
+                logger.error(f"Dockerfile not found: {dockerfile}")
                 raise SystemExit(1)
-            shutil.copy2(src, tmp_path)
+            _build_docker_image(
+                dockerfile=dockerfile,
+                image_tag=DOCKER_IMAGE_TAG,
+                use_spinner=use_spinner,
+                logger=logger,
+            )
+            docker_mounts = _collect_docker_mounts(
+                reference=reference,
+                fastq_dir=fastq_dir,
+                workdir=workdir,
+            )
+            exec_prefix = _docker_exec_prefix(
+                image_tag=DOCKER_IMAGE_TAG,
+                workdir=workdir,
+                mounts=docker_mounts,
+            )
+            runtime_mode = "docker"
+            logger.info("Docker runtime enabled.")
+            logger.info("Docker prefix: %s", exec_prefix)
+        else:
+            if docker_bin is not None and not docker_ready:
+                logger.warning(
+                    "Docker command found but daemon is not running. "
+                    "Falling back to singularity. detail: %s",
+                    docker_err,
+                )
+            singularity_bin = shutil.which("singularity")
+            if singularity_bin is None:
+                logger.error(
+                    "Missing local dependencies (%s), and no usable container runtime is available.",
+                    ", ".join(missing_tools)
+                )
+                raise SystemExit(1)
 
-        # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
-        os.replace(tmp_path, sif_path)
-        logger.info(f'Saved in {sif_path}')
+            binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
+            binary_path.mkdir(parents=True, exist_ok=True)
+            sif_path = binary_path / "janusxext.sif"
+            if not sif_path.exists():
+                user_input = input(
+                    "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
+                ).strip()
+                if not user_input or user_input.lower() == "n":
+                    raise SystemExit(1)
+                tmp_path = binary_path / "janusxext.tmp.sif"
+                if user_input.lower() == "y":
+                    downloader(
+                        "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+                        tmp_path,
+                    )
+                else:
+                    src = Path(user_input).expanduser().resolve()
+                    if not src.exists():
+                        logger.error(f"SIF path not found: {src}")
+                        raise SystemExit(1)
+                    shutil.copy2(src, tmp_path)
 
-    singularity_prefix = f"singularity exec {sif_path} "
-    logger.info(f"Singularity: {singularity_prefix}")
+                # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
+                os.replace(tmp_path, sif_path)
+                logger.info(f"Saved in {sif_path}")
+
+            exec_prefix = (
+                f"{shlex.quote(str(singularity_bin))} exec "
+                f"{shlex.quote(str(sif_path))}"
+            )
+            runtime_mode = "singularity"
+            logger.info("Singularity runtime enabled.")
+            logger.info("Singularity prefix: %s", exec_prefix)
+
+    logger.info("Execution runtime: %s", runtime_mode)
 
     fai_path = Path(f"{reference}.fai")
     ann_path = Path(f"{reference}.ann")
     if not fai_path.exists() or not ann_path.exists():
-        cmd = indexREF(str(reference), singularity=singularity_prefix)
+        cmd = indexREF(str(reference), singularity=exec_prefix)
         logger.info(f"Indexing reference: {cmd}")
         index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
         with CliStatus("Indexing reference...", enabled=use_spinner) as task:
@@ -431,7 +573,7 @@ def main():
         workdir=workdir,
         backbend=args.backend,
         nohup_max_jobs=args.maxtask,
-        singularity=singularity_prefix,
+        singularity=exec_prefix,
     )
 
     logger.info(f"Pipeline finished in {time.time() - t_start:.1f}s")

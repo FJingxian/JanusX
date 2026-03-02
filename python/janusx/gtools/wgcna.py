@@ -438,7 +438,7 @@ if __name__ == "__main__":
     import pandas as pd
     tpm = pd.read_csv('~/Public/test.tpm.tsv',sep='\t',index_col=0)
     tpm = tpm.loc[tpm.mean(axis=1)>1]
-    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:5000]
+    cv = (tpm.std(axis=1)/tpm.mean(axis=1)).sort_values(ascending=False).iloc[:15000]
     tpm = tpm.loc[cv.index]
     print(tpm.shape)
     mcor = cor(tpm,'signed')
@@ -448,7 +448,7 @@ if __name__ == "__main__":
     mtom = tom(madj)
     labels = cluster(mtom, num_modules=5,min_cluster_size=30)
     outjson = {}
-    for i in sorted(set(labels)): # 计算模块和表型的相关性 (ME-trait)
+    for i in sorted(set(labels))[1:]: # 计算模块和表型的相关性 (ME-trait)
         tpm_module = tpm.loc[labels==i].T
         genes = tpm_module.columns.astype(str).tolist()
         gene = tpm_module.T.iloc[29].values
@@ -456,6 +456,7 @@ if __name__ == "__main__":
         eigval,eigvec = np.linalg.eigh(tpm_module@tpm_module.T)
         me = eigvec[:,-1]
         outjson[f'Mod{i}'] = sorted(genes)
+        print(f'Mod{i}: {len(genes)} genes, ME-trait cor={np.corrcoef(me,gene)[0,1]:.4f}')
         # break
     with open('test.json', 'w') as f:
         json.dump(outjson, f, indent=4)

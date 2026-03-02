@@ -37,6 +37,21 @@ _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
 
 
+def format_elapsed(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "0.0s"
+    s = float(max(0.0, seconds))
+    if s < 60.0:
+        return f"{s:.1f}s"
+    total_seconds = int(round(s))
+    if total_seconds < 3600:
+        minutes, rem = divmod(total_seconds, 60)
+        return f"{minutes}m{rem:02d}s"
+    hours, rem_seconds = divmod(total_seconds, 3600)
+    mins = rem_seconds // 60
+    return f"{hours}h{mins:02d}m"
+
+
 def ensure_rich_spinner_registered() -> None:
     if not _HAS_RICH:
         return
@@ -52,30 +67,36 @@ def get_rich_spinner_name() -> str:
     return JANUSX_SPINNER_NAME
 
 
-def print_success(message: str) -> None:
+def print_success(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
-    if _HAS_RICH and getattr(sys.stdout, "isatty", lambda: False)():
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if _HAS_RICH and (is_tty or bool(force_color)):
         try:
-            Console().print(f"[green]✔︎[/green] {msg}")
+            Console(force_terminal=True, no_color=False).print(
+                f"[green]✔︎ {msg}[/green]"
+            )
             return
         except Exception:
             pass
-    if getattr(sys.stdout, "isatty", lambda: False)():
-        print(f"{_GREEN}✔︎{_RESET} {msg}", flush=True)
+    if is_tty or bool(force_color):
+        print(f"{_GREEN}✔︎ {msg}{_RESET}", flush=True)
     else:
         print(f"✔︎ {msg}", flush=True)
 
 
-def print_failure(message: str) -> None:
+def print_failure(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
-    if _HAS_RICH and getattr(sys.stdout, "isatty", lambda: False)():
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if _HAS_RICH and (is_tty or bool(force_color)):
         try:
-            Console().print(f"[red]✘[/red] {msg}")
+            Console(force_terminal=True, no_color=False).print(
+                f"[red]✘ {msg}[/red]"
+            )
             return
         except Exception:
             pass
-    if getattr(sys.stdout, "isatty", lambda: False)():
-        print(f"{_RED}✘{_RESET} {msg}", flush=True)
+    if is_tty or bool(force_color):
+        print(f"{_RED}✘ {msg}{_RESET}", flush=True)
     else:
         print(f"✘ {msg}", flush=True)
 
@@ -175,18 +196,7 @@ class CliStatus:
 
     @staticmethod
     def _format_elapsed(seconds: Optional[float]) -> str:
-        if seconds is None:
-            return "0.0s"
-        s = float(max(0.0, seconds))
-        if s < 60.0:
-            return f"{s:.1f}s"
-        total_seconds = int(round(s))
-        if total_seconds < 3600:
-            minutes, rem = divmod(total_seconds, 60)
-            return f"{minutes}m{rem:02d}s"
-        hours, rem_seconds = divmod(total_seconds, 3600)
-        mins = rem_seconds // 60
-        return f"{hours}h{mins:02d}m"
+        return format_elapsed(seconds)
 
     def _compose_line(self, symbol: str, message: str) -> str:
         base = f"{symbol} {str(message)}"
@@ -206,11 +216,10 @@ class CliStatus:
         self._stop_spinner()
         symbol = "✔︎"
         line = self._compose_line(symbol, str(message))
-        tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
-            self._console.print(f"[green]{symbol}[/green]{tail}")
+            self._console.print(f"[green]{line}[/green]")
         elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
-            print(f"{_GREEN}{symbol}{_RESET}{tail}", flush=True)
+            print(f"{_GREEN}{line}{_RESET}", flush=True)
         else:
             print(line, flush=True)
         self._done = True

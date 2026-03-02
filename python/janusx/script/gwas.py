@@ -80,7 +80,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
-from ._common.status import get_rich_spinner_name
+from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 
 try:
     from rich.progress import (
@@ -132,6 +132,8 @@ class _ProgressAdapter:
         self._progress = None
         self._task_id = None
         self._tqdm = None
+        self._start_ts = time.monotonic()
+        self._finished = False
 
         if _HAS_RICH_PROGRESS and sys.stdout.isatty():
             try:
@@ -139,14 +141,15 @@ class _ProgressAdapter:
                     SpinnerColumn(
                         spinner_name=get_rich_spinner_name(),
                         style="cyan",
+                        finished_text="[green]✔︎[/green]",
                     ),
-                    TextColumn("[bold green]{task.description}"),
+                    TextColumn("[green]{task.description}"),
                     BarColumn(),
                     TextColumn("{task.completed}/{task.total}"),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
                     TextColumn("{task.fields[postfix]}"),
-                    transient=False,
+                    transient=True,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(
@@ -160,7 +163,7 @@ class _ProgressAdapter:
                 self._task_id = None
 
         if self._backend == "none" and _HAS_TQDM:
-            self._tqdm = tqdm(total=self.total, desc=self.desc, ascii=False)
+            self._tqdm = tqdm(total=self.total, desc=self.desc, ascii=False, leave=False)
             self._backend = "tqdm"
 
     def update(self, n: int) -> None:
@@ -187,8 +190,10 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.n = self._tqdm.total
             self._tqdm.refresh()
+        self._finished = True
 
     def close(self) -> None:
+        elapsed = format_elapsed(time.monotonic() - self._start_ts)
         if self._backend == "rich" and self._progress is not None:
             self._progress.stop()
             self._progress = None
@@ -196,6 +201,8 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.close()
             self._tqdm = None
+        if self._finished:
+            print_success(f"{self.desc} ...Finished [{elapsed}]")
 
 
 def fastplot(
@@ -946,7 +953,10 @@ def run_chunked_gwas_lmm_lm(
     process = psutil.Process()
     n_cores = psutil.cpu_count(logical=True) or cpu_count()
 
-    for pname in pheno.columns:
+    trait_names = list(pheno.columns)
+    for trait_idx, pname in enumerate(trait_names):
+        if trait_idx > 0:
+            logger.info("-" * 60)
         logger.info(f"Streaming {model_label} GWAS for trait: {pname}")
 
         cpu_t0 = process.cpu_times()
@@ -1371,7 +1381,10 @@ def run_farmcpu_fullmem(
         sample_ids=famid.astype(str),
     )
 
-    for phename in pheno.columns:
+    trait_names = list(pheno.columns)
+    for trait_idx, phename in enumerate(trait_names):
+        if trait_idx > 0:
+            logger.info("-" * 60)
         logger.info(f"* FarmCPU GWAS for trait: {phename}")
         t_trait = time.time()
 

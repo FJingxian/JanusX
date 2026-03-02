@@ -39,7 +39,13 @@ from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
-from ._common.status import CliStatus, get_rich_spinner_name
+from ._common.status import (
+    CliStatus,
+    get_rich_spinner_name,
+    print_success,
+    print_failure,
+    format_elapsed,
+)
 
 try:
     from rich.progress import (
@@ -86,6 +92,7 @@ class _DownloadProgress:
         self._progress = None
         self._task_id = None
         self._tqdm = None
+        self._start_ts = time.monotonic()
 
         if _HAS_RICH_PROGRESS and sys.stdout.isatty():
             try:
@@ -93,14 +100,15 @@ class _DownloadProgress:
                     SpinnerColumn(
                         spinner_name=get_rich_spinner_name(),
                         style="cyan",
+                        finished_text="[green]✔︎[/green]",
                     ),
-                    TextColumn("[bold green]{task.description}"),
+                    TextColumn("[green]{task.description}"),
                     BarColumn(),
                     DownloadColumn(),
                     TransferSpeedColumn(),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
-                    transient=False,
+                    transient=True,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(
@@ -119,6 +127,7 @@ class _DownloadProgress:
                 unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
+                leave=False,
             )
             self._backend = "tqdm"
 
@@ -131,14 +140,24 @@ class _DownloadProgress:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.update(step)
 
-    def close(self) -> None:
+    def close(self, *, success: bool = True) -> None:
+        elapsed_text = format_elapsed(time.monotonic() - self._start_ts)
         if self._backend == "rich" and self._progress is not None:
+            if success and self._task_id is not None and self.total is not None:
+                try:
+                    self._progress.update(self._task_id, completed=int(self.total))
+                except Exception:
+                    pass
             self._progress.stop()
             self._progress = None
             self._task_id = None
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.close()
             self._tqdm = None
+        if success:
+            print_success(f"{self.desc} ...Finished [{elapsed_text}]")
+        else:
+            print_failure(f"{self.desc} ...Failed [{elapsed_text}]")
 
 
 def downloader(url: str, dst: Path) -> None:
@@ -150,6 +169,7 @@ def downloader(url: str, dst: Path) -> None:
         total = r.headers.get("Content-Length")
         total = int(total) if total is not None else None
         pbar = _DownloadProgress(total=total, desc="Downloading JanusX image")
+        ok = False
         try:
             while True:
                 chunk = r.read(1024 * 1024)
@@ -157,8 +177,9 @@ def downloader(url: str, dst: Path) -> None:
                     break
                 f.write(chunk)
                 pbar.update(len(chunk))
+            ok = True
         finally:
-            pbar.close()
+            pbar.close(success=ok)
 
     os.replace(tmp, dst)
 

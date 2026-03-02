@@ -30,7 +30,12 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
-from ._common.status import get_rich_spinner_name
+from ._common.status import (
+    get_rich_spinner_name,
+    print_success,
+    print_failure,
+    format_elapsed,
+)
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -55,6 +60,7 @@ import time
 import socket
 import sys
 import colorsys
+import concurrent.futures as cf
 from contextlib import nullcontext
 from typing import Any, Optional, Tuple
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
@@ -1379,19 +1385,22 @@ def _ldclump_significant_snps(
     progress = None
     task_id = None
     progress_tqdm = None
+    clump_start_ts = time.monotonic()
+    clump_success = False
     if use_rich_progress:
         try:
             progress = Progress(
                 SpinnerColumn(
                     spinner_name=get_rich_spinner_name(),
                     style="cyan",
+                    finished_text="[green]✔︎[/green]",
                 ),
-                TextColumn("[bold green]{task.description}"),
+                TextColumn("[green]{task.description}"),
                 BarColumn(),
                 TextColumn("{task.completed}/{task.total}"),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
-                transient=False,
+                transient=True,
             )
         except Exception:
             progress = None
@@ -1405,7 +1414,7 @@ def _ldclump_significant_snps(
                 total=int(work.shape[0]),
                 desc="LD clumping",
                 unit="snp",
-                leave=True,
+                leave=False,
                 dynamic_ncols=True,
             )
 
@@ -1520,6 +1529,13 @@ def _ldclump_significant_snps(
         finally:
             if progress_tqdm is not None:
                 progress_tqdm.close()
+        clump_success = True
+    clump_elapsed = format_elapsed(time.monotonic() - clump_start_ts)
+    if bool(show_progress):
+        if clump_success:
+            print_success(f"LD clumping ...Finished [{clump_elapsed}]")
+        else:
+            print_failure(f"LD clumping ...Failed [{clump_elapsed}]")
 
     if warn_count > warn_limit:
         logger.warning(
@@ -1828,9 +1844,11 @@ def _draw_manh_gene_ld_links(
 
 
 def _format_input_files(files: list[str]) -> str:
-    if len(files) <= 1:
-        return files[0]
-    return f"{files[0]},...({len(files)} files)"
+    if len(files) == 0:
+        return "0 files"
+    if len(files) == 1:
+        return str(files[0])
+    return f"{len(files)} files"
 
 
 def _format_bimrange_summary(
@@ -3492,49 +3510,123 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         GWASplot(files[0], args, logger)
         return
 
+    total_start_ts = time.monotonic()
+    done_count = 0
+
     if _HAS_RICH_PROGRESS and sys.stdout.isatty():
         n_total = len(files)
         basenames = [os.path.basename(f) for f in files]
         name_width = max((len(x) for x in basenames), default=0)
         idx_width = len(str(n_total))
+        max_visible = min(5, n_total)
+        req_threads = int(args.thread)
+        if req_threads == -1:
+            req_threads = int(os.cpu_count() or 1)
+        n_workers = max(1, min(req_threads, max_visible, n_total))
+        file_to_idx = {f: i for i, f in enumerate(files, start=1)}
         progress = Progress(
             SpinnerColumn(
                 spinner_name=get_rich_spinner_name(),
                 style="cyan",
+                finished_text=" ",
             ),
-            TextColumn(
-                "Task {task.fields[task_label]}: [bold]{task.fields[file_pad]}[/bold]{task.fields[suffix]}"
-            ),
-            transient=False,
+            TextColumn("Task {task.fields[task_label]}: {task.fields[file_pad]}"),
+            transient=True,
         )
         with progress:
+            task_start_ts: dict[str, float] = {}
             task_map: dict[str, int] = {}
-            for i, f in enumerate(files, start=1):
-                task_map[f] = progress.add_task(
+            future_map: dict[cf.Future[str], str] = {}
+            pending_iter = iter(files)
+
+            def _add_visible_task(file_path: str) -> None:
+                if file_path in task_map:
+                    return
+                if len(task_map) >= max_visible:
+                    return
+                idx = file_to_idx[file_path]
+                task_map[file_path] = progress.add_task(
                     description="",
-                    total=1,
-                    task_label=f"{i:>{idx_width}}/{n_total}",
-                    file_pad=os.path.basename(f).ljust(name_width),
-                    suffix="",
+                    total=None,
+                    task_label=f"{idx:>{idx_width}}/{n_total}",
+                    file_pad=os.path.basename(file_path).ljust(name_width),
                 )
+
+            def _submit_next(executor: cf.ProcessPoolExecutor) -> bool:
+                try:
+                    f_next = next(pending_iter)
+                except StopIteration:
+                    return False
+                fut = executor.submit(_run_one_postgwas_task, f_next, args, logger)
+                future_map[fut] = f_next
+                task_start_ts[f_next] = time.monotonic()
+                return True
+
+            def _fill_visible_from_running() -> None:
+                if len(task_map) >= max_visible:
+                    return
+                for running_file in list(future_map.values()):
+                    if len(task_map) >= max_visible:
+                        break
+                    _add_visible_task(running_file)
+
             try:
-                done_iter = Parallel(
-                    n_jobs=args.thread,
-                    backend="loky",
-                    return_as="generator_unordered",
-                )(
-                    delayed(_run_one_postgwas_task)(f, args, logger) for f in files
-                )
-                for done_file in done_iter:
-                    tid = task_map.get(str(done_file))
-                    if tid is not None:
-                        progress.update(tid, advance=1, suffix=" ...Finished")
+                with cf.ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    for _ in range(min(n_workers, n_total)):
+                        if not _submit_next(ex):
+                            break
+                    _fill_visible_from_running()
+
+                    while len(future_map) > 0:
+                        done, _ = cf.wait(
+                            list(future_map.keys()),
+                            timeout=0.1,
+                            return_when=cf.FIRST_COMPLETED,
+                        )
+                        if len(done) == 0:
+                            _fill_visible_from_running()
+                            continue
+                        fut = min(
+                            done,
+                            key=lambda x: file_to_idx.get(
+                                future_map.get(x, ""),
+                                10**9,
+                            ),
+                        )
+                        file_path = future_map.pop(fut)
+                        tid = task_map.pop(file_path, None)
+                        if tid is not None:
+                            try:
+                                progress.remove_task(tid)
+                            except Exception:
+                                pass
+                        elapsed = format_elapsed(
+                            time.monotonic()
+                            - task_start_ts.get(file_path, time.monotonic())
+                        )
+                        try:
+                            done_file = str(fut.result())
+                        except Exception:
+                            idx = file_to_idx.get(file_path, 0)
+                            print_failure(
+                                f"Task {idx}/{n_total}: "
+                                f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
+                            )
+                            raise
+                        _ = done_file
+                        done_count += 1
+                        _submit_next(ex)
+                        _fill_visible_from_running()
             except Exception:
-                for f, tid in task_map.items():
-                    task = progress.tasks[tid]
-                    if not task.finished:
-                        progress.update(tid, completed=1, suffix=" ...Failed")
+                for f, tid in list(task_map.items()):
+                    try:
+                        progress.remove_task(tid)
+                    except Exception:
+                        pass
+                    task_map.pop(f, None)
                 raise
+        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+        print_success(f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]")
         return
 
     if _HAS_TQDM:
@@ -3542,9 +3634,10 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             total=len(files),
             desc="PostGWAS tasks",
             unit="file",
-            leave=True,
+            leave=False,
             dynamic_ncols=True,
         )
+        task_start_ts = {f: time.monotonic() for f in files}
         try:
             done_iter = Parallel(
                 n_jobs=args.thread,
@@ -3556,8 +3649,12 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             for done_file in done_iter:
                 pbar.update(1)
                 pbar.set_postfix(file=os.path.basename(str(done_file)))
+                _ = done_file
+                done_count += 1
         finally:
             pbar.close()
+        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+        print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]")
         return
 
     Parallel(n_jobs=args.thread, backend="loky")(

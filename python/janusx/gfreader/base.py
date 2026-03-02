@@ -10,7 +10,34 @@ import pandas as pd
 import psutil
 from tqdm import tqdm
 import os
-import psutil
+import sys
+from time import monotonic
+from janusx.script._common.status import (
+    get_rich_spinner_name,
+    print_success,
+    print_failure,
+    format_elapsed,
+)
+
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
 process = psutil.Process()
 def get_process_info():
     """Return current CPU utilization and resident memory usage."""
@@ -19,6 +46,89 @@ def get_process_info():
     memory_info = process.memory_info()
     memory_mb = memory_info.rss / 1024**3  # GB
     return cpu_percent, memory_mb
+
+
+class _LoadProgressAdapter:
+    """
+    Genotype loading progress: rich-first, tqdm fallback.
+    """
+    def __init__(self, total: int, desc: str, *, enabled: bool = True) -> None:
+        self.total = int(max(0, total))
+        self.desc = str(desc)
+        self.enabled = bool(enabled)
+        self._backend = "none"
+        self._progress = None
+        self._task_id = None
+        self._tqdm = None
+        self._start_ts = monotonic()
+
+        if (not self.enabled):
+            return
+
+        if _HAS_RICH_PROGRESS and getattr(sys.stdout, "isatty", lambda: False)():
+            try:
+                self._progress = Progress(
+                    SpinnerColumn(
+                        spinner_name=get_rich_spinner_name(),
+                        style="cyan",
+                        finished_text="[green]✔︎[/green]",
+                    ),
+                    TextColumn("[green]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    transient=True,
+                )
+                self._progress.start()
+                self._task_id = self._progress.add_task(self.desc, total=self.total)
+                self._backend = "rich"
+            except Exception:
+                self._progress = None
+                self._task_id = None
+
+        if self._backend == "none":
+            self._tqdm = tqdm(
+                total=self.total,
+                desc=self.desc,
+                ascii=True,
+                leave=False,
+                dynamic_ncols=True,
+            )
+            self._backend = "tqdm"
+
+    def update(self, n: int) -> None:
+        step = int(max(0, n))
+        if step == 0:
+            return
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=step)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.update(step)
+
+    def close(self, *, success: bool = True) -> None:
+        elapsed_text = format_elapsed(max(0.0, float(monotonic() - self._start_ts)))
+
+        if self._backend == "rich" and self._progress is not None:
+            if success and self._task_id is not None:
+                try:
+                    task = self._progress.tasks[self._task_id]
+                    if not task.finished:
+                        self._progress.update(self._task_id, completed=task.total)
+                except Exception:
+                    pass
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.close()
+            self._tqdm = None
+        if not self.enabled:
+            return
+        if success:
+            print_success(f"{self.desc} ...Finished [{elapsed_text}]")
+        else:
+            print_failure(f"{self.desc} ...Failed [{elapsed_text}]")
 
 class GENOMETOOL:
     def __init__(self,genomePath:str):
@@ -57,19 +167,33 @@ class GENOMETOOL:
         self.exchange_loc:bool = (ref_alt.iloc[:,0]!=ref)
         return ref_alt.astype('category')
 
-def breader(prefix:str,chunk_size=10_000,
-            maf: float = 0,miss: float = 1, impute: bool=False, dtype:Literal['int8','float32']='int8') -> pd.DataFrame:
+def breader(
+    prefix: str,
+    chunk_size=10_000,
+    maf: float = 0,
+    miss: float = 1,
+    impute: bool = False,
+    dtype: Literal['int8', 'float32'] = 'int8',
+    *,
+    show_progress: bool = True,
+    progress_desc: str = "Loading genotype",
+) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(prefix)
     chunks = load_genotype_chunks(prefix,chunk_size,maf,miss,impute)
     genotype = np.zeros(shape=(len(idv),m),dtype=dtype)
-    pbar = tqdm(total=m, desc="Loading bed",ascii=True)
+    pbar = _LoadProgressAdapter(m, str(progress_desc), enabled=bool(show_progress))
     num = 0
-    for chunk,_ in chunks:
-        cksize = chunk.shape[0]
-        genotype[:,num:num+cksize] = chunk.T
-        num += cksize
-        pbar.update(cksize)
+    try:
+        for chunk,_ in chunks:
+            cksize = chunk.shape[0]
+            genotype[:,num:num+cksize] = chunk.T
+            num += cksize
+            pbar.update(cksize)
+    except Exception:
+        pbar.close(success=False)
+        raise
+    pbar.close(success=True)
     bim = pd.read_csv(f'{prefix}.bim',sep=r'\s+',header=None)
     genotype = pd.DataFrame(genotype,index=idv,).T
     genotype = pd.concat([bim[[0,3,4,5]],genotype],axis=1)
@@ -77,21 +201,35 @@ def breader(prefix:str,chunk_size=10_000,
     genotype = genotype.set_index(['#CHROM','POS'])
     return genotype.dropna()
 
-def vcfreader(vcfPath:str,chunk_size=50_000,
-            maf: float = 0,miss: float = 1, impute: bool=False, dtype:Literal['int8','float32']='int8') -> pd.DataFrame:
+def vcfreader(
+    vcfPath: str,
+    chunk_size=50_000,
+    maf: float = 0,
+    miss: float = 1,
+    impute: bool = False,
+    dtype: Literal['int8', 'float32'] = 'int8',
+    *,
+    show_progress: bool = True,
+    progress_desc: str = "Loading genotype",
+) -> pd.DataFrame:
     '''ref_adjust: 基于基因组矫正, 需提供参考基因组路径'''
     idv,m = inspect_genotype_file(vcfPath)
     chunks = load_genotype_chunks(vcfPath,chunk_size,maf,miss,impute)
     genotype = np.zeros(shape=(len(idv),m),dtype=dtype)
-    pbar = tqdm(total=m, desc="Loading bed",ascii=True)
+    pbar = _LoadProgressAdapter(m, str(progress_desc), enabled=bool(show_progress))
     num = 0
     bim = []
-    for chunk,site in chunks:
-        cksize = chunk.shape[0]
-        genotype[:,num:num+cksize] = chunk.T
-        num += cksize
-        pbar.update(cksize)
-        bim.extend([[i.chrom,i.pos,i.ref_allele,i.alt_allele] for i in site])
+    try:
+        for chunk,site in chunks:
+            cksize = chunk.shape[0]
+            genotype[:,num:num+cksize] = chunk.T
+            num += cksize
+            pbar.update(cksize)
+            bim.extend([[i.chrom,i.pos,i.ref_allele,i.alt_allele] for i in site])
+    except Exception:
+        pbar.close(success=False)
+        raise
+    pbar.close(success=True)
     bim = pd.DataFrame(bim)
     genotype = pd.DataFrame(genotype,index=idv,).T
     genotype = pd.concat([bim,genotype],axis=1)

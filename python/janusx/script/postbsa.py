@@ -27,12 +27,14 @@ import os
 import socket
 import tempfile
 import time
+import sys
 from pathlib import Path
 from typing import Optional
 
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.pathcheck import ensure_all_true, ensure_file_exists
+from ._common.status import CliStatus
 
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -1006,6 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     t_start = time.time()
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = build_parser()
     args = parser.parse_args()
 
@@ -1065,20 +1068,26 @@ def main() -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    rust_result = try_rust_preprocess(
-        table_path=args.file,
-        bulk1=args.bulk1,
-        bulk2=args.bulk2,
-        total_dp_threshold=args.total_dp,
-        min_dp=args.min_dp,
-        min_gq=args.min_gq,
-        ref_allele_freq=args.ref_allele_freq,
-        depth_difference=args.depth_difference,
-        window_mb=args.window,
-        step_mb=args.step,
-        ed_power=args.ed_power,
-        logger=logger,
-    )
+    with CliStatus("Preprocessing BSA table...", enabled=use_spinner) as task:
+        try:
+            rust_result = try_rust_preprocess(
+                table_path=args.file,
+                bulk1=args.bulk1,
+                bulk2=args.bulk2,
+                total_dp_threshold=args.total_dp,
+                min_dp=args.min_dp,
+                min_gq=args.min_gq,
+                ref_allele_freq=args.ref_allele_freq,
+                depth_difference=args.depth_difference,
+                window_mb=args.window,
+                step_mb=args.step,
+                ed_power=args.ed_power,
+                logger=logger,
+            )
+        except Exception:
+            task.fail("Preprocessing BSA table ...Failed")
+            raise
+        task.complete("Preprocessing BSA table ...Finished")
 
     bulk1_name = f"{args.bulk1}.SNPindex"
     bulk2_name = f"{args.bulk2}.SNPindex"
@@ -1087,44 +1096,62 @@ def main() -> None:
     if rust_result is not None:
         raw_df, smooth_df = rust_result
     else:
-        raw_df = load_bsa_in_python(
-            table_path=args.file,
-            bulk1=args.bulk1,
-            bulk2=args.bulk2,
-            total_dp_threshold=args.total_dp,
-            min_dp=args.min_dp,
-            min_gq=args.min_gq,
-            ref_allele_freq=args.ref_allele_freq,
-            depth_difference=args.depth_difference,
-            logger=logger,
-        )
-        smooth_df = compute_smooth_df(
-            raw_df=raw_df,
-            bulk1_name=bulk1_name,
-            bulk2_name=bulk2_name,
-            deltaindex_name=deltaindex_name,
-            ed_power=args.ed_power,
-            window_mb=args.window,
-            step_mb=args.step,
-        )
+        with CliStatus("Loading BSA table (Python)...", enabled=use_spinner) as task:
+            try:
+                raw_df = load_bsa_in_python(
+                    table_path=args.file,
+                    bulk1=args.bulk1,
+                    bulk2=args.bulk2,
+                    total_dp_threshold=args.total_dp,
+                    min_dp=args.min_dp,
+                    min_gq=args.min_gq,
+                    ref_allele_freq=args.ref_allele_freq,
+                    depth_difference=args.depth_difference,
+                    logger=logger,
+                )
+            except Exception:
+                task.fail("Loading BSA table (Python) ...Failed")
+                raise
+            task.complete("Loading BSA table (Python) ...Finished")
+        with CliStatus("Computing sliding-window smooth...", enabled=use_spinner) as task:
+            try:
+                smooth_df = compute_smooth_df(
+                    raw_df=raw_df,
+                    bulk1_name=bulk1_name,
+                    bulk2_name=bulk2_name,
+                    deltaindex_name=deltaindex_name,
+                    ed_power=args.ed_power,
+                    window_mb=args.window,
+                    step_mb=args.step,
+                )
+            except Exception:
+                task.fail("Computing sliding-window smooth ...Failed")
+                raise
+            task.complete("Computing sliding-window smooth ...Finished")
 
     raw_df = normalize_position_columns(raw_df)
     smooth_df = normalize_position_columns(smooth_df)
     save_table(smooth_df, f"{output_stem}.smooth.tsv", logger, "Smoothed table")
 
-    plot_bsa(
-        raw_df=raw_df,
-        smooth_df=smooth_df,
-        bulk1_name=bulk1_name,
-        bulk2_name=bulk2_name,
-        deltaindex_name=deltaindex_name,
-        output_stem=output_stem,
-        output_format=args.format,
-        subplot_ratio=args.ratio,
-        ed_power=args.ed_power,
-        window_mb=args.window,
-        logger=logger,
-    )
+    with CliStatus("Plotting BSA figures...", enabled=use_spinner) as task:
+        try:
+            plot_bsa(
+                raw_df=raw_df,
+                smooth_df=smooth_df,
+                bulk1_name=bulk1_name,
+                bulk2_name=bulk2_name,
+                deltaindex_name=deltaindex_name,
+                output_stem=output_stem,
+                output_format=args.format,
+                subplot_ratio=args.ratio,
+                ed_power=args.ed_power,
+                window_mb=args.window,
+                logger=logger,
+            )
+        except Exception:
+            task.fail("Plotting BSA figures ...Failed")
+            raise
+        task.complete("Plotting BSA figures ...Finished")
 
     lt = time.localtime()
     logger.info(

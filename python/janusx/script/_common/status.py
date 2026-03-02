@@ -180,12 +180,12 @@ class CliStatus:
         s = float(max(0.0, seconds))
         if s < 60.0:
             return f"{s:.1f}s"
-        minutes = int(s // 60.0)
-        rem = int(round(s - minutes * 60))
-        if minutes < 60:
+        total_seconds = int(round(s))
+        if total_seconds < 3600:
+            minutes, rem = divmod(total_seconds, 60)
             return f"{minutes}m{rem:02d}s"
-        hours = int(minutes // 60)
-        mins = int(minutes % 60)
+        hours, rem_seconds = divmod(total_seconds, 3600)
+        mins = rem_seconds // 60
         return f"{hours}h{mins:02d}m"
 
     def _compose_line(self, symbol: str, message: str) -> str:
@@ -220,11 +220,13 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
-        line = self._compose_line("✔︎", str(message))
+        symbol = "✔︎"
+        line = self._compose_line(symbol, str(message))
+        tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
-            self._console.print(f"[green]✔︎[/green]{line[1:]}")
+            self._console.print(f"[green]{symbol}[/green]{tail}")
         elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
-            print(f"{_GREEN}✔︎{_RESET}{line[1:]}", flush=True)
+            print(f"{_GREEN}{symbol}{_RESET}{tail}", flush=True)
         else:
             print(line, flush=True)
         self._done = True
@@ -233,11 +235,13 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
-        line = self._compose_line("✘", str(message))
+        symbol = "✘"
+        line = self._compose_line(symbol, str(message))
+        tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
-            self._console.print(f"[red]✘[/red]{line[1:]}")
+            self._console.print(f"[red]{symbol}[/red]{tail}")
         elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
-            print(f"{_RED}✘{_RESET}{line[1:]}", flush=True)
+            print(f"{_RED}{symbol}{_RESET}{tail}", flush=True)
         else:
             print(line, flush=True)
         self._done = True

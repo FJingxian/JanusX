@@ -347,6 +347,34 @@ def build_samples(level1, level2):
     return samples
 
 
+def _infer_bulks(samples: Sequence[str]) -> List[str]:
+    """
+    Infer bulk names from sample keys.
+    Heuristic: use token before first "_" when it yields >=2 groups.
+    """
+    sample_keys = sorted({str(s) for s in samples if str(s).strip()})
+    if len(sample_keys) == 0:
+        return []
+    prefix_keys = [s.split("_", 1)[0] if "_" in s else s for s in sample_keys]
+    prefix_unique = sorted(set(prefix_keys))
+    if len(prefix_unique) >= 2:
+        return prefix_unique
+    return sample_keys
+
+
+def _latest_snp_table(workdir: Path) -> Optional[Path]:
+    merge_dir = workdir / "4.merge"
+    if not merge_dir.exists():
+        return None
+    tables = [p for p in merge_dir.glob("Merge.*.SNP.tsv") if p.is_file()]
+    if len(tables) == 0:
+        return None
+    try:
+        return max(tables, key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return sorted(tables)[-1]
+
+
 def read_chroms_from_fai(reference: Path) -> List[str]:
     fai = Path(f"{reference}.fai")
     if not fai.exists():
@@ -572,6 +600,28 @@ def main():
         nohup_max_jobs=args.maxtask,
         singularity=exec_prefix,
     )
+
+    bulks = _infer_bulks(list(samples.keys()))
+    latest_tsv = _latest_snp_table(workdir)
+    if latest_tsv is not None:
+        tsv_token = str(latest_tsv)
+    elif len(chrom) > 0:
+        tsv_token = str(workdir / "4.merge" / f"Merge.{chrom[-1]}.SNP.tsv")
+    else:
+        tsv_token = str(workdir / "4.merge" / "Merge.<chrom>.SNP.tsv")
+
+    logger.info("")
+    logger.info("Detected bulks: %s", ", ".join(bulks) if len(bulks) > 0 else "None")
+    logger.info("Latest SNP table: %s", tsv_token)
+    logger.info("Next step suggestion:")
+    logger.info("  jx postbsa -file %s -b1 [bulk1] -b2 [bulk2]", tsv_token)
+    if len(bulks) >= 2:
+        logger.info(
+            "  Example: jx postbsa -file %s -b1 %s -b2 %s",
+            tsv_token,
+            bulks[0],
+            bulks[1],
+        )
 
     logger.info(f"Pipeline finished in {time.time() - t_start:.1f}s")
 

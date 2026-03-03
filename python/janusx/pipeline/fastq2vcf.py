@@ -19,6 +19,21 @@ def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _format_estimated_duration(minutes: int) -> str:
+    """
+    Format fixed expected step duration.
+    - < 60 minutes: "~Xm"
+    - >= 60 minutes: "~Xh" or "~XhYm"
+    """
+    m = int(max(0, minutes))
+    if m < 60:
+        return f"~{m}m"
+    h, rem = divmod(m, 60)
+    if rem == 0:
+        return f"~{h}h"
+    return f"~{h}h{rem}m"
+
+
 def _safe_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -607,13 +622,11 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         _sync_state_from_fs(state, steps_meta)
         _safe_write_json(state_path, state)
         # Estimated durations are fixed hints taken from the step annotations above.
+        step_eta_minutes = [15, 255, 73, 451, 36, 32]
+        step_base_names = ["fastp", "bwamem", "markdup", "bam2gvcf", "cgvcf", "gvcf2vcf"]
         step_names = [
-            "fastp (~15m)",
-            "bwamem (~255m)",
-            "markdup (~73m)",
-            "bam2gvcf (~451m)",
-            "cgvcf (~36m)",
-            "gvcf2vcf (~32m)",
+            f"{name} ({_format_estimated_duration(mins)})"
+            for name, mins in zip(step_base_names, step_eta_minutes)
         ]
         pipeline(
             [step1, step2, step3, step4, step5, step6],

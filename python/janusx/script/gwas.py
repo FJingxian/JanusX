@@ -42,6 +42,7 @@ import socket
 import argparse
 import logging
 import sys
+import threading
 import concurrent.futures as cf
 from typing import Union, Optional
 import uuid
@@ -83,7 +84,12 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
-from ._common.status import get_rich_spinner_name, print_success, format_elapsed
+from ._common.status import (
+    CliStatus,
+    get_rich_spinner_name,
+    print_success,
+    format_elapsed,
+)
 
 try:
     from rich.progress import (
@@ -756,6 +762,157 @@ def load_phenotype(
 # Low-memory LMM/LM: streaming GRM + PCA with caching
 # ======================================================================
 
+def _cache_prefix_tilde(genofile: str) -> str:
+    """
+    Cache prefix used by gfreader for VCF/TXT temporary converted files.
+    """
+    p = str(genofile).replace("\\", "/")
+    base = os.path.basename(p)
+    low = base.lower()
+    if low.endswith(".vcf.gz"):
+        stem = base[: -len(".vcf.gz")]
+    elif low.endswith((".vcf", ".txt", ".tsv", ".csv", ".npy")):
+        stem = os.path.splitext(base)[0]
+    else:
+        stem = base
+    return os.path.join(os.path.dirname(p) or ".", f"~{stem}").replace("\\", "/")
+
+
+def _detect_cache_need(genofile: str) -> tuple[bool, str, list[str]]:
+    """
+    Detect whether genotype cache build is expected before inspect/load.
+    """
+    low = str(genofile).lower()
+    if low.endswith(".vcf.gz") or low.endswith(".vcf"):
+        cprefix = _cache_prefix_tilde(genofile)
+        targets = [f"{cprefix}.bed", f"{cprefix}.bim", f"{cprefix}.fam"]
+        all_exist = all(os.path.isfile(p) for p in targets)
+        stale = False
+        if all_exist and os.path.isfile(genofile):
+            src_mtime = os.path.getmtime(genofile)
+            cache_mtime = min(os.path.getmtime(p) for p in targets)
+            stale = cache_mtime < src_mtime
+        return (not all_exist) or stale, "vcf", targets
+
+    if low.endswith((".txt", ".tsv", ".csv")):
+        cprefix = _cache_prefix_tilde(genofile)
+        targets = [f"{cprefix}.npy"]
+        return (not os.path.isfile(targets[0])), "txt", targets
+
+    return False, "", []
+
+
+def _load_phenotype_with_status(
+    phenofile: str,
+    ncol: Union[list[int], None],
+    logger: logging.Logger,
+    *,
+    id_col: int = 0,
+    use_spinner: bool = False,
+) -> pd.DataFrame:
+    """
+    Load phenotype with rich/plain CLI status.
+    """
+    with CliStatus("Loading phenotype...", enabled=bool(use_spinner)) as task:
+        try:
+            pheno = load_phenotype(phenofile, ncol, logger, id_col=id_col)
+        except Exception:
+            task.fail("Loading phenotype ...Failed")
+            raise
+        task.complete("Loading phenotype ...Finished")
+    return pheno
+
+
+def _inspect_genotype_with_status(
+    genofile: str,
+    logger: logging.Logger,
+    *,
+    use_spinner: bool = False,
+) -> tuple[np.ndarray, int]:
+    """
+    Inspect genotype metadata with optional cache-status spinner.
+    """
+    need_cache, cache_kind, cache_targets = _detect_cache_need(genofile)
+
+    if not need_cache:
+        with CliStatus("Loading genotype...", enabled=bool(use_spinner)) as task:
+            try:
+                ids, n_snps = inspect_genotype_file(genofile)
+            except Exception:
+                task.fail("Loading genotype ...Failed")
+                raise
+            task.complete("Loading genotype ...Finished")
+        return np.asarray(ids, dtype=str), int(n_snps)
+
+    with CliStatus("Caching genotype...", enabled=bool(use_spinner)) as task:
+        out: dict[str, tuple[np.ndarray, int]] = {}
+        err: dict[str, Exception] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                ids0, ns0 = inspect_genotype_file(genofile)
+                out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
+            except Exception as ex:
+                err["value"] = ex
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        bim_path = cache_targets[1] if (cache_kind == "vcf" and len(cache_targets) >= 2) else ""
+        bim_fp = None
+        bim_dev_ino: tuple[int, int] = (-1, -1)
+        bim_seen = 0
+        bim_count = 0
+        last_count = -1
+        while not done.wait(timeout=0.25):
+            if bim_path and os.path.isfile(bim_path):
+                try:
+                    st = os.stat(bim_path)
+                    dev_ino = (int(st.st_dev), int(st.st_ino))
+                    if (
+                        bim_fp is None
+                        or dev_ino != bim_dev_ino
+                        or int(st.st_size) < int(bim_seen)
+                    ):
+                        if bim_fp is not None:
+                            try:
+                                bim_fp.close()
+                            except Exception:
+                                pass
+                        bim_fp = open(bim_path, "rb")
+                        bim_dev_ino = dev_ino
+                        bim_seen = 0
+                        bim_count = 0
+                    if int(st.st_size) > int(bim_seen):
+                        bim_fp.seek(int(bim_seen))
+                        chunk = bim_fp.read(int(st.st_size) - int(bim_seen))
+                        bim_seen = int(st.st_size)
+                        bim_count += int(chunk.count(b"\n"))
+                        if bim_count != last_count:
+                            last_count = bim_count
+                            task.desc = f"Caching genotype... SNP={bim_count}"
+                except Exception:
+                    pass
+
+        t.join()
+        if bim_fp is not None:
+            try:
+                bim_fp.close()
+            except Exception:
+                pass
+        if "value" in err:
+            task.fail("Caching genotype ...Failed")
+            raise err["value"]
+
+        ids, n_snps = out["value"]
+        task.desc = f"Caching genotype... SNP={n_snps}"
+        task.complete("Caching genotype ...Finished")
+        logger.info(f"Cached genotype sites: {n_snps}")
+        return ids, n_snps
+
 def build_grm_streaming(
     genofile: str,
     n_samples: int,
@@ -1012,6 +1169,7 @@ def prepare_streaming_context(
     mmap_limit: bool,
     require_kinship: bool,
     logger,
+    use_spinner: bool = False,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -1020,10 +1178,19 @@ def prepare_streaming_context(
       - GRM + Q (cached)
       - covariates (optional)
     """
-    pheno = load_phenotype(phenofile, pheno_cols, logger, id_col=0)
+    pheno = _load_phenotype_with_status(
+        phenofile,
+        pheno_cols,
+        logger,
+        id_col=0,
+        use_spinner=use_spinner,
+    )
 
-    ids, n_snps = inspect_genotype_file(genofile)
-    ids = np.array(ids).astype(str)
+    ids, n_snps = _inspect_genotype_with_status(
+        genofile,
+        logger,
+        use_spinner=use_spinner,
+    )
     n_samples = len(ids)
     logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
 
@@ -1301,7 +1468,8 @@ def run_chunked_gwas_lmm_lm(
             )
             continue
 
-        y_vec = pheno_sub.loc[ids[sameidx]].values
+        trait_ids = np.asarray(ids[sameidx], dtype=str)
+        y_vec = pheno_sub.loc[trait_ids].values
         # Build covariate matrix X_cov for this trait
         X_cov = qmatrix[sameidx]
         if cov_all is not None:
@@ -1329,7 +1497,10 @@ def run_chunked_gwas_lmm_lm(
             if mmap_limit else None
         )
 
-        sample_sub = None if genofile.endswith('.vcf') or genofile.endswith('.vcf.gz') else ids[sameidx]
+        # Always pass trait-specific sample IDs to the reader to keep column
+        # dimension consistent across BED/VCF/TXT backends.
+        sample_sub = trait_ids
+        expected_n = int(sample_sub.shape[0])
         scan_threads = int(threads)
         if scan_threads <= 0:
             scan_threads = int(n_cores)
@@ -1440,7 +1611,17 @@ def run_chunked_gwas_lmm_lm(
                 mmap_window_mb=mmap_window_mb,
             ):
                 genosub: np.ndarray
-                genosub = genosub[:, sameidx] if sample_sub is None else genosub
+                if genosub.shape[1] != expected_n:
+                    # Backward-compatible fallback: if backend ignored sample_ids and
+                    # returned columns for full aligned IDs, apply sameidx here.
+                    if genosub.shape[1] == int(sameidx.shape[0]):
+                        genosub = genosub[:, sameidx]
+                    else:
+                        raise ValueError(
+                            f"Genotype sample dimension mismatch for trait {pname}: "
+                            f"chunk has {genosub.shape[1]} columns, "
+                            f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
+                        )
                 if genetic_model != "add":
                     keep_mask = _heter_keep_mask(genosub, het_threshold)
                     if not np.any(keep_mask):
@@ -1706,6 +1887,9 @@ def run_farmcpu_fullmem(
     prefix: str,
     logger: logging.Logger,
     pheno_preloaded: Union[pd.DataFrame , None] = None,
+    ids_preloaded: Union[np.ndarray, None] = None,
+    n_snps_preloaded: Union[int, None] = None,
+    use_spinner: bool = False,
 ) -> None:
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).
@@ -1720,11 +1904,26 @@ def run_farmcpu_fullmem(
     cov = args.cov
 
     logger.info("* FarmCPU pipeline: loading genotype and phenotype")
-    pheno = pheno_preloaded if pheno_preloaded is not None else load_phenotype(
-        phenofile, args.ncol, logger
-    )
-    famid, n_snps = inspect_genotype_file(gfile)
-    famid = np.asarray(famid, dtype=str)
+    pheno = pheno_preloaded
+    if pheno is None:
+        pheno = _load_phenotype_with_status(
+            phenofile,
+            args.ncol,
+            logger,
+            id_col=0,
+            use_spinner=use_spinner,
+        )
+
+    if ids_preloaded is not None and n_snps_preloaded is not None:
+        famid = np.asarray(ids_preloaded, dtype=str)
+        n_snps = int(n_snps_preloaded)
+    else:
+        famid, n_snps = _inspect_genotype_with_status(
+            gfile,
+            logger,
+            use_spinner=use_spinner,
+        )
+        famid = np.asarray(famid, dtype=str)
     geno_chunks = []
     site_rows = []
     pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (FarmCPU)")
@@ -1951,6 +2150,7 @@ def parse_args():
 
 def main(log: bool = True):
     t_start = time.time()
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     args = parse_args()
     args.cov = _normalize_cov_inputs(args.cov)
 
@@ -2067,6 +2267,7 @@ def main(log: bool = True):
                 mmap_limit=args.mmap_limit,
                 require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,
+                use_spinner=use_spinner,
             )
 
         # --- run streaming LMM ---
@@ -2152,6 +2353,9 @@ def main(log: bool = True):
                 prefix=prefix,
                 logger=logger,
                 pheno_preloaded=pheno,  # 若 streaming 已加载 pheno，则复用，避免重复 log
+                ids_preloaded=ids,
+                n_snps_preloaded=n_snps,
+                use_spinner=use_spinner,
             )
 
     except Exception as e:

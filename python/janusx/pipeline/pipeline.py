@@ -57,6 +57,46 @@ def _all_exists(paths: Sequence[PathLike]) -> bool:
     return all(Path(p).exists() for p in paths)
 
 
+def _safe_job_label(job: str) -> str:
+    s = str(job)
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in s)
+
+
+def _find_failed_item_logs(
+    items: List[dict[str, Any]],
+    *,
+    max_items: int = 3,
+    max_lines: int = 4,
+) -> List[str]:
+    snippets: List[str] = []
+    log_dir = Path("log")
+    if not log_dir.exists():
+        return snippets
+
+    for it in items:
+        outputs = list(it.get("outputs", []))
+        if _all_exists(outputs):
+            continue
+        item_id = str(it.get("id", "")).strip()
+        if not item_id:
+            continue
+        for ef in sorted(log_dir.glob(f"{_safe_job_label(item_id)}.*.e")):
+            try:
+                if ef.stat().st_size <= 0:
+                    continue
+                txt = ef.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+            if len(lines) == 0:
+                continue
+            head = " | ".join(lines[:max_lines])
+            snippets.append(f"{item_id}: {head}")
+            if len(snippets) >= max_items:
+                return snippets
+    return snippets
+
+
 def _format_step_done(step_text: str, tstart: float) -> str:
     if format_elapsed is None:
         elapsed = f"{max(0.0, time.time() - tstart):.1f}s"
@@ -169,7 +209,6 @@ def _wait_outputs_with_rich_subtasks(
         ),
         TextColumn("[green]{task.description}"),
         BarColumn(),
-        TextColumn("{task.percentage:>6.1f}%"),
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
     ]
@@ -179,6 +218,7 @@ def _wait_outputs_with_rich_subtasks(
 
     with progress:
         task_id = progress.add_task(step_text, total=total, completed=done_count)
+        last_error_scan = 0.0
         while done_count < total:
             new_done = sum(
                 1 for it in items
@@ -189,6 +229,15 @@ def _wait_outputs_with_rich_subtasks(
                 progress.update(task_id, completed=done_count)
             if done_count >= total:
                 break
+            now = time.time()
+            if now - last_error_scan >= max(5.0, poll_sec * 3.0):
+                last_error_scan = now
+                failed = _find_failed_item_logs(items)
+                if len(failed) > 0:
+                    details = "\n".join(f"- {x}" for x in failed)
+                    raise RuntimeError(
+                        f"{step_text} detected failed subtasks. Example stderr:\n{details}"
+                    )
             time.sleep(max(0.5, poll_sec))
         progress.update(task_id, completed=total)
 
@@ -208,8 +257,9 @@ def wrap_cmd(
             f'> ./log/{job}.o 2> ./log/{job}.e'
         )
     elif scheduler == "csub":
+        safe_job = _safe_job_label(job)
         return (
-            f'csub -J {job} -o ./log/%J.o -e ./log/%J.e -q {queue} '
+            f'csub -J {job} -o ./log/{safe_job}.%J.o -e ./log/{safe_job}.%J.e -q {queue} '
             f'-n {threads} "{singularity} {cmd}"'
         )
     raise ValueError(f"Unsupported scheduler: {scheduler}")

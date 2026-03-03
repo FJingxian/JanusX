@@ -565,20 +565,21 @@ def snpvcf_to_gt_and_missing(
     if out_gt.exists() and out_tbi.exists() and out_lmiss.exists() and out_imiss.exists():
         return f"{prefix}echo '{out_gt} exists'"
 
-    filter_expr = (
+    # Use native bcftools filtering to set low-quality genotypes to missing.
+    # AD index syntax varies across bcftools versions, so we try multiple
+    # expressions and finally fall back to DP/GQ only.
+    expr_with_ad_new = (
+        f"FMT/DP<{int(min_dp)} || FMT/GQ<{int(min_gq)} || FMT/AD[:1]<{int(min_ad)}"
+    )
+    expr_with_ad_old = (
         f"FMT/DP<{int(min_dp)} || FMT/GQ<{int(min_gq)} || FMT/AD[1]<{int(min_ad)}"
     )
-    # Prefer +setGT when available, but transparently fall back to
-    # native `bcftools filter -S .` for environments without plugin support.
-    setgt_plugin_cmd = (
-        f"{prefix}bcftools +setGT -Ou {_q(in_vcf)} -- "
-        f"-t q -n . -i '{filter_expr}'"
+    expr_dp_gq_only = f"FMT/DP<{int(min_dp)} || FMT/GQ<{int(min_gq)}"
+    setgt_cmd = (
+        f"( {prefix}bcftools filter -Ou -S . -e '{expr_with_ad_new}' {_q(in_vcf)} "
+        f"|| {prefix}bcftools filter -Ou -S . -e '{expr_with_ad_old}' {_q(in_vcf)} "
+        f"|| {prefix}bcftools filter -Ou -S . -e '{expr_dp_gq_only}' {_q(in_vcf)} )"
     )
-    setgt_fallback_cmd = (
-        f"{prefix}bcftools filter -Ou -S . "
-        f"-e '{filter_expr}' {_q(in_vcf)}"
-    )
-    setgt_cmd = f"( {setgt_plugin_cmd} || {setgt_fallback_cmd} )"
     keep_gt_cmd = (
         f"{prefix}bcftools annotate --threads {int(core)} "
         f"-x FORMAT,^FORMAT/GT -Oz -o {_q(out_gt)}"

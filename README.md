@@ -2,65 +2,39 @@
 
 [简体中文](./doc/README_zh.md) | [English](./README.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
 
-**JanusX** is a high-performance, all-in-one suite for quantitative genetics that unifies genome-wide association studies (GWAS) and genomic selection (GS). It includes established GWAS methods (GLM, LMM, fastLMM, FarmCPU) and GS models (GBLUP, rrBLUP, BayesA/B/Cpi), plus routine analyses from data processing to publication-ready visualization.
+JanusX is a high-performance toolkit for quantitative genetics. It combines Rust-accelerated kernels (PyO3) with Python CLI workflows for GWAS, genomic selection (GS), post-analysis visualization, and variant-processing pipelines.
 
-It delivers strong performance gains compared with [GEMMA](https://github.com/genetics-statistics/GEMMA), [GCTA](https://yanglab.westlake.edu.cn/software/gcta), and [rMVP](https://github.com/xiaolei-lab/rMVP), especially for multi-threaded computation.
+## Overview
 
----
-
-## Quick Start
-
-**GWAS Analysis**:
-
-```bash
-jx gwas -bfile data -p pheno.txt -lmm
-jx gwas -vcf data.vcf.gz -p pheno.txt -lmm
-```
-
-**Genomic Selection**:
-
-```bash
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP
-```
-
-**postGWAS**:
-
-```bash
-# Generate Manhattan and QQ plots
-jx postGWAS -f result.lmm.tsv
-# With SNP annotation
-jx postGWAS -f results/test.lmm.tsv -a annotation.gff -ab 30
-```
-
-![Manhattan and QQ plots](./fig/test0.png "Simple visualization")
-
-Datasets used in the screenshots are in `example/` (sourced from [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA)).
-
-**Population Structure**:
-
-```bash
-# Compute GRM
-jx grm -bfile data.vcf.gz
-# PCA
-jx pca -bfile data.vcf.gz
-```
-
----
+- Unified CLI entry: `jx`
+- Core GWAS models: `LM`, `LMM`, `fastLMM`, `FarmCPU`
+- Core GS models: `GBLUP`, `rrBLUP`, `BayesA`, `BayesB`, `BayesCpi`
+- Streaming genotype reader for VCF/PLINK/TXT with low-memory workflows
+- Integrated post-analysis tools: `postgwas`, `postbsa`, `postgarfield`
+- Additional utilities: `grm`, `pca`, `gmerge`, `fastq2vcf`, `sim`, `simulation`
 
 ## Installation
 
-Build from source required Python 3.9+ and Rust toolchain.
+Requirements:
 
-### From Source (Latest)
+- Python `>=3.9`
+- Rust toolchain (only needed when local wheel is unavailable and build from source is required)
 
-Build via Python
+### PyPI (recommended)
 
 ```bash
-pip install git+https://github.com/FJingxian/JanusX.git
+pip install -U janusx
 jx -h
 ```
 
-or docker
+### Latest GitHub version
+
+```bash
+pip install --upgrade --force-reinstall --no-cache-dir git+https://github.com/FJingxian/JanusX.git
+jx -h
+```
+
+### Docker (source image build)
 
 ```bash
 git clone https://github.com/FJingxian/JanusX.git
@@ -69,308 +43,168 @@ docker build -t janusx:latest .
 docker run --rm janusx:latest -h
 ```
 
-### PyPI (Stable)
+### In-place update for an installed JanusX
 
 ```bash
-pip install janusx
-jx -h
+jx --update
 ```
 
-### Pre-compiled Releases (Stable)
+## CLI Modules
 
-We provide pre-compiled binaries on the [GitHub Releases](https://github.com/FJingxian/JanusX/releases) page for Windows (build in Windows11) and Linux (build in Ubuntu20.04).
-Download and extract the archive, then run the executable directly.
+### Genome-wide Association Studies (GWAS)
 
----
+- `grm`: build genomic relationship matrix from genotype (`-vcf` or `-bfile`)
+- `pca`: PCA for population structure from genotype, GRM prefix, or existing PCA prefix
+- `gwas`: run genome-wide association analysis (`LM`, `LMM`, `fastLMM`, `FarmCPU`)
+- `postgwas`: post-process GWAS results (Manhattan/QQ/annotation/merge/LD views)
 
-## Modules in JanusX
+### Genomic Selection (GS)
 
-| Module | Description |
-| --- | --- |
-| `gwas` | Unified GWAS wrapper (GLM/LMM/fastLMM/FarmCPU) |
-| `gs` | Genomic Selection (GBLUP, rrBLUP, BayesA/B/Cpi) |
-| `postGWAS` | Visualization and annotation |
-| `grm` | Genetic relationship matrix (GRM) |
-| `pca` | Principal component analysis |
-| `sim` | Genotype and phenotype simulation |
+- `gs`: genomic prediction and model-based selection
 
----
+### GARFIELD
+
+- `garfield`: random-forest based marker-trait association
+- `postgarfield`: summarize and visualize GARFIELD outputs
+
+### Bulk Segregation Analysis (BSA)
+
+- `postbsa`: post-process and visualize BSA results
+
+### Pipeline and Utility
+
+- `fastq2vcf`: variant-calling pipeline from FASTQ to VCF
+- `gmerge`: merge genotype/variant datasets
+
+### Benchmark
+
+- `sim`: quick simulation workflow
+- `simulation`: extended simulation and benchmarking workflow
+
+For full options, run:
+
+```bash
+jx <module> -h
+```
+
+## Quick Start
+
+### 1) GWAS
+
+```bash
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -plot -o test
+```
+
+### 2) Post-GWAS (single result)
+
+```bash
+jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -threshold 1e-6 -o testpost
+```
+
+### 3) Post-GWAS merge plot (multiple GWAS files in one figure)
+
+```bash
+jx postgwas \
+  -gwasfile testb/mouse_hs1940.test0.add.lmm.tsv \
+  -merge testb/mouse_hs1940.test0.dom.lmm.tsv \
+  -merge testb/mouse_hs1940.test0.het.lmm.tsv \
+  -merge testb/mouse_hs1940.test0.rec.lmm.tsv \
+  -manh -qq -o testpost
+```
+
+### 4) Genomic Selection
+
+```bash
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -plot -o testgs
+```
+
+### 5) Post-BSA
+
+```bash
+jx postbsa -file QBproject/5.table/all.tsv -b1 JS -b2 JR -window 1 -format pdf -o QBproject/5.table
+```
+
+### 6) FASTQ to VCF pipeline
+
+```bash
+jx fastq2vcf -r /path/ref.fa -i /path/fastq_dir -w /path/workdir -b nohup -m 2
+```
 
 ## Input File Formats
 
-### Phenotype File
+### Phenotype file
 
-Tab-delimited. First column is sample ID; remaining columns are phenotypes.
-
-```text
-samples	trait1	trait2	trait3
-indv1	10.5	0.85	0.05
-indv2	12.3	1.00	0.08
-indv3	8.6	0.92	0.04
-```
-
-### Genotype Files
-
-- **VCF**: `.vcf` or `.vcf.gz`
+Tab-delimited. First column is sample ID, remaining columns are traits.
 
 ```text
-##fileformat=VCFv4.2
-##fileDate=20251201
-##source=JanusXv1.0.10
-##contig=<ID=1,length=2>
-##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
-#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	A	B	C	D	E	F
-1	1	10000235	A	C	.	.	PR	GT	0/1	0/0	0/0	0/0	0/0	0/1
-1	1	10000345	A	G	.	.	PR	GT	0/0	0/0	0/0	0/0	1/1	1/1
-1	1	10004575	G	.	.	.	PR	GT	0/0	0/0	0/0	0/0	0/0	0/0
-1	1	10006974	C	T	.	.	PR	GT	0/0	0/0	0/1	1/1	0/1	1/1
-1	1	10006986	A	G	.	.	PR	GT	0/0	0/0	0/1	./.	1/1	1/1
+sample	trait1	trait2
+id1	10.5	0.85
+id2	12.3	1.00
+id3	8.6	0.92
 ```
 
-- **PLINK**: `.bed`/`.bim`/`.fam` (use file prefix, details see http://zzz.bwh.harvard.edu/plink/data.shtml#bed)
+### Genotype files
 
-### GWAS Optional Matrices (GRM / Q / Covariate)
+- VCF: `.vcf` or `.vcf.gz` (`-vcf`)
+- PLINK: `.bed/.bim/.fam` prefix (`-bfile`)
+- Text genotype matrix (`-file`, selected modules):
+  - header row is sample IDs
+  - subsequent rows are SNP-major numeric genotype values
 
-- **GRM**: A or G matrix (Kinship between individuals).
+Example (text matrix):
 
 ```text
-1.00	0.12	0.05
-0.12	1.00	0.08
-0.05	0.08	1.00
+id1	id2	id3	id4
+0	1	2	0
+2	2	1	0
+0	0	1	1
 ```
 
-- **Q**: Q matrix generated from admixture or principal components.
+### GWAS optional matrices
 
-```text
-0.12	-0.03
--0.05	0.08
-0.02	-0.01
+- GRM (`-k/--grm` in `gwas`): numeric matrix aligned to genotype sample order
+- Q/PC covariate (`-q/--qcov` in `gwas`): PC count or covariate matrix file
+- Covariate (`-c/--cov` in `gwas`): numeric matrix aligned to genotype sample order
+
+All matrix files should be numeric-only, space/tab-delimited, without row/column headers.
+
+### GRM/PCA file conventions (updated)
+
+- `jx grm` accepts genotype input only: `-vcf` or `-bfile`
+- `jx grm` outputs:
+  - default text mode: `{prefix}.grm.txt` and `{prefix}.grm.txt.id`
+  - with `--npy`: `{prefix}.grm.npy` and `{prefix}.grm.npy.id`
+- `jx pca` inputs (mutually exclusive):
+  - genotype: `-vcf` or `-bfile` (compute PCA from genotype)
+  - GRM prefix: `-k/--grm <prefix>` (expects `{prefix}.grm.id` and `{prefix}.grm.txt` or `{prefix}.grm.npy`)
+  - existing PCA prefix: `-q/--qcov <prefix>` (expects `{prefix}.eigenval` and `{prefix}.eigenvec`, visualization-only mode)
+
+## Common Output Naming
+
+- `gwas`: `{prefix}.{trait}.{model}.tsv` and optional `{prefix}.{trait}.{genetic_model}.{model}.svg`
+- `postgwas`: `{prefix}.manh.{format}`, `{prefix}.qq.{format}`, `{prefix}.{thr}.anno.tsv`
+- `postgwas` merge mode: `{prefix}.merge.manh.{format}`, `{prefix}.merge.qq.{format}`
+- `postbsa`:
+  - `{prefix}.{bulk1}vs{bulk2}.snpidx.{format}`
+  - `{prefix}.{bulk1}vs{bulk2}.bsa.{format}`
+  - `{prefix}.{bulk1}vs{bulk2}.smooth.tsv`
+  - `{prefix}.{bulk1}vs{bulk2}.thr.tsv`
+- `gs`: `{prefix}.{trait}.gs.tsv`
+
+## Python API (selected)
+
+```python
+from janusx.gfreader import load_genotype_chunks
+
+for geno, sites in load_genotype_chunks("example/mouse_hs1940.vcf.gz", chunk_size=50000):
+    # geno: (m, n) float32 genotype chunk
+    # sites: variant metadata list
+    pass
 ```
 
-- **Covariate**: Sex, environments or date.
-
-```text
-0	1
-1	1
-0	2
+```python
+from janusx.gtools.wgcna import cor, adj, tom, cluster
 ```
-
-Files passed to `--grm`|`-k`, `--qcov`|`-q`, and `--cov`|`-c` must be numeric only and aligned to the genotype sample order. Numbers are splited by space- or tab-delimited without row names or column headers.
-
----
-
-## CLI Reference
-
-### GWAS (`gwas`)
-
-Unified GWAS runner supporting GLM, LMM, fastLMM (fixed lambda), and FarmCPU.
-
-```bash
-# LM / LMM (estimated variance parameter per snp) / fastLMM (fixed variance parameter) are streaming-friendly
-jx gwas -bfile data -p pheno.txt -lm -o out
-jx gwas -bfile data -p pheno.txt -lmm -o out
-jx gwas -bfile data -p pheno.txt -fastlmm -o out
-
-# FarmCPU uses full-memory to load genotype matrix
-jx gwas -bfile data -p pheno.txt -farmcpu -o out
-
-# Run multiple models at once
-jx gwas -bfile data -p pheno.txt -lm -lmm -fastlmm -farmcpu -o out
-```
-
-Note: Select at least one GWAS model flag when running `gwas`.
-
-**Input**:
-
-- `-vcf, --vcf` / `-bfile, --bfile` — Genotype source (VCF path or PLINK prefix).  
-  Default: required
-- `-p, --pheno` — Phenotype file (tab-delimited).  
-  Default: required
-- `-n, --ncol` — Phenotype column indices (0-based, repeatable).  
-  Default: all columns
-
-**Models**:
-
-- `-lm, --lm` — Run linear model (LM) GWAS.  
-  Default: `False`
-- `-lmm, --lmm` — Run linear mixed model (LMM) GWAS.  
-  Default: `False`
-- `-fastlmm, --fastlmm` — Run FaST-LMM style approximation.  
-  Default: `False`
-- `-farmcpu, --farmcpu` — Run FarmCPU.  
-  Default: `False`
-
-**Relatedness &amp; Covariates**:
-
-- `-k, --grm` — GRM setting: `1` = centered, `2` = standardized, or path to precomputed GRM.  
-  Default: `1`
-- `-q, --qcov` — Population covariates: PC count or Q-matrix path.  
-  Default: `0`
-- `-c, --cov` — Covariate file (without intercept column).  
-  Default: `None`
-
-**Variant QC**:
-
-- `-maf, --maf` — Exclude variants with MAF &lt; threshold.  
-  Default: `0.02`
-- `-geno, --geno` — Exclude variants with missing rate &gt; threshold.  
-  Default: `0.05`
-
-**Output &amp; Performance**:
-
-- `-plot, --plot` — Generate Manhattan + QQ plots.  
-  Default: `False`
-- `-chunksize, --chunksize` — SNP block size for streaming.  
-  Default: `100000`
-- `-mmap-limit, --mmap-limit` — Enable windowed mmap for BED inputs (benchmark only).  
-  Default: `False`
-- `-t, --thread` — CPU threads (`-1` = all cores).  
-  Default: `-1`
-- `-o, --out` — Output directory.  
-  Default: `"."`
-- `-prefix, --prefix` — Output prefix (auto-generated if omitted).  
-  Default: auto
-
-**Output files**:
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.{trait}.lm.tsv` | GLM results |
-| `{prefix}.{trait}.lmm.tsv` | LMM results |
-| `{prefix}.{trait}.fastlmm.tsv` | fastLMM results |
-| `{prefix}.{trait}.farmcpu.tsv` | FarmCPU results |
-| `{prefix}.{trait}.{model}.svg` | Histogram, Manhattan, and QQ plots (if `--plot`) |
-
-### Genomic Selection (`gs`)
-
-Run genomic prediction with linear and Bayesian models (GBLUP, rrBLUP, BayesA/B/Cpi).
-
-```bash
-# Run selected models
-jx gs -vcf data.vcf.gz -p pheno.txt -GBLUP -rrBLUP -o out
-jx gs -vcf data.vcf.gz -p pheno.txt -BayesA -BayesB -BayesCpi -o out
-
-# Choose phenotype column and enable PCA-based dimensionality reduction and plotting with 5-fold cross-validazation.
-jx gs -vcf data.vcf.gz -pheno pheno.txt -n 0 -GBLUP -pcd -plot -o out -cv 5
-```
-
-**Input**:
-
-- `-vcf, --vcf` / `-bfile, --bfile` — Genotype source (VCF path or PLINK prefix).  
-  Default: required
-- `-p, --pheno` — Phenotype file (tab-delimited).  
-  Default: required
-- `-n, --ncol` — Phenotype column indices (0-based, repeatable).  
-  Default: all columns
-
-**Models**:
-
-- `-GBLUP/--GBLUP`, `-rrBLUP/--rrBLUP`, `-BayesA/--BayesA`, `-BayesB/--BayesB`, `-BayesCpi/--BayesCpi` — Models to run.  
-  Default: all `False`
-
-**Variant QC**:
-
-- `-maf, --maf` — Exclude variants with MAF &lt; threshold.  
-  Default: `0.02`
-- `-geno, --geno` — Exclude variants with missing rate &gt; threshold.  
-  Default: `0.05`
-
-**Output &amp; Performance**:
-
-- `-cv/--cv` — Enable K fold of cross-validazation for models.  
-  Default: `None`
-- `-pcd/--pcd` — Enable PCA-based dimensionality reduction.  
-  Default: `False`
-- `-plot/--plot` — Scatter plots for predicted vs. observed.  
-  Default: `False`
-- `-o/--out`, `-prefix/--prefix` — Output directory/prefix.  
-  Default: `"."` / auto
-
-**Outputs**:
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.{trait}.gs.tsv` | GEBV predictions per model |
-| `{prefix}.{trait}.gs.{model}.svg` | Prediction scatter plots (if `--plot`) |
-
-### postGWAS (`postGWAS`)
-
-Visualization and annotation of GWAS results (Manhattan, QQ, optional SNP annotation and highlighting).
-
-```bash
-# Basic plotting
-jx postGWAS -f result.lmm.tsv
-
-# Custom column names and threshold
-jx postGWAS -f result.tsv -chr "chr" -pos "ps" -pvalue "p_wald" -threshold 1e-6
-
-# Highlight regions and annotate significant SNPs
-jx postGWAS -f result.tsv -hl snps.bed -a annotation.gff -ab 100
-```
-
-**Input**:
-
-- `-f/--file` — GWAS result files (supports glob).  
-  Default: required
-
-**Name of columns**:
-
-- `-chr/--chr`, `-pos/--pos`, `-pvalue/--pvalue` — Column names.  
-  Default: `"chrom"`, `"pos"`, `"pwald"`
-
-**Other parameters**:
-
-- `-threshold/--threshold` — Significance cutoff.  
-  Default: `0.05 / SNPs`
-- `-noplot/--noplot` — Disable plots (annotation only).  
-  Default: `False`
-- `-color/--color` — Color scheme (0-6).  
-  Default: `0`
-- `-hl/--highlight` — BED file for highlighted regions.  
-  Default: `None`
-- `-format/--format` — Image format `pdf/png/svg/tif`.  
-  Default: `"png"`
-- `-a/--anno` — Annotation file (GFF/GTF/BED).  
-  Default: `None`
-- `-ab/--annobroaden` — Annotation window (kb).  
-  Default: `None`
-- `-descItem/--descItem` — GFF description key.  
-  Default: `"description"`
-- `-o/--out`, `-prefix/--prefix`, `-t/--thread` — Output dir/prefix; threads (`-1` all cores).  
-  Default: `"."` / `"JanusX"` / `-1`
-
-Highlight file format:
-
-```text
-chr1    start   end     name    description
-chr1    1000000 1000000 GeneA   Description of GeneA
-chr1    2000000 2000000 GeneB   Description of GeneB
-```
-
-Annotation file format (GFF example):
-
-```text
-chr1    .       gene    1000000 2000000 .   +   .   ID=gene1;description=Example gene
-chr1    .       mRNA    1000000 2000000 .   +   .   ID=mRNA1;Parent=gene1
-```
-
-**Outputs**:
-
-| File | Description |
-| ---- | ----------- |
-| `{prefix}.manh.{format}` | Manhattan plot |
-| `{prefix}.qq.{format}` | QQ plot |
-| `{prefix}.{threshold}.anno.tsv` | Annotated significant SNPs (if enabled) |
-
-### Simulation (`sim`)
-
-Generate synthetic genotype/phenotype data for workflow testing.
-
-```bash
-jx sim [nsnp(k)] [nidv] [outprefix]
-```
-
----
 
 ## Citation
 
@@ -385,3 +219,7 @@ jx sim [nsnp(k)] [nidv] [outprefix]
   journal = {bioRxiv}
 }
 ```
+
+## License
+
+MIT License. See [LICENSE](./LICENSE).

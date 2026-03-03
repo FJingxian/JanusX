@@ -57,7 +57,6 @@ try:
         DownloadColumn,
         TransferSpeedColumn,
         TimeElapsedColumn,
-        TimeRemainingColumn,
     )
     _HAS_RICH_PROGRESS = True
 except Exception:
@@ -68,7 +67,6 @@ except Exception:
     DownloadColumn = None  # type: ignore[assignment]
     TransferSpeedColumn = None  # type: ignore[assignment]
     TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
     _HAS_RICH_PROGRESS = False
 
 try:
@@ -188,7 +186,6 @@ class _DownloadProgress:
                     DownloadColumn(),
                     TransferSpeedColumn(),
                     TimeElapsedColumn(),
-                    TimeRemainingColumn(),
                     transient=True,
                 )
                 self._progress.start()
@@ -210,7 +207,7 @@ class _DownloadProgress:
                 unit_divisor=1024,
                 leave=False,
                 bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                           "[{elapsed}, {rate_fmt}{postfix}]",
             )
             self._backend = "tqdm"
 

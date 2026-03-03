@@ -7,6 +7,7 @@ Design overview
 Input modes:
   - VCF    : genotype in VCF/VCF.GZ format
   - BFILE  : genotype in PLINK binary format (.bed/.bim/.fam prefix)
+  - FILE   : genotype text matrix (.txt/.tsv/.csv, header row is sample IDs)
   - GRM    : precomputed genetic relationship matrix (GRM) plus ID file
   - QCOV : precomputed PCA results (eigenvec/eigenval) for
              visualization only
@@ -357,6 +358,16 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     return eigvec, eigval
 
 
+def _strip_geno_suffix(name: str) -> str:
+    low = name.lower()
+    if low.endswith(".vcf.gz"):
+        return name[: -len(".vcf.gz")]
+    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
 # ======================================================================
 # Main CLI
 # ======================================================================
@@ -382,6 +393,10 @@ def main(log: bool = True):
             "Input genotype in PLINK binary format "
             "(prefix for .bed, .bim, .fam)."
         ),
+    )
+    geno_group.add_argument(
+        "-file", "--file", type=str,
+        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
     )
     geno_group.add_argument(
         "-k", "--grm", type=str,
@@ -459,7 +474,11 @@ def main(log: bool = True):
     # ------------------------- Resolve input file & output prefix -------------------------
     if args.vcf:
         gfile = args.vcf
-        args.prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "") \
+        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) \
+            if args.prefix is None else args.prefix
+    elif args.file:
+        gfile = args.file
+        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) \
             if args.prefix is None else args.prefix
     elif args.bfile:
         gfile = args.bfile
@@ -495,7 +514,7 @@ def main(log: bool = True):
 
     if log:
         cfg_rows: list[tuple[str, object]] = []
-        if args.vcf or args.bfile:
+        if args.vcf or args.file or args.bfile:
             cfg_rows.extend(
                 [
                     ("Genotype file", gfile),
@@ -537,6 +556,8 @@ def main(log: bool = True):
     checks: list[bool] = []
     if args.vcf:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+    elif args.file:
+        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     elif args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.grm:
@@ -573,8 +594,8 @@ def main(log: bool = True):
     samples = None
 
     # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
-    if args.vcf or args.bfile:
-        logger.info("* PCA from genotype (VCF/BFILE) using streaming GRM.")
+    if args.vcf or args.file or args.bfile:
+        logger.info("* PCA from genotype (VCF/BFILE/TXT) using streaming GRM.")
         logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
 
         # Build GRM in streaming mode

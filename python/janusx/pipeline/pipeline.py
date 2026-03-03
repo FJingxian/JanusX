@@ -118,10 +118,12 @@ def _wait_outputs_with_rich_subtasks(
     step_text: str,
     items: List[dict[str, Any]],
     poll_sec: float = 2.0,
+    show_time_remaining: bool = True,
 ) -> None:
     total = len(items)
     if total == 0:
         return
+    t0 = time.time()
 
     if not (_HAS_RICH_PROGRESS and _HAS_CLI_STATUS and sys.stdout.isatty()):
         done = 0
@@ -130,17 +132,21 @@ def _wait_outputs_with_rich_subtasks(
                 1 for it in items
                 if _all_exists(list(it.get("outputs", [])))
             )
+            elapsed = max(0.0, time.time() - t0)
+            elapsed_txt = format_elapsed(elapsed) if format_elapsed is not None else f"{elapsed:.1f}s"
             if done >= total:
                 break
             print(
-                f"\r{step_text} [{done}/{total}]",
+                f"\r{step_text} [{done}/{total}] [{elapsed_txt}]",
                 end="",
                 flush=True,
             )
             time.sleep(max(0.5, poll_sec))
         if done < total:
             done = total
-        print(f"\r{step_text} [{done}/{total}]")
+        elapsed = max(0.0, time.time() - t0)
+        elapsed_txt = format_elapsed(elapsed) if format_elapsed is not None else f"{elapsed:.1f}s"
+        print(f"\r{step_text} [{done}/{total}] [{elapsed_txt}]")
         return
 
     assert Progress is not None
@@ -148,13 +154,14 @@ def _wait_outputs_with_rich_subtasks(
     assert BarColumn is not None
     assert TextColumn is not None
     assert TimeElapsedColumn is not None
-    assert TimeRemainingColumn is not None
+    if show_time_remaining:
+        assert TimeRemainingColumn is not None
 
     done_count = sum(
         1 for it in items
         if _all_exists(list(it.get("outputs", [])))
     )
-    progress = Progress(
+    columns: list[Any] = [
         SpinnerColumn(
             spinner_name=get_rich_spinner_name(),
             style="cyan",
@@ -162,11 +169,13 @@ def _wait_outputs_with_rich_subtasks(
         ),
         TextColumn("[green]{task.description}"),
         BarColumn(),
+        TextColumn("{task.percentage:>6.1f}%"),
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        transient=True,
-    )
+    ]
+    if show_time_remaining and TimeRemainingColumn is not None:
+        columns.append(TimeRemainingColumn())
+    progress = Progress(*columns, transient=True)
 
     with progress:
         task_id = progress.add_task(step_text, total=total, completed=done_count)
@@ -227,6 +236,7 @@ def pipeline(
     step_names: Optional[List[str]] = None,
     use_rich: bool = True,
     step_items: Optional[List[List[dict[str, Any]]]] = None,
+    show_time_remaining: bool = True,
 ) -> None:
     Path("tmp").mkdir(mode=0o755, parents=True, exist_ok=True)
     total_steps = len(AllCMD)
@@ -276,6 +286,7 @@ def pipeline(
                         step_text=step_text,
                         items=items,
                         poll_sec=2.0,
+                        show_time_remaining=show_time_remaining,
                     )
                 else:
                     with CliStatus(step_text, enabled=True, show_elapsed=True):

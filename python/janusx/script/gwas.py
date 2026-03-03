@@ -64,6 +64,7 @@ mpl.rcParams['svg.hashsalt'] = 'hello'
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import gaussian_kde
 from joblib import cpu_count
 import psutil
 from janusx.bioplotkit import GWASPLOT
@@ -230,17 +231,74 @@ def fastplot(
     axes:dict[str,plt.Axes] = fig.subplot_mosaic(mosaic=layout)
 
     gwasplot = GWASPLOT(results)
+    scatter_size = 8.0
 
     # A: phenotype distribution
-    axes["A"].hist(phenosub, bins=15)
-    axes["A"].set_xlabel(xlabel)
+    pheno = np.asarray(phenosub, dtype="float64").reshape(-1)
+    pheno = pheno[np.isfinite(pheno)]
+    n_samples = int(pheno.size)
+    label_base = str(xlabel).strip() if str(xlabel).strip() else "phenotype"
+
+    if n_samples > 0:
+        counts, edges, _ = axes["A"].hist(
+            pheno,
+            bins=15,
+            color="black",
+            edgecolor="none",
+            alpha=1.0,
+        )
+        # Overlay seaborn-like KDE curve, scaled to histogram "Count" axis.
+        if counts.size > 1 and np.unique(pheno).size > 1:
+            try:
+                kde = gaussian_kde(pheno)
+                x_grid = np.linspace(float(np.min(pheno)), float(np.max(pheno)), 256)
+                y_density = kde(x_grid)
+                bin_width = float(np.mean(np.diff(edges)))
+                y_count = y_density * float(n_samples) * bin_width
+                axes["A"].plot(x_grid, y_count, color="#B3B3B3", linewidth=1.6)
+            except Exception:
+                pass
+    else:
+        axes["A"].text(
+            0.5,
+            0.5,
+            "No valid phenotype values",
+            ha="center",
+            va="center",
+            transform=axes["A"].transAxes,
+        )
+
+    axes["A"].set_xlabel(f"{label_base} (n={n_samples})")
     axes["A"].set_ylabel("Count")
 
     # B: Manhattan plot
-    gwasplot.manhattan(-np.log10(1 / results.shape[0]), ax=axes["B"],rasterized=True)
+    gwasplot.manhattan(
+        -np.log10(1 / results.shape[0]),
+        ax=axes["B"],
+        rasterized=True,
+        s=scatter_size,
+    )
+    snp_n = int(results.shape[0])
+    if snp_n >= 1_000_000:
+        snp_val = snp_n / 1_000_000.0
+        snp_suffix = "M"
+    else:
+        snp_val = snp_n / 1_000.0
+        snp_suffix = "K"
+    snp_text = f"{snp_val:.3f}".rstrip("0").rstrip(".")
+    axes["B"].set_xlabel(f"Chromosome (SNP={snp_text}{snp_suffix})")
 
     # C: QQ plot
-    gwasplot.qq(ax=axes["C"])
+    gwasplot.qq(ax=axes["C"], scatter_size=scatter_size)
+
+    # Align QQ with Manhattan:
+    # - QQ ylim follows Manhattan ylim
+    # - QQ xlim lower bound follows Manhattan ylim lower bound
+    # - QQ xlim upper bound keeps current auto-scaled maximum
+    manh_ymin, manh_ymax = axes["B"].get_ylim()
+    qq_xmin, qq_xmax = axes["C"].get_xlim()
+    axes["C"].set_ylim(manh_ymin, manh_ymax)
+    axes["C"].set_xlim(left=manh_ymin, right=max(qq_xmax, manh_ymin + 1e-9))
 
     plt.tight_layout()
     plt.savefig(outpdf, transparent=False, facecolor="white")
@@ -357,6 +415,269 @@ def _read_matrix_with_ids(path: str, logger, label: str) -> tuple[Union[np.ndarr
     ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
     data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
     return ids, data
+
+
+def _normalize_cov_inputs(cov_arg: Union[str, list[str], None]) -> list[str]:
+    if cov_arg is None:
+        return []
+    if isinstance(cov_arg, str):
+        raw = [cov_arg]
+    else:
+        raw = [str(x) for x in cov_arg]
+    out: list[str] = []
+    for x in raw:
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _parse_cov_site_token(token: str) -> Union[tuple[str, int], None]:
+    """
+    Parse site-style covariate token:
+      - chr:pos
+      - chr:start:end  (single-site only, requires start == end)
+    Also accepts full-width colon '：'.
+    """
+    t = str(token).strip().replace("：", ":")
+    parts = [p.strip() for p in t.split(":")]
+    if len(parts) not in (2, 3):
+        return None
+
+    chrom = parts[0]
+    if chrom == "":
+        return None
+
+    try:
+        start = int(float(parts[1]))
+    except Exception:
+        return None
+    if start <= 0:
+        raise ValueError(f"Invalid site position in --cov: {token}")
+
+    if len(parts) == 3:
+        try:
+            end = int(float(parts[2]))
+        except Exception:
+            return None
+        if end <= 0:
+            raise ValueError(f"Invalid site position in --cov: {token}")
+        if end != start:
+            raise ValueError(
+                f"--cov site token must specify a single site (start=end), got: {token}"
+            )
+
+    return chrom, start
+
+
+def _split_cov_sources(cov_inputs: list[str]) -> tuple[list[str], list[tuple[str, int]]]:
+    cov_files: list[str] = []
+    cov_sites: list[tuple[str, int]] = []
+    for item in cov_inputs:
+        parsed = _parse_cov_site_token(item)
+        if parsed is None:
+            cov_files.append(item)
+        else:
+            cov_sites.append(parsed)
+    return cov_files, cov_sites
+
+
+def _canon_site_key(chrom: str, pos: int) -> tuple[str, int]:
+    c = str(chrom).strip().lower()
+    if c.startswith("chr"):
+        c = c[3:]
+    return c, int(pos)
+
+
+def _read_cov_file_flexible(
+    path: str,
+    sample_ids: Union[np.ndarray, None],
+    logger,
+    label: str = "Covariate",
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read covariate file with flexible format:
+      1) ID + cov columns
+      2) numeric-only matrix (sample order must match genotype)
+    """
+    try:
+        df = pd.read_csv(
+            path, sep=None, engine="python", header=None,
+            dtype=str, keep_default_na=False
+        )
+    except Exception:
+        df = pd.read_csv(
+            path, sep=r"\s+", header=None,
+            dtype=str, keep_default_na=False
+        )
+
+    if df.empty:
+        raise ValueError(f"{label} file is empty: {path}")
+
+    sid = None if sample_ids is None else np.asarray(sample_ids, dtype=str)
+    if sid is not None and df.shape[1] > 1:
+        col0 = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+        overlap = len(set(col0) & set(sid))
+        if overlap >= max(1, int(0.9 * len(sid))):
+            data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            return col0, data
+
+    data = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    if sid is not None:
+        if data.shape[0] != len(sid):
+            raise ValueError(
+                f"{label} rows ({data.shape[0]}) do not match genotype sample count ({len(sid)}): {path}"
+            )
+        return sid.copy(), data
+    return np.arange(data.shape[0]).astype(str), data
+
+
+def _load_site_covariates(
+    genofile: str,
+    site_specs: list[tuple[str, int]],
+    sample_ids: np.ndarray,
+    chunk_size: int,
+    logger,
+) -> np.ndarray:
+    """
+    Load additive genotype values for requested SNP sites as covariates.
+    Returns matrix shape (n_samples, n_sites).
+    """
+    if len(site_specs) == 0:
+        return np.zeros((len(sample_ids), 0), dtype="float32")
+
+    sample_ids = np.asarray(sample_ids, dtype=str)
+    unique_sites: list[tuple[str, int]] = []
+    seen_keys: set[tuple[str, int]] = set()
+    for c, p in site_specs:
+        k = _canon_site_key(c, p)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        unique_sites.append((c, p))
+    need_keys: set[tuple[str, int]] = {_canon_site_key(c, p) for c, p in unique_sites}
+
+    picked_rows: list[np.ndarray] = []
+    picked_sites: list[tuple[str, int]] = []
+    query_chunk = max(1, min(int(max(1, chunk_size)), max(1, len(site_specs))))
+    for geno_chunk, site_chunk in load_genotype_chunks(
+        genofile,
+        chunk_size=query_chunk,
+        maf=0.0,
+        missing_rate=1.0,
+        impute=True,
+        model="add",
+        snp_sites=unique_sites,
+        sample_ids=sample_ids.tolist(),
+    ):
+        if geno_chunk.shape[0] == 0:
+            continue
+        for i, s in enumerate(site_chunk):
+            key = _canon_site_key(str(s.chrom), int(s.pos))
+            if key not in need_keys:
+                continue
+            picked_rows.append(np.asarray(geno_chunk[i], dtype="float32"))
+            picked_sites.append((str(s.chrom), int(s.pos)))
+            need_keys.remove(key)
+        if len(need_keys) == 0:
+            break
+
+    missing_tokens = []
+    for c, p in unique_sites:
+        key = _canon_site_key(c, p)
+        if key in need_keys:
+            missing_tokens.append(f"{c}:{p}")
+    if missing_tokens:
+        show = ", ".join(missing_tokens[:10])
+        if len(missing_tokens) > 10:
+            show += f", ... ({len(missing_tokens)} missing)"
+        raise ValueError(f"Some --cov SNP site(s) were not found in genotype: {show}")
+
+    idx_map: dict[tuple[str, int], list[int]] = {}
+    for i, (c, p) in enumerate(picked_sites):
+        k = _canon_site_key(c, p)
+        idx_map.setdefault(k, []).append(i)
+
+    ordered_rows: list[np.ndarray] = []
+    for c, p in site_specs:
+        k = _canon_site_key(c, p)
+        pool = idx_map.get(k, [])
+        if len(pool) == 0:
+            raise ValueError(f"--cov site lookup failed for {c}:{p}")
+        ordered_rows.append(picked_rows[pool[0]])
+
+    cov = np.vstack(ordered_rows).astype("float32", copy=False).T
+    logger.info(f"Loaded SNP-site covariates: {len(site_specs)} site(s), shape={cov.shape}")
+    return cov
+
+
+def _load_covariates_for_models(
+    cov_inputs: Union[str, list[str], None],
+    genofile: str,
+    sample_ids: np.ndarray,
+    chunk_size: int,
+    logger,
+    context: str,
+) -> tuple[Union[np.ndarray, None], Union[np.ndarray, None]]:
+    inputs = _normalize_cov_inputs(cov_inputs)
+    if len(inputs) == 0:
+        logger.info(f"No covariate input provided for {context}; skipping covariates.")
+        return None, None
+
+    cov_files, cov_sites = _split_cov_sources(inputs)
+    parts: list[tuple[np.ndarray, np.ndarray, str]] = []
+
+    for path in cov_files:
+        if not os.path.isfile(path):
+            logger.warning(f"Covariate file not found: {path}; skipped.")
+            continue
+        ids_i, cov_i = _read_cov_file_flexible(path, sample_ids, logger, label="Covariate")
+        if cov_i.ndim == 1:
+            cov_i = cov_i.reshape(-1, 1)
+        parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype="float32"), path))
+        logger.info(f"Loaded covariate file: {path}, shape={cov_i.shape}")
+
+    if len(cov_sites) > 0:
+        cov_site = _load_site_covariates(
+            genofile=genofile,
+            site_specs=cov_sites,
+            sample_ids=np.asarray(sample_ids, dtype=str),
+            chunk_size=chunk_size,
+            logger=logger,
+        )
+        parts.append((np.asarray(sample_ids, dtype=str), cov_site, "SNP-sites"))
+
+    if len(parts) == 0:
+        logger.warning(f"All covariate inputs are empty/unavailable for {context}; skipping.")
+        return None, None
+
+    common = set(parts[0][0].astype(str))
+    for ids_i, _cov_i, _name in parts[1:]:
+        common &= set(ids_i.astype(str))
+
+    ordered_ids = [sid for sid in np.asarray(sample_ids, dtype=str) if sid in common]
+    if len(ordered_ids) == 0:
+        raise ValueError(f"No overlapping samples between genotype and covariates ({context}).")
+
+    mats: list[np.ndarray] = []
+    for ids_i, cov_i, name in parts:
+        idx_map = {sid: i for i, sid in enumerate(ids_i.astype(str))}
+        take = [idx_map[sid] for sid in ordered_ids]
+        sub = cov_i[take]
+        mats.append(sub.astype("float32", copy=False))
+        logger.info(f"Aligned covariate source '{name}': shape={sub.shape}")
+
+    cov_all = np.concatenate(mats, axis=1).astype("float32", copy=False)
+    cov_ids = np.asarray(ordered_ids, dtype=str)
+    logger.info(
+        f"Combined covariate matrix ({context}) shape: {cov_all.shape} "
+        f"from {len(parts)} source(s)."
+    )
+    return cov_all, cov_ids
 
 
 def load_phenotype(
@@ -657,31 +978,23 @@ def load_or_build_q_with_cache(
 
 
 def _load_covariate_for_streaming(
-    cov_path: Union[str , None],
+    cov_inputs: Union[str, list[str], None],
+    genofile: str,
+    sample_ids: np.ndarray,
+    chunk_size: int,
     logger,
 ) -> tuple[Union[np.ndarray , None], Union[np.ndarray, None]]:
     """
-    Load covariate matrix for streaming LMM/LM.
-
-    Assumptions
-    -----------
-      - The first column contains sample IDs.
-      - Remaining columns are covariates.
+    Backward-compatible wrapper for streaming covariate loading.
     """
-    if cov_path is None:
-        logger.info("No covariate file provided; skipping covariates.")
-        return None, None
-
-    if not os.path.isfile(cov_path):
-        logger.warning(f"Covariate file not found: {cov_path}; skipping covariates.")
-        return None, None
-
-    logger.info(f"Loading covariate matrix for streaming models from {cov_path}...")
-    cov_ids, cov_all = _read_matrix_with_ids(cov_path, logger, "Covariate")
-    if cov_all.ndim == 1:
-        cov_all = cov_all.reshape(-1, 1)
-    logger.info(f"Covariate matrix (streaming) shape: {cov_all.shape}")
-    return cov_all, cov_ids
+    return _load_covariates_for_models(
+        cov_inputs=cov_inputs,
+        genofile=genofile,
+        sample_ids=np.asarray(sample_ids, dtype=str),
+        chunk_size=int(chunk_size),
+        logger=logger,
+        context="streaming",
+    )
 
 
 def prepare_streaming_context(
@@ -695,7 +1008,7 @@ def prepare_streaming_context(
     chunk_size: int,
     mgrm: str,
     pcdim: str,
-    cov_path: Union[str , None],
+    cov_inputs: Union[str, list[str], None],
     mmap_limit: bool,
     require_kinship: bool,
     logger,
@@ -750,7 +1063,13 @@ def prepare_streaming_context(
         logger=logger,
     )
 
-    cov_all, cov_ids = _load_covariate_for_streaming(cov_path, logger)
+    cov_all, cov_ids = _load_covariate_for_streaming(
+        cov_inputs,
+        genofile,
+        ids,
+        chunk_size,
+        logger,
+    )
 
     # -----------------------------------------
     # Align all data sources to shared IDs
@@ -1246,10 +1565,12 @@ def prepare_qk_and_filter(
 
 
 def build_qmatrix_farmcpu(
+    genofile: str,
     gfile_prefix: str,
     geno: np.ndarray,
     qdim: str,
-    cov_path: Union[str , None],
+    cov_inputs: Union[str, list[str], None],
+    chunk_size: int,
     logger,
     sample_ids: Union[np.ndarray, None] = None,
 ) -> np.ndarray:
@@ -1349,38 +1670,31 @@ def build_qmatrix_farmcpu(
         logger.info(f"* Loading Q matrix from {qdim}...")
         qmatrix = _maybe_load_with_ids(qdim, geno.shape[1])
 
-    if cov_path:
-        # cov file may contain IDs in the first column
-        df = pd.read_csv(
-            cov_path, sep=None, engine="python", header=None,
-            dtype=str, keep_default_na=False
+    if cov_inputs:
+        if sample_ids is None:
+            raise ValueError("FarmCPU covariate loading requires sample IDs.")
+        cov_arr, cov_ids = _load_covariates_for_models(
+            cov_inputs=cov_inputs,
+            genofile=genofile,
+            sample_ids=np.asarray(sample_ids, dtype=str),
+            chunk_size=int(chunk_size),
+            logger=logger,
+            context="FarmCPU",
         )
-        if sample_ids is not None:
-            col0 = df.iloc[:, 0].astype(str).str.strip()
-            overlap = len(set(col0) & set(sample_ids))
-            if overlap >= int(0.9 * len(sample_ids)) and df.shape[1] > 1:
-                cov_arr = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-                index = {sid: i for i, sid in enumerate(col0)}
-                missing = [sid for sid in sample_ids if sid not in index]
-                if missing:
-                    raise ValueError(f"Covariate file missing {len(missing)} sample IDs (e.g. {missing[:5]}).")
-                cov_arr = cov_arr[[index[sid] for sid in sample_ids]]
-            else:
-                cov_arr = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-        else:
-            cov_arr = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-
-        if cov_arr.ndim == 1:
-            cov_arr = cov_arr.reshape(-1, 1)
-        if cov_arr.shape[0] != geno.shape[1]:
-            msg = (
-                f"Covariate rows ({cov_arr.shape[0]}) do not match sample count "
-                f"({geno.shape[1]}) in genotype matrix."
-            )
-            logger.error(msg)
-            raise ValueError(msg)
-        logger.info(f"Appending covariate matrix for FarmCPU: shape={cov_arr.shape}")
-        qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
+        if cov_arr is not None:
+            if cov_ids is None:
+                raise ValueError("Internal error: covariate IDs are missing for FarmCPU.")
+            sid = np.asarray(sample_ids, dtype=str)
+            if cov_arr.shape[0] != sid.shape[0]:
+                raise ValueError(
+                    f"FarmCPU covariate rows ({cov_arr.shape[0]}) do not match sample count ({sid.shape[0]})."
+                )
+            if not np.array_equal(np.asarray(cov_ids, dtype=str), sid):
+                raise ValueError(
+                    "FarmCPU covariate sample order does not match genotype sample order after alignment."
+                )
+            logger.info(f"Appending covariate matrix for FarmCPU: shape={cov_arr.shape}")
+            qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
 
     logger.info(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
     return qmatrix
@@ -1449,10 +1763,12 @@ def run_farmcpu_fullmem(
 
     gfile_prefix = genotype_cache_prefix(gfile)
     qmatrix = build_qmatrix_farmcpu(
+        genofile=gfile,
         gfile_prefix=gfile_prefix,
         geno=geno,
         qdim=qdim,
-        cov_path=cov,
+        cov_inputs=cov,
+        chunk_size=args.chunksize,
         logger=logger,
         sample_ids=famid.astype(str),
     )
@@ -1580,12 +1896,14 @@ def parse_args():
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-c", "--cov", type=str, default=None,
-        help="Path to additional covariate file. "
-             "For LMM/LM, the file must be aligned with the genotype sample "
-             "order from inspect_genotype_file (one row per sample). "
-             "For FarmCPU, it must follow the genotype sample order "
-             "(famid) (default: %(default)s).",
+        "-c", "--cov", action="append", type=str, default=None,
+        help=(
+            "Additional covariate input (repeatable). Each -c accepts either: "
+            "(1) covariate file path, or "
+            "(2) single-site token chr:pos / chr:start:end (start must equal end, "
+            "supports full-width colon). "
+            "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."
+        ),
     )
     optional_group.add_argument(
         "-maf", "--maf", type=float, default=0.02,
@@ -1634,6 +1952,7 @@ def parse_args():
 def main(log: bool = True):
     t_start = time.time()
     args = parse_args()
+    args.cov = _normalize_cov_inputs(args.cov)
 
     if args.thread <= 0:
         args.thread = cpu_count()
@@ -1675,7 +1994,7 @@ def main(log: bool = True):
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
         if args.cov:
-            cfg_rows.append(("Covariate file", args.cov))
+            cfg_rows.append(("Covariates", "; ".join(args.cov)))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GWAS",
@@ -1699,8 +2018,15 @@ def main(log: bool = True):
         checks.append(ensure_file_exists(logger, args.grm, "GRM file"))
     if args.qcov not in np.arange(0, 30).astype(str):
         checks.append(ensure_file_exists(logger, args.qcov, "Q matrix file"))
-    if args.cov is not None:
-        checks.append(ensure_file_exists(logger, args.cov, "Covariate file"))
+    if args.cov:
+        for cov_item in args.cov:
+            try:
+                site_token = _parse_cov_site_token(cov_item)
+            except Exception as e:
+                logger.error(str(e))
+                raise SystemExit(1)
+            if site_token is None:
+                checks.append(ensure_file_exists(logger, cov_item, "Covariate file"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
@@ -1737,7 +2063,7 @@ def main(log: bool = True):
                 chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
-                cov_path=args.cov,
+                cov_inputs=args.cov,
                 mmap_limit=args.mmap_limit,
                 require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,

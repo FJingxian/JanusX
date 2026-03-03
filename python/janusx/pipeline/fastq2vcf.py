@@ -606,6 +606,15 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         state["started_at"] = state.get("started_at", _utc_now())
         _sync_state_from_fs(state, steps_meta)
         _safe_write_json(state_path, state)
+        # Estimated durations are fixed hints taken from the step annotations above.
+        step_names = [
+            "fastp (~15m)",
+            "bwamem (~255m)",
+            "markdup (~73m)",
+            "bam2gvcf (~451m)",
+            "cgvcf (~36m)",
+            "gvcf2vcf (~32m)",
+        ]
         pipeline(
             [step1, step2, step3, step4, step5, step6],
             [step1in, step1out, step2out, step3out, step4out, step5out],
@@ -613,15 +622,9 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
             scheduler=scheduler,
             nohup_max_jobs=nohup_max_jobs,
             skip_if_outputs_exist=False,
-            step_names=[
-                "fastp",
-                "bwamem",
-                "markdup",
-                "bam2gvcf",
-                "cgvcf",
-                "gvcf2vcf",
-            ],
+            step_names=step_names,
             use_rich=True,
+            show_time_remaining=False,
             step_items=[
                 step1_items,
                 step2_items,

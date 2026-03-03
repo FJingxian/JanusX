@@ -84,6 +84,7 @@ REQUIRED_LOCAL_TOOLS = (
     "samtools",
     "gatk",
     "bcftools",
+    "tabix",
     "plink",
     "beagle",
 )
@@ -92,6 +93,22 @@ DOCKER_IMAGE_TAG = "janusx-fastq2vcf:latest"
 
 def _missing_binaries(commands: Sequence[str]) -> List[str]:
     return [cmd for cmd in commands if shutil.which(cmd) is None]
+
+
+def _bcftools_setgt_available() -> bool:
+    bcftools_bin = shutil.which("bcftools")
+    if bcftools_bin is None:
+        return False
+    try:
+        p = subprocess.run(
+            [str(bcftools_bin), "+setGT", "-h"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return False
+    return p.returncode == 0
 
 
 def _dockerfile_path() -> Path:
@@ -478,6 +495,11 @@ def main():
             "Using local runtime. Found dependencies: %s",
             ", ".join(REQUIRED_LOCAL_TOOLS),
         )
+        if not _bcftools_setgt_available():
+            logger.warning(
+                "bcftools +setGT plugin is unavailable in current environment; "
+                "step7 will fall back to `bcftools filter -S .` automatically."
+            )
     else:
         logger.warning("Missing local dependencies: %s", ", ".join(missing_tools))
         docker_bin = shutil.which("docker")

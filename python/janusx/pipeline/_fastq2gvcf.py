@@ -62,7 +62,10 @@ def indexREF(reference:Pathlike, singularity: str = ""):
     bwaidx = f'{prefix}bwa index {reference}'
     outdict = f"{str(reference).replace('.fasta.gz','').replace('.fa.gz','').replace('.fasta','').replace('.fasta','')}.dict"
     gatkidx = f"{prefix}gatk CreateSequenceDictionary -R {reference} -O {outdict}"
-    if Path(gatkidx).exists():
+    has_fai = Path(f"{reference}.fai").exists()
+    has_ann = Path(f"{reference}.ann").exists()
+    has_dict = Path(outdict).exists()
+    if has_fai and has_ann and has_dict:
         return f"{prefix}echo 'all index exist'"
     else:
         return (f'{samtoolsidx} && '
@@ -565,10 +568,17 @@ def snpvcf_to_gt_and_missing(
     filter_expr = (
         f"FMT/DP<{int(min_dp)} || FMT/GQ<{int(min_gq)} || FMT/AD[1]<{int(min_ad)}"
     )
-    setgt_cmd = (
-        f"{prefix}bcftools +setGT {_q(in_vcf)} -- "
+    # Prefer +setGT when available, but transparently fall back to
+    # native `bcftools filter -S .` for environments without plugin support.
+    setgt_plugin_cmd = (
+        f"{prefix}bcftools +setGT -Ou {_q(in_vcf)} -- "
         f"-t q -n . -i '{filter_expr}'"
     )
+    setgt_fallback_cmd = (
+        f"{prefix}bcftools filter -Ou -S . "
+        f"-e '{filter_expr}' {_q(in_vcf)}"
+    )
+    setgt_cmd = f"( {setgt_plugin_cmd} || {setgt_fallback_cmd} )"
     keep_gt_cmd = (
         f"{prefix}bcftools annotate --threads {int(core)} "
         f"-x FORMAT,^FORMAT/GT -Oz -o {_q(out_gt)}"

@@ -623,7 +623,13 @@ def main():
             bulks[1],
         )
 
-    logger.info(f"Pipeline finished in {time.time() - t_start:.1f}s")
+    lt = time.localtime()
+    endinfo = (
+        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    )
+    logger.info(endinfo)
 
 
 if __name__ == "__main__":

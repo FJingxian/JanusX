@@ -614,7 +614,7 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     summary = state.get("summary", {})
     if int(summary.get("total_items", 0)) > 0 and int(summary.get("done_items", 0)) >= int(summary.get("total_items", 0)):
         print("All FASTQ2VCF tasks already completed (same parameters).")
-        return
+        print("Re-checking all 6 steps with rich progress...")
 
     try:
         state["status"] = "running"

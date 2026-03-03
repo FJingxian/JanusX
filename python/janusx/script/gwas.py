@@ -43,6 +43,8 @@ import argparse
 import logging
 import sys
 import threading
+import warnings
+import multiprocessing as mp
 import concurrent.futures as cf
 from typing import Union, Optional
 import uuid
@@ -130,6 +132,58 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * 60)
 
 
+def _log_file_only(logger: logging.Logger, level: int, message: str) -> None:
+    """
+    Emit a log record to file handlers only.
+    Used to keep rich terminal output clean while preserving full log files.
+    """
+    msg = str(message)
+    handled = False
+    try:
+        for handler in getattr(logger, "handlers", []):
+            if isinstance(handler, logging.FileHandler):
+                record = logger.makeRecord(
+                    logger.name,
+                    level,
+                    __file__,
+                    0,
+                    msg,
+                    args=(),
+                    exc_info=None,
+                    func=None,
+                    extra=None,
+                )
+                handler.handle(record)
+                handled = True
+    except Exception:
+        handled = False
+    if not handled:
+        logger.log(level, msg)
+
+
+def _log_info(logger: logging.Logger, message: str, *, use_spinner: bool = False) -> None:
+    if use_spinner:
+        _log_file_only(logger, logging.INFO, str(message))
+    else:
+        logger.info(str(message))
+
+
+def _rich_success(
+    logger: logging.Logger,
+    message: str,
+    *,
+    use_spinner: bool = False,
+    log_message: Optional[str] = None,
+) -> None:
+    msg = str(message)
+    file_msg = str(msg if log_message is None else log_message)
+    if use_spinner:
+        _log_file_only(logger, logging.INFO, file_msg)
+        print_success(msg)
+    else:
+        logger.info(file_msg)
+
+
 class _ProgressAdapter:
     """
     Progress bar adapter with rich-first rendering and tqdm fallback.
@@ -178,7 +232,7 @@ class _ProgressAdapter:
                 ascii=False,
                 leave=False,
                 bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                           "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             )
             self._backend = "tqdm"
 
@@ -375,33 +429,64 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     return None
 
 
-def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
+def _basename_only(path: str) -> str:
+    p = str(path).replace("\\", "/").rstrip("/")
+    b = os.path.basename(p)
+    return b if b else p
+
+
+def _read_id_file(
+    path: str,
+    logger,
+    label: str,
+    *,
+    use_spinner: bool = False,
+    show_status: bool = True,
+) -> Union[np.ndarray, None]:
     if not os.path.isfile(path):
         logger.warning(f"{label} ID file not found: {path}")
         return None
-    try:
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    except Exception:
-        df = pd.read_csv(
-            path, sep=None, engine="python", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    if not df.empty and df.iloc[0, 0] == "":
-        # sep=None can mis-parse single-column ID files; fallback to whitespace
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    if df.empty:
-        logger.warning(f"{label} ID file is empty: {path}")
-        return None
-    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-    if ids.size == 0:
-        logger.warning(f"{label} ID file has no usable IDs: {path}")
-        return None
+    src = _basename_only(path)
+
+    def _load_ids() -> Union[np.ndarray, None]:
+        try:
+            df = pd.read_csv(
+                path, sep=r"\s+", header=None, usecols=[0],
+                dtype=str, keep_default_na=False
+            )
+        except Exception:
+            df = pd.read_csv(
+                path, sep=None, engine="python", header=None, usecols=[0],
+                dtype=str, keep_default_na=False
+            )
+        if not df.empty and df.iloc[0, 0] == "":
+            # sep=None can mis-parse single-column ID files; fallback to whitespace
+            df = pd.read_csv(
+                path, sep=r"\s+", header=None, usecols=[0],
+                dtype=str, keep_default_na=False
+            )
+        if df.empty:
+            logger.warning(f"{label} ID file is empty: {path}")
+            return None
+        ids0 = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+        if ids0.size == 0:
+            logger.warning(f"{label} ID file has no usable IDs: {path}")
+            return None
+        return ids0
+
+    if not show_status:
+        return _load_ids()
+
+    with CliStatus(f"Loading {label} ID from {src}...", enabled=bool(use_spinner)) as task:
+        try:
+            ids = _load_ids()
+        except Exception:
+            task.fail(f"Loading {label} ID from {src} ...Failed")
+            raise
+        if ids is None:
+            task.complete(f"Loading {label} ID from {src} shape=(0,)")
+            return None
+        task.complete(f"Loading {label} ID from {src} shape=({ids.size},)")
     return ids
 
 
@@ -548,6 +633,7 @@ def _load_site_covariates(
     sample_ids: np.ndarray,
     chunk_size: int,
     logger,
+    use_spinner: bool = False,
 ) -> np.ndarray:
     """
     Load additive genotype values for requested SNP sites as covariates.
@@ -617,7 +703,11 @@ def _load_site_covariates(
         ordered_rows.append(picked_rows[pool[0]])
 
     cov = np.vstack(ordered_rows).astype("float32", copy=False).T
-    logger.info(f"Loaded SNP-site covariates: {len(site_specs)} site(s), shape={cov.shape}")
+    _log_info(
+        logger,
+        f"Loaded SNP-site covariates: {len(site_specs)} site(s), shape={cov.shape}",
+        use_spinner=use_spinner,
+    )
     return cov
 
 
@@ -628,10 +718,16 @@ def _load_covariates_for_models(
     chunk_size: int,
     logger,
     context: str,
+    use_spinner: bool = False,
 ) -> tuple[Union[np.ndarray, None], Union[np.ndarray, None]]:
     inputs = _normalize_cov_inputs(cov_inputs)
     if len(inputs) == 0:
-        logger.info(f"No covariate input provided for {context}; skipping covariates.")
+        _rich_success(
+            logger,
+            f"Loading covariates ({context}) ...Skipped (none)",
+            use_spinner=use_spinner,
+            log_message=f"No covariate input provided for {context}; skipping covariates.",
+        )
         return None, None
 
     cov_files, cov_sites = _split_cov_sources(inputs)
@@ -641,21 +737,40 @@ def _load_covariates_for_models(
         if not os.path.isfile(path):
             logger.warning(f"Covariate file not found: {path}; skipped.")
             continue
-        ids_i, cov_i = _read_cov_file_flexible(path, sample_ids, logger, label="Covariate")
-        if cov_i.ndim == 1:
-            cov_i = cov_i.reshape(-1, 1)
-        parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype="float32"), path))
-        logger.info(f"Loaded covariate file: {path}, shape={cov_i.shape}")
+        src = _basename_only(path)
+        with CliStatus(f"Loading covariate from {src}...", enabled=bool(use_spinner)) as task:
+            try:
+                ids_i, cov_i = _read_cov_file_flexible(path, sample_ids, logger, label="Covariate")
+                if cov_i.ndim == 1:
+                    cov_i = cov_i.reshape(-1, 1)
+            except Exception:
+                task.fail(f"Loading covariate from {src} ...Failed")
+                raise
+            task.complete(
+                f"Loading covariate from {src} (n={cov_i.shape[0]}, ncov={cov_i.shape[1]})"
+            )
+        parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype="float32"), src))
 
     if len(cov_sites) > 0:
-        cov_site = _load_site_covariates(
-            genofile=genofile,
-            site_specs=cov_sites,
-            sample_ids=np.asarray(sample_ids, dtype=str),
-            chunk_size=chunk_size,
-            logger=logger,
-        )
-        parts.append((np.asarray(sample_ids, dtype=str), cov_site, "SNP-sites"))
+        for chrom, pos in cov_sites:
+            token = f"{chrom}:{pos}"
+            with CliStatus(f"Loading covariate from {token}...", enabled=bool(use_spinner)) as task:
+                try:
+                    cov_site = _load_site_covariates(
+                        genofile=genofile,
+                        site_specs=[(chrom, pos)],
+                        sample_ids=np.asarray(sample_ids, dtype=str),
+                        chunk_size=chunk_size,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                    )
+                except Exception:
+                    task.fail(f"Loading covariate from {token} ...Failed")
+                    raise
+                task.complete(
+                    f"Loading covariate from {token} (n={cov_site.shape[0]}, ncov={cov_site.shape[1]})"
+                )
+            parts.append((np.asarray(sample_ids, dtype=str), cov_site, token))
 
     if len(parts) == 0:
         logger.warning(f"All covariate inputs are empty/unavailable for {context}; skipping.")
@@ -675,13 +790,19 @@ def _load_covariates_for_models(
         take = [idx_map[sid] for sid in ordered_ids]
         sub = cov_i[take]
         mats.append(sub.astype("float32", copy=False))
-        logger.info(f"Aligned covariate source '{name}': shape={sub.shape}")
+        _rich_success(
+            logger,
+            f"Aligned covariate source '{name}' (n={sub.shape[0]}, ncov={sub.shape[1]})",
+            use_spinner=use_spinner,
+        )
 
     cov_all = np.concatenate(mats, axis=1).astype("float32", copy=False)
     cov_ids = np.asarray(ordered_ids, dtype=str)
-    logger.info(
-        f"Combined covariate matrix ({context}) shape: {cov_all.shape} "
-        f"from {len(parts)} source(s)."
+    _rich_success(
+        logger,
+        f"Combined covariate matrix ({context}) (n={cov_all.shape[0]}, ncov={cov_all.shape[1]}) "
+        f"from {len(parts)} source(s).",
+        use_spinner=use_spinner,
     )
     return cov_all, cov_ids
 
@@ -691,6 +812,7 @@ def load_phenotype(
     ncol: Union[list[int] , None],
     logger,
     id_col: int = 0,
+    use_spinner: bool = False,
 ) -> pd.DataFrame:
     """
     Load and preprocess phenotype table.
@@ -701,7 +823,6 @@ def load_phenotype(
       - If needed, set id_col=1 to use the second column as IDs (PLINK FID/IID).
     - Duplicated IDs are averaged.
     """
-    logger.info(f"Loading phenotype from {phenofile}...")
     try:
         df = pd.read_csv(phenofile, sep=None, engine="python", header=None)
     except Exception:
@@ -750,8 +871,10 @@ def load_phenotype(
             logger.error(msg)
             raise ValueError(msg)
         ncol = [i for i in ncol if i in range(pheno.shape[1])]
-        logger.info(
-            "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol]))
+        _log_info(
+            logger,
+            "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol])),
+            use_spinner=use_spinner,
         )
         pheno = pheno.iloc[:, ncol]
 
@@ -802,6 +925,18 @@ def _detect_cache_need(genofile: str) -> tuple[bool, str, list[str]]:
     return False, "", []
 
 
+def _format_cache_size(nbytes: int) -> str:
+    x = float(max(0, int(nbytes)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while x >= 1024.0 and idx < len(units) - 1:
+        x /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(x)}{units[idx]}"
+    return f"{x:.1f}{units[idx]}"
+
+
 def _load_phenotype_with_status(
     phenofile: str,
     ncol: Union[list[int], None],
@@ -813,14 +948,44 @@ def _load_phenotype_with_status(
     """
     Load phenotype with rich/plain CLI status.
     """
-    with CliStatus("Loading phenotype...", enabled=bool(use_spinner)) as task:
+    src = _basename_only(phenofile)
+    with CliStatus(f"Loading phenotype from {src}...", enabled=bool(use_spinner)) as task:
         try:
-            pheno = load_phenotype(phenofile, ncol, logger, id_col=id_col)
+            pheno = load_phenotype(
+                phenofile,
+                ncol,
+                logger,
+                id_col=id_col,
+                use_spinner=use_spinner,
+            )
         except Exception:
-            task.fail("Loading phenotype ...Failed")
+            task.fail(f"Loading phenotype from {src} ...Failed")
             raise
-        task.complete("Loading phenotype ...Finished")
+        task.complete(
+            f"Loading phenotype from {src} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
+        )
     return pheno
+
+
+def _inspect_genotype_file_with_warnings(
+    genofile: str,
+) -> tuple[np.ndarray, int, list[str]]:
+    """
+    Run inspect_genotype_file and capture warning messages.
+    Designed for subprocess execution to avoid GIL stalls during cache build.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ids0, ns0 = inspect_genotype_file(genofile)
+    warn_msgs: list[str] = []
+    for w in caught:
+        try:
+            msg = str(w.message).strip()
+        except Exception:
+            msg = ""
+        if msg:
+            warn_msgs.append(msg)
+    return np.asarray(ids0, dtype=str), int(ns0), warn_msgs
 
 
 def _inspect_genotype_with_status(
@@ -832,43 +997,103 @@ def _inspect_genotype_with_status(
     """
     Inspect genotype metadata with optional cache-status spinner.
     """
+    src = _basename_only(genofile)
     need_cache, cache_kind, cache_targets = _detect_cache_need(genofile)
+    status_enabled = bool(use_spinner)
+    plain_progress = (not status_enabled) and (cache_kind in {"vcf", "txt"})
 
-    if not need_cache:
-        with CliStatus("Loading genotype...", enabled=bool(use_spinner)) as task:
+    # For direct PLINK prefixes (no cache-target metadata), inspect directly.
+    # For VCF/TXT sources, always run the threaded+monitored path below so that
+    # cache rebuilds triggered inside inspect_genotype_file() are still visible.
+    if cache_kind == "":
+        with CliStatus(f"Loading genotype from {src}...", enabled=status_enabled) as task:
             try:
                 ids, n_snps = inspect_genotype_file(genofile)
             except Exception:
-                task.fail("Loading genotype ...Failed")
+                task.fail(f"Loading genotype from {src} ...Failed")
                 raise
-            task.complete("Loading genotype ...Finished")
+            task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
         return np.asarray(ids, dtype=str), int(n_snps)
 
-    with CliStatus("Caching genotype...", enabled=bool(use_spinner)) as task:
+    with CliStatus(f"Loading genotype from {src}...", enabled=status_enabled) as task:
         out: dict[str, tuple[np.ndarray, int]] = {}
         err: dict[str, Exception] = {}
-        done = threading.Event()
+        warn_msgs: list[str] = []
+        last_plain_msg = ""
+        last_plain_emit = 0.0
+        plain_t0 = time.monotonic()
+        last_wait_beat = plain_t0
+        if plain_progress:
+            logger.info(f"Loading genotype from {src}... [{format_elapsed(0.0)}]")
+            last_plain_msg = f"Loading genotype from {src}..."
+            last_plain_emit = plain_t0
 
-        def _worker() -> None:
+        def _emit_plain(msg: str, *, allow_same_after: float = 5.0) -> None:
+            nonlocal last_plain_msg, last_plain_emit
+            if not plain_progress:
+                return
+            m = str(msg)
+            now = time.monotonic()
+            elapsed = format_elapsed(now - plain_t0)
+            changed = (m != last_plain_msg)
+            # Emit on change with a small throttle; also emit heartbeat when unchanged.
+            if (
+                (changed and (now - last_plain_emit >= 0.5))
+                or ((not changed) and (now - last_plain_emit >= float(max(0.5, allow_same_after))))
+            ):
+                logger.info(f"{m} [{elapsed}]")
+                last_plain_msg = m
+                last_plain_emit = now
+
+        # Use subprocess first so UI updates are not blocked by GIL while Rust builds cache.
+        fut = None
+        executor = None
+        done_evt: Union[threading.Event, None] = None
+        t: Union[threading.Thread, None] = None
+        use_subproc = cache_kind in {"vcf", "txt"}
+        if use_subproc:
             try:
-                ids0, ns0 = inspect_genotype_file(genofile)
-                out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
-            except Exception as ex:
-                err["value"] = ex
-            finally:
-                done.set()
+                mp_ctx = mp.get_context("spawn")
+                executor = cf.ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx)
+                fut = executor.submit(_inspect_genotype_file_with_warnings, genofile)
+            except Exception:
+                use_subproc = False
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        if not use_subproc:
+            done_evt = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    ids0, ns0, warns0 = _inspect_genotype_file_with_warnings(genofile)
+                    out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
+                    warn_msgs.extend(warns0)
+                except Exception as ex:
+                    err["value"] = ex
+                finally:
+                    done_evt.set()
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
 
         bim_path = cache_targets[1] if (cache_kind == "vcf" and len(cache_targets) >= 2) else ""
+        bed_path = cache_targets[0] if (cache_kind == "vcf" and len(cache_targets) >= 1) else ""
+        npy_path = cache_targets[0] if (cache_kind == "txt" and len(cache_targets) >= 1) else ""
         bim_fp = None
         bim_dev_ino: tuple[int, int] = (-1, -1)
         bim_seen = 0
         bim_count = 0
         last_count = -1
-        while not done.wait(timeout=0.25):
+        last_size = -1
+        while True:
+            if use_subproc:
+                if fut is not None and fut.done():
+                    break
+                time.sleep(0.25)
+            else:
+                if done_evt is not None and done_evt.wait(timeout=0.25):
+                    break
             if bim_path and os.path.isfile(bim_path):
+                bim_progressed = False
                 try:
                     st = os.stat(bim_path)
                     dev_ino = (int(st.st_dev), int(st.st_ino))
@@ -891,26 +1116,84 @@ def _inspect_genotype_with_status(
                         chunk = bim_fp.read(int(st.st_size) - int(bim_seen))
                         bim_seen = int(st.st_size)
                         bim_count += int(chunk.count(b"\n"))
+                        bim_progressed = True
                         if bim_count != last_count:
                             last_count = bim_count
-                            task.desc = f"Caching genotype... SNP={bim_count}"
+                            msg = f"Loading genotype from {src}... SNP={bim_count}"
+                            task.desc = msg
+                            _emit_plain(msg)
                 except Exception:
                     pass
+                if (not bim_progressed) and bed_path and os.path.isfile(bed_path):
+                    # .bim may not flush frequently; keep progress alive via .bed growth.
+                    try:
+                        bsz = int(os.path.getsize(bed_path))
+                        if bsz != last_size:
+                            last_size = bsz
+                            msg = f"Loading genotype from {src}... cache={_format_cache_size(bsz)}"
+                            task.desc = msg
+                            _emit_plain(msg)
+                    except Exception:
+                        pass
+            elif bed_path and os.path.isfile(bed_path):
+                try:
+                    sz = int(os.path.getsize(bed_path))
+                    if sz != last_size:
+                        last_size = sz
+                        msg = f"Loading genotype from {src}... cache={_format_cache_size(sz)}"
+                        task.desc = msg
+                        _emit_plain(msg)
+                except Exception:
+                    pass
+            elif npy_path and os.path.isfile(npy_path):
+                try:
+                    sz = int(os.path.getsize(npy_path))
+                    if sz != last_size:
+                        last_size = sz
+                        msg = f"Loading genotype from {src}... cache={_format_cache_size(sz)}"
+                        task.desc = msg
+                        _emit_plain(msg)
+                except Exception:
+                    pass
+            now = time.monotonic()
+            if now - last_wait_beat >= 3.0:
+                dots = "." * (1 + (int((now - plain_t0) // 3) % 3))
+                wait_msg = f"Loading genotype from {src}... waiting{dots}"
+                task.desc = wait_msg
+                _emit_plain(wait_msg, allow_same_after=3.0)
+                last_wait_beat = now
 
-        t.join()
+        if use_subproc:
+            try:
+                if fut is not None:
+                    ids0, ns0, warns0 = fut.result()
+                    out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
+                    warn_msgs.extend(list(warns0))
+            except Exception as ex:
+                err["value"] = ex
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=False)
+        elif t is not None:
+            t.join()
         if bim_fp is not None:
             try:
                 bim_fp.close()
             except Exception:
                 pass
         if "value" in err:
-            task.fail("Caching genotype ...Failed")
+            task.fail(f"Loading genotype from {src} ...Failed")
             raise err["value"]
 
         ids, n_snps = out["value"]
-        task.desc = f"Caching genotype... SNP={n_snps}"
-        task.complete("Caching genotype ...Finished")
-        logger.info(f"Cached genotype sites: {n_snps}")
+        for wmsg in warn_msgs:
+            if use_spinner:
+                print(f"Warning: {wmsg}", flush=True)
+            else:
+                logger.warning(wmsg)
+        task.desc = f"Loading genotype from {src}... SNP={n_snps}"
+        task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
+        _log_info(logger, f"Cached genotype sites: {n_snps}", use_spinner=use_spinner)
         return ids, n_snps
 
 def build_grm_streaming(
@@ -923,11 +1206,12 @@ def build_grm_streaming(
     method: int,
     mmap_window_mb: Union[int , None],
     logger,
+    use_spinner: bool = False,
 ) -> tuple[np.ndarray, int]:
     """
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
     """
-    logger.info(f"Building GRM (streaming), method={method}")
+    _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
     grm = np.zeros((n_samples, n_samples), dtype="float32")
     pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
     process = psutil.Process()
@@ -974,7 +1258,7 @@ def build_grm_streaming(
     else:  # method == 2
         grm = (grm + grm.T) / eff_m / 2
 
-    logger.info("GRM construction finished.")
+    _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
     return grm, eff_m
 
 
@@ -987,6 +1271,7 @@ def load_or_build_grm_with_cache(
     chunk_size: int,
     mmap_limit: bool,
     logger:logging.Logger,
+    use_spinner: bool = False,
 ) -> tuple[np.ndarray, int, Union[np.ndarray, None]]:
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
@@ -1011,15 +1296,29 @@ def load_or_build_grm_with_cache(
                     "Warning: Genotype input is newer than cached GRM; rebuilding GRM cache."
                 )
         if os.path.exists(cache_npy) and (not cache_is_stale):
-            logger.info(f"Loading cached GRM from {km_path}.npy...")
-            grm = np.load(f'{km_path}.npy',mmap_mode='r')
-            grm = grm.reshape(n_samples, n_samples)
-            grm_ids = _read_id_file(id_path, logger, "GRM")
-            if grm_ids is not None and len(grm_ids) != n_samples:
-                raise ValueError(
-                    f"GRM ID count ({len(grm_ids)}) does not match GRM shape ({n_samples})."
-                )
-            eff_m = n_snps  # approximate; exact effective M not critical here
+            src = _basename_only(cache_npy)
+            with CliStatus(f"Loading GRM from {src}...", enabled=bool(use_spinner)) as task:
+                try:
+                    grm = np.load(f'{km_path}.npy',mmap_mode='r')
+                    grm = grm.reshape(n_samples, n_samples)
+                    grm_ids = _read_id_file(
+                        id_path,
+                        logger,
+                        "GRM",
+                        use_spinner=use_spinner,
+                        show_status=False,
+                    )
+                    if grm_ids is not None and len(grm_ids) != n_samples:
+                        raise ValueError(
+                            f"GRM ID count ({len(grm_ids)}) does not match GRM shape ({n_samples})."
+                        )
+                    if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
+                        raise ValueError(f"GRM must be square; got shape={grm.shape}")
+                    eff_m = n_snps  # approximate; exact effective M not critical here
+                except Exception:
+                    task.fail(f"Loading GRM from {src} ...Failed")
+                    raise
+                task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
         else:
             method_int = int(mgrm)
             grm, eff_m = build_grm_streaming(
@@ -1034,50 +1333,88 @@ def load_or_build_grm_with_cache(
                     genofile, n_samples, n_snps, chunk_size
                 ) if mmap_limit else None,
                 logger=logger,
+                use_spinner=use_spinner,
             )
             np.save(f'{km_path}.npy', grm)
             pd.Series(ids).to_csv(id_path, sep="\t", index=False, header=False)
             grm_ids = ids
             grm = np.load(f'{km_path}.npy',mmap_mode='r')
-            logger.info(f"Cached GRM written to {km_path}.npy")
+            if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
+                raise ValueError(f"GRM must be square; got shape={grm.shape}")
+            _log_file_only(logger, logging.INFO, f"Cached GRM written to {km_path}.npy")
     else:
         if not os.path.isfile(mgrm):
             msg = f"GRM file not found: {mgrm}"
             logger.error(msg)
             raise ValueError(msg)
-        logger.info(f"Loading GRM from {mgrm}...")
-        if mgrm.endswith('.npy'):
-            grm = np.load(mgrm,mmap_mode='r')
-        else:
-            grm = np.genfromtxt(mgrm, dtype="float32")
-        grm_ids = _read_id_file(f"{mgrm}.id", logger, "GRM")
-        if grm_ids is None:
-            if grm.size != n_samples * n_samples:
-                msg = f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
-                logger.error(msg)
-                raise ValueError(msg)
-            grm = grm.reshape(n_samples, n_samples)
-        else:
-            if grm.size != len(grm_ids) * len(grm_ids):
-                msg = (
-                    f"GRM size mismatch: expected {len(grm_ids)*len(grm_ids)}, "
-                    f"got {grm.size}"
+        src = _basename_only(mgrm)
+        with CliStatus(f"Loading GRM from {src}...", enabled=bool(use_spinner)) as task:
+            try:
+                if mgrm.endswith('.npy'):
+                    grm = np.load(mgrm,mmap_mode='r')
+                else:
+                    grm = np.genfromtxt(mgrm, dtype="float32")
+                grm_ids = _read_id_file(
+                    f"{mgrm}.id",
+                    logger,
+                    "GRM",
+                    use_spinner=use_spinner,
+                    show_status=False,
                 )
-                logger.error(msg)
-                raise ValueError(msg)
-            grm = grm.reshape(len(grm_ids), len(grm_ids))
-        eff_m = n_snps
+                if grm_ids is None:
+                    if grm.size != n_samples * n_samples:
+                        msg = f"GRM size mismatch: expected {n_samples*n_samples}, got {grm.size}"
+                        logger.error(msg)
+                        raise ValueError(msg)
+                    grm = grm.reshape(n_samples, n_samples)
+                else:
+                    if grm.size != len(grm_ids) * len(grm_ids):
+                        msg = (
+                            f"GRM size mismatch: expected {len(grm_ids)*len(grm_ids)}, "
+                            f"got {grm.size}"
+                        )
+                        logger.error(msg)
+                        raise ValueError(msg)
+                    grm = grm.reshape(len(grm_ids), len(grm_ids))
+                if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
+                    raise ValueError(f"GRM must be square; got shape={grm.shape}")
+                eff_m = n_snps
+            except Exception:
+                task.fail(f"Loading GRM from {src} ...Failed")
+                raise
+            task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
 
-    logger.info(f"GRM shape: {grm.shape}")
+    _log_info(logger, f"GRM shape: {grm.shape}", use_spinner=use_spinner)
     return grm, eff_m, grm_ids
 
 
-def build_pcs_from_grm(grm: np.ndarray, dim: int, logger: logging.Logger) -> np.ndarray:
+def build_pcs_from_grm(
+    grm: np.ndarray,
+    dim: int,
+    logger: logging.Logger,
+    *,
+    use_spinner: bool = False,
+) -> np.ndarray:
     """
     Compute leading principal components from GRM.
     """
+    if use_spinner:
+        with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
+            try:
+                _eigval, eigvec = np.linalg.eigh(grm)
+                pcs = eigvec[:, -dim:]
+            except Exception:
+                task.fail(f"Computing top {dim} PCs from GRM ...Failed")
+                raise
+            task.complete(
+                f"Computing top {dim} PCs from GRM (n={pcs.shape[0]}, nPC={pcs.shape[1]})"
+            )
+        _log_file_only(logger, logging.INFO, f"Computing top {dim} PCs from GRM...")
+        _log_file_only(logger, logging.INFO, "PC computation finished.")
+        return pcs
+
     logger.info(f"Computing top {dim} PCs from GRM...")
-    _, eigvec = np.linalg.eigh(grm)
+    _eigval, eigvec = np.linalg.eigh(grm)
     pcs = eigvec[:, -dim:]
     logger.info("PC computation finished.")
     return pcs
@@ -1090,6 +1427,7 @@ def load_or_build_q_with_cache(
     pcdim: str,
     ids: np.ndarray,
     logger,
+    use_spinner: bool = False,
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
     """
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
@@ -1103,34 +1441,54 @@ def load_or_build_q_with_cache(
         dim = int(pcdim)
         q_path = f"{cache_prefix}.q.{pcdim}.txt"
         if os.path.exists(q_path):
-            logger.info(f"Loading cached Q matrix from {q_path}...")
-            try:
-                q_ids, qmatrix = _read_matrix_with_ids(q_path, logger, "Q")
-            except Exception:
-                qmatrix = np.genfromtxt(q_path, dtype="float32")
-                q_ids = None
-                logger.warning("Q cache has no IDs; assuming genotype order.")
+            src = _basename_only(q_path)
+            with CliStatus(f"Loading Q matrix from {src}...", enabled=bool(use_spinner)) as task:
+                try:
+                    try:
+                        q_ids, qmatrix = _read_matrix_with_ids(q_path, logger, "Q")
+                    except Exception:
+                        qmatrix = np.genfromtxt(q_path, dtype="float32")
+                        q_ids = None
+                        logger.warning("Q cache has no IDs; assuming genotype order.")
+                except Exception:
+                    task.fail(f"Loading Q matrix from {src} ...Failed")
+                    raise
+                task.complete(
+                    f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
+                )
         else:
             if grm is None:
                 raise ValueError(
                     "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
                 )
-            qmatrix = build_pcs_from_grm(grm, dim, logger)
+            qmatrix = build_pcs_from_grm(grm, dim, logger, use_spinner=use_spinner)
             df = pd.DataFrame(np.column_stack([ids.astype(str), qmatrix]))
             df.to_csv(q_path, sep="\t", header=False, index=False)
             q_ids = ids
-            logger.info(f"Cached Q matrix written to {q_path}")
+            _log_file_only(logger, logging.INFO, f"Cached Q matrix written to {q_path}")
     elif pcdim == "0":
-        logger.info("PC dimension set to 0; using empty Q matrix.")
+        _rich_success(
+            logger,
+            "PC dimension set to 0; using empty Q matrix.",
+            use_spinner=use_spinner,
+        )
         qmatrix = np.zeros((n, 0), dtype="float32")
         q_ids = ids
     elif os.path.isfile(pcdim):
-        logger.info(f"Loading Q matrix from {pcdim}...")
-        q_ids, qmatrix = _read_matrix_with_ids(pcdim, logger, "Q")
+        src = _basename_only(pcdim)
+        with CliStatus(f"Loading Q matrix from {src}...", enabled=bool(use_spinner)) as task:
+            try:
+                q_ids, qmatrix = _read_matrix_with_ids(pcdim, logger, "Q")
+            except Exception:
+                task.fail(f"Loading Q matrix from {src} ...Failed")
+                raise
+            task.complete(
+                f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
+            )
     else:
         raise ValueError(f"Unknown Q/PC option: {pcdim}")
 
-    logger.info(f"Q matrix shape: {qmatrix.shape}")
+    _log_info(logger, f"Q matrix shape: {qmatrix.shape}", use_spinner=use_spinner)
     return qmatrix, q_ids
 
 
@@ -1140,6 +1498,7 @@ def _load_covariate_for_streaming(
     sample_ids: np.ndarray,
     chunk_size: int,
     logger,
+    use_spinner: bool = False,
 ) -> tuple[Union[np.ndarray , None], Union[np.ndarray, None]]:
     """
     Backward-compatible wrapper for streaming covariate loading.
@@ -1151,6 +1510,7 @@ def _load_covariate_for_streaming(
         chunk_size=int(chunk_size),
         logger=logger,
         context="streaming",
+        use_spinner=use_spinner,
     )
 
 
@@ -1192,10 +1552,18 @@ def prepare_streaming_context(
         use_spinner=use_spinner,
     )
     n_samples = len(ids)
-    logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
+    _log_info(
+        logger,
+        f"Genotype meta: {n_samples} samples, {n_snps} SNPs.",
+        use_spinner=use_spinner,
+    )
 
     cache_prefix = genotype_cache_prefix(genofile)
-    logger.info(f"Cache prefix (genotype folder): {cache_prefix}")
+    _log_info(
+        logger,
+        f"Cache prefix (genotype folder): {cache_prefix}",
+        use_spinner=use_spinner,
+    )
     need_generate_q = (
         pcdim in np.arange(1, n_samples).astype(str)
         and not os.path.exists(f"{cache_prefix}.q.{pcdim}.txt")
@@ -1216,9 +1584,14 @@ def prepare_streaming_context(
             chunk_size=chunk_size,
             mmap_limit=mmap_limit,
             logger=logger,
+            use_spinner=use_spinner,
         )
     else:
-        logger.info("Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.")
+        _rich_success(
+            logger,
+            "Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.",
+            use_spinner=use_spinner,
+        )
 
     # PCA stream...
     qmatrix, q_ids = load_or_build_q_with_cache(
@@ -1228,6 +1601,7 @@ def prepare_streaming_context(
         pcdim=pcdim,
         ids=ids,
         logger=logger,
+        use_spinner=use_spinner,
     )
 
     cov_all, cov_ids = _load_covariate_for_streaming(
@@ -1236,6 +1610,7 @@ def prepare_streaming_context(
         ids,
         chunk_size,
         logger,
+        use_spinner=use_spinner,
     )
 
     # -----------------------------------------
@@ -1289,7 +1664,13 @@ def prepare_streaming_context(
     if len(common_ids) == 0:
         # Try using IID (second column) for PLINK-style phenotype files
         try:
-            pheno_alt = load_phenotype(phenofile, pheno_cols, logger, id_col=1)
+            pheno_alt = load_phenotype(
+                phenofile,
+                pheno_cols,
+                logger,
+                id_col=1,
+                use_spinner=use_spinner,
+            )
             pheno_ids_alt = pheno_alt.index.astype(str).to_numpy()
             common_alt = set(geno_ids) & set(pheno_ids_alt)
             if grm_ids is not None:
@@ -1754,6 +2135,7 @@ def build_qmatrix_farmcpu(
     chunk_size: int,
     logger,
     sample_ids: Union[np.ndarray, None] = None,
+    use_spinner: bool = False,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
@@ -1773,7 +2155,7 @@ def build_qmatrix_farmcpu(
             else:
                 grm = grm.reshape(n, n)
                 if sample_ids is not None and os.path.exists(id_path):
-                    grm_ids = _read_id_file(id_path, logger, "GRM")
+                    grm_ids = _read_id_file(id_path, logger, "GRM", use_spinner=use_spinner)
                     if grm_ids is None or len(grm_ids) != n:
                         logger.warning("GRM cache IDs are invalid; rebuilding GRM cache.")
                     else:
@@ -1861,6 +2243,7 @@ def build_qmatrix_farmcpu(
             chunk_size=int(chunk_size),
             logger=logger,
             context="FarmCPU",
+            use_spinner=use_spinner,
         )
         if cov_arr is not None:
             if cov_ids is None:
@@ -1970,6 +2353,7 @@ def run_farmcpu_fullmem(
         chunk_size=args.chunksize,
         logger=logger,
         sample_ids=famid.astype(str),
+        use_spinner=use_spinner,
     )
 
     trait_names = list(pheno.columns)

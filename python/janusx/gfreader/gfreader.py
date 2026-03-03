@@ -111,6 +111,29 @@ def _ensure_plink_cache(prefix: str, vcf_path: str):
         )
 
 
+def _remove_plink_cache_files(cache_prefix: str) -> None:
+    for ext in ("bed", "bim", "fam"):
+        path = f"{cache_prefix}.{ext}"
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _is_likely_broken_plink_cache_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    keys = (
+        "malformed bim line",
+        "malformed fam line",
+        "cached bim row count mismatch",
+        "bim row count mismatch",
+        "invalid bed",
+        "bed magic",
+        "not enough bytes",
+        "unexpected eof",
+        "truncated",
+    )
+    return any(k in msg for k in keys)
+
+
 def calc_mmap_window_mb(
     n_samples: int,
     n_snps: int,
@@ -388,22 +411,43 @@ def load_genotype_chunks(
             raise ValueError("VCF source path not found.")
         _ensure_plink_cache(prefix, src_path)
         cache_prefix = _cache_prefix(prefix)
-        yield from bed_chunk_reader(
-            cache_prefix,
-            chunk_size=chunk_size,
-            maf=maf,
-            missing_rate=missing_rate,
-            impute=impute,
-            model=model,
-            het=het,
-            snp_range=snp_range,
-            snp_indices=snp_indices,
-            bim_range=bim_range,
-            snp_sites=snp_sites,
-            sample_ids=sample_ids,
-            sample_indices=sample_indices,
-            mmap_window_mb=mmap_window_mb,
-        )
+
+        def _iter_cached_bed():
+            yield from bed_chunk_reader(
+                cache_prefix,
+                chunk_size=chunk_size,
+                maf=maf,
+                missing_rate=missing_rate,
+                impute=impute,
+                model=model,
+                het=het,
+                snp_range=snp_range,
+                snp_indices=snp_indices,
+                bim_range=bim_range,
+                snp_sites=snp_sites,
+                sample_ids=sample_ids,
+                sample_indices=sample_indices,
+                mmap_window_mb=mmap_window_mb,
+            )
+
+        try:
+            yield from _iter_cached_bed()
+        except Exception as ex:
+            # If a prior run was interrupted, cache files may exist but be incomplete.
+            # Rebuild once and retry transparently.
+            if not _is_likely_broken_plink_cache_error(ex):
+                raise
+            warnings.warn(
+                (
+                    f"Detected broken PLINK cache for '{prefix}': {ex}. "
+                    "Removing cache files and rebuilding."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _remove_plink_cache_files(cache_prefix)
+            _ensure_plink_cache(prefix, src_path)
+            yield from _iter_cached_bed()
         return
 
     if kind == "plink":
@@ -495,8 +539,24 @@ def inspect_genotype_file(
             raise ValueError("VCF source path not found.")
         _ensure_plink_cache(prefix, src_path)
         cache_prefix = _cache_prefix(prefix)
-        reader = BedChunkReader(cache_prefix, 0.0, 1.0)
-        return reader.sample_ids, reader.n_snps
+        try:
+            reader = BedChunkReader(cache_prefix, 0.0, 1.0)
+            return reader.sample_ids, reader.n_snps
+        except Exception as ex:
+            if not _is_likely_broken_plink_cache_error(ex):
+                raise
+            warnings.warn(
+                (
+                    f"Detected broken PLINK cache for '{prefix}': {ex}. "
+                    "Removing cache files and rebuilding."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _remove_plink_cache_files(cache_prefix)
+            _ensure_plink_cache(prefix, src_path)
+            reader = BedChunkReader(cache_prefix, 0.0, 1.0)
+            return reader.sample_ids, reader.n_snps
 
     if kind in ("txt", "npy"):
         txt_input = src_path if src_path is not None else prefix

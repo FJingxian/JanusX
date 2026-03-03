@@ -1,6 +1,5 @@
 import subprocess
 import time
-import re
 import sys
 from pathlib import Path
 from typing import List, Literal, Optional, Union, Sequence, Any
@@ -26,7 +25,14 @@ except Exception:
     _HAS_CLI_STATUS = False
 
 try:
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
 
     _HAS_RICH_PROGRESS = True
 except Exception:
@@ -34,11 +40,9 @@ except Exception:
     SpinnerColumn = None  # type: ignore[assignment]
     BarColumn = None  # type: ignore[assignment]
     TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    TimeRemainingColumn = None  # type: ignore[assignment]
     _HAS_RICH_PROGRESS = False
-
-_CSUB_SUBMIT_LINE_RE = re.compile(
-    r"^Job\s+\d+\s+has\s+been\s+submitted\s+to\s+the\s+queue\s+\[[^\]]+\]\.?$"
-)
 
 
 def _step_label(step_idx: int, total_steps: int, step_names: Optional[List[str]]) -> str:
@@ -58,7 +62,7 @@ def _format_step_done(step_text: str, tstart: float) -> str:
         elapsed = f"{max(0.0, time.time() - tstart):.1f}s"
     else:
         elapsed = format_elapsed(time.time() - tstart)
-    return f"{step_text} ...Step-Finished [{elapsed}]"
+    return f"{step_text} ...Finished [{elapsed}]"
 
 
 def _normalize_step_items(
@@ -98,22 +102,14 @@ def _run_step_script(sh: Path, scheduler: str) -> None:
         text=True,
         check=False,
     )
-    output = proc.stdout or ""
-    kept_lines: List[str] = []
-    for line in output.splitlines():
-        s = line.strip()
-        if len(s) == 0:
-            continue
-        if _CSUB_SUBMIT_LINE_RE.match(s):
-            continue
-        kept_lines.append(line)
-    if len(kept_lines) > 0:
-        print("\n".join(kept_lines), flush=True)
     if proc.returncode != 0:
+        output = proc.stdout or ""
+        if len(output.strip()) > 0:
+            print(output, flush=True)
         raise subprocess.CalledProcessError(
             returncode=int(proc.returncode),
             cmd=["bash", str(sh)],
-            output=output,
+            output=proc.stdout,
         )
 
 
@@ -122,80 +118,70 @@ def _wait_outputs_with_rich_subtasks(
     step_text: str,
     items: List[dict[str, Any]],
     poll_sec: float = 2.0,
-    max_visible: int = 5,
 ) -> None:
+    total = len(items)
+    if total == 0:
+        return
+
     if not (_HAS_RICH_PROGRESS and _HAS_CLI_STATUS and sys.stdout.isatty()):
-        while not _all_exists([p for it in items for p in it["outputs"]]):
+        done = 0
+        while done < total:
+            done = sum(
+                1 for it in items
+                if _all_exists(list(it.get("outputs", [])))
+            )
+            if done >= total:
+                break
+            print(
+                f"\r{step_text} [{done}/{total}]",
+                end="",
+                flush=True,
+            )
             time.sleep(max(0.5, poll_sec))
+        if done < total:
+            done = total
+        print(f"\r{step_text} [{done}/{total}]")
         return
 
     assert Progress is not None
     assert SpinnerColumn is not None
     assert BarColumn is not None
     assert TextColumn is not None
+    assert TimeElapsedColumn is not None
+    assert TimeRemainingColumn is not None
 
-    total = len(items)
-    if total == 0:
-        return
-
-    done: set[int] = set()
-    for i, item in enumerate(items):
-        outputs = list(item.get("outputs", []))
-        if _all_exists(outputs):
-            done.add(i)
-
-    task_map: dict[int, int] = {}
+    done_count = sum(
+        1 for it in items
+        if _all_exists(list(it.get("outputs", [])))
+    )
     progress = Progress(
         SpinnerColumn(
             spinner_name=get_rich_spinner_name(),
             style="cyan",
             finished_text=" ",
         ),
-        TextColumn("{task.fields[idx]} {task.fields[name]}"),
+        TextColumn("[green]{task.description}"),
         BarColumn(),
-        TextColumn("{task.percentage:>6.1f}%"),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
         transient=True,
     )
 
-    def _add_visible() -> None:
-        for i, item in enumerate(items):
-            if len(task_map) >= int(max_visible):
-                break
-            if i in done or i in task_map:
-                continue
-            task_id = progress.add_task(
-                description="",
-                total=1,
-                completed=0,
-                idx=f"[{i+1}/{total}]",
-                name=str(item.get("id", f"item-{i+1}")),
-            )
-            task_map[i] = task_id
-
     with progress:
-        _add_visible()
-        while len(done) < total:
-            advanced = False
-            for i, item in enumerate(items):
-                if i in done:
-                    continue
-                outputs = list(item.get("outputs", []))
-                if not _all_exists(outputs):
-                    continue
-                done.add(i)
-                task_id = task_map.pop(i, None)
-                if task_id is not None:
-                    progress.update(task_id, completed=1)
-                    try:
-                        progress.remove_task(task_id)
-                    except Exception:
-                        pass
-                advanced = True
-            _add_visible()
-            if len(done) >= total:
+        task_id = progress.add_task(step_text, total=total, completed=done_count)
+        while done_count < total:
+            new_done = sum(
+                1 for it in items
+                if _all_exists(list(it.get("outputs", [])))
+            )
+            if new_done > done_count:
+                done_count = new_done
+                progress.update(task_id, completed=done_count)
+            if done_count >= total:
                 break
-            if not advanced:
-                time.sleep(max(0.5, poll_sec))
+            time.sleep(max(0.5, poll_sec))
+        progress.update(task_id, completed=total)
 
 
 def wrap_cmd(
@@ -290,7 +276,6 @@ def pipeline(
                         step_text=step_text,
                         items=items,
                         poll_sec=2.0,
-                        max_visible=5,
                     )
                 else:
                     with CliStatus(step_text, enabled=True, show_elapsed=True):

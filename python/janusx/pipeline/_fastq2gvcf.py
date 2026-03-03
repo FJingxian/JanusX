@@ -585,10 +585,24 @@ def snpvcf_to_gt_and_missing(
         f"-x FORMAT,^FORMAT/GT -Oz -o {_q(out_gt)}"
     )
     index_cmd = f"{prefix}tabix -f -p vcf {_q(out_gt)}"
-    miss_cmd = (
+    plink_missing_cmd = (
         f"{prefix}plink --vcf {_q(out_gt)} --allow-extra-chr --double-id "
         f"--set-missing-var-ids @:# --threads {int(core)} --missing "
         f"--out {_q(miss_prefix)}"
+    )
+    write_empty_miss_cmd = (
+        f"printf 'CHR\\tSNP\\tN_MISS\\tN_GENO\\tF_MISS\\n' > {_q(out_lmiss)} && "
+        f"printf 'FID\\tIID\\tMISS_PHENO\\tN_MISS\\tN_GENO\\tF_MISS\\n' > {_q(out_imiss)}"
+    )
+    # Some chromosomes/contigs have zero SNPs after filtering; PLINK exits
+    # non-zero on empty VCF. Detect empties and emit header-only .lmiss/.imiss.
+    miss_cmd = (
+        f"NVAR=$({prefix}bcftools index -n {_q(out_gt)}) && "
+        f"if [ \"${{NVAR:-0}}\" -gt 0 ]; then "
+        f"{plink_missing_cmd}; "
+        f"else "
+        f"{write_empty_miss_cmd}; "
+        f"fi"
     )
     return f"{setgt_cmd} | {keep_gt_cmd} && {index_cmd} && {miss_cmd}"
 
@@ -625,7 +639,17 @@ def beagle_impute(
         f"{prefix}beagle gt={_q(in_gt)} out={_q(out_prefix)} nthreads={int(core)}"
     )
     index_cmd = f"{prefix}tabix -f -p vcf {_q(out_imp)}"
-    return f"{beagle_cmd} && {index_cmd}"
+    copy_empty_cmd = (
+        f"{prefix}bcftools view -Oz -o {_q(out_imp)} {_q(in_gt)} && {index_cmd}"
+    )
+    return (
+        f"NVAR=$({prefix}bcftools index -n {_q(in_gt)}) && "
+        f"if [ \"${{NVAR:-0}}\" -gt 0 ]; then "
+        f"{beagle_cmd} && {index_cmd}; "
+        f"else "
+        f"{copy_empty_cmd}; "
+        f"fi"
+    )
 
 
 def filter_imputed_by_maf_and_missing(
@@ -696,7 +720,17 @@ def filter_imputed_by_maf_and_missing(
         f"-Oz -o {_q(out_vcf)} {_q(in_imp)}"
     )
     index_cmd = f"{prefix}tabix -f -p vcf {_q(out_vcf)}"
-    return f"{build_sample_keep} && {build_site_keep} && {filter_cmd} && {index_cmd}"
+    copy_empty_cmd = (
+        f"{prefix}bcftools view -Oz -o {_q(out_vcf)} {_q(in_imp)} && {index_cmd}"
+    )
+    return (
+        f"NVAR=$({prefix}bcftools index -n {_q(in_imp)}) && "
+        f"if [ \"${{NVAR:-0}}\" -gt 0 ]; then "
+        f"{build_sample_keep} && {build_site_keep} && {filter_cmd} && {index_cmd}; "
+        f"else "
+        f"{copy_empty_cmd}; "
+        f"fi"
+    )
 
 
 def concat_imputed_vcfs(

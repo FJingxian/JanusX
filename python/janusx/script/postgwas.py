@@ -1181,9 +1181,10 @@ def _compute_ld_from_genotypes(geno_sig: np.ndarray) -> np.ndarray:
         return np.ones((1, 1), dtype=np.float32)
     corr = np.corrcoef(geno_sig)
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    corr = np.abs(corr).astype(np.float32)
-    np.fill_diagonal(corr, 1.0)
-    return corr
+    r2 = np.square(corr)
+    r2 = np.nan_to_num(r2, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    np.fill_diagonal(r2, 1.0)
+    return r2
 
 
 def _lead_vs_all_r2(geno_block: np.ndarray) -> np.ndarray:

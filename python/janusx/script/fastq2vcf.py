@@ -78,7 +78,15 @@ except Exception:
 
 READ_RE = re.compile(r"\.(R[12])\.(fastq|fq)(\.gz)?$", re.IGNORECASE)
 FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
-REQUIRED_LOCAL_TOOLS = ("fastp", "bwa", "samtools", "gatk")
+REQUIRED_LOCAL_TOOLS = (
+    "fastp",
+    "bwa",
+    "samtools",
+    "gatk",
+    "bcftools",
+    "plink",
+    "beagle",
+)
 DOCKER_IMAGE_TAG = "janusx-fastq2vcf:latest"
 
 

@@ -1,7 +1,12 @@
 from pathlib import Path
-from typing import List,Union,Literal
+import shlex
+from typing import List, Sequence, Union, Literal
 
 Pathlike = Union[Path,str]
+
+
+def _q(path: Pathlike) -> str:
+    return shlex.quote(str(path))
 
 def _singularity_prefix(singularity: str) -> str:
     singularity = str(singularity or "").strip()
@@ -518,3 +523,203 @@ def vcf2table(reference: Pathlike, chrom: str, out: Pathlike, singularity: str =
             "-F CHROM -F POS -F REF -F ALT "
             "-GF DP -GF AD -GF GQ "
             f"-O {out_tsv}")
+
+
+def snpvcf_to_gt_and_missing(
+    chrom: str,
+    merge_dir: Pathlike,
+    impute_dir: Pathlike,
+    *,
+    min_dp: int = 5,
+    min_gq: int = 20,
+    min_ad: int = 2,
+    core: int = 2,
+    singularity: str = "",
+) -> str:
+    """
+    Prepare per-chromosome GT-only VCF for imputation and compute missingness stats.
+
+    Input:
+      - 4.merge/Merge.{chrom}.SNP.filtered.vcf.gz
+
+    Outputs:
+      - 5.impute/Merge.{chrom}.SNP.GT.vcf.gz (+ .tbi)
+      - 5.impute/Merge.{chrom}.SNP.GT.lmiss
+      - 5.impute/Merge.{chrom}.SNP.GT.imiss
+    """
+    merge_dir = Path(merge_dir)
+    impute_dir = Path(impute_dir)
+    prefix = _singularity_prefix(singularity)
+    impute_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+    in_vcf = merge_dir / f"Merge.{chrom}.SNP.filtered.vcf.gz"
+    out_gt = impute_dir / f"Merge.{chrom}.SNP.GT.vcf.gz"
+    out_tbi = impute_dir / f"Merge.{chrom}.SNP.GT.vcf.gz.tbi"
+    miss_prefix = impute_dir / f"Merge.{chrom}.SNP.GT"
+    out_lmiss = Path(f"{miss_prefix}.lmiss")
+    out_imiss = Path(f"{miss_prefix}.imiss")
+
+    if out_gt.exists() and out_tbi.exists() and out_lmiss.exists() and out_imiss.exists():
+        return f"{prefix}echo '{out_gt} exists'"
+
+    filter_expr = (
+        f"FMT/DP<{int(min_dp)} || FMT/GQ<{int(min_gq)} || FMT/AD[1]<{int(min_ad)}"
+    )
+    setgt_cmd = (
+        f"{prefix}bcftools +setGT {_q(in_vcf)} -- "
+        f"-t q -n . -i '{filter_expr}'"
+    )
+    keep_gt_cmd = (
+        f"{prefix}bcftools annotate --threads {int(core)} "
+        f"-x FORMAT,^FORMAT/GT -Oz -o {_q(out_gt)}"
+    )
+    index_cmd = f"{prefix}tabix -f -p vcf {_q(out_gt)}"
+    miss_cmd = (
+        f"{prefix}plink --vcf {_q(out_gt)} --allow-extra-chr --double-id "
+        f"--set-missing-var-ids @:# --threads {int(core)} --missing "
+        f"--out {_q(miss_prefix)}"
+    )
+    return f"{setgt_cmd} | {keep_gt_cmd} && {index_cmd} && {miss_cmd}"
+
+
+def beagle_impute(
+    chrom: str,
+    impute_dir: Pathlike,
+    *,
+    core: int = 2,
+    singularity: str = "",
+) -> str:
+    """
+    Run BEAGLE imputation on per-chromosome GT VCF.
+
+    Input:
+      - 5.impute/Merge.{chrom}.SNP.GT.vcf.gz
+
+    Output:
+      - 5.impute/Merge.{chrom}.SNP.GT.imp.vcf.gz (+ .tbi)
+    """
+    impute_dir = Path(impute_dir)
+    prefix = _singularity_prefix(singularity)
+    impute_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+    in_gt = impute_dir / f"Merge.{chrom}.SNP.GT.vcf.gz"
+    out_prefix = impute_dir / f"Merge.{chrom}.SNP.GT.imp"
+    out_imp = impute_dir / f"Merge.{chrom}.SNP.GT.imp.vcf.gz"
+    out_tbi = impute_dir / f"Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"
+
+    if out_imp.exists() and out_tbi.exists():
+        return f"{prefix}echo '{out_imp} exists'"
+
+    beagle_cmd = (
+        f"{prefix}beagle gt={_q(in_gt)} out={_q(out_prefix)} nthreads={int(core)}"
+    )
+    index_cmd = f"{prefix}tabix -f -p vcf {_q(out_imp)}"
+    return f"{beagle_cmd} && {index_cmd}"
+
+
+def filter_imputed_by_maf_and_missing(
+    chrom: str,
+    chroms: Sequence[str],
+    impute_dir: Pathlike,
+    *,
+    maf: float = 0.02,
+    max_missing: float = 0.2,
+    core: int = 2,
+    singularity: str = "",
+) -> str:
+    """
+    Filter imputed VCF by MAF and pre-imputation missingness constraints.
+
+    Rules:
+      1) Keep SNPs with pre-imputation site missingness <= max_missing (per chrom).
+      2) Keep samples with pre-imputation global missingness <= max_missing
+         (aggregated across all chromosomes).
+      3) Keep variants with MAF >= maf.
+
+    Input:
+      - 5.impute/Merge.{chrom}.SNP.GT.imp.vcf.gz
+      - 5.impute/Merge.{chrom}.SNP.GT.lmiss
+      - 5.impute/Merge.{chrom}.SNP.GT.imiss (all chroms for global sample filtering)
+
+    Output:
+      - 5.impute/Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz (+ .tbi)
+    """
+    impute_dir = Path(impute_dir)
+    prefix = _singularity_prefix(singularity)
+    impute_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+    in_imp = impute_dir / f"Merge.{chrom}.SNP.GT.imp.vcf.gz"
+    out_vcf = impute_dir / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
+    out_tbi = impute_dir / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
+    site_lmiss = impute_dir / f"Merge.{chrom}.SNP.GT.lmiss"
+    site_keep = impute_dir / f"Merge.{chrom}.preimpute.site.keep.txt"
+    sample_keep = impute_dir / "Merge.preimpute.sample.keep.txt"
+    sample_tmp = Path(f"{sample_keep}.tmp")
+    sample_lock = Path(f"{sample_keep}.lock")
+
+    if out_vcf.exists() and out_tbi.exists():
+        return f"{prefix}echo '{out_vcf} exists'"
+
+    all_imiss = [impute_dir / f"Merge.{c}.SNP.GT.imiss" for c in chroms]
+    all_imiss_txt = " ".join(_q(p) for p in all_imiss)
+    build_sample_keep = (
+        f"if [ ! -s {_q(sample_keep)} ]; then "
+        f"if mkdir {_q(sample_lock)} 2>/dev/null; then "
+        f"awk 'NR==1{{next}} {{id=$2; miss[id]+=$4; geno[id]+=$5}} "
+        f"END{{for (id in miss) if (geno[id]>0 && miss[id]/geno[id]<={float(max_missing)}) print id}}' "
+        f"{all_imiss_txt} | sort > {_q(sample_tmp)} && mv {_q(sample_tmp)} {_q(sample_keep)}; "
+        f"rmdir {_q(sample_lock)}; "
+        f"else "
+        f"while [ -d {_q(sample_lock)} ]; do sleep 1; done; "
+        f"fi; "
+        f"fi"
+    )
+    build_site_keep = (
+        f"awk 'NR>1 && $5<={float(max_missing)} {{n=split($2,a,\":\"); "
+        f"if (n>=2) print a[1]\"\\t\"a[2]}}' "
+        f"{_q(site_lmiss)} > {_q(site_keep)}"
+    )
+    filter_cmd = (
+        f"{prefix}bcftools view --threads {int(core)} "
+        f"-S {_q(sample_keep)} -T {_q(site_keep)} -i 'MAF>={float(maf)}' "
+        f"-Oz -o {_q(out_vcf)} {_q(in_imp)}"
+    )
+    index_cmd = f"{prefix}tabix -f -p vcf {_q(out_vcf)}"
+    return f"{build_sample_keep} && {build_site_keep} && {filter_cmd} && {index_cmd}"
+
+
+def concat_imputed_vcfs(
+    chroms: Sequence[str],
+    impute_dir: Pathlike,
+    genotype_dir: Pathlike,
+    *,
+    core: int = 2,
+    singularity: str = "",
+) -> str:
+    """
+    Concatenate all per-chromosome filtered imputed VCFs into one merged VCF.
+
+    Input:
+      - 5.impute/Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz
+
+    Output:
+      - 6.genotype/Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz (+ .tbi)
+    """
+    impute_dir = Path(impute_dir)
+    genotype_dir = Path(genotype_dir)
+    prefix = _singularity_prefix(singularity)
+    genotype_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+    out_vcf = genotype_dir / "Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
+    out_tbi = genotype_dir / "Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
+    if out_vcf.exists() and out_tbi.exists():
+        return f"{prefix}echo '{out_vcf} exists'"
+
+    inputs = [
+        impute_dir / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
+        for chrom in chroms
+    ]
+    inputs_txt = " ".join(_q(p) for p in inputs)
+    concat_cmd = f"{prefix}bcftools concat --threads {int(core)} -Oz -o {_q(out_vcf)} {inputs_txt}"
+    index_cmd = f"{prefix}tabix -f -p vcf {_q(out_vcf)}"
+    return f"{concat_cmd} && {index_cmd}"

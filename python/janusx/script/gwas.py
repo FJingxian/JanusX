@@ -197,6 +197,10 @@ class _ProgressAdapter:
         self._tqdm = None
         self._start_ts = time.monotonic()
         self._finished = False
+        self._done = 0
+        self._tick = 0
+        self._memory_text = ""
+        self._memory_until_tick = 0
 
         if _HAS_RICH_PROGRESS and sys.stdout.isatty():
             try:
@@ -208,17 +212,16 @@ class _ProgressAdapter:
                     ),
                     TextColumn("[green]{task.description}"),
                     BarColumn(),
-                    TextColumn("{task.percentage:>6.1f}%"),
+                    TextColumn("{task.fields[metric]}"),
                     TimeElapsedColumn(),
                     TimeRemainingColumn(),
-                    TextColumn("{task.fields[postfix]}"),
                     transient=True,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(
                     self.desc,
                     total=self.total,
-                    postfix="",
+                    metric="0.0%",
                 )
                 self._backend = "rich"
             except Exception:
@@ -236,23 +239,47 @@ class _ProgressAdapter:
             )
             self._backend = "tqdm"
 
+    def _metric_text(self) -> str:
+        if self._memory_text and self._tick <= self._memory_until_tick:
+            return self._memory_text
+        if self.total <= 0:
+            pct = 0.0
+        else:
+            pct = 100.0 * float(self._done) / float(self.total)
+        return f"{pct:>6.1f}%"
+
     def update(self, n: int) -> None:
         step = int(max(0, n))
         if step == 0:
             return
+        self._done += step
+        self._tick += 1
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, advance=step)
+            self._progress.update(
+                self._task_id,
+                advance=step,
+                metric=self._metric_text(),
+            )
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.update(step)
+            self._tqdm.set_postfix_str(self._metric_text())
 
     def set_postfix(self, **kwargs: object) -> None:
         if len(kwargs) == 0:
             return
+        if len(kwargs) == 1 and "memory" in kwargs:
+            self._memory_text = str(kwargs["memory"]).replace(" ", "")
+            self._memory_until_tick = self._tick + 5
+            if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+                self._progress.update(self._task_id, metric=self._metric_text())
+            elif self._backend == "tqdm" and self._tqdm is not None:
+                self._tqdm.set_postfix_str(self._metric_text())
+            return
+        text = " ".join([f"{k} ~ {v}" for k, v in kwargs.items()])
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            text = " ".join([f"{k}={v}" for k, v in kwargs.items()])
-            self._progress.update(self._task_id, postfix=text)
+            self._progress.update(self._task_id, metric=text)
         elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.set_postfix(kwargs)
+            self._tqdm.set_postfix_str(text)
 
     def finish(self) -> None:
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
@@ -1247,7 +1274,7 @@ def build_grm_streaming(
 
         if eff_m % (10 * chunk_size) == 0:
             mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f} GB")
+            pbar.set_postfix(memory=f"{mem:.2f}GB")
 
     # force bar to 100% even if SNPs were filtered in Rust
     pbar.finish()
@@ -1760,6 +1787,7 @@ def run_chunked_gwas_lmm_lm(
     plot: bool,
     threads: int,
     logger:logging.Logger,
+    use_spinner: bool = False,
 ) -> None:
     """
     Run LMM or LM GWAS using a streaming, low-memory pipeline.
@@ -1860,10 +1888,17 @@ def run_chunked_gwas_lmm_lm(
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
             Ksub = grm[np.ix_(sameidx, sameidx)]
-            mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+            evd_t0 = time.monotonic()
+            with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
+                mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+            evd_elapsed = format_elapsed(time.monotonic() - evd_t0)
             logger.info(
                 f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}, PVE(null): {mod.pve:.3f}"
             )
+            if use_spinner:
+                print_success(f"Eigen-Decomposition ...Finished [{evd_elapsed}]")
+            else:
+                logger.info(f"Eigen-Decomposition ...Finished [{evd_elapsed}]")
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             logger.info(f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}")
@@ -1953,7 +1988,7 @@ def run_chunked_gwas_lmm_lm(
                 peak_rss = max(peak_rss, mem_info.rss)
                 if done_snps % (10 * chunk_size) == 0:
                     mem_gb = mem_info.rss / 1024**3
-                    pbar.set_postfix(memory=f"{mem_gb:.2f} GB")
+                    pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
                 next_write_seq += 1
 
         def _drain_completed(*, wait_for_one: bool) -> None:
@@ -2047,7 +2082,6 @@ def run_chunked_gwas_lmm_lm(
         pbar.close()
 
         cpu_t1 = process.cpu_times()
-        rss1 = process.memory_info().rss
         t1 = time.time()
 
         wall = t1 - t0
@@ -2056,15 +2090,12 @@ def run_chunked_gwas_lmm_lm(
         total_cpu = user_cpu + sys_cpu
 
         avg_cpu_pct = 100.0 * total_cpu / wall / (n_cores or 1) if wall > 0 else 0.0
-        avg_rss_gb = (rss0 + rss1) / 2 / 1024**3
         peak_rss_gb = peak_rss / 1024**3
 
         logger.info(
             f"Effective SNP: {done_snps} | "
             f"Resource usage for {model_label} / {pname}: \n"
-            f"wall={wall:.2f} s, "
-            f"avg CPU={avg_cpu_pct:.1f}% of {n_cores} cores, "
-            f"avg RSS={avg_rss_gb:.2f} GB, "
+            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} cores, "
             f"peak RSS ~ {peak_rss_gb:.2f} GB\n"
         )
 
@@ -2677,6 +2708,7 @@ def main(log: bool = True):
                 plot=args.plot,
                 threads=args.thread,
                 logger=logger,
+                use_spinner=use_spinner,
             )
 
         # --- run streaming LM ---
@@ -2702,6 +2734,7 @@ def main(log: bool = True):
                 plot=args.plot,
                 threads=args.thread,
                 logger=logger,
+                use_spinner=use_spinner,
             )
 
         if args.lm:
@@ -2726,6 +2759,7 @@ def main(log: bool = True):
                 plot=args.plot,
                 threads=args.thread,
                 logger=logger,
+                use_spinner=use_spinner,
             )
 
         # --- run FarmCPU (full memory) ---

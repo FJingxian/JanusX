@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from janusx.pipeline.pipeline import pipeline,wrap_cmd
 from janusx.pipeline._fastq2gvcf import (
     filtersnp, gvcf2vcf, fastp, bwamem, markdup, bam2gvcf, cgvcf,
-    selectfiltersnp, vcf2snpvcf, vcf2table,indexREF
+    selectfiltersnp, vcf2snpvcf, vcf2table, indexREF,
+    snpvcf_to_gt_and_missing, beagle_impute,
+    filter_imputed_by_maf_and_missing, concat_imputed_vcfs,
 )
 
 PathLike = Union[Path, str]
@@ -291,6 +293,8 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
           - 2.mapping/ : sorted BAMs, markdup BAMs, metrics
           - 3.gvcf/    : per-sample per-chrom gVCFs and indexes
           - 4.merge/   : joint-called per-chrom merged gVCFs/VCFs and SNP tables
+          - 5.impute/  : per-chrom GT-VCF, missing stats, imputed and filtered VCFs
+          - 6.genotype/: final merged imputed-filtered VCF
 
     backbend : {"nohup", "csub"}, default="csub"
         Execution backend passed to `wrap_cmd()` and `pipeline()`.
@@ -328,6 +332,13 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
           Merge.{chrom}.g.vcf.gz.tbi
           Merge.{chrom}.vcf.gz / related outputs (depending on helper functions)
           Merge.{chrom}.SNP.tsv
+      - 5.impute/
+          Merge.{chrom}.SNP.GT.vcf.gz
+          Merge.{chrom}.SNP.GT.lmiss / .imiss
+          Merge.{chrom}.SNP.GT.imp.vcf.gz
+          Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz
+      - 6.genotype/
+          Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz
 
     Pipeline Steps
     --------------
@@ -355,6 +366,22 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
        - Converts merged gVCF → VCF, extracts SNPs, applies filters, selects filtered SNPs,
          and exports per-chromosome SNP table.
 
+    7) GT extraction + genotype-level QC + missing stats (per-chrom)
+       - Input: Merge.{chrom}.SNP.filtered.vcf.gz
+       - Output: Merge.{chrom}.SNP.GT.vcf.gz and per-chrom .lmiss/.imiss
+
+    8) Beagle imputation (per-chrom)
+       - Input: Merge.{chrom}.SNP.GT.vcf.gz
+       - Output: Merge.{chrom}.SNP.GT.imp.vcf.gz
+
+    9) Post-imputation filtering (per-chrom)
+       - MAF>=0.02, remove SNPs with pre-imputation F_MISS>0.2, and
+         remove samples with global pre-imputation F_MISS>0.2.
+       - Output: Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz
+
+    10) Merge per-chrom filtered VCFs
+        - Output: 6.genotype/Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz
+
     Notes
     -----
     - This function expects all helper command builders (`fastp`, `bwamem`, `markdup`, `bam2gvcf`,
@@ -377,12 +404,16 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     mappingfolder = workdir / '2.mapping'
     gvcffolder = workdir / '3.gvcf'
     mergefolder = workdir / '4.merge'
+    imputefolder = workdir / '5.impute'
+    genotypefolder = workdir / '6.genotype'
     state_path = workdir / ".work.json"
 
     cleanfolder.mkdir(0o755, exist_ok=True)
     mappingfolder.mkdir(0o755, exist_ok=True)
     gvcffolder.mkdir(0o755, exist_ok=True)
     mergefolder.mkdir(0o755, exist_ok=True)
+    imputefolder.mkdir(0o755, exist_ok=True)
+    genotypefolder.mkdir(0o755, exist_ok=True)
 
     reference = Path(metadata["reference"])
     samples_fq: Dict[str, Dict[str, Any]] = metadata["samples"]
@@ -572,7 +603,10 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     step6_items: list[dict] = []
     for chrom in CHROM:
         item_id = f"gvcf2vcf.{chrom}"
-        item_outputs = [mergefolder / f"Merge.{chrom}.SNP.tsv"]
+        out_snp_f = mergefolder / f"Merge.{chrom}.SNP.filtered.vcf.gz"
+        out_snp_f_tbi = mergefolder / f"Merge.{chrom}.SNP.filtered.vcf.gz.tbi"
+        out_snp_tsv = mergefolder / f"Merge.{chrom}.SNP.tsv"
+        item_outputs = [out_snp_f, out_snp_f_tbi, out_snp_tsv]
         cmd6 = " && ".join([
             gvcf2vcf(reference, chrom, mergefolder, 1, 50, singularity=singularity),
             vcf2snpvcf(reference, chrom, mergefolder, singularity=singularity),
@@ -598,7 +632,190 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         )
     step6 = "\n".join(step6_lines)
 
-    step6out = [mergefolder / f"Merge.{chrom}.SNP.tsv" for chrom in CHROM]
+    step6out = list(itertools.chain.from_iterable(
+        [
+            [
+                mergefolder / f"Merge.{chrom}.SNP.filtered.vcf.gz",
+                mergefolder / f"Merge.{chrom}.SNP.filtered.vcf.gz.tbi",
+                mergefolder / f"Merge.{chrom}.SNP.tsv",
+            ]
+            for chrom in CHROM
+        ]
+    ))
+    step7in = [mergefolder / f"Merge.{chrom}.SNP.filtered.vcf.gz" for chrom in CHROM]
+
+    # -------- step7: per-chrom genotype QC + GT extraction + missing stats -------- 40 mins
+    step7_lines = []
+    step7_items: list[dict] = []
+    for chrom in CHROM:
+        out_gt = imputefolder / f"Merge.{chrom}.SNP.GT.vcf.gz"
+        out_gt_tbi = imputefolder / f"Merge.{chrom}.SNP.GT.vcf.gz.tbi"
+        out_lmiss = imputefolder / f"Merge.{chrom}.SNP.GT.lmiss"
+        out_imiss = imputefolder / f"Merge.{chrom}.SNP.GT.imiss"
+        item_id = f"gtprep.{chrom}"
+        item_outputs = [out_gt, out_gt_tbi, out_lmiss, out_imiss]
+        cmd7 = snpvcf_to_gt_and_missing(
+            chrom,
+            mergefolder,
+            imputefolder,
+            min_dp=5,
+            min_gq=20,
+            min_ad=2,
+            core=2,
+            singularity=singularity,
+        )
+        cmd7 = _append_state_update_hook(
+            cmd7,
+            state_path,
+            "step7_gtprep",
+            item_id,
+            item_outputs,
+        )
+        step7_lines.append(
+            wrap_cmd(cmd7, f"gtprep.{chrom}", 2, scheduler)
+        )
+        step7_items.append(
+            {
+                "id": item_id,
+                "outputs": item_outputs,
+            }
+        )
+    step7 = "\n".join(step7_lines)
+    step7out = list(itertools.chain.from_iterable(
+        [
+            [
+                imputefolder / f"Merge.{chrom}.SNP.GT.vcf.gz",
+                imputefolder / f"Merge.{chrom}.SNP.GT.vcf.gz.tbi",
+                imputefolder / f"Merge.{chrom}.SNP.GT.lmiss",
+                imputefolder / f"Merge.{chrom}.SNP.GT.imiss",
+            ]
+            for chrom in CHROM
+        ]
+    ))
+
+    # -------- step8: beagle imputation per chrom -------- 120 mins
+    step8_lines = []
+    step8_items: list[dict] = []
+    for chrom in CHROM:
+        out_imp = imputefolder / f"Merge.{chrom}.SNP.GT.imp.vcf.gz"
+        out_imp_tbi = imputefolder / f"Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"
+        item_id = f"beagle.{chrom}"
+        item_outputs = [out_imp, out_imp_tbi]
+        cmd8 = beagle_impute(
+            chrom,
+            imputefolder,
+            core=2,
+            singularity=singularity,
+        )
+        cmd8 = _append_state_update_hook(
+            cmd8,
+            state_path,
+            "step8_impute",
+            item_id,
+            item_outputs,
+        )
+        step8_lines.append(
+            wrap_cmd(cmd8, f"beagle.{chrom}", 2, scheduler)
+        )
+        step8_items.append(
+            {
+                "id": item_id,
+                "outputs": item_outputs,
+            }
+        )
+    step8 = "\n".join(step8_lines)
+    step8out = list(itertools.chain.from_iterable(
+        [
+            [
+                imputefolder / f"Merge.{chrom}.SNP.GT.imp.vcf.gz",
+                imputefolder / f"Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi",
+            ]
+            for chrom in CHROM
+        ]
+    ))
+
+    # -------- step9: per-chrom MAF/missing filtering -------- 24 mins
+    step9_lines = []
+    step9_items: list[dict] = []
+    for chrom in CHROM:
+        out_f = imputefolder / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
+        out_f_tbi = imputefolder / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
+        item_id = f"impfilter.{chrom}"
+        item_outputs = [out_f, out_f_tbi]
+        cmd9 = filter_imputed_by_maf_and_missing(
+            chrom,
+            CHROM,
+            imputefolder,
+            maf=0.02,
+            max_missing=0.2,
+            core=2,
+            singularity=singularity,
+        )
+        cmd9 = _append_state_update_hook(
+            cmd9,
+            state_path,
+            "step9_impfilter",
+            item_id,
+            item_outputs,
+        )
+        step9_lines.append(
+            wrap_cmd(cmd9, f"impfilter.{chrom}", 2, scheduler)
+        )
+        step9_items.append(
+            {
+                "id": item_id,
+                "outputs": item_outputs,
+            }
+        )
+    step9 = "\n".join(step9_lines)
+    step9in = (
+        step8out
+        + [imputefolder / f"Merge.{chrom}.SNP.GT.lmiss" for chrom in CHROM]
+        + [imputefolder / f"Merge.{chrom}.SNP.GT.imiss" for chrom in CHROM]
+    )
+    step9out = list(itertools.chain.from_iterable(
+        [
+            [
+                imputefolder / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz",
+                imputefolder / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi",
+            ]
+            for chrom in CHROM
+        ]
+    ))
+    step10in = [imputefolder / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz" for chrom in CHROM]
+
+    # -------- step10: merge filtered imputed vcf -------- 8 mins
+    step10_lines = []
+    step10_items: list[dict] = []
+    item_id = "mergevcf.all"
+    out_merge_vcf = genotypefolder / "Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
+    out_merge_tbi = genotypefolder / "Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
+    item_outputs = [out_merge_vcf, out_merge_tbi]
+    cmd10 = concat_imputed_vcfs(
+        CHROM,
+        imputefolder,
+        genotypefolder,
+        core=2,
+        singularity=singularity,
+    )
+    cmd10 = _append_state_update_hook(
+        cmd10,
+        state_path,
+        "step10_mergevcf",
+        item_id,
+        item_outputs,
+    )
+    step10_lines.append(
+        wrap_cmd(cmd10, "mergevcf.all", 2, scheduler)
+    )
+    step10_items.append(
+        {
+            "id": item_id,
+            "outputs": item_outputs,
+        }
+    )
+    step10 = "\n".join(step10_lines)
+    step10out = [out_merge_vcf, out_merge_tbi]
 
     steps_meta = [
         {"id": "step1_fastp", "name": "fastp", "items": step1_items},
@@ -607,6 +824,10 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         {"id": "step4_bam2gvcf", "name": "bam2gvcf", "items": step4_items},
         {"id": "step5_cgvcf", "name": "cgvcf", "items": step5_items},
         {"id": "step6_gvcf2vcf", "name": "gvcf2vcf", "items": step6_items},
+        {"id": "step7_gtprep", "name": "gtprep", "items": step7_items},
+        {"id": "step8_impute", "name": "impute", "items": step8_items},
+        {"id": "step9_impfilter", "name": "impfilter", "items": step9_items},
+        {"id": "step10_mergevcf", "name": "mergevcf", "items": step10_items},
     ]
     state, resumed = _init_or_resume_work_state(state_path, run_params, steps_meta)
     if resumed:
@@ -614,7 +835,7 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
     summary = state.get("summary", {})
     if int(summary.get("total_items", 0)) > 0 and int(summary.get("done_items", 0)) >= int(summary.get("total_items", 0)):
         print("All FASTQ2VCF tasks already completed (same parameters).")
-        print("Re-checking all 6 steps with rich progress...")
+        print(f"Re-checking all {len(steps_meta)} steps with rich progress...")
 
     try:
         state["status"] = "running"
@@ -622,16 +843,27 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
         _sync_state_from_fs(state, steps_meta)
         _safe_write_json(state_path, state)
         # Estimated durations are fixed hints taken from the step annotations above.
-        step_eta_minutes = [15, 255, 73, 451, 36, 32]
-        step_base_names = ["fastp", "bwamem", "markdup", "bam2gvcf", "cgvcf", "gvcf2vcf"]
+        step_eta_minutes = [15, 255, 73, 451, 36, 32, 40, 120, 24, 8]
+        step_base_names = [
+            "fastp",
+            "bwamem",
+            "markdup",
+            "bam2gvcf",
+            "cgvcf",
+            "gvcf2vcf",
+            "gtprep",
+            "impute",
+            "impfilter",
+            "mergevcf",
+        ]
         step_names = [
             f"{name} ({_format_estimated_duration(mins)})"
             for name, mins in zip(step_base_names, step_eta_minutes)
         ]
         pipeline(
-            [step1, step2, step3, step4, step5, step6],
-            [step1in, step1out, step2out, step3out, step4out, step5out],
-            [step1out, step2out, step3out, step4out, step5out, step6out],
+            [step1, step2, step3, step4, step5, step6, step7, step8, step9, step10],
+            [step1in, step1out, step2out, step3out, step4out, step5out, step7in, step7out, step9in, step10in],
+            [step1out, step2out, step3out, step4out, step5out, step6out, step7out, step8out, step9out, step10out],
             scheduler=scheduler,
             nohup_max_jobs=nohup_max_jobs,
             skip_if_outputs_exist=False,
@@ -645,6 +877,10 @@ def fastq2vcf(metadata:dict=None,workdir:PathLike=".",backbend:Literal["nohup","
                 step4_items,
                 step5_items,
                 step6_items,
+                step7_items,
+                step8_items,
+                step9_items,
+                step10_items,
             ],
         )
     except Exception as e:

@@ -7,7 +7,7 @@ JanusX is a high-performance toolkit for quantitative genetics. It combines Rust
 ## Overview
 
 - Unified CLI entry: `jx`
-- Core GWAS models: `LM`, `LMM`, `fastLMM`, `FarmCPU`
+- Core GWAS models: `LM`, `LMM`, `FarmCPU`
 - Core GS models: `GBLUP`, `rrBLUP`, `BayesA`, `BayesB`, `BayesCpi`
 - Streaming genotype reader for VCF/PLINK/TXT with low-memory workflows
 - Integrated post-analysis tools: `postgwas`, `postbsa`, `postgarfield`

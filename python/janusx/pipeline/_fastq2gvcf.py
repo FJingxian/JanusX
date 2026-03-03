@@ -764,7 +764,35 @@ def concat_imputed_vcfs(
         impute_dir / f"Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"
         for chrom in chroms
     ]
+    first_input = inputs[0]
     inputs_txt = " ".join(_q(p) for p in inputs)
-    concat_cmd = f"{prefix}bcftools concat --threads {int(core)} -Oz -o {_q(out_vcf)} {inputs_txt}"
+    nonempty_list = genotype_dir / "Merge.concat.nonempty.list.txt"
+    build_nonempty_cmd = (
+        f": > {_q(nonempty_list)}; "
+        f"for f in {inputs_txt}; do "
+        f"n=$({prefix}bcftools index -n \"$f\" 2>/dev/null || echo 0); "
+        f"if [ \"${{n:-0}}\" -gt 0 ]; then printf '%s\\n' \"$f\" >> {_q(nonempty_list)}; fi; "
+        f"done"
+    )
+    copy_empty_cmd = f"{prefix}bcftools view -Oz -o {_q(out_vcf)} {_q(first_input)}"
+    copy_single_cmd = (
+        f"f=$(head -n 1 {_q(nonempty_list)}); "
+        f"{prefix}bcftools view -Oz -o {_q(out_vcf)} \"$f\""
+    )
+    concat_cmd = (
+        f"{prefix}bcftools concat --threads {int(core)} -a "
+        f"-f {_q(nonempty_list)} -Oz -o {_q(out_vcf)}"
+    )
     index_cmd = f"{prefix}tabix -f -p vcf {_q(out_vcf)}"
-    return f"{concat_cmd} && {index_cmd}"
+    return (
+        f"{build_nonempty_cmd} && "
+        f"nfile=$(wc -l < {_q(nonempty_list)}); "
+        f"if [ \"${{nfile:-0}}\" -eq 0 ]; then "
+        f"{copy_empty_cmd}; "
+        f"elif [ \"${{nfile:-0}}\" -eq 1 ]; then "
+        f"{copy_single_cmd}; "
+        f"else "
+        f"{concat_cmd}; "
+        f"fi && "
+        f"{index_cmd}"
+    )

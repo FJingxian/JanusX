@@ -715,7 +715,14 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
         } else {
             println!("JanusX runtime not found in venv. Installing from PyPI...");
         }
-        let _ = pip_install_tail(&python, &home, PYPI_SPEC, false, "Updating from PyPI...", 5)?;
+        let _ = pip_install_tail(
+            &python,
+            &home,
+            PYPI_SPEC,
+            false,
+            "Building runtime from PyPI...",
+            5,
+        )?;
     }
     Ok(python)
 }
@@ -1322,90 +1329,42 @@ fn pip_install_tail(
     });
     drop(tx);
 
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut frame_i = 0usize;
     let mut rendered = false;
-    let mut done = false;
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
-    let mut exit_status: Option<ExitStatus> = None;
 
-    loop {
-        match rx.recv_timeout(Duration::from_millis(120)) {
-            Ok((is_err, line)) => {
-                if is_err {
-                    err_text.push_str(&line);
-                    err_text.push('\n');
-                } else {
-                    out_text.push_str(&line);
-                    out_text.push('\n');
-                }
-                if max_lines > 0 {
-                    if tail.len() == max_lines {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                done = true;
-            }
-        }
+    if is_tty {
+        render_tail_block(desc, "…", start.elapsed(), &tail, max_lines, rendered)?;
+        rendered = true;
+    }
 
-        while let Ok((is_err, line)) = rx.try_recv() {
-            if is_err {
-                err_text.push_str(&line);
-                err_text.push('\n');
-            } else {
-                out_text.push_str(&line);
-                out_text.push('\n');
-            }
-            if max_lines > 0 {
-                if tail.len() == max_lines {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
-            }
+    while let Ok((is_err, line)) = rx.recv() {
+        if is_err {
+            err_text.push_str(&line);
+            err_text.push('\n');
+        } else {
+            out_text.push_str(&line);
+            out_text.push('\n');
         }
-
-        if exit_status.is_none() {
-            if let Some(s) = child
-                .try_wait()
-                .map_err(|e| format!("Failed to poll pip install status: {e}"))?
-            {
-                exit_status = Some(s);
+        if max_lines > 0 {
+            if tail.len() == max_lines {
+                tail.pop_front();
             }
+            tail.push_back(line);
         }
-        if done && exit_status.is_some() {
-            break;
-        }
-
         if is_tty {
-            render_tail_block(
-                desc,
-                frames[frame_i % frames.len()],
-                start.elapsed(),
-                &tail,
-                max_lines,
-                rendered,
-            )?;
+            render_tail_block(desc, "…", start.elapsed(), &tail, max_lines, rendered)?;
             rendered = true;
-            frame_i += 1;
         }
     }
 
     let _ = out_handle.join();
     let _ = err_handle.join();
 
-    let status = if let Some(s) = exit_status {
-        s
-    } else {
-        child
-            .wait()
-            .map_err(|e| format!("Failed to wait for pip install process: {e}"))?
-    };
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for pip install process: {e}"))?;
 
     if is_tty {
         let final_symbol = if status.success() { "✔︎" } else { "✘" };

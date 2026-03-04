@@ -946,7 +946,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
             &home,
             PYPI_SPEC,
             false,
-            "Building runtime from PyPI...",
+            "Building runtime from PyPI ...",
             10,
         )?;
     }
@@ -1722,13 +1722,13 @@ fn render_tail_block(
     if symbol.is_empty() {
         let idx = ((elapsed.as_millis() / 120) as usize) % frames.len();
         let title = truncate_plain_line(
-            &format!("{} {} [{}]", frames[idx], desc, format_elapsed(elapsed)),
+            &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
             width,
         );
         print!("\x1b[2K\r{}\n", style_green(&title));
     } else {
         let title = truncate_plain_line(
-            &format!("{symbol} {desc} [{}]", format_elapsed(elapsed)),
+            &format!("{symbol} {desc}[{}]", format_elapsed(elapsed)),
             width,
         );
         print!("\x1b[2K\r{}\n", style_green(&title));

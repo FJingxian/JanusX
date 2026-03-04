@@ -130,23 +130,30 @@ def _maybe_spawn_windows_stage2() -> bool:
     return True
 
 
-def _handle_windows_stage2_args() -> None:
+def _handle_windows_stage2_args() -> bool:
     if os.name != "nt":
-        return
+        return False
     if _WIN_STAGE2_FLAG not in sys.argv:
-        return
+        return False
     try:
         idx = sys.argv.index(_WIN_STAGE2_FLAG)
         parent_pid = int(sys.argv[idx + 1]) if (idx + 1) < len(sys.argv) else -1
     except Exception:
         parent_pid = -1
     _wait_for_parent_exit_on_windows(parent_pid, timeout_seconds=180)
+    return True
+
+
+def _print_windows_stage2_exit_hint() -> None:
+    if os.name != "nt":
+        return
+    print("Update finished. Returning to terminal prompt...", flush=True)
 
 
 def main() -> None:
     if _maybe_spawn_windows_stage2():
         return
-    _handle_windows_stage2_args()
+    is_windows_stage2 = _handle_windows_stage2_args()
 
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     with CliStatus("Updating...", enabled=use_spinner) as task:
@@ -154,6 +161,8 @@ def main() -> None:
         if direct.returncode == 0:
             task.complete("JanusX update completed.")
     if direct.returncode == 0:
+        if is_windows_stage2:
+            _print_windows_stage2_exit_hint()
         return
 
     if _looks_like_timeout(direct.stdout):
@@ -166,10 +175,14 @@ def main() -> None:
         if proxied.returncode == 0:
             task.complete("JanusX update completed (via proxy).")
     if proxied.returncode == 0:
+        if is_windows_stage2:
+            _print_windows_stage2_exit_hint()
         return
 
     _print_failure("GitHub attempt failed.", direct)
     _print_failure("Proxy retry failed.", proxied)
+    if is_windows_stage2:
+        _print_windows_stage2_exit_hint()
     raise SystemExit(1)
 
 

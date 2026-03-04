@@ -68,7 +68,37 @@ jobs:
           fi
           cp "launcher/target/${{ matrix.target }}/release/jx" "$OUT"
           chmod +x "$OUT"
-          echo "PACKAGED_FILE=$OUT" >> "$GITHUB_ENV"
+          FILES="$OUT"
+          if [[ "${{ matrix.target }}" == *"unknown-linux-gnu" ]]; then
+            WRAP="${OUT}.run"
+            cat > "$WRAP" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="\$0"
+TMPDIR="\$(mktemp -d "\${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"
+cleanup() { rm -rf "\$TMPDIR"; }
+trap cleanup EXIT
+PAYLOAD_LINE="\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' "\$SELF")"
+if [[ -z "\${PAYLOAD_LINE:-}" ]]; then
+  echo "Installer payload missing."
+  exit 1
+fi
+BIN="\$TMPDIR/JanusX-installer"
+tail -n +"\$PAYLOAD_LINE" "\$SELF" > "\$BIN"
+chmod +x "\$BIN"
+exec "\$BIN" "\$@"
+exit 0
+__JANUSX_PAYLOAD_BELOW__
+EOF
+            cat "$OUT" >> "$WRAP"
+            chmod +x "$WRAP"
+            FILES="$WRAP"
+          fi
+          {
+            echo "PACKAGED_FILE<<EOF"
+            echo "$FILES"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Package installer (Windows)
         if: runner.os == 'Windows'
@@ -114,7 +144,77 @@ jobs:
           OUT="JanusX-${TAG}-darwin-universal"
           lipo -create "$X86_FILE" "$ARM_FILE" -output "$OUT"
           chmod +x "$OUT"
-          echo "PACKAGED_FILE=$OUT" >> "$GITHUB_ENV"
+          echo "PACKAGED_BINARY=$OUT" >> "$GITHUB_ENV"
+
+      - name: Optional codesign (Developer ID)
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/janusx-signing.p12"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$MACOS_CERT_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_CERT_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_CERT_PASSWORD" "$KEYCHAIN"
+          codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$PACKAGED_BINARY"
+          codesign --verify --verbose=2 "$PACKAGED_BINARY"
+
+      - name: Optional notarize (Apple notarytool)
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ZIP_PATH="${PACKAGED_BINARY}.zip"
+          ditto -c -k --keepParent "$PACKAGED_BINARY" "$ZIP_PATH"
+          xcrun notarytool submit "$ZIP_PATH" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+
+      - name: Cleanup signing keychain
+        if: ${{ always() && secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+        shell: bash
+        run: |
+          security delete-keychain "build.keychain-db" || true
+
+      - name: Package double-click launcher (.command)
+        shell: bash
+        run: |
+          WRAP="${PACKAGED_BINARY}.command"
+          cat > "$WRAP" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="\$0"
+TMPDIR="\$(mktemp -d "\${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"
+cleanup() { rm -rf "\$TMPDIR"; }
+trap cleanup EXIT
+PAYLOAD_LINE="\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' "\$SELF")"
+if [[ -z "\${PAYLOAD_LINE:-}" ]]; then
+  echo "Installer payload missing."
+  exit 1
+fi
+BIN="\$TMPDIR/JanusX-installer"
+tail -n +"\$PAYLOAD_LINE" "\$SELF" > "\$BIN"
+chmod +x "\$BIN"
+exec "\$BIN" "\$@"
+exit 0
+__JANUSX_PAYLOAD_BELOW__
+EOF
+          cat "$PACKAGED_BINARY" >> "$WRAP"
+          chmod +x "$WRAP"
+          {
+            echo "PACKAGED_FILE<<EOF"
+            echo "$WRAP"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Upload universal installer artifact
         uses: actions/upload-artifact@v4
@@ -290,6 +390,12 @@ jobs:
         with:
           path: dist-installers
           merge-multiple: true
+
+      - name: Keep only release-ready macOS installer
+        shell: bash
+        run: |
+          rm -f dist-installers/JanusX-*-darwin-x86_64
+          rm -f dist-installers/JanusX-*-darwin-arm64
 
       - name: Upload installers to release
         uses: softprops/action-gh-release@v2

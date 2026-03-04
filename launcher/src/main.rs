@@ -17,6 +17,7 @@ const COMMIT_MARKER: &str = ".python_core_commit";
 const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
 const VERSION_CONTACT: &str = "fujingxian@yzwlab.cn";
 const RUNTIME_HOME_CONFIG: &str = ".jx_home";
+const INSTALLER_RELAUNCH_ENV: &str = "JX_INSTALLER_RELAUNCHED";
 const LOGO: &str = r#"
        _                      __   __
       | |                     \ \ / /
@@ -101,6 +102,16 @@ fn is_installer_binary() -> bool {
 }
 
 fn run_installer() -> Result<i32, String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        if env::var_os(INSTALLER_RELAUNCH_ENV).is_none() && relaunch_installer_in_terminal()? {
+            return Ok(0);
+        }
+        return Err("Installer requires a terminal UI.\n\
+macOS: please double-click the `.command` installer file.\n\
+Linux: please run the `.run` installer file."
+            .to_string());
+    }
+
     println!("{LOGO}");
     println!("JanusX installer\n");
 
@@ -136,7 +147,155 @@ fn run_installer() -> Result<i32, String> {
         ));
     }
     print_success_line("Installation completed.");
+    print_path_setup_hint(&installed_jx);
     Ok(0)
+}
+
+fn relaunch_installer_in_terminal() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe =
+            env::current_exe().map_err(|e| format!("Failed to locate installer binary: {e}"))?;
+        let cmdline = format!(
+            "export {flag}=1; {exe}; echo; echo 'Press Enter to close...'; read -r _",
+            flag = INSTALLER_RELAUNCH_ENV,
+            exe = sh_quote(&exe.to_string_lossy())
+        );
+        let osa_expr = format!(
+            "tell application \"Terminal\" to do script {}",
+            applescript_quote(&cmdline)
+        );
+        let ok = Command::new("osascript")
+            .arg("-e")
+            .arg(osa_expr)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        return Ok(ok);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exe =
+            env::current_exe().map_err(|e| format!("Failed to locate installer binary: {e}"))?;
+        let cmdline = format!(
+            "export {flag}=1; {exe}; echo; echo 'Press Enter to close...'; read -r _",
+            flag = INSTALLER_RELAUNCH_ENV,
+            exe = sh_quote(&exe.to_string_lossy())
+        );
+        let attempts: [(&str, &[&str]); 5] = [
+            ("x-terminal-emulator", &["-e", "sh", "-lc"]),
+            ("gnome-terminal", &["--", "sh", "-lc"]),
+            ("konsole", &["-e", "sh", "-lc"]),
+            ("xfce4-terminal", &["--command", "sh -lc"]),
+            ("xterm", &["-e", "sh", "-lc"]),
+        ];
+        for (bin, fixed) in attempts {
+            let mut cmd = Command::new(bin);
+            if bin == "xfce4-terminal" {
+                let wrapped = format!("{} {}", fixed[1], sh_quote(&cmdline));
+                cmd.arg(fixed[0]).arg(wrapped);
+            } else {
+                cmd.args(fixed).arg(&cmdline);
+            }
+            let launched = cmd
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if launched {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(false)
+    }
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn applescript_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn print_path_setup_hint(installed_jx: &Path) {
+    let Some(install_dir) = installed_jx.parent() else {
+        return;
+    };
+
+    if is_dir_in_path(install_dir) {
+        print_success_line("`jx` is already in PATH.");
+        return;
+    }
+
+    println!();
+    println!("`jx` is not in PATH yet. Add this directory to PATH:");
+    println!("  {}", install_dir.display());
+
+    #[cfg(target_os = "windows")]
+    {
+        let d = install_dir.display();
+        println!("PowerShell (current session):");
+        println!("  $env:Path = \"{d};$env:Path\"");
+        println!("PowerShell (persistent, user):");
+        println!(
+            "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+        );
+        println!("Then open a new terminal.");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let d = install_dir.display();
+        println!("zsh (recommended):");
+        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
+        println!("  source ~/.zshrc");
+        println!("bash:");
+        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
+        println!("  source ~/.bashrc");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let d = install_dir.display();
+        println!("bash:");
+        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
+        println!("  source ~/.bashrc");
+        println!("zsh:");
+        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
+        println!("  source ~/.zshrc");
+    }
+}
+
+fn is_dir_in_path(dir: &Path) -> bool {
+    let Some(path_var) = env::var_os("PATH") else {
+        return false;
+    };
+    let want = canonical_or_self(dir);
+    env::split_paths(&path_var).any(|p| path_eq(&canonical_or_self(&p), &want))
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn path_eq(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn path_eq(a: &Path, b: &Path) -> bool {
+    a == b
 }
 
 fn default_runtime_home() -> Result<PathBuf, String> {

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
 const VERSION_CONTACT: &str = "fujingxian@yzwlab.cn";
 const RUNTIME_HOME_CONFIG: &str = ".jx_home";
 const INSTALLER_RELAUNCH_ENV: &str = "JX_INSTALLER_RELAUNCHED";
+const SKIP_RUNTIME_REBUILD_ENV: &str = "JX_SKIP_RUNTIME_REBUILD";
 const LOGO: &str = r#"
        _                      __   __
       | |                     \ \ / /
@@ -116,8 +117,8 @@ Linux: please run the `.run` installer file."
     println!("{LOGO}");
     println!("JanusX Installer");
     println!("Guided setup: Runtime home -> jx location -> PATH\n");
+    check_and_handle_existing_jx_in_path()?;
 
-    let installer_start = Instant::now();
     let (runtime_home, install_dir) = prompt_runtime_home()?;
     env::set_var("JX_HOME", &runtime_home);
     println!("Runtime home: {}", runtime_home.display());
@@ -129,25 +130,37 @@ Linux: please run the `.run` installer file."
 
     let installed_jx = install_jx_binary(&install_dir)?;
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
-    println!("Installed jx to {}", installed_jx.display());
-
-    let mut cmd = Command::new(&installed_jx);
-    cmd.arg("-v")
+    let warm_start = Instant::now();
+    let h_status = Command::new(&installed_jx)
+        .arg("-h")
         .env("JX_HOME", &runtime_home)
+        .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run `{}` -h: {e}", installed_jx.display()))?;
+    if !h_status.success() {
+        return Err(format!(
+            "Warm-up command failed: {} -h (exit={})",
+            installed_jx.display(),
+            exit_code(h_status)
+        ));
+    }
+
+    let output = Command::new(&installed_jx)
+        .arg("-v")
+        .env("JX_HOME", &runtime_home)
+        .env(SKIP_RUNTIME_REBUILD_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let warm_start = Instant::now();
-    let output = cmd
+        .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("Failed to run `{}` -h: {e}", installed_jx.display()))?;
-    println!(
-        "{}",
-        style_green(&format!(
-            "Warming up ...[{}]",
-            format_elapsed(warm_start.elapsed())
-        ))
-    );
+        .map_err(|e| format!("Failed to run `{}` -v: {e}", installed_jx.display()))?;
+    print_success_line(&format!(
+        "Warming up ...[{}]",
+        format_elapsed(warm_start.elapsed())
+    ));
     print_dim_block(&String::from_utf8_lossy(&output.stdout));
     print_dim_block(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
@@ -159,7 +172,6 @@ Linux: please run the `.run` installer file."
     }
     println!("Installation complete.");
     print_path_setup_hint(&installed_jx);
-    println!("Total time: {}", format_elapsed(installer_start.elapsed()));
     Ok(0)
 }
 
@@ -286,6 +298,70 @@ fn print_path_setup_hint(installed_jx: &Path) {
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
         println!("  source ~/.zshrc");
     }
+}
+
+fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
+    let found = find_existing_jx_in_path();
+    if found.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("Warning: detected existing `jx` in PATH:");
+    for p in &found {
+        eprintln!("  {}", p.display());
+    }
+
+    loop {
+        print!("Delete existing `jx` and continue? [y/n]: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        let v = line.trim();
+        if v.eq_ignore_ascii_case("n") {
+            return Err("Installer cancelled.".to_string());
+        }
+        if v.eq_ignore_ascii_case("y") {
+            let mut failed: Vec<String> = Vec::new();
+            for p in &found {
+                if let Err(e) = std::fs::remove_file(p) {
+                    failed.push(format!("{} ({e})", p.display()));
+                }
+            }
+            if !failed.is_empty() {
+                return Err(format!(
+                    "Failed to delete existing `jx` executable(s):\n{}",
+                    failed.join("\n")
+                ));
+            }
+            println!("Existing `jx` removed from PATH locations.");
+            return Ok(());
+        }
+    }
+}
+
+fn find_existing_jx_in_path() -> Vec<PathBuf> {
+    let Some(path_var) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    let names: &[&str] = if cfg!(windows) {
+        &["jx.exe", "jx.cmd", "jx.bat", "jx"]
+    } else {
+        &["jx"]
+    };
+    for dir in env::split_paths(&path_var) {
+        for name in names {
+            let p = dir.join(name);
+            if p.exists() && p.is_file() {
+                out.insert(p);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn is_dir_in_path(dir: &Path) -> bool {
@@ -773,6 +849,13 @@ fn ensure_venv() -> Result<PathBuf, String> {
 }
 
 fn should_rebuild_runtime(home: &Path) -> Result<bool, String> {
+    let skip = env::var(SKIP_RUNTIME_REBUILD_ENV)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if skip {
+        return Ok(false);
+    }
     if !home.exists() {
         return Ok(false);
     }
@@ -1340,11 +1423,6 @@ fn pip_install_tail(
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
-
-    if is_tty {
-        render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
-        rendered = true;
-    }
 
     while let Ok((is_err, line)) = rx.recv() {
         if is_err {

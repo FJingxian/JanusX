@@ -107,7 +107,7 @@ fn run_installer() -> Result<i32, String> {
             return Ok(0);
         }
         return Err("Installer requires a terminal UI.\n\
-macOS: please double-click the `JanusX-*-darwin-universal` installer binary.\n\
+macOS: please double-click the `.command` installer file.\n\
 Linux: please run the `.run` installer file."
             .to_string());
     }

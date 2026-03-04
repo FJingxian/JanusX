@@ -203,6 +203,11 @@ pub struct BedChunkReader {
     snp_pos: usize,
     sample_indices: Vec<usize>,
     sample_ids: Vec<String>,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
 }
 
 #[pymethods]
@@ -264,16 +269,16 @@ impl BedChunkReader {
         let it = if let Some(window_mb) = mmap_window_mb {
             BedSnpIter::new_with_fill_window(
                 &prefix,
-                maf,
-                miss,
-                fill,
-                apply_het_filter,
+                0.0,
+                1.0,
+                false,
+                false,
                 het,
                 window_mb,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         } else {
-            BedSnpIter::new_with_fill(&prefix, maf, miss, fill, apply_het_filter, het)
+            BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         };
         let (sample_indices, sample_ids) =
@@ -289,6 +294,11 @@ impl BedChunkReader {
             snp_pos: 0,
             sample_indices,
             sample_ids,
+            maf,
+            miss,
+            fill_missing: fill,
+            apply_het_filter,
+            het_threshold: het,
         })
     }
 
@@ -334,27 +344,53 @@ impl BedChunkReader {
             while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let snp_idx = snp_indices[self.snp_pos];
                 self.snp_pos += 1;
-                if let Some((row, site)) = self.it.get_snp_row(snp_idx) {
-                    if full_samples {
-                        data.extend_from_slice(&row);
+                if let Some((row, mut site)) = self.it.get_snp_row_raw(snp_idx) {
+                    let mut row_sub = if full_samples {
+                        row
                     } else {
-                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                        self.sample_indices.iter().map(|&i| row[i]).collect()
+                    };
+                    let keep = core::process_snp_row(
+                        &mut row_sub,
+                        &mut site.ref_allele,
+                        &mut site.alt_allele,
+                        self.maf,
+                        self.miss,
+                        self.fill_missing,
+                        self.apply_het_filter,
+                        self.het_threshold,
+                    );
+                    if keep {
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site.into());
+                        m += 1;
                     }
-                    sites.push(site.into());
-                    m += 1;
                 }
             }
         } else {
             while m < chunk_size {
-                match self.it.next_snp() {
-                    Some((row, site)) => {
-                        if full_samples {
-                            data.extend_from_slice(&row);
+                match self.it.next_snp_raw() {
+                    Some((row, mut site)) => {
+                        let mut row_sub = if full_samples {
+                            row
                         } else {
-                            data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                            self.sample_indices.iter().map(|&i| row[i]).collect()
+                        };
+                        let keep = core::process_snp_row(
+                            &mut row_sub,
+                            &mut site.ref_allele,
+                            &mut site.alt_allele,
+                            self.maf,
+                            self.miss,
+                            self.fill_missing,
+                            self.apply_het_filter,
+                            self.het_threshold,
+                        );
+                        if keep {
+                            data.extend_from_slice(&row_sub);
+                            sites.push(site.into());
+                            m += 1;
                         }
-                        sites.push(site.into());
-                        m += 1;
                     }
                     None => break,
                 }
@@ -378,6 +414,11 @@ pub struct VcfChunkReader {
     it: VcfSnpIter,
     sample_indices: Vec<usize>,
     sample_ids: Vec<String>,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
 }
 
 #[pymethods]
@@ -419,7 +460,7 @@ impl VcfChunkReader {
             ));
         }
         let apply_het_filter = model_key != "add";
-        let it = VcfSnpIter::new_with_fill(&path, maf, miss, fill, apply_het_filter, het)
+        let it = VcfSnpIter::new_with_fill(&path, 0.0, 1.0, false, false, het)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)
@@ -428,6 +469,11 @@ impl VcfChunkReader {
             it,
             sample_indices,
             sample_ids,
+            maf,
+            miss,
+            fill_missing: fill,
+            apply_het_filter,
+            het_threshold: het,
         })
     }
 
@@ -454,15 +500,28 @@ impl VcfChunkReader {
         let mut m: usize = 0;
 
         while m < chunk_size {
-            match self.it.next_snp() {
-                Some((row, site)) => {
-                    if full_samples {
-                        data.extend_from_slice(&row);
+            match self.it.next_snp_raw() {
+                Some((row, mut site)) => {
+                    let mut row_sub = if full_samples {
+                        row
                     } else {
-                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                        self.sample_indices.iter().map(|&i| row[i]).collect()
+                    };
+                    let keep = core::process_snp_row(
+                        &mut row_sub,
+                        &mut site.ref_allele,
+                        &mut site.alt_allele,
+                        self.maf,
+                        self.miss,
+                        self.fill_missing,
+                        self.apply_het_filter,
+                        self.het_threshold,
+                    );
+                    if keep {
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site.into());
+                        m += 1;
                     }
-                    sites.push(site.into());
-                    m += 1;
                 }
                 None => break,
             }

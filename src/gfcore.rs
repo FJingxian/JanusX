@@ -754,10 +754,15 @@ pub struct BedSnpIter {
     n_snps: usize,
     bytes_per_snp: usize,
     cur: usize,
+    #[allow(dead_code)]
     maf: f32,
+    #[allow(dead_code)]
     miss: f32,
+    #[allow(dead_code)]
     fill_missing: bool,
+    #[allow(dead_code)]
     apply_het_filter: bool,
+    #[allow(dead_code)]
     het_threshold: f32,
 }
 
@@ -941,8 +946,7 @@ impl BedSnpIter {
         Some(&self.mmap[rel..end])
     }
 
-    /// 随机访问解码某个 SNP（用于并行）
-    pub fn get_snp_row(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
+    fn decode_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
         if snp_idx >= self.n_snps {
             return None;
         }
@@ -971,7 +975,19 @@ impl BedSnpIter {
             }
         }
 
-        let mut site = self.sites[snp_idx].clone();
+        let site = self.sites[snp_idx].clone();
+        Some((row, site))
+    }
+
+    /// 随机访问解码某个 SNP（用于并行）
+    pub fn get_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
+        self.decode_snp_row_raw(snp_idx)
+    }
+
+    /// 随机访问并按迭代器参数过滤 SNP
+    #[allow(dead_code)]
+    pub fn get_snp_row(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
+        let (mut row, mut site) = self.decode_snp_row_raw(snp_idx)?;
         let keep = crate::gfcore::process_snp_row(
             &mut row,
             &mut site.ref_allele,
@@ -993,7 +1009,7 @@ impl BedSnpIter {
         self.n_samples
     }
 
-    pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+    pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
         while self.cur < self.n_snps {
             let snp_idx = self.cur;
             self.cur += 1;
@@ -1031,7 +1047,16 @@ impl BedSnpIter {
                 }
             }
 
-            let mut site = self.sites[snp_idx].clone();
+            let site = self.sites[snp_idx].clone();
+            return Some((row, site));
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+        loop {
+            let (mut row, mut site) = self.next_snp_raw()?;
             let keep = process_snp_row(
                 &mut row,
                 &mut site.ref_allele,
@@ -1046,7 +1071,6 @@ impl BedSnpIter {
                 return Some((row, site));
             }
         }
-        None
     }
 }
 
@@ -1056,10 +1080,15 @@ impl BedSnpIter {
 pub struct VcfSnpIter {
     pub samples: Vec<String>,
     reader: Box<dyn BufRead + Send + Sync + 'static>,
+    #[allow(dead_code)]
     maf: f32,
+    #[allow(dead_code)]
     miss: f32,
+    #[allow(dead_code)]
     fill_missing: bool,
+    #[allow(dead_code)]
     apply_het_filter: bool,
+    #[allow(dead_code)]
     het_threshold: f32,
     finished: bool,
 }
@@ -1113,7 +1142,7 @@ impl VcfSnpIter {
         self.samples.len()
     }
 
-    pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+    pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
         if self.finished {
             return None;
         }
@@ -1140,7 +1169,7 @@ impl VcfSnpIter {
                 continue;
             }
 
-            let mut site = SiteInfo {
+            let site = SiteInfo {
                 chrom: parts[0].to_string(),
                 pos: parts[1].parse().unwrap_or(0),
                 ref_allele: parts[3].to_string(),
@@ -1159,7 +1188,14 @@ impl VcfSnpIter {
                 };
                 row.push(g);
             }
+            return Some((row, site));
+        }
+    }
 
+    #[allow(dead_code)]
+    pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+        loop {
+            let (mut row, mut site) = self.next_snp_raw()?;
             let keep = process_snp_row(
                 &mut row,
                 &mut site.ref_allele,

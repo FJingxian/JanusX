@@ -444,10 +444,19 @@ def _maybe_spawn_windows_stage2(user_args: List[str], *, is_stage2: bool) -> boo
     if len(user_args) > 0:
         cmd.extend(user_args)
     try:
-        subprocess.Popen(cmd)
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        # Avoid extra terminal window on Windows while running stage2 updater.
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            popen_kwargs["creationflags"] = int(subprocess.CREATE_NO_WINDOW)  # type: ignore[arg-type]
+        subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[arg-type]
     except Exception:
         return False
-    print("Windows update launcher started. Waiting for current jx process to exit...")
+    print("Windows update launcher started in background. This terminal will return immediately.")
     return True
 
 

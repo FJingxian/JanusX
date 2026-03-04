@@ -223,11 +223,9 @@ jobs:
           } > "$WRAP"
           cat "$PACKAGED_BINARY" >> "$WRAP"
           chmod +x "$WRAP"
-          ZIP="${WRAP}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$WRAP" "$ZIP"
           {
             echo "PACKAGED_FILE<<EOF"
-            echo "$ZIP"
+            echo "$WRAP"
             echo "EOF"
           } >> "$GITHUB_ENV"
 
@@ -426,11 +424,27 @@ jobs:
           rm -f dist-installers/JanusX-*-darwin-x86_64
           rm -f dist-installers/JanusX-*-darwin-arm64
 
+      - name: Repackage installers as tar.gz
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in dist-installers/JanusX-*; do
+            [ -f "$f" ] || continue
+            b="$(basename "$f")"
+            stem="$b"
+            stem="${stem%.command}"
+            stem="${stem%.run}"
+            stem="${stem%.exe}"
+            out="dist-installers/${stem}.tar.gz"
+            tar -czf "$out" -C dist-installers "$b"
+          done
+          find dist-installers -maxdepth 1 -type f -name 'JanusX-*' ! -name '*.tar.gz' -delete
+
       - name: Upload installers to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          files: dist-installers/JanusX-*
+          files: dist-installers/JanusX-*.tar.gz
           overwrite_files: true
 
   sync-version-back-to-repo:

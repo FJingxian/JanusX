@@ -5,19 +5,21 @@ JanusX updater.
 Usage:
   jx --update
   jx --update latest
+  jx --update --verbose
+  jx --update latest --verbose
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import subprocess
 import sys
 from importlib import metadata as importlib_metadata
-from typing import List, Tuple
+from time import monotonic
+from typing import List, NamedTuple, Tuple
 
-from janusx.script._common.status import CliStatus
+from janusx.script._common.status import CliStatus, format_elapsed
 
 
 _PYPI_SPEC = "janusx"
@@ -25,9 +27,19 @@ _GITHUB_SPEC = "git+https://github.com/FJingxian/JanusX.git"
 _GITHUB_PROXY_SPEC = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git"
 _PIP_TIMEOUT_SECONDS = 30
 _WIN_STAGE2_FLAG = "--janusx-update-stage2"
+_FORCE_FLAGS = {"--force-reinstall", "--reinstall", "--full"}
+_VERBOSE_FLAGS = {"--verbose"}
+_LATEST_FLAGS = {"latest", "--latest"}
+_HELP_FLAGS = {"help", "-h", "--help"}
 
 
-def _run_update(spec: str, *, force_reinstall: bool) -> subprocess.CompletedProcess[str]:
+class _UpdateArgs(NamedTuple):
+    latest: bool
+    force_reinstall: bool
+    verbose: bool
+
+
+def _build_pip_cmd(spec: str, *, force_reinstall: bool) -> List[str]:
     cmd = [
         sys.executable,
         "-m",
@@ -41,12 +53,48 @@ def _run_update(spec: str, *, force_reinstall: bool) -> subprocess.CompletedProc
     if force_reinstall:
         cmd.extend(["--force-reinstall", "--no-cache-dir"])
     cmd.append(spec)
+    return cmd
+
+
+def _run_update(spec: str, *, force_reinstall: bool) -> subprocess.CompletedProcess[str]:
+    cmd = _build_pip_cmd(spec, force_reinstall=force_reinstall)
     return subprocess.run(
         cmd,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+
+
+def _run_update_verbose(
+    spec: str,
+    *,
+    force_reinstall: bool,
+    desc: str,
+) -> Tuple[subprocess.CompletedProcess[str], float]:
+    cmd = _build_pip_cmd(spec, force_reinstall=force_reinstall)
+    print(desc)
+    print(f"Running: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+
+    start_ts = monotonic()
+    all_lines: List[str] = []
+    if proc.stdout is not None:
+        for raw in proc.stdout:
+            line = str(raw).rstrip("\n")
+            all_lines.append(line)
+            print(line, flush=True)
+    returncode = proc.wait()
+
+    elapsed = max(0.0, monotonic() - start_ts)
+    output = "\n".join(all_lines)
+    return subprocess.CompletedProcess(cmd, returncode, output), elapsed
 
 
 def _installed_version() -> str | None:
@@ -210,44 +258,86 @@ def _pause_windows_stage2_exit(*, is_stage2: bool) -> None:
         return
 
 
-def _parse_args(user_args: List[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="jx --update",
-        description=(
-            "Update JanusX. Default channel is PyPI latest; "
-            "use optional `latest` to update from GitHub."
-        ),
+def _update_usage() -> str:
+    return (
+        "Update usage:\n"
+        "  jx --update [latest] [--verbose] [--force-reinstall]\n\n"
+        "Channels:\n"
+        "  (default)  PyPI latest\n"
+        "  latest     GitHub latest (requires git)\n\n"
+        "Options:\n"
+        "  --verbose  Print full installer details (no rich animation)\n"
     )
-    parser.add_argument(
-        "channel",
-        nargs="?",
-        default=None,
-        choices=["latest"],
-        help="Use `latest` to update from GitHub (requires git).",
-    )
-    parser.add_argument(
-        "--force-reinstall",
-        "--reinstall",
-        "--full",
-        dest="force_reinstall",
-        action="store_true",
-        help="Force reinstall package files.",
-    )
-    return parser.parse_args(user_args)
 
 
-def _run_pypi_update(spec: str, *, force_reinstall: bool, use_spinner: bool) -> None:
+def _parse_args(user_args: List[str]) -> _UpdateArgs:
+    latest = False
+    force_reinstall = False
+    verbose = False
+    unknown: List[str] = []
+
+    for raw in user_args:
+        token = str(raw).strip()
+        if not token:
+            continue
+        if token in _HELP_FLAGS:
+            print(_update_usage())
+            raise SystemExit(0)
+        if token in _LATEST_FLAGS:
+            latest = True
+            continue
+        if token in _FORCE_FLAGS:
+            force_reinstall = True
+            continue
+        if token in _VERBOSE_FLAGS:
+            verbose = True
+            continue
+        unknown.append(raw)
+
+    if unknown:
+        print(f"Unknown update option(s): {' '.join(unknown)}")
+        print(_update_usage())
+        raise SystemExit(2)
+
+    return _UpdateArgs(
+        latest=latest,
+        force_reinstall=force_reinstall,
+        verbose=verbose,
+    )
+
+
+def _run_pypi_update(
+    spec: str,
+    *,
+    force_reinstall: bool,
+    use_spinner: bool,
+    verbose: bool,
+) -> None:
     before = _installed_version()
     show_latest_hint = False
-    with CliStatus("Updating from PyPI...", enabled=use_spinner) as task:
-        proc = _run_update(spec, force_reinstall=force_reinstall)
+    if verbose:
+        proc, elapsed = _run_update_verbose(
+            spec,
+            force_reinstall=force_reinstall,
+            desc="Updating from PyPI...",
+        )
         if proc.returncode == 0:
             after = _installed_version()
             if (not force_reinstall) and before is not None and after is not None and before == after:
-                task.complete(f"Already the latest PyPI version ({after})")
+                print(f"It is the latest PyPI version ({after}) [{format_elapsed(elapsed)}]")
                 show_latest_hint = True
             else:
-                task.complete("JanusX update completed.")
+                print(f"JanusX update completed. [{format_elapsed(elapsed)}]")
+    else:
+        with CliStatus("Updating from PyPI...", enabled=use_spinner) as task:
+            proc = _run_update(spec, force_reinstall=force_reinstall)
+            if proc.returncode == 0:
+                after = _installed_version()
+                if (not force_reinstall) and before is not None and after is not None and before == after:
+                    task.complete(f"It is the latest PyPI version ({after})")
+                    show_latest_hint = True
+                else:
+                    task.complete("JanusX update completed.")
     if proc.returncode != 0:
         _print_failure("PyPI update failed.", proc)
         raise SystemExit(1)
@@ -255,12 +345,26 @@ def _run_pypi_update(spec: str, *, force_reinstall: bool, use_spinner: bool) -> 
         print("Use `jx --update latest` for GitHub latest.")
 
 
-def _run_github_update(*, force_reinstall: bool, use_spinner: bool) -> None:
+def _run_github_update(
+    *,
+    force_reinstall: bool,
+    use_spinner: bool,
+    verbose: bool,
+) -> None:
     _ensure_git_available_or_exit()
-    with CliStatus("Updating from GitHub...", enabled=use_spinner) as task:
-        direct = _run_update(_GITHUB_SPEC, force_reinstall=force_reinstall)
+    if verbose:
+        direct, elapsed = _run_update_verbose(
+            _GITHUB_SPEC,
+            force_reinstall=force_reinstall,
+            desc="Updating from GitHub...",
+        )
         if direct.returncode == 0:
-            task.complete("JanusX update completed.")
+            print(f"JanusX update completed. [{format_elapsed(elapsed)}]")
+    else:
+        with CliStatus("Updating from GitHub...", enabled=use_spinner) as task:
+            direct = _run_update(_GITHUB_SPEC, force_reinstall=force_reinstall)
+            if direct.returncode == 0:
+                task.complete("JanusX update completed.")
     if direct.returncode == 0:
         return
 
@@ -269,10 +373,19 @@ def _run_github_update(*, force_reinstall: bool, use_spinner: bool) -> None:
     else:
         print("Direct GitHub update failed, retrying with proxy...")
 
-    with CliStatus("Updating from proxy...", enabled=use_spinner) as task:
-        proxied = _run_update(_GITHUB_PROXY_SPEC, force_reinstall=force_reinstall)
+    if verbose:
+        proxied, elapsed = _run_update_verbose(
+            _GITHUB_PROXY_SPEC,
+            force_reinstall=force_reinstall,
+            desc="Updating from proxy...",
+        )
         if proxied.returncode == 0:
-            task.complete("JanusX update completed (via proxy).")
+            print(f"JanusX update completed (via proxy). [{format_elapsed(elapsed)}]")
+    else:
+        with CliStatus("Updating from proxy...", enabled=use_spinner) as task:
+            proxied = _run_update(_GITHUB_PROXY_SPEC, force_reinstall=force_reinstall)
+            if proxied.returncode == 0:
+                task.complete("JanusX update completed (via proxy).")
     if proxied.returncode == 0:
         return
 
@@ -292,10 +405,19 @@ def main() -> None:
 
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
-    if args.channel == "latest":
-        _run_github_update(force_reinstall=bool(args.force_reinstall), use_spinner=use_spinner)
+    if args.latest:
+        _run_github_update(
+            force_reinstall=bool(args.force_reinstall),
+            use_spinner=use_spinner,
+            verbose=bool(args.verbose),
+        )
     else:
-        _run_pypi_update(_PYPI_SPEC, force_reinstall=bool(args.force_reinstall), use_spinner=use_spinner)
+        _run_pypi_update(
+            _PYPI_SPEC,
+            force_reinstall=bool(args.force_reinstall),
+            use_spinner=use_spinner,
+            verbose=bool(args.verbose),
+        )
     _pause_windows_stage2_exit(is_stage2=is_stage2)
 
 

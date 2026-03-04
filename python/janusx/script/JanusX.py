@@ -7,7 +7,7 @@ Usage:
 Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
-    -update, --update      Update JanusX: `jx --update [latest]`
+    -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
 
 Modules:
     Genome-wide Association Studies (GWAS):

@@ -223,9 +223,11 @@ jobs:
           } > "$WRAP"
           cat "$PACKAGED_BINARY" >> "$WRAP"
           chmod +x "$WRAP"
+          ZIP="${WRAP}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$WRAP" "$ZIP"
           {
             echo "PACKAGED_FILE<<EOF"
-            echo "$WRAP"
+            echo "$ZIP"
             echo "EOF"
           } >> "$GITHUB_ENV"
 

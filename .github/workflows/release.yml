@@ -424,6 +424,14 @@ jobs:
           rm -f dist-installers/JanusX-*-darwin-x86_64
           rm -f dist-installers/JanusX-*-darwin-arm64
 
+      - name: Restore executable permissions for Unix installers
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in dist-installers/JanusX-*.command dist-installers/JanusX-*.run; do
+            chmod +x "$f" || true
+          done
+
       - name: Repackage installers as tar.gz
         shell: bash
         run: |

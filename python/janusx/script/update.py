@@ -204,7 +204,7 @@ def _pause_windows_stage2_exit(*, is_stage2: bool) -> None:
     if not bool(getattr(sys.stdin, "isatty", lambda: False)()):
         return
     try:
-        print("Update finished. Press Enter to return...", flush=True)
+        print("\nUpdate finished. Press Enter to return...", flush=True)
         input()
     except Exception:
         return

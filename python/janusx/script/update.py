@@ -5,13 +5,20 @@ JanusX updater.
 Examples
 --------
   jx --update
+  jx --update --force-reinstall
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
+from importlib import metadata as importlib_metadata
+from typing import List, Optional, Tuple
 from janusx.script._common.status import CliStatus
 
 
@@ -19,22 +26,24 @@ _GITHUB_PROXY_SPEC = "git+https://gh-proxy.org/https://github.com/FJingxian/Janu
 _GITHUB_SPEC = "git+https://github.com/FJingxian/JanusX.git"
 _PIP_TIMEOUT_SECONDS = 30
 _WIN_STAGE2_FLAG = "--janusx-update-stage2"
+_FORCE_FLAGS = {"--force-reinstall", "--reinstall", "--full"}
+_FAST_COMMIT_MARKER = ".janusx_fastupdate_commit"
 
 
-def _run_update(spec: str) -> subprocess.CompletedProcess[str]:
+def _run_update(spec: str, *, force_reinstall: bool) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
         "--upgrade",
-        "--force-reinstall",
-        "--no-cache-dir",
         "--disable-pip-version-check",
         "--default-timeout",
         str(_PIP_TIMEOUT_SECONDS),
-        spec,
     ]
+    if force_reinstall:
+        cmd.extend(["--force-reinstall", "--no-cache-dir"])
+    cmd.append(spec)
     return subprocess.run(
         cmd,
         text=True,
@@ -79,6 +88,229 @@ def _print_failure(label: str, proc: subprocess.CompletedProcess[str]) -> None:
     print(f"Reason: {_extract_error_reason(proc.stdout)}")
 
 
+def _spec_to_repo_url(spec: str) -> str:
+    text = str(spec).strip()
+    if text.startswith("git+"):
+        return text[4:]
+    return text
+
+
+def _run_git(args: List[str], *, cwd: Optional[str] = None, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+    )
+
+
+def _resolve_installed_package_dir() -> Optional[Path]:
+    try:
+        import janusx as _janusx  # type: ignore
+        return Path(_janusx.__file__).resolve().parent
+    except Exception:
+        return None
+
+
+def _get_local_commit_marker(pkg_dir: Optional[Path]) -> Optional[str]:
+    if pkg_dir is None:
+        return None
+    marker = pkg_dir / _FAST_COMMIT_MARKER
+    if not marker.exists():
+        return None
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+def _write_local_commit_marker(pkg_dir: Optional[Path], commit: str) -> None:
+    if pkg_dir is None:
+        return
+    marker = pkg_dir / _FAST_COMMIT_MARKER
+    try:
+        marker.write_text(str(commit).strip() + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
+def _load_direct_url_json_path() -> Optional[Path]:
+    try:
+        dist = importlib_metadata.distribution("janusx")
+        p = Path(dist.locate_file("direct_url.json"))
+        if p.exists():
+            return p
+    except Exception:
+        return None
+    return None
+
+
+def _get_local_commit_from_direct_url() -> Optional[str]:
+    p = _load_direct_url_json_path()
+    if p is None:
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        vcs = data.get("vcs_info", {})
+        commit = str(vcs.get("commit_id", "")).strip()
+        return commit if commit else None
+    except Exception:
+        return None
+
+
+def _update_direct_url_commit(commit: str) -> None:
+    p = _load_direct_url_json_path()
+    if p is None:
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        vcs = data.get("vcs_info")
+        if not isinstance(vcs, dict):
+            return
+        vcs["commit_id"] = str(commit).strip()
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
+def _get_local_effective_commit(pkg_dir: Optional[Path]) -> Optional[str]:
+    marker_commit = _get_local_commit_marker(pkg_dir)
+    if marker_commit:
+        return marker_commit
+    return _get_local_commit_from_direct_url()
+
+
+def _get_remote_head_commit(repo_url: str) -> Optional[str]:
+    try:
+        proc = _run_git(["ls-remote", repo_url, "HEAD"], timeout=60)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    line = str(proc.stdout).strip().splitlines()
+    if len(line) == 0:
+        return None
+    fields = line[0].split()
+    if len(fields) == 0:
+        return None
+    commit = fields[0].strip()
+    if len(commit) >= 7:
+        return commit
+    return None
+
+
+def _is_python_only_change(paths: List[str]) -> bool:
+    if len(paths) == 0:
+        return False
+    allowed_single = {
+        "README.md",
+        "README.zh-CN.md",
+        "README_cn.md",
+        "LICENSE",
+        "MANIFEST.in",
+    }
+    for p in paths:
+        rel = str(p).strip().lstrip("./")
+        if not rel:
+            continue
+        if rel.startswith("python/"):
+            continue
+        if rel in allowed_single:
+            continue
+        # Any Rust/build/packaging/meta change falls back to full update.
+        return False
+    return True
+
+
+def _overlay_tree(src_dir: Path, dst_dir: Path) -> None:
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        root_path = Path(root)
+        rel = root_path.relative_to(src_dir)
+        out_dir = dst_dir / rel
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            src_file = root_path / name
+            dst_file = out_dir / name
+            shutil.copy2(src_file, dst_file)
+
+
+def _try_python_only_fast_update() -> Tuple[str, str]:
+    """
+    Returns:
+      - ("updated", reason)
+      - ("up_to_date", reason)
+      - ("fallback", reason)
+    """
+    pkg_dir = _resolve_installed_package_dir()
+    if pkg_dir is None:
+        return ("fallback", "cannot resolve installed janusx package path")
+    local_commit = _get_local_effective_commit(pkg_dir)
+    if not local_commit:
+        return ("fallback", "cannot detect installed commit metadata")
+
+    candidates = [
+        ("GitHub", _spec_to_repo_url(_GITHUB_SPEC)),
+        ("Proxy", _spec_to_repo_url(_GITHUB_PROXY_SPEC)),
+    ]
+    last_reason = "remote query failed"
+    for label, repo_url in candidates:
+        remote_commit = _get_remote_head_commit(repo_url)
+        if not remote_commit:
+            last_reason = f"{label} HEAD unavailable"
+            continue
+        if remote_commit == local_commit:
+            return ("up_to_date", f"{label} HEAD == local commit")
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="janusx_fastupdate_") as td:
+                # Fetch both commits and diff changed files.
+                init = _run_git(["init"], cwd=td, timeout=60)
+                if init.returncode != 0:
+                    last_reason = f"{label} git init failed"
+                    continue
+                remote_add = _run_git(["remote", "add", "origin", repo_url], cwd=td, timeout=60)
+                if remote_add.returncode != 0:
+                    last_reason = f"{label} git remote add failed"
+                    continue
+                fetch_old = _run_git(["fetch", "--depth=1", "origin", local_commit], cwd=td, timeout=120)
+                if fetch_old.returncode != 0:
+                    last_reason = f"{label} cannot fetch local commit"
+                    continue
+                fetch_new = _run_git(["fetch", "--depth=1", "origin", remote_commit], cwd=td, timeout=120)
+                if fetch_new.returncode != 0:
+                    last_reason = f"{label} cannot fetch remote commit"
+                    continue
+                diff = _run_git(["diff", "--name-only", local_commit, remote_commit], cwd=td, timeout=120)
+                if diff.returncode != 0:
+                    last_reason = f"{label} git diff failed"
+                    continue
+                changed_files = [x.strip() for x in str(diff.stdout).splitlines() if x.strip()]
+                if not _is_python_only_change(changed_files):
+                    return ("fallback", f"{label} detected non-python changes")
+
+                checkout = _run_git(["checkout", "--detach", remote_commit], cwd=td, timeout=120)
+                if checkout.returncode != 0:
+                    last_reason = f"{label} checkout failed"
+                    continue
+                src_python = Path(td) / "python" / "janusx"
+                if not src_python.exists():
+                    last_reason = f"{label} python/janusx not found in repo"
+                    continue
+                _overlay_tree(src_python, pkg_dir)
+                _write_local_commit_marker(pkg_dir, remote_commit)
+                _update_direct_url_commit(remote_commit)
+                return ("updated", f"{label} python-only overlay applied")
+        except Exception as e:
+            last_reason = f"{label} fast path error: {e}"
+            continue
+
+    return ("fallback", last_reason)
+
+
 def _wait_for_parent_exit_on_windows(parent_pid: int, timeout_seconds: int = 180) -> None:
     if os.name != "nt":
         return
@@ -104,7 +336,32 @@ def _wait_for_parent_exit_on_windows(parent_pid: int, timeout_seconds: int = 180
         kernel32.CloseHandle(handle)
 
 
-def _maybe_spawn_windows_stage2() -> bool:
+def _split_stage2_and_user_args(argv: List[str]) -> Tuple[bool, int, List[str]]:
+    """
+    Split stage2 internal args from user-facing update args.
+    Returns: (is_stage2, parent_pid, user_args)
+    """
+    args = list(argv)
+    if _WIN_STAGE2_FLAG not in args:
+        return False, -1, args
+    idx = args.index(_WIN_STAGE2_FLAG)
+    parent_pid = -1
+    if idx + 1 < len(args):
+        try:
+            parent_pid = int(args[idx + 1])
+        except Exception:
+            parent_pid = -1
+        del args[idx:idx + 2]
+    else:
+        del args[idx]
+    return True, parent_pid, args
+
+
+def _is_force_reinstall_requested(user_args: List[str]) -> bool:
+    return any(str(x).strip().lower() in _FORCE_FLAGS for x in user_args)
+
+
+def _maybe_spawn_windows_stage2(user_args: List[str], *, is_stage2: bool) -> bool:
     """
     Windows self-update workaround:
     the currently running jx.exe cannot be replaced by pip.
@@ -112,7 +369,7 @@ def _maybe_spawn_windows_stage2() -> bool:
     """
     if os.name != "nt":
         return False
-    if _WIN_STAGE2_FLAG in sys.argv:
+    if is_stage2:
         return False
 
     cmd = [
@@ -122,25 +379,13 @@ def _maybe_spawn_windows_stage2() -> bool:
         _WIN_STAGE2_FLAG,
         str(os.getpid()),
     ]
+    if len(user_args) > 0:
+        cmd.extend(user_args)
     try:
         subprocess.Popen(cmd)
     except Exception:
         return False
     print("Windows update launcher started. Waiting for current jx process to exit...")
-    return True
-
-
-def _handle_windows_stage2_args() -> bool:
-    if os.name != "nt":
-        return False
-    if _WIN_STAGE2_FLAG not in sys.argv:
-        return False
-    try:
-        idx = sys.argv.index(_WIN_STAGE2_FLAG)
-        parent_pid = int(sys.argv[idx + 1]) if (idx + 1) < len(sys.argv) else -1
-    except Exception:
-        parent_pid = -1
-    _wait_for_parent_exit_on_windows(parent_pid, timeout_seconds=180)
     return True
 
 
@@ -151,17 +396,34 @@ def _print_windows_stage2_exit_hint() -> None:
 
 
 def main() -> None:
-    if _maybe_spawn_windows_stage2():
+    is_stage2, parent_pid, user_args = _split_stage2_and_user_args(sys.argv[1:])
+    force_reinstall = _is_force_reinstall_requested(user_args)
+
+    if _maybe_spawn_windows_stage2(user_args, is_stage2=is_stage2):
         return
-    is_windows_stage2 = _handle_windows_stage2_args()
+    if is_stage2:
+        _wait_for_parent_exit_on_windows(parent_pid, timeout_seconds=180)
 
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if not force_reinstall:
+        with CliStatus("Checking fast-update path...", enabled=use_spinner) as task:
+            fast_status, fast_reason = _try_python_only_fast_update()
+            if fast_status == "updated":
+                task.complete("JanusX fast update completed (Python-only).")
+            elif fast_status == "up_to_date":
+                task.complete("JanusX is already up to date.")
+        if fast_status in {"updated", "up_to_date"}:
+            if is_stage2:
+                _print_windows_stage2_exit_hint()
+            return
+        print(f"Fast Python-only update skipped: {fast_reason}. Falling back to full pip update...")
+
     with CliStatus("Updating...", enabled=use_spinner) as task:
-        direct = _run_update(_GITHUB_SPEC)
+        direct = _run_update(_GITHUB_SPEC, force_reinstall=force_reinstall)
         if direct.returncode == 0:
             task.complete("JanusX update completed.")
     if direct.returncode == 0:
-        if is_windows_stage2:
+        if is_stage2:
             _print_windows_stage2_exit_hint()
         return
 
@@ -171,17 +433,17 @@ def main() -> None:
         print("Direct GitHub update failed, retrying with proxy...")
 
     with CliStatus("Updating via proxy...", enabled=use_spinner) as task:
-        proxied = _run_update(_GITHUB_PROXY_SPEC)
+        proxied = _run_update(_GITHUB_PROXY_SPEC, force_reinstall=force_reinstall)
         if proxied.returncode == 0:
             task.complete("JanusX update completed (via proxy).")
     if proxied.returncode == 0:
-        if is_windows_stage2:
+        if is_stage2:
             _print_windows_stage2_exit_hint()
         return
 
     _print_failure("GitHub attempt failed.", direct)
     _print_failure("Proxy retry failed.", proxied)
-    if is_windows_stage2:
+    if is_stage2:
         _print_windows_stage2_exit_hint()
     raise SystemExit(1)
 

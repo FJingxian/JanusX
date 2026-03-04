@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref (tag/sha/branch) to build"
+        description: "Git ref (tag/sha/branch) to build from"
+        required: false
+        default: ""
+      release_tag:
+        description: "GitHub Release tag to upload installers (e.g. v1.0.13)"
         required: false
         default: ""
       installers_only:
@@ -63,7 +67,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           if [ -z "$TAG" ]; then TAG="dev"; fi
           if [ -n "${{ matrix.ext }}" ]; then
@@ -109,7 +113,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = "${{ github.event.inputs.ref || github.ref_name }}"
+          $tag = "${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
           if ($tag.StartsWith("refs/tags/")) { $tag = $tag.Substring(10) }
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "dev" }
           $out = "JanusX-$tag-${{ matrix.asset_suffix }}.${{ matrix.ext }}"
@@ -143,7 +147,7 @@ jobs:
       - name: Create universal installer
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           if [ -z "$TAG" ]; then TAG="dev"; fi
           X86_FILE=$(ls dist-installer-x86/JanusX-*darwin-x86_64 | head -n 1)
@@ -397,14 +401,14 @@ jobs:
     needs:
       - build-installers
       - build-darwin-universal
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release_tag, 'v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v') }}
     permissions:
       contents: write
     steps:
       - name: Resolve release tag
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           if [[ -z "$TAG" || ! "$TAG" =~ ^v ]]; then
             echo "Invalid tag for release upload: '$TAG'"

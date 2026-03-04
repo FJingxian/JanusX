@@ -1423,33 +1423,57 @@ fn pip_install_tail(
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
+    let mut channel_open = true;
+    let mut exit_status: Option<ExitStatus> = None;
 
-    while let Ok((is_err, line)) = rx.recv() {
-        if is_err {
-            err_text.push_str(&line);
-            err_text.push('\n');
-        } else {
-            out_text.push_str(&line);
-            out_text.push('\n');
-        }
-        if max_lines > 0 {
-            if tail.len() == max_lines {
-                tail.pop_front();
+    while channel_open {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok((is_err, line)) => {
+                if is_err {
+                    err_text.push_str(&line);
+                    err_text.push('\n');
+                } else {
+                    out_text.push_str(&line);
+                    out_text.push('\n');
+                }
+                if max_lines > 0 {
+                    if tail.len() == max_lines {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                if is_tty {
+                    render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    rendered = true;
+                }
             }
-            tail.push_back(line);
-        }
-        if is_tty {
-            render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
-            rendered = true;
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if exit_status.is_none() {
+                    exit_status = child
+                        .try_wait()
+                        .map_err(|e| format!("Failed to poll pip install status: {e}"))?;
+                }
+                if is_tty {
+                    render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    rendered = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                channel_open = false;
+            }
         }
     }
 
     let _ = out_handle.join();
     let _ = err_handle.join();
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for pip install process: {e}"))?;
+    let status = if let Some(s) = exit_status {
+        s
+    } else {
+        child
+            .wait()
+            .map_err(|e| format!("Failed to wait for pip install process: {e}"))?
+    };
 
     if is_tty {
         let final_symbol = if status.success() { "✔︎" } else { "✘" };

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 from importlib import metadata as importlib_metadata
+import importlib.util
 from typing import List, Optional, Tuple
 from janusx.script._common.status import CliStatus
 
@@ -107,11 +108,37 @@ def _run_git(args: List[str], *, cwd: Optional[str] = None, timeout: int = 120) 
 
 
 def _resolve_installed_package_dir() -> Optional[Path]:
+    # 1) Namespace/package-spec path (works for janusx without __init__.py).
+    try:
+        spec = importlib.util.find_spec("janusx")
+        if spec is not None and spec.submodule_search_locations is not None:
+            for loc in spec.submodule_search_locations:
+                p = Path(str(loc)).resolve()
+                if p.exists() and p.is_dir():
+                    return p
+    except Exception:
+        pass
+
+    # 2) Distribution metadata location fallback.
+    try:
+        dist = importlib_metadata.distribution("janusx")
+        candidate = Path(dist.locate_file("janusx")).resolve()
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    except Exception:
+        pass
+
+    # 3) Traditional package __file__ fallback.
     try:
         import janusx as _janusx  # type: ignore
-        return Path(_janusx.__file__).resolve().parent
+        pkg_file = getattr(_janusx, "__file__", None)
+        if pkg_file:
+            p = Path(str(pkg_file)).resolve().parent
+            if p.exists() and p.is_dir():
+                return p
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _get_local_commit_marker(pkg_dir: Optional[Path]) -> Optional[str]:
@@ -393,6 +420,12 @@ def _print_windows_stage2_exit_hint() -> None:
     if os.name != "nt":
         return
     print("Update finished. Returning to terminal prompt...", flush=True)
+    print("", flush=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -405,6 +438,10 @@ def main() -> None:
         _wait_for_parent_exit_on_windows(parent_pid, timeout_seconds=180)
 
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if os.name == "nt" and is_stage2:
+        # Avoid dynamic terminal control sequences in stage2 updater process on
+        # Windows cmd/PowerShell; they can leave prompt redraw in a bad state.
+        use_spinner = False
     if not force_reinstall:
         with CliStatus("Checking fast-update path...", enabled=use_spinner) as task:
             fast_status, fast_reason = _try_python_only_fast_update()

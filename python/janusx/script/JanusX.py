@@ -7,7 +7,7 @@ Usage:
 Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
-    -update, --update      Update JanusX from GitHub via pip
+    -update, --update      Update JanusX: `jx --update [latest]`
 
 Modules:
     Genome-wide Association Studies (GWAS):
@@ -114,7 +114,6 @@ def main():
             print(__version__)
         elif sys.argv[1] == '-update' or sys.argv[1] == '--update':
             print(__logo__)
-            # Keep argparse usage as "jx --update ..."
             sys.argv[0] = "jx --update"
             del sys.argv[1]
             update.main()

@@ -38,7 +38,7 @@ fn run() -> Result<i32, String> {
         return run_python_janusx(&python, &args);
     }
 
-    if matches!(head, "-update" | "--update" | "update") {
+    if matches!(head, "-update" | "--update") {
         let opts = match parse_update_args(&args[1..]) {
             Ok(v) => v,
             Err(e) if e.is_empty() => return Ok(0),

@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
+use std::time::SystemTime;
 
 const PYPI_SPEC: &str = "janusx";
 const GITHUB_SPEC: &str = "git+https://github.com/FJingxian/JanusX.git";
@@ -153,7 +154,19 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
 
 fn ensure_venv() -> Result<PathBuf, String> {
     let home = runtime_home()?;
+    if should_rebuild_runtime(&home)? {
+        println!(
+            "Detected newer jx binary than runtime cache. Rebuilding {} ...",
+            home.display()
+        );
+        std::fs::remove_dir_all(&home)
+            .map_err(|e| format!("Failed to remove runtime directory {}: {e}", home.display()))?;
+    }
     if !home.exists() {
+        println!(
+            "Runtime directory not found. Initializing {} ...",
+            home.display()
+        );
         std::fs::create_dir_all(&home)
             .map_err(|e| format!("Failed to create runtime directory {}: {e}", home.display()))?;
     }
@@ -187,6 +200,30 @@ fn ensure_venv() -> Result<PathBuf, String> {
         ));
     }
     Ok(py)
+}
+
+fn should_rebuild_runtime(home: &Path) -> Result<bool, String> {
+    if !home.exists() {
+        return Ok(false);
+    }
+    let launcher_ts = launcher_mtime()?;
+    let runtime_ts = path_mtime(home)?;
+    match (launcher_ts, runtime_ts) {
+        (Some(l), Some(r)) => Ok(l > r),
+        _ => Ok(false),
+    }
+}
+
+fn launcher_mtime() -> Result<Option<SystemTime>, String> {
+    let exe =
+        env::current_exe().map_err(|e| format!("Failed to locate current executable: {e}"))?;
+    path_mtime(&exe)
+}
+
+fn path_mtime(path: &Path) -> Result<Option<SystemTime>, String> {
+    let md = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read metadata {}: {e}", path.display()))?;
+    Ok(md.modified().ok())
 }
 
 fn runtime_home() -> Result<PathBuf, String> {
@@ -300,6 +337,7 @@ fn pip_install(
             .status()
             .map_err(|e| format!("Failed to run pip install for {spec}: {e}"))?;
         if status.success() {
+            remove_conflicting_jx_entrypoints(python);
             return Ok(());
         }
         return Err(format!(
@@ -314,6 +352,7 @@ fn pip_install(
         .output()
         .map_err(|e| format!("Failed to run pip install for {spec}: {e}"))?;
     if out.status.success() {
+        remove_conflicting_jx_entrypoints(python);
         return Ok(());
     }
     let mut msg = String::new();
@@ -324,6 +363,19 @@ fn pip_install(
         exit_code(out.status),
         msg.trim()
     ))
+}
+
+fn remove_conflicting_jx_entrypoints(python: &Path) {
+    let Some(dir) = python.parent() else {
+        return;
+    };
+    let candidates = ["jx", "jx.exe", "jx-script.py", "jx.cmd", "jx.bat"];
+    for name in candidates {
+        let p = dir.join(name);
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn ensure_git_available() -> Result<(), String> {

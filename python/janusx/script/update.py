@@ -186,25 +186,28 @@ def _maybe_spawn_windows_stage2(user_args: List[str], *, is_stage2: bool) -> boo
     if user_args:
         cmd.extend(user_args)
     try:
-        if hasattr(subprocess, "CREATE_NEW_CONSOLE"):
-            subprocess.Popen(
-                cmd,
-                close_fds=True,
-                creationflags=int(subprocess.CREATE_NEW_CONSOLE),  # type: ignore[arg-type]
-            )
-            print("Windows update launcher started in a new console window (progress shown there).")
-        else:
-            subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
-            print("Windows update launcher started in background. This terminal will return immediately.")
+        # Keep update in the same terminal (no popup window).
+        # Parent returns immediately to release jx.exe lock; stage2 continues.
+        subprocess.Popen(
+            cmd,
+            close_fds=False,
+        )
+        print("Windows update launcher started in this terminal.")
     except Exception:
         return False
     return True
+
+
+def _pause_windows_stage2_exit(*, is_stage2: bool) -> None:
+    if os.name != "nt" or not is_stage2:
+        return
+    if not bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        return
+    try:
+        print("Update finished. Press Enter to return...", flush=True)
+        input()
+    except Exception:
+        return
 
 
 def _parse_args(user_args: List[str]) -> argparse.Namespace:
@@ -241,7 +244,7 @@ def _run_pypi_update(spec: str, *, force_reinstall: bool, use_spinner: bool) -> 
         if proc.returncode == 0:
             after = _installed_version()
             if (not force_reinstall) and before is not None and after is not None and before == after:
-                task.complete(f"It is the latest PyPI version ({after})")
+                task.complete(f"Already the latest PyPI version ({after})")
                 show_latest_hint = True
             else:
                 task.complete("JanusX update completed.")
@@ -288,13 +291,12 @@ def main() -> None:
         _wait_for_parent_exit_on_windows(parent_pid, timeout_seconds=180)
 
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    if os.name == "nt" and is_stage2:
-        use_spinner = False
 
     if args.channel == "latest":
         _run_github_update(force_reinstall=bool(args.force_reinstall), use_spinner=use_spinner)
     else:
         _run_pypi_update(_PYPI_SPEC, force_reinstall=bool(args.force_reinstall), use_spinner=use_spinner)
+    _pause_windows_stage2_exit(is_stage2=is_stage2)
 
 
 if __name__ == "__main__":

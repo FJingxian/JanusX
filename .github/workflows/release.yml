@@ -10,6 +10,10 @@ on:
         description: "Git ref (tag/sha/branch) to build"
         required: false
         default: ""
+      installers_only:
+        description: "Only rebuild/upload release installers (skip wheels/sdist/PyPI)"
+        required: false
+        default: "false"
 
 jobs:
   build-installers:
@@ -59,7 +63,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
           if [ -z "$TAG" ]; then TAG="dev"; fi
           if [ -n "${{ matrix.ext }}" ]; then
             OUT="JanusX-${TAG}-${{ matrix.asset_suffix }}.${{ matrix.ext }}"
@@ -71,25 +76,25 @@ jobs:
           FILES="$OUT"
           if [[ "${{ matrix.target }}" == *"unknown-linux-gnu" ]]; then
             WRAP="${OUT}.run"
-            cat > "$WRAP" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-SELF="\$0"
-TMPDIR="\$(mktemp -d "\${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"
-cleanup() { rm -rf "\$TMPDIR"; }
-trap cleanup EXIT
-PAYLOAD_LINE="\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' "\$SELF")"
-if [[ -z "\${PAYLOAD_LINE:-}" ]]; then
-  echo "Installer payload missing."
-  exit 1
-fi
-BIN="\$TMPDIR/JanusX-installer"
-tail -n +"\$PAYLOAD_LINE" "\$SELF" > "\$BIN"
-chmod +x "\$BIN"
-exec "\$BIN" "\$@"
-exit 0
-__JANUSX_PAYLOAD_BELOW__
-EOF
+            {
+              printf '%s\n' '#!/usr/bin/env bash'
+              printf '%s\n' 'set -euo pipefail'
+              printf '%s\n' 'SELF="$0"'
+              printf '%s\n' 'TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"'
+              printf '%s\n' 'cleanup() { rm -rf "$TMPDIR"; }'
+              printf '%s\n' 'trap cleanup EXIT'
+              printf '%s\n' "PAYLOAD_LINE=\"\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' \"\$SELF\")\""
+              printf '%s\n' 'if [[ -z "${PAYLOAD_LINE:-}" ]]; then'
+              printf '%s\n' '  echo "Installer payload missing."'
+              printf '%s\n' '  exit 1'
+              printf '%s\n' 'fi'
+              printf '%s\n' 'BIN="$TMPDIR/JanusX-installer"'
+              printf '%s\n' 'tail -n +"$PAYLOAD_LINE" "$SELF" > "$BIN"'
+              printf '%s\n' 'chmod +x "$BIN"'
+              printf '%s\n' 'exec "$BIN" "$@"'
+              printf '%s\n' 'exit 0'
+              printf '%s\n' '__JANUSX_PAYLOAD_BELOW__'
+            } > "$WRAP"
             cat "$OUT" >> "$WRAP"
             chmod +x "$WRAP"
             FILES="$WRAP"
@@ -104,7 +109,8 @@ EOF
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ github.event.inputs.ref || github.ref_name }}"
+          if ($tag.StartsWith("refs/tags/")) { $tag = $tag.Substring(10) }
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "dev" }
           $out = "JanusX-$tag-${{ matrix.asset_suffix }}.${{ matrix.ext }}"
           Copy-Item "launcher/target/${{ matrix.target }}/release/jx.exe" $out
@@ -137,7 +143,8 @@ EOF
       - name: Create universal installer
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
           if [ -z "$TAG" ]; then TAG="dev"; fi
           X86_FILE=$(ls dist-installer-x86/JanusX-*darwin-x86_64 | head -n 1)
           ARM_FILE=$(ls dist-installer-arm/JanusX-*darwin-arm64 | head -n 1)
@@ -189,25 +196,25 @@ EOF
         shell: bash
         run: |
           WRAP="${PACKAGED_BINARY}.command"
-          cat > "$WRAP" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-SELF="\$0"
-TMPDIR="\$(mktemp -d "\${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"
-cleanup() { rm -rf "\$TMPDIR"; }
-trap cleanup EXIT
-PAYLOAD_LINE="\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' "\$SELF")"
-if [[ -z "\${PAYLOAD_LINE:-}" ]]; then
-  echo "Installer payload missing."
-  exit 1
-fi
-BIN="\$TMPDIR/JanusX-installer"
-tail -n +"\$PAYLOAD_LINE" "\$SELF" > "\$BIN"
-chmod +x "\$BIN"
-exec "\$BIN" "\$@"
-exit 0
-__JANUSX_PAYLOAD_BELOW__
-EOF
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'set -euo pipefail'
+            printf '%s\n' 'SELF="$0"'
+            printf '%s\n' 'TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"'
+            printf '%s\n' 'cleanup() { rm -rf "$TMPDIR"; }'
+            printf '%s\n' 'trap cleanup EXIT'
+            printf '%s\n' "PAYLOAD_LINE=\"\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' \"\$SELF\")\""
+            printf '%s\n' 'if [[ -z "${PAYLOAD_LINE:-}" ]]; then'
+            printf '%s\n' '  echo "Installer payload missing."'
+            printf '%s\n' '  exit 1'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'BIN="$TMPDIR/JanusX-installer"'
+            printf '%s\n' 'tail -n +"$PAYLOAD_LINE" "$SELF" > "$BIN"'
+            printf '%s\n' 'chmod +x "$BIN"'
+            printf '%s\n' 'exec "$BIN" "$@"'
+            printf '%s\n' 'exit 0'
+            printf '%s\n' '__JANUSX_PAYLOAD_BELOW__'
+          } > "$WRAP"
           cat "$PACKAGED_BINARY" >> "$WRAP"
           chmod +x "$WRAP"
           {
@@ -224,6 +231,7 @@ EOF
 
   build-wheels:
     name: Build wheels (${{ matrix.os }} / py${{ matrix.python-version }})
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -295,6 +303,7 @@ EOF
 
   build-sdist:
     name: Build sdist
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -339,6 +348,7 @@ EOF
 
   publish:
     name: Publish to PyPI
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     needs:
       - build-wheels
@@ -381,10 +391,21 @@ EOF
     needs:
       - build-installers
       - build-darwin-universal
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v') }}
     permissions:
       contents: write
     steps:
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          if [[ -z "$TAG" || ! "$TAG" =~ ^v ]]; then
+            echo "Invalid tag for release upload: '$TAG'"
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
@@ -400,14 +421,16 @@ EOF
       - name: Upload installers to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: dist-installers/JanusX-*
+          overwrite_files: true
 
   sync-version-back-to-repo:
     name: Sync Version Back To Repo
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') }}
     runs-on: ubuntu-latest
     needs:
       - publish
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:

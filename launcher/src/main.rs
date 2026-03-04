@@ -1,10 +1,11 @@
+use std::collections::VecDeque;
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    mpsc, Arc,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -714,14 +715,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
         } else {
             println!("JanusX runtime not found in venv. Installing from PyPI...");
         }
-        let _ = pip_install(
-            &python,
-            &home,
-            PYPI_SPEC,
-            false,
-            true,
-            "Updating from PyPI...",
-        )?;
+        let _ = pip_install_tail(&python, &home, PYPI_SPEC, false, "Updating from PyPI...", 5)?;
     }
     Ok(python)
 }
@@ -1227,16 +1221,7 @@ fn pip_install(
     verbose: bool,
     desc: &str,
 ) -> Result<Duration, String> {
-    let mut cmd = Command::new(python);
-    cmd.arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg("--upgrade")
-        .arg("--disable-pip-version-check");
-    if force_reinstall {
-        cmd.arg("--force-reinstall").arg("--no-cache-dir");
-    }
-    cmd.arg(spec);
+    let mut cmd = build_pip_install_cmd(python, spec, force_reinstall);
 
     if verbose {
         let start = Instant::now();
@@ -1272,6 +1257,214 @@ fn pip_install(
         exit_code(out.status),
         msg.trim()
     ))
+}
+
+fn build_pip_install_cmd(python: &Path, spec: &str, force_reinstall: bool) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--upgrade")
+        .arg("--disable-pip-version-check");
+    if force_reinstall {
+        cmd.arg("--force-reinstall").arg("--no-cache-dir");
+    }
+    cmd.arg(spec);
+    cmd
+}
+
+fn pip_install_tail(
+    python: &Path,
+    runtime_home: &Path,
+    spec: &str,
+    force_reinstall: bool,
+    desc: &str,
+    max_lines: usize,
+) -> Result<Duration, String> {
+    let is_tty = io::stdout().is_terminal();
+    let mut cmd = build_pip_install_cmd(python, spec, force_reinstall);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let start = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run pip install for {spec}: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture pip stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture pip stderr".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+    let out_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_out.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let err_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_err.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    drop(tx);
+
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame_i = 0usize;
+    let mut rendered = false;
+    let mut done = false;
+    let mut out_text = String::new();
+    let mut err_text = String::new();
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
+    let mut exit_status: Option<ExitStatus> = None;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(120)) {
+            Ok((is_err, line)) => {
+                if is_err {
+                    err_text.push_str(&line);
+                    err_text.push('\n');
+                } else {
+                    out_text.push_str(&line);
+                    out_text.push('\n');
+                }
+                if max_lines > 0 {
+                    if tail.len() == max_lines {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                done = true;
+            }
+        }
+
+        while let Ok((is_err, line)) = rx.try_recv() {
+            if is_err {
+                err_text.push_str(&line);
+                err_text.push('\n');
+            } else {
+                out_text.push_str(&line);
+                out_text.push('\n');
+            }
+            if max_lines > 0 {
+                if tail.len() == max_lines {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        }
+
+        if exit_status.is_none() {
+            if let Some(s) = child
+                .try_wait()
+                .map_err(|e| format!("Failed to poll pip install status: {e}"))?
+            {
+                exit_status = Some(s);
+            }
+        }
+        if done && exit_status.is_some() {
+            break;
+        }
+
+        if is_tty {
+            render_tail_block(
+                desc,
+                frames[frame_i % frames.len()],
+                start.elapsed(),
+                &tail,
+                max_lines,
+                rendered,
+            )?;
+            rendered = true;
+            frame_i += 1;
+        }
+    }
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+
+    let status = if let Some(s) = exit_status {
+        s
+    } else {
+        child
+            .wait()
+            .map_err(|e| format!("Failed to wait for pip install process: {e}"))?
+    };
+
+    if is_tty {
+        let final_symbol = if status.success() { "✔︎" } else { "✘" };
+        render_tail_block(
+            desc,
+            final_symbol,
+            start.elapsed(),
+            &tail,
+            max_lines,
+            rendered,
+        )?;
+    }
+
+    if status.success() {
+        remove_conflicting_jx_entrypoints(python);
+        write_python_core_update_marker(runtime_home, python);
+        return Ok(start.elapsed());
+    }
+
+    let mut msg = String::new();
+    msg.push_str(&out_text);
+    msg.push_str(&err_text);
+    Err(format!(
+        "pip install failed (exit={}) for {spec}\n{}",
+        exit_code(status),
+        msg.trim()
+    ))
+}
+
+fn render_tail_block(
+    desc: &str,
+    symbol: &str,
+    elapsed: Duration,
+    tail: &VecDeque<String>,
+    max_lines: usize,
+    rendered_before: bool,
+) -> Result<(), String> {
+    if rendered_before {
+        print!("\x1b[{}A", max_lines.saturating_add(1));
+    }
+    print!(
+        "\x1b[2K\r{} {} [{}]\n",
+        symbol,
+        desc,
+        format_elapsed(elapsed)
+    );
+    let mut shown = 0usize;
+    for line in tail {
+        print!("\x1b[2K\r{}\n", line);
+        shown += 1;
+    }
+    while shown < max_lines {
+        print!("\x1b[2K\r\n");
+        shown += 1;
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
 }
 
 fn remove_conflicting_jx_entrypoints(python: &Path) {

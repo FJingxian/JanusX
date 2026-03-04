@@ -634,7 +634,10 @@ def _parse_bimrange(value: object, logger: logging.Logger) -> tuple[str, int, in
     Supported formats:
       - chr:start-end
       - chr:start:end
-    start/end are interpreted as Mb.
+    Numeric interpretation:
+      - default: Mb
+      - if start/end look like bp-scale integers (>6 digits), they are
+        interpreted as bp (and axis labels remain in Mb).
     """
     text = str(value).strip()
     m = re.match(r"^([^:]+):([0-9]*\.?[0-9]+)(?:-|:)([0-9]*\.?[0-9]+)$", text)
@@ -644,17 +647,45 @@ def _parse_bimrange(value: object, logger: logging.Logger) -> tuple[str, int, in
             "Use chr:start-end (or chr:start:end)."
         )
     chrom = m.group(1)
-    start_mb = float(m.group(2))
-    end_mb = float(m.group(3))
-    if start_mb < 0 or end_mb < 0:
-        raise ValueError("Invalid --bimrange: start/end must be >= 0 (Mb).")
-    if start_mb > end_mb:
+    start_raw = m.group(2).strip()
+    end_raw = m.group(3).strip()
+    start_num = float(start_raw)
+    end_num = float(end_raw)
+
+    def _looks_like_bp_integer(token: str) -> bool:
+        tok = str(token).strip()
+        if "." in tok:
+            return False
+        tok = tok.lstrip("0")
+        if tok == "":
+            tok = "0"
+        return len(tok) > 6
+
+    use_bp_input = _looks_like_bp_integer(start_raw) or _looks_like_bp_integer(end_raw)
+    if use_bp_input:
         logger.warning(
-            f"bimrange start > end ({start_mb} > {end_mb}); swapped to {end_mb}-{start_mb} Mb."
+            "Warning: --bimrange looks like bp coordinates (>6 digits); "
+            "interpreting start/end as bp and showing axis in Mb."
         )
-        start_mb, end_mb = end_mb, start_mb
-    start = int(round(start_mb * 1_000_000))
-    end = int(round(end_mb * 1_000_000))
+        start = int(round(start_num))
+        end = int(round(end_num))
+        if start < 0 or end < 0:
+            raise ValueError("Invalid --bimrange: start/end must be >= 0 (bp).")
+        if start > end:
+            logger.warning(
+                f"bimrange start > end ({start} > {end}); swapped to {end}-{start} bp."
+            )
+            start, end = end, start
+    else:
+        if start_num < 0 or end_num < 0:
+            raise ValueError("Invalid --bimrange: start/end must be >= 0 (Mb).")
+        if start_num > end_num:
+            logger.warning(
+                f"bimrange start > end ({start_num} > {end_num}); swapped to {end_num}-{start_num} Mb."
+            )
+            start_num, end_num = end_num, start_num
+        start = int(round(start_num * 1_000_000))
+        end = int(round(end_num * 1_000_000))
     return chrom, start, end
 
 
@@ -1927,6 +1958,11 @@ def _overlay_manhattan_threshold_points(
     )
 
 
+def _save_figure_and_close(fig: plt.Figure, path: str) -> None:
+    fig.savefig(path, transparent=True)
+    plt.close(fig)
+
+
 def GWASplot(file: str, args, logger:logging.Logger) -> None:
     """
     Plot Manhattan/QQ figures and optionally annotate significant hits
@@ -2067,6 +2103,15 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         manh_min_logp = args.ylim_min if args.ylim_min is not None else default_manh_min
         manh_max_logp = args.ylim_max
         manh_ymin = manh_min_logp
+        postgwas_job_workers = max(1, int(getattr(args, "_postgwas_job_workers", 1)))
+        enable_pure_manhqq_parallel = (
+            postgwas_job_workers == 1
+            and args.manh_ratio is not None
+            and args.qq_ratio is not None
+            and effective_ldblock_ratio is None
+        )
+        pending_manh_fig: Optional[plt.Figure] = None
+        pending_manh_path: Optional[str] = None
 
         plot_colors = None
         two_color_style = _resolve_two_color_style(args.pallete_spec)
@@ -2261,67 +2306,95 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             fig.tight_layout()
             manh_axes_bounds = ax.get_position().bounds
             manh_path = f"{args.out}/{args.prefix}.manh.{args.format}"
-            fig.savefig(manh_path, transparent=True)
-            plt.close(fig)
+            if enable_pure_manhqq_parallel:
+                pending_manh_fig = fig
+                pending_manh_path = manh_path
+            else:
+                _save_figure_and_close(fig, manh_path)
         else:
             manh_path = None
 
         # ----------------- QQ plot -----------------
         if args.qq_ratio is not None:
-            if plotmodel_qq is None:
-                logger.warning("Warning: QQ plotting skipped because no SNPs are available.")
-                qq_path = None
-            else:
-                qq_y_in = 4.0
-                if manh_height_in is not None:
-                    qq_y_in = manh_height_in
-                qq_x_in = qq_y_in * args.qq_ratio
-                fig = plt.figure(
-                    figsize=(qq_x_in, qq_y_in),
-                    dpi=dpi,
+            manh_save_executor: Optional[cf.ThreadPoolExecutor] = None
+            manh_save_future: Optional[cf.Future] = None
+            if (
+                enable_pure_manhqq_parallel
+                and pending_manh_fig is not None
+                and pending_manh_path is not None
+            ):
+                manh_save_executor = cf.ThreadPoolExecutor(max_workers=1)
+                manh_save_future = manh_save_executor.submit(
+                    _save_figure_and_close,
+                    pending_manh_fig,
+                    pending_manh_path,
                 )
-                ax2 = fig.add_subplot(111)
-                plotmodel_qq.qq(
-                    ax=ax2,
-                    color_set=[qq_point_color, qq_band_color],
-                    line_color="black",
-                    scatter_size=args.scatter_size,
-                )
-                qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
-                if np.isfinite(qq_xmax) and qq_xmax > 0:
-                    x_left = 0.0
-                    x_right = float(qq_xmax)
+                pending_manh_fig = None
+                pending_manh_path = None
+            try:
+                if plotmodel_qq is None:
+                    logger.warning("Warning: QQ plotting skipped because no SNPs are available.")
+                    qq_path = None
                 else:
-                    x_left, x_right = ax2.get_xlim()
-                    x_left = float(x_left)
-                    x_right = float(x_right)
-                if x_right <= x_left:
-                    x_left, x_right = (0.0, max(1.0, x_right))
-                x_pad = max(1e-9, 0.02 * float(x_right - x_left))
-                ax2.set_xlim(x_left - x_pad, x_right + x_pad)
-                if manh_ylim is not None:
-                    ax2.set_ylim(manh_ylim)
-                if manh_yticks is not None and manh_ylim is not None:
-                    y0, y1 = ax2.get_ylim()
-                    lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
-                    yticks = [
-                        float(t) for t in manh_yticks
-                        if (t >= lo - 1e-12) and (t <= hi + 1e-12)
-                    ]
-                    ax2.set_yticks(yticks)
-                if manh_fontsize is not None:
-                    ax2.xaxis.label.set_size(manh_fontsize)
-                    ax2.yaxis.label.set_size(manh_fontsize)
-                    ax2.tick_params(axis="both", labelsize=manh_fontsize)
-                if hide_axis_labels:
-                    ax2.set_xlabel("")
-                    ax2.set_ylabel("")
-                fig.tight_layout()
-                qq_path = f"{args.out}/{args.prefix}.qq.{args.format}"
-                fig.savefig(qq_path, transparent=True)
-                plt.close(fig)
+                    qq_y_in = 4.0
+                    if manh_height_in is not None:
+                        qq_y_in = manh_height_in
+                    qq_x_in = qq_y_in * args.qq_ratio
+                    fig = plt.figure(
+                        figsize=(qq_x_in, qq_y_in),
+                        dpi=dpi,
+                    )
+                    ax2 = fig.add_subplot(111)
+                    plotmodel_qq.qq(
+                        ax=ax2,
+                        color_set=[qq_point_color, qq_band_color],
+                        line_color="black",
+                        scatter_size=args.scatter_size,
+                    )
+                    qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
+                    if np.isfinite(qq_xmax) and qq_xmax > 0:
+                        x_left = 0.0
+                        x_right = float(qq_xmax)
+                    else:
+                        x_left, x_right = ax2.get_xlim()
+                        x_left = float(x_left)
+                        x_right = float(x_right)
+                    if x_right <= x_left:
+                        x_left, x_right = (0.0, max(1.0, x_right))
+                    x_pad = max(1e-9, 0.02 * float(x_right - x_left))
+                    ax2.set_xlim(x_left - x_pad, x_right + x_pad)
+                    if manh_ylim is not None:
+                        ax2.set_ylim(manh_ylim)
+                    if manh_yticks is not None and manh_ylim is not None:
+                        y0, y1 = ax2.get_ylim()
+                        lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
+                        yticks = [
+                            float(t) for t in manh_yticks
+                            if (t >= lo - 1e-12) and (t <= hi + 1e-12)
+                        ]
+                        ax2.set_yticks(yticks)
+                    if manh_fontsize is not None:
+                        ax2.xaxis.label.set_size(manh_fontsize)
+                        ax2.yaxis.label.set_size(manh_fontsize)
+                        ax2.tick_params(axis="both", labelsize=manh_fontsize)
+                    if hide_axis_labels:
+                        ax2.set_xlabel("")
+                        ax2.set_ylabel("")
+                    fig.tight_layout()
+                    qq_path = f"{args.out}/{args.prefix}.qq.{args.format}"
+                    fig.savefig(qq_path, transparent=True)
+                    plt.close(fig)
+            finally:
+                if manh_save_future is not None:
+                    manh_save_future.result()
+                if manh_save_executor is not None:
+                    manh_save_executor.shutdown(wait=True)
         else:
             qq_path = None
+        if pending_manh_fig is not None and pending_manh_path is not None:
+            _save_figure_and_close(pending_manh_fig, pending_manh_path)
+            pending_manh_fig = None
+            pending_manh_path = None
 
         # ----------------- LD block -----------------
         gene_path = None
@@ -3510,11 +3583,16 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     if len(files) == 0:
         return
     if len(files) == 1:
+        setattr(args, "_postgwas_job_workers", 1)
         GWASplot(files[0], args, logger)
         return
 
     total_start_ts = time.monotonic()
     done_count = 0
+    req_threads = int(args.thread)
+    if req_threads == -1:
+        req_threads = int(os.cpu_count() or 1)
+    logical_workers = max(1, min(req_threads, len(files)))
 
     if _HAS_RICH_PROGRESS and sys.stdout.isatty():
         n_total = len(files)
@@ -3522,10 +3600,8 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         name_width = max((len(x) for x in basenames), default=0)
         idx_width = len(str(n_total))
         max_visible = min(5, n_total)
-        req_threads = int(args.thread)
-        if req_threads == -1:
-            req_threads = int(os.cpu_count() or 1)
         n_workers = max(1, min(req_threads, max_visible, n_total))
+        setattr(args, "_postgwas_job_workers", int(n_workers))
         file_to_idx = {f: i for i, f in enumerate(files, start=1)}
         progress = Progress(
             SpinnerColumn(
@@ -3633,6 +3709,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         return
 
     if _HAS_TQDM:
+        setattr(args, "_postgwas_job_workers", int(logical_workers))
         pbar = tqdm(
             total=len(files),
             desc="PostGWAS tasks",
@@ -3662,6 +3739,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]")
         return
 
+    setattr(args, "_postgwas_job_workers", int(logical_workers))
     Parallel(n_jobs=args.thread, backend="loky")(
         delayed(GWASplot)(file, args, logger) for file in files
     )
@@ -3725,7 +3803,10 @@ def main():
         "-bimrange", "--bimrange", type=str, action="append", default=None,
         help=(
             "Plotting range filter in Mb, format chr:start-end "
-            "(also accepts chr:start:end). Can be specified multiple times."
+            "(also accepts chr:start:end). "
+            "If start/end are integer-like and >6 digits, they are auto-treated as bp "
+            "(with warning) and axis labels are shown in Mb. "
+            "Can be specified multiple times."
         ),
     )
     optional_group.add_argument(

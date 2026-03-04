@@ -28,7 +28,7 @@ Type conventions
 from __future__ import annotations
 
 import time
-from typing import Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from scipy.linalg import eigh
@@ -41,7 +41,6 @@ warnings.filterwarnings(
 )
 
 from joblib import Parallel, delayed, cpu_count
-from tqdm import trange
 
 # Rust core kernels (PyO3 extension)
 from janusx.janusx import (
@@ -1095,7 +1094,9 @@ def farmcpu(
     iter: int = 30,
     threshold: float = 0.05,
     threads: int = 1,
-) -> np.ndarray:
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    return_info: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
     """
     FarmCPU GWAS (Fixed and random model Circulating Probability Unification).
 
@@ -1143,11 +1144,21 @@ def farmcpu(
           - Rust FEM threads
           - joblib Parallel workers (outer loops)
 
+    progress_cb : callable or None
+        Optional callback receiving `(done_iter, total_iter)` to report
+        FarmCPU iteration progress to external UIs (e.g. Rich progress bars).
+    return_info : bool, default False
+        If True, return `(out, info)` where `info` includes summary metadata
+        such as the final pseudo-QTN count.
+
     Returns
     -------
     out : np.ndarray, shape (m, 3)
         Columns: beta, se, p (final iteration).
         P-values for selected QTNs are replaced by their covariate-min p-values.
+    (out, info) : tuple, optional
+        Returned when `return_info=True`.
+        `info["n_pseudo_qtn"]` is the number of final pseudo-QTNs.
     """
     threads = cpu_count() if threads == -1 else int(threads)
 
@@ -1172,7 +1183,7 @@ def farmcpu(
 
     QTNidx = np.array([], dtype=int)
 
-    for _ in trange(iter, desc="Process of FarmCPU", ascii=False):
+    for i_iter in range(int(iter)):
         X_QTN = np.concatenate([X, M[QTNidx].T], axis=1) if QTNidx.size > 0 else X
 
         FEMresult = FEM(y, X_QTN, M, threads=threads)
@@ -1187,6 +1198,8 @@ def farmcpu(
 
         # Stop if no SNP passes threshold
         if np.sum(FEMp <= threshold / m) == 0:
+            if progress_cb is not None:
+                progress_cb(i_iter + 1, int(iter))
             break
 
         # Build grid tasks for REM
@@ -1206,9 +1219,12 @@ def farmcpu(
         QTNidx_pre = QTNidx_pre[keep]
 
         if np.array_equal(QTNidx_pre, QTNidx):
+            if progress_cb is not None:
+                progress_cb(i_iter + 1, int(iter))
             break
         QTNidx = QTNidx_pre
-    print(QTNidx)
+        if progress_cb is not None:
+            progress_cb(i_iter + 1, int(iter))
     # Final scan with final QTN set
     X_QTN = np.concatenate([X, M[QTNidx].T], axis=1)
     FEMresult = FEM(y, X_QTN, M, threads=threads)
@@ -1242,4 +1258,7 @@ def farmcpu(
             beta_se[qidx, 0] = full[j, base]
             beta_se[qidx, 1] = full[j, base + 1]
 
-    return np.concatenate([beta_se, p.reshape(-1, 1)], axis=1)
+    out = np.concatenate([beta_se, p.reshape(-1, 1)], axis=1)
+    if return_info:
+        return out, {"n_pseudo_qtn": int(QTNidx.size)}
+    return out

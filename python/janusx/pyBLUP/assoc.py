@@ -28,10 +28,11 @@ Type conventions
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
-from scipy.linalg import eigh
+from scipy.linalg import eigh, cho_factor, cho_solve
 import warnings
 
 warnings.filterwarnings(
@@ -41,6 +42,10 @@ warnings.filterwarnings(
 )
 
 from joblib import Parallel, delayed, cpu_count
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    _threadpool_limits = None
 
 # Rust core kernels (PyO3 extension)
 from janusx.janusx import (
@@ -62,6 +67,7 @@ def FEM(
     M: np.ndarray,
     chunksize: int = 50_000,
     threads: int = 1,
+    ixx: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Fixed Effects Model (FEM) GWAS scan (fast GLM/LM in Rust, chunked).
@@ -125,8 +131,11 @@ def FEM(
     y = np.ascontiguousarray(y, dtype=np.float64).ravel()
     X = np.ascontiguousarray(X, dtype=np.float64)
 
-    # Precompute (X'X)^(-1) in Python (matches your Rust signature)
-    ixx = np.ascontiguousarray(np.linalg.pinv(X.T @ X), dtype=np.float64)
+    # Precompute (X'X)^(-1) once unless caller provides a cached matrix.
+    if ixx is None:
+        ixx = np.ascontiguousarray(np.linalg.pinv(X.T @ X), dtype=np.float64)
+    else:
+        ixx = np.ascontiguousarray(ixx, dtype=np.float64)
 
     if M.ndim != 2:
         raise ValueError("M must be a 2D array with shape (m, n) [SNP-major].")
@@ -140,7 +149,16 @@ def FEM(
         end = min(start+chunksize,M.shape[0])
         # Genotypes as f32 for Rust SIMD / bandwidth-friendly kernels
         # ---- Call Rust kernel ----
-        result.append(glmf32(y, X, ixx, np.ascontiguousarray(M[start:end], dtype=np.float32), int(chunksize), int(threads)))
+        result.append(
+            glmf32(
+                y,
+                X,
+                ixx,
+                np.ascontiguousarray(M[start:end], dtype=np.float32),
+                int(end - start),
+                int(threads),
+            )
+        )
     return np.concatenate(result,axis=0)
 
 
@@ -825,6 +843,8 @@ class LM:
             if X is not None
             else np.ones((self.y.shape[0], 1))
         )
+        # Cache (X'X)^(-1) for repeated chunk scans on the same trait.
+        self.ixx = np.ascontiguousarray(np.linalg.pinv(self.X.T @ self.X), dtype=np.float64)
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
         """
@@ -843,7 +863,14 @@ class LM:
         beta_se_p : np.ndarray, shape (m, 3)
             Columns: beta, se, p (as you slice in the original code).
         """
-        beta_se_p = FEM(self.y, self.X, snp, snp.shape[0], threads)[:, [0, 1, -1]]
+        beta_se_p = FEM(
+            self.y,
+            self.X,
+            snp,
+            snp.shape[0],
+            threads,
+            ixx=self.ixx,
+        )[:, [0, 1, -1]]
         return beta_se_p
 
 
@@ -881,6 +908,29 @@ def REM(sz, n, pvalue, pos, M, y, X):
 def _pinv_safe(A: np.ndarray, rcond: float = 1e-12) -> np.ndarray:
     """Numerically safe pseudo-inverse wrapper."""
     return np.linalg.pinv(A, rcond=rcond)
+
+
+def _solve_beta_system(
+    A: np.ndarray,
+    b: np.ndarray,
+    *,
+    pinv_rcond: float = 1e-12,
+) -> np.ndarray:
+    """
+    Solve A x = b via fast/stable path:
+      1) Cholesky (with small ridge retries),
+      2) fallback to pseudo-inverse.
+    """
+    p = int(A.shape[0])
+    eye = np.eye(p, dtype=A.dtype)
+    for ridge in (0.0, 1e-10, 1e-8, 1e-6):
+        try:
+            A_use = A if ridge == 0.0 else (A + ridge * eye)
+            c, lower = cho_factor(A_use, overwrite_a=False, check_finite=False)
+            return cho_solve((c, lower), b, check_finite=False)
+        except Exception:
+            continue
+    return _pinv_safe(A, rcond=pinv_rcond) @ b
 
 
 def ll(
@@ -995,8 +1045,11 @@ def ll(
         beta2 = (IUX.T @ IUX) / delta
         beta4 = (IUX.T @ IUY) / delta
 
-        zw1 = _pinv_safe(beta1 + beta2, rcond=pinv_rcond)
-        beta = zw1 @ (beta3 + beta4)
+        beta = _solve_beta_system(
+            beta1 + beta2,
+            beta3 + beta4,
+            pinv_rcond=pinv_rcond,
+        )
 
         part11 = n * np.log(2.0 * np.pi)
         part13 = (n - r) * np.log(delta)
@@ -1094,6 +1147,8 @@ def farmcpu(
     iter: int = 30,
     threshold: float = 0.05,
     threads: int = 1,
+    fem_threads: Optional[int] = None,
+    rem_jobs: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     return_info: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
@@ -1139,10 +1194,12 @@ def farmcpu(
         Uses Bonferroni-like criterion: threshold / m.
 
     threads : int
-        If -1, use all CPU cores.
-        Used both for:
-          - Rust FEM threads
-          - joblib Parallel workers (outer loops)
+        If -1, use all CPU cores. Acts as default thread budget.
+    fem_threads : int or None
+        Number of threads for Rust FEM kernels. None -> use `threads`.
+    rem_jobs : int or None
+        Number of joblib workers for REM grid-search. None -> use `threads`
+        but capped by current REM task count.
 
     progress_cb : callable or None
         Optional callback receiving `(done_iter, total_iter)` to report
@@ -1161,6 +1218,9 @@ def farmcpu(
         `info["n_pseudo_qtn"]` is the number of final pseudo-QTNs.
     """
     threads = cpu_count() if threads == -1 else int(threads)
+    threads = max(1, threads)
+    fem_threads = threads if fem_threads is None else int(fem_threads)
+    fem_threads = max(1, fem_threads)
 
     m, n = M.shape
 
@@ -1176,7 +1236,11 @@ def farmcpu(
         QTNbound = int(np.sqrt(n / np.log10(n)))
 
     szbin = np.array(szbin)
-    nbin = np.array(range(QTNbound // nbin, QTNbound + 1, QTNbound // nbin))
+    nbin_den = max(1, int(nbin))
+    nbin_step = max(1, int(QTNbound // nbin_den))
+    nbin = np.array(range(nbin_step, QTNbound + 1, nbin_step))
+    if nbin.size == 0:
+        nbin = np.array([int(QTNbound)], dtype=int)
 
     # Add intercept
     X = np.concatenate([np.ones((y.shape[0], 1)), X], axis=1) if X is not None else np.ones((y.shape[0], 1))
@@ -1186,7 +1250,7 @@ def farmcpu(
     for i_iter in range(int(iter)):
         X_QTN = np.concatenate([X, M[QTNidx].T], axis=1) if QTNidx.size > 0 else X
 
-        FEMresult = FEM(y, X_QTN, M, threads=threads)
+        FEMresult = FEM(y, X_QTN, M, threads=fem_threads)
         FEMresult[:, 2:] = np.nan_to_num(FEMresult[:, 2:], nan=1)
 
         # p-values of pseudo-QTNs as covariates
@@ -1204,13 +1268,22 @@ def farmcpu(
 
         # Build grid tasks for REM
         combine_list = [(sz, n_) for sz in szbin for n_ in nbin]
-
-        REMresult = Parallel(threads,
-                            max_nbytes="1M",
-                            mmap_mode="r",
-                            temp_folder="/tmp/janusx-joblib",)(
-            delayed(REM)(sz, n_, FEMp, pos, M, y, X_QTN) for sz, n_ in combine_list
+        rem_jobs_i = threads if rem_jobs is None else int(rem_jobs)
+        rem_jobs_i = max(1, min(int(len(combine_list)), int(rem_jobs_i)))
+        blas_guard = (
+            _threadpool_limits(limits=1)
+            if _threadpool_limits is not None
+            else nullcontext()
         )
+
+        with blas_guard:
+            REMresult = Parallel(
+                n_jobs=rem_jobs_i,
+                prefer="threads",
+            )(
+                delayed(REM)(sz, n_, FEMp, pos, M, y, X_QTN)
+                for sz, n_ in combine_list
+            )
 
         optcombidx = int(np.argmin([l for l, _idx in REMresult]))
         QTNidx_pre = np.unique(np.concatenate([REMresult[optcombidx][1], QTNidx]))
@@ -1227,7 +1300,7 @@ def farmcpu(
             progress_cb(i_iter + 1, int(iter))
     # Final scan with final QTN set
     X_QTN = np.concatenate([X, M[QTNidx].T], axis=1)
-    FEMresult = FEM(y, X_QTN, M, threads=threads)
+    FEMresult = FEM(y, X_QTN, M, threads=fem_threads)
     FEMresult[:, 2:] = np.nan_to_num(FEMresult[:, 2:], nan=1)
 
     QTNpval = FEMresult[:, 2 + X.shape[1] : -1].min(axis=0)
@@ -1248,7 +1321,7 @@ def farmcpu(
             ixx,
             M_sub,
             int(M_sub.shape[0]),
-            int(threads),
+            int(fem_threads),
         )
         full = np.asarray(full)
         qtn_offset = X.shape[1]

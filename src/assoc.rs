@@ -4,7 +4,11 @@ use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
 use rayon::prelude::*;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use crate::brent::brent_minimize;
 use crate::linalg::{
@@ -18,6 +22,32 @@ use crate::linalg::{
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+thread_local! {
+    static LOCAL_RAYON_POOLS: RefCell<HashMap<usize, Arc<rayon::ThreadPool>>> =
+        RefCell::new(HashMap::new());
+}
+
+#[inline]
+fn get_cached_pool(threads: usize) -> PyResult<Option<Arc<rayon::ThreadPool>>> {
+    if threads == 0 {
+        return Ok(None);
+    }
+    LOCAL_RAYON_POOLS.with(|cell| {
+        let mut pools = cell.borrow_mut();
+        if let Some(tp) = pools.get(&threads) {
+            return Ok(Some(Arc::clone(tp)));
+        }
+        let tp = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
+        );
+        pools.insert(threads, Arc::clone(&tp));
+        Ok(Some(tp))
+    })
 }
 
 /// 用 cholesky(L) 解 A x = b，a 中存的是 L（下三角）
@@ -261,13 +291,20 @@ pub fn glmf32<'py>(
             "n too small: require n > q0+1, got n={n}, q0={q0}"
         )));
     }
+    let g_slice_opt = g.as_slice().ok();
 
     let m = g_arr.shape()[0];
     let row_stride = q0 + 3;
     let dim = q0 + 1;
 
-    let x_flat: Vec<f64> = x_arr.iter().cloned().collect();
-    let ixx_flat: Vec<f64> = ixx_arr.iter().cloned().collect();
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    };
 
     let mut xy = vec![0.0; q0];
     for i in 0..n {
@@ -285,16 +322,7 @@ pub fn glmf32<'py>(
             .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
     };
 
-    let pool = if threads > 0 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let pool = get_cached_pool(threads)?;
 
     py.detach(|| {
         let mut runner = || {
@@ -312,14 +340,28 @@ pub fn glmf32<'py>(
                         let mut sy = 0.0_f64;
                         let mut ss = 0.0_f64;
 
-                        for k in 0..n {
-                            let gv = g_arr[(idx, k)] as f64; // float32 -> f64
-                            sy += gv * y[k];
-                            ss += gv * gv;
+                        if let Some(gs) = g_slice_opt {
+                            let grow = &gs[idx * n..(idx + 1) * n];
+                            for k in 0..n {
+                                let gv = grow[k] as f64;
+                                sy += gv * y[k];
+                                ss += gv * gv;
 
-                            let row = &x_flat[k * q0..(k + 1) * q0];
-                            for j in 0..q0 {
-                                scr.xs[j] += row[j] * gv;
+                                let row = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += row[j] * gv;
+                                }
+                            }
+                        } else {
+                            for k in 0..n {
+                                let gv = g_arr[(idx, k)] as f64; // float32 -> f64
+                                sy += gv * y[k];
+                                ss += gv * gv;
+
+                                let row = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += row[j] * gv;
+                                }
                             }
                         }
 
@@ -421,13 +463,20 @@ pub fn glmf32_full<'py>(
             "n too small: require n > q0+1, got n={n}, q0={q0}"
         )));
     }
+    let g_slice_opt = g.as_slice().ok();
 
     let m = g_arr.shape()[0];
     let dim = q0 + 1;
     let row_stride = dim * 3;
 
-    let x_flat: Vec<f64> = x_arr.iter().cloned().collect();
-    let ixx_flat: Vec<f64> = ixx_arr.iter().cloned().collect();
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    };
 
     let mut xy = vec![0.0; q0];
     for i in 0..n {
@@ -445,16 +494,7 @@ pub fn glmf32_full<'py>(
             .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
     };
 
-    let pool = if threads > 0 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let pool = get_cached_pool(threads)?;
 
     py.detach(|| {
         let mut runner = || {
@@ -472,14 +512,28 @@ pub fn glmf32_full<'py>(
                         let mut sy = 0.0_f64;
                         let mut ss = 0.0_f64;
 
-                        for k in 0..n {
-                            let gv = g_arr[(idx, k)] as f64;
-                            sy += gv * y[k];
-                            ss += gv * gv;
+                        if let Some(gs) = g_slice_opt {
+                            let grow = &gs[idx * n..(idx + 1) * n];
+                            for k in 0..n {
+                                let gv = grow[k] as f64;
+                                sy += gv * y[k];
+                                ss += gv * gv;
 
-                            let row = &x_flat[k * q0..(k + 1) * q0];
-                            for j in 0..q0 {
-                                scr.xs[j] += row[j] * gv;
+                                let row = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += row[j] * gv;
+                                }
+                            }
+                        } else {
+                            for k in 0..n {
+                                let gv = g_arr[(idx, k)] as f64;
+                                sy += gv * y[k];
+                                ss += gv * gv;
+
+                                let row = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += row[j] * gv;
+                                }
                             }
                         }
 
@@ -887,7 +941,10 @@ pub fn lmm_reml_null_f32<'py>(
         return Err(PyRuntimeError::new_err("low must be < high"));
     }
 
-    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
     let (best_log10_lbd, best_cost) = brent_minimize(
         |x| -reml_loglike(x, s, &xcov_flat, y, None, n, p_cov),
         low,
@@ -923,7 +980,10 @@ pub fn ml_loglike_null_f32<'py>(
         return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
     }
 
-    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
     let ml = ml_loglike(log10_lbd, s, &xcov_flat, y, None, n, p_cov);
     Ok(ml)
 }
@@ -964,7 +1024,11 @@ pub fn lmm_reml_chunk_f32<'py>(
     }
 
     let m_chunk = g_arr.shape()[0];
-    let xcov_flat: Vec<f64> = xcov_arr.iter().cloned().collect();
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let g_slice_opt = g_rot_chunk.as_slice().ok();
 
     let with_plrt = nullml.is_some();
     let nullml_val = nullml.unwrap_or(0.0);
@@ -977,6 +1041,8 @@ pub fn lmm_reml_chunk_f32<'py>(
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("beta_se_p not contiguous"))?
     };
+    // For REML chunk scanning, rebuilding a local pool is consistently faster
+    // than thread-local pool reuse in CLI LMM benchmarks.
     let pool = if threads > 0 {
         Some(
             rayon::ThreadPoolBuilder::new()
@@ -989,69 +1055,75 @@ pub fn lmm_reml_chunk_f32<'py>(
     };
 
     py.detach(|| {
-        let compute_all = || {
-            (0..m_chunk)
-                .into_par_iter()
-                .map(|idx| {
-                    let row = g_arr.row(idx);
-                    let mut snp_vec = vec![0.0_f64; n];
-                    for i in 0..n {
-                        snp_vec[i] = row[i] as f64;
-                    }
-
-                    let (best_log10_lbd, _best_cost) = brent_minimize(
-                        |x| -reml_loglike(x, s, &xcov_flat, y, Some(&snp_vec), n, p_cov),
-                        low,
-                        high,
-                        tol,
-                        max_iter,
-                    );
-
-                    let (beta, se, _lbd) =
-                        final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
-
-                    let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
-                        let z = beta / se;
-                        (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
-                    } else {
-                        1.0
-                    };
-
-                    let plrt = if with_plrt {
-                        let ml =
-                            ml_loglike(best_log10_lbd, s, &xcov_flat, y, Some(&snp_vec), n, p_cov);
-                        if ml.is_finite() {
-                            let mut stat = 2.0 * (ml - nullml_val);
-                            if !stat.is_finite() || stat < 0.0 {
-                                stat = 0.0;
+        let mut run = || {
+            beta_se_p_slice
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; n],
+                    |snp_vec, (idx, out_row)| {
+                        if let Some(gs) = g_slice_opt {
+                            let row = &gs[idx * n..(idx + 1) * n];
+                            for i in 0..n {
+                                snp_vec[i] = row[i] as f64;
                             }
-                            chi2_sf_df1(stat)
+                        } else {
+                            let row = g_arr.row(idx);
+                            for i in 0..n {
+                                snp_vec[i] = row[i] as f64;
+                            }
+                        }
+
+                        let (best_log10_lbd, _best_cost) = brent_minimize(
+                            |x| -reml_loglike(x, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
+                            low,
+                            high,
+                            tol,
+                            max_iter,
+                        );
+
+                        let (beta, se, _lbd) =
+                            final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
+
+                        let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                            let z = beta / se;
+                            (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
                         } else {
                             1.0
+                        };
+
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        out_row[2] = if p.is_finite() { p } else { 1.0 };
+
+                        if with_plrt {
+                            let ml = ml_loglike(
+                                best_log10_lbd,
+                                s,
+                                &xcov_flat,
+                                y,
+                                Some(&snp_vec[..]),
+                                n,
+                                p_cov,
+                            );
+                            out_row[3] = if ml.is_finite() {
+                                let mut stat = 2.0 * (ml - nullml_val);
+                                if !stat.is_finite() || stat < 0.0 {
+                                    stat = 0.0;
+                                }
+                                chi2_sf_df1(stat)
+                            } else {
+                                1.0
+                            };
                         }
-                    } else {
-                        0.0
-                    };
-
-                    (beta, se, if p.is_finite() { p } else { 1.0 }, plrt)
-                })
-                .collect::<Vec<(f64, f64, f64, f64)>>()
+                    },
+                );
         };
 
-        let results = if let Some(pool) = &pool {
-            pool.install(compute_all)
+        if let Some(tp) = &pool {
+            tp.install(run);
         } else {
-            compute_all()
-        };
-
-        for (idx, (beta, se, p, plrt)) in results.into_iter().enumerate() {
-            let out_row = &mut beta_se_p_slice[idx * out_cols..(idx + 1) * out_cols];
-            out_row[0] = beta;
-            out_row[1] = se;
-            out_row[2] = p;
-            if with_plrt {
-                out_row[3] = plrt;
-            }
+            run();
         }
     });
 
@@ -1207,16 +1279,7 @@ pub fn lmm_assoc_chunk_f32<'py>(
     }
 
     // Thread pool
-    let pool = if threads > 0 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let pool = get_cached_pool(threads)?;
 
     py.detach(|| {
         let mut run = || {
@@ -1527,16 +1590,7 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
     let df = (n as isize) - (p as isize) - 1;
     let df_f = df as f64;
 
-    let pool = if threads > 0 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let pool = get_cached_pool(threads)?;
 
     py.detach(|| {
         let mut run = || {

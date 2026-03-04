@@ -132,6 +132,51 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * 60)
 
 
+def _emit_gwas_summary(
+    logger: logging.Logger,
+    rows: list[dict[str, object]],
+) -> None:
+    if len(rows) == 0:
+        return
+
+    _section(logger, "Summary")
+    headers = [
+        "pheno",
+        "model",
+        "nidv",
+        "nsnp",
+        "cpu(%)",
+        "mem(G)",
+        "Ctime(s)",
+        "Vtime(s)",
+    ]
+
+    out_rows: list[list[str]] = []
+    for r in rows:
+        out_rows.append(
+            [
+                str(r.get("phenotype", "")),
+                str(r.get("model", "")),
+                f"{int(r.get('nidv', 0))}",
+                f"{int(r.get('eff_snp', 0))}",
+                f"{float(r.get('avg_cpu', 0.0)):.1f}",
+                f"{float(r.get('peak_rss_gb', 0.0)):.2f}",
+                f"{float(r.get('gwas_time_s', 0.0)):.1f}",
+                f"{float(r.get('viz_time_s', 0.0)):.1f}",
+            ]
+        )
+
+    widths = [len(h) for h in headers]
+    for row in out_rows:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    header_line = "  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    logger.info(header_line)
+    for row in out_rows:
+        logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+
+
 def _log_file_only(logger: logging.Logger, level: int, message: str) -> None:
     """
     Emit a log record to file handlers only.
@@ -281,6 +326,13 @@ class _ProgressAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.set_postfix_str(text)
 
+    def set_desc(self, desc: str) -> None:
+        self.desc = str(desc)
+        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, description=self.desc)
+        elif self._backend == "tqdm" and self._tqdm is not None:
+            self._tqdm.set_description_str(self.desc)
+
     def finish(self) -> None:
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
             self._progress.update(self._task_id, completed=self.total)
@@ -289,7 +341,7 @@ class _ProgressAdapter:
             self._tqdm.refresh()
         self._finished = True
 
-    def close(self) -> None:
+    def close(self, done_text: str = "Finished") -> None:
         elapsed = format_elapsed(time.monotonic() - self._start_ts)
         if self._backend == "rich" and self._progress is not None:
             self._progress.stop()
@@ -299,7 +351,7 @@ class _ProgressAdapter:
             self._tqdm.close()
             self._tqdm = None
         if self._finished:
-            print_success(f"{self.desc} ...Finished [{elapsed}]")
+            print_success(f"{self.desc} ...{done_text} [{elapsed}]")
 
 
 def fastplot(
@@ -812,25 +864,14 @@ def _load_covariates_for_models(
         raise ValueError(f"No overlapping samples between genotype and covariates ({context}).")
 
     mats: list[np.ndarray] = []
-    for ids_i, cov_i, name in parts:
+    for ids_i, cov_i, _name in parts:
         idx_map = {sid: i for i, sid in enumerate(ids_i.astype(str))}
         take = [idx_map[sid] for sid in ordered_ids]
         sub = cov_i[take]
         mats.append(sub.astype("float32", copy=False))
-        _rich_success(
-            logger,
-            f"Aligned covariate source '{name}' (n={sub.shape[0]}, ncov={sub.shape[1]})",
-            use_spinner=use_spinner,
-        )
 
     cov_all = np.concatenate(mats, axis=1).astype("float32", copy=False)
     cov_ids = np.asarray(ordered_ids, dtype=str)
-    _rich_success(
-        logger,
-        f"Combined covariate matrix ({context}) (n={cov_all.shape[0]}, ncov={cov_all.shape[1]}) "
-        f"from {len(parts)} source(s).",
-        use_spinner=use_spinner,
-    )
     return cov_all, cov_ids
 
 
@@ -1728,7 +1769,7 @@ def prepare_streaming_context(
         raise ValueError("No overlapping samples across genotype/phenotype/GRM/Q/cov.")
 
     logger.info(
-        f"Sample intersection: geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
+        f"geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
         f"grm={'NA' if grm_ids is None else len(grm_ids)}, "
         f"q={'NA' if q_ids is None else len(q_ids)}, "
         f"cov={'NA' if cov_ids is None else len(cov_ids)} -> {len(common_ids)}"
@@ -1788,6 +1829,9 @@ def run_chunked_gwas_lmm_lm(
     threads: int,
     logger:logging.Logger,
     use_spinner: bool = False,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
 ) -> None:
     """
     Run LMM or LM GWAS using a streaming, low-memory pipeline.
@@ -1858,23 +1902,29 @@ def run_chunked_gwas_lmm_lm(
     process = psutil.Process()
     n_cores = psutil.cpu_count(logical=True) or cpu_count()
 
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
     trait_names = list(pheno.columns)
     for trait_idx, pname in enumerate(trait_names):
-        if trait_idx > 0:
-            logger.info("-" * 60)
-        logger.info(f"Streaming {model_label} GWAS for trait: {pname}")
-
         cpu_t0 = process.cpu_times()
         rss0 = process.memory_info().rss
         t0 = time.time()
         peak_rss = rss0
+        evd_secs = 0.0
 
         pheno_sub = pheno[pname].dropna()
         sameidx = np.isin(ids, pheno_sub.index)
-        if np.sum(sameidx) == 0:
-            logger.info(
-                f"No overlapping samples between genotype and phenotype {pname}. Skipped."
-            )
+        n_idv = int(np.sum(sameidx))
+        if n_idv == 0:
+            logger.info(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            logger.info("")  # single blank line between traits
             continue
 
         trait_ids = np.asarray(ids[sameidx], dtype=str)
@@ -1891,9 +1941,12 @@ def run_chunked_gwas_lmm_lm(
             evd_t0 = time.monotonic()
             with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
                 mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
-            evd_elapsed = format_elapsed(time.monotonic() - evd_t0)
-            logger.info(
-                f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}, PVE(null): {mod.pve:.3f}"
+            evd_secs = time.monotonic() - evd_t0
+            evd_elapsed = format_elapsed(evd_secs)
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"{model_label}, trait: {pname}, PVE(null): {mod.pve:.3f}",
             )
             if use_spinner:
                 print_success(f"Eigen-Decomposition ...Finished [{evd_elapsed}]")
@@ -1901,7 +1954,7 @@ def run_chunked_gwas_lmm_lm(
                 logger.info(f"Eigen-Decomposition ...Finished [{evd_elapsed}]")
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
-            logger.info(f"Samples: {np.sum(sameidx)}, Total SNPs: {eff_m}")
+            _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
 
         done_snps = 0
         has_results = False
@@ -1925,7 +1978,12 @@ def run_chunked_gwas_lmm_lm(
         threads_per_worker = max(1, scan_threads // workers)
 
         process.cpu_percent(interval=None)
-        pbar = _ProgressAdapter(total=n_snps, desc=f"{model_label}-{pname}")
+        scan_t0 = time.time()
+        pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
+        pbar_desc = f"{model_label}-{pname}"
+        if model_key in ("lmm", "fastlmm"):
+            pbar_desc = f"{pbar_desc} (pve={mod.pve:.3f})"
+        pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc)
 
         inflight: dict[
             int,
@@ -2083,6 +2141,7 @@ def run_chunked_gwas_lmm_lm(
 
         cpu_t1 = process.cpu_times()
         t1 = time.time()
+        scan_secs = max(t1 - scan_t0, 0.0)
 
         wall = t1 - t0
         user_cpu = cpu_t1.user - cpu_t0.user
@@ -2091,37 +2150,86 @@ def run_chunked_gwas_lmm_lm(
 
         avg_cpu_pct = 100.0 * total_cpu / wall / (n_cores or 1) if wall > 0 else 0.0
         peak_rss_gb = peak_rss / 1024**3
-
-        logger.info(
-            f"Effective SNP: {done_snps} | "
-            f"Resource usage for {model_label} / {pname}: \n"
-            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} cores, "
-            f"peak RSS ~ {peak_rss_gb:.2f} GB\n"
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, "
+            f"peak RSS ~ {peak_rss_gb:.2f} G",
         )
 
         if not has_results:
             logger.info(f"No SNPs passed filters for trait {pname}.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = int(done_snps)
+            summary_rows.append(
+                {
+                    "phenotype": str(pname),
+                    "model": model_label,
+                    "nidv": int(n_idv),
+                    "eff_snp": int(done_snps),
+                    "avg_cpu": float(avg_cpu_pct),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(evd_secs + scan_secs),
+                    "viz_time_s": 0.0,
+                }
+            )
             if os.path.exists(tmp_tsv):
                 os.remove(tmp_tsv)
+            logger.info("")  # single blank line between traits
             continue
 
+        viz_secs = 0.0
         if plot:
-            plot_df = pd.read_csv(
-                tmp_tsv,
-                sep="\t",
-                usecols=["chrom", "pos", "pwald"],
-                dtype={"chrom": str, "pos": "int64"},
-            )
-            plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-            fastplot(
-                plot_df,
-                y_vec,
-                xlabel=pname,
-                outpdf=f"{outprefix}.{pname}.{genetic_model}.{model_tag}.svg",
-            )
+            viz_t0 = time.time()
+            def _run_plot() -> None:
+                plot_df = pd.read_csv(
+                    tmp_tsv,
+                    sep="\t",
+                    usecols=["chrom", "pos", "pwald"],
+                    dtype={"chrom": str, "pos": "int64"},
+                )
+                plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+                fastplot(
+                    plot_df,
+                    y_vec,
+                    xlabel=pname,
+                    outpdf=f"{outprefix}.{pname}.{genetic_model}.{model_tag}.svg",
+                )
+
+            if use_spinner:
+                with CliStatus("Visualization...", enabled=True) as task:
+                    try:
+                        _run_plot()
+                    except Exception:
+                        task.fail("Visualization ...Failed")
+                        raise
+                    task.complete("Visualization ...Finished")
+            else:
+                _run_plot()
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        if pname not in eff_snp_by_trait:
+            eff_snp_by_trait[pname] = int(done_snps)
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": model_label,
+                "nidv": int(n_idv),
+                "eff_snp": int(done_snps),
+                "avg_cpu": float(avg_cpu_pct),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(evd_secs + scan_secs),
+                "viz_time_s": float(viz_secs),
+            }
+        )
 
         os.replace(tmp_tsv, out_tsv)
-        logger.info(f"Saved {model_label} results to {out_tsv}".replace("//", "/"))
+        saved_paths.append(str(out_tsv).replace("//", "/"))
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Results saved to {str(out_tsv).replace('//', '/')}",
+        )
         logger.info("")  # ensure blank line between traits
 
 
@@ -2167,20 +2275,27 @@ def build_qmatrix_farmcpu(
     logger,
     sample_ids: Union[np.ndarray, None] = None,
     use_spinner: bool = False,
+    quiet_terminal: bool = False,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
     """
+    def _farm_log(msg: str) -> None:
+        if bool(quiet_terminal):
+            _log_file_only(logger, logging.INFO, str(msg))
+        else:
+            logger.info(str(msg))
+
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
         grm_path = f"{gfile_prefix}.k.1.npy"
         id_path = f"{grm_path}.id"
         n = geno.shape[1]
 
         if os.path.exists(grm_path):
-            logger.info(f"* Loading GRM cache for FarmCPU PCA from {grm_path}...")
+            _farm_log(f"* Loading GRM cache for FarmCPU PCA from {grm_path}...")
             grm = np.load(grm_path, mmap_mode="r")
             if grm.size != n * n:
-                logger.warning(
+                _farm_log(
                     f"GRM cache shape mismatch ({grm.size} elements) for sample size {n}; rebuilding."
                 )
             else:
@@ -2188,7 +2303,7 @@ def build_qmatrix_farmcpu(
                 if sample_ids is not None and os.path.exists(id_path):
                     grm_ids = _read_id_file(id_path, logger, "GRM", use_spinner=use_spinner)
                     if grm_ids is None or len(grm_ids) != n:
-                        logger.warning("GRM cache IDs are invalid; rebuilding GRM cache.")
+                        _farm_log("GRM cache IDs are invalid; rebuilding GRM cache.")
                     else:
                         grm_ids = np.asarray(grm_ids, dtype=str)
                         sid = sample_ids.astype(str)
@@ -2197,7 +2312,7 @@ def build_qmatrix_farmcpu(
                         index = {s: i for i, s in enumerate(grm_ids)}
                         missing = [s for s in sid if s not in index]
                         if missing:
-                            logger.warning(
+                            _farm_log(
                                 f"GRM cache missing {len(missing)} sample IDs; rebuilding GRM cache."
                             )
                         else:
@@ -2206,17 +2321,17 @@ def build_qmatrix_farmcpu(
                             return np.asarray(grm, dtype="float32")
                 else:
                     if sample_ids is not None and not os.path.exists(id_path):
-                        logger.warning("GRM cache ID file not found; assuming genotype sample order.")
+                        _farm_log("GRM cache ID file not found; assuming genotype sample order.")
                     return np.asarray(grm, dtype="float32")
 
-        logger.info("* Building GRM cache for FarmCPU PCA...")
+        _farm_log("* Building GRM cache for FarmCPU PCA...")
         grm = GRM(geno).astype("float32")
         np.save(grm_path, grm)
         if sample_ids is not None:
             pd.Series(sample_ids.astype(str)).to_csv(
                 id_path, sep="\t", index=False, header=False
             )
-        logger.info(f"Cached GRM written to {grm_path}")
+        _farm_log(f"Cached GRM written to {grm_path}")
         return grm
 
     def _maybe_load_with_ids(path: str, expect_rows: int):
@@ -2245,12 +2360,17 @@ def build_qmatrix_farmcpu(
     if qdim in np.arange(0, 30).astype(str):
         q_path = f"{gfile_prefix}.q.{qdim}.txt"
         if os.path.exists(q_path):
-            logger.info(f"* Loading Q matrix from {q_path}...")
-            qmatrix = _maybe_load_with_ids(q_path, geno.shape[1])
+            q_src = _basename_only(q_path)
+            with CliStatus(
+                f"Loading Q matrix from {q_src}...",
+                enabled=bool(use_spinner and (not quiet_terminal)),
+            ) as task:
+                qmatrix = _maybe_load_with_ids(q_path, geno.shape[1])
+                task.complete(f"Loading Q matrix from {q_src}")
         elif qdim == "0":
             qmatrix = np.array([]).reshape(geno.shape[1], 0)
         else:
-            logger.info(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
+            _farm_log(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
             grm = _load_or_build_grm_cache_for_pca()
             _eigval, eigvec = np.linalg.eigh(grm)
             qmatrix = eigvec[:, -int(qdim):]
@@ -2259,10 +2379,15 @@ def build_qmatrix_farmcpu(
                 df.to_csv(q_path, sep="\t", header=False, index=False)
             else:
                 np.savetxt(q_path, qmatrix, fmt="%.6f")
-            logger.info(f"Cached Q matrix written to {q_path}")
+            _farm_log(f"Cached Q matrix written to {q_path}")
     else:
-        logger.info(f"* Loading Q matrix from {qdim}...")
-        qmatrix = _maybe_load_with_ids(qdim, geno.shape[1])
+        q_src = _basename_only(qdim)
+        with CliStatus(
+            f"Loading Q matrix from {q_src}...",
+            enabled=bool(use_spinner and (not quiet_terminal)),
+        ) as task:
+            qmatrix = _maybe_load_with_ids(qdim, geno.shape[1])
+            task.complete(f"Loading Q matrix from {q_src}")
 
     if cov_inputs:
         if sample_ids is None:
@@ -2274,7 +2399,7 @@ def build_qmatrix_farmcpu(
             chunk_size=int(chunk_size),
             logger=logger,
             context="FarmCPU",
-            use_spinner=use_spinner,
+            use_spinner=bool(use_spinner and (not quiet_terminal)),
         )
         if cov_arr is not None:
             if cov_ids is None:
@@ -2288,10 +2413,9 @@ def build_qmatrix_farmcpu(
                 raise ValueError(
                     "FarmCPU covariate sample order does not match genotype sample order after alignment."
                 )
-            logger.info(f"Appending covariate matrix for FarmCPU: shape={cov_arr.shape}")
             qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
 
-    logger.info(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
+    _farm_log(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
     return qmatrix
 
 
@@ -2303,7 +2427,12 @@ def run_farmcpu_fullmem(
     pheno_preloaded: Union[pd.DataFrame , None] = None,
     ids_preloaded: Union[np.ndarray, None] = None,
     n_snps_preloaded: Union[int, None] = None,
+    qmatrix_preloaded: Union[np.ndarray, None] = None,
+    cov_preloaded: Union[np.ndarray, None] = None,
     use_spinner: bool = False,
+    context_prepared: bool = False,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
 ) -> None:
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).
@@ -2317,7 +2446,6 @@ def run_farmcpu_fullmem(
     qdim = args.qcov
     cov = args.cov
 
-    logger.info("* FarmCPU pipeline: loading genotype and phenotype")
     pheno = pheno_preloaded
     if pheno is None:
         pheno = _load_phenotype_with_status(
@@ -2327,6 +2455,12 @@ def run_farmcpu_fullmem(
             id_col=0,
             use_spinner=use_spinner,
         )
+    else:
+        if not bool(context_prepared):
+            with CliStatus("Loading phenotype from dataframe...", enabled=bool(use_spinner)) as task:
+                task.complete(
+                    f"Loading phenotype from dataframe (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
+                )
 
     if ids_preloaded is not None and n_snps_preloaded is not None:
         famid = np.asarray(ids_preloaded, dtype=str)
@@ -2340,13 +2474,14 @@ def run_farmcpu_fullmem(
         famid = np.asarray(famid, dtype=str)
     geno_chunks = []
     site_rows = []
-    pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (FarmCPU)")
+    pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
     for chunk, sites in load_genotype_chunks(
         gfile,
         chunk_size=args.chunksize,
         maf=args.maf,
         missing_rate=args.geno,
         impute=True,
+        sample_ids=famid.tolist(),
     ):
         if chunk.shape[0] == 0:
             continue
@@ -2355,6 +2490,8 @@ def run_farmcpu_fullmem(
             [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
         )
         pbar.update(chunk.shape[0])
+    loaded_snps = int(sum(c.shape[0] for c in geno_chunks))
+    pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
     pbar.finish()
     pbar.close()
 
@@ -2366,74 +2503,196 @@ def run_farmcpu_fullmem(
     ref_alt = pd.DataFrame(site_rows, columns=["chrom", "pos", "allele0", "allele1"])
     ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
 
-    logger.info(
-        f"Genotype and phenotype loaded in {(time.time() - t_loading):.2f} seconds"
-    )
+    t_loaded = time.time() - t_loading
+    if not bool(context_prepared):
+        _rich_success(
+            logger,
+            f"FarmCPU input ready (n={len(famid)}, nSNP={geno.shape[0]}) [{format_elapsed(t_loaded)}]",
+            use_spinner=use_spinner,
+            log_message=f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
+        )
+    else:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
+        )
     if geno.size == 0:
         msg = "After filtering, number of SNPs is zero for FarmCPU."
         logger.error(msg)
         raise ValueError(msg)
 
-    gfile_prefix = genotype_cache_prefix(gfile)
-    qmatrix = build_qmatrix_farmcpu(
-        genofile=gfile,
-        gfile_prefix=gfile_prefix,
-        geno=geno,
-        qdim=qdim,
-        cov_inputs=cov,
-        chunk_size=args.chunksize,
-        logger=logger,
-        sample_ids=famid.astype(str),
-        use_spinner=use_spinner,
-    )
+    if bool(context_prepared) and qmatrix_preloaded is not None:
+        qmatrix = np.asarray(qmatrix_preloaded, dtype="float32")
+        if cov_preloaded is not None:
+            cov_arr = np.asarray(cov_preloaded, dtype="float32")
+            if cov_arr.shape[0] != qmatrix.shape[0]:
+                raise ValueError(
+                    f"FarmCPU preloaded covariate rows ({cov_arr.shape[0]}) "
+                    f"do not match preloaded Q rows ({qmatrix.shape[0]})."
+                )
+            qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
+    else:
+        gfile_prefix = genotype_cache_prefix(gfile)
+        qmatrix = build_qmatrix_farmcpu(
+            genofile=gfile,
+            gfile_prefix=gfile_prefix,
+            geno=geno,
+            qdim=qdim,
+            cov_inputs=cov,
+            chunk_size=args.chunksize,
+            logger=logger,
+            sample_ids=famid.astype(str),
+            use_spinner=use_spinner,
+            quiet_terminal=bool(context_prepared),
+        )
+
+    if bool(context_prepared):
+        cov_n = "NA" if cov_preloaded is None else int(np.asarray(cov_preloaded).shape[0])
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"geno={geno.shape[1]}, pheno={pheno.shape[0]}, "
+            f"q={qmatrix.shape[0]}, cov={cov_n} -> {famid.shape[0]}"
+        )
+
+    process = psutil.Process()
+    n_cores = psutil.cpu_count(logical=True) or cpu_count()
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
 
     trait_names = list(pheno.columns)
     for trait_idx, phename in enumerate(trait_names):
-        if trait_idx > 0:
-            logger.info("-" * 60)
-        logger.info(f"* FarmCPU GWAS for trait: {phename}")
-        t_trait = time.time()
-
         p = pheno[phename].dropna()
         famidretain = np.isin(famid, p.index)
         if np.sum(famidretain) == 0:
-            logger.info(f"Trait {phename}: no overlapping samples, skipped.")
+            logger.info(f"{phename}: no overlapping samples, skipped.")
+            logger.info("")  # single blank line between traits
             continue
 
         snp_sub = geno[:, famidretain]
         p_sub = p.loc[famid[famidretain]].values.reshape(-1, 1)
         q_sub = qmatrix[famidretain]
-
-        logger.info(f"Samples: {np.sum(famidretain)}, SNPs: {snp_sub.shape[0]}")
-        maf = snp_sub.mean(axis=1)/2
-        res = farmcpu(
-            y=p_sub,
-            M=snp_sub,
-            X=q_sub,
-            chrlist=ref_alt["chrom"].values,
-            poslist=ref_alt["pos"].values,
-            iter=20,
-            threads=args.thread,
+        n_idv = int(np.sum(famidretain))
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"FarmCPU, trait: {phename}, Samples: {n_idv}",
         )
+
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        gwas_t0 = time.time()
+        peak_rss = process.memory_info().rss
+        maf = snp_sub.mean(axis=1)/2
+        farm_iter = 20
+        farm_pbar = _ProgressAdapter(total=farm_iter, desc=f"FarmCPU-{phename}")
+        farm_state = {"done": 0}
+
+        def _farmcpu_progress(done: int, total: int) -> None:
+            nonlocal peak_rss
+            target = int(max(0, min(int(total), int(done))))
+            delta = target - int(farm_state["done"])
+            if delta > 0:
+                farm_pbar.update(delta)
+                farm_state["done"] = target
+            try:
+                peak_rss = max(peak_rss, process.memory_info().rss)
+            except Exception:
+                pass
+
+        try:
+            farm_out = farmcpu(
+                y=p_sub,
+                M=snp_sub,
+                X=q_sub,
+                chrlist=ref_alt["chrom"].values,
+                poslist=ref_alt["pos"].values,
+                iter=farm_iter,
+                threads=args.thread,
+                progress_cb=_farmcpu_progress,
+                return_info=True,
+            )
+        except Exception:
+            farm_pbar.close()
+            raise
+        else:
+            farm_pbar.finish()
+        if isinstance(farm_out, tuple):
+            res, _farm_info = farm_out
+            n_pseudo_qtn = int(_farm_info.get("n_pseudo_qtn", 0))
+        else:
+            res = farm_out
+            n_pseudo_qtn = 0
+        farm_pbar.close(done_text=f"Found {n_pseudo_qtn} QTNs")
+        gwas_secs = max(time.time() - gwas_t0, 0.0)
         res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"])
         res_df['maf'] = maf
         res_df = pd.concat([ref_alt.reset_index(drop=True), res_df], axis=1)
         res_df = res_df[['chrom','pos','allele0','allele1','maf','beta','se','pwald']]
 
+        viz_secs = 0.0
         if args.plot:
-            fastplot(
-                res_df,
-                p_sub,
-                xlabel=phename,
-                outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
-            )
+            viz_t0 = time.time()
+            if use_spinner:
+                with CliStatus("Visualization...", enabled=True) as task:
+                    try:
+                        fastplot(
+                            res_df,
+                            p_sub,
+                            xlabel=phename,
+                            outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
+                        )
+                    except Exception:
+                        task.fail("Visualization ...Failed")
+                        raise
+                    task.complete("Visualization ...Finished")
+            else:
+                fastplot(
+                    res_df,
+                    p_sub,
+                    xlabel=phename,
+                    outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
+                )
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        wall = max(time.time() - t0, 1e-9)
+        cpu_used = (cpu_t1.user + cpu_t1.system) - (cpu_t0.user + cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, "
+            f"peak RSS ~ {peak_rss_gb:.2f} G, pseudoQTNs ~ {n_pseudo_qtn}",
+        )
+        summary_rows.append(
+            {
+                "phenotype": str(phename),
+                "model": "Farm",
+                "nidv": int(n_idv),
+                "eff_snp": int(snp_sub.shape[0]),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(gwas_secs),
+                "viz_time_s": float(viz_secs),
+            }
+        )
 
         res_df = res_df.astype({"pwald": "object","pos":int})
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
-        logger.info(f"FarmCPU results saved to {out_tsv}".replace("//", "/"))
-        logger.info(f"Trait {phename} finished in {time.time() - t_trait:.2f} s")
+        saved_paths.append(str(out_tsv).replace("//", "/"))
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Results saved to {str(out_tsv).replace('//', '/')}",
+        )
         logger.info("")
 
 
@@ -2664,9 +2923,17 @@ def main(log: bool = True):
         qmatrix = None
         cov_all = None
         eff_m = None
+        eff_snp_by_trait: dict[str, int] = {}
+        gwas_summary_rows: list[dict[str, object]] = []
+        saved_result_paths: list[str] = []
 
         if args.lmm or args.lm or args.fastlmm:
-            _section(logger, "Prepare streaming context (phenotype/genotype meta/GRM/Q/cov)")
+            _section(logger, "Metadata preparation")
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "Prepare streaming context (phenotype/genotype meta/GRM/Q/cov)",
+            )
             pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m = prepare_streaming_context(
                 genofile=gfile,
                 phenofile=args.pheno,
@@ -2684,10 +2951,10 @@ def main(log: bool = True):
                 logger=logger,
                 use_spinner=use_spinner,
             )
+            logger.info("")
+            _section(logger, "Streaming task")
 
-        # --- run streaming LMM ---
         if args.lmm:
-            _section(logger, "Run streaming LMM")
             run_chunked_gwas_lmm_lm(
                 model_name="lmm",
                 genofile=gfile,
@@ -2709,11 +2976,12 @@ def main(log: bool = True):
                 threads=args.thread,
                 logger=logger,
                 use_spinner=use_spinner,
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
             )
 
-        # --- run streaming LM ---
         if args.fastlmm:
-            _section(logger, "Run streaming fastLMM (fixed lambda)")
             run_chunked_gwas_lmm_lm(
                 model_name="fastlmm",
                 genofile=gfile,
@@ -2735,10 +3003,12 @@ def main(log: bool = True):
                 threads=args.thread,
                 logger=logger,
                 use_spinner=use_spinner,
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
             )
 
         if args.lm:
-            _section(logger, "Run streaming LM")
             run_chunked_gwas_lmm_lm(
                 model_name="lm",
                 genofile=gfile,
@@ -2760,11 +3030,15 @@ def main(log: bool = True):
                 threads=args.thread,
                 logger=logger,
                 use_spinner=use_spinner,
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
             )
 
-        # --- run FarmCPU (full memory) ---
+        # --- run FarmCPU ---
         if args.farmcpu:
-            _section(logger, "Run FarmCPU (full memory)")
+            _section(logger, "Full genotype task")
+            context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
             run_farmcpu_fullmem(
                 args=args,
                 gfile=gfile,
@@ -2773,15 +3047,29 @@ def main(log: bool = True):
                 pheno_preloaded=pheno,  # 若 streaming 已加载 pheno，则复用，避免重复 log
                 ids_preloaded=ids,
                 n_snps_preloaded=n_snps,
+                qmatrix_preloaded=qmatrix,
+                cov_preloaded=cov_all,
                 use_spinner=use_spinner,
+                context_prepared=context_prepared,
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
             )
+
+        if len(gwas_summary_rows) > 0:
+            _emit_gwas_summary(logger, gwas_summary_rows)
+        if len(saved_result_paths) > 0:
+            logger.info("")
+            logger.info("Results saved:")
+            for p in saved_result_paths:
+                logger.info(f"  {p}")
+        logger.info(f"Log saved in {str(log_path).replace('//', '/')}")
 
     except Exception as e:
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
 
     lt = time.localtime()
     endinfo = (
-        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+        f"\n\n\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )

@@ -27,7 +27,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset_suffix: linux-aarch64
             ext: ""
-          - runner: macos-13
+          - runner: macos-14
             target: x86_64-apple-darwin
             asset_suffix: darwin-x86_64
             ext: ""
@@ -246,11 +246,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Download artifacts
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -266,7 +273,7 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          maturin upload --non-interactive --skip-existing dist/*
+          maturin upload --non-interactive --skip-existing dist/*.whl dist/*.tar.gz
 
   publish-installers:
     name: Publish launcher installers to GitHub Release

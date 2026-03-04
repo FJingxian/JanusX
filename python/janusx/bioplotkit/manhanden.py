@@ -67,6 +67,9 @@ class GWASPLOT:
         df = df.reset_index(drop=True)
 
         # ---- (1) Optional down-sampling for plotting ----
+        # minidx is first computed on the original row order (after reset_index).
+        # We later sort df by (chr, pos), so we must remap these row labels to
+        # positional indices in the sorted table before using iloc.
         if compression:
             n_snp = int(df.shape[0])
             if n_snp == 0:
@@ -130,6 +133,14 @@ class GWASPLOT:
 
         # Sort by chromosome and position
         df = df.sort_values(by=[chr, pos])
+        # Remap kept-row labels -> positional indices in sorted df to avoid
+        # iloc selecting wrong rows after sorting.
+        if len(self.minidx) > 0:
+            orig_labels = np.asarray(self.minidx, dtype=np.int64)
+            label_to_pos = np.empty(df.shape[0], dtype=np.int64)
+            sorted_labels = df.index.to_numpy(dtype=np.int64, copy=False)
+            label_to_pos[sorted_labels] = np.arange(df.shape[0], dtype=np.int64)
+            self.minidx = label_to_pos[orig_labels].tolist()
         self.chr_ids = df[chr].unique()
 
         # ---- (4) Build cumulative genomic x-coordinate (vectorized) ----

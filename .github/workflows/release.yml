@@ -154,13 +154,16 @@ jobs:
           echo "PACKAGED_BINARY=$OUT" >> "$GITHUB_ENV"
 
       - name: Optional codesign (Developer ID)
-        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
         shell: bash
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
+          if [[ -z "${MACOS_CERT_P12_BASE64:-}" || -z "${MACOS_CERT_PASSWORD:-}" || -z "${MACOS_SIGN_IDENTITY:-}" ]]; then
+            echo "Skipping codesign: missing MACOS_CERT_P12_BASE64 / MACOS_CERT_PASSWORD / MACOS_SIGN_IDENTITY."
+            exit 0
+          fi
           KEYCHAIN="build.keychain-db"
           CERT_PATH="$RUNNER_TEMP/janusx-signing.p12"
           echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
@@ -175,19 +178,22 @@ jobs:
           codesign --verify --verbose=2 "$PACKAGED_BINARY"
 
       - name: Optional notarize (Apple notarytool)
-        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
         shell: bash
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "Skipping notarize: missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID."
+            exit 0
+          fi
           ZIP_PATH="${PACKAGED_BINARY}.zip"
           ditto -c -k --keepParent "$PACKAGED_BINARY" "$ZIP_PATH"
           xcrun notarytool submit "$ZIP_PATH" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
 
       - name: Cleanup signing keychain
-        if: ${{ always() && secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+        if: ${{ always() }}
         shell: bash
         run: |
           security delete-keychain "build.keychain-db" || true

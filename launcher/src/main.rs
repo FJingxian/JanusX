@@ -120,7 +120,8 @@ Linux: please run the `.run` installer file."
         style_green("Guided setup: Runtime home -> jx location -> PATH")
     );
 
-    let runtime_home = prompt_runtime_home()?;
+    let installer_start = Instant::now();
+    let (runtime_home, install_dir) = prompt_runtime_home()?;
     env::set_var("JX_HOME", &runtime_home);
     println!(
         "{} {}",
@@ -133,7 +134,6 @@ Linux: please run the `.run` installer file."
         return Err("Failed to initialize JanusX runtime in selected JX_HOME.".to_string());
     }
 
-    let install_dir = prompt_install_dir()?;
     let installed_jx = install_jx_binary(&install_dir)?;
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
     print_success_line(&format!("Installed jx to {}", installed_jx.display()));
@@ -158,7 +158,10 @@ Linux: please run the `.run` installer file."
             exit_code(status)
         ));
     }
-    print_success_line("Installation completed.");
+    print_success_line(&format!(
+        "Installation complete. [{}]",
+        format_elapsed(installer_start.elapsed())
+    ));
     print_path_setup_hint(&installed_jx);
     Ok(0)
 }
@@ -351,18 +354,16 @@ fn expand_tilde(input: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn prompt_runtime_home() -> Result<PathBuf, String> {
+fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
     let default_home = default_runtime_home()?;
     loop {
-        println!(
-            "{} {}",
-            style_green_bold("Choose JanusX runtime home"),
-            style_green("[y/n/path]")
+        let default_home_s = default_home.display().to_string();
+        print!(
+            "{} {} {} ",
+            style_green_bold("JanusX runtime home builds in"),
+            style_green(&default_home_s),
+            style_green("[y/n/path]:")
         );
-        println!("  {} {}", style_green("y:"), default_home.display());
-        println!("  {} cancel", style_green("n:"));
-        println!("  {} existing directory", style_green("path:"));
-        print!("{} ", style_green_bold("Input [y]:"));
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {e}"))?;
@@ -371,20 +372,67 @@ fn prompt_runtime_home() -> Result<PathBuf, String> {
             .read_line(&mut line)
             .map_err(|e| format!("Failed to read input: {e}"))?;
         let v = line.trim();
-        if v.is_empty() || v.eq_ignore_ascii_case("y") {
-            return Ok(default_home.clone());
-        }
-        if v.eq_ignore_ascii_case("n") {
+        let runtime_home = if v.is_empty() || v.eq_ignore_ascii_case("y") {
+            default_home.clone()
+        } else if v.eq_ignore_ascii_case("n") {
             return Err("Installer cancelled.".to_string());
+        } else {
+            let p = expand_tilde(v);
+            if !p.exists() || !p.is_dir() {
+                eprintln!(
+                    "Invalid path: {} (must already exist). Please choose [y/n/path] again.",
+                    p.display()
+                );
+                continue;
+            }
+            if p.file_name().and_then(|x| x.to_str()) == Some(".janusx") {
+                p
+            } else {
+                p.join(".janusx")
+            }
+        };
+        let install_dir = runtime_home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| runtime_home.clone());
+        let runtime_parent = runtime_home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| runtime_home.clone());
+        if !runtime_parent.exists() || !runtime_parent.is_dir() {
+            eprintln!(
+                "Runtime parent directory does not exist: {}",
+                runtime_parent.display()
+            );
+            continue;
         }
-        let p = expand_tilde(v);
-        if p.exists() && p.is_dir() {
-            return Ok(p);
+        if !is_dir_writable(&runtime_parent) {
+            eprintln!(
+                "Runtime parent directory is not writable: {}",
+                runtime_parent.display()
+            );
+            continue;
         }
-        eprintln!(
-            "Invalid path: {} (must already exist). Please choose [y/n/path] again.",
-            p.display()
+        if !install_dir.exists() || !install_dir.is_dir() {
+            eprintln!(
+                "Install directory does not exist: {}",
+                install_dir.display()
+            );
+            continue;
+        }
+        if !is_dir_writable(&install_dir) {
+            eprintln!(
+                "Install directory is not writable: {}",
+                install_dir.display()
+            );
+            continue;
+        }
+        println!(
+            "{} {}",
+            style_green_bold("Binary `jx` builds in"),
+            style_green(&install_dir.display().to_string())
         );
+        return Ok((runtime_home, install_dir));
     }
 }
 
@@ -406,68 +454,6 @@ fn is_dir_writable(dir: &Path) -> bool {
             true
         }
         Err(_) => false,
-    }
-}
-
-fn default_install_dir() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        // Keep default conservative on Windows to avoid UAC issues.
-        return env::current_dir().map_err(|e| format!("Failed to resolve current directory: {e}"));
-    }
-    #[cfg(not(windows))]
-    {
-        let preferred = PathBuf::from("/usr/bin");
-        if is_dir_writable(&preferred) {
-            return Ok(preferred);
-        }
-        return env::current_dir().map_err(|e| format!("Failed to resolve current directory: {e}"));
-    }
-}
-
-fn prompt_install_dir() -> Result<PathBuf, String> {
-    let default_dir = default_install_dir()?;
-    loop {
-        println!(
-            "{} {}",
-            style_green_bold("Choose install directory for `jx`"),
-            style_green("[y/n/path]")
-        );
-        println!("  {} {}", style_green("y:"), default_dir.display());
-        println!("  {} cancel", style_green("n:"));
-        println!("  {} existing writable directory", style_green("path:"));
-        print!("{} ", style_green_bold("Input [y]:"));
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("Failed to read input: {e}"))?;
-        let v = line.trim();
-        if v.is_empty() || v.eq_ignore_ascii_case("y") {
-            if is_dir_writable(&default_dir) {
-                return Ok(default_dir.clone());
-            }
-            eprintln!(
-                "Default install dir is not writable: {}",
-                default_dir.display()
-            );
-            continue;
-        }
-        if v.eq_ignore_ascii_case("n") {
-            return Err("Installer cancelled.".to_string());
-        }
-        let p = expand_tilde(v);
-        if !p.exists() || !p.is_dir() {
-            eprintln!("Invalid path: {} (must already exist).", p.display());
-            continue;
-        }
-        if !is_dir_writable(&p) {
-            eprintln!("Path is not writable: {}", p.display());
-            continue;
-        }
-        return Ok(p);
     }
 }
 
@@ -732,8 +718,6 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
     if !is_janusx_installed(&python) {
         if verbose_bootstrap {
             println!("Bootstrapping JanusX from PyPI...");
-        } else {
-            println!("JanusX runtime not found in venv. Installing from PyPI...");
         }
         let _ = pip_install_tail(
             &python,
@@ -1375,7 +1359,7 @@ fn pip_install_tail(
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
 
     if is_tty {
-        render_tail_block(desc, "…", start.elapsed(), &tail, max_lines, rendered)?;
+        render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
         rendered = true;
     }
 
@@ -1394,7 +1378,7 @@ fn pip_install_tail(
             tail.push_back(line);
         }
         if is_tty {
-            render_tail_block(desc, "…", start.elapsed(), &tail, max_lines, rendered)?;
+            render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
             rendered = true;
         }
     }
@@ -1445,12 +1429,16 @@ fn render_tail_block(
     if rendered_before {
         print!("\x1b[{}A", max_lines.saturating_add(1));
     }
-    print!(
-        "\x1b[2K\r{} {} [{}]\n",
-        symbol,
-        desc,
-        format_elapsed(elapsed)
-    );
+    if symbol.is_empty() {
+        print!("\x1b[2K\r{} [{}]\n", desc, format_elapsed(elapsed));
+    } else {
+        print!(
+            "\x1b[2K\r{} {} [{}]\n",
+            symbol,
+            desc,
+            format_elapsed(elapsed)
+        );
+    }
     let mut shown = 0usize;
     for line in tail {
         print!("\x1b[2K\r\x1b[2m{}\x1b[0m\n", line);

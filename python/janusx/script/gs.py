@@ -612,9 +612,12 @@ def main(log: bool = True) -> None:
     )
     optional_group.add_argument(
         "-n", "--ncol",
+        action="extend",
+        nargs="+",
         type=int,
         default=None,
-        help="Zero-based phenotype column index to analyze. "
+        help="Zero-based phenotype column indices to analyze. "
+             "Supports repeated inputs, e.g. -n 0 -n 3 or -n 0 3. "
              "If not set, all phenotype columns will be processed "
              "(default: %(default)s).",
     )
@@ -678,10 +681,15 @@ def main(log: bool = True) -> None:
 
     # Configuration summary
     if log:
+        ncol_cfg = (
+            "All"
+            if args.ncol is None
+            else ",".join(str(int(i)) for i in args.ncol)
+        )
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
-            ("Analysis Pcol", args.ncol if args.ncol is not None else "All"),
+            ("Analysis Pcol", ncol_cfg),
         ]
         model_count = 0
         if args.GBLUP:
@@ -751,10 +759,23 @@ def main(log: bool = True) -> None:
         raise SystemExit(1)
 
     if args.ncol is not None:
-        if not (0 <= args.ncol < pheno.shape[1]):
-            logger.error("IndexError: phenotype column index out of range.")
+        requested_cols = [int(i) for i in args.ncol]
+        invalid_cols = [i for i in requested_cols if (i < 0 or i >= pheno.shape[1])]
+        if invalid_cols:
+            logger.error(
+                "IndexError: phenotype column index out of range. "
+                f"Invalid: {invalid_cols}; valid range: [0, {pheno.shape[1] - 1}]"
+            )
             raise SystemExit(1)
-        pheno = pheno.iloc[:, [args.ncol]]
+
+        # Keep user-provided order and drop duplicates.
+        seen: set[int] = set()
+        unique_cols: list[int] = []
+        for i in requested_cols:
+            if i not in seen:
+                unique_cols.append(i)
+                seen.add(i)
+        pheno = pheno.iloc[:, unique_cols]
 
     # ------------------------------------------------------------------
     # Collect methods to run

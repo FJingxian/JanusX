@@ -114,20 +114,13 @@ Linux: please run the `.run` installer file."
     }
 
     println!("{LOGO}");
-    println!("{}", style_green_bold("JanusX Installer"));
-    println!(
-        "{}\n",
-        style_green("Guided setup: Runtime home -> jx location -> PATH")
-    );
+    println!("JanusX Installer");
+    println!("Guided setup: Runtime home -> jx location -> PATH\n");
 
     let installer_start = Instant::now();
     let (runtime_home, install_dir) = prompt_runtime_home()?;
     env::set_var("JX_HOME", &runtime_home);
-    println!(
-        "{} {}",
-        style_green_bold("Runtime home:"),
-        style_green(&runtime_home.display().to_string())
-    );
+    println!("Runtime home: {}", runtime_home.display());
 
     let python = ensure_runtime(false)?;
     if !is_janusx_installed(&python) {
@@ -136,33 +129,37 @@ Linux: please run the `.run` installer file."
 
     let installed_jx = install_jx_binary(&install_dir)?;
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
-    print_success_line(&format!("Installed jx to {}", installed_jx.display()));
+    println!("Installed jx to {}", installed_jx.display());
 
+    let mut cmd = Command::new(&installed_jx);
+    cmd.arg("-v")
+        .env("JX_HOME", &runtime_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let warm_start = Instant::now();
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run `{}` -h: {e}", installed_jx.display()))?;
     println!(
         "{}",
-        style_green_bold("Warming up runtime with `jx -h` ...")
+        style_green(&format!(
+            "Warming up ...[{}]",
+            format_elapsed(warm_start.elapsed())
+        ))
     );
-    let mut cmd = Command::new(&installed_jx);
-    cmd.arg("-h")
-        .env("JX_HOME", &runtime_home)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = cmd
-        .status()
-        .map_err(|e| format!("Failed to run `{}` -h: {e}", installed_jx.display()))?;
-    if !status.success() {
+    print_dim_block(&String::from_utf8_lossy(&output.stdout));
+    print_dim_block(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
         return Err(format!(
-            "Warm-up command failed: {} -h (exit={})",
+            "Warm-up command failed: {} -v (exit={})",
             installed_jx.display(),
-            exit_code(status)
+            exit_code(output.status)
         ));
     }
-    print_success_line(&format!(
-        "Installation complete. [{}]",
-        format_elapsed(installer_start.elapsed())
-    ));
+    println!("Installation complete.");
     print_path_setup_hint(&installed_jx);
+    println!("Total time: {}", format_elapsed(installer_start.elapsed()));
     Ok(0)
 }
 
@@ -247,34 +244,34 @@ fn print_path_setup_hint(installed_jx: &Path) {
     };
 
     if is_dir_in_path(install_dir) {
-        print_success_line("`jx` is already in PATH.");
+        println!("`jx` is already in PATH.");
         return;
     }
 
     println!();
-    println!("{}", style_green_bold("`jx` is not in PATH yet."));
-    println!("{}", style_green("Add this directory to PATH:"));
-    println!("  {}", style_green(&install_dir.display().to_string()));
+    println!("`jx` is not in PATH yet.");
+    println!("Add this directory to PATH:");
+    println!("  {}", install_dir.display());
 
     #[cfg(target_os = "windows")]
     {
         let d = install_dir.display();
-        println!("{}", style_green_bold("PowerShell (current session):"));
+        println!("PowerShell (current session):");
         println!("  $env:Path = \"{d};$env:Path\"");
-        println!("{}", style_green_bold("PowerShell (persistent, user):"));
+        println!("PowerShell (persistent, user):");
         println!(
             "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
         );
-        println!("{}", style_green("Then open a new terminal."));
+        println!("Then open a new terminal.");
     }
 
     #[cfg(target_os = "macos")]
     {
         let d = install_dir.display();
-        println!("{}", style_green_bold("zsh (recommended):"));
+        println!("zsh (recommended):");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
         println!("  source ~/.zshrc");
-        println!("{}", style_green_bold("bash:"));
+        println!("bash:");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
         println!("  source ~/.bashrc");
     }
@@ -282,10 +279,10 @@ fn print_path_setup_hint(installed_jx: &Path) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let d = install_dir.display();
-        println!("{}", style_green_bold("bash:"));
+        println!("bash:");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
         println!("  source ~/.bashrc");
-        println!("{}", style_green_bold("zsh:"));
+        println!("zsh:");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
         println!("  source ~/.zshrc");
     }
@@ -359,10 +356,8 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
     loop {
         let default_home_s = default_home.display().to_string();
         print!(
-            "{} {} {} ",
-            style_green_bold("JanusX runtime home builds in"),
-            style_green(&default_home_s),
-            style_green("[y/n/path]:")
+            "JanusX runtime home builds in {} [y/n/path]: ",
+            default_home_s
         );
         io::stdout()
             .flush()
@@ -427,11 +422,7 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             );
             continue;
         }
-        println!(
-            "{} {}",
-            style_green_bold("Binary `jx` builds in"),
-            style_green(&install_dir.display().to_string())
-        );
+        println!("Binary `jx` builds in {}", install_dir.display());
         return Ok((runtime_home, install_dir));
     }
 }
@@ -1201,14 +1192,6 @@ fn style_green(text: &str) -> String {
     }
 }
 
-fn style_green_bold(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[1;32m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
 fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
@@ -1429,19 +1412,21 @@ fn render_tail_block(
     if rendered_before {
         print!("\x1b[{}A", max_lines.saturating_add(1));
     }
+    let width = terminal_line_width();
     if symbol.is_empty() {
-        print!("\x1b[2K\r{} [{}]\n", desc, format_elapsed(elapsed));
+        let title = truncate_plain_line(&format!("{} [{}]", desc, format_elapsed(elapsed)), width);
+        print!("\x1b[2K\r{}\n", style_green(&title));
     } else {
-        print!(
-            "\x1b[2K\r{} {} [{}]\n",
-            symbol,
-            desc,
-            format_elapsed(elapsed)
+        let title = truncate_plain_line(
+            &format!("{symbol} {desc} [{}]", format_elapsed(elapsed)),
+            width,
         );
+        print!("\x1b[2K\r{}\n", style_green(&title));
     }
     let mut shown = 0usize;
     for line in tail {
-        print!("\x1b[2K\r\x1b[2m{}\x1b[0m\n", line);
+        let trimmed = truncate_plain_line(line, width);
+        print!("\x1b[2K\r\x1b[2m{}\x1b[0m\n", trimmed);
         shown += 1;
     }
     while shown < max_lines {
@@ -1452,6 +1437,41 @@ fn render_tail_block(
         .flush()
         .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
     Ok(())
+}
+
+fn terminal_line_width() -> usize {
+    let cols = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(120);
+    cols.clamp(40, 240)
+}
+
+fn truncate_plain_line(s: &str, max_chars: usize) -> String {
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let mut out = String::new();
+    let mut n = 0usize;
+    for ch in s.chars() {
+        if n + 1 >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+        n += 1;
+    }
+    out
+}
+
+fn print_dim_block(text: &str) {
+    for line in text.lines() {
+        if supports_color() {
+            println!("\x1b[2m{}\x1b[0m", line);
+        } else {
+            println!("{line}");
+        }
+    }
 }
 
 fn remove_conflicting_jx_entrypoints(python: &Path) {

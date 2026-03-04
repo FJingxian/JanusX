@@ -114,11 +114,19 @@ Linux: please run the `.run` installer file."
     }
 
     println!("{LOGO}");
-    println!("JanusX installer\n");
+    println!("{}", style_green_bold("JanusX Installer"));
+    println!(
+        "{}\n",
+        style_green("Guided setup: Runtime home -> jx location -> PATH")
+    );
 
     let runtime_home = prompt_runtime_home()?;
     env::set_var("JX_HOME", &runtime_home);
-    println!("Runtime home: {}", runtime_home.display());
+    println!(
+        "{} {}",
+        style_green_bold("Runtime home:"),
+        style_green(&runtime_home.display().to_string())
+    );
 
     let python = ensure_runtime(false)?;
     if !is_janusx_installed(&python) {
@@ -130,7 +138,10 @@ Linux: please run the `.run` installer file."
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
     print_success_line(&format!("Installed jx to {}", installed_jx.display()));
 
-    println!("Warming up runtime with `jx -h` ...");
+    println!(
+        "{}",
+        style_green_bold("Warming up runtime with `jx -h` ...")
+    );
     let mut cmd = Command::new(&installed_jx);
     cmd.arg("-h")
         .env("JX_HOME", &runtime_home)
@@ -238,28 +249,29 @@ fn print_path_setup_hint(installed_jx: &Path) {
     }
 
     println!();
-    println!("`jx` is not in PATH yet. Add this directory to PATH:");
-    println!("  {}", install_dir.display());
+    println!("{}", style_green_bold("`jx` is not in PATH yet."));
+    println!("{}", style_green("Add this directory to PATH:"));
+    println!("  {}", style_green(&install_dir.display().to_string()));
 
     #[cfg(target_os = "windows")]
     {
         let d = install_dir.display();
-        println!("PowerShell (current session):");
+        println!("{}", style_green_bold("PowerShell (current session):"));
         println!("  $env:Path = \"{d};$env:Path\"");
-        println!("PowerShell (persistent, user):");
+        println!("{}", style_green_bold("PowerShell (persistent, user):"));
         println!(
             "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
         );
-        println!("Then open a new terminal.");
+        println!("{}", style_green("Then open a new terminal."));
     }
 
     #[cfg(target_os = "macos")]
     {
         let d = install_dir.display();
-        println!("zsh (recommended):");
+        println!("{}", style_green_bold("zsh (recommended):"));
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
         println!("  source ~/.zshrc");
-        println!("bash:");
+        println!("{}", style_green_bold("bash:"));
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
         println!("  source ~/.bashrc");
     }
@@ -267,10 +279,10 @@ fn print_path_setup_hint(installed_jx: &Path) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let d = install_dir.display();
-        println!("bash:");
+        println!("{}", style_green_bold("bash:"));
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
         println!("  source ~/.bashrc");
-        println!("zsh:");
+        println!("{}", style_green_bold("zsh:"));
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
         println!("  source ~/.zshrc");
     }
@@ -343,10 +355,14 @@ fn prompt_runtime_home() -> Result<PathBuf, String> {
     let default_home = default_runtime_home()?;
     loop {
         println!(
-            "Choose JanusX runtime home [y/n/path]\n  y: {}\n  n: cancel\n  path: existing directory",
-            default_home.display()
+            "{} {}",
+            style_green_bold("Choose JanusX runtime home"),
+            style_green("[y/n/path]")
         );
-        print!("Input [y]: ");
+        println!("  {} {}", style_green("y:"), default_home.display());
+        println!("  {} cancel", style_green("n:"));
+        println!("  {} existing directory", style_green("path:"));
+        print!("{} ", style_green_bold("Input [y]:"));
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {e}"))?;
@@ -413,10 +429,14 @@ fn prompt_install_dir() -> Result<PathBuf, String> {
     let default_dir = default_install_dir()?;
     loop {
         println!(
-            "Choose install directory for `jx` [y/n/path]\n  y: {}\n  n: cancel\n  path: existing writable directory",
-            default_dir.display()
+            "{} {}",
+            style_green_bold("Choose install directory for `jx`"),
+            style_green("[y/n/path]")
         );
-        print!("Input [y]: ");
+        println!("  {} {}", style_green("y:"), default_dir.display());
+        println!("  {} cancel", style_green("n:"));
+        println!("  {} existing writable directory", style_green("path:"));
+        print!("{} ", style_green_bold("Input [y]:"));
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {e}"))?;
@@ -721,7 +741,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
             PYPI_SPEC,
             false,
             "Building runtime from PyPI...",
-            5,
+            10,
         )?;
     }
     Ok(python)
@@ -1178,10 +1198,30 @@ fn format_elapsed(d: Duration) -> String {
 }
 
 fn print_success_line(msg: &str) {
-    if io::stdout().is_terminal() {
+    if supports_color() {
         println!("\x1b[32m✔︎ {}\x1b[0m", msg);
     } else {
         println!("✔︎ {}", msg);
+    }
+}
+
+fn supports_color() -> bool {
+    io::stdout().is_terminal()
+}
+
+fn style_green(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[32m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn style_green_bold(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[1;32m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1413,7 +1453,7 @@ fn render_tail_block(
     );
     let mut shown = 0usize;
     for line in tail {
-        print!("\x1b[2K\r{}\n", line);
+        print!("\x1b[2K\r\x1b[2m{}\x1b[0m\n", line);
         shown += 1;
     }
     while shown < max_lines {

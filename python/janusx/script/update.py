@@ -89,6 +89,41 @@ def _print_failure(label: str, proc: subprocess.CompletedProcess[str]) -> None:
     print(f"Reason: {_extract_error_reason(proc.stdout)}")
 
 
+def _git_install_hint() -> str:
+    if os.name == "nt" or sys.platform.lower().startswith("win"):
+        return (
+            "Git is required for jx --update, but it was not found in PATH.\n"
+            "Windows install options:\n"
+            "  1) winget: winget install --id Git.Git -e\n"
+            "  2) choco:  choco install git -y\n"
+            "  3) installer: https://git-scm.com/download/win\n"
+            "Then reopen terminal and run: jx --update"
+        )
+    if sys.platform.lower().startswith("darwin"):
+        return (
+            "Git is required for jx --update, but it was not found in PATH.\n"
+            "macOS install options:\n"
+            "  1) xcode-select --install\n"
+            "  2) brew install git\n"
+            "Then reopen terminal and run: jx --update"
+        )
+    return (
+        "Git is required for jx --update, but it was not found in PATH.\n"
+        "Linux install options:\n"
+        "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y git\n"
+        "  RHEL/CentOS/Fedora: sudo dnf install -y git (or: sudo yum install -y git)\n"
+        "  openSUSE: sudo zypper install -y git\n"
+        "Then reopen terminal and run: jx --update"
+    )
+
+
+def _ensure_git_available_or_exit() -> None:
+    if shutil.which("git") is not None:
+        return
+    print(_git_install_hint(), flush=True)
+    raise SystemExit(1)
+
+
 def _spec_to_repo_url(spec: str) -> str:
     text = str(spec).strip()
     if text.startswith("git+"):
@@ -431,6 +466,7 @@ def _print_windows_stage2_exit_hint() -> None:
 def main() -> None:
     is_stage2, parent_pid, user_args = _split_stage2_and_user_args(sys.argv[1:])
     force_reinstall = _is_force_reinstall_requested(user_args)
+    _ensure_git_available_or_exit()
 
     if _maybe_spawn_windows_stage2(user_args, is_stage2=is_stage2):
         return

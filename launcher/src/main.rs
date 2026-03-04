@@ -20,6 +20,41 @@ const VERSION_CONTACT: &str = "fujingxian@yzwlab.cn";
 const RUNTIME_HOME_CONFIG: &str = ".jx_home";
 const INSTALLER_RELAUNCH_ENV: &str = "JX_INSTALLER_RELAUNCHED";
 const SKIP_RUNTIME_REBUILD_ENV: &str = "JX_SKIP_RUNTIME_REBUILD";
+const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
+const WARMUP_MARKER: &str = ".runtime_warmed";
+const CLI_HELP_TEXT: &str = r#"Usage:
+    jx <module> [options]
+
+Options:
+    -h, --help             Show this help message
+    -v, --version          Show version/build information
+    -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
+
+Modules:
+    Genome-wide Association Studies (GWAS):
+    grm           Build genomic relationship matrix
+    pca           Principal component analysis for population structure
+    gwas          Run genome-wide association analysis
+    postgwas      Post-process GWAS results and downstream plots
+
+    Genomic Selection (GS):
+    gs            Genomic prediction and model-based selection
+
+    GARFIELD:
+    garfield      Random-forest based marker-trait association
+    postgarfield  Summarize and visualize GARFIELD outputs
+
+    Bulk Segregation Analysis (BSA):
+    postbsa       Post-process and visualize BSA results
+
+    Pipeline and utility:
+    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
+    gmerge        Merge genotype/variant tables
+
+    Benchmark:
+    sim           Quick simulation workflow
+    simulation    Extended simulation and benchmarking workflow
+"#;
 const LOGO: &str = r#"
        _                      __   __
       | |                     \ \ / /
@@ -62,18 +97,24 @@ fn run() -> Result<i32, String> {
 
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
+        let home = runtime_home()?;
         let python = ensure_runtime(false)?;
+        let _ = maybe_auto_warmup(&home)?;
         return run_python_janusx(&python, &[]);
     }
 
     let head = args[0].as_str();
     if matches!(head, "-h" | "--help") {
-        let python = ensure_runtime(false)?;
-        return run_python_janusx(&python, &args);
+        println!("{LOGO}");
+        println!("{}", CLI_HELP_TEXT.trim());
+        return Ok(0);
     }
     if matches!(head, "-v" | "--version") {
         let home = runtime_home()?;
         let python = ensure_runtime(false)?;
+        if maybe_auto_warmup(&home)? {
+            return Ok(0);
+        }
         print_version(&python, &home);
         return Ok(0);
     }
@@ -87,7 +128,9 @@ fn run() -> Result<i32, String> {
         return run_update(opts);
     }
 
+    let home = runtime_home()?;
     let python = ensure_runtime(false)?;
+    let _ = maybe_auto_warmup(&home)?;
     run_python_janusx(&python, &args)
 }
 
@@ -123,40 +166,112 @@ Linux: please run the `.run` installer file."
     env::set_var("JX_HOME", &runtime_home);
     println!("Runtime home: {}", runtime_home.display());
 
-    let python = ensure_runtime(false)?;
-    if !is_janusx_installed(&python) {
-        return Err("Failed to initialize JanusX runtime in selected JX_HOME.".to_string());
-    }
+    ensure_runtime(false)?;
 
     let installed_jx = install_jx_binary(&install_dir)?;
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
+    warm_up_jx(&installed_jx, &runtime_home)?;
+    println!("Installation complete.");
+    print_path_setup_hint(&installed_jx);
+    Ok(0)
+}
+
+fn warm_up_jx(jx_bin: &Path, runtime_home: &Path) -> Result<(), String> {
     let warm_start = Instant::now();
-    let h_status = Command::new(&installed_jx)
+    let warm_done = Arc::new(AtomicBool::new(false));
+    let warm_done_c = Arc::clone(&warm_done);
+    let warm_progress = if io::stdout().is_terminal() {
+        Some(thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0usize;
+            while !warm_done_c.load(Ordering::Relaxed) {
+                let line = format!(
+                    "{} Warming up ...[{}]",
+                    frames[i % frames.len()],
+                    format_elapsed(warm_start.elapsed())
+                );
+                if supports_color() {
+                    print!("\r{}", style_green(&line));
+                } else {
+                    print!("\r{}", line);
+                }
+                let _ = io::stdout().flush();
+                i += 1;
+                thread::sleep(Duration::from_millis(100));
+            }
+            print!("\r{}\r", " ".repeat(120));
+            let _ = io::stdout().flush();
+        }))
+    } else {
+        None
+    };
+
+    let stop_warm_progress = |done: Arc<AtomicBool>, handle: Option<thread::JoinHandle<()>>| {
+        done.store(true, Ordering::Relaxed);
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    };
+
+    let h_status = Command::new(jx_bin)
         .arg("-h")
-        .env("JX_HOME", &runtime_home)
+        .env("JX_HOME", runtime_home)
         .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+        .env(SKIP_WARMUP_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|e| format!("Failed to run `{}` -h: {e}", installed_jx.display()))?;
+        .map_err(|e| format!("Failed to run `{}` -h: {e}", jx_bin.display()))?;
     if !h_status.success() {
+        stop_warm_progress(warm_done, warm_progress);
         return Err(format!(
             "Warm-up command failed: {} -h (exit={})",
-            installed_jx.display(),
+            jx_bin.display(),
             exit_code(h_status)
         ));
     }
 
-    let output = Command::new(&installed_jx)
+    let py = venv_python(&runtime_home.join("venv"));
+    if py.exists() {
+        let py_status = Command::new(&py)
+            .arg("-m")
+            .arg("janusx.script.JanusX")
+            .arg("-h")
+            .env("JX_HOME", runtime_home)
+            .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| {
+                format!(
+                    "Failed to run `{}` -m janusx.script.JanusX -h: {e}",
+                    py.display()
+                )
+            })?;
+        if !py_status.success() {
+            stop_warm_progress(warm_done, warm_progress);
+            return Err(format!(
+                "Warm-up command failed: {} -m janusx.script.JanusX -h (exit={})",
+                py.display(),
+                exit_code(py_status)
+            ));
+        }
+    }
+
+    let output = Command::new(jx_bin)
         .arg("-v")
-        .env("JX_HOME", &runtime_home)
+        .env("JX_HOME", runtime_home)
         .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+        .env(SKIP_WARMUP_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("Failed to run `{}` -v: {e}", installed_jx.display()))?;
+        .map_err(|e| format!("Failed to run `{}` -v: {e}", jx_bin.display()))?;
+    stop_warm_progress(warm_done, warm_progress);
+
     print_success_line(&format!(
         "Warming up ...[{}]",
         format_elapsed(warm_start.elapsed())
@@ -166,13 +281,47 @@ Linux: please run the `.run` installer file."
     if !output.status.success() {
         return Err(format!(
             "Warm-up command failed: {} -v (exit={})",
-            installed_jx.display(),
+            jx_bin.display(),
             exit_code(output.status)
         ));
     }
-    println!("Installation complete.");
-    print_path_setup_hint(&installed_jx);
-    Ok(0)
+    write_warmup_marker(runtime_home);
+    Ok(())
+}
+
+fn maybe_auto_warmup(runtime_home: &Path) -> Result<bool, String> {
+    if should_skip_auto_warmup() || is_warmup_done(runtime_home) {
+        return Ok(false);
+    }
+    let Some(jx_bin) = env::current_exe().ok() else {
+        return Ok(false);
+    };
+    warm_up_jx(&jx_bin, runtime_home)?;
+    Ok(true)
+}
+
+fn should_skip_auto_warmup() -> bool {
+    env::var(SKIP_WARMUP_ENV)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn warmup_marker_path(runtime_home: &Path) -> PathBuf {
+    runtime_home.join(WARMUP_MARKER)
+}
+
+fn is_warmup_done(runtime_home: &Path) -> bool {
+    warmup_marker_path(runtime_home).exists()
+}
+
+fn write_warmup_marker(runtime_home: &Path) {
+    let marker = warmup_marker_path(runtime_home);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs();
+    let _ = std::fs::write(marker, format!("{ts}\n"));
 }
 
 fn relaunch_installer_in_terminal() -> Result<bool, String> {
@@ -617,6 +766,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     let home = runtime_home()?;
     let python = ensure_venv()?;
     let before = installed_version(&python);
+    let jx_bin = env::current_exe().ok();
 
     match &opts.source {
         UpdateSource::Latest => {
@@ -627,7 +777,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             if let (Some(local), Some(remote)) = (local_commit.as_deref(), remote_head.as_deref()) {
                 if local == remote {
                     print_success_line("Already at latest GitHub commit.");
-                    print_current_version(&python);
+                    warm_up_after_update(jx_bin.as_deref(), &home)?;
                     return Ok(0);
                 }
                 let start = Instant::now();
@@ -644,7 +794,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                             "JanusX python-only update completed. [{}]",
                             format_elapsed(start.elapsed())
                         ));
-                        print_current_version(&python);
+                        warm_up_after_update(jx_bin.as_deref(), &home)?;
                         return Ok(0);
                     }
                     Ok(false) => {
@@ -663,25 +813,21 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             // GitHub latest should refresh even when package version string is unchanged.
             let gh_force_reinstall = true;
             if opts.verbose {
-                println!("Updating from GitHub...");
+                println!("Updating from GitHub ...");
             }
-            match pip_install(
+            match pip_install_update(
                 &python,
                 &home,
                 GITHUB_SPEC,
                 gh_force_reinstall,
                 opts.verbose,
-                "Updating from GitHub...",
+                "Updating from GitHub ...",
             ) {
-                Ok(elapsed) => {
+                Ok(_) => {
                     if let Some(remote) = remote_head.as_deref() {
                         write_commit_marker(&home, remote);
                     }
-                    print_success_line(&format!(
-                        "JanusX update completed. [{}]",
-                        format_elapsed(elapsed)
-                    ));
-                    print_current_version(&python);
+                    warm_up_after_update(jx_bin.as_deref(), &home)?;
                     return Ok(0);
                 }
                 Err(err_primary) => {
@@ -689,7 +835,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     if opts.verbose {
                         eprintln!("Reason: {err_primary}");
                     }
-                    let elapsed = pip_install(
+                    let _ = pip_install_update(
                         &python,
                         &home,
                         GITHUB_PROXY_SPEC,
@@ -700,11 +846,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     if let Some(remote) = remote_head.as_deref() {
                         write_commit_marker(&home, remote);
                     }
-                    print_success_line(&format!(
-                        "JanusX update completed (via proxy). [{}]",
-                        format_elapsed(elapsed)
-                    ));
-                    print_current_version(&python);
+                    warm_up_after_update(jx_bin.as_deref(), &home)?;
                     return Ok(0);
                 }
             }
@@ -713,7 +855,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             if opts.verbose {
                 println!("Updating from local source: {path}");
             }
-            let elapsed = pip_install(
+            let _ = pip_install_update(
                 &python,
                 &home,
                 path,
@@ -721,11 +863,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 opts.verbose,
                 "Updating from local source...",
             )?;
-            print_success_line(&format!(
-                "JanusX local update completed. [{}]",
-                format_elapsed(elapsed)
-            ));
-            print_current_version(&python);
+            warm_up_after_update(jx_bin.as_deref(), &home)?;
             return Ok(0);
         }
         UpdateSource::Pypi => {}
@@ -734,7 +872,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     if opts.verbose {
         println!("Updating from PyPI...");
     }
-    let elapsed = pip_install(
+    let elapsed = pip_install_update(
         &python,
         &home,
         PYPI_SPEC,
@@ -756,14 +894,30 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             ));
         }
         println!("Use `jx --update latest` for GitHub latest.");
-    } else {
-        print_success_line(&format!(
-            "JanusX update completed. [{}]",
-            format_elapsed(elapsed)
-        ));
     }
-    print_current_version(&python);
+    warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn pip_install_update(
+    python: &Path,
+    runtime_home: &Path,
+    spec: &str,
+    force_reinstall: bool,
+    verbose: bool,
+    desc: &str,
+) -> Result<Duration, String> {
+    if verbose {
+        return pip_install(python, runtime_home, spec, force_reinstall, true, desc);
+    }
+    pip_install_tail(python, runtime_home, spec, force_reinstall, desc, 10)
+}
+
+fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {
+    let Some(jx_path) = jx_bin else {
+        return Ok(());
+    };
+    warm_up_jx(jx_path, runtime_home)
 }
 
 fn run_python_janusx(python: &Path, args: &[String]) -> Result<i32, String> {
@@ -783,6 +937,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
     let home = runtime_home()?;
     let python = ensure_venv()?;
     if !is_janusx_installed(&python) {
+        let _ = std::fs::remove_file(warmup_marker_path(&home));
         if verbose_bootstrap {
             println!("Bootstrapping JanusX from PyPI...");
         }
@@ -819,6 +974,7 @@ fn ensure_venv() -> Result<PathBuf, String> {
     let venv = home.join("venv");
     let py = venv_python(&venv);
     if py.exists() {
+        ensure_pip_in_venv(&py)?;
         return Ok(py);
     }
 
@@ -845,7 +1001,54 @@ fn ensure_venv() -> Result<PathBuf, String> {
             py.display()
         ));
     }
+    ensure_pip_in_venv(&py)?;
     Ok(py)
+}
+
+fn has_pip(python: &Path) -> bool {
+    Command::new(python)
+        .arg("-m")
+        .arg("pip")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn ensure_pip_in_venv(python: &Path) -> Result<(), String> {
+    if has_pip(python) {
+        return Ok(());
+    }
+
+    let out = Command::new(python)
+        .arg("-m")
+        .arg("ensurepip")
+        .arg("--upgrade")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to bootstrap pip with ensurepip: {e}"))?;
+
+    if !out.status.success() || !has_pip(python) {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        let details = msg.trim();
+        let details = if details.is_empty() {
+            "(no output)".to_string()
+        } else {
+            details.to_string()
+        };
+        return Err(format!(
+            "Runtime venv Python has no pip, and ensurepip bootstrap failed.\n{}\n{}",
+            details,
+            pip_bootstrap_hint()
+        ));
+    }
+
+    Ok(())
 }
 
 fn should_rebuild_runtime(home: &Path) -> Result<bool, String> {
@@ -961,14 +1164,6 @@ fn installed_version(python: &Path) -> Option<String> {
         None
     } else {
         Some(text)
-    }
-}
-
-fn print_current_version(python: &Path) {
-    if let Some(v) = installed_version(python) {
-        println!("Current version: {v}");
-    } else {
-        println!("Current version: unknown");
     }
 }
 
@@ -1425,10 +1620,14 @@ fn pip_install_tail(
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
     let mut channel_open = true;
     let mut exit_status: Option<ExitStatus> = None;
+    let mut last_render = Instant::now();
+    let mut last_line_seen: Option<String> = None;
 
     while channel_open {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok((is_err, line)) => {
+                let is_duplicate = last_line_seen.as_deref() == Some(line.as_str());
+                last_line_seen = Some(line.clone());
                 if is_err {
                     err_text.push_str(&line);
                     err_text.push('\n');
@@ -1436,15 +1635,18 @@ fn pip_install_tail(
                     out_text.push_str(&line);
                     out_text.push('\n');
                 }
-                if max_lines > 0 {
-                    if tail.len() == max_lines {
-                        tail.pop_front();
+                if !is_duplicate {
+                    if max_lines > 0 {
+                        if tail.len() == max_lines {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line);
                     }
-                    tail.push_back(line);
                 }
                 if is_tty {
                     render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
                     rendered = true;
+                    last_render = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1453,9 +1655,10 @@ fn pip_install_tail(
                         .try_wait()
                         .map_err(|e| format!("Failed to poll pip install status: {e}"))?;
                 }
-                if is_tty {
+                if is_tty && last_render.elapsed() >= Duration::from_secs(2) {
                     render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
                     rendered = true;
+                    last_render = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1515,8 +1718,13 @@ fn render_tail_block(
         print!("\x1b[{}A", max_lines.saturating_add(1));
     }
     let width = terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if symbol.is_empty() {
-        let title = truncate_plain_line(&format!("{} [{}]", desc, format_elapsed(elapsed)), width);
+        let idx = ((elapsed.as_millis() / 120) as usize) % frames.len();
+        let title = truncate_plain_line(
+            &format!("{} {} [{}]", frames[idx], desc, format_elapsed(elapsed)),
+            width,
+        );
         print!("\x1b[2K\r{}\n", style_green(&title));
     } else {
         let title = truncate_plain_line(
@@ -1545,8 +1753,9 @@ fn terminal_line_width() -> usize {
     let cols = env::var("COLUMNS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(120);
-    cols.clamp(40, 240)
+        .unwrap_or(80);
+    // Keep a conservative width to avoid visual wrap; wrapped lines break block redraw.
+    cols.saturating_sub(4).clamp(40, 68)
 }
 
 fn truncate_plain_line(s: &str, max_chars: usize) -> String {
@@ -1617,6 +1826,29 @@ Linux install options:\n\
   Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y git\n\
   RHEL/CentOS/Fedora: sudo dnf install -y git (or: sudo yum install -y git)\n\
   openSUSE: sudo zypper install -y git"
+        .to_string()
+}
+
+fn pip_bootstrap_hint() -> String {
+    if cfg!(windows) {
+        return "Try recreating runtime venv with a full Python distribution that includes ensurepip.\n\
+Suggested fix:\n\
+  1) Remove runtime: %LOCALAPPDATA%\\JanusX\\venv\n\
+  2) Re-run installer or `jx -h`"
+            .to_string();
+    }
+    if cfg!(target_os = "macos") {
+        return "Try recreating runtime venv with a Python that includes ensurepip.\n\
+Suggested fix:\n\
+  1) rm -rf ~/.janusx/venv\n\
+  2) Re-run installer or `jx -h`\n\
+If system Python lacks ensurepip, install python via Homebrew: `brew install python`."
+            .to_string();
+    }
+    "Try recreating runtime venv with a Python that includes ensurepip.\n\
+Suggested fix:\n\
+  1) rm -rf ~/.janusx/venv\n\
+  2) Re-run installer or `jx -h`"
         .to_string()
 }
 

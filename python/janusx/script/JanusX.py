@@ -36,19 +36,9 @@ Modules:
 '''
 import sys
 import subprocess
+import importlib
 from datetime import date
 from pathlib import Path
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message=".*ChainedAssignmentError.*"
-)
-import matplotlib as mpl
-mpl.use('Agg')
-import matplotlib.backends.backend_pdf # pdf support
-import matplotlib.backends.backend_svg # svg support
-from janusx.script import gwas, gs, postgwas, postgarfield, postbsa, garfield, grm, pca, sim, gmerge, fastq2vcf, simulation, update
 from importlib.metadata import version, PackageNotFoundError
 try:
     v = version("janusx")
@@ -95,6 +85,16 @@ __version__ = (
     f"Build date: {_build_date()}\n"
 )
 
+_MODULE_NAMES = [
+    "gwas", "postgwas", "postgarfield", "postbsa",
+    "garfield", "grm", "pca", "gs",
+    "sim", "simulation", "gmerge", "fastq2vcf",
+]
+
+
+def _load_script_module(name: str):
+    return importlib.import_module(f"janusx.script.{name}")
+
 def _print_help() -> None:
     print(__logo__)
     if __doc__:
@@ -102,11 +102,7 @@ def _print_help() -> None:
 
 
 def main():
-    module = dict(zip(
-        ['gwas','postgwas','postgarfield','postbsa','garfield','grm','pca','gs','sim','simulation','gmerge','fastq2vcf'],
-        [gwas,postgwas,postgarfield,postbsa,garfield,grm,pca,gs,sim,simulation,gmerge,fastq2vcf],
-    ))
-    if len(sys.argv)>1:
+    if len(sys.argv) > 1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             _print_help()
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
@@ -116,15 +112,15 @@ def main():
             print(__logo__)
             sys.argv[0] = "jx --update"
             del sys.argv[1]
-            update.main()
+            _load_script_module("update").main()
         else:
             module_name = sys.argv[1]
-            if sys.argv[1] in module.keys():
+            if module_name in _MODULE_NAMES:
                 # Keep argparse usage as "jx <module> ..."
                 sys.argv[0] = f"jx {module_name}"
                 del sys.argv[1]
-                module[module_name].main() # Process of Target Module
-            elif sys.argv[1] not in module.keys():
+                _load_script_module(module_name).main()  # Process of target module
+            elif module_name not in _MODULE_NAMES:
                 print(f"Unknown module: {sys.argv[1]}")
                 _print_help()
     else:

@@ -152,6 +152,30 @@ jobs:
             cat "$OUT" >> "$WRAP"
             chmod +x "$WRAP"
             FILES="$WRAP"
+          elif [[ "${{ matrix.target }}" == *"apple-darwin" ]]; then
+            WRAP="${OUT}.command"
+            {
+              printf '%s\n' '#!/usr/bin/env bash'
+              printf '%s\n' 'set -euo pipefail'
+              printf '%s\n' 'SELF="$0"'
+              printf '%s\n' 'TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/janusx-installer.XXXXXX")"'
+              printf '%s\n' 'cleanup() { rm -rf "$TMPDIR"; }'
+              printf '%s\n' 'trap cleanup EXIT'
+              printf '%s\n' "PAYLOAD_LINE=\"\$(awk '/^__JANUSX_PAYLOAD_BELOW__\$/ {print NR + 1; exit 0;}' \"\$SELF\")\""
+              printf '%s\n' 'if [[ -z "${PAYLOAD_LINE:-}" ]]; then'
+              printf '%s\n' '  echo "Installer payload missing."'
+              printf '%s\n' '  exit 1'
+              printf '%s\n' 'fi'
+              printf '%s\n' 'BIN="$TMPDIR/JanusX-installer"'
+              printf '%s\n' 'tail -n +"$PAYLOAD_LINE" "$SELF" > "$BIN"'
+              printf '%s\n' 'chmod +x "$BIN"'
+              printf '%s\n' 'exec "$BIN" "$@"'
+              printf '%s\n' 'exit 0'
+              printf '%s\n' '__JANUSX_PAYLOAD_BELOW__'
+            } > "$WRAP"
+            cat "$OUT" >> "$WRAP"
+            chmod +x "$WRAP"
+            FILES="$WRAP"
           fi
           {
             echo "PACKAGED_FILE<<EOF"

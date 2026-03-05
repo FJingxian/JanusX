@@ -3487,6 +3487,9 @@ fn pip_install_tail(
     }
 
     if status.success() {
+        if is_tty && tail_mode_started && max_lines > 0 {
+            clear_tail_log_lines(max_lines)?;
+        }
         remove_conflicting_jx_entrypoints(python);
         write_python_core_update_marker(runtime_home, python);
         return Ok(start.elapsed());
@@ -3563,6 +3566,23 @@ fn render_tail_title_only(desc: &str, elapsed: Duration, max_lines: usize) -> Re
     Ok(())
 }
 
+fn clear_tail_log_lines(max_lines: usize) -> Result<(), String> {
+    // Cursor is currently below the fixed block.
+    // Move to first log line (below title), clear log lines only, keep title.
+    print!("\x1b[{}A", max_lines);
+    for i in 0..max_lines {
+        print!("\x1b[2K\r");
+        if i + 1 < max_lines {
+            print!("\x1b[1B");
+        }
+    }
+    print!("\r");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
 fn render_prelog_spinner_line(desc: &str, elapsed: Duration) -> Result<(), String> {
     let width = terminal_line_width();
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -3610,11 +3630,7 @@ fn truncate_plain_line(s: &str, max_chars: usize) -> String {
 
 fn print_dim_block(text: &str) {
     for line in text.lines() {
-        if supports_color() {
-            println!("\x1b[2m{}\x1b[0m", line);
-        } else {
-            println!("{line}");
-        }
+        println!("{line}");
     }
 }
 

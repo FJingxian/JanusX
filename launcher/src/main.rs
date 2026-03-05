@@ -2471,7 +2471,12 @@ fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration),
             let mut i = 0usize;
             while !done_c.load(Ordering::Relaxed) {
                 let elapsed = format_elapsed(start.elapsed());
-                print!("\r{} {} [{}]", frames[i % frames.len()], desc_s, elapsed);
+                let line = format!("\r{} {} [{}]", frames[i % frames.len()], desc_s, elapsed);
+                if supports_color() {
+                    print!("{}", style_green(&line));
+                } else {
+                    print!("{line}");
+                }
                 let _ = io::stdout().flush();
                 i += 1;
                 thread::sleep(Duration::from_millis(80));

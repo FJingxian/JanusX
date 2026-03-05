@@ -29,23 +29,27 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
             zig_target: x86_64-unknown-linux-gnu.2.17
             use_zigbuild: true
             asset_suffix: linux-x86_64
             ext: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu
             zig_target: aarch64-unknown-linux-gnu.2.17
             use_zigbuild: true
             asset_suffix: linux-aarch64
             ext: ""
           - runner: macos-14
-            target: aarch64-apple-darwin
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             use_zigbuild: false
-            asset_suffix: darwin-arm64
+            asset_suffix: darwin-universal
             ext: ""
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
             use_zigbuild: false
             asset_suffix: windows-x86_64
             ext: exe
@@ -58,7 +62,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
       - name: Set up Zig (Linux compatibility build)
         if: ${{ matrix.use_zigbuild }}
@@ -75,6 +79,14 @@ jobs:
         run: |
           if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
             cargo zigbuild --release --manifest-path launcher/Cargo.toml --target "${{ matrix.zig_target }}"
+          elif [[ "${{ matrix.asset_suffix }}" == "darwin-universal" ]]; then
+            cargo build --release --manifest-path launcher/Cargo.toml --target aarch64-apple-darwin
+            cargo build --release --manifest-path launcher/Cargo.toml --target x86_64-apple-darwin
+            mkdir -p launcher/target/universal-apple-darwin/release
+            lipo -create \
+              launcher/target/aarch64-apple-darwin/release/jx \
+              launcher/target/x86_64-apple-darwin/release/jx \
+              -output launcher/target/universal-apple-darwin/release/jx
           else
             cargo build --release --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
           fi

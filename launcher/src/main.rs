@@ -2380,26 +2380,57 @@ fn pip_install_update(
     desc: &str,
     use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
-    if verbose {
-        return pip_install(
-            python,
-            runtime_home,
-            spec,
-            force_reinstall,
-            true,
-            desc,
-            use_cn_rust_mirror,
-        );
+    let attempt_install = |force_source_build: bool| -> Result<Duration, String> {
+        if verbose {
+            pip_install(
+                python,
+                runtime_home,
+                spec,
+                force_reinstall,
+                true,
+                desc,
+                use_cn_rust_mirror,
+                force_source_build,
+            )
+        } else {
+            pip_install_tail(
+                python,
+                runtime_home,
+                spec,
+                force_reinstall,
+                desc,
+                10,
+                use_cn_rust_mirror,
+                force_source_build,
+            )
+        }
+    };
+
+    if spec_requires_rust_build(spec) && !local_rust_toolchain_ready(runtime_home) {
+        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
     }
-    pip_install_tail(
-        python,
-        runtime_home,
-        spec,
-        force_reinstall,
-        desc,
-        10,
-        use_cn_rust_mirror,
-    )
+
+    match attempt_install(false) {
+        Ok(d) => return Ok(d),
+        Err(e) => {
+            if is_pypi_janusx_spec(spec) && should_retry_with_source_build(&e) {
+                if verbose {
+                    eprintln!("PyPI wheel install is unavailable; retrying source build.");
+                }
+                if !local_rust_toolchain_ready(runtime_home) {
+                    ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                }
+                return attempt_install(true);
+            }
+            return Err(e);
+        }
+    }
+}
+
+fn should_retry_with_source_build(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("no matching distribution found for janusx")
+        || e.contains("could not find a version that satisfies the requirement janusx")
 }
 
 fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {
@@ -2431,13 +2462,13 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
         if verbose_bootstrap {
             println!("Bootstrapping JanusX from PyPI...");
         }
-        let _ = pip_install_tail(
+        let _ = pip_install_update(
             &python,
             &home,
             &pypi_spec,
             false,
+            verbose_bootstrap,
             "Building runtime from PyPI ...",
-            10,
             true,
         )?;
     }
@@ -3106,6 +3137,7 @@ fn pip_install(
     verbose: bool,
     desc: &str,
     use_cn_rust_mirror: bool,
+    force_source_build: bool,
 ) -> Result<Duration, String> {
     let mut cmd = build_pip_install_cmd(
         python,
@@ -3113,6 +3145,7 @@ fn pip_install(
         spec,
         force_reinstall,
         use_cn_rust_mirror,
+        force_source_build,
     );
 
     if verbose {
@@ -3157,6 +3190,7 @@ fn build_pip_install_cmd(
     spec: &str,
     force_reinstall: bool,
     use_cn_rust_mirror: bool,
+    force_source_build: bool,
 ) -> Command {
     let mut cmd = Command::new(python);
     cmd.arg("-m")
@@ -3164,7 +3198,7 @@ fn build_pip_install_cmd(
         .arg("install")
         .arg("--upgrade")
         .arg("--disable-pip-version-check");
-    if should_force_source_build_for_spec(spec) {
+    if force_source_build || should_force_source_build_for_spec(spec) {
         cmd.arg("--no-binary").arg("janusx");
     }
     if force_reinstall {
@@ -3208,6 +3242,7 @@ fn pip_install_tail(
     desc: &str,
     max_lines: usize,
     use_cn_rust_mirror: bool,
+    force_source_build: bool,
 ) -> Result<Duration, String> {
     let is_tty = io::stdout().is_terminal();
     let mut cmd = build_pip_install_cmd(
@@ -3216,6 +3251,7 @@ fn pip_install_tail(
         spec,
         force_reinstall,
         use_cn_rust_mirror,
+        force_source_build,
     );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())

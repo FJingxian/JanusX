@@ -13,6 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PYPI_SPEC: &str = "janusx";
 const GITHUB_SPEC_CN: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";
 const GITHUB_SPEC_ORIGIN: &str = "git+https://github.com/FJingxian/JanusX.git";
+const GITHUB_ARCHIVE_CN: &str =
+    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/archive/refs/heads/main.tar.gz";
+const GITHUB_ARCHIVE_ORIGIN: &str =
+    "https://github.com/FJingxian/JanusX/archive/refs/heads/main.tar.gz";
 const UPDATE_TIME_MARKER: &str = ".python_core_updated_at";
 const COMMIT_MARKER: &str = ".python_core_commit";
 const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
@@ -1342,7 +1346,51 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             if maybe_self_update_launcher_from_release(&python, &home, opts.verbose)? {
                 return Ok(0);
             }
-            ensure_git_available()?;
+            if ensure_git_available().is_err() {
+                if !has_http_download_tool() {
+                    return Err(git_install_hint());
+                }
+                let tmp_dir = home.join(".update-src");
+                std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+                    format!(
+                        "Failed to create GitHub source cache directory {}: {e}",
+                        tmp_dir.display()
+                    )
+                })?;
+                let archive_path = tmp_dir.join("JanusX-latest-main.tar.gz");
+                match download_file_with_http_tools(
+                    GITHUB_ARCHIVE_CN,
+                    &archive_path,
+                    "Downloading GitHub source archive (CN mirror) ...",
+                    opts.verbose,
+                ) {
+                    Ok(_) => {}
+                    Err(err_cn) => {
+                        eprintln!("GitHub source archive CN mirror failed, retrying source...");
+                        if opts.verbose {
+                            eprintln!("Reason: {err_cn}");
+                        }
+                        download_file_with_http_tools(
+                            GITHUB_ARCHIVE_ORIGIN,
+                            &archive_path,
+                            "Downloading GitHub source archive (source) ...",
+                            opts.verbose,
+                        )?;
+                    }
+                }
+                let archive_spec = archive_path.to_string_lossy().to_string();
+                let _ = pip_install_update(
+                    &python,
+                    &home,
+                    &archive_spec,
+                    true,
+                    opts.verbose,
+                    "Updating from GitHub source archive ...",
+                    true,
+                )?;
+                warm_up_after_update(jx_bin.as_deref(), &home)?;
+                return Ok(0);
+            }
             let repo_url_cn = repo_url_from_spec(GITHUB_SPEC_CN);
             let repo_url_origin = repo_url_from_spec(GITHUB_SPEC_ORIGIN);
             let (repo_url, remote_head, using_cn_repo) =
@@ -2093,6 +2141,44 @@ urllib.request.urlretrieve(url, out)
     run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
         .map_err(|e| format!("Python download failed: {e}"))?;
     Ok(())
+}
+
+fn has_http_download_tool() -> bool {
+    command_ok("wget", &["--version"]) || command_ok("curl", &["--version"])
+}
+
+fn download_file_with_http_tools(
+    url: &str,
+    output: &Path,
+    desc: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    if command_ok("wget", &["--version"]) {
+        let mut cmd = Command::new("wget");
+        cmd.arg("-c")
+            .arg("-O")
+            .arg(output)
+            .arg(url)
+            .stdin(Stdio::null());
+        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
+            .map_err(|e| format!("wget download failed: {e}"))?;
+        return Ok(());
+    }
+    if command_ok("curl", &["--version"]) {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-L")
+            .arg("--fail")
+            .arg("--continue-at")
+            .arg("-")
+            .arg("-o")
+            .arg(output)
+            .arg(url)
+            .stdin(Stdio::null());
+        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
+            .map_err(|e| format!("curl download failed: {e}"))?;
+        return Ok(());
+    }
+    Err("Neither wget nor curl is available.".to_string())
 }
 
 fn extract_tar_gz_with_python(

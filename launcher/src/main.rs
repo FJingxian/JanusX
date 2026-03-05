@@ -432,12 +432,31 @@ fn print_path_setup_hint(installed_jx: &Path) {
     #[cfg(target_os = "windows")]
     {
         let d = install_dir.display();
-        println!("PowerShell (current session):");
-        println!("  $env:Path = \"{d};$env:Path\"");
-        println!("PowerShell (persistent, user):");
-        println!(
-            "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
-        );
+        let shell = detect_windows_shell();
+        let show_cmd_first = matches!(shell, WindowsShell::Cmd);
+        if show_cmd_first {
+            println!("cmd (current session):");
+            println!("  set \"PATH={d};%PATH%\"");
+            println!("cmd (persistent, user):");
+            println!("  setx PATH \"{d};%PATH%\"");
+            println!("PowerShell (current session):");
+            println!("  $env:Path = \"{d};$env:Path\"");
+            println!("PowerShell (persistent, user):");
+            println!(
+                "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+            );
+        } else {
+            println!("PowerShell (current session):");
+            println!("  $env:Path = \"{d};$env:Path\"");
+            println!("PowerShell (persistent, user):");
+            println!(
+                "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+            );
+            println!("cmd (current session):");
+            println!("  set \"PATH={d};%PATH%\"");
+            println!("cmd (persistent, user):");
+            println!("  setx PATH \"{d};%PATH%\"");
+        }
         println!("Then open a new terminal.");
     }
 
@@ -541,6 +560,33 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WindowsShell {
+    PowerShell,
+    Cmd,
+    Unknown,
+}
+
+#[cfg(windows)]
+fn detect_windows_shell() -> WindowsShell {
+    if env::var_os("POWERSHELL_DISTRIBUTION_CHANNEL").is_some()
+        || env::var_os("PSModulePath").is_some()
+    {
+        return WindowsShell::PowerShell;
+    }
+    if let Some(comspec) = env::var_os("ComSpec") {
+        let s = comspec.to_string_lossy().to_ascii_lowercase();
+        if s.ends_with("cmd.exe") {
+            return WindowsShell::Cmd;
+        }
+        if s.contains("powershell") || s.contains("pwsh") {
+            return WindowsShell::PowerShell;
+        }
+    }
+    WindowsShell::Unknown
+}
+
+#[cfg(windows)]
 fn path_eq(a: &Path, b: &Path) -> bool {
     a.to_string_lossy()
         .eq_ignore_ascii_case(&b.to_string_lossy())
@@ -555,7 +601,7 @@ fn default_runtime_home() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
         if let Some(v) = env::var_os("LOCALAPPDATA") {
-            return Ok(PathBuf::from(v).join("JanusX"));
+            return Ok(PathBuf::from(v).join("JanusX").join(".janusx"));
         }
     }
     #[cfg(not(windows))]
@@ -634,11 +680,18 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| runtime_home.clone());
-        if !runtime_parent.exists() || !runtime_parent.is_dir() {
-            eprintln!(
-                "Runtime parent directory does not exist: {}",
-                runtime_parent.display()
-            );
+        if !runtime_parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(&runtime_parent) {
+                eprintln!(
+                    "Failed to create runtime parent directory {}: {}",
+                    runtime_parent.display(),
+                    e
+                );
+                continue;
+            }
+        }
+        if !runtime_parent.is_dir() {
+            eprintln!("Runtime parent is not a directory: {}", runtime_parent.display());
             continue;
         }
         if !is_dir_writable(&runtime_parent) {
@@ -648,11 +701,18 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             );
             continue;
         }
-        if !install_dir.exists() || !install_dir.is_dir() {
-            eprintln!(
-                "Install directory does not exist: {}",
-                install_dir.display()
-            );
+        if !install_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&install_dir) {
+                eprintln!(
+                    "Failed to create install directory {}: {}",
+                    install_dir.display(),
+                    e
+                );
+                continue;
+            }
+        }
+        if !install_dir.is_dir() {
+            eprintln!("Install path is not a directory: {}", install_dir.display());
             continue;
         }
         if !is_dir_writable(&install_dir) {

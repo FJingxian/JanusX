@@ -3354,6 +3354,11 @@ fn pip_install_tail(
     let mut streamed_lines_before_tail = 0usize;
     let mut saw_any_line = false;
 
+    if is_tty {
+        render_prelog_spinner_line(desc, start.elapsed())?;
+        prelog_spinner_shown = true;
+    }
+
     while channel_open {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok((is_err, line)) => {
@@ -3465,14 +3470,18 @@ fn pip_install_tail(
         }
         let final_symbol = if status.success() { "✔︎" } else { "✘" };
         if tail_mode_started {
-            render_tail_block(
-                desc,
-                final_symbol,
-                start.elapsed(),
-                &tail,
-                max_lines,
-                rendered,
-            )?;
+            if status.success() {
+                render_tail_success_compact(desc, start.elapsed(), max_lines)?;
+            } else {
+                render_tail_block(
+                    desc,
+                    final_symbol,
+                    start.elapsed(),
+                    &tail,
+                    max_lines,
+                    rendered,
+                )?;
+            }
         } else {
             let width = terminal_line_width();
             let title = truncate_plain_line(
@@ -3487,9 +3496,6 @@ fn pip_install_tail(
     }
 
     if status.success() {
-        if is_tty && tail_mode_started && max_lines > 0 {
-            clear_tail_log_lines(max_lines)?;
-        }
         remove_conflicting_jx_entrypoints(python);
         write_python_core_update_marker(runtime_home, python);
         return Ok(start.elapsed());
@@ -3566,17 +3572,16 @@ fn render_tail_title_only(desc: &str, elapsed: Duration, max_lines: usize) -> Re
     Ok(())
 }
 
-fn clear_tail_log_lines(max_lines: usize) -> Result<(), String> {
+fn render_tail_success_compact(desc: &str, elapsed: Duration, max_lines: usize) -> Result<(), String> {
+    let width = terminal_line_width();
+    let title = truncate_plain_line(&format!("✔︎ {desc}[{}]", format_elapsed(elapsed)), width);
     // Cursor is currently below the fixed block.
-    // Move to first log line (below title), clear log lines only, keep title.
-    print!("\x1b[{}A", max_lines);
-    for i in 0..max_lines {
-        print!("\x1b[2K\r");
-        if i + 1 < max_lines {
-            print!("\x1b[1B");
-        }
+    // Move to title row, print success title, then delete tail log rows entirely.
+    print!("\x1b[{}A", max_lines.saturating_add(1));
+    print!("\x1b[2K\r{}\n", style_green(&title));
+    if max_lines > 0 {
+        print!("\x1b[{}M", max_lines);
     }
-    print!("\r");
     io::stdout()
         .flush()
         .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;

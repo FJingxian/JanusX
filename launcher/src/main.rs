@@ -2665,6 +2665,7 @@ fn find_system_python() -> Option<String> {
         }
     }
 
+    #[cfg(windows)]
     let candidates: &[(&str, &[&str])] = &[
         ("python3.14", &[]),
         ("python3.13", &[]),
@@ -2673,8 +2674,22 @@ fn find_system_python() -> Option<String> {
         ("python3.10", &[]),
         ("python3.9", &[]),
         ("python3", &[]),
-        ("python", &[]),
         ("py", &[]),
+        ("python", &[]),
+    ];
+
+    #[cfg(not(windows))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("python3.14", &[]),
+        ("python3.13", &[]),
+        ("python3.12", &[]),
+        ("python3.11", &[]),
+        ("python3.10", &[]),
+        ("python3.9", &[]),
+        ("python3", &[]),
+        // Safe fallback for Unix environments that only expose `python`.
+        // python_bin_meets_min_version_with_prefix() still enforces >= MIN_PYTHON.
+        ("python", &[]),
     ];
 
     for (bin, prefix) in candidates {

@@ -82,7 +82,8 @@ from joblib import cpu_count as joblib_cpu_count
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
-from janusx.pyBLUP import BLUP, kfold
+from janusx.pyBLUP.kfold import kfold
+from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
@@ -182,7 +183,7 @@ def GSapi(
     # Linear mixed models
     if method in ("GBLUP", "rrBLUP"):
         kinship = 1 if method == "GBLUP" else None
-        model = BLUP(Y.reshape(-1, 1), Xtrain, kinship=kinship)
+        model = MLMBLUP(Y.reshape(-1, 1), Xtrain, kinship=kinship)
         return model.predict(Xtrain), model.predict(Xtest), model.pve
 
     if method in ("BayesA", "BayesB", "BayesCpi"):

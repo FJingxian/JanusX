@@ -2383,7 +2383,8 @@ fn pip_install_update(
     desc: &str,
     use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
-    let attempt_install = |force_source_build: bool| -> Result<Duration, String> {
+    let attempt_install =
+        |force_source_build: bool, suppress_failure_status_line: bool| -> Result<Duration, String> {
         if verbose {
             pip_install(
                 python,
@@ -2405,11 +2406,13 @@ fn pip_install_update(
                 10,
                 use_cn_rust_mirror,
                 force_source_build,
+                suppress_failure_status_line,
             )
         }
     };
 
-    match attempt_install(false) {
+    let suppress_first_failure = is_pypi_janusx_spec(spec);
+    match attempt_install(false, suppress_first_failure) {
         Ok(d) => return Ok(d),
         Err(e) => {
             if spec_requires_rust_build(spec)
@@ -2420,13 +2423,15 @@ fn pip_install_update(
                     eprintln!("Rust toolchain is required by this update; installing local Rust and retrying.");
                 }
                 ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-                return attempt_install(false);
+                return attempt_install(false, false);
             }
             if is_pypi_janusx_spec(spec) && should_retry_with_source_build(&e) {
                 if verbose {
                     eprintln!("PyPI wheel install is unavailable; retrying source build.");
+                } else {
+                    println!("Retrying source build...");
                 }
-                match attempt_install(true) {
+                match attempt_install(true, false) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {
                         if !local_rust_toolchain_ready(runtime_home)
@@ -2438,7 +2443,7 @@ fn pip_install_update(
                                 );
                             }
                             ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-                            return attempt_install(true);
+                            return attempt_install(true, false);
                         }
                         return Err(e2);
                     }
@@ -3295,6 +3300,7 @@ fn pip_install_tail(
     max_lines: usize,
     use_cn_rust_mirror: bool,
     force_source_build: bool,
+    suppress_failure_status_line: bool,
 ) -> Result<Duration, String> {
     let is_tty = io::stdout().is_terminal();
     let mut cmd = build_pip_install_cmd(
@@ -3484,27 +3490,37 @@ fn pip_install_tail(
                 .flush()
                 .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
         }
-        let final_symbol = if status.success() { "✔︎" } else { "✘" };
-        if tail_mode_started {
-            if status.success() {
-                render_tail_success_compact(desc, start.elapsed(), max_lines)?;
+        let should_render_failure = !suppress_failure_status_line;
+        if status.success() || should_render_failure {
+            let final_symbol = if status.success() { "✔︎" } else { "✘" };
+            if tail_mode_started {
+                if status.success() {
+                    render_tail_success_compact(desc, start.elapsed(), max_lines)?;
+                } else {
+                    render_tail_block(
+                        desc,
+                        final_symbol,
+                        start.elapsed(),
+                        &tail,
+                        max_lines,
+                        rendered,
+                    )?;
+                }
             } else {
-                render_tail_block(
-                    desc,
-                    final_symbol,
-                    start.elapsed(),
-                    &tail,
-                    max_lines,
-                    rendered,
-                )?;
+                let width = terminal_line_width();
+                let title = truncate_plain_line(
+                    &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
+                    width,
+                );
+                println!("{}", style_green(&title));
+                io::stdout()
+                    .flush()
+                    .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
             }
+        } else if tail_mode_started {
+            clear_tail_title_only(max_lines)?;
         } else {
-            let width = terminal_line_width();
-            let title = truncate_plain_line(
-                &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
-                width,
-            );
-            println!("{}", style_green(&title));
+            print!("\r\x1b[2K");
             io::stdout()
                 .flush()
                 .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
@@ -3597,6 +3613,20 @@ fn render_tail_success_compact(desc: &str, elapsed: Duration, max_lines: usize) 
     print!("\x1b[2K\r{}\n", style_green(&title));
     if max_lines > 0 {
         print!("\x1b[{}M", max_lines);
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn clear_tail_title_only(max_lines: usize) -> Result<(), String> {
+    // Cursor is currently below the fixed block.
+    // Move to title row, clear it, keep logs, then return to bottom.
+    print!("\x1b[{}A", max_lines.saturating_add(1));
+    print!("\x1b[2K\r\n");
+    if max_lines > 0 {
+        print!("\x1b[{}B", max_lines);
     }
     io::stdout()
         .flush()

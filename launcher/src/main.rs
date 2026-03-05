@@ -472,6 +472,12 @@ enum PathPersistStatus {
     AlreadyConfigured,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PathRemoveStatus {
+    Removed,
+    NotFound,
+}
+
 fn ensure_install_dir_in_path_persistent(install_dir: &Path) -> Result<PathPersistStatus, String> {
     #[cfg(target_os = "windows")]
     {
@@ -489,6 +495,23 @@ fn ensure_install_dir_in_path_persistent(install_dir: &Path) -> Result<PathPersi
     Err("Unsupported platform for PATH auto-setup.".to_string())
 }
 
+fn remove_install_dir_from_path_persistent(install_dir: &Path) -> Result<PathRemoveStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return remove_install_dir_from_path_persistent_windows(install_dir);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return remove_install_dir_from_path_persistent_unix(install_dir, ".zshrc");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return remove_install_dir_from_path_persistent_unix(install_dir, ".bashrc");
+    }
+    #[allow(unreachable_code)]
+    Err("Unsupported platform for PATH removal.".to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn ensure_install_dir_in_path_persistent_windows(
     install_dir: &Path,
@@ -503,7 +526,14 @@ if ([string]::IsNullOrWhiteSpace($old)) {
   exit 10
 }
 $parts = $old.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-if ($parts -contains $target) { exit 11 }
+$exists = $false
+foreach ($p in $parts) {
+  if ([System.StringComparer]::OrdinalIgnoreCase.Equals($p, $target)) {
+    $exists = $true
+    break
+  }
+}
+if ($exists) { exit 11 }
 [Environment]::SetEnvironmentVariable('Path', "$target;$old", 'User')
 exit 10
 "#;
@@ -550,6 +580,61 @@ exit 10
     Err(format!("setx failed with exit={}", exit_code(status)))
 }
 
+#[cfg(target_os = "windows")]
+fn remove_install_dir_from_path_persistent_windows(
+    install_dir: &Path,
+) -> Result<PathRemoveStatus, String> {
+    let target = canonical_or_self(install_dir);
+    let target_s = target.to_string_lossy().to_string();
+    let script = r#"
+$target = [System.IO.Path]::GetFullPath($args[0])
+$old = [Environment]::GetEnvironmentVariable('Path','User')
+if ([string]::IsNullOrWhiteSpace($old)) { exit 21 }
+$parts = @()
+$removed = $false
+foreach ($p in $old.Split(';')) {
+  $t = $p.Trim()
+  if ($t -eq '') { continue }
+  if ([System.StringComparer]::OrdinalIgnoreCase.Equals($t, $target)) {
+    $removed = $true
+    continue
+  }
+  $parts += $t
+}
+if (-not $removed) { exit 21 }
+$new = [string]::Join(';', $parts)
+[Environment]::SetEnvironmentVariable('Path', $new, 'User')
+exit 20
+"#;
+
+    for shell in ["powershell", "pwsh"] {
+        if !command_ok(
+            shell,
+            &["-NoProfile", "-Command", "$PSVersionTable.PSVersion"],
+        ) {
+            continue;
+        }
+        let status = Command::new(shell)
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(script)
+            .arg(&target_s)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to run {shell} for PATH removal: {e}"))?;
+        let code = exit_code(status);
+        if code == 20 {
+            return Ok(PathRemoveStatus::Removed);
+        }
+        if code == 21 {
+            return Ok(PathRemoveStatus::NotFound);
+        }
+    }
+    Err("No PowerShell runtime available to remove PATH entry.".to_string())
+}
+
 #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
 fn ensure_install_dir_in_path_persistent_unix(
     install_dir: &Path,
@@ -579,6 +664,37 @@ fn ensure_install_dir_in_path_persistent_unix(
     out.push('\n');
     std::fs::write(&rc, out).map_err(|e| format!("Failed to write {}: {e}", rc.display()))?;
     Ok(PathPersistStatus::Added)
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn remove_install_dir_from_path_persistent_unix(
+    install_dir: &Path,
+    rc_name: &str,
+) -> Result<PathRemoveStatus, String> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set; cannot update shell rc file.".to_string())?;
+    let rc = home.join(rc_name);
+    if !rc.exists() {
+        return Ok(PathRemoveStatus::NotFound);
+    }
+
+    let d = canonical_or_self(install_dir).to_string_lossy().to_string();
+    let line = format!("export PATH=\"{}:$PATH\"", d.replace('"', "\\\""));
+    let text = std::fs::read_to_string(&rc)
+        .map_err(|e| format!("Failed to read {}: {e}", rc.display()))?;
+
+    let kept: Vec<&str> = text.lines().filter(|l| l.trim() != line).collect();
+    if kept.len() == text.lines().count() {
+        return Ok(PathRemoveStatus::NotFound);
+    }
+
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&rc, out).map_err(|e| format!("Failed to write {}: {e}", rc.display()))?;
+    Ok(PathRemoveStatus::Removed)
 }
 
 fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
@@ -1825,6 +1941,13 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
         .ok_or_else(|| "Failed to resolve jx install directory.".to_string())?;
 
     let mut failed: Vec<String> = Vec::new();
+    let path_remove_status = match remove_install_dir_from_path_persistent(&install_dir) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            failed.push(format!("PATH cleanup ({e})"));
+            None
+        }
+    };
     cleanup_generated_artifacts_in_install_dir(&install_dir, &mut failed);
 
     if let Ok(home) = runtime_home() {
@@ -1883,6 +2006,11 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
     }
 
     print_success_line("JanusX uninstall completed.");
+    match path_remove_status {
+        Some(PathRemoveStatus::Removed) => println!("Removed JanusX from PATH."),
+        Some(PathRemoveStatus::NotFound) => println!("JanusX PATH entry was not found."),
+        None => {}
+    }
     println!("Genotype caches were not removed.");
     Ok(0)
 }

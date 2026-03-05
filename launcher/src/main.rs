@@ -197,7 +197,6 @@ Linux: please run the `.run` installer file."
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
     write_launcher_version_marker_near_binary(&installed_jx);
     warm_up_jx(&installed_jx, &runtime_home)?;
-    println!("Installation complete.");
     print_path_setup_hint(&installed_jx);
     Ok(0)
 }
@@ -441,7 +440,12 @@ fn print_path_setup_hint(installed_jx: &Path) {
             println!("Reopen terminal.");
         }
         Ok(PathPersistStatus::AlreadyConfigured) => {
-            print_success_line("JanusX PATH entry already exists.");
+            println!("JanusX PATH is already configured, but current session may not be reloaded.");
+            #[cfg(target_os = "macos")]
+            println!("Run: source ~/.zshrc");
+            #[cfg(all(unix, not(target_os = "macos")))]
+            println!("Run: source ~/.bashrc");
+            #[cfg(target_os = "windows")]
             println!("Reopen terminal.");
         }
         Err(e) => {

@@ -144,6 +144,7 @@ def _emit_trait_header(
     trait_name: str,
     n_idv: int,
     *,
+    pve: Optional[float] = None,
     use_spinner: bool = False,
     width: int = 60,
 ) -> None:
@@ -152,7 +153,18 @@ def _emit_trait_header(
     If it exceeds section width, wrap at trait/name boundary.
     """
     trait = str(trait_name)
-    n_line = f"(n={int(n_idv)})"
+    pve_val: Optional[float] = None
+    if pve is not None:
+        try:
+            pve_tmp = float(pve)
+            if np.isfinite(pve_tmp):
+                pve_val = pve_tmp
+        except Exception:
+            pve_val = None
+    if pve_val is None:
+        n_line = f"(n={int(n_idv)})"
+    else:
+        n_line = f"(n={int(n_idv)}; pve={pve_val:.3f})"
     full = f"{trait} {n_line}"
     if len(full) <= int(width):
         lines = [full]
@@ -2047,14 +2059,6 @@ def run_chunked_gwas_lmm_lm(
                 logger.info("")  # single blank line between traits
             continue
 
-        _emit_trait_header(
-            logger,
-            pname,
-            n_idv,
-            use_spinner=bool(use_spinner),
-            width=60,
-        )
-
         trait_ids = np.asarray(ids[sameidx], dtype=str)
         y_vec = pheno_sub.loc[trait_ids].values
         # Build covariate matrix X_cov for this trait
@@ -2062,6 +2066,7 @@ def run_chunked_gwas_lmm_lm(
         if cov_all is not None:
             X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
 
+        header_pve: Optional[float] = None
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
@@ -2069,6 +2074,12 @@ def run_chunked_gwas_lmm_lm(
             evd_t0 = time.monotonic()
             with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
                 mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+            try:
+                pve_tmp = float(mod.pve)
+                if np.isfinite(pve_tmp):
+                    header_pve = pve_tmp
+            except Exception:
+                header_pve = None
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
             _log_file_only(
@@ -2084,6 +2095,15 @@ def run_chunked_gwas_lmm_lm(
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
+
+        _emit_trait_header(
+            logger,
+            pname,
+            n_idv,
+            pve=header_pve,
+            use_spinner=bool(use_spinner),
+            width=60,
+        )
 
         done_snps = 0
         has_results = False
@@ -2421,14 +2441,6 @@ def run_chunked_gwas_streaming_shared(
             eff_snp_by_trait[pname] = 0
         return
 
-    _emit_trait_header(
-        logger,
-        pname,
-        n_idv,
-        use_spinner=bool(use_spinner),
-        width=60,
-    )
-
     trait_ids = np.asarray(ids[sameidx], dtype=str)
     y_vec = pheno_sub.loc[trait_ids].values
     X_cov = qmatrix[sameidx]
@@ -2577,6 +2589,28 @@ def run_chunked_gwas_streaming_shared(
         )
         ctx["mod"] = mod
         model_ctxs.append(ctx)
+
+    header_pve: Optional[float] = None
+    for ctx in model_ctxs:
+        if str(ctx.get("model_key", "")) in {"lmm", "fastlmm"}:
+            mod_obj = ctx.get("mod")
+            if mod_obj is not None and hasattr(mod_obj, "pve"):
+                try:
+                    pve_tmp = float(getattr(mod_obj, "pve"))
+                    if np.isfinite(pve_tmp):
+                        header_pve = pve_tmp
+                        break
+                except Exception:
+                    pass
+
+    _emit_trait_header(
+        logger,
+        pname,
+        n_idv,
+        pve=header_pve,
+        use_spinner=bool(use_spinner),
+        width=60,
+    )
 
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
     use_rich_multi = bool(use_spinner and _HAS_RICH_PROGRESS and sys.stdout.isatty())

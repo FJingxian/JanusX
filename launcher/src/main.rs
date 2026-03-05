@@ -2383,8 +2383,11 @@ fn pip_install_update(
     desc: &str,
     use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
-    let attempt_install =
-        |force_source_build: bool, suppress_failure_status_line: bool| -> Result<Duration, String> {
+    let attempt_install = |force_source_build: bool,
+                           suppress_failure_status_line: bool,
+                           desc_override: Option<&str>|
+     -> Result<Duration, String> {
+        let effective_desc = desc_override.unwrap_or(desc);
         if verbose {
             pip_install(
                 python,
@@ -2392,7 +2395,7 @@ fn pip_install_update(
                 spec,
                 force_reinstall,
                 true,
-                desc,
+                effective_desc,
                 use_cn_rust_mirror,
                 force_source_build,
             )
@@ -2402,7 +2405,7 @@ fn pip_install_update(
                 runtime_home,
                 spec,
                 force_reinstall,
-                desc,
+                effective_desc,
                 10,
                 use_cn_rust_mirror,
                 force_source_build,
@@ -2411,8 +2414,7 @@ fn pip_install_update(
         }
     };
 
-    let suppress_first_failure = is_pypi_janusx_spec(spec);
-    match attempt_install(false, suppress_first_failure) {
+    match attempt_install(false, false, None) {
         Ok(d) => return Ok(d),
         Err(e) => {
             if spec_requires_rust_build(spec)
@@ -2423,15 +2425,13 @@ fn pip_install_update(
                     eprintln!("Rust toolchain is required by this update; installing local Rust and retrying.");
                 }
                 ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-                return attempt_install(false, false);
+                return attempt_install(false, false, None);
             }
             if is_pypi_janusx_spec(spec) && should_retry_with_source_build(&e) {
                 if verbose {
                     eprintln!("PyPI wheel install is unavailable; retrying source build.");
-                } else {
-                    println!("Retrying source build...");
                 }
-                match attempt_install(true, false) {
+                match attempt_install(true, false, Some("Retrying source build from PyPI ...")) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {
                         if !local_rust_toolchain_ready(runtime_home)
@@ -2443,7 +2443,11 @@ fn pip_install_update(
                                 );
                             }
                             ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-                            return attempt_install(true, false);
+                            return attempt_install(
+                                true,
+                                false,
+                                Some("Retrying source build from PyPI ..."),
+                            );
                         }
                         return Err(e2);
                     }
@@ -3144,6 +3148,14 @@ fn style_green(text: &str) -> String {
     }
 }
 
+fn style_yellow(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[33m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
@@ -3512,7 +3524,11 @@ fn pip_install_tail(
                     &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
                     width,
                 );
-                println!("{}", style_green(&title));
+                if status.success() {
+                    println!("{}", style_green(&title));
+                } else {
+                    println!("{}", style_yellow(&title));
+                }
                 io::stdout()
                     .flush()
                     .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
@@ -3568,7 +3584,11 @@ fn render_tail_block(
             &format!("{symbol} {desc}[{}]", format_elapsed(elapsed)),
             width,
         );
-        print!("\x1b[2K\r{}\n", style_green(&title));
+        if symbol == "✘" {
+            print!("\x1b[2K\r{}\n", style_yellow(&title));
+        } else {
+            print!("\x1b[2K\r{}\n", style_green(&title));
+        }
     }
     let mut shown = 0usize;
     for line in tail {

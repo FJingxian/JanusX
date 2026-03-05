@@ -432,26 +432,153 @@ fn print_path_setup_hint(installed_jx: &Path) {
         return;
     }
 
-    println!();
-    println!("Add JanusX to PATH:");
+    match ensure_install_dir_in_path_persistent(install_dir) {
+        Ok(PathPersistStatus::Added) => {
+            print_success_line("JanusX has been added to PATH.");
+            println!("Reopen terminal.");
+        }
+        Ok(PathPersistStatus::AlreadyConfigured) => {
+            print_success_line("JanusX PATH entry already exists.");
+            println!("Reopen terminal.");
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to auto-add JanusX to PATH: {e}");
+            println!("Add JanusX to PATH:");
 
+            #[cfg(target_os = "windows")]
+            {
+                let d = install_dir.display();
+                println!("setx PATH \"{d};%PATH%\"");
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let d = install_dir.display();
+                println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
+            }
+
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let d = install_dir.display();
+                println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PathPersistStatus {
+    Added,
+    AlreadyConfigured,
+}
+
+fn ensure_install_dir_in_path_persistent(install_dir: &Path) -> Result<PathPersistStatus, String> {
     #[cfg(target_os = "windows")]
     {
-        let d = install_dir.display();
-        println!("setx PATH \"{d};%PATH%\"");
+        return ensure_install_dir_in_path_persistent_windows(install_dir);
     }
-
     #[cfg(target_os = "macos")]
     {
-        let d = install_dir.display();
-        println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
+        return ensure_install_dir_in_path_persistent_unix(install_dir, ".zshrc");
     }
-
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let d = install_dir.display();
-        println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
+        return ensure_install_dir_in_path_persistent_unix(install_dir, ".bashrc");
     }
+    #[allow(unreachable_code)]
+    Err("Unsupported platform for PATH auto-setup.".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_install_dir_in_path_persistent_windows(
+    install_dir: &Path,
+) -> Result<PathPersistStatus, String> {
+    let target = canonical_or_self(install_dir);
+    let target_s = target.to_string_lossy().to_string();
+    let script = r#"
+$target = [System.IO.Path]::GetFullPath($args[0])
+$old = [Environment]::GetEnvironmentVariable('Path','User')
+if ([string]::IsNullOrWhiteSpace($old)) {
+  [Environment]::SetEnvironmentVariable('Path', $target, 'User')
+  exit 10
+}
+$parts = $old.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+if ($parts -contains $target) { exit 11 }
+[Environment]::SetEnvironmentVariable('Path', "$target;$old", 'User')
+exit 10
+"#;
+
+    for shell in ["powershell", "pwsh"] {
+        if !command_ok(
+            shell,
+            &["-NoProfile", "-Command", "$PSVersionTable.PSVersion"],
+        ) {
+            continue;
+        }
+        let status = Command::new(shell)
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(script)
+            .arg(&target_s)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to run {shell} for PATH setup: {e}"))?;
+        let code = exit_code(status);
+        if code == 10 {
+            return Ok(PathPersistStatus::Added);
+        }
+        if code == 11 {
+            return Ok(PathPersistStatus::AlreadyConfigured);
+        }
+    }
+
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg("setx")
+        .arg("PATH")
+        .arg(format!("{};%PATH%", target_s))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run setx for PATH setup: {e}"))?;
+    if status.success() {
+        return Ok(PathPersistStatus::Added);
+    }
+    Err(format!("setx failed with exit={}", exit_code(status)))
+}
+
+#[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
+fn ensure_install_dir_in_path_persistent_unix(
+    install_dir: &Path,
+    rc_name: &str,
+) -> Result<PathPersistStatus, String> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set; cannot update shell rc file.".to_string())?;
+    let rc = home.join(rc_name);
+    let d = canonical_or_self(install_dir).to_string_lossy().to_string();
+    let line = format!("export PATH=\"{}:$PATH\"", d.replace('"', "\\\""));
+
+    let mut existing = String::new();
+    if rc.exists() {
+        existing = std::fs::read_to_string(&rc)
+            .map_err(|e| format!("Failed to read {}: {e}", rc.display()))?;
+    }
+    if existing.lines().any(|l| l.trim() == line) {
+        return Ok(PathPersistStatus::AlreadyConfigured);
+    }
+
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&line);
+    out.push('\n');
+    std::fs::write(&rc, out).map_err(|e| format!("Failed to write {}: {e}", rc.display()))?;
+    Ok(PathPersistStatus::Added)
 }
 
 fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
@@ -806,8 +933,10 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             eprintln!("Install path is not a directory: {}", install_dir.display());
             continue;
         }
-        println!("Binary `jx` builds in {}", install_dir.display());
-        return Ok((runtime_home, install_dir));
+        let install_dir_abs = canonical_or_self(&install_dir);
+        let runtime_home_abs = install_dir_abs.join(".janusx");
+        println!("Binary `jx` builds in {}", install_dir_abs.display());
+        return Ok((runtime_home_abs, install_dir_abs));
     }
 }
 

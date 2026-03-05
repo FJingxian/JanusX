@@ -3203,6 +3203,10 @@ fn build_pip_install_cmd(
         .arg("--disable-pip-version-check");
     if force_source_build || should_force_source_build_for_spec(spec) {
         cmd.arg("--no-binary").arg("janusx");
+    } else if is_pypi_janusx_spec(spec) {
+        // Prefer wheel-only first for PyPI installs.
+        // If wheel is unavailable, pip_install_update() will fall back to source build.
+        cmd.arg("--only-binary").arg("janusx").arg("--prefer-binary");
     }
     if force_reinstall {
         cmd.arg("--force-reinstall").arg("--no-cache-dir");
@@ -3295,6 +3299,7 @@ fn pip_install_tail(
 
     let mut rendered = false;
     let mut tail_mode_started = false;
+    let mut prelog_spinner_shown = false;
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
@@ -3303,10 +3308,19 @@ fn pip_install_tail(
     let mut last_render = Instant::now();
     let mut last_line_seen: Option<String> = None;
     let mut streamed_lines_before_tail = 0usize;
+    let mut saw_any_line = false;
 
     while channel_open {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok((is_err, line)) => {
+                if is_tty && prelog_spinner_shown && !tail_mode_started {
+                    print!("\r\x1b[2K");
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+                    prelog_spinner_shown = false;
+                }
+                saw_any_line = true;
                 let is_duplicate = last_line_seen.as_deref() == Some(line.as_str());
                 last_line_seen = Some(line.clone());
                 if is_err {
@@ -3368,8 +3382,15 @@ fn pip_install_tail(
                         .try_wait()
                         .map_err(|e| format!("Failed to poll pip install status: {e}"))?;
                 }
-                if is_tty && tail_mode_started && last_render.elapsed() >= Duration::from_secs(2) {
-                    render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                if is_tty && !tail_mode_started && !saw_any_line {
+                    render_prelog_spinner_line(desc, start.elapsed())?;
+                    prelog_spinner_shown = true;
+                }
+                if is_tty
+                    && tail_mode_started
+                    && last_render.elapsed() >= Duration::from_millis(100)
+                {
+                    render_tail_title_only(desc, start.elapsed(), max_lines)?;
                     rendered = true;
                     last_render = Instant::now();
                 }
@@ -3392,6 +3413,12 @@ fn pip_install_tail(
     };
 
     if is_tty {
+        if prelog_spinner_shown {
+            print!("\r\x1b[2K");
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+        }
         let final_symbol = if status.success() { "✔︎" } else { "✘" };
         if tail_mode_started {
             render_tail_block(
@@ -3445,7 +3472,7 @@ fn render_tail_block(
     let width = terminal_line_width();
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if symbol.is_empty() {
-        let idx = ((elapsed.as_millis() / 120) as usize) % frames.len();
+        let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
         let title = truncate_plain_line(
             &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
             width,
@@ -3467,6 +3494,43 @@ fn render_tail_block(
     while shown < max_lines {
         print!("\x1b[2K\r\n");
         shown += 1;
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_tail_title_only(desc: &str, elapsed: Duration, max_lines: usize) -> Result<(), String> {
+    let width = terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = truncate_plain_line(
+        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        width,
+    );
+    // Cursor is at the bottom of the fixed block; move to title row, rewrite title only, then return.
+    print!("\x1b[{}A", max_lines.saturating_add(1));
+    print!("\x1b[2K\r{}\n", style_green(&title));
+    print!("\x1b[{}B", max_lines);
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_prelog_spinner_line(desc: &str, elapsed: Duration) -> Result<(), String> {
+    let width = terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = truncate_plain_line(
+        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        width,
+    );
+    if supports_color() {
+        print!("\r{}", style_green(&title));
+    } else {
+        print!("\r{title}");
     }
     io::stdout()
         .flush()

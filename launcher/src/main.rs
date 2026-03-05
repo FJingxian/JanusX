@@ -429,7 +429,6 @@ fn print_path_setup_hint(installed_jx: &Path) {
     }
 
     println!();
-    println!("`jx` is not in PATH yet.");
     println!("Add JanusX to PATH:");
 
     #[cfg(target_os = "windows")]
@@ -667,11 +666,15 @@ fn expand_tilde(input: &str) -> PathBuf {
 
 fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
     let default_home = default_runtime_home()?;
+    let default_install = default_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_home.clone());
     loop {
-        let default_home_s = default_home.display().to_string();
+        let default_install_s = default_install.display().to_string();
         print!(
-            "JanusX runtime home builds in {} [y/n/path]: ",
-            default_home_s
+            "JanusX will be installed in {} [y/n/path]: ",
+            default_install_s
         );
         io::stdout()
             .flush()
@@ -720,7 +723,10 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
                 continue;
             }
             if !is_dir_empty(&install_dir)? {
-                print!("{} 已存在且非空，删除后安装[y/n]: ", install_dir.display());
+                print!(
+                    "{} already exists and is not empty. Delete and install? [y/n]: ",
+                    install_dir.display()
+                );
                 io::stdout()
                     .flush()
                     .map_err(|e| format!("Failed to flush stdout: {e}"))?;
@@ -1251,10 +1257,6 @@ fn ensure_venv() -> Result<PathBuf, String> {
             .map_err(|e| format!("Failed to remove runtime directory {}: {e}", home.display()))?;
     }
     if !home.exists() {
-        println!(
-            "Runtime directory not found. Initializing {} ...",
-            home.display()
-        );
         std::fs::create_dir_all(&home)
             .map_err(|e| format!("Failed to create runtime directory {}: {e}", home.display()))?;
     }

@@ -100,7 +100,25 @@ jobs:
           else
             OUT="JanusX-${TAG}-${{ matrix.asset_suffix }}"
           fi
-          cp "launcher/target/${BUILD_TARGET}/release/jx" "$OUT"
+          BIN_PATH=""
+          for c in \
+            "launcher/target/${BUILD_TARGET}/release/jx" \
+            "launcher/target/${{ matrix.target }}/release/jx"
+          do
+            if [[ -f "$c" ]]; then
+              BIN_PATH="$c"
+              break
+            fi
+          done
+          if [[ -z "$BIN_PATH" ]]; then
+            BIN_PATH="$(find launcher/target -type f -path '*/release/jx' | head -n 1 || true)"
+          fi
+          if [[ -z "$BIN_PATH" || ! -f "$BIN_PATH" ]]; then
+            echo "Cannot find built launcher binary under launcher/target."
+            find launcher/target -maxdepth 3 -type d -print || true
+            exit 1
+          fi
+          cp "$BIN_PATH" "$OUT"
           chmod +x "$OUT"
           FILES="$OUT"
           if [[ "${{ matrix.target }}" == *"unknown-linux-gnu" ]]; then

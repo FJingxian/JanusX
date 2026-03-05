@@ -520,21 +520,32 @@ fn ensure_install_dir_in_path_persistent_windows(
     let target_s = target.to_string_lossy().to_string();
     let script = r#"
 $target = [System.IO.Path]::GetFullPath($args[0])
+$target = $target.Trim()
+if ([string]::IsNullOrWhiteSpace($target)) { exit 12 }
 $old = [Environment]::GetEnvironmentVariable('Path','User')
-if ([string]::IsNullOrWhiteSpace($old)) {
-  [Environment]::SetEnvironmentVariable('Path', $target, 'User')
-  exit 10
+$parts = @()
+if (-not [string]::IsNullOrWhiteSpace($old)) {
+  $parts = @(
+    $old.Split(';') |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { $_ -ne '' }
+  )
 }
-$parts = $old.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-$exists = $false
-foreach ($p in $parts) {
-  if ([System.StringComparer]::OrdinalIgnoreCase.Equals($p, $target)) {
-    $exists = $true
-    break
+$parts = @(
+  $parts | Where-Object {
+    -not [System.StringComparer]::OrdinalIgnoreCase.Equals($_, $target)
+  }
+)
+$newParts = @($target) + $parts
+$new = [string]::Join(';', $newParts)
+$oldNorm = [string]::Join(';', @($parts))
+if (-not [string]::IsNullOrWhiteSpace($oldNorm)) {
+  $oldWithTarget = [string]::Join(';', @($target) + $parts)
+  if ([System.StringComparer]::OrdinalIgnoreCase.Equals($old, $oldWithTarget)) {
+    exit 11
   }
 }
-if ($exists) { exit 11 }
-[Environment]::SetEnvironmentVariable('Path', "$target;$old", 'User')
+[Environment]::SetEnvironmentVariable('Path', $new, 'User')
 exit 10
 "#;
 
@@ -561,6 +572,9 @@ exit 10
         }
         if code == 11 {
             return Ok(PathPersistStatus::AlreadyConfigured);
+        }
+        if code == 12 {
+            return Err("Resolved install directory is empty; cannot update PATH.".to_string());
         }
     }
 

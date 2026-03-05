@@ -430,39 +430,24 @@ fn print_path_setup_hint(installed_jx: &Path) {
 
     println!();
     println!("`jx` is not in PATH yet.");
-    println!("Add this directory to PATH (persistent):");
-    println!("  {}", install_dir.display());
+    println!("Add JanusX to PATH:");
 
     #[cfg(target_os = "windows")]
     {
         let d = install_dir.display();
-        match detect_windows_shell() {
-            WindowsShell::Cmd => {
-                println!("cmd (persistent, user):");
-                println!("  setx PATH \"{d};%PATH%\"");
-            }
-            WindowsShell::PowerShell | WindowsShell::Unknown => {
-                println!("PowerShell (persistent, user):");
-                println!(
-                    "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
-                );
-            }
-        }
-        println!("Reopen terminal.");
+        println!("setx PATH \"{d};%PATH%\"");
     }
 
     #[cfg(target_os = "macos")]
     {
         let d = install_dir.display();
-        println!("zsh:");
-        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
+        println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let d = install_dir.display();
-        println!("bash:");
-        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
+        println!("echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
     }
 }
 
@@ -650,11 +635,11 @@ fn default_runtime_home() -> Result<PathBuf, String> {
     #[cfg(not(windows))]
     {
         if let Some(v) = env::var_os("HOME") {
-            return Ok(PathBuf::from(v).join(".janusx"));
+            return Ok(PathBuf::from(v).join("JanusX").join(".janusx"));
         }
     }
     env::current_dir()
-        .map(|p| p.join(".janusx"))
+        .map(|p| p.join("JanusX").join(".janusx"))
         .map_err(|e| format!("Failed to resolve runtime home: {e}"))
 }
 
@@ -696,8 +681,13 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             .read_line(&mut line)
             .map_err(|e| format!("Failed to read input: {e}"))?;
         let v = line.trim();
-        let runtime_home = if v.is_empty() || v.eq_ignore_ascii_case("y") {
-            default_home.clone()
+        let (runtime_home, install_dir) = if v.is_empty() || v.eq_ignore_ascii_case("y") {
+            let home = default_home.clone();
+            let install = home
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home.clone());
+            (home, install)
         } else if v.eq_ignore_ascii_case("n") {
             return Err("Installer cancelled.".to_string());
         } else {
@@ -709,16 +699,60 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
                 );
                 continue;
             }
-            if p.file_name().and_then(|x| x.to_str()) == Some(".janusx") {
+            let install = if p.file_name().and_then(|x| x.to_str()) == Some("JanusX") {
                 p
             } else {
-                p.join(".janusx")
-            }
+                p.join("JanusX")
+            };
+            (install.join(".janusx"), install)
         };
-        let install_dir = runtime_home
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| runtime_home.clone());
+
+        if install_dir.exists() {
+            if !install_dir.is_dir() {
+                eprintln!("Install path is not a directory: {}", install_dir.display());
+                continue;
+            }
+            if !is_dir_writable(&install_dir) {
+                eprintln!(
+                    "Install directory is not writable: {}",
+                    install_dir.display()
+                );
+                continue;
+            }
+            if !is_dir_empty(&install_dir)? {
+                print!("{} 已存在且非空，删除后安装[y/n]: ", install_dir.display());
+                io::stdout()
+                    .flush()
+                    .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+                let mut confirm = String::new();
+                io::stdin()
+                    .read_line(&mut confirm)
+                    .map_err(|e| format!("Failed to read input: {e}"))?;
+                if !confirm.trim().eq_ignore_ascii_case("y") {
+                    continue;
+                }
+                std::fs::remove_dir_all(&install_dir).map_err(|e| {
+                    format!(
+                        "Failed to remove existing install directory {}: {e}",
+                        install_dir.display()
+                    )
+                })?;
+                std::fs::create_dir_all(&install_dir).map_err(|e| {
+                    format!(
+                        "Failed to recreate install directory {}: {e}",
+                        install_dir.display()
+                    )
+                })?;
+            }
+        } else {
+            std::fs::create_dir_all(&install_dir).map_err(|e| {
+                format!(
+                    "Failed to create install directory {}: {e}",
+                    install_dir.display()
+                )
+            })?;
+        }
+
         let runtime_parent = runtime_home
             .parent()
             .map(Path::to_path_buf)
@@ -761,16 +795,15 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             eprintln!("Install path is not a directory: {}", install_dir.display());
             continue;
         }
-        if !is_dir_writable(&install_dir) {
-            eprintln!(
-                "Install directory is not writable: {}",
-                install_dir.display()
-            );
-            continue;
-        }
         println!("Binary `jx` builds in {}", install_dir.display());
         return Ok((runtime_home, install_dir));
     }
+}
+
+fn is_dir_empty(dir: &Path) -> Result<bool, String> {
+    let mut it =
+        std::fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {e}", dir.display()))?;
+    Ok(it.next().is_none())
 }
 
 fn is_dir_writable(dir: &Path) -> bool {

@@ -226,7 +226,7 @@ fn warm_up_jx(jx_bin: &Path, runtime_home: &Path) -> Result<(), String> {
                 i += 1;
                 thread::sleep(Duration::from_millis(100));
             }
-            print!("\r{}\r", " ".repeat(120));
+            print!("\r\x1b[2K");
             let _ = io::stdout().flush();
         }))
     } else {
@@ -3070,8 +3070,11 @@ fn format_elapsed(d: Duration) -> String {
 }
 
 fn print_success_line(msg: &str) {
-    if supports_color() {
-        println!("\x1b[32m✔︎ {}\x1b[0m", msg);
+    let tty = io::stdout().is_terminal();
+    if tty && supports_color() {
+        println!("\r\x1b[2K\x1b[32m✔︎ {}\x1b[0m", msg);
+    } else if tty {
+        println!("\r\x1b[2K✔︎ {}", msg);
     } else {
         println!("✔︎ {}", msg);
     }
@@ -3112,7 +3115,7 @@ fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration),
                 i += 1;
                 thread::sleep(Duration::from_millis(80));
             }
-            print!("\r{}\r", " ".repeat(120));
+            print!("\r\x1b[2K");
             let _ = io::stdout().flush();
         }))
     } else {
@@ -3212,10 +3215,8 @@ fn build_pip_install_cmd(
 }
 
 fn should_force_source_build_for_spec(spec: &str) -> bool {
-    if !is_pypi_janusx_spec(spec) {
-        return false;
-    }
-    cfg!(target_os = "macos") && cfg!(target_arch = "x86_64")
+    let _ = spec;
+    false
 }
 
 fn is_pypi_janusx_spec(spec: &str) -> bool {
@@ -3301,6 +3302,7 @@ fn pip_install_tail(
     let mut exit_status: Option<ExitStatus> = None;
     let mut last_render = Instant::now();
     let mut last_line_seen: Option<String> = None;
+    let mut streamed_lines_before_tail = 0usize;
 
     while channel_open {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -3338,12 +3340,15 @@ fn pip_install_tail(
                                 } else {
                                     println!("{trimmed}");
                                 }
+                                streamed_lines_before_tail += 1;
                                 io::stdout()
                                     .flush()
                                     .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
                             } else {
                                 // Switch from normal streaming log to fixed tail-refresh mode.
-                                print!("\x1b[{}A", max_lines);
+                                if streamed_lines_before_tail > 0 {
+                                    print!("\x1b[{}A", streamed_lines_before_tail);
+                                }
                                 render_tail_block(desc, "", start.elapsed(), &tail, max_lines, false)?;
                                 rendered = true;
                                 tail_mode_started = true;

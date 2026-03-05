@@ -22,6 +22,9 @@ const INSTALLER_RELAUNCH_ENV: &str = "JX_INSTALLER_RELAUNCHED";
 const SKIP_RUNTIME_REBUILD_ENV: &str = "JX_SKIP_RUNTIME_REBUILD";
 const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
+const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
+const MIN_PYTHON_MAJOR: u32 = 3;
+const MIN_PYTHON_MINOR: u32 = 9;
 const CLI_HELP_TEXT: &str = r#"Usage:
     jx <module> [options]
 
@@ -189,6 +192,7 @@ Linux: please run the `.run` installer file."
 
     let installed_jx = install_jx_binary(&install_dir)?;
     write_runtime_home_config_near_binary(&installed_jx, &runtime_home);
+    write_launcher_version_marker_near_binary(&installed_jx);
     warm_up_jx(&installed_jx, &runtime_home)?;
     println!("Installation complete.");
     print_path_setup_hint(&installed_jx);
@@ -530,6 +534,7 @@ fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut V
         ".janusx",
         "venv",
         RUNTIME_HOME_CONFIG,
+        LAUNCHER_VERSION_MARKER,
         UPDATE_TIME_MARKER,
         COMMIT_MARKER,
         WARMUP_MARKER,
@@ -869,6 +874,98 @@ fn write_runtime_home_config_near_binary(binary_path: &Path, runtime_home: &Path
     let _ = std::fs::write(cfg, format!("{}\n", runtime_home.display()));
 }
 
+fn write_launcher_version_marker_near_binary(binary_path: &Path) {
+    let Some(version) = detect_expected_janusx_version(None) else {
+        return;
+    };
+    let Some(parent) = binary_path.parent() else {
+        return;
+    };
+    let marker = parent.join(LAUNCHER_VERSION_MARKER);
+    let _ = std::fs::write(marker, format!("{version}\n"));
+}
+
+fn resolve_pypi_spec(runtime_home: &Path) -> String {
+    if let Some(v) = detect_expected_janusx_version(Some(runtime_home)) {
+        return format!("{PYPI_SPEC}=={v}");
+    }
+    PYPI_SPEC.to_string()
+}
+
+fn detect_expected_janusx_version(runtime_home: Option<&Path>) -> Option<String> {
+    if let Some(v) = option_env!("JANUSX_EXPECTED_VERSION").and_then(normalize_version_token) {
+        return Some(v);
+    }
+    if let Ok(v) = env::var("JX_EXPECTED_VERSION") {
+        if let Some(s) = normalize_version_token(&v) {
+            return Some(s);
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let marker = parent.join(LAUNCHER_VERSION_MARKER);
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Some(s) = normalize_version_token(&text) {
+                    return Some(s);
+                }
+            }
+        }
+        if let Some(name) = exe.file_name().and_then(|x| x.to_str()) {
+            if let Some(s) = extract_version_from_filename(name) {
+                return Some(s);
+            }
+        }
+    }
+    if let Some(home) = runtime_home {
+        if let Some(parent) = home.parent() {
+            let marker = parent.join(LAUNCHER_VERSION_MARKER);
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Some(s) = normalize_version_token(&text) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_version_from_filename(name: &str) -> Option<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let n = chars.len();
+    for i in 0..n {
+        if chars[i] != 'v' && chars[i] != 'V' {
+            continue;
+        }
+        if i + 1 >= n || !chars[i + 1].is_ascii_digit() {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && (chars[j].is_ascii_digit() || chars[j] == '.') {
+            j += 1;
+        }
+        let cand: String = chars[i + 1..j].iter().collect();
+        if let Some(v) = normalize_version_token(&cand) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn normalize_version_token(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches('v').trim_start_matches('V');
+    if t.is_empty() {
+        return None;
+    }
+    if !t.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let parts: Vec<&str> = t.split('.').collect();
+    if parts.len() < 2 || parts.iter().any(|x| x.is_empty()) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
 fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     let mut latest = false;
     let mut local_source: Option<String> = None;
@@ -924,12 +1021,39 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
 
 fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     let home = runtime_home()?;
+    let pypi_spec = resolve_pypi_spec(&home);
     let python = ensure_venv()?;
     let before = installed_version(&python);
     let jx_bin = env::current_exe().ok();
 
+    if matches!(opts.source, UpdateSource::Pypi)
+        && maybe_self_update_launcher_from_pypi_check(&python, &home, opts.verbose)?
+    {
+        return Ok(0);
+    }
+    if matches!(opts.source, UpdateSource::Pypi) && !opts.force_reinstall {
+        let check_start = Instant::now();
+        if let (Some(current), Some(latest)) =
+            (before.clone(), pypi_latest_version(&python, opts.verbose))
+        {
+            if compare_version_tokens(&current, &latest) != std::cmp::Ordering::Less {
+                print_success_line(&format!(
+                    "It is the latest PyPI version ({current})[{}]",
+                    format_elapsed(check_start.elapsed())
+                ));
+                if github_has_newer_release_hint(&python, &home, &current, opts.verbose) {
+                    println!("Use `jx --update latest` for GitHub latest.");
+                }
+                return Ok(0);
+            }
+        }
+    }
+
     match &opts.source {
         UpdateSource::Latest => {
+            if maybe_self_update_launcher_from_release(&python, &home, opts.verbose)? {
+                return Ok(0);
+            }
             ensure_git_available()?;
             let repo_url = repo_url_from_spec(GITHUB_SPEC);
             let remote_head = remote_head_commit(&repo_url);
@@ -1035,7 +1159,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     let elapsed = pip_install_update(
         &python,
         &home,
-        PYPI_SPEC,
+        &pypi_spec,
         opts.force_reinstall,
         opts.verbose,
         "Updating from PyPI...",
@@ -1053,10 +1177,484 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 format_elapsed(elapsed)
             ));
         }
-        println!("Use `jx --update latest` for GitHub latest.");
+        if let Some(v) = before.as_deref() {
+            if github_has_newer_release_hint(&python, &home, v, opts.verbose) {
+                println!("Use `jx --update latest` for GitHub latest.");
+            }
+        }
+        return Ok(0);
     }
     warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn maybe_self_update_launcher_from_pypi_check(
+    python: &Path,
+    runtime_home: &Path,
+    verbose: bool,
+) -> Result<bool, String> {
+    let Some(current_version) =
+        detect_expected_janusx_version(Some(runtime_home)).or_else(|| installed_version(python))
+    else {
+        return Ok(false);
+    };
+    let Some(latest_pypi) = pypi_latest_version(python, verbose) else {
+        return Ok(false);
+    };
+    if compare_version_tokens(&current_version, &latest_pypi) != std::cmp::Ordering::Less {
+        return Ok(false);
+    }
+    println!(
+        "Detected newer PyPI janusx: current v{}, latest v{}",
+        current_version, latest_pypi
+    );
+    println!("Switching to launcher self-update flow...");
+    maybe_self_update_launcher_from_release(python, runtime_home, verbose)
+}
+
+fn maybe_self_update_launcher_from_release(
+    python: &Path,
+    runtime_home: &Path,
+    verbose: bool,
+) -> Result<bool, String> {
+    let Some(asset_suffix) = release_asset_suffix_for_platform() else {
+        return Ok(false);
+    };
+    let Some(current_version) =
+        detect_expected_janusx_version(Some(runtime_home)).or_else(|| installed_version(python))
+    else {
+        return Ok(false);
+    };
+    let Some((tag_name, asset_name, asset_url)) =
+        github_latest_release_asset(python, asset_suffix, verbose)?
+    else {
+        return Ok(false);
+    };
+    let Some(latest_version) = normalize_version_token(&tag_name) else {
+        return Ok(false);
+    };
+    if compare_version_tokens(&current_version, &latest_version) != std::cmp::Ordering::Less {
+        return Ok(false);
+    }
+
+    println!(
+        "Detected newer launcher release: current v{}, latest v{}",
+        current_version, latest_version
+    );
+    println!("Auto-updating launcher from GitHub release asset: {asset_name}");
+
+    let work_dir = env::temp_dir().join(format!(
+        "jx_selfupdate_{}_{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis()
+    ));
+    std::fs::create_dir_all(&work_dir).map_err(|e| {
+        format!(
+            "Failed to create self-update temp dir {}: {e}",
+            work_dir.display()
+        )
+    })?;
+    let archive_path = work_dir.join(&asset_name);
+    download_release_asset(python, &asset_url, &archive_path, verbose)?;
+    let extract_dir = work_dir.join("extract");
+    std::fs::create_dir_all(&extract_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            extract_dir.display()
+        )
+    })?;
+    extract_tar_gz_with_python(python, &archive_path, &extract_dir, verbose)?;
+    let installer = find_installer_in_tree(&extract_dir).ok_or_else(|| {
+        format!(
+            "Installer executable not found after extraction in {}",
+            extract_dir.display()
+        )
+    })?;
+    run_downloaded_installer(&installer, verbose)?;
+    Ok(true)
+}
+
+fn release_asset_suffix_for_platform() -> Option<&'static str> {
+    #[cfg(target_os = "windows")]
+    {
+        return Some("windows-x86_64.tar.gz");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Some("darwin-universal.tar.gz");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("linux-x86_64.tar.gz");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("linux-aarch64.tar.gz");
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn github_latest_release_asset(
+    python: &Path,
+    suffix: &str,
+    verbose: bool,
+) -> Result<Option<(String, String, String)>, String> {
+    let script = r#"
+import json, sys, urllib.request
+url = "https://api.github.com/repos/FJingxian/JanusX/releases/latest"
+req = urllib.request.Request(url, headers={
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "jx-launcher"
+})
+with urllib.request.urlopen(req, timeout=20) as resp:
+    obj = json.load(resp)
+tag = str(obj.get("tag_name", "")).strip()
+suffix = sys.argv[1]
+for a in (obj.get("assets") or []):
+    name = str(a.get("name", "")).strip()
+    if name.endswith(suffix):
+        print(tag)
+        print(name)
+        print(str(a.get("browser_download_url", "")).strip())
+        break
+"#;
+
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(suffix)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let Ok(out) = out else {
+        return Ok(None);
+    };
+    if !out.status.success() {
+        if verbose {
+            eprintln!(
+                "Warning: failed to query GitHub latest release.\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        return Ok(None);
+    }
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if lines.len() < 3 {
+        return Ok(None);
+    }
+    Ok(Some((lines[0].clone(), lines[1].clone(), lines[2].clone())))
+}
+
+fn pypi_latest_version(python: &Path, verbose: bool) -> Option<String> {
+    let script = r#"
+import json, urllib.request
+url = "https://pypi.org/pypi/janusx/json"
+req = urllib.request.Request(url, headers={"User-Agent": "jx-launcher"})
+with urllib.request.urlopen(req, timeout=20) as resp:
+    obj = json.load(resp)
+info = obj.get("info") or {}
+v = str(info.get("version", "")).strip()
+if v:
+    print(v)
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        if verbose {
+            eprintln!(
+                "Warning: failed to query PyPI latest janusx version.\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    normalize_version_token(&s)
+}
+
+fn github_has_newer_release_hint(
+    python: &Path,
+    runtime_home: &Path,
+    current_version: &str,
+    verbose: bool,
+) -> bool {
+    let Some((tag, published_at)) = github_latest_release_meta(python, verbose) else {
+        return false;
+    };
+    let latest_ver = normalize_version_token(&tag).unwrap_or_default();
+    if !latest_ver.is_empty()
+        && compare_version_tokens(current_version, &latest_ver) == std::cmp::Ordering::Less
+    {
+        return true;
+    }
+    if latest_ver == current_version {
+        if let Some(local_time) = python_core_update_time(python, runtime_home) {
+            let local_date = local_time.split_whitespace().next().unwrap_or_default();
+            let remote_date = published_at.get(0..10).unwrap_or_default();
+            return !local_date.is_empty() && !remote_date.is_empty() && remote_date > local_date;
+        }
+    }
+    false
+}
+
+fn github_latest_release_meta(python: &Path, verbose: bool) -> Option<(String, String)> {
+    let script = r#"
+import json, urllib.request
+url = "https://api.github.com/repos/FJingxian/JanusX/releases/latest"
+req = urllib.request.Request(url, headers={
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "jx-launcher"
+})
+with urllib.request.urlopen(req, timeout=20) as resp:
+    obj = json.load(resp)
+tag = str(obj.get("tag_name", "")).strip()
+published = str(obj.get("published_at", "")).strip()
+if tag:
+    print(tag)
+    print(published)
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        if verbose {
+            eprintln!(
+                "Warning: failed to query GitHub latest release metadata.\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        return None;
+    }
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some((lines[0].clone(), lines.get(1).cloned().unwrap_or_default()))
+}
+
+fn compare_version_tokens(a: &str, b: &str) -> std::cmp::Ordering {
+    let pa: Vec<u32> = a
+        .split('.')
+        .map(|x| x.parse::<u32>().ok().unwrap_or(0))
+        .collect();
+    let pb: Vec<u32> = b
+        .split('.')
+        .map(|x| x.parse::<u32>().ok().unwrap_or(0))
+        .collect();
+    let n = pa.len().max(pb.len());
+    for i in 0..n {
+        let va = *pa.get(i).unwrap_or(&0);
+        let vb = *pb.get(i).unwrap_or(&0);
+        match va.cmp(&vb) {
+            std::cmp::Ordering::Equal => {}
+            o => return o,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn download_release_asset(
+    python: &Path,
+    url: &str,
+    output: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    if command_ok("wget", &["--version"]) {
+        let mut cmd = Command::new("wget");
+        cmd.arg("-c")
+            .arg("-O")
+            .arg(output)
+            .arg(url)
+            .stdin(Stdio::null());
+        run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+            .map_err(|e| format!("wget download failed: {e}"))?;
+        return Ok(());
+    }
+    if command_ok("curl", &["--version"]) {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-L")
+            .arg("--fail")
+            .arg("--continue-at")
+            .arg("-")
+            .arg("-o")
+            .arg(output)
+            .arg(url)
+            .stdin(Stdio::null());
+        run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+            .map_err(|e| format!("curl download failed: {e}"))?;
+        return Ok(());
+    }
+
+    let script = r#"
+import urllib.request, sys
+url = sys.argv[1]
+out = sys.argv[2]
+urllib.request.urlretrieve(url, out)
+"#;
+    let mut cmd = Command::new(python);
+    cmd.arg("-c")
+        .arg(script)
+        .arg(url)
+        .arg(output)
+        .stdin(Stdio::null());
+    run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+        .map_err(|e| format!("Python download failed: {e}"))?;
+    Ok(())
+}
+
+fn extract_tar_gz_with_python(
+    python: &Path,
+    archive: &Path,
+    dest: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    let script = r#"
+import tarfile, os, sys
+arc = sys.argv[1]
+dst = sys.argv[2]
+os.makedirs(dst, exist_ok=True)
+with tarfile.open(arc, "r:gz") as tf:
+    tf.extractall(dst)
+"#;
+    let mut cmd = Command::new(python);
+    cmd.arg("-c")
+        .arg(script)
+        .arg(archive)
+        .arg(dest)
+        .stdin(Stdio::null());
+    run_cmd_with_optional_spinner(&mut cmd, "Extracting launcher installer ...", verbose)
+        .map_err(|e| format!("Failed to extract installer archive: {e}"))?;
+    Ok(())
+}
+
+fn run_cmd_with_optional_spinner(
+    cmd: &mut Command,
+    desc: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    if verbose {
+        let status = cmd
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to run command: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("command failed with exit={}", exit_code(status)));
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (out, _) = run_with_spinner(cmd, desc)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut msg = String::new();
+    msg.push_str(&String::from_utf8_lossy(&out.stdout));
+    msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "command failed with exit={}\n{}",
+        exit_code(out.status),
+        msg.trim()
+    ))
+}
+
+fn find_installer_in_tree(root: &Path) -> Option<PathBuf> {
+    let expected_ext = if cfg!(windows) {
+        "exe"
+    } else if cfg!(target_os = "macos") {
+        "command"
+    } else {
+        "run"
+    };
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if ext == expected_ext {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(installer)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to launch installer {}: {e}", installer.display()))?;
+        if !status.success() {
+            return Err(format!(
+                "Failed to launch installer {} (exit={})",
+                installer.display(),
+                exit_code(status)
+            ));
+        }
+        println!("Launched installer: {}", installer.display());
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(installer)
+                .map_err(|e| format!("Failed to stat installer {}: {e}", installer.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(installer, perms).map_err(|e| {
+                format!(
+                    "Failed to set executable permission on {}: {e}",
+                    installer.display()
+                )
+            })?;
+        }
+        let mut cmd = Command::new(installer);
+        cmd.stdin(Stdio::inherit());
+        run_cmd_with_optional_spinner(&mut cmd, "Running launcher installer ...", verbose)
+            .map_err(|e| format!("Installer execution failed: {e}"))?;
+        return Ok(());
+    }
 }
 
 fn run_uninstall(args: &[String]) -> Result<i32, String> {
@@ -1228,6 +1826,7 @@ fn run_python_janusx(python: &Path, args: &[String]) -> Result<i32, String> {
 
 fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
     let home = runtime_home()?;
+    let pypi_spec = resolve_pypi_spec(&home);
     let python = ensure_venv()?;
     if !is_janusx_installed(&python) {
         let _ = std::fs::remove_file(warmup_marker_path(&home));
@@ -1237,7 +1836,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
         let _ = pip_install_tail(
             &python,
             &home,
-            PYPI_SPEC,
+            &pypi_spec,
             false,
             "Building runtime from PyPI ...",
             10,
@@ -1262,6 +1861,19 @@ fn ensure_venv() -> Result<PathBuf, String> {
     }
     let venv = home.join("venv");
     let py = venv_python(&venv);
+    if py.exists() {
+        if !python_path_meets_min_version(&py) {
+            println!(
+                "Runtime Python is below {}.{}; rebuilding venv ...",
+                MIN_PYTHON_MAJOR, MIN_PYTHON_MINOR
+            );
+            std::fs::remove_dir_all(&venv)
+                .map_err(|e| format!("Failed to remove old venv {}: {e}", venv.display()))?;
+        } else {
+            ensure_pip_in_venv(&py)?;
+            return Ok(py);
+        }
+    }
     if py.exists() {
         ensure_pip_in_venv(&py)?;
         return Ok(py);
@@ -1404,16 +2016,85 @@ fn venv_python(venv: &Path) -> PathBuf {
 
 fn find_system_python() -> Option<String> {
     if let Ok(val) = env::var("JX_PYTHON") {
-        if command_ok(&val, &["--version"]) {
+        if python_bin_meets_min_version(&val) {
             return Some(val);
         }
     }
-    for cand in ["python3", "python", "py"] {
-        if command_ok(cand, &["--version"]) {
-            return Some(cand.to_string());
+
+    let candidates: &[(&str, &[&str])] = &[
+        ("python3.14", &[]),
+        ("python3.13", &[]),
+        ("python3.12", &[]),
+        ("python3.11", &[]),
+        ("python3.10", &[]),
+        ("python3.9", &[]),
+        ("python3", &[]),
+        ("python", &[]),
+        ("py", &[]),
+    ];
+
+    for (bin, prefix) in candidates {
+        if python_bin_meets_min_version_with_prefix(bin, prefix) {
+            return Some((*bin).to_string());
         }
     }
     None
+}
+
+fn python_bin_meets_min_version(bin: &str) -> bool {
+    python_bin_meets_min_version_with_prefix(bin, &[])
+}
+
+fn python_bin_meets_min_version_with_prefix(bin: &str, prefix: &[&str]) -> bool {
+    python_version_with_prefix(bin, prefix)
+        .map(python_version_is_compatible)
+        .unwrap_or(false)
+}
+
+fn python_path_meets_min_version(python: &Path) -> bool {
+    python_version_for_path(python)
+        .map(python_version_is_compatible)
+        .unwrap_or(false)
+}
+
+fn python_version_is_compatible(v: (u32, u32)) -> bool {
+    v.0 > MIN_PYTHON_MAJOR || (v.0 == MIN_PYTHON_MAJOR && v.1 >= MIN_PYTHON_MINOR)
+}
+
+fn python_version_with_prefix(bin: &str, prefix: &[&str]) -> Option<(u32, u32)> {
+    let mut cmd = Command::new(bin);
+    cmd.args(prefix)
+        .arg("-c")
+        .arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_python_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn python_version_for_path(python: &Path) -> Option<(u32, u32)> {
+    let out = Command::new(python)
+        .arg("-c")
+        .arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_python_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_python_version(s: &str) -> Option<(u32, u32)> {
+    let t = s.trim();
+    let mut it = t.split('.');
+    let major = it.next()?.parse::<u32>().ok()?;
+    let minor = it.next()?.parse::<u32>().ok()?;
+    Some((major, minor))
 }
 
 fn command_ok(bin: &str, args: &[&str]) -> bool {
@@ -1542,17 +2223,17 @@ fn remote_head_commit(repo_url: &str) -> Option<String> {
     }
 }
 
-fn is_python_only_change(path: &str) -> bool {
+fn is_rust_core_change(path: &str) -> bool {
     let p = path.trim();
     if p.is_empty() {
-        return true;
+        return false;
     }
-    if p.starts_with("python/") {
+    if p.starts_with("src/") {
         return true;
     }
     matches!(
         p,
-        "README.md" | "README.zh-CN.md" | "README_cn.md" | "LICENSE" | "MANIFEST.in" | ".gitignore"
+        "Cargo.toml" | "Cargo.lock" | "build.rs"
     )
 }
 
@@ -1684,9 +2365,17 @@ fn try_fast_python_update_latest(
         cleanup();
         return Ok(true);
     }
-    if !changed.iter().all(|p| is_python_only_change(p)) {
+    if changed.iter().any(|p| is_rust_core_change(p)) {
         cleanup();
         return Ok(false);
+    }
+
+    let has_python_change = changed.iter().any(|p| p.starts_with("python/"));
+    if !has_python_change {
+        write_commit_marker(runtime_home, remote_commit);
+        write_python_core_update_marker(runtime_home, python);
+        cleanup();
+        return Ok(true);
     }
 
     if !run_git_status(&["checkout", "--detach", remote_commit]) {
@@ -1847,11 +2536,26 @@ fn build_pip_install_cmd(python: &Path, spec: &str, force_reinstall: bool) -> Co
         .arg("install")
         .arg("--upgrade")
         .arg("--disable-pip-version-check");
+    if should_force_source_build_for_spec(spec) {
+        cmd.arg("--no-binary").arg("janusx");
+    }
     if force_reinstall {
         cmd.arg("--force-reinstall").arg("--no-cache-dir");
     }
     cmd.arg(spec);
     cmd
+}
+
+fn should_force_source_build_for_spec(spec: &str) -> bool {
+    if !is_pypi_janusx_spec(spec) {
+        return false;
+    }
+    cfg!(target_os = "macos") && cfg!(target_arch = "x86_64")
+}
+
+fn is_pypi_janusx_spec(spec: &str) -> bool {
+    let s = spec.trim().to_ascii_lowercase();
+    s == "janusx" || s.starts_with("janusx==")
 }
 
 fn pip_install_tail(
@@ -2129,34 +2833,41 @@ Suggested fix:\n\
     if cfg!(target_os = "macos") {
         return "Try recreating runtime venv with a Python that includes ensurepip.\n\
 Suggested fix:\n\
-  1) rm -rf ~/.janusx/venv\n\
+  1) rm -rf ~/JanusX/.janusx/venv\n\
   2) Re-run installer or `jx -h`\n\
 If system Python lacks ensurepip, install python via Homebrew: `brew install python`."
             .to_string();
     }
     "Try recreating runtime venv with a Python that includes ensurepip.\n\
 Suggested fix:\n\
-  1) rm -rf ~/.janusx/venv\n\
+  1) rm -rf ~/JanusX/.janusx/venv\n\
   2) Re-run installer or `jx -h`"
         .to_string()
 }
 
 fn python_install_hint() -> String {
     if cfg!(windows) {
-        return "No system Python found. Install Python 3 first, or set JX_PYTHON.\n\
+        return "No compatible Python found. JanusX requires Python >=3.9.\n\
+Install Python 3.9+ first, or set JX_PYTHON.\n\
+Note: a venv cannot upgrade Python major/minor by itself.\n\
 Windows examples:\n\
   winget install Python.Python.3.12\n\
   set JX_PYTHON=C:\\Python312\\python.exe"
             .to_string();
     }
     if cfg!(target_os = "macos") {
-        return "No system Python found. Install Python 3 first, or set JX_PYTHON.\n\
+        return "No compatible Python found. JanusX requires Python >=3.9.\n\
+Install Python 3.9+ first, or set JX_PYTHON.\n\
+Note: a venv cannot upgrade Python major/minor by itself.\n\
 macOS examples:\n\
   brew install python\n\
-  export JX_PYTHON=/opt/homebrew/bin/python3"
+  export JX_PYTHON=/opt/homebrew/bin/python3   # Apple Silicon\n\
+  export JX_PYTHON=/usr/local/bin/python3      # Intel x86_64"
             .to_string();
     }
-    "No system Python found. Install Python 3 first, or set JX_PYTHON.\n\
+    "No compatible Python found. JanusX requires Python >=3.9.\n\
+Install Python 3.9+ first, or set JX_PYTHON.\n\
+Note: a venv cannot upgrade Python major/minor by itself.\n\
 Linux examples:\n\
   sudo apt-get install -y python3 python3-venv\n\
   export JX_PYTHON=/usr/bin/python3"

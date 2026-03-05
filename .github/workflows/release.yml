@@ -29,22 +29,29 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.17
+            use_zigbuild: true
             asset_suffix: linux-x86_64
             ext: ""
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.17
+            use_zigbuild: true
             asset_suffix: linux-aarch64
             ext: ""
           - runner: macos-14
             target: x86_64-apple-darwin
+            use_zigbuild: false
             asset_suffix: darwin-x86_64
             ext: ""
           - runner: macos-14
             target: aarch64-apple-darwin
+            use_zigbuild: false
             asset_suffix: darwin-arm64
             ext: ""
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            use_zigbuild: false
             asset_suffix: windows-x86_64
             ext: exe
     steps:
@@ -58,15 +65,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Set up Zig (Linux compatibility build)
+        if: ${{ matrix.use_zigbuild }}
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.use_zigbuild }}
+        shell: bash
+        run: |
+          cargo install cargo-zigbuild --locked
+
       - name: Build launcher
         shell: bash
         run: |
-          cargo build --release --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            cargo zigbuild --release --manifest-path launcher/Cargo.toml --target "${{ matrix.zig_target }}"
+          else
+            cargo build --release --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
+          fi
 
       - name: Package installer (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          BUILD_TARGET="${{ matrix.target }}"
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            BUILD_TARGET="${{ matrix.zig_target }}"
+          fi
           TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           if [ -z "$TAG" ]; then TAG="dev"; fi
@@ -75,7 +100,7 @@ jobs:
           else
             OUT="JanusX-${TAG}-${{ matrix.asset_suffix }}"
           fi
-          cp "launcher/target/${{ matrix.target }}/release/jx" "$OUT"
+          cp "launcher/target/${BUILD_TARGET}/release/jx" "$OUT"
           chmod +x "$OUT"
           FILES="$OUT"
           if [[ "${{ matrix.target }}" == *"unknown-linux-gnu" ]]; then

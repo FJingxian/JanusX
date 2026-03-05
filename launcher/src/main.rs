@@ -426,49 +426,32 @@ fn print_path_setup_hint(installed_jx: &Path) {
 
     println!();
     println!("`jx` is not in PATH yet.");
-    println!("Add this directory to PATH:");
+    println!("Add this directory to PATH (persistent):");
     println!("  {}", install_dir.display());
 
     #[cfg(target_os = "windows")]
     {
         let d = install_dir.display();
-        let shell = detect_windows_shell();
-        let show_cmd_first = matches!(shell, WindowsShell::Cmd);
-        if show_cmd_first {
-            println!("cmd (current session):");
-            println!("  set \"PATH={d};%PATH%\"");
-            println!("cmd (persistent, user):");
-            println!("  setx PATH \"{d};%PATH%\"");
-            println!("PowerShell (current session):");
-            println!("  $env:Path = \"{d};$env:Path\"");
-            println!("PowerShell (persistent, user):");
-            println!(
-                "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
-            );
-        } else {
-            println!("PowerShell (current session):");
-            println!("  $env:Path = \"{d};$env:Path\"");
-            println!("PowerShell (persistent, user):");
-            println!(
-                "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
-            );
-            println!("cmd (current session):");
-            println!("  set \"PATH={d};%PATH%\"");
-            println!("cmd (persistent, user):");
-            println!("  setx PATH \"{d};%PATH%\"");
+        match detect_windows_shell() {
+            WindowsShell::Cmd => {
+                println!("cmd (persistent, user):");
+                println!("  setx PATH \"{d};%PATH%\"");
+            }
+            WindowsShell::PowerShell | WindowsShell::Unknown => {
+                println!("PowerShell (persistent, user):");
+                println!(
+                    "  [Environment]::SetEnvironmentVariable('Path', \"{d};\" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+                );
+            }
         }
-        println!("Then open a new terminal.");
+        println!("Reopen terminal.");
     }
 
     #[cfg(target_os = "macos")]
     {
         let d = install_dir.display();
-        println!("zsh (recommended):");
+        println!("zsh:");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
-        println!("  source ~/.zshrc");
-        println!("bash:");
-        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
-        println!("  source ~/.bashrc");
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -476,10 +459,6 @@ fn print_path_setup_hint(installed_jx: &Path) {
         let d = install_dir.display();
         println!("bash:");
         println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.bashrc");
-        println!("  source ~/.bashrc");
-        println!("zsh:");
-        println!("  echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc");
-        println!("  source ~/.zshrc");
     }
 }
 
@@ -512,6 +491,14 @@ fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
             for p in &found {
                 if let Err(e) = std::fs::remove_file(p) {
                     failed.push(format!("{} ({e})", p.display()));
+                }
+                if let Some(parent) = p.parent() {
+                    let runtime_dir = parent.join(".janusx");
+                    if runtime_dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&runtime_dir) {
+                            failed.push(format!("{} ({e})", runtime_dir.display()));
+                        }
+                    }
                 }
             }
             if !failed.is_empty() {
@@ -570,17 +557,20 @@ enum WindowsShell {
 #[cfg(windows)]
 fn detect_windows_shell() -> WindowsShell {
     if env::var_os("POWERSHELL_DISTRIBUTION_CHANNEL").is_some()
-        || env::var_os("PSModulePath").is_some()
+        || env::var_os("PSExecutionPolicyPreference").is_some()
     {
         return WindowsShell::PowerShell;
     }
+    if env::var_os("PROMPT").is_some() {
+        return WindowsShell::Cmd;
+    }
     if let Some(comspec) = env::var_os("ComSpec") {
         let s = comspec.to_string_lossy().to_ascii_lowercase();
+        if s.contains("pwsh") || s.contains("powershell") {
+            return WindowsShell::PowerShell;
+        }
         if s.ends_with("cmd.exe") {
             return WindowsShell::Cmd;
-        }
-        if s.contains("powershell") || s.contains("pwsh") {
-            return WindowsShell::PowerShell;
         }
     }
     WindowsShell::Unknown

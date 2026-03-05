@@ -29,6 +29,7 @@ Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
     -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
+    -uninstall, --uninstall  Remove JanusX runtime and launcher files
 
 Modules:
     Genome-wide Association Studies (GWAS):
@@ -141,6 +142,9 @@ fn run() -> Result<i32, String> {
             Err(e) => return Err(e),
         };
         return run_update(opts);
+    }
+    if matches!(head, "-uninstall" | "--uninstall") {
+        return run_uninstall(&args[1..]);
     }
 
     let home = runtime_home()?;
@@ -488,16 +492,15 @@ fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
         }
         if v.eq_ignore_ascii_case("y") {
             let mut failed: Vec<String> = Vec::new();
+            let mut cleaned_dirs: BTreeSet<PathBuf> = BTreeSet::new();
             for p in &found {
                 if let Err(e) = std::fs::remove_file(p) {
                     failed.push(format!("{} ({e})", p.display()));
                 }
                 if let Some(parent) = p.parent() {
-                    let runtime_dir = parent.join(".janusx");
-                    if runtime_dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&runtime_dir) {
-                            failed.push(format!("{} ({e})", runtime_dir.display()));
-                        }
+                    let parent_buf = parent.to_path_buf();
+                    if cleaned_dirs.insert(parent_buf.clone()) {
+                        cleanup_generated_artifacts_in_install_dir(&parent_buf, &mut failed);
                     }
                 }
             }
@@ -509,6 +512,56 @@ fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
             }
             println!("Existing `jx` removed from PATH locations.");
             return Ok(());
+        }
+    }
+}
+
+fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut Vec<String>) {
+    let mut remove_path = |p: PathBuf| {
+        if !p.exists() {
+            return;
+        }
+        let res = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        if let Err(e) = res {
+            failed.push(format!("{} ({e})", p.display()));
+        }
+    };
+
+    // Capture linked runtime path before removing .jx_home
+    let linked_runtime = {
+        let cfg = install_dir.join(RUNTIME_HOME_CONFIG);
+        std::fs::read_to_string(&cfg)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| expand_tilde(&s))
+    };
+
+    // Cleanup current and legacy runtime/artifact layouts under jx install directory.
+    for name in [
+        ".janusx",
+        "venv",
+        RUNTIME_HOME_CONFIG,
+        UPDATE_TIME_MARKER,
+        COMMIT_MARKER,
+        WARMUP_MARKER,
+    ] {
+        remove_path(install_dir.join(name));
+    }
+
+    // Also cleanup runtime linked by .jx_home (cross-platform default/override locations).
+    if let Some(runtime_home) = linked_runtime {
+        // Guard against accidentally deleting install dir/root-like paths.
+        if runtime_home != install_dir
+            && runtime_home.parent().is_some()
+            && runtime_home.as_os_str() != "/"
+            && runtime_home.as_os_str() != "\\"
+        {
+            remove_path(runtime_home);
         }
     }
 }
@@ -681,7 +734,10 @@ fn prompt_runtime_home() -> Result<(PathBuf, PathBuf), String> {
             }
         }
         if !runtime_parent.is_dir() {
-            eprintln!("Runtime parent is not a directory: {}", runtime_parent.display());
+            eprintln!(
+                "Runtime parent is not a directory: {}",
+                runtime_parent.display()
+            );
             continue;
         }
         if !is_dir_writable(&runtime_parent) {
@@ -962,6 +1018,139 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     }
     warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn run_uninstall(args: &[String]) -> Result<i32, String> {
+    let mut yes = false;
+    for token in args {
+        match token.as_str() {
+            "-y" | "--yes" => yes = true,
+            "-h" | "--help" | "help" => {
+                println!("Uninstall usage:\n  jx --uninstall [--yes]");
+                return Ok(0);
+            }
+            other => {
+                return Err(format!(
+                    "Unknown uninstall option: {other}\nUninstall usage:\n  jx --uninstall [--yes]"
+                ));
+            }
+        }
+    }
+
+    if !yes {
+        print!("This will remove JanusX launcher/runtime files. Continue? [y/n]: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("Uninstall cancelled.");
+            return Ok(0);
+        }
+    }
+
+    let exe = env::current_exe().map_err(|e| format!("Failed to locate current jx binary: {e}"))?;
+    let install_dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Failed to resolve jx install directory.".to_string())?;
+
+    let mut failed: Vec<String> = Vec::new();
+    cleanup_generated_artifacts_in_install_dir(&install_dir, &mut failed);
+
+    if let Ok(home) = runtime_home() {
+        cleanup_runtime_home(&home, &mut failed);
+    }
+    if let Ok(def_home) = default_runtime_home() {
+        cleanup_runtime_home(&def_home, &mut failed);
+    }
+
+    let mut remove_path = |p: &Path| {
+        if !p.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(p) {
+            failed.push(format!("{} ({e})", p.display()));
+        }
+    };
+
+    remove_path(&install_dir.join("jx"));
+    remove_path(&install_dir.join("jx.cmd"));
+    remove_path(&install_dir.join("jx.bat"));
+    remove_path(&install_dir.join("jx-script.py"));
+
+    #[cfg(not(windows))]
+    {
+        remove_path(&install_dir.join("jx.exe"));
+        remove_path(&exe);
+    }
+    #[cfg(windows)]
+    {
+        let jx_exe = install_dir.join("jx.exe");
+        if jx_exe.exists() {
+            if let Err(e) = std::fs::remove_file(&jx_exe) {
+                let escaped = jx_exe.to_string_lossy().replace('"', "\"\"");
+                let cmdline =
+                    format!("ping 127.0.0.1 -n 2 >NUL & del /f /q \"{escaped}\" >NUL 2>NUL");
+                let spawned = Command::new("cmd")
+                    .arg("/C")
+                    .arg(cmdline)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if spawned.is_err() {
+                    failed.push(format!("{} ({e})", jx_exe.display()));
+                }
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        return Err(format!(
+            "JanusX uninstall finished with errors:\n{}",
+            failed.join("\n")
+        ));
+    }
+
+    print_success_line("JanusX uninstall completed.");
+    println!("Genotype caches were not removed.");
+    Ok(0)
+}
+
+fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
+    if !runtime_home.exists() {
+        return;
+    }
+    let marker_hits = runtime_home.join("venv").exists()
+        || runtime_home.join(UPDATE_TIME_MARKER).exists()
+        || runtime_home.join(COMMIT_MARKER).exists()
+        || runtime_home.join(WARMUP_MARKER).exists();
+    if marker_hits {
+        if let Err(e) = std::fs::remove_dir_all(runtime_home) {
+            failed.push(format!("{} ({e})", runtime_home.display()));
+        }
+        return;
+    }
+
+    // Fallback: only prune known runtime artifacts if directory doesn't look fully managed by JanusX.
+    for name in ["venv", UPDATE_TIME_MARKER, COMMIT_MARKER, WARMUP_MARKER] {
+        let p = runtime_home.join(name);
+        if !p.exists() {
+            continue;
+        }
+        let res = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        if let Err(e) = res {
+            failed.push(format!("{} ({e})", p.display()));
+        }
+    }
 }
 
 fn pip_install_update(

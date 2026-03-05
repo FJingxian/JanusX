@@ -1391,7 +1391,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 }
             }
             // GitHub latest should refresh even when package version string is unchanged.
-            ensure_local_rust_toolchain(&home, &python, opts.verbose)?;
+            // Rust toolchain bootstrap is now lazy and only happens on explicit build errors.
             let gh_force_reinstall = true;
             if opts.verbose {
                 println!("Updating from GitHub (CN mirror) ...");
@@ -2406,21 +2406,40 @@ fn pip_install_update(
         }
     };
 
-    if spec_requires_rust_build(spec) && !local_rust_toolchain_ready(runtime_home) {
-        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-    }
-
     match attempt_install(false) {
         Ok(d) => return Ok(d),
         Err(e) => {
+            if spec_requires_rust_build(spec)
+                && !local_rust_toolchain_ready(runtime_home)
+                && should_retry_after_installing_rust(&e)
+            {
+                if verbose {
+                    eprintln!("Rust toolchain is required by this update; installing local Rust and retrying.");
+                }
+                ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                return attempt_install(false);
+            }
             if is_pypi_janusx_spec(spec) && should_retry_with_source_build(&e) {
                 if verbose {
                     eprintln!("PyPI wheel install is unavailable; retrying source build.");
                 }
-                if !local_rust_toolchain_ready(runtime_home) {
-                    ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                match attempt_install(true) {
+                    Ok(d) => return Ok(d),
+                    Err(e2) => {
+                        if !local_rust_toolchain_ready(runtime_home)
+                            && should_retry_after_installing_rust(&e2)
+                        {
+                            if verbose {
+                                eprintln!(
+                                    "Source build requires Rust toolchain; installing local Rust and retrying."
+                                );
+                            }
+                            ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                            return attempt_install(true);
+                        }
+                        return Err(e2);
+                    }
                 }
-                return attempt_install(true);
             }
             return Err(e);
         }
@@ -2431,6 +2450,16 @@ fn should_retry_with_source_build(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("no matching distribution found for janusx")
         || e.contains("could not find a version that satisfies the requirement janusx")
+}
+
+fn should_retry_after_installing_rust(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("can't find rust compiler")
+        || e.contains("cannot find rust compiler")
+        || e.contains("rust compiler")
+        || e.contains("cargo, the rust package manager, is not installed")
+        || e.contains("is not installed or is not on path")
+        || e.contains("no such file or directory (os error 2)") && e.contains("rust")
 }
 
 fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {

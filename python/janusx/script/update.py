@@ -23,8 +23,8 @@ from janusx.script._common.status import CliStatus, format_elapsed
 
 
 _PYPI_SPEC = "janusx"
-_GITHUB_SPEC = "git+https://github.com/FJingxian/JanusX.git"
-_GITHUB_PROXY_SPEC = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git"
+_GITHUB_SPEC_CN = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git"
+_GITHUB_SPEC_ORIGIN = "git+https://github.com/FJingxian/JanusX.git"
 _PIP_TIMEOUT_SECONDS = 30
 _WIN_STAGE2_FLAG = "--janusx-update-stage2"
 _FORCE_FLAGS = {"--force-reinstall", "--reinstall", "--full"}
@@ -56,13 +56,32 @@ def _build_pip_cmd(spec: str, *, force_reinstall: bool) -> List[str]:
     return cmd
 
 
-def _run_update(spec: str, *, force_reinstall: bool) -> subprocess.CompletedProcess[str]:
+def _build_update_env(*, use_cn_mirror: bool) -> dict:
+    env = os.environ.copy()
+    if use_cn_mirror:
+        env["RUSTUP_DIST_SERVER"] = "https://rsproxy.cn"
+        env["RUSTUP_UPDATE_ROOT"] = "https://rsproxy.cn/rustup"
+    else:
+        env["RUSTUP_DIST_SERVER"] = "https://static.rust-lang.org"
+        env["RUSTUP_UPDATE_ROOT"] = "https://static.rust-lang.org/rustup"
+    env["CARGO_REGISTRIES_CRATES_IO_PROTOCOL"] = "sparse"
+    env["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
+    return env
+
+
+def _run_update(
+    spec: str,
+    *,
+    force_reinstall: bool,
+    use_cn_mirror: bool,
+) -> subprocess.CompletedProcess[str]:
     cmd = _build_pip_cmd(spec, force_reinstall=force_reinstall)
     return subprocess.run(
         cmd,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=_build_update_env(use_cn_mirror=use_cn_mirror),
     )
 
 
@@ -70,6 +89,7 @@ def _run_update_verbose(
     spec: str,
     *,
     force_reinstall: bool,
+    use_cn_mirror: bool,
     desc: str,
 ) -> Tuple[subprocess.CompletedProcess[str], float]:
     cmd = _build_pip_cmd(spec, force_reinstall=force_reinstall)
@@ -81,6 +101,7 @@ def _run_update_verbose(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
+        env=_build_update_env(use_cn_mirror=use_cn_mirror),
     )
 
     start_ts = monotonic()
@@ -319,6 +340,7 @@ def _run_pypi_update(
         proc, elapsed = _run_update_verbose(
             spec,
             force_reinstall=force_reinstall,
+            use_cn_mirror=True,
             desc="Updating from PyPI...",
         )
         if proc.returncode == 0:
@@ -330,7 +352,11 @@ def _run_pypi_update(
                 print(f"JanusX update completed. [{format_elapsed(elapsed)}]")
     else:
         with CliStatus("Updating from PyPI...", enabled=use_spinner) as task:
-            proc = _run_update(spec, force_reinstall=force_reinstall)
+            proc = _run_update(
+                spec,
+                force_reinstall=force_reinstall,
+                use_cn_mirror=True,
+            )
             if proc.returncode == 0:
                 after = _installed_version()
                 if (not force_reinstall) and before is not None and after is not None and before == after:
@@ -354,43 +380,53 @@ def _run_github_update(
     _ensure_git_available_or_exit()
     if verbose:
         direct, elapsed = _run_update_verbose(
-            _GITHUB_SPEC,
+            _GITHUB_SPEC_CN,
             force_reinstall=force_reinstall,
-            desc="Updating from GitHub...",
+            use_cn_mirror=True,
+            desc="Updating from GitHub (CN mirror)...",
         )
         if direct.returncode == 0:
             print(f"JanusX update completed. [{format_elapsed(elapsed)}]")
     else:
-        with CliStatus("Updating from GitHub...", enabled=use_spinner) as task:
-            direct = _run_update(_GITHUB_SPEC, force_reinstall=force_reinstall)
+        with CliStatus("Updating from GitHub (CN mirror)...", enabled=use_spinner) as task:
+            direct = _run_update(
+                _GITHUB_SPEC_CN,
+                force_reinstall=force_reinstall,
+                use_cn_mirror=True,
+            )
             if direct.returncode == 0:
                 task.complete("JanusX update completed.")
     if direct.returncode == 0:
         return
 
     if _looks_like_timeout(direct.stdout):
-        print("Direct GitHub update timed out, retrying with proxy...")
+        print("GitHub CN mirror timed out, retrying with source...")
     else:
-        print("Direct GitHub update failed, retrying with proxy...")
+        print("GitHub CN mirror failed, retrying with source...")
 
     if verbose:
         proxied, elapsed = _run_update_verbose(
-            _GITHUB_PROXY_SPEC,
+            _GITHUB_SPEC_ORIGIN,
             force_reinstall=force_reinstall,
-            desc="Updating from proxy...",
+            use_cn_mirror=False,
+            desc="Updating from GitHub (source)...",
         )
         if proxied.returncode == 0:
-            print(f"JanusX update completed (via proxy). [{format_elapsed(elapsed)}]")
+            print(f"JanusX update completed (via source). [{format_elapsed(elapsed)}]")
     else:
-        with CliStatus("Updating from proxy...", enabled=use_spinner) as task:
-            proxied = _run_update(_GITHUB_PROXY_SPEC, force_reinstall=force_reinstall)
+        with CliStatus("Updating from GitHub (source)...", enabled=use_spinner) as task:
+            proxied = _run_update(
+                _GITHUB_SPEC_ORIGIN,
+                force_reinstall=force_reinstall,
+                use_cn_mirror=False,
+            )
             if proxied.returncode == 0:
-                task.complete("JanusX update completed (via proxy).")
+                task.complete("JanusX update completed (via source).")
     if proxied.returncode == 0:
         return
 
-    _print_failure("GitHub attempt failed.", direct)
-    _print_failure("Proxy retry failed.", proxied)
+    _print_failure("GitHub CN mirror attempt failed.", direct)
+    _print_failure("Source retry failed.", proxied)
     raise SystemExit(1)
 
 

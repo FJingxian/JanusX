@@ -51,6 +51,10 @@ from typing import Union, Optional
 import uuid
 
 from janusx.pyBLUP.QK2 import GRM
+from janusx.pyBLUP.stream_grm import (
+    auto_stream_grm_chunk_size,
+    build_streaming_grm_from_chunks,
+)
 
 # ---- Matplotlib backend configuration (non-interactive, server-safe) ----
 for key in ["MPLBACKEND"]:
@@ -413,81 +417,84 @@ def fastplot(
     mpl.rcParams["font.size"] = 12
     results = gwasresult.astype({"pos": "int64"})
     fig = plt.figure(figsize=(16, 4), dpi=300)
-    layout = [["A", "B", "B", "C"]]
-    axes:dict[str,plt.Axes] = fig.subplot_mosaic(mosaic=layout)
+    try:
+        layout = [["A", "B", "B", "C"]]
+        axes:dict[str,plt.Axes] = fig.subplot_mosaic(mosaic=layout)
 
-    gwasplot = GWASPLOT(results)
-    scatter_size = 8.0
+        gwasplot = GWASPLOT(results)
+        scatter_size = 8.0
 
-    # A: phenotype distribution
-    pheno = np.asarray(phenosub, dtype="float64").reshape(-1)
-    pheno = pheno[np.isfinite(pheno)]
-    n_samples = int(pheno.size)
-    label_base = str(xlabel).strip() if str(xlabel).strip() else "phenotype"
+        # A: phenotype distribution
+        pheno = np.asarray(phenosub, dtype="float64").reshape(-1)
+        pheno = pheno[np.isfinite(pheno)]
+        n_samples = int(pheno.size)
+        label_base = str(xlabel).strip() if str(xlabel).strip() else "phenotype"
 
-    if n_samples > 0:
-        counts, edges, _ = axes["A"].hist(
-            pheno,
-            bins=15,
-            color="black",
-            edgecolor="none",
-            alpha=1.0,
+        if n_samples > 0:
+            counts, edges, _ = axes["A"].hist(
+                pheno,
+                bins=15,
+                color="black",
+                edgecolor="none",
+                alpha=1.0,
+            )
+            # Overlay seaborn-like KDE curve, scaled to histogram "Count" axis.
+            if counts.size > 1 and np.unique(pheno).size > 1:
+                try:
+                    kde = gaussian_kde(pheno)
+                    x_grid = np.linspace(float(np.min(pheno)), float(np.max(pheno)), 256)
+                    y_density = kde(x_grid)
+                    bin_width = float(np.mean(np.diff(edges)))
+                    y_count = y_density * float(n_samples) * bin_width
+                    axes["A"].plot(x_grid, y_count, color="#B3B3B3", linewidth=1.6)
+                except Exception:
+                    pass
+        else:
+            axes["A"].text(
+                0.5,
+                0.5,
+                "No valid phenotype values",
+                ha="center",
+                va="center",
+                transform=axes["A"].transAxes,
+            )
+
+        axes["A"].set_xlabel(f"{label_base} (n={n_samples})")
+        axes["A"].set_ylabel("Count")
+
+        # B: Manhattan plot
+        gwasplot.manhattan(
+            -np.log10(1 / results.shape[0]),
+            ax=axes["B"],
+            rasterized=True,
+            s=scatter_size,
         )
-        # Overlay seaborn-like KDE curve, scaled to histogram "Count" axis.
-        if counts.size > 1 and np.unique(pheno).size > 1:
-            try:
-                kde = gaussian_kde(pheno)
-                x_grid = np.linspace(float(np.min(pheno)), float(np.max(pheno)), 256)
-                y_density = kde(x_grid)
-                bin_width = float(np.mean(np.diff(edges)))
-                y_count = y_density * float(n_samples) * bin_width
-                axes["A"].plot(x_grid, y_count, color="#B3B3B3", linewidth=1.6)
-            except Exception:
-                pass
-    else:
-        axes["A"].text(
-            0.5,
-            0.5,
-            "No valid phenotype values",
-            ha="center",
-            va="center",
-            transform=axes["A"].transAxes,
-        )
+        snp_n = int(results.shape[0])
+        if snp_n >= 1_000_000:
+            snp_val = snp_n / 1_000_000.0
+            snp_suffix = "M"
+        else:
+            snp_val = snp_n / 1_000.0
+            snp_suffix = "K"
+        snp_text = f"{snp_val:.3f}".rstrip("0").rstrip(".")
+        axes["B"].set_xlabel(f"Chromosome (SNP={snp_text}{snp_suffix})")
 
-    axes["A"].set_xlabel(f"{label_base} (n={n_samples})")
-    axes["A"].set_ylabel("Count")
+        # C: QQ plot
+        gwasplot.qq(ax=axes["C"], scatter_size=scatter_size)
 
-    # B: Manhattan plot
-    gwasplot.manhattan(
-        -np.log10(1 / results.shape[0]),
-        ax=axes["B"],
-        rasterized=True,
-        s=scatter_size,
-    )
-    snp_n = int(results.shape[0])
-    if snp_n >= 1_000_000:
-        snp_val = snp_n / 1_000_000.0
-        snp_suffix = "M"
-    else:
-        snp_val = snp_n / 1_000.0
-        snp_suffix = "K"
-    snp_text = f"{snp_val:.3f}".rstrip("0").rstrip(".")
-    axes["B"].set_xlabel(f"Chromosome (SNP={snp_text}{snp_suffix})")
+        # Align QQ with Manhattan:
+        # - QQ ylim follows Manhattan ylim
+        # - QQ xlim lower bound follows Manhattan ylim lower bound
+        # - QQ xlim upper bound keeps current auto-scaled maximum
+        manh_ymin, manh_ymax = axes["B"].get_ylim()
+        qq_xmin, qq_xmax = axes["C"].get_xlim()
+        axes["C"].set_ylim(manh_ymin, manh_ymax)
+        axes["C"].set_xlim(left=manh_ymin, right=max(qq_xmax, manh_ymin + 1e-9))
 
-    # C: QQ plot
-    gwasplot.qq(ax=axes["C"], scatter_size=scatter_size)
-
-    # Align QQ with Manhattan:
-    # - QQ ylim follows Manhattan ylim
-    # - QQ xlim lower bound follows Manhattan ylim lower bound
-    # - QQ xlim upper bound keeps current auto-scaled maximum
-    manh_ymin, manh_ymax = axes["B"].get_ylim()
-    qq_xmin, qq_xmax = axes["C"].get_xlim()
-    axes["C"].set_ylim(manh_ymin, manh_ymax)
-    axes["C"].set_xlim(left=manh_ymin, right=max(qq_xmax, manh_ymin + 1e-9))
-
-    plt.tight_layout()
-    plt.savefig(outpdf, transparent=False, facecolor="white")
+        fig.tight_layout()
+        fig.savefig(outpdf, transparent=False, facecolor="white")
+    finally:
+        plt.close(fig)
 
 
 def determine_genotype_source(args) -> tuple[str, str]:
@@ -1320,6 +1327,7 @@ def build_grm_streaming(
     chunk_size: int,
     method: int,
     mmap_window_mb: Union[int , None],
+    threads: int,
     logger,
     use_spinner: bool = False,
 ) -> tuple[np.ndarray, int]:
@@ -1327,54 +1335,57 @@ def build_grm_streaming(
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
     """
     _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
-    grm = np.zeros((n_samples, n_samples), dtype="float32")
     pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
     process = psutil.Process()
 
-    varsum = 0.0
-    eff_m = 0
     prefetch_depth = 2
+    tuned_chunk_size = auto_stream_grm_chunk_size(
+        n_samples=n_samples,
+        requested_chunk_size=chunk_size,
+        threads=threads,
+        prefetch_depth=prefetch_depth,
+    )
+    if tuned_chunk_size != int(chunk_size):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            (
+                "Auto-tuned GRM chunk size: "
+                f"{chunk_size} -> {tuned_chunk_size} "
+                f"(n_samples={n_samples}, threads={threads})"
+            ),
+        )
+    mem_tick_span = max(1, 10 * int(tuned_chunk_size))
+
     chunk_iter = load_genotype_chunks(
         genofile,
-        chunk_size,
+        tuned_chunk_size,
         maf_threshold,
         max_missing_rate,
         model="add",
         mmap_window_mb=mmap_window_mb,
     )
-    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-        # genosub: (m_chunk, n_samples)
-        genosub:np.ndarray
-        maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
-        genosub = genosub - 2 * maf
 
-        if method == 1:
-            grm += genosub.T @ genosub
-            varsum += np.sum(2 * maf * (1 - maf))
-        elif method == 2:
-            w = 1.0 / (2 * maf * (1 - maf))              # (m_chunk,1)
-            grm += (genosub.T * w.ravel()) @ genosub     # (n_samples, n_samples)
-        else:
-            raise ValueError(f"Unsupported GRM method: {method}")
-
-        eff_m += genosub.shape[0]
-        pbar.update(genosub.shape[0])
-
-        if eff_m % (10 * chunk_size) == 0:
+    def _on_grm_chunk(added_snps: int, total_eff: int) -> None:
+        pbar.update(int(added_snps))
+        if total_eff % mem_tick_span == 0:
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f}GB")
+
+    grm, grm_stats = build_streaming_grm_from_chunks(
+        prefetch_iter(chunk_iter, in_flight=prefetch_depth),
+        n_samples=n_samples,
+        method=method,
+        accumulate="gemm",
+        on_chunk=_on_grm_chunk,
+    )
 
     # force bar to 100% even if SNPs were filtered in Rust
     pbar.finish()
     pbar.close()
 
-    if method == 1:
-        grm = (grm + grm.T) / varsum / 2
-    else:  # method == 2
-        grm = (grm + grm.T) / eff_m / 2
-
     _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
-    return grm, eff_m
+    return grm, int(grm_stats.eff_m)
 
 
 def load_or_build_grm_with_cache(
@@ -1384,6 +1395,7 @@ def load_or_build_grm_with_cache(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    threads: int,
     mmap_limit: bool,
     logger:logging.Logger,
     use_spinner: bool = False,
@@ -1447,6 +1459,7 @@ def load_or_build_grm_with_cache(
                 mmap_window_mb=auto_mmap_window_mb(
                     genofile, n_samples, n_snps, chunk_size
                 ) if mmap_limit else None,
+                threads=threads,
                 logger=logger,
                 use_spinner=use_spinner,
             )
@@ -1641,6 +1654,7 @@ def prepare_streaming_context(
     mgrm: str,
     pcdim: str,
     cov_inputs: Union[str, list[str], None],
+    threads: int,
     mmap_limit: bool,
     require_kinship: bool,
     logger,
@@ -1697,6 +1711,7 @@ def prepare_streaming_context(
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
             chunk_size=chunk_size,
+            threads=threads,
             mmap_limit=mmap_limit,
             logger=logger,
             use_spinner=use_spinner,
@@ -3263,7 +3278,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=minimal_help_epilog([
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
-            "jx gwas -bfile example_prefix -p pheno.tsv -lm -plot",
+            "jx gwas -bfile example_prefix -p pheno.tsv -lm",
         ]),
     )
 
@@ -3355,10 +3370,6 @@ def parse_args():
              "Sites with het rate outside [het, 1-het] are removed (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-plot", "--plot", action="store_true", default=False,
-        help="Generate diagnostic plots (histogram, Manhattan, QQ; default: %(default)s).",
-    )
-    optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=100_000,
         help="Number of SNPs per chunk for streaming LMM/LM "
              "(affects GRM and GWAS; default: %(default)s).",
@@ -3387,6 +3398,8 @@ def main(log: bool = True):
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     args = parse_args()
+    # Plotting is always enabled for GWAS CLI.
+    args.plot = True
     args.cov = _normalize_cov_inputs(args.cov)
 
     if args.thread <= 0:
@@ -3508,6 +3521,7 @@ def main(log: bool = True):
                 mgrm=args.grm,
                 pcdim=args.qcov,
                 cov_inputs=args.cov,
+                threads=args.thread,
                 mmap_limit=args.mmap_limit,
                 require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,

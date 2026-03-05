@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PYPI_SPEC: &str = "janusx";
-const GITHUB_SPEC: &str = "git+https://github.com/FJingxian/JanusX.git";
-const GITHUB_PROXY_SPEC: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";
+const GITHUB_SPEC_CN: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";
+const GITHUB_SPEC_ORIGIN: &str = "git+https://github.com/FJingxian/JanusX.git";
 const UPDATE_TIME_MARKER: &str = ".python_core_updated_at";
 const COMMIT_MARKER: &str = ".python_core_commit";
 const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
@@ -25,6 +25,10 @@ const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const MIN_PYTHON_MAJOR: u32 = 3;
 const MIN_PYTHON_MINOR: u32 = 9;
+const RUSTUP_DIST_SERVER_CN: &str = "https://rsproxy.cn";
+const RUSTUP_UPDATE_ROOT_CN: &str = "https://rsproxy.cn/rustup";
+const RUSTUP_DIST_SERVER_ORIGIN: &str = "https://static.rust-lang.org";
+const RUSTUP_UPDATE_ROOT_ORIGIN: &str = "https://static.rust-lang.org/rustup";
 const CLI_HELP_TEXT: &str = r#"Usage:
     jx <module> [options]
 
@@ -519,9 +523,9 @@ fn ensure_install_dir_in_path_persistent_windows(
     let target = canonical_or_self(install_dir);
     let target_s = target.to_string_lossy().to_string();
     let script = r#"
-$target = [System.IO.Path]::GetFullPath($args[0])
-$target = $target.Trim()
+$target = "$env:JX_TARGET_DIR".Trim()
 if ([string]::IsNullOrWhiteSpace($target)) { exit 12 }
+$target = [System.IO.Path]::GetFullPath($target)
 $old = [Environment]::GetEnvironmentVariable('Path','User')
 $parts = @()
 if (-not [string]::IsNullOrWhiteSpace($old)) {
@@ -560,7 +564,7 @@ exit 10
             .arg("-NoProfile")
             .arg("-Command")
             .arg(script)
-            .arg(&target_s)
+            .env("JX_TARGET_DIR", &target_s)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -601,7 +605,9 @@ fn remove_install_dir_from_path_persistent_windows(
     let target = canonical_or_self(install_dir);
     let target_s = target.to_string_lossy().to_string();
     let script = r#"
-$target = [System.IO.Path]::GetFullPath($args[0])
+$target = "$env:JX_TARGET_DIR".Trim()
+if ([string]::IsNullOrWhiteSpace($target)) { exit 21 }
+$target = [System.IO.Path]::GetFullPath($target)
 $old = [Environment]::GetEnvironmentVariable('Path','User')
 if ([string]::IsNullOrWhiteSpace($old)) { exit 21 }
 $parts = @()
@@ -632,7 +638,7 @@ exit 20
             .arg("-NoProfile")
             .arg("-Command")
             .arg(script)
-            .arg(&target_s)
+            .env("JX_TARGET_DIR", &target_s)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1334,8 +1340,16 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 return Ok(0);
             }
             ensure_git_available()?;
-            let repo_url = repo_url_from_spec(GITHUB_SPEC);
-            let remote_head = remote_head_commit(&repo_url);
+            let repo_url_cn = repo_url_from_spec(GITHUB_SPEC_CN);
+            let repo_url_origin = repo_url_from_spec(GITHUB_SPEC_ORIGIN);
+            let (repo_url, remote_head, using_cn_repo) =
+                if let Some(head) = remote_head_commit(&repo_url_cn) {
+                    (repo_url_cn.clone(), Some(head), true)
+                } else if let Some(head) = remote_head_commit(&repo_url_origin) {
+                    (repo_url_origin.clone(), Some(head), false)
+                } else {
+                    (repo_url_cn.clone(), None, true)
+                };
             let local_commit = read_commit_marker(&home);
             if let (Some(local), Some(remote)) = (local_commit.as_deref(), remote_head.as_deref()) {
                 if local == remote {
@@ -1362,6 +1376,9 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     }
                     Ok(false) => {
                         if opts.verbose {
+                            if !using_cn_repo {
+                                println!("CN GitHub mirror is unavailable; using source for fast update.");
+                            }
                             println!("Rust or build files changed; falling back to full update.");
                         }
                     }
@@ -1374,17 +1391,19 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 }
             }
             // GitHub latest should refresh even when package version string is unchanged.
+            ensure_local_rust_toolchain(&home, &python, opts.verbose)?;
             let gh_force_reinstall = true;
             if opts.verbose {
-                println!("Updating from GitHub ...");
+                println!("Updating from GitHub (CN mirror) ...");
             }
             match pip_install_update(
                 &python,
                 &home,
-                GITHUB_SPEC,
+                GITHUB_SPEC_CN,
                 gh_force_reinstall,
                 opts.verbose,
-                "Updating from GitHub ...",
+                "Updating from GitHub (CN mirror) ...",
+                true,
             ) {
                 Ok(_) => {
                     if let Some(remote) = remote_head.as_deref() {
@@ -1394,17 +1413,18 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     return Ok(0);
                 }
                 Err(err_primary) => {
-                    eprintln!("Direct GitHub update failed, retrying with proxy...");
+                    eprintln!("GitHub CN mirror update failed, retrying with source...");
                     if opts.verbose {
                         eprintln!("Reason: {err_primary}");
                     }
                     let _ = pip_install_update(
                         &python,
                         &home,
-                        GITHUB_PROXY_SPEC,
+                        GITHUB_SPEC_ORIGIN,
                         gh_force_reinstall,
                         opts.verbose,
-                        "Updating from proxy...",
+                        "Updating from GitHub (source)...",
+                        false,
                     )?;
                     if let Some(remote) = remote_head.as_deref() {
                         write_commit_marker(&home, remote);
@@ -1425,6 +1445,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 opts.force_reinstall,
                 opts.verbose,
                 "Updating from local source...",
+                true,
             )?;
             warm_up_after_update(jx_bin.as_deref(), &home)?;
             return Ok(0);
@@ -1442,6 +1463,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
         opts.force_reinstall,
         opts.verbose,
         "Updating from PyPI...",
+        true,
     )?;
     let after = installed_version(&python);
     if !opts.force_reinstall && before.is_some() && before == after {
@@ -1465,6 +1487,231 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     }
     warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn rustup_home(runtime_home: &Path) -> PathBuf {
+    runtime_home.join(".rustup")
+}
+
+fn cargo_home(runtime_home: &Path) -> PathBuf {
+    runtime_home.join(".cargo")
+}
+
+fn cargo_bin_dir(runtime_home: &Path) -> PathBuf {
+    cargo_home(runtime_home).join("bin")
+}
+
+fn local_rustc_path(runtime_home: &Path) -> PathBuf {
+    if cfg!(windows) {
+        cargo_bin_dir(runtime_home).join("rustc.exe")
+    } else {
+        cargo_bin_dir(runtime_home).join("rustc")
+    }
+}
+
+fn local_cargo_path(runtime_home: &Path) -> PathBuf {
+    if cfg!(windows) {
+        cargo_bin_dir(runtime_home).join("cargo.exe")
+    } else {
+        cargo_bin_dir(runtime_home).join("cargo")
+    }
+}
+
+fn apply_local_rust_env(cmd: &mut Command, runtime_home: &Path, use_cn_mirror: bool) {
+    let rustup_dir = rustup_home(runtime_home);
+    let cargo_dir = cargo_home(runtime_home);
+    cmd.env("RUSTUP_HOME", &rustup_dir);
+    cmd.env("CARGO_HOME", &cargo_dir);
+    if use_cn_mirror {
+        cmd.env("RUSTUP_DIST_SERVER", RUSTUP_DIST_SERVER_CN);
+        cmd.env("RUSTUP_UPDATE_ROOT", RUSTUP_UPDATE_ROOT_CN);
+    } else {
+        cmd.env("RUSTUP_DIST_SERVER", RUSTUP_DIST_SERVER_ORIGIN);
+        cmd.env("RUSTUP_UPDATE_ROOT", RUSTUP_UPDATE_ROOT_ORIGIN);
+    }
+    cmd.env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse");
+    cmd.env("CARGO_NET_GIT_FETCH_WITH_CLI", "true");
+    cmd.env("CARGO_TERM_COLOR", "always");
+
+    let mut paths: Vec<PathBuf> = vec![cargo_bin_dir(runtime_home)];
+    if let Some(curr) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&curr));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+}
+
+fn local_rust_toolchain_ready(runtime_home: &Path) -> bool {
+    let rustc = local_rustc_path(runtime_home);
+    let cargo = local_cargo_path(runtime_home);
+    if !(rustc.exists() && cargo.exists()) {
+        return false;
+    }
+    let mut cmd_rustc = Command::new(&rustc);
+    cmd_rustc
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_local_rust_env(&mut cmd_rustc, runtime_home, true);
+    let rustc_ok = cmd_rustc.status().map(|s| s.success()).unwrap_or(false);
+
+    if !rustc_ok {
+        return false;
+    }
+
+    let mut cmd_cargo = Command::new(&cargo);
+    cmd_cargo
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_local_rust_env(&mut cmd_cargo, runtime_home, true);
+    cmd_cargo.status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn rustup_target_triple() -> Option<&'static str> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("aarch64-pc-windows-msvc")
+    } else {
+        None
+    }
+}
+
+fn rustup_init_file_name() -> &'static str {
+    if cfg!(windows) {
+        "rustup-init.exe"
+    } else {
+        "rustup-init"
+    }
+}
+
+fn rustup_init_download_url_cn() -> Option<String> {
+    let triple = rustup_target_triple()?;
+    Some(format!(
+        "{}/rustup/dist/{}/{}",
+        RUSTUP_DIST_SERVER_CN,
+        triple,
+        rustup_init_file_name()
+    ))
+}
+
+fn rustup_init_download_url_origin() -> Option<String> {
+    let triple = rustup_target_triple()?;
+    Some(format!(
+        "{}/rustup/dist/{}/{}",
+        RUSTUP_DIST_SERVER_ORIGIN,
+        triple,
+        rustup_init_file_name()
+    ))
+}
+
+fn ensure_local_rust_toolchain(
+    runtime_home: &Path,
+    python: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    if local_rust_toolchain_ready(runtime_home) {
+        return Ok(());
+    }
+
+    let (Some(url_cn), Some(url_origin)) =
+        (rustup_init_download_url_cn(), rustup_init_download_url_origin())
+    else {
+        return Err(
+            "Current platform is not supported for local rustup bootstrap in `jx --update latest`."
+                .to_string(),
+        );
+    };
+
+    std::fs::create_dir_all(rustup_home(runtime_home))
+        .map_err(|e| format!("Failed to create {}: {e}", rustup_home(runtime_home).display()))?;
+    std::fs::create_dir_all(cargo_home(runtime_home))
+        .map_err(|e| format!("Failed to create {}: {e}", cargo_home(runtime_home).display()))?;
+
+    let install_tmp = runtime_home.join(".rustup-bootstrap");
+    std::fs::create_dir_all(&install_tmp)
+        .map_err(|e| format!("Failed to create {}: {e}", install_tmp.display()))?;
+    let installer = install_tmp.join(rustup_init_file_name());
+
+    match download_file_with_fallback(
+        python,
+        &url_cn,
+        &installer,
+        "Downloading local Rust toolchain bootstrap (CN mirror) ...",
+        verbose,
+    ) {
+        Ok(_) => {}
+        Err(err_cn) => {
+            eprintln!("CN Rust bootstrap mirror failed, retrying source...");
+            if verbose {
+                eprintln!("Reason: {err_cn}");
+            }
+            download_file_with_fallback(
+                python,
+                &url_origin,
+                &installer,
+                "Downloading local Rust toolchain bootstrap (source) ...",
+                verbose,
+            )?;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&installer)
+            .map_err(|e| format!("Failed to stat {}: {e}", installer.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&installer, perms)
+            .map_err(|e| format!("Failed to chmod {}: {e}", installer.display()))?;
+    }
+
+    let run_rustup_install = |use_cn_mirror: bool, desc: &str| -> Result<(), String> {
+        let mut cmd = Command::new(&installer);
+        cmd.arg("-y")
+            .arg("--profile")
+            .arg("minimal")
+            .arg("--default-toolchain")
+            .arg("stable")
+            .arg("--no-modify-path")
+            .stdin(Stdio::null());
+        apply_local_rust_env(&mut cmd, runtime_home, use_cn_mirror);
+        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
+            .map_err(|e| format!("Failed to install local Rust toolchain: {e}"))?;
+        Ok(())
+    };
+
+    match run_rustup_install(true, "Installing local Rust toolchain (CN mirror) ...") {
+        Ok(_) => {}
+        Err(err_cn) => {
+            eprintln!("CN Rust toolchain install failed, retrying source...");
+            if verbose {
+                eprintln!("Reason: {err_cn}");
+            }
+            run_rustup_install(false, "Installing local Rust toolchain (source) ...")?;
+        }
+    }
+
+    if !local_rust_toolchain_ready(runtime_home) {
+        return Err(
+            "Local Rust toolchain bootstrap finished, but `rustc/cargo` are still unavailable."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn maybe_self_update_launcher_from_pypi_check(
@@ -1759,6 +2006,49 @@ fn download_release_asset(
     output: &Path,
     verbose: bool,
 ) -> Result<(), String> {
+    let mirror_url = github_mirror_url(url);
+    if mirror_url != url {
+        match download_file_with_fallback(
+            python,
+            &mirror_url,
+            output,
+            "Downloading launcher installer (CN mirror) ...",
+            verbose,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(err_cn) => {
+                eprintln!("GitHub CN mirror download failed, retrying source...");
+                if verbose {
+                    eprintln!("Reason: {err_cn}");
+                }
+            }
+        }
+    }
+    download_file_with_fallback(
+        python,
+        url,
+        output,
+        "Downloading launcher installer (source) ...",
+        verbose,
+    )
+}
+
+fn github_mirror_url(url: &str) -> String {
+    let t = url.trim();
+    if t.starts_with("https://github.com/") {
+        format!("https://gh-proxy.org/{t}")
+    } else {
+        t.to_string()
+    }
+}
+
+fn download_file_with_fallback(
+    python: &Path,
+    url: &str,
+    output: &Path,
+    desc: &str,
+    verbose: bool,
+) -> Result<(), String> {
     if command_ok("wget", &["--version"]) {
         let mut cmd = Command::new("wget");
         cmd.arg("-c")
@@ -1766,7 +2056,7 @@ fn download_release_asset(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
             .map_err(|e| format!("wget download failed: {e}"))?;
         return Ok(());
     }
@@ -1780,7 +2070,7 @@ fn download_release_asset(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
             .map_err(|e| format!("curl download failed: {e}"))?;
         return Ok(());
     }
@@ -1797,7 +2087,7 @@ urllib.request.urlretrieve(url, out)
         .arg(url)
         .arg(output)
         .stdin(Stdio::null());
-    run_cmd_with_optional_spinner(&mut cmd, "Downloading launcher installer ...", verbose)
+    run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
         .map_err(|e| format!("Python download failed: {e}"))?;
     Ok(())
 }
@@ -2088,11 +2378,28 @@ fn pip_install_update(
     force_reinstall: bool,
     verbose: bool,
     desc: &str,
+    use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
     if verbose {
-        return pip_install(python, runtime_home, spec, force_reinstall, true, desc);
+        return pip_install(
+            python,
+            runtime_home,
+            spec,
+            force_reinstall,
+            true,
+            desc,
+            use_cn_rust_mirror,
+        );
     }
-    pip_install_tail(python, runtime_home, spec, force_reinstall, desc, 10)
+    pip_install_tail(
+        python,
+        runtime_home,
+        spec,
+        force_reinstall,
+        desc,
+        10,
+        use_cn_rust_mirror,
+    )
 }
 
 fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {
@@ -2131,6 +2438,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
             false,
             "Building runtime from PyPI ...",
             10,
+            true,
         )?;
     }
     Ok(python)
@@ -2797,8 +3105,15 @@ fn pip_install(
     force_reinstall: bool,
     verbose: bool,
     desc: &str,
+    use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
-    let mut cmd = build_pip_install_cmd(python, spec, force_reinstall);
+    let mut cmd = build_pip_install_cmd(
+        python,
+        runtime_home,
+        spec,
+        force_reinstall,
+        use_cn_rust_mirror,
+    );
 
     if verbose {
         let start = Instant::now();
@@ -2836,7 +3151,13 @@ fn pip_install(
     ))
 }
 
-fn build_pip_install_cmd(python: &Path, spec: &str, force_reinstall: bool) -> Command {
+fn build_pip_install_cmd(
+    python: &Path,
+    runtime_home: &Path,
+    spec: &str,
+    force_reinstall: bool,
+    use_cn_rust_mirror: bool,
+) -> Command {
     let mut cmd = Command::new(python);
     cmd.arg("-m")
         .arg("pip")
@@ -2848,6 +3169,9 @@ fn build_pip_install_cmd(python: &Path, spec: &str, force_reinstall: bool) -> Co
     }
     if force_reinstall {
         cmd.arg("--force-reinstall").arg("--no-cache-dir");
+    }
+    if spec_requires_rust_build(spec) && local_rust_toolchain_ready(runtime_home) {
+        apply_local_rust_env(&mut cmd, runtime_home, use_cn_rust_mirror);
     }
     cmd.arg(spec);
     cmd
@@ -2865,6 +3189,17 @@ fn is_pypi_janusx_spec(spec: &str) -> bool {
     s == "janusx" || s.starts_with("janusx==")
 }
 
+fn spec_requires_rust_build(spec: &str) -> bool {
+    let s = spec.trim();
+    if s.starts_with("git+") {
+        return true;
+    }
+    if Path::new(s).exists() {
+        return true;
+    }
+    should_force_source_build_for_spec(spec)
+}
+
 fn pip_install_tail(
     python: &Path,
     runtime_home: &Path,
@@ -2872,9 +3207,16 @@ fn pip_install_tail(
     force_reinstall: bool,
     desc: &str,
     max_lines: usize,
+    use_cn_rust_mirror: bool,
 ) -> Result<Duration, String> {
     let is_tty = io::stdout().is_terminal();
-    let mut cmd = build_pip_install_cmd(python, spec, force_reinstall);
+    let mut cmd = build_pip_install_cmd(
+        python,
+        runtime_home,
+        spec,
+        force_reinstall,
+        use_cn_rust_mirror,
+    );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

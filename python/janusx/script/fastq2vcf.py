@@ -90,6 +90,10 @@ REQUIRED_LOCAL_TOOLS = (
     "beagle",
 )
 DOCKER_IMAGE_TAG = "janusx-fastq2vcf:latest"
+JANUSX_SIF_URLS = (
+    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+    "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+)
 
 
 def _missing_binaries(commands: Sequence[str]) -> List[str]:
@@ -272,6 +276,19 @@ def downloader(url: str, dst: Path) -> None:
             pbar.close(success=ok)
 
     os.replace(tmp, dst)
+
+
+def download_with_fallback(urls: Sequence[str], dst: Path, logger) -> None:
+    errs: List[str] = []
+    for i, url in enumerate(urls):
+        try:
+            downloader(str(url), dst)
+            return
+        except Exception as e:
+            errs.append(f"{url} -> {e}")
+            if i < len(urls) - 1:
+                logger.warning("SIF download failed from mirror, retrying source...")
+    raise RuntimeError("All SIF download sources failed:\n" + "\n".join(errs))
 
 
 def _fastq_read_info(name: str):
@@ -540,10 +557,7 @@ def main():
                     raise SystemExit(1)
                 tmp_path = binary_path / "janusxext.tmp.sif"
                 if user_input.lower() == "y":
-                    downloader(
-                        "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
-                        tmp_path,
-                    )
+                    download_with_fallback(JANUSX_SIF_URLS, tmp_path, logger)
                 else:
                     src = Path(user_input).expanduser().resolve()
                     if not src.exists():

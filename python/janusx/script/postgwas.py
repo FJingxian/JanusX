@@ -2148,7 +2148,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax.get_xlim(),
                 )
 
-            rasterized = False if args.format == "pdf" else True
+            rasterized = True
 
             if args.highlight:
                 # Highlight specific SNPs (bed-like file: chr, start, end, gene, desc)

@@ -2880,6 +2880,7 @@ fn pip_install_tail(
     drop(tx);
 
     let mut rendered = false;
+    let mut tail_mode_started = false;
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
@@ -2905,13 +2906,42 @@ fn pip_install_tail(
                         if tail.len() == max_lines {
                             tail.pop_front();
                         }
-                        tail.push_back(line);
+                        tail.push_back(line.clone());
                     }
                 }
                 if is_tty {
-                    render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
-                    rendered = true;
-                    last_render = Instant::now();
+                    if max_lines == 0 {
+                        tail_mode_started = true;
+                        render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                        rendered = true;
+                        last_render = Instant::now();
+                    } else if !tail_mode_started {
+                        if !is_duplicate {
+                            if tail.len() < max_lines {
+                                let width = terminal_line_width();
+                                let trimmed = truncate_plain_line(&line, width);
+                                if supports_color() {
+                                    println!("\x1b[2m{}\x1b[0m", trimmed);
+                                } else {
+                                    println!("{trimmed}");
+                                }
+                                io::stdout()
+                                    .flush()
+                                    .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+                            } else {
+                                // Switch from normal streaming log to fixed tail-refresh mode.
+                                print!("\x1b[{}A", max_lines);
+                                render_tail_block(desc, "", start.elapsed(), &tail, max_lines, false)?;
+                                rendered = true;
+                                tail_mode_started = true;
+                                last_render = Instant::now();
+                            }
+                        }
+                    } else {
+                        render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                        rendered = true;
+                        last_render = Instant::now();
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2920,7 +2950,7 @@ fn pip_install_tail(
                         .try_wait()
                         .map_err(|e| format!("Failed to poll pip install status: {e}"))?;
                 }
-                if is_tty && last_render.elapsed() >= Duration::from_secs(2) {
+                if is_tty && tail_mode_started && last_render.elapsed() >= Duration::from_secs(2) {
                     render_tail_block(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
                     rendered = true;
                     last_render = Instant::now();
@@ -2945,14 +2975,26 @@ fn pip_install_tail(
 
     if is_tty {
         let final_symbol = if status.success() { "✔︎" } else { "✘" };
-        render_tail_block(
-            desc,
-            final_symbol,
-            start.elapsed(),
-            &tail,
-            max_lines,
-            rendered,
-        )?;
+        if tail_mode_started {
+            render_tail_block(
+                desc,
+                final_symbol,
+                start.elapsed(),
+                &tail,
+                max_lines,
+                rendered,
+            )?;
+        } else {
+            let width = terminal_line_width();
+            let title = truncate_plain_line(
+                &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
+                width,
+            );
+            println!("{}", style_green(&title));
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+        }
     }
 
     if status.success() {

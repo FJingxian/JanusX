@@ -46,6 +46,7 @@ import threading
 import warnings
 import multiprocessing as mp
 import concurrent.futures as cf
+import textwrap
 from typing import Union, Optional
 import uuid
 
@@ -131,6 +132,42 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * 60)
     logger.info(title)
     logger.info("=" * 60)
+
+
+def _emit_trait_header(
+    logger: logging.Logger,
+    trait_name: str,
+    n_idv: int,
+    *,
+    use_spinner: bool = False,
+    width: int = 60,
+) -> None:
+    """
+    Emit trait header as one line: "<trait> (n=<idv>)".
+    If it exceeds section width, wrap at trait/name boundary.
+    """
+    trait = str(trait_name)
+    n_line = f"(n={int(n_idv)})"
+    full = f"{trait} {n_line}"
+    if len(full) <= int(width):
+        lines = [full]
+    else:
+        if len(trait) <= int(width):
+            lines = [trait, n_line]
+        else:
+            trait_lines = textwrap.wrap(
+                trait,
+                width=max(10, int(width)),
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            lines = trait_lines + [n_line]
+    for ln in lines:
+        _log_file_only(logger, logging.INFO, ln)
+        if use_spinner:
+            print(ln, flush=True)
+        else:
+            logger.info(ln)
 
 
 def _emit_gwas_summary(
@@ -1941,6 +1978,14 @@ def run_chunked_gwas_lmm_lm(
                 logger.info("")  # single blank line between traits
             continue
 
+        _emit_trait_header(
+            logger,
+            pname,
+            n_idv,
+            use_spinner=bool(use_spinner),
+            width=60,
+        )
+
         trait_ids = np.asarray(ids[sameidx], dtype=str)
         y_vec = pheno_sub.loc[trait_ids].values
         # Build covariate matrix X_cov for this trait
@@ -1962,13 +2007,6 @@ def run_chunked_gwas_lmm_lm(
                 logging.INFO,
                 f"{model_label}, trait: {pname}, PVE(null): {mod.pve:.3f}",
             )
-            if show_npve_line:
-                npve_line = f"n={n_idv}; pve={mod.pve:.3f}"
-                _log_file_only(logger, logging.INFO, npve_line)
-                if use_spinner:
-                    print(npve_line, flush=True)
-                else:
-                    logger.info(npve_line)
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -1977,13 +2015,6 @@ def run_chunked_gwas_lmm_lm(
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
-            if show_npve_line:
-                n_line = f"n={n_idv}"
-                _log_file_only(logger, logging.INFO, n_line)
-                if use_spinner:
-                    print(n_line, flush=True)
-                else:
-                    logger.info(n_line)
 
         done_snps = 0
         has_results = False
@@ -2321,6 +2352,14 @@ def run_chunked_gwas_streaming_shared(
             eff_snp_by_trait[pname] = 0
         return
 
+    _emit_trait_header(
+        logger,
+        pname,
+        n_idv,
+        use_spinner=bool(use_spinner),
+        width=60,
+    )
+
     trait_ids = np.asarray(ids[sameidx], dtype=str)
     y_vec = pheno_sub.loc[trait_ids].values
     X_cov = qmatrix[sameidx]
@@ -2412,9 +2451,6 @@ def run_chunked_gwas_streaming_shared(
         return chunk_df
 
     model_label_map = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM"}
-    pve_models = [m for m in model_order if m in {"lmm", "fastlmm"}]
-    printed_npve = False
-
     model_ctxs: list[dict[str, object]] = []
     for mkey in model_order:
         ModelCls = model_map[mkey]
@@ -2456,14 +2492,6 @@ def run_chunked_gwas_streaming_shared(
                 logging.INFO,
                 f"{model_label}, trait: {pname}, PVE(null): {mod.pve:.3f}",
             )
-            if not printed_npve:
-                npve_line = f"n={n_idv}; pve={mod.pve:.3f}"
-                _log_file_only(logger, logging.INFO, npve_line)
-                if use_spinner:
-                    print(npve_line, flush=True)
-                else:
-                    logger.info(npve_line)
-                printed_npve = True
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -2473,15 +2501,6 @@ def run_chunked_gwas_streaming_shared(
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
-
-        if (not printed_npve) and (len(pve_models) == 0):
-            n_line = f"n={n_idv}"
-            _log_file_only(logger, logging.INFO, n_line)
-            if use_spinner:
-                print(n_line, flush=True)
-            else:
-                logger.info(n_line)
-            printed_npve = True
 
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
@@ -2559,7 +2578,7 @@ def run_chunked_gwas_streaming_shared(
     scan_threads = int(threads)
     if scan_threads <= 0:
         scan_threads = int(n_cores)
-    threads_per_model = max(1, scan_threads // max(1, len(model_ctxs)))
+    threads_per_model = max(1, scan_threads)
 
     for genosub, sites in load_genotype_chunks(
         genofile,
@@ -3515,7 +3534,7 @@ def main(log: bool = True):
         has_farmcpu = bool(args.farmcpu)
 
         trait_order = list(pheno.columns) if pheno is not None else []
-        if len(stream_models) > 0 or has_farmcpu:
+        if len(stream_models) > 0:
             _section(logger, "Streaming task")
 
         # -------------------------------
@@ -3523,12 +3542,6 @@ def main(log: bool = True):
         # -------------------------------
         if len(stream_models) > 0:
             for trait_idx, pname in enumerate(trait_order):
-                if use_spinner:
-                    _log_file_only(logger, logging.INFO, str(pname))
-                    print(str(pname), flush=True)
-                else:
-                    logger.info(str(pname))
-
                 if len(stream_models) == 1:
                     model_key = stream_models[0]
                     pve_line_model = model_key if model_key in {"lmm", "fastlmm"} else None

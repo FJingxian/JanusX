@@ -183,7 +183,6 @@ Linux: please run the `.run` installer file."
             .to_string());
     }
 
-    println!("{LOGO}");
     println!("JanusX Installer");
     println!("Guided setup: Runtime home -> jx location -> PATH\n");
     check_and_handle_existing_jx_in_path()?;
@@ -3344,6 +3343,7 @@ fn pip_install_tail(
     let mut rendered = false;
     let mut tail_mode_started = false;
     let mut prelog_spinner_shown = false;
+    let mut streaming_title_started = false;
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
@@ -3363,10 +3363,10 @@ fn pip_install_tail(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok((is_err, line)) => {
                 if is_tty && prelog_spinner_shown && !tail_mode_started {
-                    print!("\r\x1b[2K");
-                    io::stdout()
-                        .flush()
-                        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+                    if !streaming_title_started {
+                        render_streaming_title_init(desc, start.elapsed())?;
+                        streaming_title_started = true;
+                    }
                     prelog_spinner_shown = false;
                 }
                 saw_any_line = true;
@@ -3410,7 +3410,11 @@ fn pip_install_tail(
                             } else {
                                 // Switch from normal streaming log to fixed tail-refresh mode.
                                 if streamed_lines_before_tail > 0 {
-                                    print!("\x1b[{}A", streamed_lines_before_tail);
+                                    let mut up = streamed_lines_before_tail;
+                                    if streaming_title_started {
+                                        up = up.saturating_add(1);
+                                    }
+                                    print!("\x1b[{}A", up);
                                 }
                                 render_tail_block(desc, "", start.elapsed(), &tail, max_lines, false)?;
                                 rendered = true;
@@ -3434,6 +3438,14 @@ fn pip_install_tail(
                 if is_tty && !tail_mode_started && !saw_any_line {
                     render_prelog_spinner_line(desc, start.elapsed())?;
                     prelog_spinner_shown = true;
+                }
+                if is_tty
+                    && !tail_mode_started
+                    && streaming_title_started
+                    && last_render.elapsed() >= Duration::from_millis(100)
+                {
+                    render_streaming_title_only(desc, start.elapsed(), streamed_lines_before_tail)?;
+                    last_render = Instant::now();
                 }
                 if is_tty
                     && tail_mode_started
@@ -3600,6 +3612,45 @@ fn render_prelog_spinner_line(desc: &str, elapsed: Duration) -> Result<(), Strin
         print!("\r{}", style_green(&title));
     } else {
         print!("\r{title}");
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_title_init(desc: &str, elapsed: Duration) -> Result<(), String> {
+    let width = terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = truncate_plain_line(
+        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        width,
+    );
+    print!("\r\x1b[2K{}\n", style_green(&title));
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_title_only(
+    desc: &str,
+    elapsed: Duration,
+    lines_below: usize,
+) -> Result<(), String> {
+    let width = terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = truncate_plain_line(
+        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        width,
+    );
+    let up = lines_below.saturating_add(1);
+    print!("\x1b[{}A", up);
+    print!("\x1b[2K\r{}\n", style_green(&title));
+    if lines_below > 0 {
+        print!("\x1b[{}B", lines_below);
     }
     io::stdout()
         .flush()

@@ -1283,7 +1283,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
         {
             if compare_version_tokens(&current, &latest) != std::cmp::Ordering::Less {
                 print_success_line(&format!(
-                    "It is the latest PyPI version ({current})[{}]",
+                    "Already at latest PyPI version ({current})[{}]",
                     format_elapsed(check_start.elapsed())
                 ));
                 if github_has_newer_release_hint(&python, &home, &current, opts.verbose) {
@@ -1413,12 +1413,12 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     if !opts.force_reinstall && before.is_some() && before == after {
         if let Some(v) = after {
             print_success_line(&format!(
-                "It is the latest PyPI version ({v}) [{}]",
+                "Already at latest PyPI version ({v}) [{}]",
                 format_elapsed(elapsed)
             ));
         } else {
             print_success_line(&format!(
-                "It is already the latest PyPI version. [{}]",
+                "Already at latest PyPI version. [{}]",
                 format_elapsed(elapsed)
             ));
         }

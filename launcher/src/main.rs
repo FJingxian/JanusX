@@ -1351,44 +1351,53 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     return Err(git_install_hint());
                 }
                 let tmp_dir = home.join(".update-src");
-                std::fs::create_dir_all(&tmp_dir).map_err(|e| {
-                    format!(
-                        "Failed to create GitHub source cache directory {}: {e}",
-                        tmp_dir.display()
-                    )
-                })?;
                 let archive_path = tmp_dir.join("JanusX-latest-main.tar.gz");
-                match download_file_with_http_tools(
-                    GITHUB_ARCHIVE_CN,
-                    &archive_path,
-                    "Downloading GitHub source archive (CN mirror) ...",
-                    opts.verbose,
-                ) {
-                    Ok(_) => {}
-                    Err(err_cn) => {
-                        eprintln!("GitHub source archive CN mirror failed, retrying source...");
-                        if opts.verbose {
-                            eprintln!("Reason: {err_cn}");
+                let archive_update_result: Result<(), String> = (|| {
+                    std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+                        format!(
+                            "Failed to create GitHub source cache directory {}: {e}",
+                            tmp_dir.display()
+                        )
+                    })?;
+                    match download_file_with_http_tools(
+                        GITHUB_ARCHIVE_CN,
+                        &archive_path,
+                        "Downloading GitHub source archive (CN mirror) ...",
+                        opts.verbose,
+                    ) {
+                        Ok(_) => {}
+                        Err(err_cn) => {
+                            eprintln!("GitHub source archive CN mirror failed, retrying source...");
+                            if opts.verbose {
+                                eprintln!("Reason: {err_cn}");
+                            }
+                            download_file_with_http_tools(
+                                GITHUB_ARCHIVE_ORIGIN,
+                                &archive_path,
+                                "Downloading GitHub source archive (source) ...",
+                                opts.verbose,
+                            )?;
                         }
-                        download_file_with_http_tools(
-                            GITHUB_ARCHIVE_ORIGIN,
-                            &archive_path,
-                            "Downloading GitHub source archive (source) ...",
-                            opts.verbose,
-                        )?;
                     }
-                }
-                let archive_spec = archive_path.to_string_lossy().to_string();
-                let _ = pip_install_update(
-                    &python,
-                    &home,
-                    &archive_spec,
-                    true,
-                    opts.verbose,
-                    "Updating from GitHub source archive ...",
-                    true,
-                )?;
-                warm_up_after_update(jx_bin.as_deref(), &home)?;
+                    let archive_spec = archive_path.to_string_lossy().to_string();
+                    let _ = pip_install_update(
+                        &python,
+                        &home,
+                        &archive_spec,
+                        true,
+                        opts.verbose,
+                        "Updating from GitHub source archive ...",
+                        true,
+                    )?;
+                    warm_up_after_update(jx_bin.as_deref(), &home)?;
+                    Ok(())
+                })();
+
+                // Always clean downloaded source archive after update attempt.
+                let _ = std::fs::remove_file(&archive_path);
+                let _ = std::fs::remove_dir(&tmp_dir);
+
+                archive_update_result?;
                 return Ok(0);
             }
             let repo_url_cn = repo_url_from_spec(GITHUB_SPEC_CN);

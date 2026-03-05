@@ -1631,6 +1631,14 @@ fn local_rust_toolchain_ready(runtime_home: &Path) -> bool {
     cmd_cargo.status().map(|s| s.success()).unwrap_or(false)
 }
 
+fn system_rust_toolchain_ready() -> bool {
+    command_ok("rustc", &["--version"]) && command_ok("cargo", &["--version"])
+}
+
+fn any_rust_toolchain_ready(runtime_home: &Path) -> bool {
+    local_rust_toolchain_ready(runtime_home) || system_rust_toolchain_ready()
+}
+
 fn rustup_target_triple() -> Option<&'static str> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Some("x86_64-unknown-linux-gnu")
@@ -2509,11 +2517,18 @@ fn pip_install_update(
         }
     };
 
+    if spec_requires_rust_build(spec) && !any_rust_toolchain_ready(runtime_home) {
+        if verbose {
+            eprintln!("Rust toolchain not detected for source build; installing local Rust toolchain...");
+        }
+        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+    }
+
     match attempt_install(false, false, None) {
         Ok(d) => return Ok(d),
         Err(e) => {
             if spec_requires_rust_build(spec)
-                && !local_rust_toolchain_ready(runtime_home)
+                && !any_rust_toolchain_ready(runtime_home)
                 && should_retry_after_installing_rust(&e)
             {
                 if verbose {
@@ -2529,7 +2544,7 @@ fn pip_install_update(
                 match attempt_install(true, false, Some("Retrying source build from PyPI ...")) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {
-                        if !local_rust_toolchain_ready(runtime_home)
+                        if !any_rust_toolchain_ready(runtime_home)
                             && should_retry_after_installing_rust(&e2)
                         {
                             if verbose {

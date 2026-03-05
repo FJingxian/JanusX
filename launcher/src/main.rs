@@ -1880,22 +1880,30 @@ fn ensure_venv() -> Result<PathBuf, String> {
     }
 
     let sys_py = find_system_python().ok_or_else(|| python_install_hint())?;
-    let status = Command::new(&sys_py)
-        .arg("-m")
+    let mut cmd = Command::new(&sys_py);
+    cmd.arg("-m")
         .arg("venv")
         .arg(&venv)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (out, elapsed) = run_with_spinner(&mut cmd, "Creating runtime venv ...")
         .map_err(|e| format!("Failed to create venv with `{sys_py}`: {e}"))?;
-    if !status.success() {
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
         return Err(format!(
-            "Failed to create venv at {} (exit={}).",
+            "Failed to create venv at {} (exit={}).\n{}",
             venv.display(),
-            exit_code(status)
+            exit_code(out.status),
+            msg.trim()
         ));
     }
+    print_success_line(&format!(
+        "Creating runtime venv ...[{}]",
+        format_elapsed(elapsed)
+    ));
     if !py.exists() {
         return Err(format!(
             "venv was created but Python executable not found at {}",
@@ -1923,13 +1931,14 @@ fn ensure_pip_in_venv(python: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let out = Command::new(python)
-        .arg("-m")
+    let mut cmd = Command::new(python);
+    cmd.arg("-m")
         .arg("ensurepip")
         .arg("--upgrade")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    let (out, elapsed) = run_with_spinner(&mut cmd, "Bootstrapping pip in venv ...")
         .map_err(|e| format!("Failed to bootstrap pip with ensurepip: {e}"))?;
 
     if !out.status.success() || !has_pip(python) {
@@ -1948,6 +1957,10 @@ fn ensure_pip_in_venv(python: &Path) -> Result<(), String> {
             pip_bootstrap_hint()
         ));
     }
+    print_success_line(&format!(
+        "Bootstrapping pip in venv ...[{}]",
+        format_elapsed(elapsed)
+    ));
 
     Ok(())
 }
@@ -2231,10 +2244,7 @@ fn is_rust_core_change(path: &str) -> bool {
     if p.starts_with("src/") {
         return true;
     }
-    matches!(
-        p,
-        "Cargo.toml" | "Cargo.lock" | "build.rs"
-    )
+    matches!(p, "Cargo.toml" | "Cargo.lock" | "build.rs")
 }
 
 fn installed_package_dir(python: &Path) -> Option<PathBuf> {

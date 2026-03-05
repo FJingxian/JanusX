@@ -50,6 +50,7 @@ from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as mpl_font_manager
 from matplotlib import colors as mcolors
 from matplotlib.patches import ConnectionPatch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -72,6 +73,7 @@ _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
+_CJK_FONT_READY: Optional[bool] = None
 
 try:
     from rich.progress import (
@@ -114,6 +116,73 @@ except Exception:
     Text = None  # type: ignore[assignment]
     box = None  # type: ignore[assignment]
     _HAS_RICH_CONSOLE = False
+
+
+def _contains_cjk(text: object) -> bool:
+    s = str(text)
+    for ch in s:
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3000 <= code <= 0x303F
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            return True
+    return False
+
+
+def _ensure_cjk_font() -> bool:
+    global _CJK_FONT_READY
+    if _CJK_FONT_READY is not None:
+        return _CJK_FONT_READY
+
+    candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "PingFang SC",
+        "Heiti SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
+    selected = next((name for name in candidates if name in installed), None)
+    if selected is None:
+        _CJK_FONT_READY = False
+        return False
+
+    current = mpl.rcParams.get("font.sans-serif", [])
+    if not isinstance(current, list):
+        current = [str(current)]
+    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
+    mpl.rcParams["axes.unicode_minus"] = False
+    _CJK_FONT_READY = True
+    return True
+
+
+def _sanitize_plot_text(text: object) -> str:
+    s = str(text)
+    if not _contains_cjk(s):
+        return s
+    if _ensure_cjk_font():
+        return s
+    # No CJK-capable font: fallback to ASCII to avoid glyph warnings.
+    fallback = re.sub(r"[^\x00-\x7F]+", " ", s)
+    fallback = re.sub(r"\s+", " ", fallback).strip()
+    return fallback if fallback != "" else "NA"
+
+
+def _prepare_cjk_plotting() -> None:
+    # Try to enable a CJK font. If unavailable, silence glyph warnings and
+    # fallback labels to ASCII where possible.
+    if not _ensure_cjk_font():
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            message=r"Glyph .* missing from font\(s\).*",
+        )
 
 
 def _emit_info_to_file_handlers(logger: logging.Logger, message: str) -> None:
@@ -1018,7 +1087,7 @@ def _apply_multi_bimrange_manhattan_axis(
         return
     ax.set_xlim(left, right)
     centers = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in layout]
-    labels = [str(seg["label"]) for seg in layout]
+    labels = [_sanitize_plot_text(seg["label"]) for seg in layout]
     ax.set_xticks(centers)
     ax.set_xticklabels(labels)
     loc_fontsize = 5.0 if label_fontsize is None else float(label_fontsize)
@@ -1027,10 +1096,13 @@ def _apply_multi_bimrange_manhattan_axis(
         x_next = float(layout[i + 1]["x_start"])
         xb = 0.5 * (x_end + x_next)
         ax.axvline(x=xb, color="black", linestyle=":", linewidth=0.7, alpha=0.9)
-        prev_end_lab = f"{layout[i]['chrom']}:{int(layout[i]['end']) / 1_000_000:g}Mb"
+        prev_end_lab = _sanitize_plot_text(
+            f"{layout[i]['chrom']}:{int(layout[i]['end']) / 1_000_000:g}Mb"
+        )
         next_start_lab = (
             f"{layout[i + 1]['chrom']}:{int(layout[i + 1]['start']) / 1_000_000:g}Mb"
         )
+        next_start_lab = _sanitize_plot_text(next_start_lab)
         x_shift = 0.006 * (right - left)
         trans = ax.get_xaxis_transform()
         ax.text(
@@ -1098,6 +1170,8 @@ def _show_end_locs_without_xticks(
         left_lab = _fmt(float(x0), 0)
     if right_lab is None:
         right_lab = _fmt(float(x1), 1)
+    left_lab = _sanitize_plot_text(left_lab)
+    right_lab = _sanitize_plot_text(right_lab)
 
     ax.set_xlabel(None)
     ax.set_xticks([])
@@ -1795,9 +1869,13 @@ def _draw_gene_structure_axis(
     """
     Draw gene/CDS/UTR structure into `ax` using projected x coordinates.
     """
+    gene_df_plot = gene_df.copy()
+    if "attribute" in gene_df_plot.columns:
+        gene_df_plot["attribute"] = gene_df_plot["attribute"].map(_sanitize_plot_text)
+
     draw_gene_structure_records(
         ax,
-        gene_df,
+        gene_df_plot,
         arrow_color=arrow_color,
         block_color=block_color,
         line_width=line_width,
@@ -1974,6 +2052,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     mpl.rcParams["font.size"] = 6
     plt.rcParams["svg.fonttype"] = "none"
     plt.rcParams["axes.unicode_minus"] = False
+    _prepare_cjk_plotting()
 
     # Silence pandas chained-assignment warnings in this script
     warnings.filterwarnings(
@@ -2208,7 +2287,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         linewidths=0.0,
                     )
                     for idx in draw_hl_idx:
-                        text = df_hl.loc[idx, 3]
+                        text = _sanitize_plot_text(df_hl.loc[idx, 3])
                         ax.text(
                             plotmodel.df.loc[idx, "x"],
                             -np.log10(plotmodel.df.loc[idx, "y"]),
@@ -3042,6 +3121,7 @@ def _read_merge_gwas_table(
 
 
 def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
+    _prepare_cjk_plotting()
     files = [str(f) for f in args.merge_files]
     if len(files) < 2:
         logger.warning(
@@ -3165,7 +3245,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             plot_df.loc[mask, "_x"] = offset + rel
         plot_df = plot_df[np.isfinite(pd.to_numeric(plot_df["_x"], errors="coerce"))].copy()
         xticks = [0.5 * (float(seg["x_start"]) + float(seg["x_end"])) for seg in bim_layout]
-        xticklabels = [str(seg["label"]) for seg in bim_layout]
+        xticklabels = [_sanitize_plot_text(seg["label"]) for seg in bim_layout]
         for i in range(len(bim_layout) - 1):
             x_end = float(bim_layout[i]["x_end"])
             x_next = float(bim_layout[i + 1]["x_start"])
@@ -3191,7 +3271,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             length = max(1, int(max_pos_by_chr[chrom]))
             offsets[chrom] = cursor
             xticks.append(float(cursor) + float(length) / 2.0)
-            xticklabels.append(str(chrom))
+            xticklabels.append(_sanitize_plot_text(chrom))
             if i < len(chrom_order) - 1:
                 x_separators.append(float(cursor) + float(length) + float(gap) / 2.0)
             cursor += length + gap

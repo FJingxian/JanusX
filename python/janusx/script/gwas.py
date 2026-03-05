@@ -70,6 +70,7 @@ mpl.rcParams['svg.fonttype'] = 'none'
 mpl.rcParams['svg.hashsalt'] = 'hello'
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as mpl_font_manager
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -459,7 +460,11 @@ def fastplot(
                 transform=axes["A"].transAxes,
             )
 
-        axes["A"].set_xlabel(f"{label_base} (n={n_samples})")
+        x_label_text = f"{label_base} (n={n_samples})"
+        if _contains_cjk(x_label_text) and not _ensure_cjk_font():
+            # No CJK font found on this host; fallback to ASCII to avoid glyph warnings.
+            x_label_text = f"phenotype (n={n_samples})"
+        axes["A"].set_xlabel(x_label_text)
         axes["A"].set_ylabel("Count")
 
         # B: Manhattan plot
@@ -1336,7 +1341,56 @@ def build_grm_streaming(
     """
     _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
     pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
-    process = psutil.Process()
+process = psutil.Process()
+
+_CJK_FONT_READY: Optional[bool] = None
+
+
+def _contains_cjk(text: str) -> bool:
+    for ch in str(text):
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3000 <= code <= 0x303F
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            return True
+    return False
+
+
+def _ensure_cjk_font() -> bool:
+    """
+    Ensure matplotlib has at least one CJK-capable sans font configured.
+    Returns True when a candidate font is found, otherwise False.
+    """
+    global _CJK_FONT_READY
+    if _CJK_FONT_READY is not None:
+        return _CJK_FONT_READY
+
+    candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "PingFang SC",
+        "Heiti SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
+    selected = next((name for name in candidates if name in installed), None)
+    if selected is None:
+        _CJK_FONT_READY = False
+        return False
+
+    current = mpl.rcParams.get("font.sans-serif", [])
+    if not isinstance(current, list):
+        current = [str(current)]
+    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
+    mpl.rcParams["axes.unicode_minus"] = False
+    _CJK_FONT_READY = True
+    return True
 
     prefetch_depth = 2
     tuned_chunk_size = auto_stream_grm_chunk_size(

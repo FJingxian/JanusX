@@ -3519,19 +3519,27 @@ fn pip_install_tail(
                     )?;
                 }
             } else {
-                let width = terminal_line_width();
-                let title = truncate_plain_line(
-                    &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
-                    width,
-                );
-                if status.success() {
-                    println!("{}", style_green(&title));
+                if !status.success() && streaming_title_started {
+                    render_streaming_failure_compact(
+                        desc,
+                        start.elapsed(),
+                        streamed_lines_before_tail,
+                    )?;
                 } else {
-                    println!("{}", style_yellow(&title));
+                    let width = terminal_line_width();
+                    let title = truncate_plain_line(
+                        &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
+                        width,
+                    );
+                    if status.success() {
+                        println!("{}", style_green(&title));
+                    } else {
+                        println!("{}", style_yellow(&title));
+                    }
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
                 }
-                io::stdout()
-                    .flush()
-                    .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
             }
         } else if tail_mode_started {
             clear_tail_title_only(max_lines)?;
@@ -3618,6 +3626,26 @@ fn render_tail_title_only(desc: &str, elapsed: Duration, max_lines: usize) -> Re
     print!("\x1b[{}A", max_lines.saturating_add(1));
     print!("\x1b[2K\r{}\n", style_green(&title));
     print!("\x1b[{}B", max_lines);
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_failure_compact(
+    desc: &str,
+    elapsed: Duration,
+    lines_below: usize,
+) -> Result<(), String> {
+    let width = terminal_line_width();
+    let title = truncate_plain_line(&format!("✘ {desc}[{}]", format_elapsed(elapsed)), width);
+    // Move to title row, rewrite as failure, then delete streamed log rows entirely.
+    let up = lines_below.saturating_add(1);
+    print!("\x1b[{}A", up);
+    print!("\x1b[2K\r{}\n", style_yellow(&title));
+    if lines_below > 0 {
+        print!("\x1b[{}M", lines_below);
+    }
     io::stdout()
         .flush()
         .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;

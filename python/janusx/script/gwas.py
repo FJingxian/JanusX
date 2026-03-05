@@ -80,6 +80,7 @@ from janusx.gfreader import (
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
+from ._common.helptext import minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -2703,7 +2704,10 @@ def run_farmcpu_fullmem(
 def parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=minimal_help_epilog([
+            "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
+            "jx gwas -bfile example_prefix -p pheno.tsv -lm -plot",
+        ]),
     )
 
     required_group = parser.add_argument_group("Required arguments")
@@ -3044,7 +3048,7 @@ def main(log: bool = True):
                 gfile=gfile,
                 prefix=prefix,
                 logger=logger,
-                pheno_preloaded=pheno,  # 若 streaming 已加载 pheno，则复用，避免重复 log
+                pheno_preloaded=pheno,  # Reuse phenotype loaded in streaming stage.
                 ids_preloaded=ids,
                 n_snps_preloaded=n_snps,
                 qmatrix_preloaded=qmatrix,

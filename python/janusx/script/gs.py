@@ -31,8 +31,8 @@ Cross-validation
 Genomic selection workflow
 --------------------------
   1. Load genotypes and phenotypes.
-  2. Filter SNPs by MAF/missing rate thresholds (default 0.02/0.05) and impute
-     by mode (via QK).
+  2. Filter SNPs by MAF/missing rate thresholds (default 0.02/0.05) and
+     mean-impute missing genotypes during Rust `gfreader` loading.
   3. For each phenotype column:
        - Split individuals into training (non-missing phenotype) and test sets.
        - Run 5-fold CV on the training set for each selected model.
@@ -81,11 +81,12 @@ from scipy.stats import pearsonr, spearmanr
 from joblib import cpu_count as joblib_cpu_count
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
-from janusx.gfreader import breader, vcfreader
+from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.pyBLUP import BLUP, kfold
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
+from ._common.helptext import minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -510,6 +511,47 @@ def _run_methods_parallel(
     return [results_by_method[m] for m in methods if m in results_by_method]
 
 
+def _load_genotype_with_rust_gfreader(
+    genotype_path: str,
+    *,
+    maf: float,
+    missing_rate: float,
+    chunk_size: int = 50_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load full genotype matrix with Rust gfreader chunk decoder.
+
+    Returns
+    -------
+    sample_ids : np.ndarray[str], shape (n_samples,)
+    geno : np.ndarray[float32], shape (n_snps_filtered, n_samples)
+    """
+    sample_ids, _ = inspect_genotype_file(genotype_path)
+    chunks = load_genotype_chunks(
+        genotype_path,
+        chunk_size=int(chunk_size),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        impute=True,
+    )
+
+    blocks: list[np.ndarray] = []
+    for geno_chunk, _ in chunks:
+        arr = np.asarray(geno_chunk, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            continue
+        blocks.append(arr)
+
+    if len(blocks) == 0:
+        raise ValueError(
+            "No SNPs left after Rust-side filtering. "
+            "Please relax --maf/--geno thresholds."
+        )
+
+    geno = np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
+    return np.asarray(sample_ids, dtype=str), geno
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -519,7 +561,10 @@ def main(log: bool = True) -> None:
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=minimal_help_epilog([
+            "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
+            "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",
+        ]),
     )
 
     # ------------------------------------------------------------------
@@ -800,41 +845,24 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     # Load genotype
     # ------------------------------------------------------------------
-    if args.vcf:
-        geno_df = vcfreader(
-            gfile,
-            maf=args.maf,
-            miss=args.geno,
-            impute=True,
-            dtype='float32',
-            progress_desc="Loading genotype",
-            show_progress=True,
-        )
-    elif args.bfile:
-        geno_df = breader(
-            gfile,
-            maf=args.maf,
-            miss=args.geno,
-            impute=True,
-            dtype='float32',
-            progress_desc="Loading genotype",
-            show_progress=True,
-        )
-    else:
-        raise ValueError("Genotype input not recognized.")
+    sample_ids, geno = _load_genotype_with_rust_gfreader(
+        gfile,
+        maf=args.maf,
+        missing_rate=args.geno,
+    )
     logger.info(
         f"* Filter SNPs with MAF < {args.maf} or missing rate > {args.geno}; "
         "impute with mean."
     )
     logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
     logger.info(f"Completed, cost: {round(time.time() - t_loading, 3)} secs")
-    m, n = geno_df.shape
-    n = n - 2  # First 2 columns usually CHR and POS
+    m, n = geno.shape
     logger.info(f"Loaded SNP: {m}, individuals: {n}")
 
-    samples = geno_df.columns[2:].astype(str)
-    geno = geno_df.iloc[:, 2:].values
-    geno = (geno - geno.mean(axis=1,keepdims=True)) / (geno.std(axis=1,keepdims=True)+1e-6) # standardization of genotype
+    samples = sample_ids
+    geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+        geno.std(axis=1, keepdims=True) + 1e-6
+    )  # standardization of genotype
 
     # ------------------------------------------------------------------
     # Genomic Selection for each phenotype

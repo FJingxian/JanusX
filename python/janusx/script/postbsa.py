@@ -33,6 +33,7 @@ from typing import Optional
 
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
+from ._common.helptext import minimal_help_epilog
 from ._common.pathcheck import ensure_all_true, ensure_file_exists
 from ._common.status import CliStatus
 
@@ -878,7 +879,9 @@ def plot_bsa(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=minimal_help_epilog([
+            "jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2",
+        ]),
     )
 
     required_group = parser.add_argument_group("Required Arguments")

@@ -25,6 +25,7 @@ Citation
 import logging
 import os
 from ._common.log import setup_logging
+from ._common.helptext import minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -3750,7 +3751,10 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=minimal_help_epilog([
+            "jx postgwas -gwasfile result.lmm.tsv -manh -qq",
+            "jx postgwas -gwasfile result.lmm.tsv -a genes.bed -ab 50",
+        ]),
     )
 
     # ------------------------------------------------------------------

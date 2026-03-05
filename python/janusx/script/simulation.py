@@ -26,6 +26,7 @@ from janusx.gfreader import load_genotype_chunks
 from janusx.gfreader import inspect_genotype_file
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
+from ._common.helptext import minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -232,7 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jx sim",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=minimal_help_epilog([
+            "jx sim -bfile geno_prefix -o out -prefix demo",
+            "jx simulation -vcf geno.vcf.gz -mode single -o out",
+        ]),
         description="JanusX simulation: phenotype from existing genotype",
     )
 

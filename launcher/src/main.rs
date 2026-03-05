@@ -80,6 +80,7 @@ struct UpdateOptions {
 }
 
 fn main() {
+    let installer_mode = is_installer_binary();
     let code = match run() {
         Ok(c) => c,
         Err(e) => {
@@ -87,7 +88,21 @@ fn main() {
             1
         }
     };
+    if installer_mode {
+        pause_before_exit();
+    }
     process::exit(code);
+}
+
+fn pause_before_exit() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return;
+    }
+    println!();
+    print!("Press Enter to exit...");
+    let _ = io::stdout().flush();
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
 }
 
 fn run() -> Result<i32, String> {
@@ -330,7 +345,7 @@ fn relaunch_installer_in_terminal() -> Result<bool, String> {
         let exe =
             env::current_exe().map_err(|e| format!("Failed to locate installer binary: {e}"))?;
         let cmdline = format!(
-            "export {flag}=1; {exe}; echo; echo 'Press Enter to close...'; read -r _",
+            "export {flag}=1; {exe}",
             flag = INSTALLER_RELAUNCH_ENV,
             exe = sh_quote(&exe.to_string_lossy())
         );
@@ -353,7 +368,7 @@ fn relaunch_installer_in_terminal() -> Result<bool, String> {
         let exe =
             env::current_exe().map_err(|e| format!("Failed to locate installer binary: {e}"))?;
         let cmdline = format!(
-            "export {flag}=1; {exe}; echo; echo 'Press Enter to close...'; read -r _",
+            "export {flag}=1; {exe}",
             flag = INSTALLER_RELAUNCH_ENV,
             exe = sh_quote(&exe.to_string_lossy())
         );

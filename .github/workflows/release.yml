@@ -120,6 +120,33 @@ jobs:
           Copy-Item "launcher/target/${{ matrix.target }}/release/jx.exe" $out
           "PACKAGED_FILE=$out" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Optional sign installer (Windows Authenticode)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WIN_SIGN_CERT_PFX_BASE64: ${{ secrets.WIN_SIGN_CERT_PFX_BASE64 }}
+          WIN_SIGN_CERT_PASSWORD: ${{ secrets.WIN_SIGN_CERT_PASSWORD }}
+          WIN_SIGN_TIMESTAMP_URL: ${{ secrets.WIN_SIGN_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WIN_SIGN_CERT_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:WIN_SIGN_CERT_PASSWORD)) {
+            Write-Host "Skipping Windows signing: missing WIN_SIGN_CERT_PFX_BASE64 / WIN_SIGN_CERT_PASSWORD."
+            exit 0
+          }
+
+          $certPath = Join-Path $env:RUNNER_TEMP "janusx-signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WIN_SIGN_CERT_PFX_BASE64))
+
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\**\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw "signtool.exe not found on runner." }
+
+          $timestamp = if ([string]::IsNullOrWhiteSpace($env:WIN_SIGN_TIMESTAMP_URL)) { "http://timestamp.digicert.com" } else { $env:WIN_SIGN_TIMESTAMP_URL }
+          & $signtool sign /fd SHA256 /f $certPath /p $env:WIN_SIGN_CERT_PASSWORD /tr $timestamp /td SHA256 $env:PACKAGED_FILE
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE." }
+
+          & $signtool verify /pa /v $env:PACKAGED_FILE
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE." }
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
@@ -181,21 +208,6 @@ jobs:
           codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$PACKAGED_BINARY"
           codesign --verify --verbose=2 "$PACKAGED_BINARY"
 
-      - name: Optional notarize (Apple notarytool)
-        shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
-            echo "Skipping notarize: missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID."
-            exit 0
-          fi
-          ZIP_PATH="${PACKAGED_BINARY}.zip"
-          ditto -c -k --keepParent "$PACKAGED_BINARY" "$ZIP_PATH"
-          xcrun notarytool submit "$ZIP_PATH" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
-
       - name: Cleanup signing keychain
         if: ${{ always() }}
         shell: bash
@@ -232,6 +244,21 @@ jobs:
             echo "$WRAP"
             echo "EOF"
           } >> "$GITHUB_ENV"
+
+      - name: Optional notarize final macOS installer
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "Skipping notarize: missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID."
+            exit 0
+          fi
+          ZIP_PATH="${PACKAGED_FILE}.zip"
+          ditto -c -k --keepParent "$PACKAGED_FILE" "$ZIP_PATH"
+          xcrun notarytool submit "$ZIP_PATH" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
 
       - name: Upload universal installer artifact
         uses: actions/upload-artifact@v4

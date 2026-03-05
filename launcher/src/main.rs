@@ -828,7 +828,27 @@ fn is_dir_in_path(dir: &Path) -> bool {
 }
 
 fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        return de_verbatim_windows_path(p);
+    }
+    #[cfg(not(windows))]
+    {
+        p
+    }
+}
+
+#[cfg(windows)]
+fn de_verbatim_windows_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 #[cfg(windows)]
@@ -2140,6 +2160,7 @@ fn ensure_venv() -> Result<PathBuf, String> {
     let mut cmd = Command::new(&sys_py);
     cmd.arg("-m")
         .arg("venv")
+        .arg("--without-pip")
         .arg(&venv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

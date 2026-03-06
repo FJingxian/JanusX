@@ -512,12 +512,13 @@ def fastplot(
 
         # Align QQ with Manhattan:
         # - QQ ylim follows Manhattan ylim
-        # - QQ xlim lower bound follows Manhattan ylim lower bound
-        # - QQ xlim upper bound keeps current auto-scaled maximum
+        # - QQ xlim keeps QQ auto/adaptive range
         manh_ymin, manh_ymax = axes["B"].get_ylim()
         qq_xmin, qq_xmax = axes["C"].get_xlim()
         axes["C"].set_ylim(manh_ymin, manh_ymax)
-        axes["C"].set_xlim(left=manh_ymin, right=max(qq_xmax, manh_ymin + 1e-9))
+        if np.isfinite(qq_xmin) and np.isfinite(qq_xmax) and qq_xmax > qq_xmin:
+            x_pad = max(1e-9, 0.02 * float(qq_xmax - qq_xmin))
+            axes["C"].set_xlim(qq_xmin - x_pad, qq_xmax + x_pad)
 
         fig.tight_layout()
         fig.savefig(outpdf, transparent=False, facecolor="white")
@@ -732,6 +733,41 @@ def _split_cov_sources(cov_inputs: list[str]) -> tuple[list[str], list[tuple[str
         else:
             cov_sites.append(parsed)
     return cov_files, cov_sites
+
+
+def _format_grm_display(grm_opt: object) -> str:
+    s = str(grm_opt if grm_opt is not None else "").strip()
+    if s in {"1", "2"}:
+        return s
+    if s == "":
+        return ""
+    return _basename_only(s)
+
+
+def _format_qcov_display(qcov_opt: object) -> str:
+    s = str(qcov_opt if qcov_opt is not None else "").strip()
+    if s == "":
+        return ""
+    if s in set(np.arange(0, 30).astype(str)):
+        return s
+    return _basename_only(s)
+
+
+def _format_cov_display(cov_inputs: Union[list[str], None]) -> str:
+    if cov_inputs is None:
+        return ""
+    parts: list[str] = []
+    for item in cov_inputs:
+        token = str(item).strip()
+        if token == "":
+            continue
+        parsed = _parse_cov_site_token(token)
+        if parsed is not None:
+            chrom, pos = parsed
+            parts.append(f"{chrom}:{int(pos)}")
+        else:
+            parts.append(_basename_only(token))
+    return ";".join(parts)
 
 
 def _canon_site_key(chrom: str, pos: int) -> tuple[str, int]:
@@ -973,10 +1009,82 @@ def load_phenotype(
       - If needed, set id_col=1 to use the second column as IDs (PLINK FID/IID).
     - Duplicated IDs are averaged.
     """
-    try:
-        df = pd.read_csv(phenofile, sep=None, engine="python", header=None)
-    except Exception:
-        df = pd.read_csv(phenofile, sep=r"\s+", header=None)
+    def _sniff_sep(path: str) -> str:
+        """
+        Fast delimiter sniffing for phenotype tables.
+        Returns one of: 'tab', 'comma', 'whitespace'.
+        """
+        sample = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for _ in range(16):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    s = line.strip()
+                    if s != "":
+                        sample = s
+                        break
+        except Exception:
+            sample = ""
+
+        if "\t" in sample:
+            return "tab"
+        if "," in sample:
+            return "comma"
+        return "whitespace"
+
+    def _candidate_orders(kind: str) -> list[str]:
+        if kind == "tab":
+            return ["tab", "comma", "whitespace"]
+        if kind == "comma":
+            return ["comma", "tab", "whitespace"]
+        return ["whitespace", "tab", "comma"]
+
+    # If phenotype columns are explicitly requested, read only ID + target cols.
+    # ncol indices are relative to phenotype columns (after removing ID/FID).
+    usecols: Union[list[int], None] = None
+    if ncol is not None and len(ncol) > 0 and int(id_col) in (0, 1):
+        offset = 1 if int(id_col) == 0 else 2
+        try:
+            wanted = [int(id_col)] + [int(i) + offset for i in ncol]
+            usecols = sorted(set(wanted))
+        except Exception:
+            usecols = None
+
+    sniffed = _sniff_sep(phenofile)
+    read_err: Optional[Exception] = None
+    df = None
+    for mode in _candidate_orders(sniffed):
+        try:
+            kwargs: dict[str, object] = {"header": None}
+            if usecols is not None:
+                kwargs["usecols"] = usecols
+            if mode == "tab":
+                kwargs["sep"] = "\t"
+                kwargs["engine"] = "c"
+            elif mode == "comma":
+                kwargs["sep"] = ","
+                kwargs["engine"] = "c"
+            else:
+                kwargs["delim_whitespace"] = True
+                kwargs["engine"] = "c"
+            df_try = pd.read_csv(phenofile, **kwargs)
+            if df_try.shape[1] <= int(id_col):
+                continue
+            data_cols = int(df_try.shape[1]) - 1 - (1 if int(id_col) == 1 else 0)
+            if data_cols <= 0:
+                continue
+            df = df_try
+            break
+        except Exception as ex:
+            read_err = ex
+            continue
+
+    if df is None:
+        if read_err is not None:
+            raise read_err
+        raise ValueError("Failed to read phenotype file.")
 
     if df.empty:
         raise ValueError("Phenotype file is empty.")
@@ -1006,6 +1114,7 @@ def load_phenotype(
     pheno = data
     pheno.index = ids
     pheno = pheno.groupby(pheno.index).mean()
+    selected_ncol: list[int] = list(range(pheno.shape[1]))
 
     if pheno.shape[1] <= 0:
         msg = (
@@ -1021,12 +1130,18 @@ def load_phenotype(
             logger.error(msg)
             raise ValueError(msg)
         ncol = [i for i in ncol if i in range(pheno.shape[1])]
+        selected_ncol = [int(i) for i in ncol]
         _log_info(
             logger,
             "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol])),
             use_spinner=use_spinner,
         )
         pheno = pheno.iloc[:, ncol]
+    else:
+        selected_ncol = list(range(pheno.shape[1]))
+
+    # Preserve phenotype file column mapping for downstream history recording.
+    pheno.attrs["selected_ncol"] = [int(i) for i in selected_ncol]
 
     return pheno
 
@@ -1099,6 +1214,8 @@ def _load_phenotype_with_status(
     Load phenotype with rich/plain CLI status.
     """
     src = _basename_only(phenofile)
+    if not bool(use_spinner):
+        logger.info(f"Loading phenotype from {src}... [{format_elapsed(0.0)}]")
     with CliStatus(f"Loading phenotype from {src}...", enabled=bool(use_spinner)) as task:
         try:
             pheno = load_phenotype(
@@ -1400,17 +1517,19 @@ def build_grm_streaming(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f}GB")
 
-    grm, grm_stats = build_streaming_grm_from_chunks(
-        prefetch_iter(chunk_iter, in_flight=prefetch_depth),
-        n_samples=n_samples,
-        method=method,
-        accumulate="gemm",
-        on_chunk=_on_grm_chunk,
-    )
-
-    # force bar to 100% even if SNPs were filtered in Rust
-    pbar.finish()
-    pbar.close()
+    try:
+        grm, grm_stats = build_streaming_grm_from_chunks(
+            prefetch_iter(chunk_iter, in_flight=prefetch_depth),
+            n_samples=n_samples,
+            method=method,
+            accumulate="gemm",
+            on_chunk=_on_grm_chunk,
+        )
+        # force bar to 100% even if SNPs were filtered in Rust
+        pbar.finish()
+    finally:
+        # Always stop progress renderer on Ctrl+C / exceptions.
+        pbar.close(show_done=False)
 
     _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
     return grm, int(grm_stats.eff_m)
@@ -1476,12 +1595,20 @@ def load_or_build_grm_with_cache(
     mmap_limit: bool,
     logger:logging.Logger,
     use_spinner: bool = False,
+    ids_preloaded: Union[np.ndarray, None] = None,
+    n_snps_preloaded: Union[int, None] = None,
 ) -> tuple[np.ndarray, int, Union[np.ndarray, None]]:
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
     """
-    ids, n_snps = inspect_genotype_file(genofile)
-    n_samples = len(ids)
+    if ids_preloaded is not None and n_snps_preloaded is not None:
+        ids = np.asarray(ids_preloaded, dtype=str)
+        n_snps = int(n_snps_preloaded)
+    else:
+        ids0, n_snps0 = inspect_genotype_file(genofile)
+        ids = np.asarray(ids0, dtype=str)
+        n_snps = int(n_snps0)
+    n_samples = int(len(ids))
     method_is_builtin = mgrm in ["1", "2"]
 
     grm_ids = None
@@ -1792,6 +1919,8 @@ def prepare_streaming_context(
             mmap_limit=mmap_limit,
             logger=logger,
             use_spinner=use_spinner,
+            ids_preloaded=ids,
+            n_snps_preloaded=n_snps,
         )
     else:
         _rich_success(
@@ -2150,6 +2279,7 @@ def run_chunked_gwas_lmm_lm(
         ready_rows: dict[int, tuple[pd.DataFrame, int]] = {}
         chunk_seq = 0
         next_write_seq = 0
+        interrupted = False
 
         def _build_chunk_df(
             results: np.ndarray,
@@ -2231,7 +2361,8 @@ def run_chunked_gwas_lmm_lm(
                 ready_rows[seq] = (_build_chunk_df(results, info_chunk, maf_chunk), m_chunk)
             _write_ready_chunks()
 
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        ex = cf.ThreadPoolExecutor(max_workers=workers)
+        try:
             for genosub, sites in load_genotype_chunks(
                 genofile,
                 chunk_size,
@@ -2293,9 +2424,24 @@ def run_chunked_gwas_lmm_lm(
             while len(inflight) > 0:
                 _drain_completed(wait_for_one=True)
             _write_ready_chunks()
-
-        pbar.finish()
-        pbar.close(show_done=False)
+            pbar.finish()
+        except KeyboardInterrupt:
+            interrupted = True
+            for fut, _m, _info, _maf in inflight.values():
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            raise
+        finally:
+            # Always stop renderer first, then tear down workers.
+            pbar.close(show_done=False)
+            ex.shutdown(wait=False, cancel_futures=True)
+            if interrupted and os.path.exists(tmp_tsv):
+                try:
+                    os.remove(tmp_tsv)
+                except Exception:
+                    pass
 
         cpu_t1 = process.cpu_times()
         t1 = time.time()
@@ -2330,6 +2476,7 @@ def run_chunked_gwas_lmm_lm(
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
                     "viz_time_s": 0.0,
+                    "result_file": "",
                 }
             )
             if os.path.exists(tmp_tsv):
@@ -2372,6 +2519,7 @@ def run_chunked_gwas_lmm_lm(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(evd_secs + scan_secs),
                 "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv).replace("//", "/"),
             }
         )
 
@@ -2696,101 +2844,128 @@ def run_chunked_gwas_streaming_shared(
         scan_threads = int(n_cores)
     threads_per_model = max(1, scan_threads)
 
-    for genosub, sites in load_genotype_chunks(
-        genofile,
-        chunk_size,
-        maf_threshold,
-        max_missing_rate,
-        model=genetic_model,
-        het=het_threshold,
-        sample_ids=sample_sub,
-        mmap_window_mb=mmap_window_mb,
-    ):
-        genosub: np.ndarray
-        if genosub.shape[1] != expected_n:
-            if genosub.shape[1] == int(sameidx.shape[0]):
-                genosub = genosub[:, sameidx]
-            else:
-                raise ValueError(
-                    f"Genotype sample dimension mismatch for trait {pname}: "
-                    f"chunk has {genosub.shape[1]} columns, "
-                    f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
-                )
-        if genetic_model != "add":
-            keep_mask = _heter_keep_mask(genosub, het_threshold)
-            if not np.any(keep_mask):
+    interrupted = False
+    try:
+        for genosub, sites in load_genotype_chunks(
+            genofile,
+            chunk_size,
+            maf_threshold,
+            max_missing_rate,
+            model=genetic_model,
+            het=het_threshold,
+            sample_ids=sample_sub,
+            mmap_window_mb=mmap_window_mb,
+        ):
+            genosub: np.ndarray
+            if genosub.shape[1] != expected_n:
+                if genosub.shape[1] == int(sameidx.shape[0]):
+                    genosub = genosub[:, sameidx]
+                else:
+                    raise ValueError(
+                        f"Genotype sample dimension mismatch for trait {pname}: "
+                        f"chunk has {genosub.shape[1]} columns, "
+                        f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
+                    )
+            if genetic_model != "add":
+                keep_mask = _heter_keep_mask(genosub, het_threshold)
+                if not np.any(keep_mask):
+                    continue
+                genosub = genosub[keep_mask]
+                sites = [s for s, k in zip(sites, keep_mask) if k]
+            m_chunk = int(genosub.shape[0])
+            if m_chunk == 0:
                 continue
-            genosub = genosub[keep_mask]
-            sites = [s for s, k in zip(sites, keep_mask) if k]
-        m_chunk = int(genosub.shape[0])
-        if m_chunk == 0:
-            continue
 
-        info_chunk = [
-            (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
-            for s in sites
-        ]
-        if len(info_chunk) == 0:
-            continue
+            info_chunk = [
+                (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
+                for s in sites
+            ]
+            if len(info_chunk) == 0:
+                continue
 
-        geno_model = _apply_genetic_model(genosub, genetic_model)
-        if genetic_model == "add":
-            maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
-        else:
-            maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-        geno_center = geno_model - np.mean(
-            geno_model, axis=1, dtype=np.float32, keepdims=True
-        )
+            geno_model = _apply_genetic_model(genosub, genetic_model)
+            if genetic_model == "add":
+                maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
+            else:
+                maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
+            geno_center = geno_model - np.mean(
+                geno_model, axis=1, dtype=np.float32, keepdims=True
+            )
 
+            for ctx in model_ctxs:
+                cpu_before = process.cpu_times()
+                t0 = time.monotonic()
+                results = ctx["mod"].gwas(geno_center, threads=threads_per_model)
+                elapsed = max(time.monotonic() - t0, 0.0)
+                cpu_after = process.cpu_times()
+                ctx["scan_secs"] = float(ctx["scan_secs"]) + float(elapsed)
+                ctx["cpu_used"] = float(ctx["cpu_used"]) + float(
+                    (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
+                )
+
+                chunk_df = _build_chunk_df(results, info_chunk, maf_chunk)
+                tmp_tsv = str(ctx["tmp_tsv"])
+                wrote_header = bool(ctx["wrote_header"])
+                chunk_df.to_csv(
+                    tmp_tsv,
+                    sep="\t",
+                    float_format="%.4f",
+                    index=False,
+                    header=not wrote_header,
+                    mode="w" if not wrote_header else "a",
+                )
+                ctx["wrote_header"] = True
+                ctx["has_results"] = True
+
+                mem_info = process.memory_info()
+                ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
+                done_next = int(ctx["done_snps"]) + m_chunk
+                mem_text = None
+                if done_next % (10 * chunk_size) == 0:
+                    mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
+                _advance_ctx(ctx, m_chunk, mem_text)
+
+        first_done = 0
         for ctx in model_ctxs:
-            cpu_before = process.cpu_times()
-            t0 = time.monotonic()
-            results = ctx["mod"].gwas(geno_center, threads=threads_per_model)
-            elapsed = max(time.monotonic() - t0, 0.0)
-            cpu_after = process.cpu_times()
-            ctx["scan_secs"] = float(ctx["scan_secs"]) + float(elapsed)
-            ctx["cpu_used"] = float(ctx["cpu_used"]) + float(
-                (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
-            )
-
-            chunk_df = _build_chunk_df(results, info_chunk, maf_chunk)
-            tmp_tsv = str(ctx["tmp_tsv"])
-            wrote_header = bool(ctx["wrote_header"])
-            chunk_df.to_csv(
-                tmp_tsv,
-                sep="\t",
-                float_format="%.4f",
-                index=False,
-                header=not wrote_header,
-                mode="w" if not wrote_header else "a",
-            )
-            ctx["wrote_header"] = True
-            ctx["has_results"] = True
-
-            mem_info = process.memory_info()
-            ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
-            done_next = int(ctx["done_snps"]) + m_chunk
-            mem_text = None
-            if done_next % (10 * chunk_size) == 0:
-                mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
-            _advance_ctx(ctx, m_chunk, mem_text)
+            first_done = first_done or int(ctx.get("done_snps", 0))
+            if use_rich_multi and rich_progress is not None:
+                rich_progress.update(
+                    int(ctx["task_id"]),
+                    completed=pbar_total,
+                    metric=_metric_text(ctx),
+                )
+            else:
+                pbar_obj = ctx.get("pbar")
+                if pbar_obj is not None:
+                    pbar_obj.finish()
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
+    finally:
+        # Always stop any active progress renderer on Ctrl+C / errors.
+        if rich_progress is not None:
+            try:
+                rich_progress.stop()
+            except Exception:
+                pass
+        for ctx in model_ctxs:
+            pbar_obj = ctx.get("pbar")
+            if pbar_obj is not None:
+                try:
+                    pbar_obj.close(show_done=False)
+                except Exception:
+                    pass
+            if interrupted:
+                tmp_tsv = str(ctx.get("tmp_tsv", ""))
+                if tmp_tsv and os.path.exists(tmp_tsv):
+                    try:
+                        os.remove(tmp_tsv)
+                    except Exception:
+                        pass
 
     first_done = 0
     for ctx in model_ctxs:
         first_done = first_done or int(ctx.get("done_snps", 0))
-        if use_rich_multi and rich_progress is not None:
-            rich_progress.update(
-                int(ctx["task_id"]),
-                completed=pbar_total,
-                metric=_metric_text(ctx),
-            )
-        else:
-            pbar_obj = ctx.get("pbar")
-            if pbar_obj is not None:
-                pbar_obj.finish()
-                pbar_obj.close(show_done=False)
-    if rich_progress is not None:
-        rich_progress.stop()
 
     if pname not in eff_snp_by_trait:
         eff_snp_by_trait[pname] = int(first_done)
@@ -2837,6 +3012,7 @@ def run_chunked_gwas_streaming_shared(
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
                     "viz_time_s": 0.0,
+                    "result_file": "",
                 }
             )
             if os.path.exists(tmp_tsv):
@@ -2875,6 +3051,7 @@ def run_chunked_gwas_streaming_shared(
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
                     "viz_time_s": float(viz_secs),
+                    "result_file": str(out_tsv).replace("//", "/"),
                 }
             )
 
@@ -3144,25 +3321,28 @@ def run_farmcpu_fullmem(
         geno_chunks = []
         site_rows = []
         pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
-        for chunk, sites in load_genotype_chunks(
-            gfile,
-            chunk_size=args.chunksize,
-            maf=args.maf,
-            missing_rate=args.geno,
-            impute=True,
-            sample_ids=famid.tolist(),
-        ):
-            if chunk.shape[0] == 0:
-                continue
-            geno_chunks.append(np.asarray(chunk, dtype="float32"))
-            site_rows.extend(
-                [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
-            )
-            pbar.update(chunk.shape[0])
-        loaded_snps = int(sum(c.shape[0] for c in geno_chunks))
-        pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
-        pbar.finish()
-        pbar.close(success_style=False)
+        try:
+            for chunk, sites in load_genotype_chunks(
+                gfile,
+                chunk_size=args.chunksize,
+                maf=args.maf,
+                missing_rate=args.geno,
+                impute=True,
+                sample_ids=famid.tolist(),
+            ):
+                if chunk.shape[0] == 0:
+                    continue
+                geno_chunks.append(np.asarray(chunk, dtype="float32"))
+                site_rows.extend(
+                    [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
+                )
+                pbar.update(chunk.shape[0])
+            loaded_snps = int(sum(c.shape[0] for c in geno_chunks))
+            pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
+            pbar.finish()
+        finally:
+            # Ensure spinner/progress stops on Ctrl+C.
+            pbar.close(success_style=False, show_done=False)
 
         if len(geno_chunks) == 0:
             msg = "After filtering, number of SNPs is zero for FarmCPU."
@@ -3305,18 +3485,16 @@ def run_farmcpu_fullmem(
                 progress_cb=_farmcpu_progress,
                 return_info=True,
             )
-        except Exception:
-            farm_pbar.close()
-            raise
-        else:
             farm_pbar.finish()
+        finally:
+            # Ensure spinner/progress stops on Ctrl+C.
+            farm_pbar.close(show_done=False)
         if isinstance(farm_out, tuple):
             res, _farm_info = farm_out
             n_pseudo_qtn = int(_farm_info.get("n_pseudo_qtn", 0))
         else:
             res = farm_out
             n_pseudo_qtn = 0
-        farm_pbar.close(show_done=False)
         gwas_secs = max(time.time() - gwas_t0, 0.0)
         res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"])
         res_df['maf'] = maf
@@ -3340,6 +3518,7 @@ def run_farmcpu_fullmem(
         cpu_used = (cpu_t1.user + cpu_t1.system) - (cpu_t0.user + cpu_t0.system)
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
+        out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
         _log_file_only(
             logger,
             logging.INFO,
@@ -3357,12 +3536,12 @@ def run_farmcpu_fullmem(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv).replace("//", "/"),
             }
         )
 
         res_df = res_df.astype({"pwald": "object","pos":int})
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
-        out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         saved_paths.append(str(out_tsv).replace("//", "/"))
         _log_file_only(
@@ -3668,6 +3847,16 @@ def main(log: bool = True):
         has_farmcpu = bool(args.farmcpu)
 
         trait_order = list(pheno.columns) if pheno is not None else []
+        trait_col_map: dict[str, int] = {}
+        selected_ncol = []
+        if pheno is not None:
+            selected_ncol = pheno.attrs.get("selected_ncol", [])
+        if isinstance(selected_ncol, list) and len(selected_ncol) == len(trait_order):
+            for trait_name, col_idx in zip(trait_order, selected_ncol):
+                trait_col_map[str(trait_name)] = int(col_idx)
+        else:
+            for idx0, trait_name in enumerate(trait_order):
+                trait_col_map[str(trait_name)] = int(idx0)
         if len(stream_models) > 0:
             _section(logger, "Streaming task")
 
@@ -3763,6 +3952,9 @@ def main(log: bool = True):
             )
 
         if len(gwas_summary_rows) > 0:
+            for row in gwas_summary_rows:
+                pnm = str(row.get("phenotype", ""))
+                row["pheno_col_idx"] = int(trait_col_map.get(pnm, -1))
             _emit_gwas_summary(logger, gwas_summary_rows)
         if len(saved_result_paths) > 0:
             logger.info("")
@@ -3771,48 +3963,57 @@ def main(log: bool = True):
                 logger.info(f"  {p}")
         logger.info(f"Log saved in {str(log_path).replace('//', '/')}")
 
+    except KeyboardInterrupt:
+        run_status = "failed"
+        run_error = "Interrupted by user (Ctrl+C)"
+        logger.info("Interrupted by user (Ctrl+C).")
     except Exception as e:
         run_status = "failed"
         run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
 
-    try:
-        genofile_kind = "bfile" if bool(args.bfile) else ("vcf" if bool(args.vcf) else "file")
-        args_data = {
-            "models": {
-                "lmm": bool(args.lmm),
-                "fastlmm": bool(args.fastlmm),
-                "lm": bool(args.lm),
-                "farmcpu": bool(args.farmcpu),
-            },
-            "model": str(args.model),
-            "maf": float(args.maf),
-            "geno": float(args.geno),
-            "het": float(args.het),
-            "chunksize": int(args.chunksize),
-            "thread": int(args.thread),
-            "ncol": (list(args.ncol) if args.ncol is not None else None),
-            "cov": (list(args.cov) if args.cov is not None else []),
-            "grm": str(args.grm),
-            "qcov": str(args.qcov),
-            "traits": [str(x) for x in trait_order],
-        }
-        record_gwas_run(
-            run_id=run_id,
-            status=run_status,
-            genofile=str(gfile),
-            genofile_kind=genofile_kind,
-            phenofile=str(args.pheno),
-            outprefix=str(outprefix),
-            log_file=str(log_path),
-            result_files=[str(x) for x in saved_result_paths],
-            summary_rows=[dict(x) for x in gwas_summary_rows],
-            args_data=args_data,
-            error_text=run_error,
-            created_at=run_created_at,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to write GWAS history DB: {e}")
+    if run_status == "done":
+        try:
+            genofile_kind = "bfile" if bool(args.bfile) else ("vcf" if bool(args.vcf) else "tsv")
+            args_data = {
+                "models": {
+                    "lmm": bool(args.lmm),
+                    "fastlmm": bool(args.fastlmm),
+                    "lm": bool(args.lm),
+                    "farmcpu": bool(args.farmcpu),
+                },
+                "model": str(args.model),
+                "maf": float(args.maf),
+                "geno": float(args.geno),
+                "het": float(args.het),
+                "chunksize": int(args.chunksize),
+                "thread": int(args.thread),
+                "ncol": (list(args.ncol) if args.ncol is not None else None),
+                "cov": (list(args.cov) if args.cov is not None else []),
+                "grm": str(args.grm),
+                "qcov": str(args.qcov),
+                "grm_display": _format_grm_display(args.grm),
+                "qcov_display": _format_qcov_display(args.qcov),
+                "cov_display": _format_cov_display(args.cov),
+                "traits": [str(x) for x in trait_order],
+                "trait_col_map": {str(k): int(v) for k, v in trait_col_map.items()},
+            }
+            record_gwas_run(
+                run_id=run_id,
+                status=run_status,
+                genofile=str(gfile),
+                genofile_kind=genofile_kind,
+                phenofile=str(args.pheno),
+                outprefix=str(outprefix),
+                log_file=str(log_path),
+                result_files=[str(x) for x in saved_result_paths],
+                summary_rows=[dict(x) for x in gwas_summary_rows],
+                args_data=args_data,
+                error_text="",
+                created_at=run_created_at,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write GWAS history DB: {e}")
 
     lt = time.localtime()
     endinfo = (

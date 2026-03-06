@@ -2441,10 +2441,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         x_right = float(x_right)
                     if x_right <= x_left:
                         x_left, x_right = (0.0, max(1.0, x_right))
-                    x_pad = max(1e-9, 0.02 * float(x_right - x_left))
-                    ax2.set_xlim(x_left - x_pad, x_right + x_pad)
                     if manh_ylim is not None:
                         ax2.set_ylim(manh_ylim)
+                    # Keep QQ x-range adaptive to QQ data; only align y-range to Manhattan.
+                    x_pad = max(1e-9, 0.02 * float(x_right - x_left))
+                    ax2.set_xlim(x_left - x_pad, x_right + x_pad)
                     if manh_yticks is not None and manh_ylim is not None:
                         y0, y1 = ax2.get_ylim()
                         lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
@@ -2764,7 +2765,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             mid_gene_y_offset = 0.03
             mid_gene_ymin = -0.15
             mid_gene_ymax = 0.2
-            mid_h_in = gene_panel_h_in if use_gene_bridge else 0.22
+            # Keep Manhattan<->LD transition layer from becoming too tall:
+            # cap middle layer height at width/15.
+            mid_h_raw = gene_panel_h_in if use_gene_bridge else 0.22
+            mid_h_cap = float(width_in) / 15.0
+            mid_h_in = min(float(mid_h_raw), float(mid_h_cap))
             # LD row height should follow actual LD panel width;
             # otherwise narrowed x-span leaves large vertical blanks.
             sub_left = 0.08
@@ -3446,6 +3451,8 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
         if not np.isfinite(exp_xmin) or not np.isfinite(exp_xmax):
             exp_xmin, exp_xmax = (0.0, 1.0)
+        if manh_ylim_pair is not None:
+            ax.set_ylim(manh_ylim_pair)
         if exp_xmax > exp_xmin:
             x_pad = max(1e-9, 0.02 * float(exp_xmax - exp_xmin))
             ax.set_xlim(exp_xmin - x_pad, exp_xmax + x_pad)
@@ -3454,8 +3461,6 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             x_pad = max(1e-9, 0.02 * float(eps))
             ax.set_xlim(exp_xmin - eps - x_pad, exp_xmax + eps + x_pad)
         ax.margins(x=0.0)
-        if manh_ylim_pair is not None:
-            ax.set_ylim(manh_ylim_pair)
         line_left, line_right = ax.get_xlim()
         ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")
         ax.set_xlabel("Expected -log10(p-value)")
@@ -4111,6 +4116,11 @@ def main():
             raise SystemExit(1)
     else:
         args.bimrange_tuples = None
+    if args.bimrange_tuples is not None and args.qq_ratio is not None:
+        logger.info(
+            "QQ is disabled when --bimrange is set."
+        )
+        args.qq_ratio = None
     if args.ldblock_ratio is not None and args.bimrange_tuples is None:
         logger.warning(
             "Warning: --ldblock/--ldblock-all requires --bimrange; LD block and Manhattan+LD plotting are skipped."

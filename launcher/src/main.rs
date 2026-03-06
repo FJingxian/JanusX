@@ -27,6 +27,7 @@ const SKIP_RUNTIME_REBUILD_ENV: &str = "JX_SKIP_RUNTIME_REBUILD";
 const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
+const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
 const MIN_PYTHON_MAJOR: u32 = 3;
 const MIN_PYTHON_MINOR: u32 = 9;
 const RUSTUP_DIST_SERVER_CN: &str = "https://rsproxy.cn";
@@ -40,6 +41,8 @@ Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
     -update, --update      Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`
+    -load, --load          List/load files: `jx --load` or `jx --load <type> <name> <file>`
+    -clean, --clean        Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record
     -uninstall, --uninstall  Remove JanusX runtime and launcher files
 
 Modules:
@@ -154,6 +157,12 @@ fn run() -> Result<i32, String> {
             Err(e) => return Err(e),
         };
         return run_update(opts);
+    }
+    if matches!(head, "-load" | "--load") {
+        return run_load(&args[1..]);
+    }
+    if matches!(head, "-clean" | "--clean") {
+        return run_clean(&args[1..]);
     }
     if matches!(head, "-uninstall" | "--uninstall") {
         return run_uninstall(&args[1..]);
@@ -2372,6 +2381,91 @@ fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), Strin
     }
 }
 
+fn run_clean(args: &[String]) -> Result<i32, String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        println!("Clean usage:\n  jx --clean\n  jx --clean <load_id>");
+        return Ok(0);
+    }
+    if args.len() > 1 {
+        return Err("Clean usage:\n  jx --clean\n  jx --clean <load_id>".to_string());
+    }
+    if args.len() == 1 {
+        let python = ensure_runtime(false)?;
+        let mut cmd = Command::new(&python);
+        cmd.arg("-m")
+            .arg("janusx.script.loadanno")
+            .arg("--clean-id")
+            .arg(&args[0]);
+        let status = cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to run load cleaner: {e}"))?;
+        return Ok(exit_code(status));
+    }
+
+    let clean_home = runtime_home().or_else(|_| default_runtime_home())?;
+    let uniq: Vec<PathBuf> = vec![clean_home.join(GWAS_HISTORY_DB_FILE)];
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let mut failed_primary: Vec<String> = Vec::new();
+    for p in uniq {
+        if !p.exists() {
+            continue;
+        }
+        let res = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        match res {
+            Ok(_) => removed.push(p),
+            Err(e) => failed_primary.push(format!("{} ({e})", p.display())),
+        }
+    }
+
+    if !failed_primary.is_empty() {
+        return Err(format!(
+            "Failed to clean GWAS history DB:\n{}",
+            failed_primary.join("\n")
+        ));
+    }
+
+    if removed.is_empty() {
+        print_success_line("GWAS history DB already clean.");
+    } else {
+        print_success_line("GWAS history DB cleaned.");
+        for p in removed {
+            println!("  removed {}", p.display());
+        }
+    }
+    println!("A new history DB will be created automatically on next `jx gwas`.");
+    Ok(0)
+}
+
+fn run_load(args: &[String]) -> Result<i32, String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        println!("Load usage:\n  jx --load\n  jx --load <type> <name> <file>");
+        return Ok(0);
+    }
+    if !args.is_empty() && args.len() != 3 {
+        return Err("Load usage:\n  jx --load\n  jx --load <type> <name> <file>".to_string());
+    }
+    let python = ensure_runtime(false)?;
+    let mut cmd = Command::new(&python);
+    cmd.arg("-m").arg("janusx.script.loadanno");
+    for a in args {
+        cmd.arg(a);
+    }
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to run annotation loader: {e}"))?;
+    Ok(exit_code(status))
+}
+
 fn run_uninstall(args: &[String]) -> Result<i32, String> {
     let mut yes = false;
     for token in args {
@@ -3371,10 +3465,11 @@ fn print_cli_help() {
     }
 
     println!("{}", style_orange("Usage:"));
-    println!("  {}", style_green("jx <module> [options]"));
+    println!("  {}", style_green("jx [flags]"));
+    println!("  {}", style_green("jx [module] -h"));
     println!();
 
-    println!("{}", style_orange("Options:"));
+    println!("{}", style_orange("Flags:"));
     println!(
         "  {}  {}",
         style_green("-h, --help"),
@@ -3389,6 +3484,16 @@ fn print_cli_help() {
         "  {}  {}",
         style_green("-update, --update"),
         style_white("Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`")
+    );
+    println!(
+        "  {}  {}",
+        style_green("-load, --load"),
+        style_white("List/load files: `jx --load` or `jx --load <type> <name> <file>`")
+    );
+    println!(
+        "  {}  {}",
+        style_green("-clean, --clean"),
+        style_white("Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record")
     );
     println!(
         "  {}  {}",

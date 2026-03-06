@@ -8,6 +8,8 @@ Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
     -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
+    -load, --load          List/load files: `jx --load` or `jx --load <type> <name> <file>`
+    -clean, --clean        Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record
 
 Modules:
     Genome-wide Association Studies (GWAS):
@@ -38,9 +40,11 @@ Modules:
 import sys
 import subprocess
 import importlib
+import os
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
+from ._common.gwas_history import remove_loaded_file_by_id
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -89,7 +93,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs",
-    "sim", "simulation", "gmerge", "fastq2vcf", "webui",
+    "sim", "simulation", "gmerge", "fastq2vcf", "webui", "loadanno",
 ]
 
 
@@ -100,6 +104,44 @@ def _print_help() -> None:
     print(__logo__)
     if __doc__:
         print(__doc__.strip())
+
+
+def _resolve_runtime_home() -> Path:
+    env_home = os.environ.get("JX_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser().resolve()
+    p1 = (Path.home() / "JanusX" / ".janusx").resolve()
+    p2 = (Path.home() / ".janusx").resolve()
+    return p1 if p1.exists() else p2
+
+
+def _clean_history_db() -> None:
+    target = _resolve_runtime_home() / "janusx_tasks.db"
+    removed = []
+    if target.exists():
+        try:
+            target.unlink()
+            removed.append(str(target))
+        except Exception as e:
+            print(f"Error: failed to remove {target}: {e}")
+            return
+    if len(removed) == 0:
+        print("GWAS history DB already clean.")
+    else:
+        print("GWAS history DB cleaned.")
+        for p in removed:
+            print(f"  removed {p}")
+    print("A new history DB will be created automatically on next `jx gwas`.")
+
+
+def _clean_loaded_by_id(load_id: str) -> None:
+    out = remove_loaded_file_by_id(load_id)
+    print(f"Removed load id: {out.get('id','')}")
+    print(f"  type: {out.get('type','')}  name: {out.get('name','')}")
+    for p in out.get("removed_paths", []):
+        print(f"  removed {p}")
+    for p in out.get("failed_paths", []):
+        print(f"  failed {p}")
 
 
 def main():
@@ -114,6 +156,20 @@ def main():
             sys.argv[0] = "jx --update"
             del sys.argv[1]
             _load_script_module("update").main()
+        elif sys.argv[1] == '-clean' or sys.argv[1] == '--clean':
+            print(__logo__)
+            clean_args = sys.argv[2:]
+            if len(clean_args) == 0:
+                _clean_history_db()
+            elif len(clean_args) == 1:
+                _clean_loaded_by_id(clean_args[0])
+            else:
+                print("Usage: jx --clean [<load_id>]")
+        elif sys.argv[1] == '-load' or sys.argv[1] == '--load':
+            print(__logo__)
+            sys.argv[0] = "jx --load"
+            del sys.argv[1]
+            _load_script_module("loadanno").main()
         else:
             module_name = sys.argv[1]
             if module_name in _MODULE_NAMES:

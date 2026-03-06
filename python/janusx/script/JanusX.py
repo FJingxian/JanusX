@@ -29,6 +29,7 @@ Modules:
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF
     gmerge        Merge genotype/variant tables
+    webui         Start JanusX web UI (postgwas first)
 
     Benchmark:
     sim           Quick simulation workflow
@@ -88,7 +89,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs",
-    "sim", "simulation", "gmerge", "fastq2vcf",
+    "sim", "simulation", "gmerge", "fastq2vcf", "webui",
 ]
 
 

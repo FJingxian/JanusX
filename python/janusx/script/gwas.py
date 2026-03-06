@@ -47,6 +47,7 @@ import warnings
 import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
+from datetime import datetime
 from typing import Union, Optional
 import uuid
 
@@ -99,6 +100,7 @@ from ._common.status import (
     print_success,
     format_elapsed,
 )
+from ._common.gwas_history import record_gwas_run
 
 try:
     from rich.progress import (
@@ -1362,56 +1364,7 @@ def build_grm_streaming(
     """
     _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
     pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
-process = psutil.Process()
-
-_CJK_FONT_READY: Optional[bool] = None
-
-
-def _contains_cjk(text: str) -> bool:
-    for ch in str(text):
-        code = ord(ch)
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3000 <= code <= 0x303F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
-            return True
-    return False
-
-
-def _ensure_cjk_font() -> bool:
-    """
-    Ensure matplotlib has at least one CJK-capable sans font configured.
-    Returns True when a candidate font is found, otherwise False.
-    """
-    global _CJK_FONT_READY
-    if _CJK_FONT_READY is not None:
-        return _CJK_FONT_READY
-
-    candidates = [
-        "Microsoft YaHei",
-        "SimHei",
-        "Noto Sans CJK SC",
-        "Source Han Sans CN",
-        "PingFang SC",
-        "Heiti SC",
-        "WenQuanYi Zen Hei",
-        "Arial Unicode MS",
-    ]
-    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
-    selected = next((name for name in candidates if name in installed), None)
-    if selected is None:
-        _CJK_FONT_READY = False
-        return False
-
-    current = mpl.rcParams.get("font.sans-serif", [])
-    if not isinstance(current, list):
-        current = [str(current)]
-    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
-    mpl.rcParams["axes.unicode_minus"] = False
-    _CJK_FONT_READY = True
-    return True
+    process = psutil.Process()
 
     prefetch_depth = 2
     tuned_chunk_size = auto_stream_grm_chunk_size(
@@ -1461,6 +1414,55 @@ def _ensure_cjk_font() -> bool:
 
     _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
     return grm, int(grm_stats.eff_m)
+
+_CJK_FONT_READY: Optional[bool] = None
+
+
+def _contains_cjk(text: str) -> bool:
+    for ch in str(text):
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3000 <= code <= 0x303F
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            return True
+    return False
+
+
+def _ensure_cjk_font() -> bool:
+    """
+    Ensure matplotlib has at least one CJK-capable sans font configured.
+    Returns True when a candidate font is found, otherwise False.
+    """
+    global _CJK_FONT_READY
+    if _CJK_FONT_READY is not None:
+        return _CJK_FONT_READY
+
+    candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans CN",
+        "PingFang SC",
+        "Heiti SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
+    selected = next((name for name in candidates if name in installed), None)
+    if selected is None:
+        _CJK_FONT_READY = False
+        return False
+
+    current = mpl.rcParams.get("font.sans-serif", [])
+    if not isinstance(current, list):
+        current = [str(current)]
+    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
+    mpl.rcParams["axes.unicode_minus"] = False
+    _CJK_FONT_READY = True
+    return True
 
 
 def load_or_build_grm_with_cache(
@@ -3510,6 +3512,10 @@ def parse_args():
 def main(log: bool = True):
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_status = "done"
+    run_error = ""
     args = parse_args()
     # Plotting is always enabled for GWAS CLI.
     args.plot = True
@@ -3528,6 +3534,9 @@ def main(log: bool = True):
     outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    gwas_summary_rows: list[dict[str, object]] = []
+    saved_result_paths: list[str] = []
+    trait_order: list[str] = []
 
     if log:
         model_tokens: list[str] = []
@@ -3611,8 +3620,6 @@ def main(log: bool = True):
         cov_all = None
         eff_m = None
         eff_snp_by_trait: dict[str, int] = {}
-        gwas_summary_rows: list[dict[str, object]] = []
-        saved_result_paths: list[str] = []
 
         stream_selected = bool(args.lmm or args.lm or args.fastlmm)
         if stream_selected:
@@ -3765,7 +3772,47 @@ def main(log: bool = True):
         logger.info(f"Log saved in {str(log_path).replace('//', '/')}")
 
     except Exception as e:
+        run_status = "failed"
+        run_error = str(e)
         logger.exception(f"Error in JanusX GWAS pipeline: {e}")
+
+    try:
+        genofile_kind = "bfile" if bool(args.bfile) else ("vcf" if bool(args.vcf) else "file")
+        args_data = {
+            "models": {
+                "lmm": bool(args.lmm),
+                "fastlmm": bool(args.fastlmm),
+                "lm": bool(args.lm),
+                "farmcpu": bool(args.farmcpu),
+            },
+            "model": str(args.model),
+            "maf": float(args.maf),
+            "geno": float(args.geno),
+            "het": float(args.het),
+            "chunksize": int(args.chunksize),
+            "thread": int(args.thread),
+            "ncol": (list(args.ncol) if args.ncol is not None else None),
+            "cov": (list(args.cov) if args.cov is not None else []),
+            "grm": str(args.grm),
+            "qcov": str(args.qcov),
+            "traits": [str(x) for x in trait_order],
+        }
+        record_gwas_run(
+            run_id=run_id,
+            status=run_status,
+            genofile=str(gfile),
+            genofile_kind=genofile_kind,
+            phenofile=str(args.pheno),
+            outprefix=str(outprefix),
+            log_file=str(log_path),
+            result_files=[str(x) for x in saved_result_paths],
+            summary_rows=[dict(x) for x in gwas_summary_rows],
+            args_data=args_data,
+            error_text=run_error,
+            created_at=run_created_at,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write GWAS history DB: {e}")
 
     lt = time.localtime()
     endinfo = (

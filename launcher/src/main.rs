@@ -62,6 +62,7 @@ Modules:
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF
     gmerge        Merge genotype/variant tables
+    webui         Start JanusX web UI (postgwas first)
 
     Benchmark:
     sim           Quick simulation workflow
@@ -3447,6 +3448,11 @@ fn print_cli_help() {
         "    {:12} {}",
         style_green("gmerge"),
         style_white("Merge genotype/variant tables")
+    );
+    println!(
+        "    {:12} {}",
+        style_green("webui"),
+        style_white("Start JanusX web UI (postgwas first)")
     );
     println!();
     println!("  {}", style_blue("Benchmark:"));

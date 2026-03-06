@@ -2573,6 +2573,14 @@ fn pip_install_update(
                 if verbose {
                     eprintln!("PyPI wheel install is unavailable; retrying source build.");
                 }
+                if !any_rust_toolchain_ready(runtime_home) {
+                    if verbose {
+                        eprintln!(
+                            "Rust toolchain not detected; installing local Rust before source build."
+                        );
+                    }
+                    ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                }
                 match attempt_install(true, false, Some("Retrying source build from PyPI ...")) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {

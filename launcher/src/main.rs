@@ -2544,6 +2544,18 @@ fn pip_install_update(
         }
     };
 
+    let is_pypi_spec = is_pypi_janusx_spec(spec);
+    // For explicit source installs (GitHub/local path), ensure Rust toolchain upfront.
+    // For PyPI, keep the preferred order: wheel first, then source+Rust fallback.
+    if spec_requires_rust_build(spec) && !is_pypi_spec && !any_rust_toolchain_ready(runtime_home) {
+        if verbose {
+            eprintln!(
+                "Rust toolchain not detected for source build; installing local Rust toolchain..."
+            );
+        }
+        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+    }
+
     match attempt_install(false, false, None) {
         Ok(d) => return Ok(d),
         Err(e) => {
@@ -2557,7 +2569,7 @@ fn pip_install_update(
                 ensure_local_rust_toolchain(runtime_home, python, verbose)?;
                 return attempt_install(false, false, None);
             }
-            if is_pypi_janusx_spec(spec) && should_retry_with_source_build(&e) {
+            if is_pypi_spec && should_retry_with_source_build(&e) {
                 if verbose {
                     eprintln!("PyPI wheel install is unavailable; retrying source build.");
                 }

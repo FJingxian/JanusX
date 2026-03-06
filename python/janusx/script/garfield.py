@@ -113,6 +113,7 @@ def main() -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = argparse.ArgumentParser(
+        prog="jx garfield",
         formatter_class=cli_help_formatter(),
     )
 

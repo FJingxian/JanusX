@@ -377,6 +377,7 @@ def main(log: bool = True):
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
+        prog="jx pca",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx pca -vcf geno.vcf.gz -pc 3 -plot",

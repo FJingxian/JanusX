@@ -66,6 +66,7 @@ def main(log: bool = True):
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
+        prog="jx gmerge",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gmerge -i a.vcf.gz b.vcf.gz -o merged.vcf.gz",

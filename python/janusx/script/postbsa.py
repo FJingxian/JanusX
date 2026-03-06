@@ -878,6 +878,7 @@ def plot_bsa(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="jx postbsa",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2",

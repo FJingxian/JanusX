@@ -287,6 +287,7 @@ def main(log: bool = True):
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
+        prog="jx grm",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx grm -vcf geno.vcf.gz -o outdir -prefix demo",

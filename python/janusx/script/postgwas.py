@@ -3830,6 +3830,7 @@ def main():
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
+        prog="jx postgwas",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postgwas -gwasfile result.lmm.tsv -manh -qq",

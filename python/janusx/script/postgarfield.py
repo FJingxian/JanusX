@@ -127,6 +127,7 @@ def main() -> None:
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
+        prog="jx postgarfield",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postgarfield -bfile demo.garfield -p pheno.tsv -k kinship.npy",

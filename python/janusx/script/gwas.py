@@ -3387,6 +3387,7 @@ def run_farmcpu_fullmem(
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        prog="jx gwas",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",

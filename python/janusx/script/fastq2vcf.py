@@ -424,6 +424,7 @@ def main():
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
     parser = argparse.ArgumentParser(
+        prog="jx fastq2vcf",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx fastq2vcf -r ref.fa -i fastq_dir -w workdir",

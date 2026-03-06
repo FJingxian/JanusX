@@ -561,6 +561,7 @@ def main(log: bool = True) -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = argparse.ArgumentParser(
+        prog="jx gs",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",

@@ -3338,6 +3338,30 @@ fn style_cyan(text: &str) -> String {
     }
 }
 
+fn style_blue(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[34m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn style_orange(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[38;5;208m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn style_white(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[37m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 fn print_cli_help() {
     println!("{LOGO}");
     if !supports_color() {
@@ -3345,57 +3369,93 @@ fn print_cli_help() {
         return;
     }
 
-    println!("{}", style_cyan("Usage:"));
+    println!("{}", style_orange("Usage:"));
     println!("  {}", style_green("jx <module> [options]"));
     println!();
 
-    println!("{}", style_cyan("Options:"));
+    println!("{}", style_orange("Options:"));
     println!(
         "  {}  {}",
         style_green("-h, --help"),
-        "Show this help message"
+        style_white("Show this help message")
     );
     println!(
         "  {}  {}",
         style_green("-v, --version"),
-        "Show version/build information"
+        style_white("Show version/build information")
     );
     println!(
         "  {}  {}",
         style_green("-update, --update"),
-        "Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`"
+        style_white("Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`")
     );
     println!(
         "  {}  {}",
         style_green("-uninstall, --uninstall"),
-        "Remove JanusX runtime and launcher files"
+        style_white("Remove JanusX runtime and launcher files")
     );
     println!();
 
-    println!("{}", style_cyan("Modules:"));
-    println!("  {}", style_cyan("Genome-wide Association Studies (GWAS):"));
-    println!("    {:12} {}", style_green("grm"), "Build genomic relationship matrix");
-    println!("    {:12} {}", style_green("pca"), "Principal component analysis for population structure");
-    println!("    {:12} {}", style_green("gwas"), "Run genome-wide association analysis");
-    println!("    {:12} {}", style_green("postgwas"), "Post-process GWAS results and downstream plots");
+    println!("{}", style_orange("Modules:"));
+    println!("  {}", style_blue("Genome-wide Association Studies (GWAS):"));
+    println!("    {:12} {}", style_green("grm"), style_white("Build genomic relationship matrix"));
+    println!(
+        "    {:12} {}",
+        style_green("pca"),
+        style_white("Principal component analysis for population structure")
+    );
+    println!("    {:12} {}", style_green("gwas"), style_white("Run genome-wide association analysis"));
+    println!(
+        "    {:12} {}",
+        style_green("postgwas"),
+        style_white("Post-process GWAS results and downstream plots")
+    );
     println!();
-    println!("  {}", style_cyan("Genomic Selection (GS):"));
-    println!("    {:12} {}", style_green("gs"), "Genomic prediction and model-based selection");
+    println!("  {}", style_blue("Genomic Selection (GS):"));
+    println!(
+        "    {:12} {}",
+        style_green("gs"),
+        style_white("Genomic prediction and model-based selection")
+    );
     println!();
-    println!("  {}", style_cyan("GARFIELD:"));
-    println!("    {:12} {}", style_green("garfield"), "Random-forest based marker-trait association");
-    println!("    {:12} {}", style_green("postgarfield"), "Summarize and visualize GARFIELD outputs");
+    println!("  {}", style_blue("GARFIELD:"));
+    println!(
+        "    {:12} {}",
+        style_green("garfield"),
+        style_white("Random-forest based marker-trait association")
+    );
+    println!(
+        "    {:12} {}",
+        style_green("postgarfield"),
+        style_white("Summarize and visualize GARFIELD outputs")
+    );
     println!();
-    println!("  {}", style_cyan("Bulk Segregation Analysis (BSA):"));
-    println!("    {:12} {}", style_green("postbsa"), "Post-process and visualize BSA results");
+    println!("  {}", style_blue("Bulk Segregation Analysis (BSA):"));
+    println!(
+        "    {:12} {}",
+        style_green("postbsa"),
+        style_white("Post-process and visualize BSA results")
+    );
     println!();
-    println!("  {}", style_cyan("Pipeline and utility:"));
-    println!("    {:12} {}", style_green("fastq2vcf"), "Variant-calling pipeline from FASTQ to VCF");
-    println!("    {:12} {}", style_green("gmerge"), "Merge genotype/variant tables");
+    println!("  {}", style_blue("Pipeline and utility:"));
+    println!(
+        "    {:12} {}",
+        style_green("fastq2vcf"),
+        style_white("Variant-calling pipeline from FASTQ to VCF")
+    );
+    println!(
+        "    {:12} {}",
+        style_green("gmerge"),
+        style_white("Merge genotype/variant tables")
+    );
     println!();
-    println!("  {}", style_cyan("Benchmark:"));
-    println!("    {:12} {}", style_green("sim"), "Quick simulation workflow");
-    println!("    {:12} {}", style_green("simulation"), "Extended simulation and benchmarking workflow");
+    println!("  {}", style_blue("Benchmark:"));
+    println!("    {:12} {}", style_green("sim"), style_white("Quick simulation workflow"));
+    println!(
+        "    {:12} {}",
+        style_green("simulation"),
+        style_white("Extended simulation and benchmarking workflow")
+    );
 }
 
 fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {

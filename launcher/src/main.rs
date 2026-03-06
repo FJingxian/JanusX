@@ -1757,8 +1757,35 @@ fn ensure_local_rust_toolchain(
             .arg("--no-modify-path")
             .stdin(Stdio::null());
         apply_local_rust_env(&mut cmd, runtime_home, use_cn_mirror);
-        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-            .map_err(|e| format!("Failed to install local Rust toolchain: {e}"))?;
+        if verbose {
+            let status = cmd
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .map_err(|e| format!("Failed to install local Rust toolchain: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "Failed to install local Rust toolchain: command failed with exit={}",
+                    exit_code(status)
+                ));
+            }
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let (out, elapsed) = run_with_spinner(&mut cmd, desc)
+                .map_err(|e| format!("Failed to install local Rust toolchain: {e}"))?;
+            if out.status.success() {
+                print_success_line(&format!("{desc}[{}]", format_elapsed(elapsed)));
+            } else {
+                let mut msg = String::new();
+                msg.push_str(&String::from_utf8_lossy(&out.stdout));
+                msg.push_str(&String::from_utf8_lossy(&out.stderr));
+                return Err(format!(
+                    "Failed to install local Rust toolchain: command failed with exit={}\n{}",
+                    exit_code(out.status),
+                    msg.trim()
+                ));
+            }
+        }
         Ok(())
     };
 
@@ -2516,13 +2543,6 @@ fn pip_install_update(
             )
         }
     };
-
-    if spec_requires_rust_build(spec) && !any_rust_toolchain_ready(runtime_home) {
-        if verbose {
-            eprintln!("Rust toolchain not detected for source build; installing local Rust toolchain...");
-        }
-        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
-    }
 
     match attempt_install(false, false, None) {
         Ok(d) => return Ok(d),

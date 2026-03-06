@@ -86,7 +86,7 @@ from janusx.gfreader import (
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import minimal_help_epilog
+from ._common.helptext import cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -200,7 +200,7 @@ def _emit_gwas_summary(
         "model",
         "nidv",
         "nsnp",
-        "cpu(%)",
+        "pve",
         "mem(G)",
         "Ctime(s)",
         "Vtime(s)",
@@ -208,13 +208,22 @@ def _emit_gwas_summary(
 
     out_rows: list[list[str]] = []
     for r in rows:
+        pve_raw = r.get("pve", None)
+        pve_text = "NA"
+        try:
+            if pve_raw is not None:
+                pve_val = float(pve_raw)
+                if np.isfinite(pve_val):
+                    pve_text = f"{pve_val:.3f}"
+        except Exception:
+            pve_text = "NA"
         out_rows.append(
             [
                 str(r.get("phenotype", "")),
                 str(r.get("model", "")),
                 f"{int(r.get('nidv', 0))}",
                 f"{int(r.get('eff_snp', 0))}",
-                f"{float(r.get('avg_cpu', 0.0)):.1f}",
+                pve_text,
                 f"{float(r.get('peak_rss_gb', 0.0)):.2f}",
                 f"{float(r.get('gwas_time_s', 0.0)):.1f}",
                 f"{float(r.get('viz_time_s', 0.0)):.1f}",
@@ -2314,6 +2323,7 @@ def run_chunked_gwas_lmm_lm(
                     "model": model_label,
                     "nidv": int(n_idv),
                     "eff_snp": int(done_snps),
+                    "pve": (float(header_pve) if header_pve is not None else None),
                     "avg_cpu": float(avg_cpu_pct),
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
@@ -2355,6 +2365,7 @@ def run_chunked_gwas_lmm_lm(
                 "model": model_label,
                 "nidv": int(n_idv),
                 "eff_snp": int(done_snps),
+                "pve": (float(header_pve) if header_pve is not None else None),
                 "avg_cpu": float(avg_cpu_pct),
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(evd_secs + scan_secs),
@@ -2801,6 +2812,16 @@ def run_chunked_gwas_streaming_shared(
         has_results = bool(ctx["has_results"])
         tmp_tsv = str(ctx["tmp_tsv"])
         out_tsv = str(ctx["out_tsv"])
+        ctx_pve: Optional[float] = None
+        if str(ctx.get("model_key", "")) in {"lmm", "fastlmm"}:
+            mod_obj = ctx.get("mod")
+            if mod_obj is not None and hasattr(mod_obj, "pve"):
+                try:
+                    pve_tmp = float(getattr(mod_obj, "pve"))
+                    if np.isfinite(pve_tmp):
+                        ctx_pve = pve_tmp
+                except Exception:
+                    ctx_pve = None
         if not has_results:
             logger.info(f"No SNPs passed filters for trait {pname} ({model_label}).")
             summary_rows.append(
@@ -2809,6 +2830,7 @@ def run_chunked_gwas_streaming_shared(
                     "model": model_label,
                     "nidv": int(n_idv),
                     "eff_snp": int(done_snps),
+                    "pve": (float(ctx_pve) if ctx_pve is not None else None),
                     "avg_cpu": float(avg_cpu_pct),
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
@@ -2846,6 +2868,7 @@ def run_chunked_gwas_streaming_shared(
                     "model": model_label,
                     "nidv": int(n_idv),
                     "eff_snp": int(done_snps),
+                    "pve": (float(ctx_pve) if ctx_pve is not None else None),
                     "avg_cpu": float(avg_cpu_pct),
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
@@ -3327,6 +3350,7 @@ def run_farmcpu_fullmem(
                 "model": "Farm",
                 "nidv": int(n_idv),
                 "eff_snp": int(snp_sub.shape[0]),
+                "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(gwas_secs),
@@ -3363,7 +3387,7 @@ def run_farmcpu_fullmem(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
             "jx gwas -bfile example_prefix -p pheno.tsv -lm",

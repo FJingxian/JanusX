@@ -87,7 +87,7 @@ from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import minimal_help_epilog
+from ._common.helptext import cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -561,7 +561,7 @@ def main(log: bool = True) -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",

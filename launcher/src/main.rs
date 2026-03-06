@@ -39,7 +39,7 @@ const CLI_HELP_TEXT: &str = r#"Usage:
 Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
-    -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
+    -update, --update      Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`
     -uninstall, --uninstall  Remove JanusX runtime and launcher files
 
 Modules:
@@ -89,6 +89,7 @@ struct UpdateOptions {
     source: UpdateSource,
     verbose: bool,
     force_reinstall: bool,
+    editable: bool,
 }
 
 fn main() {
@@ -132,8 +133,7 @@ fn run() -> Result<i32, String> {
 
     let head = args[0].as_str();
     if matches!(head, "-h" | "--help") {
-        println!("{LOGO}");
-        println!("{}", CLI_HELP_TEXT.trim());
+        print_cli_help();
         return Ok(0);
     }
     if matches!(head, "-v" | "--version") {
@@ -1263,15 +1263,17 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     let mut local_source: Option<String> = None;
     let mut verbose = false;
     let mut force_reinstall = false;
+    let mut editable = false;
 
     for token in args {
         match token.as_str() {
             "latest" | "--latest" => latest = true,
+            "-e" | "--editable" => editable = true,
             "--verbose" => verbose = true,
             "--force-reinstall" | "--reinstall" | "--full" => force_reinstall = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Update usage:\n  jx --update [latest|<local_path>] [--verbose] [--force-reinstall]\n  Example: jx --update ."
+                    "Update usage:\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
                 );
                 return Err(String::new());
             }
@@ -1285,7 +1287,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown update option: {other}\nUpdate usage:\n  jx --update [latest|<local_path>] [--verbose] [--force-reinstall]\n  Example: jx --update ."
+                        "Unknown update option: {other}\nUpdate usage:\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
                     ));
                 }
             }
@@ -1304,10 +1306,15 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
         UpdateSource::Pypi
     };
 
+    if editable && !matches!(source, UpdateSource::Local(_)) {
+        return Err("`-e/--editable` requires a local source path, e.g. `jx --update -e .`.".to_string());
+    }
+
     Ok(UpdateOptions {
         source,
         verbose,
         force_reinstall,
+        editable,
     })
 }
 
@@ -1385,6 +1392,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                         &home,
                         &archive_spec,
                         true,
+                        false,
                         opts.verbose,
                         "Updating from GitHub source archive ...",
                         true,
@@ -1461,6 +1469,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 &home,
                 GITHUB_SPEC_CN,
                 gh_force_reinstall,
+                false,
                 opts.verbose,
                 "Updating from GitHub (CN mirror) ...",
                 true,
@@ -1482,6 +1491,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                         &home,
                         GITHUB_SPEC_ORIGIN,
                         gh_force_reinstall,
+                        false,
                         opts.verbose,
                         "Updating from GitHub (source)...",
                         false,
@@ -1503,6 +1513,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 &home,
                 path,
                 opts.force_reinstall,
+                opts.editable,
                 opts.verbose,
                 "Updating from local source...",
                 true,
@@ -1521,6 +1532,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
         &home,
         &pypi_spec,
         opts.force_reinstall,
+        false,
         opts.verbose,
         "Updating from PyPI...",
         true,
@@ -2509,6 +2521,7 @@ fn pip_install_update(
     runtime_home: &Path,
     spec: &str,
     force_reinstall: bool,
+    editable: bool,
     verbose: bool,
     desc: &str,
     use_cn_rust_mirror: bool,
@@ -2524,6 +2537,7 @@ fn pip_install_update(
                 runtime_home,
                 spec,
                 force_reinstall,
+                editable,
                 true,
                 effective_desc,
                 use_cn_rust_mirror,
@@ -2535,6 +2549,7 @@ fn pip_install_update(
                 runtime_home,
                 spec,
                 force_reinstall,
+                editable,
                 effective_desc,
                 10,
                 use_cn_rust_mirror,
@@ -2657,6 +2672,7 @@ fn ensure_runtime(verbose_bootstrap: bool) -> Result<PathBuf, String> {
             &python,
             &home,
             &pypi_spec,
+            false,
             false,
             verbose_bootstrap,
             "Building runtime from PyPI ...",
@@ -2992,6 +3008,14 @@ fn print_version(python: &Path, runtime_home: &Path) {
     let build_time =
         python_core_update_time(python, runtime_home).unwrap_or_else(|| "unknown".to_string());
     println!("{LOGO}");
+    if supports_color() {
+        println!("{}", style_cyan(&format!("JanusX v{version}")));
+        println!("{} {}", style_green("Author:"), VERSION_AUTHOR);
+        println!("{} <{}>", style_green("Contact:"), VERSION_CONTACT);
+        println!("{} {}", style_green("Build time:"), build_time);
+        println!();
+        return;
+    }
     println!("JanusX v{version} by {VERSION_AUTHOR}");
     println!("Please report issues to <{VERSION_CONTACT}>");
     println!("Build time: {build_time}");
@@ -3306,6 +3330,74 @@ fn style_yellow(text: &str) -> String {
     }
 }
 
+fn style_cyan(text: &str) -> String {
+    if supports_color() {
+        format!("\x1b[36m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn print_cli_help() {
+    println!("{LOGO}");
+    if !supports_color() {
+        println!("{}", CLI_HELP_TEXT.trim());
+        return;
+    }
+
+    println!("{}", style_cyan("Usage:"));
+    println!("  {}", style_green("jx <module> [options]"));
+    println!();
+
+    println!("{}", style_cyan("Options:"));
+    println!(
+        "  {}  {}",
+        style_green("-h, --help"),
+        "Show this help message"
+    );
+    println!(
+        "  {}  {}",
+        style_green("-v, --version"),
+        "Show version/build information"
+    );
+    println!(
+        "  {}  {}",
+        style_green("-update, --update"),
+        "Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`"
+    );
+    println!(
+        "  {}  {}",
+        style_green("-uninstall, --uninstall"),
+        "Remove JanusX runtime and launcher files"
+    );
+    println!();
+
+    println!("{}", style_cyan("Modules:"));
+    println!("  {}", style_cyan("Genome-wide Association Studies (GWAS):"));
+    println!("    {:12} {}", style_green("grm"), "Build genomic relationship matrix");
+    println!("    {:12} {}", style_green("pca"), "Principal component analysis for population structure");
+    println!("    {:12} {}", style_green("gwas"), "Run genome-wide association analysis");
+    println!("    {:12} {}", style_green("postgwas"), "Post-process GWAS results and downstream plots");
+    println!();
+    println!("  {}", style_cyan("Genomic Selection (GS):"));
+    println!("    {:12} {}", style_green("gs"), "Genomic prediction and model-based selection");
+    println!();
+    println!("  {}", style_cyan("GARFIELD:"));
+    println!("    {:12} {}", style_green("garfield"), "Random-forest based marker-trait association");
+    println!("    {:12} {}", style_green("postgarfield"), "Summarize and visualize GARFIELD outputs");
+    println!();
+    println!("  {}", style_cyan("Bulk Segregation Analysis (BSA):"));
+    println!("    {:12} {}", style_green("postbsa"), "Post-process and visualize BSA results");
+    println!();
+    println!("  {}", style_cyan("Pipeline and utility:"));
+    println!("    {:12} {}", style_green("fastq2vcf"), "Variant-calling pipeline from FASTQ to VCF");
+    println!("    {:12} {}", style_green("gmerge"), "Merge genotype/variant tables");
+    println!();
+    println!("  {}", style_cyan("Benchmark:"));
+    println!("    {:12} {}", style_green("sim"), "Quick simulation workflow");
+    println!("    {:12} {}", style_green("simulation"), "Extended simulation and benchmarking workflow");
+}
+
 fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {
     let start = Instant::now();
     let is_tty = io::stdout().is_terminal();
@@ -3351,6 +3443,7 @@ fn pip_install(
     runtime_home: &Path,
     spec: &str,
     force_reinstall: bool,
+    editable: bool,
     verbose: bool,
     desc: &str,
     use_cn_rust_mirror: bool,
@@ -3361,6 +3454,7 @@ fn pip_install(
         runtime_home,
         spec,
         force_reinstall,
+        editable,
         use_cn_rust_mirror,
         force_source_build,
     );
@@ -3406,6 +3500,7 @@ fn build_pip_install_cmd(
     runtime_home: &Path,
     spec: &str,
     force_reinstall: bool,
+    editable: bool,
     use_cn_rust_mirror: bool,
     force_source_build: bool,
 ) -> Command {
@@ -3428,7 +3523,11 @@ fn build_pip_install_cmd(
     if spec_requires_rust_build(spec) && local_rust_toolchain_ready(runtime_home) {
         apply_local_rust_env(&mut cmd, runtime_home, use_cn_rust_mirror);
     }
-    cmd.arg(spec);
+    if editable {
+        cmd.arg("-e").arg(spec);
+    } else {
+        cmd.arg(spec);
+    }
     cmd
 }
 
@@ -3458,6 +3557,7 @@ fn pip_install_tail(
     runtime_home: &Path,
     spec: &str,
     force_reinstall: bool,
+    editable: bool,
     desc: &str,
     max_lines: usize,
     use_cn_rust_mirror: bool,
@@ -3470,6 +3570,7 @@ fn pip_install_tail(
         runtime_home,
         spec,
         force_reinstall,
+        editable,
         use_cn_rust_mirror,
         force_source_build,
     );

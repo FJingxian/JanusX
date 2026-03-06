@@ -39,7 +39,7 @@ from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
 from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import minimal_help_epilog
+from ._common.helptext import cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
 from ._common.status import (
     CliStatus,
@@ -424,7 +424,7 @@ def main():
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx fastq2vcf -r ref.fa -i fastq_dir -w workdir",
         ]),

@@ -29,7 +29,7 @@ import pandas as pd
 from janusx.garfield.decode import decode
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.helptext import minimal_help_epilog
+from janusx.script._common.helptext import cli_help_formatter, minimal_help_epilog
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -127,7 +127,7 @@ def main() -> None:
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postgarfield -bfile demo.garfield -p pheno.tsv -k kinship.npy",
         ]),

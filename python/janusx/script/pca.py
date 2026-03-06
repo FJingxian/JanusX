@@ -67,7 +67,7 @@ from janusx.gfreader import (
 )
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import minimal_help_epilog
+from ._common.helptext import cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -377,7 +377,7 @@ def main(log: bool = True):
     t_start = time.time()
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx pca -vcf geno.vcf.gz -pc 3 -plot",
             "jx pca -k data.grm -pc 3 -plot",

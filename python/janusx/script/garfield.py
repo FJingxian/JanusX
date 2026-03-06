@@ -22,6 +22,7 @@ from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus
+from janusx.script._common.helptext import cli_help_formatter
 
 
 def _safe_trait_label(label: object) -> str:
@@ -112,7 +113,7 @@ def main() -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=cli_help_formatter(),
     )
 
     required_group = parser.add_argument_group("Required Arguments")

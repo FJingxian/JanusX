@@ -12,6 +12,7 @@ dependencies = [
     "psutil",
     "tqdm",
     "rich",
+    "rich-argparse",
     "dynamicTreeCut",
     "joblib>=1.5",
 ]

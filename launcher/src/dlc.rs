@@ -21,7 +21,10 @@ const JANUSX_SIF_MIRROR_URL: &str =
 const JANUSX_SIF_ORIGIN_URL: &str =
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
 const JANUSX_SIF_URLS: [&str; 2] = [JANUSX_SIF_MIRROR_URL, JANUSX_SIF_ORIGIN_URL];
-const MICROMAMBA_URLS: [&str; 1] = ["https://micro.mamba.pm/api/micromamba/linux-64/latest"];
+const MICROMAMBA_MIRROR_URL: &str =
+    "https://gh-proxy.org/https://micro.mamba.pm/api/micromamba/linux-64/latest";
+const MICROMAMBA_ORIGIN_URL: &str = "https://micro.mamba.pm/api/micromamba/linux-64/latest";
+const MICROMAMBA_URLS: [&str; 2] = [MICROMAMBA_MIRROR_URL, MICROMAMBA_ORIGIN_URL];
 const CONDA_BIOCONDA_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda";
 const CONDA_FORGE_MIRROR_URL: &str =
@@ -1834,29 +1837,75 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
             );
         }
         let mut ok = false;
-        if command_in_path("curl") {
+        if command_in_path("aria2c") {
+            let total_bytes = probe_content_length_with_curl(url)
+                .or_else(|| probe_content_length_with_wget(url));
+            let tmp_dir = tmp
+                .parent()
+                .ok_or_else(|| format!("Invalid temporary download path: {}", tmp.display()))?
+                .to_string_lossy()
+                .to_string();
+            let tmp_name = tmp
+                .file_name()
+                .ok_or_else(|| format!("Invalid temporary download path: {}", tmp.display()))?
+                .to_string_lossy()
+                .to_string();
+            let cmd = vec![
+                "aria2c".to_string(),
+                "--allow-overwrite=true".to_string(),
+                "--auto-file-renaming=false".to_string(),
+                "--file-allocation=none".to_string(),
+                "--console-log-level=error".to_string(),
+                "--summary-interval=0".to_string(),
+                "-x".to_string(),
+                "8".to_string(),
+                "-s".to_string(),
+                "8".to_string(),
+                "-k".to_string(),
+                "1M".to_string(),
+                "-d".to_string(),
+                tmp_dir,
+                "-o".to_string(),
+                tmp_name,
+                (*url).to_string(),
+            ];
+            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
+                ok = true;
+            }
+        } else if command_in_path("curl") {
+            let total_bytes = probe_content_length_with_curl(url);
             let cmd = vec![
                 "curl".to_string(),
                 "-L".to_string(),
                 "--fail".to_string(),
                 "--silent".to_string(),
                 "--show-error".to_string(),
+                "--retry".to_string(),
+                "2".to_string(),
+                "--retry-delay".to_string(),
+                "2".to_string(),
+                "--retry-all-errors".to_string(),
+                "--connect-timeout".to_string(),
+                "15".to_string(),
                 "-o".to_string(),
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_download_with_progress(desc, &cmd, &tmp).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
                 ok = true;
             }
         } else if command_in_path("wget") {
+            let total_bytes = probe_content_length_with_wget(url);
             let cmd = vec![
                 "wget".to_string(),
                 "-q".to_string(),
+                "--tries=2".to_string(),
+                "--timeout=15".to_string(),
                 "-O".to_string(),
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_download_with_progress(desc, &cmd, &tmp).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
                 ok = true;
             }
         } else {
@@ -1880,6 +1929,7 @@ fn run_download_with_progress(
     desc: &str,
     argv: &[String],
     target_path: &Path,
+    total_bytes: Option<u64>,
 ) -> Result<(), String> {
     if argv.is_empty() {
         return Err(format!("{desc}: empty command"));
@@ -1950,10 +2000,17 @@ fn run_download_with_progress(
     let mut out_text = String::new();
     let mut err_text = String::new();
     let mut last_render: Instant;
-    let mut last_probe = Instant::now() - Duration::from_secs(2);
-    let mut last_downloaded = 0u64;
 
-    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, false)?;
+    let downloaded0 = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+    let mut last_progress_desc = download_desc_with_progress(desc, downloaded0, total_bytes);
+    render_tail_block_dlc(
+        &last_progress_desc,
+        "",
+        start.elapsed(),
+        &tail,
+        max_lines,
+        false,
+    )?;
     last_render = Instant::now();
 
     while status.is_none() || channel_open {
@@ -1971,7 +2028,17 @@ fn run_download_with_progress(
                         tail.pop_front();
                     }
                     tail.push_back(line);
-                    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+                    let desc_now = download_desc_with_progress(desc, downloaded, total_bytes);
+                    render_tail_block_dlc(
+                        &desc_now,
+                        "",
+                        start.elapsed(),
+                        &tail,
+                        max_lines,
+                        rendered,
+                    )?;
+                    last_progress_desc = desc_now;
                     rendered = true;
                     last_render = Instant::now();
                 }
@@ -1988,24 +2055,16 @@ fn run_download_with_progress(
                 .map_err(|e| format!("Failed to poll download status: {e}"))?;
         }
 
-        if status.is_none() && last_probe.elapsed() >= Duration::from_secs(1) {
+        if status.is_none() {
             let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
-            if downloaded != last_downloaded || downloaded == 0 {
-                let probe_line = format!("downloaded {}", human_bytes(downloaded));
-                if tail.len() == max_lines {
-                    tail.pop_front();
-                }
-                tail.push_back(probe_line);
-                render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
-                rendered = true;
-                last_render = Instant::now();
-                last_downloaded = downloaded;
+            let desc_now = download_desc_with_progress(desc, downloaded, total_bytes);
+            if desc_now != last_progress_desc {
+                last_progress_desc = desc_now;
             }
-            last_probe = Instant::now();
         }
 
         if status.is_none() && rendered && last_render.elapsed() >= Duration::from_millis(100) {
-            render_tail_title_only_dlc(desc, start.elapsed(), max_lines)?;
+            render_tail_title_only_dlc(&last_progress_desc, start.elapsed(), max_lines)?;
             last_render = Instant::now();
         }
     }
@@ -2025,7 +2084,7 @@ fn run_download_with_progress(
         render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
         return Ok(());
     }
-    render_tail_block_dlc(desc, "✘", elapsed, &tail, max_lines, rendered)?;
+    render_tail_block_dlc(&last_progress_desc, "✘", elapsed, &tail, max_lines, rendered)?;
     let mut msg = String::new();
     msg.push_str(out_text.trim());
     if !msg.is_empty() && !err_text.trim().is_empty() {
@@ -2049,6 +2108,77 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn download_desc_with_progress(base: &str, downloaded: u64, total_bytes: Option<u64>) -> String {
+    match total_bytes {
+        Some(total) if total > 0 => format!("{base} [{}/{}]", human_bytes(downloaded), human_bytes(total)),
+        _ => format!("{base} [{}]", human_bytes(downloaded)),
+    }
+}
+
+fn probe_content_length_with_curl(url: &str) -> Option<u64> {
+    let out = Command::new("curl")
+        .arg("-L")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--head")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn probe_content_length_with_wget(url: &str) -> Option<u64> {
+    let out = Command::new("wget")
+        .arg("--spider")
+        .arg("--server-response")
+        .arg("--timeout=10")
+        .arg("--tries=1")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stderr))
+}
+
+fn parse_content_length_from_headers(text: &str) -> Option<u64> {
+    let mut out: Option<u64> = None;
+    for line in text.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let lower = s.to_ascii_lowercase();
+        if !lower.starts_with("content-length:") {
+            continue;
+        }
+        let n = s.split_once(':').map(|(_, v)| v.trim()).and_then(|v| {
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<u64>().ok()
+            }
+        });
+        if let Some(v) = n {
+            out = Some(v);
+        }
+    }
+    out
 }
 
 fn save_runtime_record(

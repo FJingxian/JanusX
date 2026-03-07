@@ -18,6 +18,7 @@ const JANUSX_SIF_URLS: [&str; 2] = [
     "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
 ];
+const MICROMAMBA_URLS: [&str; 1] = ["https://micro.mamba.pm/api/micromamba/linux-64/latest"];
 
 #[derive(Clone, Debug)]
 struct MethodStatus {
@@ -203,7 +204,10 @@ fn collect_build_method_status() -> Vec<MethodStatus> {
     } else {
         false
     };
-    let has_singularity = command_in_path("singularity");
+    let singularity_ready = match find_bin("singularity") {
+        Some(bin) => singularity_runtime_ready(&bin).0,
+        None => false,
+    };
 
     if !linux {
         let checks = vec![("docker", has_docker), ("daemon", docker_daemon)];
@@ -242,7 +246,7 @@ fn collect_build_method_status() -> Vec<MethodStatus> {
             id: 4,
             name: "singularity",
             builder_id: 4,
-            checks: vec![("Linux", linux), ("singularity", has_singularity)],
+            checks: vec![("Linux", linux), ("singularity", singularity_ready)],
             selectable: false,
         },
     ];
@@ -437,9 +441,10 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
         return Err("env method is Linux only.".to_string());
     }
     prepare_env_runtime_bin(runtime_home)?;
-    let missing_before = missing_local_tools();
-    if missing_before.is_empty() {
-        sync_env_runtime_bin(runtime_home)?;
+    let env_prefix = env_runtime_prefix_dir(runtime_home);
+    let host_missing = missing_host_tools();
+    if host_missing.is_empty() {
+        sync_env_runtime_bin_mixed(runtime_home, &env_prefix)?;
         return Ok(RuntimeRecord {
             method_id: 1,
             runtime_mode: "env".to_string(),
@@ -451,134 +456,39 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
             updated_at: now_utc_epoch(),
         });
     }
-    let Some(pm) = linux_pkg_manager() else {
-        return Err(
-            "Unsupported Linux package manager (need apt-get/dnf/yum/pacman/zypper).".to_string(),
-        );
-    };
-    if pm == "apt-get" {
-        run_cmd(
-            &format!("build via env [{} update]", pm),
-            &with_sudo(vec!["apt-get".to_string(), "update".to_string()])?,
-            true,
-        )?;
-        run_cmd(
-            "build via env [apt core tools]",
-            &with_sudo(vec![
-                "apt-get".to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                "fastp".to_string(),
-                "bwa".to_string(),
-                "samtools".to_string(),
-                "bcftools".to_string(),
-                "tabix".to_string(),
-                "plink".to_string(),
-                "default-jre".to_string(),
-            ])?,
-            true,
-        )?;
-        run_cmd(
-            "build via env [apt gatk]",
-            &with_sudo(vec![
-                "apt-get".to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                "gatk".to_string(),
-            ])?,
-            false,
-        )?;
-        run_cmd(
-            "build via env [apt beagle]",
-            &with_sudo(vec![
-                "apt-get".to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                "beagle".to_string(),
-            ])?,
-            false,
-        )?;
-    } else if pm == "dnf" || pm == "yum" {
-        run_cmd(
-            &format!("build via env [{pm} core tools]"),
-            &with_sudo(vec![
-                pm.to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                "fastp".to_string(),
-                "bwa".to_string(),
-                "samtools".to_string(),
-                "bcftools".to_string(),
-                "htslib".to_string(),
-                "plink".to_string(),
-                "java-17-openjdk".to_string(),
-            ])?,
-            true,
-        )?;
-        run_cmd(
-            &format!("build via env [{pm} gatk]"),
-            &with_sudo(vec![
-                pm.to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                "gatk".to_string(),
-            ])?,
-            false,
-        )?;
-    } else if pm == "pacman" {
-        run_cmd(
-            "build via env [pacman core tools]",
-            &with_sudo(vec![
-                "pacman".to_string(),
-                "-Sy".to_string(),
-                "--noconfirm".to_string(),
-                "fastp".to_string(),
-                "bwa".to_string(),
-                "samtools".to_string(),
-                "bcftools".to_string(),
-                "htslib".to_string(),
-                "plink".to_string(),
-                "jre-openjdk".to_string(),
-            ])?,
-            true,
-        )?;
-    } else if pm == "zypper" {
-        run_cmd(
-            "build via env [zypper core tools]",
-            &with_sudo(vec![
-                "zypper".to_string(),
-                "--non-interactive".to_string(),
-                "install".to_string(),
-                "fastp".to_string(),
-                "bwa".to_string(),
-                "samtools".to_string(),
-                "bcftools".to_string(),
-                "tabix".to_string(),
-                "plink".to_string(),
-                "java-17-openjdk".to_string(),
-            ])?,
-            true,
-        )?;
-        run_cmd(
-            "build via env [zypper gatk]",
-            &with_sudo(vec![
-                "zypper".to_string(),
-                "--non-interactive".to_string(),
-                "install".to_string(),
-                "gatk".to_string(),
-            ])?,
-            false,
-        )?;
+    let micromamba_bin = ensure_micromamba(runtime_home)?;
+    let install_pkgs = toolchain_packages_for_tools(&host_missing);
+    if install_pkgs.is_empty() {
+        return Err("No installable packages resolved for missing env tools.".to_string());
     }
-
-    let missing_after = missing_local_tools();
+    let mut install_cmd = vec![micromamba_bin.to_string_lossy().to_string()];
+    if env_prefix.exists() {
+        install_cmd.push("install".to_string());
+    } else {
+        install_cmd.push("create".to_string());
+    }
+    install_cmd.extend([
+        "-y".to_string(),
+        "-p".to_string(),
+        env_prefix.to_string_lossy().to_string(),
+        "-c".to_string(),
+        "bioconda".to_string(),
+        "-c".to_string(),
+        "conda-forge".to_string(),
+    ]);
+    if !env_prefix.exists() {
+        install_cmd.push("python=3.10".to_string());
+    }
+    install_cmd.extend(install_pkgs);
+    run_cmd("build via env [local dlc env]", &install_cmd, true)?;
+    sync_env_runtime_bin_mixed(runtime_home, &env_prefix)?;
+    let missing_after = missing_env_runtime_tools(runtime_home);
     if !missing_after.is_empty() {
         return Err(format!(
-            "Host runtime is still missing tools: {}",
+            "DLC env runtime is still missing tools: {}",
             missing_after.join(", ")
         ));
     }
-    sync_env_runtime_bin(runtime_home)?;
     Ok(RuntimeRecord {
         method_id: 1,
         runtime_mode: "env".to_string(),
@@ -598,31 +508,28 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
     let Some(conda_bin) = find_bin("conda") else {
         return Err("conda command not found in PATH.".to_string());
     };
-    let prefix = vec![
-        conda_bin.to_string_lossy().to_string(),
-        "run".to_string(),
-        "--no-capture-output".to_string(),
-        "-n".to_string(),
-        CONDA_ENV.to_string(),
-    ];
-    let missing_now = missing_tools_in_prefixed_runtime(&prefix)?;
-    if missing_now.is_empty() {
-        return Ok(RuntimeRecord {
-            method_id: 2,
-            runtime_mode: "conda".to_string(),
-            image_tag: String::new(),
-            conda_env: CONDA_ENV.to_string(),
-            sif_path: String::new(),
-            installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
-            status: "ok".to_string(),
-            updated_at: now_utc_epoch(),
-        });
+    let conda_bin_s = conda_bin.to_string_lossy().to_string();
+    let mut env_exists = conda_env_named_exists(&conda_bin, CONDA_ENV);
+    if env_exists && !conda_env_exists(&conda_bin, CONDA_ENV) {
+        run_cmd(
+            "build via conda [remove broken env]",
+            &vec![
+                conda_bin_s.clone(),
+                "env".to_string(),
+                "remove".to_string(),
+                "-n".to_string(),
+                CONDA_ENV.to_string(),
+                "-y".to_string(),
+            ],
+            true,
+        )?;
+        env_exists = false;
     }
-    if !conda_env_exists(&conda_bin, CONDA_ENV) {
+    if !env_exists {
         run_cmd(
             &format!("build via conda [create {CONDA_ENV}]"),
             &vec![
-                conda_bin.to_string_lossy().to_string(),
+                conda_bin_s.clone(),
                 "create".to_string(),
                 "-n".to_string(),
                 CONDA_ENV.to_string(),
@@ -632,50 +539,102 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             true,
         )?;
     }
-    run_cmd(
-        "build via conda [install 1/2]",
-        &vec![
-            conda_bin.to_string_lossy().to_string(),
-            "install".to_string(),
-            "-n".to_string(),
-            CONDA_ENV.to_string(),
-            "-c".to_string(),
-            "conda-forge".to_string(),
-            "openjdk=17".to_string(),
-            "-y".to_string(),
-        ],
-        true,
-    )?;
-    run_cmd(
-        "build via conda [install 2/2]",
-        &vec![
-            conda_bin.to_string_lossy().to_string(),
-            "install".to_string(),
-            "-n".to_string(),
-            CONDA_ENV.to_string(),
-            "-c".to_string(),
-            "bioconda".to_string(),
-            "-c".to_string(),
-            "conda-forge".to_string(),
-            "fastp".to_string(),
-            "bwa".to_string(),
-            "samtools".to_string(),
-            "bcftools".to_string(),
-            "htslib".to_string(),
-            "plink".to_string(),
-            "beagle".to_string(),
-            "picard".to_string(),
-            "gatk4".to_string(),
-            "-y".to_string(),
-        ],
-        true,
-    )?;
+
+    let prefix = vec![
+        conda_bin_s.clone(),
+        "run".to_string(),
+        "--no-capture-output".to_string(),
+        "-n".to_string(),
+        CONDA_ENV.to_string(),
+    ];
+
+    let missing_now = match missing_tools_in_prefixed_runtime(&prefix) {
+        Ok(v) => v,
+        Err(e) => {
+            if !should_rebuild_conda_env(&e) {
+                return Err(e);
+            }
+            run_cmd(
+                "build via conda [remove invalid env]",
+                &vec![
+                    conda_bin_s.clone(),
+                    "env".to_string(),
+                    "remove".to_string(),
+                    "-n".to_string(),
+                    CONDA_ENV.to_string(),
+                    "-y".to_string(),
+                ],
+                true,
+            )?;
+            run_cmd(
+                &format!("build via conda [create {CONDA_ENV}]"),
+                &vec![
+                    conda_bin_s.clone(),
+                    "create".to_string(),
+                    "-n".to_string(),
+                    CONDA_ENV.to_string(),
+                    "python=3.10".to_string(),
+                    "-y".to_string(),
+                ],
+                true,
+            )?;
+            REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect()
+        }
+    };
+    if !missing_now.is_empty() {
+        let pkgs = toolchain_packages_for_tools(&missing_now);
+        install_conda_packages(
+            &conda_bin_s,
+            CONDA_ENV,
+            &pkgs,
+            "build via conda [install missing]",
+        )?;
+    }
     let missing_after = missing_tools_in_prefixed_runtime(&prefix)?;
     if !missing_after.is_empty() {
-        return Err(format!(
-            "Conda runtime is still missing tools: {}",
-            missing_after.join(", ")
-        ));
+        run_cmd(
+            "build via conda [rebuild env remove]",
+            &vec![
+                conda_bin_s.clone(),
+                "env".to_string(),
+                "remove".to_string(),
+                "-n".to_string(),
+                CONDA_ENV.to_string(),
+                "-y".to_string(),
+            ],
+            true,
+        )?;
+        run_cmd(
+            &format!("build via conda [create {CONDA_ENV}]"),
+            &vec![
+                conda_bin_s.clone(),
+                "create".to_string(),
+                "-n".to_string(),
+                CONDA_ENV.to_string(),
+                "python=3.10".to_string(),
+                "-y".to_string(),
+            ],
+            true,
+        )?;
+        let all_pkgs = toolchain_packages_for_tools(
+            &REQUIRED_TOOLS
+                .iter()
+                .map(|x| (*x).to_string())
+                .collect::<Vec<String>>(),
+        );
+        install_conda_packages(
+            &conda_bin_s,
+            CONDA_ENV,
+            &all_pkgs,
+            "build via conda [rebuild install]",
+        )?;
+        let missing_rebuilt = missing_tools_in_prefixed_runtime(&prefix)?;
+        if !missing_rebuilt.is_empty() {
+            return Err(format!(
+                "Conda runtime is still missing tools: {}",
+                missing_rebuilt.join(", ")
+            ));
+        }
     }
     Ok(RuntimeRecord {
         method_id: 2,
@@ -777,6 +736,10 @@ fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
     let Some(singularity_bin) = find_bin("singularity") else {
         return Err("singularity command not found in PATH".to_string());
     };
+    let (ready, detail) = singularity_runtime_ready(&singularity_bin);
+    if !ready {
+        return Err(format!("Singularity runtime is not usable: {detail}"));
+    }
     let pipeline_dir = pipeline_dir_from_python(python)?;
     let bin_dir = pipeline_dir.join("bin");
     fs::create_dir_all(&bin_dir)
@@ -920,6 +883,10 @@ fn build_tool_command(
             let Some(singularity_bin) = find_bin("singularity") else {
                 return Err("singularity command not found in PATH.".to_string());
             };
+            let (ready, detail) = singularity_runtime_ready(&singularity_bin);
+            if !ready {
+                return Err(format!("Singularity runtime is not usable: {detail}"));
+            }
             let sif = PathBuf::from(record.sif_path.trim());
             if !sif.exists() {
                 return Err(
@@ -983,6 +950,10 @@ fn missing_tools_for_record(
             let Some(singularity_bin) = find_bin("singularity") else {
                 return Err("singularity command not found in PATH.".to_string());
             };
+            let (ready, detail) = singularity_runtime_ready(&singularity_bin);
+            if !ready {
+                return Err(format!("Singularity runtime is not usable: {detail}"));
+            }
             let sif = record.sif_path.trim();
             if sif.is_empty() {
                 return Err("Saved singularity runtime is invalid.".to_string());
@@ -995,14 +966,6 @@ fn missing_tools_for_record(
         }
         _ => Err("Unknown DLC runtime mode.".to_string()),
     }
-}
-
-fn missing_local_tools() -> Vec<String> {
-    REQUIRED_TOOLS
-        .iter()
-        .filter(|x| !command_in_path(x))
-        .map(|x| (*x).to_string())
-        .collect()
 }
 
 fn prepare_env_runtime_bin(runtime_home: &Path) -> Result<(), String> {
@@ -1019,21 +982,132 @@ fn env_runtime_bin_dir(runtime_home: &Path) -> PathBuf {
     runtime_home.join("dlc").join("bin")
 }
 
+fn env_runtime_prefix_dir(runtime_home: &Path) -> PathBuf {
+    runtime_home.join("dlc").join("env")
+}
+
+fn env_runtime_micromamba_root(runtime_home: &Path) -> PathBuf {
+    runtime_home.join("dlc").join("_micromamba")
+}
+
+fn env_runtime_micromamba_bin(runtime_home: &Path) -> PathBuf {
+    env_runtime_micromamba_root(runtime_home)
+        .join("bin")
+        .join("micromamba")
+}
+
 fn env_runtime_tool_path(runtime_home: &Path, tool: &str) -> PathBuf {
     env_runtime_bin_dir(runtime_home).join(tool)
 }
 
-fn sync_env_runtime_bin(runtime_home: &Path) -> Result<(), String> {
+fn missing_host_tools() -> Vec<String> {
+    REQUIRED_TOOLS
+        .iter()
+        .filter(|x| !command_in_path(x))
+        .map(|x| (*x).to_string())
+        .collect()
+}
+
+fn ensure_micromamba(runtime_home: &Path) -> Result<PathBuf, String> {
+    let mm_bin = env_runtime_micromamba_bin(runtime_home);
+    if mm_bin.exists() {
+        return Ok(mm_bin);
+    }
+    let mm_root = env_runtime_micromamba_root(runtime_home);
+    fs::create_dir_all(&mm_root).map_err(|e| {
+        format!(
+            "Failed to prepare micromamba directory {}: {e}",
+            mm_root.display()
+        )
+    })?;
+    if !command_in_path("tar") {
+        return Err(
+            "`tar` command not found in PATH (required for env local install).".to_string(),
+        );
+    }
+    let archive = mm_root.join("micromamba.tar.bz2");
+    if !archive.exists() {
+        download_with_fallback(&MICROMAMBA_URLS, &archive)?;
+    }
+    run_cmd(
+        "build via env [extract micromamba]",
+        &vec![
+            "tar".to_string(),
+            "-xjf".to_string(),
+            archive.to_string_lossy().to_string(),
+            "-C".to_string(),
+            mm_root.to_string_lossy().to_string(),
+        ],
+        true,
+    )?;
+    if !mm_bin.exists() {
+        return Err(format!(
+            "micromamba binary not found after extraction: {}",
+            mm_bin.display()
+        ));
+    }
+    Ok(mm_bin)
+}
+
+fn sync_env_runtime_bin_mixed(runtime_home: &Path, env_prefix: &Path) -> Result<(), String> {
     prepare_env_runtime_bin(runtime_home)?;
     let bin_dir = env_runtime_bin_dir(runtime_home);
     for tool in REQUIRED_TOOLS {
-        let Some(src) = find_bin(tool) else {
-            return Err(format!("Cannot locate host tool `{tool}` in PATH."));
+        let local_src = env_prefix.join("bin").join(tool);
+        let src = if local_src.exists() {
+            local_src
+        } else {
+            let Some(host_src) = find_bin(tool) else {
+                return Err(format!(
+                    "Tool `{tool}` not found in either host PATH or DLC env prefix {}",
+                    env_prefix.display()
+                ));
+            };
+            host_src
         };
         let dst = bin_dir.join(tool);
         write_tool_wrapper(&dst, &src)?;
     }
     Ok(())
+}
+
+fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for t in tools {
+        match t.as_str() {
+            "fastp" => {
+                out.insert("fastp".to_string());
+            }
+            "bwa" => {
+                out.insert("bwa".to_string());
+            }
+            "samtools" => {
+                out.insert("samtools".to_string());
+            }
+            "bcftools" => {
+                out.insert("bcftools".to_string());
+            }
+            "tabix" => {
+                out.insert("htslib".to_string());
+            }
+            "plink" => {
+                out.insert("plink".to_string());
+            }
+            "beagle" => {
+                out.insert("beagle".to_string());
+                out.insert("openjdk=17".to_string());
+            }
+            "gatk" => {
+                out.insert("gatk4".to_string());
+                out.insert("picard".to_string());
+                out.insert("openjdk=17".to_string());
+            }
+            other => {
+                out.insert(other.to_string());
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn write_tool_wrapper(dst: &Path, src: &Path) -> Result<(), String> {
@@ -1373,33 +1447,10 @@ print("\t".join(vals))
     }))
 }
 
-fn linux_pkg_manager() -> Option<&'static str> {
-    for name in ["apt-get", "dnf", "yum", "pacman", "zypper"] {
-        if command_in_path(name) {
-            return Some(name);
-        }
-    }
-    None
-}
-
-fn with_sudo(cmd: Vec<String>) -> Result<Vec<String>, String> {
-    if is_root() {
-        return Ok(cmd);
-    }
-    if !command_in_path("sudo") {
-        return Err("Host installation requires root privilege (sudo not found).".to_string());
-    }
-    let mut out = vec!["sudo".to_string()];
-    out.extend(cmd);
-    Ok(out)
-}
-
-fn is_root() -> bool {
-    if cfg!(windows) {
-        return false;
-    }
-    let out = Command::new("id")
-        .arg("-u")
+fn conda_env_named_exists(conda_bin: &Path, env_name: &str) -> bool {
+    let out = Command::new(conda_bin)
+        .arg("env")
+        .arg("list")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -1410,7 +1461,48 @@ fn is_root() -> bool {
     if !out.status.success() {
         return false;
     }
-    String::from_utf8_lossy(&out.stdout).trim() == "0"
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = s.split_whitespace().collect();
+        if cols.iter().any(|x| *x == env_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn install_conda_packages(
+    conda_bin: &str,
+    env_name: &str,
+    packages: &[String],
+    label: &str,
+) -> Result<(), String> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = vec![
+        conda_bin.to_string(),
+        "install".to_string(),
+        "-n".to_string(),
+        env_name.to_string(),
+        "-c".to_string(),
+        "bioconda".to_string(),
+        "-c".to_string(),
+        "conda-forge".to_string(),
+    ];
+    cmd.extend(packages.iter().cloned());
+    cmd.push("-y".to_string());
+    run_cmd(label, &cmd, true)
+}
+
+fn should_rebuild_conda_env(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("environmentlocationnotfound")
+        || e.contains("not a conda environment")
+        || e.contains("condaenvironmenterror")
 }
 
 fn conda_env_exists(conda_bin: &Path, env_name: &str) -> bool {
@@ -1444,6 +1536,34 @@ fn docker_daemon_running() -> (bool, String) {
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if err.is_empty() {
         (false, "docker daemon unavailable".to_string())
+    } else {
+        (false, err)
+    }
+}
+
+fn singularity_runtime_ready(singularity_bin: &Path) -> (bool, String) {
+    let out = Command::new(singularity_bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return (false, "failed to call singularity --version".to_string());
+    };
+    if out.status.success() {
+        return (true, String::new());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.contains("singularity.conf") {
+        return (
+            false,
+            "missing singularity configuration file (e.g. /etc/singularity/singularity.conf)"
+                .to_string(),
+        );
+    }
+    if err.is_empty() {
+        (false, "singularity runtime unavailable".to_string())
     } else {
         (false, err)
     }

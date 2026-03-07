@@ -96,6 +96,25 @@ struct UpdateOptions {
     editable: bool,
 }
 
+#[derive(Clone, Debug)]
+enum UpgradeSource {
+    Latest,
+    Local(String),
+}
+
+#[derive(Clone, Debug)]
+struct UpgradeOptions {
+    source: UpgradeSource,
+    verbose: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum LauncherReplaceResult {
+    ReplacedNow,
+    #[cfg(windows)]
+    ReplacedAfterExit,
+}
+
 fn main() {
     let installer_mode = is_installer_binary();
     let code = match run() {
@@ -160,6 +179,14 @@ fn run() -> Result<i32, String> {
             Err(e) => return Err(e),
         };
         return run_update(opts);
+    }
+    if matches!(head, "-upgrade" | "--upgrade") {
+        let opts = match parse_upgrade_args(&args[1..]) {
+            Ok(v) => v,
+            Err(e) if e.is_empty() => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        return run_upgrade(opts);
     }
     if matches!(head, "-load" | "--load") {
         return run_load(&args[1..]);
@@ -1292,6 +1319,377 @@ fn normalize_version_token(raw: &str) -> Option<String> {
         return None;
     }
     Some(t.to_string())
+}
+
+fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
+    let mut latest = false;
+    let mut local_source: Option<String> = None;
+    let mut verbose = false;
+
+    for token in args {
+        match token.as_str() {
+            "latest" | "--latest" => latest = true,
+            "--verbose" => verbose = true,
+            "-h" | "--help" | "help" => {
+                println!(
+                    "Upgrade usage:\n  jx --upgrade\n  jx --upgrade latest [--verbose]\n  jx --upgrade <local_path> [--verbose]"
+                );
+                return Err(String::new());
+            }
+            other => {
+                if Path::new(other).exists() {
+                    if local_source.is_some() {
+                        return Err(
+                            "Only one local source path is allowed for `--upgrade`.".to_string()
+                        );
+                    }
+                    local_source = Some(other.to_string());
+                } else {
+                    return Err(format!(
+                        "Unknown upgrade option: {other}\nUpgrade usage:\n  jx --upgrade\n  jx --upgrade latest [--verbose]\n  jx --upgrade <local_path> [--verbose]"
+                    ));
+                }
+            }
+        }
+    }
+
+    if latest && local_source.is_some() {
+        return Err("`latest` and local path cannot be used together.".to_string());
+    }
+
+    let source = if let Some(path) = local_source {
+        UpgradeSource::Local(path)
+    } else {
+        UpgradeSource::Latest
+    };
+
+    Ok(UpgradeOptions { source, verbose })
+}
+
+fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
+    let home = runtime_home()?;
+    let python = ensure_runtime(false)?;
+    ensure_rust_toolchain_for_upgrade(&home, &python, opts.verbose)?;
+
+    let (launcher_dir, cleanup_dir) = prepare_upgrade_launcher_source(&opts, &home, &python)?;
+    let replace_result = (|| -> Result<LauncherReplaceResult, String> {
+        let built = build_launcher_binary_from_source(&launcher_dir, &home, opts.verbose)?;
+        replace_current_launcher_binary(&built, opts.verbose)
+    })();
+    if let Some(dir) = cleanup_dir {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    match replace_result? {
+        LauncherReplaceResult::ReplacedNow => {
+            print_success_line("Launcher upgrade completed. Current `jx` has been replaced.");
+        }
+        #[cfg(windows)]
+        LauncherReplaceResult::ReplacedAfterExit => {
+            print_success_line(
+                "Launcher upgrade compiled and staged. `jx` will be replaced after this process exits.",
+            );
+            println!("Re-run `jx -h` to verify the upgraded launcher.");
+        }
+    }
+    Ok(0)
+}
+
+fn ensure_rust_toolchain_for_upgrade(
+    runtime_home: &Path,
+    python: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    if verbose {
+        eprintln!("Checking Rust toolchain for launcher source build...");
+    }
+    if any_rust_toolchain_ready(runtime_home) {
+        if verbose {
+            eprintln!("Rust toolchain is available.");
+        }
+        return Ok(());
+    }
+    if verbose {
+        eprintln!("Rust toolchain not detected; installing local Rust toolchain...");
+    }
+    ensure_local_rust_toolchain(runtime_home, python, verbose)
+}
+
+fn prepare_upgrade_launcher_source(
+    opts: &UpgradeOptions,
+    runtime_home: &Path,
+    python: &Path,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    match &opts.source {
+        UpgradeSource::Local(raw) => {
+            let source = canonical_or_self(Path::new(raw));
+            let launcher_dir = resolve_launcher_dir_from_source_path(&source)?;
+            return Ok((launcher_dir, None));
+        }
+        UpgradeSource::Latest => {}
+    }
+
+    let work_dir = runtime_home.join(".launcher-upgrade-src");
+    if work_dir.exists() {
+        std::fs::remove_dir_all(&work_dir).map_err(|e| {
+            format!(
+                "Failed to clear launcher upgrade workspace {}: {e}",
+                work_dir.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&work_dir).map_err(|e| {
+        format!(
+            "Failed to create launcher upgrade workspace {}: {e}",
+            work_dir.display()
+        )
+    })?;
+
+    let repo_dir = work_dir.join("repo");
+    let repo_cn = repo_url_from_spec(GITHUB_SPEC_CN);
+    let repo_origin = repo_url_from_spec(GITHUB_SPEC_ORIGIN);
+    let mut git_ok = false;
+    if command_ok("git", &["--version"]) {
+        match git_clone_source_repo(
+            &repo_cn,
+            &repo_dir,
+            "Cloning JanusX source (CN mirror) ...",
+            opts.verbose,
+        ) {
+            Ok(_) => git_ok = true,
+            Err(err_cn) => {
+                eprintln!("GitHub CN mirror clone failed, retrying source...");
+                if opts.verbose {
+                    eprintln!("Reason: {err_cn}");
+                }
+                git_clone_source_repo(
+                    &repo_origin,
+                    &repo_dir,
+                    "Cloning JanusX source (source) ...",
+                    opts.verbose,
+                )?;
+                git_ok = true;
+            }
+        }
+    }
+    if git_ok {
+        let launcher_dir = resolve_launcher_dir_from_source_path(&repo_dir)?;
+        return Ok((launcher_dir, Some(work_dir)));
+    }
+
+    let archive_path = work_dir.join("JanusX-latest-main.tar.gz");
+    match download_file_with_http_tools(
+        GITHUB_ARCHIVE_CN,
+        &archive_path,
+        "Downloading GitHub source archive (CN mirror) ...",
+        opts.verbose,
+    ) {
+        Ok(_) => {}
+        Err(err_cn) => {
+            eprintln!("GitHub source archive CN mirror failed, retrying source...");
+            if opts.verbose {
+                eprintln!("Reason: {err_cn}");
+            }
+            download_file_with_http_tools(
+                GITHUB_ARCHIVE_ORIGIN,
+                &archive_path,
+                "Downloading GitHub source archive (source) ...",
+                opts.verbose,
+            )?;
+        }
+    }
+
+    let extract_dir = work_dir.join("extract");
+    std::fs::create_dir_all(&extract_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            extract_dir.display()
+        )
+    })?;
+    extract_tar_gz_with_python(python, &archive_path, &extract_dir, opts.verbose)?;
+    let repo_root = find_repo_root_with_launcher(&extract_dir).ok_or_else(|| {
+        format!(
+            "Failed to locate JanusX source root containing launcher/Cargo.toml under {}",
+            extract_dir.display()
+        )
+    })?;
+    let launcher_dir = resolve_launcher_dir_from_source_path(&repo_root)?;
+    Ok((launcher_dir, Some(work_dir)))
+}
+
+fn git_clone_source_repo(
+    repo_url: &str,
+    dst: &Path,
+    desc: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst)
+            .map_err(|e| format!("Failed to clear {} before clone: {e}", dst.display()))?;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg(repo_url)
+        .arg(dst)
+        .stdin(Stdio::null());
+    run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
+        .map_err(|e| format!("Failed to clone source repo: {e}"))
+}
+
+fn find_repo_root_with_launcher(root: &Path) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join("launcher").join("Cargo.toml").exists() {
+            return Some(dir);
+        }
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_launcher_dir_from_source_path(source: &Path) -> Result<PathBuf, String> {
+    let source = canonical_or_self(source);
+    let direct = source.join("Cargo.toml");
+    let direct_main = source.join("src").join("main.rs");
+    if direct.exists() && direct_main.exists() {
+        return Ok(source);
+    }
+    let nested = source.join("launcher");
+    let nested_cargo = nested.join("Cargo.toml");
+    if nested_cargo.exists() {
+        return Ok(nested);
+    }
+    Err(format!(
+        "Launcher source not found from {} (expect `<src>/launcher/Cargo.toml` or `<src>/Cargo.toml`).",
+        source.display()
+    ))
+}
+
+fn build_launcher_binary_from_source(
+    launcher_dir: &Path,
+    runtime_home: &Path,
+    verbose: bool,
+) -> Result<PathBuf, String> {
+    if !launcher_dir.join("Cargo.toml").exists() {
+        return Err(format!(
+            "Launcher Cargo.toml not found in {}",
+            launcher_dir.display()
+        ));
+    }
+
+    let local_cargo = local_cargo_path(runtime_home);
+    let use_local_toolchain = local_rust_toolchain_ready(runtime_home) && local_cargo.exists();
+
+    let mut cmd = if use_local_toolchain {
+        Command::new(&local_cargo)
+    } else {
+        Command::new("cargo")
+    };
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg("jx")
+        .current_dir(launcher_dir)
+        .stdin(Stdio::null());
+    if launcher_dir.join("Cargo.lock").exists() {
+        cmd.arg("--locked");
+    }
+    if use_local_toolchain {
+        apply_local_rust_env(&mut cmd, runtime_home, true);
+    }
+    run_cmd_with_optional_spinner(&mut cmd, "Compiling launcher from source ...", verbose)
+        .map_err(|e| format!("Launcher source build failed: {e}"))?;
+
+    let built = launcher_dir
+        .join("target")
+        .join("release")
+        .join(if cfg!(windows) { "jx.exe" } else { "jx" });
+    if !built.exists() {
+        return Err(format!(
+            "Build completed but launcher binary not found: {}",
+            built.display()
+        ));
+    }
+    Ok(built)
+}
+
+fn replace_current_launcher_binary(
+    built_binary: &Path,
+    _verbose: bool,
+) -> Result<LauncherReplaceResult, String> {
+    let current = env::current_exe().map_err(|e| format!("Failed to locate current jx: {e}"))?;
+    let install_dir = current
+        .parent()
+        .ok_or_else(|| "Failed to resolve current jx install directory.".to_string())?;
+    let staged = install_dir.join(if cfg!(windows) { "jx.new.exe" } else { "jx.new" });
+    if staged.exists() {
+        std::fs::remove_file(&staged)
+            .map_err(|e| format!("Failed to remove stale staged launcher {}: {e}", staged.display()))?;
+    }
+    std::fs::copy(built_binary, &staged).map_err(|e| {
+        format!(
+            "Failed to stage launcher binary {} -> {}: {e}",
+            built_binary.display(),
+            staged.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&staged)
+            .map_err(|e| format!("Failed to stat staged launcher {}: {e}", staged.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&staged, perms)
+            .map_err(|e| format!("Failed to chmod staged launcher {}: {e}", staged.display()))?;
+    }
+
+    #[cfg(windows)]
+    {
+        let esc_stage = staged.to_string_lossy().replace('"', "\"\"");
+        let esc_current = current.to_string_lossy().replace('"', "\"\"");
+        let cmdline = format!(
+            "ping 127.0.0.1 -n 2 >NUL & move /Y \"{esc_stage}\" \"{esc_current}\" >NUL 2>NUL"
+        );
+        if _verbose {
+            println!("Applying launcher replacement after exit: {cmdline}");
+        }
+        Command::new("cmd")
+            .arg("/C")
+            .arg(cmdline)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to stage launcher replacement: {e}"))?;
+        return Ok(LauncherReplaceResult::ReplacedAfterExit);
+    }
+
+    #[cfg(not(windows))]
+    {
+        match std::fs::rename(&staged, &current) {
+            Ok(_) => Ok(LauncherReplaceResult::ReplacedNow),
+            Err(rename_err) => {
+                let _ = std::fs::remove_file(&current);
+                std::fs::rename(&staged, &current).map_err(|retry_err| {
+                    format!(
+                        "Failed to replace current launcher {} (first: {}; retry: {})",
+                        current.display(),
+                        rename_err,
+                        retry_err
+                    )
+                })?;
+                Ok(LauncherReplaceResult::ReplacedNow)
+            }
+        }
+    }
 }
 
 fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
@@ -3590,6 +3988,13 @@ fn print_cli_help() {
         2,
         "-update, --update",
         "Update JanusX: `jx --update [dlc|latest|<local_path>] [-e|--editable] [--verbose]`",
+        24,
+        width,
+    );
+    print_help_entry(
+        2,
+        "-upgrade, --upgrade",
+        "Upgrade launcher only from source: `jx --upgrade [latest|<local_path>] [--verbose]`",
         24,
         width,
     );

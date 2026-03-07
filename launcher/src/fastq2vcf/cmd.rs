@@ -66,14 +66,25 @@ pub(super) fn cmd_bwamem(
     let prefix = cmd_prefix(singularity);
     let out_bam = out.join(format!("{sample}.sorted.bam"));
     let out_done = out.join(format!("{sample}.sorted.bam.finished"));
+    let out_bai = out.join(format!("{sample}.sorted.bam.bai"));
+    let sort_tmp_prefix = out.join(format!("{sample}.sorted.bam.tmp"));
+    let sort_tmp_glob = format!("{}*", qpath(&sort_tmp_prefix));
     let rg = sh_quote(&format!(
         "@RG\\tID:{sample}\\tPL:illumina\\tLB:{sample}\\tSM:{sample}"
     ));
+    let cleanup_cmd = format!(
+        "rm -f {} {} {} {}",
+        qpath(&out_bam),
+        qpath(&out_bai),
+        qpath(&out_done),
+        sort_tmp_glob,
+    );
     format!(
-        "{prefix}bwa mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -o {} && {prefix}touch {}",
+        "{cleanup_cmd} && {prefix}bwa mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T {} -o {} && touch {}",
         qpath(reference),
         qpath(fq1),
         qpath(fq2),
+        qpath(&sort_tmp_prefix),
         qpath(&out_bam),
         qpath(&out_done),
     )

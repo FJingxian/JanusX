@@ -238,6 +238,7 @@ fn wait_step_outputs(
 
             if let Some(timeout) = stall_timeout {
                 if done < total && last_progress.elapsed() >= timeout {
+                    clear_progress_line_if_tty()?;
                     return Err(format!(
                         "{step_text} has no progress for {} (done {done}/{total}).",
                         super::format_elapsed(timeout)
@@ -302,6 +303,7 @@ fn wait_step_outputs(
                 let failed =
                     find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4, ignore_error_logs)?;
                 if !failed.is_empty() {
+                    clear_progress_line_if_tty()?;
                     return Err(format!(
                         "{step_text} detected failed subtasks. Example stderr:\n{}",
                         failed
@@ -315,6 +317,7 @@ fn wait_step_outputs(
         }
         if let Some(timeout) = stall_timeout {
             if done < total && last_progress.elapsed() >= timeout {
+                clear_progress_line_if_tty()?;
                 return Err(format!(
                     "{step_text} has no progress for {} (done {done}/{total}).",
                     super::format_elapsed(timeout)

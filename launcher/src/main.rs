@@ -1368,8 +1368,12 @@ fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
 
 fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
     let home = runtime_home()?;
-    let python = ensure_runtime(false)?;
-    ensure_rust_toolchain_for_upgrade(&home, &python, opts.verbose)?;
+    let python = select_python_for_launcher_upgrade(&home)?;
+    let rust_check_source = match &opts.source {
+        UpgradeSource::Latest => UpdateSource::Latest,
+        UpgradeSource::Local(path) => UpdateSource::Local(path.clone()),
+    };
+    ensure_rust_toolchain_for_update_source(&rust_check_source, &home, &python, opts.verbose)?;
 
     let (launcher_dir, cleanup_dir) = prepare_upgrade_launcher_source(&opts, &home, &python)?;
     let replace_result = (|| -> Result<LauncherReplaceResult, String> {
@@ -1394,24 +1398,15 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
     Ok(0)
 }
 
-fn ensure_rust_toolchain_for_upgrade(
-    runtime_home: &Path,
-    python: &Path,
-    verbose: bool,
-) -> Result<(), String> {
-    if verbose {
-        eprintln!("Checking Rust toolchain for launcher source build...");
+fn select_python_for_launcher_upgrade(runtime_home: &Path) -> Result<PathBuf, String> {
+    let runtime_py = venv_python(&runtime_home.join("venv"));
+    if runtime_py.exists() {
+        return Ok(runtime_py);
     }
-    if any_rust_toolchain_ready(runtime_home) {
-        if verbose {
-            eprintln!("Rust toolchain is available.");
-        }
-        return Ok(());
-    }
-    if verbose {
-        eprintln!("Rust toolchain not detected; installing local Rust toolchain...");
-    }
-    ensure_local_rust_toolchain(runtime_home, python, verbose)
+    let Some(sys_py) = find_system_python() else {
+        return Err(python_install_hint());
+    };
+    Ok(PathBuf::from(sys_py))
 }
 
 fn prepare_upgrade_launcher_source(
@@ -3409,6 +3404,16 @@ fn ensure_pip_in_venv(python: &Path) -> Result<(), String> {
 }
 
 fn should_rebuild_runtime(home: &Path) -> Result<bool, String> {
+    // Auto rebuild is disabled by default to avoid implicit update/reinstall side effects.
+    // Opt-in with JX_AUTO_RUNTIME_REBUILD=1 when forced rebuild is desired.
+    let auto = env::var("JX_AUTO_RUNTIME_REBUILD")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !auto {
+        return Ok(false);
+    }
+
     let skip = env::var(SKIP_RUNTIME_REBUILD_ENV)
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))

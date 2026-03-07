@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 const REQUIRED_DLC_TOOLS: [&str; 8] = [
     "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
 ];
+const OPTIONAL_HOST_TOOLS: [&str; 1] = ["bgzip"];
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,34 +484,15 @@ fn detect_backend() -> (String, String) {
     )
 }
 
-fn probe_dlc_toolchain() -> Result<Vec<(String, bool)>, String> {
+fn probe_dlc_toolchain() -> Result<Vec<(String, bool, bool)>, String> {
     let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
     let mut out = Vec::new();
 
     for tool in REQUIRED_DLC_TOOLS {
-        let out_cmd = Command::new(&jx_bin)
-            .arg(tool)
-            .arg("-h")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        let out_cmd = match out_cmd {
-            Ok(v) => v,
-            Err(_) => {
-                out.push((tool.to_string(), false));
-                continue;
-            }
-        };
-        if out_cmd.status.success() {
-            out.push((tool.to_string(), true));
-            continue;
-        }
-        let mut merged = String::new();
-        merged.push_str(&String::from_utf8_lossy(&out_cmd.stdout));
-        merged.push('\n');
-        merged.push_str(&String::from_utf8_lossy(&out_cmd.stderr));
-        out.push((tool.to_string(), !wrapper_missing_by_output(&merged)));
+        out.push((tool.to_string(), probe_dlc_tool_wrapper(&jx_bin, tool), true));
+    }
+    for tool in OPTIONAL_HOST_TOOLS {
+        out.push((tool.to_string(), find_in_path(tool).is_some(), false));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -518,9 +500,31 @@ fn probe_dlc_toolchain() -> Result<Vec<(String, bool)>, String> {
     Ok(out)
 }
 
-fn print_toolchain_line(toolchain: &[(String, bool)]) {
+fn probe_dlc_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
+    let out_cmd = Command::new(jx_bin)
+        .arg(tool)
+        .arg("-h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let out_cmd = match out_cmd {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if out_cmd.status.success() {
+        return true;
+    }
+    let mut merged = String::new();
+    merged.push_str(&String::from_utf8_lossy(&out_cmd.stdout));
+    merged.push('\n');
+    merged.push_str(&String::from_utf8_lossy(&out_cmd.stderr));
+    !wrapper_missing_by_output(&merged)
+}
+
+fn print_toolchain_line(toolchain: &[(String, bool, bool)]) {
     let mut segs = Vec::with_capacity(toolchain.len());
-    for (tool, ok) in toolchain {
+    for (tool, ok, _) in toolchain {
         if *ok {
             segs.push(super::style_green(tool));
         } else {
@@ -530,10 +534,18 @@ fn print_toolchain_line(toolchain: &[(String, bool)]) {
     println!("{}", segs.join(" "));
 }
 
-fn missing_tools_from_probe(toolchain: &[(String, bool)]) -> Vec<String> {
+fn missing_tools_from_probe(toolchain: &[(String, bool, bool)]) -> Vec<String> {
     let mut missing = toolchain
         .iter()
-        .filter_map(|(tool, ok)| if *ok { None } else { Some(tool.clone()) })
+        .filter_map(
+            |(tool, ok, required)| {
+                if *required && !*ok {
+                    Some(tool.clone())
+                } else {
+                    None
+                }
+            },
+        )
         .collect::<Vec<String>>();
     missing.sort();
     missing.dedup();

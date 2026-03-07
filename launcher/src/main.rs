@@ -1349,6 +1349,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     let home = runtime_home()?;
     let pypi_spec = resolve_pypi_spec(&home);
     let python = ensure_venv()?;
+    ensure_rust_toolchain_for_update_source(&opts.source, &home, &python, opts.verbose)?;
     let before = installed_version(&python);
     let jx_bin = env::current_exe().ok();
 
@@ -1486,7 +1487,6 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                 }
             }
             // GitHub latest should refresh even when package version string is unchanged.
-            // Rust toolchain bootstrap is now lazy and only happens on explicit build errors.
             let gh_force_reinstall = true;
             if opts.verbose {
                 println!("Updating from GitHub (CN mirror) ...");
@@ -1589,6 +1589,30 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     }
     warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn ensure_rust_toolchain_for_update_source(
+    source: &UpdateSource,
+    runtime_home: &Path,
+    python: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    if !matches!(source, UpdateSource::Latest | UpdateSource::Local(_)) {
+        return Ok(());
+    }
+    if verbose {
+        eprintln!("Checking Rust toolchain for source update...");
+    }
+    if any_rust_toolchain_ready(runtime_home) {
+        if verbose {
+            eprintln!("Rust toolchain is available.");
+        }
+        return Ok(());
+    }
+    if verbose {
+        eprintln!("Rust toolchain not detected; installing local Rust toolchain...");
+    }
+    ensure_local_rust_toolchain(runtime_home, python, verbose)
 }
 
 fn rustup_home(runtime_home: &Path) -> PathBuf {

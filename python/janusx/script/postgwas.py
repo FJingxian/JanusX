@@ -71,6 +71,7 @@ import warnings
 
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
+_QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
 _CJK_FONT_READY: Optional[bool] = None
@@ -2037,6 +2038,50 @@ def _overlay_manhattan_threshold_points(
     )
 
 
+def _qq_select_points_with_threshold(
+    pvals: np.ndarray,
+    *,
+    sig_p_threshold: Optional[float],
+    max_points: int = _QQ_FAST_MAX_POINTS,
+    keep_all: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Select QQ scatter points with deterministic down-sampling:
+    - always keep all points with p <= sig_p_threshold
+    - for remaining points, keep an evenly spaced rank grid up to max_points
+    """
+    p = np.asarray(pvals, dtype=float)
+    p = p[np.isfinite(p) & (p > 0.0)]
+    if p.size == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    p = np.clip(p, np.nextafter(0.0, 1.0), 1.0)
+    p_sorted = np.sort(p, kind="mergesort")
+    n = int(p_sorted.size)
+
+    if sig_p_threshold is None or (not np.isfinite(sig_p_threshold)):
+        sig_thr = 1.0 / float(max(1, n))
+    else:
+        sig_thr = float(sig_p_threshold)
+    sig_thr = float(np.clip(sig_thr, np.nextafter(0.0, 1.0), 1.0))
+
+    if keep_all or n <= int(max_points):
+        draw_idx = np.arange(n, dtype=np.int64)
+    else:
+        base_idx = np.linspace(0, n - 1, int(max_points), dtype=np.int64)
+        sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
+        if sig_n > 0:
+            sig_idx = np.arange(sig_n, dtype=np.int64)
+            draw_idx = np.unique(np.concatenate([base_idx, sig_idx]))
+        else:
+            draw_idx = np.unique(base_idx)
+
+    ranks = draw_idx.astype(float) + 1.0
+    exp = -np.log10(ranks / (n + 1.0))
+    obs = -np.log10(p_sorted[draw_idx])
+    keep = np.isfinite(exp) & np.isfinite(obs)
+    return exp[keep], obs[keep]
+
+
 def _save_figure_and_close(fig: plt.Figure, path: str) -> None:
     fig.savefig(path, transparent=True)
     plt.close(fig)
@@ -2154,7 +2199,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
             if args.qq_ratio is not None:
-                # QQ should keep all SNPs to preserve expected quantiles.
+                # QQ keeps all threshold-passing SNPs and can down-sample
+                # only sub-threshold points in fast mode.
                 plotmodel_qq = GWASPLOT(
                     df,
                     chr_col,
@@ -2430,6 +2476,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         color_set=[qq_point_color, qq_band_color],
                         line_color="black",
                         scatter_size=args.scatter_size,
+                        qq_mode=("full" if args.fullscatter else "auto"),
+                        qq_fast_max_points=_QQ_FAST_MAX_POINTS,
+                        sig_p_threshold=(
+                            float(threshold)
+                            if (np.isfinite(threshold) and float(threshold) > 0.0)
+                            else None
+                        ),
                     )
                     qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
                     if np.isfinite(qq_xmax) and qq_xmax > 0:
@@ -3426,14 +3479,18 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             pvals = pvals_by_series.get(i)
             if pvals is None or pvals.size == 0:
                 continue
-            pvals = np.asarray(pvals, dtype=float)
-            pvals = pvals[np.isfinite(pvals) & (pvals > 0.0)]
-            if pvals.size == 0:
+            exp, obs = _qq_select_points_with_threshold(
+                np.asarray(pvals, dtype=float),
+                sig_p_threshold=(
+                    float(threshold_merge)
+                    if (np.isfinite(threshold_merge) and float(threshold_merge) > 0.0)
+                    else None
+                ),
+                max_points=_QQ_FAST_MAX_POINTS,
+                keep_all=bool(args.fullscatter),
+            )
+            if exp.size == 0 or obs.size == 0:
                 continue
-            pvals = np.sort(pvals)
-            n = int(pvals.size)
-            exp = -np.log10(np.arange(1, n + 1, dtype=float) / (n + 1.0))
-            obs = -np.log10(pvals)
             if exp.size > 0:
                 exp_xmin = min(exp_xmin, float(np.nanmin(exp)))
                 exp_xmax = max(exp_xmax, float(np.nanmax(exp)))
@@ -3934,7 +3991,8 @@ def main():
             "(also accepts '-' as separator), e.g. --ylim 6, --ylim 0:6, "
             "--ylim 2:, --ylim :6. Missing bound is auto-determined. "
             "Points outside this range are filtered before Manhattan scatter "
-            "to speed plotting. QQ always keeps all points."
+            "to speed plotting. QQ keeps all threshold-passing points and "
+            "can down-sample sub-threshold points for speed."
         ),
     )
     geno_group = optional_group.add_mutually_exclusive_group(required=False)

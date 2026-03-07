@@ -220,6 +220,7 @@ fn wait_step_outputs(
         let poll = Duration::from_secs_f64(opts.poll_sec.max(0.5));
         let mut last_progress = Instant::now();
         let mut last_done = 0usize;
+        let mut spinner_tick = 0usize;
 
         loop {
             let done = if all_outputs_ready(&step.outputs) {
@@ -244,7 +245,8 @@ fn wait_step_outputs(
                 }
             }
 
-            render_step_progress(step_text, done, total, start.elapsed())?;
+            render_step_progress(step_text, done, total, start.elapsed(), spinner_tick)?;
+            spinner_tick = spinner_tick.wrapping_add(1);
             thread::sleep(poll);
         }
         clear_progress_line_if_tty()?;
@@ -263,6 +265,7 @@ fn wait_step_outputs(
     let mut pending: Vec<usize> = Vec::new();
     let mut done = 0usize;
     let mut last_progress = Instant::now();
+    let mut spinner_tick = 0usize;
 
     for (idx, item) in step.items.iter().enumerate() {
         if all_outputs_ready(&item.outputs) {
@@ -319,7 +322,8 @@ fn wait_step_outputs(
             }
         }
 
-        render_step_progress(step_text, done, total, start.elapsed())?;
+        render_step_progress(step_text, done, total, start.elapsed(), spinner_tick)?;
+        spinner_tick = spinner_tick.wrapping_add(1);
         thread::sleep(poll);
     }
     clear_progress_line_if_tty()?;
@@ -336,12 +340,16 @@ fn render_step_progress(
     done: usize,
     total: usize,
     elapsed: Duration,
+    spinner_tick: usize,
 ) -> Result<(), String> {
     if !io::stdout().is_terminal() {
         return Ok(());
     }
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = spinner_tick % frames.len();
     let line = format!(
-        "\r{} [{}/{}] [{}]",
+        "\r{} {} [{}/{}] [{}]",
+        frames[idx],
         step_text,
         done,
         total,

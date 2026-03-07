@@ -6,6 +6,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +45,7 @@ const CONDA_FORGE_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
 const CONDA_BIOCONDA_OFFICIAL: &str = "bioconda";
 const CONDA_FORGE_OFFICIAL: &str = "conda-forge";
+static DLC_INLINE_STEP_LINE_OPEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct MethodStatus {
@@ -288,7 +290,14 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
         cleanup_previous_runtime(&existing, runtime_home)?;
     }
 
-    let mut record = build_runtime(selected_entry.builder_id, python, runtime_home)?;
+    let mut record = match build_runtime(selected_entry.builder_id, python, runtime_home) {
+        Ok(r) => r,
+        Err(e) => {
+            ensure_dlc_inline_step_newline();
+            return Err(e);
+        }
+    };
+    ensure_dlc_inline_step_newline();
     record.method_id = selected;
     let missing_after = missing_tools_for_record(&record, runtime_home)?;
     if !missing_after.is_empty() {
@@ -1889,12 +1898,14 @@ fn run_with_live_tail(
             .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
     }
     if tail_mode_started {
+        DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         if status.success() {
             render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
         } else {
             render_tail_block_dlc(desc, "✘", elapsed, &tail, max_lines, rendered)?;
         }
     } else if !status.success() && streaming_title_started {
+        DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         render_streaming_failure_compact_dlc(desc, elapsed, streamed_lines_before_tail)?;
     } else {
         let width = dlc_terminal_line_width();
@@ -1907,9 +1918,16 @@ fn run_with_live_tail(
             width,
         );
         if status.success() {
-            println!("{}", super::style_green(&title));
+            if is_inline_step_desc(desc) {
+                print!("\r\x1b[2K{}", super::style_green(&title));
+                DLC_INLINE_STEP_LINE_OPEN.store(true, Ordering::Relaxed);
+            } else {
+                println!("{}", super::style_green(&title));
+                DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
+            }
         } else {
             println!("{}", super::style_yellow(&title));
+            DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         }
         io::stdout()
             .flush()
@@ -2054,7 +2072,7 @@ fn render_prelog_spinner_line_dlc(desc: &str, elapsed: Duration) -> Result<(), S
         ),
         width,
     );
-    print!("\r{}", super::style_green(&title));
+    print!("\r\x1b[2K{}", super::style_green(&title));
     io::stdout()
         .flush()
         .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
@@ -2133,6 +2151,18 @@ fn dlc_truncate_plain_line(s: &str, max_chars: usize) -> String {
         n += 1;
     }
     out
+}
+
+fn is_inline_step_desc(desc: &str) -> bool {
+    desc.starts_with('[') && desc.contains('/') && desc.contains(']')
+}
+
+fn ensure_dlc_inline_step_newline() {
+    if !DLC_INLINE_STEP_LINE_OPEN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    println!();
+    let _ = io::stdout().flush();
 }
 
 fn pipeline_dir_from_python(python: &Path) -> Result<PathBuf, String> {
@@ -2510,12 +2540,14 @@ fn run_download_with_progress(
             .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
     }
     if tail_mode_started {
+        DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         if status.success() {
             render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
             return Ok(());
         }
         render_tail_block_dlc(&last_progress_desc, "✘", elapsed, &tail, max_lines, rendered)?;
     } else if !status.success() && streaming_title_started {
+        DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         render_streaming_failure_compact_dlc(&last_progress_desc, elapsed, streamed_lines_before_tail)?;
     } else {
         let width = dlc_terminal_line_width();
@@ -2529,13 +2561,20 @@ fn run_download_with_progress(
             width,
         );
         if status.success() {
-            println!("{}", super::style_green(&title));
+            if is_inline_step_desc(desc) {
+                print!("\r\x1b[2K{}", super::style_green(&title));
+                DLC_INLINE_STEP_LINE_OPEN.store(true, Ordering::Relaxed);
+            } else {
+                println!("{}", super::style_green(&title));
+                DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
+            }
             io::stdout()
                 .flush()
                 .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
             return Ok(());
         }
         println!("{}", super::style_yellow(&title));
+        DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;

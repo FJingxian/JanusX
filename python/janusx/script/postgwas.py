@@ -4031,8 +4031,13 @@ def main():
         help="Scatter marker size for Manhattan and QQ plots (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-fullscatter", "--fullscatter", action="store_true", default=False,
-        help="Disable GWASPLOT compression and draw all points.",
+        "-full", "--full", "-fullscatter", "--fullscatter",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable scatter compression for both Manhattan and QQ and draw all points "
+            "(no fast optimization; no 0.5 cut)."
+        ),
     )
     optional_group.add_argument(
         "-hl", "--highlight", type=str, default=None,
@@ -4294,9 +4299,9 @@ def main():
             qq_pal_text = "default (black/grey)"
         if args.disable_compression:
             if args.fullscatter and args.bimrange_tuples is not None:
-                comp_text = "off (--fullscatter, auto for --bimrange)"
+                comp_text = "off (--full, auto for --bimrange)"
             elif args.fullscatter:
-                comp_text = "off (--fullscatter)"
+                comp_text = "off (--full)"
             else:
                 comp_text = "off (auto for --bimrange)"
         else:

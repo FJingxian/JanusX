@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,12 @@ const JANUSX_SIF_ORIGIN_URL: &str =
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
 const JANUSX_SIF_URLS: [&str; 2] = [JANUSX_SIF_MIRROR_URL, JANUSX_SIF_ORIGIN_URL];
 const MICROMAMBA_URLS: [&str; 1] = ["https://micro.mamba.pm/api/micromamba/linux-64/latest"];
+const CONDA_BIOCONDA_MIRROR_URL: &str =
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda";
+const CONDA_FORGE_MIRROR_URL: &str =
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
+const CONDA_BIOCONDA_OFFICIAL: &str = "bioconda";
+const CONDA_FORGE_OFFICIAL: &str = "conda-forge";
 
 #[derive(Clone, Debug)]
 struct MethodStatus {
@@ -468,30 +474,26 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
         });
     }
     let micromamba_bin = ensure_micromamba(runtime_home)?;
-    let install_pkgs = toolchain_packages_for_tools(&host_missing);
-    if install_pkgs.is_empty() {
-        return Err("No installable packages resolved for missing env tools.".to_string());
-    }
-    let mut install_cmd = vec![micromamba_bin.to_string_lossy().to_string()];
-    if env_prefix.exists() {
-        install_cmd.push("install".to_string());
-    } else {
-        install_cmd.push("create".to_string());
-    }
-    install_cmd.extend([
-        "-y".to_string(),
-        "-p".to_string(),
-        env_prefix.to_string_lossy().to_string(),
-        "-c".to_string(),
-        "bioconda".to_string(),
-        "-c".to_string(),
-        "conda-forge".to_string(),
-    ]);
     if !env_prefix.exists() {
-        install_cmd.push("python=3.10".to_string());
+        run_cmd_tail_with_conda_channel_fallback(
+            "build via env [prepare] create local env",
+            &[
+                micromamba_bin.to_string_lossy().to_string(),
+                "create".to_string(),
+                "-y".to_string(),
+                "-p".to_string(),
+                env_prefix.to_string_lossy().to_string(),
+            ],
+            &["python=3.10".to_string()],
+            10,
+        )?;
     }
-    install_cmd.extend(install_pkgs);
-    run_cmd("build via env [local dlc env]", &install_cmd, true)?;
+    install_tools_stepwise_env(
+        &micromamba_bin.to_string_lossy(),
+        &env_prefix,
+        &host_missing,
+        "Build",
+    )?;
     sync_env_runtime_bin_mixed(runtime_home, &env_prefix)?;
     let missing_after = missing_env_runtime_tools(runtime_home);
     if !missing_after.is_empty() {
@@ -545,17 +547,16 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
         } else {
             format!("build via conda [1/1] create {CONDA_ENV}")
         };
-        run_cmd_tail(
+        run_cmd_tail_with_conda_channel_fallback(
             &create_desc,
-            &vec![
+            &[
                 conda_bin_s.clone(),
                 "create".to_string(),
                 "-n".to_string(),
                 CONDA_ENV.to_string(),
-                "python=3.10".to_string(),
                 "-y".to_string(),
             ],
-            true,
+            &["python=3.10".to_string()],
             10,
         )?;
     }
@@ -587,30 +588,23 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                 true,
                 10,
             )?;
-            run_cmd_tail(
+            run_cmd_tail_with_conda_channel_fallback(
                 &format!("build via conda [2/2] create {CONDA_ENV}"),
-                &vec![
+                &[
                     conda_bin_s.clone(),
                     "create".to_string(),
                     "-n".to_string(),
                     CONDA_ENV.to_string(),
-                    "python=3.10".to_string(),
                     "-y".to_string(),
                 ],
-                true,
+                &["python=3.10".to_string()],
                 10,
             )?;
             REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect()
         }
     };
     if !missing_now.is_empty() {
-        let pkgs = toolchain_packages_for_tools(&missing_now);
-        install_conda_packages(
-            &conda_bin_s,
-            CONDA_ENV,
-            &pkgs,
-            "build via conda [1/1] install missing",
-        )?;
+        install_tools_stepwise_conda(&conda_bin_s, CONDA_ENV, &missing_now, "Build")?;
     }
     let missing_after = missing_tools_in_prefixed_runtime(&prefix)?;
     if !missing_after.is_empty() {
@@ -627,31 +621,23 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             true,
             10,
         )?;
-        run_cmd_tail(
+        run_cmd_tail_with_conda_channel_fallback(
             &format!("build via conda [2/3] create {CONDA_ENV}"),
-            &vec![
+            &[
                 conda_bin_s.clone(),
                 "create".to_string(),
                 "-n".to_string(),
                 CONDA_ENV.to_string(),
-                "python=3.10".to_string(),
                 "-y".to_string(),
             ],
-            true,
+            &["python=3.10".to_string()],
             10,
         )?;
-        let all_pkgs = toolchain_packages_for_tools(
-            &REQUIRED_TOOLS
-                .iter()
-                .map(|x| (*x).to_string())
-                .collect::<Vec<String>>(),
-        );
-        install_conda_packages(
-            &conda_bin_s,
-            CONDA_ENV,
-            &all_pkgs,
-            "build via conda [3/3] rebuild install",
-        )?;
+        let all_tools = REQUIRED_TOOLS
+            .iter()
+            .map(|x| (*x).to_string())
+            .collect::<Vec<String>>();
+        install_tools_stepwise_conda(&conda_bin_s, CONDA_ENV, &all_tools, "Rebuild")?;
         let missing_rebuilt = missing_tools_in_prefixed_runtime(&prefix)?;
         if !missing_rebuilt.is_empty() {
             return Err(format!(
@@ -770,7 +756,7 @@ fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
         .map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
     let sif_path = bin_dir.join("janusxext.sif");
     if !sif_path.exists() {
-        print!("Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: ");
+        print!("Download JanusX Singularity Image (~800MB)? [y/N/path.sif]: ");
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {e}"))?;
@@ -1289,6 +1275,49 @@ fn run_cmd_tail(
     Ok(())
 }
 
+fn append_conda_channel_args(cmd: &mut Vec<String>, use_mirror: bool) {
+    cmd.push("--override-channels".to_string());
+    cmd.push("-c".to_string());
+    cmd.push(if use_mirror {
+        CONDA_BIOCONDA_MIRROR_URL.to_string()
+    } else {
+        CONDA_BIOCONDA_OFFICIAL.to_string()
+    });
+    cmd.push("-c".to_string());
+    cmd.push(if use_mirror {
+        CONDA_FORGE_MIRROR_URL.to_string()
+    } else {
+        CONDA_FORGE_OFFICIAL.to_string()
+    });
+}
+
+fn run_cmd_tail_with_conda_channel_fallback(
+    desc: &str,
+    base_argv: &[String],
+    packages: &[String],
+    max_lines: usize,
+) -> Result<(), String> {
+    let mut mirror_cmd: Vec<String> = base_argv.to_vec();
+    append_conda_channel_args(&mut mirror_cmd, true);
+    mirror_cmd.extend(packages.iter().cloned());
+    match run_cmd_tail(desc, &mirror_cmd, true, max_lines) {
+        Ok(()) => Ok(()),
+        Err(mirror_err) => {
+            eprintln!(
+                "{}",
+                super::style_yellow(&format!(
+                    "{desc}: mirror channels failed, fallback to official channels."
+                ))
+            );
+            let mut official_cmd: Vec<String> = base_argv.to_vec();
+            append_conda_channel_args(&mut official_cmd, false);
+            official_cmd.extend(packages.iter().cloned());
+            run_cmd_tail(desc, &official_cmd, true, max_lines)
+                .map_err(|e| format!("{e}\nMirror attempt error: {mirror_err}"))
+        }
+    }
+}
+
 fn run_with_live_tail(
     cmd: &mut Command,
     desc: &str,
@@ -1767,26 +1796,30 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
         }
         let mut ok = false;
         if command_in_path("curl") {
+            let total_bytes = probe_content_length_with_curl(url);
             let cmd = vec![
                 "curl".to_string(),
                 "-L".to_string(),
                 "--fail".to_string(),
-                "--progress-bar".to_string(),
+                "--silent".to_string(),
+                "--show-error".to_string(),
                 "-o".to_string(),
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_cmd_passthrough(desc, &cmd, true).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
                 ok = true;
             }
         } else if command_in_path("wget") {
+            let total_bytes = probe_content_length_with_wget(url);
             let cmd = vec![
                 "wget".to_string(),
+                "-q".to_string(),
                 "-O".to_string(),
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_cmd_passthrough(desc, &cmd, true).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
                 ok = true;
             }
         } else {
@@ -1806,37 +1839,220 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
     ))
 }
 
-fn run_cmd_passthrough(desc: &str, argv: &[String], required: bool) -> Result<(), String> {
+fn run_download_with_progress(
+    desc: &str,
+    argv: &[String],
+    target_path: &Path,
+    total_bytes: Option<u64>,
+) -> Result<(), String> {
     if argv.is_empty() {
         return Err(format!("{desc}: empty command"));
     }
+
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let start = Instant::now();
-    let status = cmd
-        .status()
-        .map_err(|e| format!("Failed to run command `{}`: {e}", argv[0]))?;
-    if status.success() {
-        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(start.elapsed())));
-        return Ok(());
-    }
-    if required {
+    cmd.args(&argv[1..]).stdin(Stdio::null());
+    if !io::stdout().is_terminal() {
+        let out = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to run download command: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
         return Err(format!(
-            "{desc} failed with exit={}.",
-            super::exit_code(status)
+            "{desc} failed with exit={}: {}",
+            super::exit_code(out.status),
+            msg.trim()
         ));
     }
-    eprintln!(
-        "{}",
-        super::style_yellow(&format!(
-            "Warning: {desc} failed (optional, exit={}).",
-            super::exit_code(status)
-        ))
-    );
-    Ok(())
+
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run download command: {e}"))?;
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel::<String>();
+    let stderr_handle = thread::spawn(move || {
+        if let Some(mut s) = stderr {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        } else {
+            let _ = tx.send(String::new());
+        }
+    });
+
+    let start = Instant::now();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut idx = 0usize;
+    let mut status: Option<ExitStatus> = None;
+
+    while status.is_none() {
+        status = child
+            .try_wait()
+            .map_err(|e| format!("Failed to poll download status: {e}"))?;
+        if status.is_some() {
+            break;
+        }
+        let elapsed = start.elapsed();
+        let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+        let (pct_txt, eta_txt) = match total_bytes {
+            Some(total) if total > 0 => {
+                let ratio = ((downloaded as f64) / (total as f64)).clamp(0.0, 1.0);
+                let pct = ratio * 100.0;
+                let eta = estimate_eta(total, downloaded, elapsed);
+                (
+                    format!("{pct:.1}%"),
+                    eta.unwrap_or_else(|| "--".to_string()),
+                )
+            }
+            _ => ("--.-%".to_string(), "--".to_string()),
+        };
+        let line = format!(
+            "\r{} Downloading ... [{} {}/{}]",
+            frames[idx % frames.len()],
+            pct_txt,
+            super::format_elapsed(elapsed),
+            eta_txt
+        );
+        if super::supports_color() {
+            print!("{}", super::style_green(&line));
+        } else {
+            print!("{line}");
+        }
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush download progress: {e}"))?;
+        idx = idx.wrapping_add(1);
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    let status = match status {
+        Some(s) => s,
+        None => child
+            .wait()
+            .map_err(|e| format!("Failed to wait download process: {e}"))?,
+    };
+    let _ = stderr_handle.join();
+    let stderr_text = rx.recv().unwrap_or_default();
+    print!("\r\x1b[2K");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush download progress: {e}"))?;
+
+    if status.success() {
+        let elapsed = start.elapsed();
+        super::print_success_line(&format!("{} [{}]", desc, super::format_elapsed(elapsed)));
+        return Ok(());
+    }
+    Err(format!(
+        "{desc} failed with exit={}: {}",
+        super::exit_code(status),
+        stderr_text.trim()
+    ))
+}
+
+#[cfg(unix)]
+fn estimate_eta(total: u64, downloaded: u64, elapsed: Duration) -> Option<String> {
+    if downloaded == 0 || downloaded >= total {
+        return None;
+    }
+    let sec = elapsed.as_secs_f64();
+    if sec <= 0.5 {
+        return None;
+    }
+    let speed = downloaded as f64 / sec;
+    if speed <= 1.0 {
+        return None;
+    }
+    let remain = (total - downloaded) as f64 / speed;
+    Some(super::format_elapsed(Duration::from_secs_f64(
+        remain.max(0.0),
+    )))
+}
+
+#[cfg(not(unix))]
+fn estimate_eta(total: u64, downloaded: u64, elapsed: Duration) -> Option<String> {
+    if downloaded == 0 || downloaded >= total {
+        return None;
+    }
+    let sec = elapsed.as_secs_f64();
+    if sec <= 0.5 {
+        return None;
+    }
+    let speed = downloaded as f64 / sec;
+    if speed <= 1.0 {
+        return None;
+    }
+    let remain = (total - downloaded) as f64 / speed;
+    Some(super::format_elapsed(Duration::from_secs_f64(
+        remain.max(0.0),
+    )))
+}
+
+fn probe_content_length_with_curl(url: &str) -> Option<u64> {
+    let out = Command::new("curl")
+        .arg("-L")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--head")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn probe_content_length_with_wget(url: &str) -> Option<u64> {
+    let out = Command::new("wget")
+        .arg("--spider")
+        .arg("--server-response")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stderr))
+}
+
+fn parse_content_length_from_headers(text: &str) -> Option<u64> {
+    let mut out: Option<u64> = None;
+    for line in text.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let lower = s.to_ascii_lowercase();
+        if !lower.starts_with("content-length:") {
+            continue;
+        }
+        let n = s.split_once(':').map(|(_, v)| v.trim()).and_then(|v| {
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<u64>().ok()
+            }
+        });
+        if let Some(v) = n {
+            out = Some(v);
+        }
+    }
+    out
 }
 
 fn save_runtime_record(
@@ -2066,28 +2282,84 @@ fn conda_env_named_exists(conda_bin: &Path, env_name: &str) -> bool {
     false
 }
 
-fn install_conda_packages(
+fn install_tools_stepwise_conda(
     conda_bin: &str,
     env_name: &str,
-    packages: &[String],
-    label: &str,
+    tools: &[String],
+    action: &str,
 ) -> Result<(), String> {
-    if packages.is_empty() {
+    let ordered = ordered_required_tools(tools);
+    if ordered.is_empty() {
         return Ok(());
     }
-    let mut cmd = vec![
-        conda_bin.to_string(),
-        "install".to_string(),
-        "-n".to_string(),
-        env_name.to_string(),
-        "-c".to_string(),
-        "bioconda".to_string(),
-        "-c".to_string(),
-        "conda-forge".to_string(),
-    ];
-    cmd.extend(packages.iter().cloned());
-    cmd.push("-y".to_string());
-    run_cmd_tail(label, &cmd, true, 10)
+    let total = ordered.len();
+    for (idx, tool) in ordered.iter().enumerate() {
+        let pkgs = toolchain_packages_for_tools(std::slice::from_ref(tool));
+        if pkgs.is_empty() {
+            continue;
+        }
+        let cmd = vec![
+            conda_bin.to_string(),
+            "install".to_string(),
+            "-n".to_string(),
+            env_name.to_string(),
+        ];
+        let mut packages = vec!["-y".to_string()];
+        packages.extend(pkgs);
+        let desc = format!("[{}/{}] {} {} via conda", idx + 1, total, action, tool);
+        run_cmd_tail_with_conda_channel_fallback(&desc, &cmd, &packages, 10)?;
+    }
+    Ok(())
+}
+
+fn install_tools_stepwise_env(
+    micromamba_bin: &str,
+    env_prefix: &Path,
+    tools: &[String],
+    action: &str,
+) -> Result<(), String> {
+    let ordered = ordered_required_tools(tools);
+    if ordered.is_empty() {
+        return Ok(());
+    }
+    let total = ordered.len();
+    for (idx, tool) in ordered.iter().enumerate() {
+        let pkgs = toolchain_packages_for_tools(std::slice::from_ref(tool));
+        if pkgs.is_empty() {
+            continue;
+        }
+        let cmd = vec![
+            micromamba_bin.to_string(),
+            "install".to_string(),
+            "-p".to_string(),
+            env_prefix.to_string_lossy().to_string(),
+        ];
+        let mut packages = vec!["-y".to_string()];
+        packages.extend(pkgs);
+        let desc = format!("[{}/{}] {} {} via env", idx + 1, total, action, tool);
+        run_cmd_tail_with_conda_channel_fallback(&desc, &cmd, &packages, 10)?;
+    }
+    Ok(())
+}
+
+fn ordered_required_tools(tools: &[String]) -> Vec<String> {
+    let mut raw: BTreeSet<String> = BTreeSet::new();
+    for t in tools {
+        let x = t.trim();
+        if !x.is_empty() {
+            raw.insert(x.to_string());
+        }
+    }
+    let mut ordered: Vec<String> = Vec::new();
+    for t in REQUIRED_TOOLS {
+        if raw.remove(t) {
+            ordered.push(t.to_string());
+        }
+    }
+    for x in raw {
+        ordered.push(x);
+    }
+    ordered
 }
 
 fn should_rebuild_conda_env(err: &str) -> bool {

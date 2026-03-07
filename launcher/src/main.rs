@@ -819,13 +819,20 @@ fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut V
 
     // Also cleanup runtime linked by .jx_home (cross-platform default/override locations).
     if let Some(runtime_home) = linked_runtime {
-        // Guard against accidentally deleting install dir/root-like paths.
-        if runtime_home != install_dir
-            && runtime_home.parent().is_some()
-            && runtime_home.as_os_str() != "/"
-            && runtime_home.as_os_str() != "\\"
-        {
-            remove_path(runtime_home);
+        if !is_managed_runtime_home_path(&runtime_home) {
+            failed.push(format!(
+                "Refusing to remove linked runtime outside JanusX/.janusx: {}",
+                runtime_home.display()
+            ));
+        } else {
+            // Guard against accidentally deleting install dir/root-like paths.
+            if runtime_home != install_dir
+                && runtime_home.parent().is_some()
+                && runtime_home.as_os_str() != "/"
+                && runtime_home.as_os_str() != "\\"
+            {
+                remove_path(runtime_home);
+            }
         }
     }
 }
@@ -2605,6 +2612,13 @@ fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
     if !runtime_home.exists() {
         return;
     }
+    if !is_managed_runtime_home_path(runtime_home) {
+        failed.push(format!(
+            "Refusing to remove runtime outside JanusX/.janusx: {}",
+            runtime_home.display()
+        ));
+        return;
+    }
     let marker_hits = runtime_home.join("venv").exists()
         || runtime_home.join(UPDATE_TIME_MARKER).exists()
         || runtime_home.join(COMMIT_MARKER).exists()
@@ -2631,6 +2645,34 @@ fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
             failed.push(format!("{} ({e})", p.display()));
         }
     }
+}
+
+fn is_managed_runtime_home_path(runtime_home: &Path) -> bool {
+    let p = canonical_or_self(runtime_home);
+    let Some(name) = p.file_name().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    if !runtime_path_name_eq(name, ".janusx") {
+        return false;
+    }
+    let Some(parent_name) = p
+        .parent()
+        .and_then(|pp| pp.file_name())
+        .and_then(|v| v.to_str())
+    else {
+        return false;
+    };
+    runtime_path_name_eq(parent_name, "JanusX")
+}
+
+#[cfg(windows)]
+fn runtime_path_name_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(not(windows))]
+fn runtime_path_name_eq(a: &str, b: &str) -> bool {
+    a == b
 }
 
 fn pip_install_update(

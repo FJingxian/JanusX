@@ -1,12 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DLC_SLOT: &str = "active";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
@@ -509,10 +511,11 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
         return Err("conda command not found in PATH.".to_string());
     };
     let conda_bin_s = conda_bin.to_string_lossy().to_string();
+    let mut removed_broken_env = false;
     let mut env_exists = conda_env_named_exists(&conda_bin, CONDA_ENV);
     if env_exists && !conda_env_exists(&conda_bin, CONDA_ENV) {
-        run_cmd(
-            "build via conda [remove broken env]",
+        run_cmd_tail(
+            "build via conda [1/2] remove broken env",
             &vec![
                 conda_bin_s.clone(),
                 "env".to_string(),
@@ -522,12 +525,19 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                 "-y".to_string(),
             ],
             true,
+            10,
         )?;
+        removed_broken_env = true;
         env_exists = false;
     }
     if !env_exists {
-        run_cmd(
-            &format!("build via conda [create {CONDA_ENV}]"),
+        let create_desc = if removed_broken_env {
+            format!("build via conda [2/2] create {CONDA_ENV}")
+        } else {
+            format!("build via conda [1/1] create {CONDA_ENV}")
+        };
+        run_cmd_tail(
+            &create_desc,
             &vec![
                 conda_bin_s.clone(),
                 "create".to_string(),
@@ -537,6 +547,7 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                 "-y".to_string(),
             ],
             true,
+            10,
         )?;
     }
 
@@ -554,8 +565,8 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             if !should_rebuild_conda_env(&e) {
                 return Err(e);
             }
-            run_cmd(
-                "build via conda [remove invalid env]",
+            run_cmd_tail(
+                "build via conda [1/2] remove invalid env",
                 &vec![
                     conda_bin_s.clone(),
                     "env".to_string(),
@@ -565,9 +576,10 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                     "-y".to_string(),
                 ],
                 true,
+                10,
             )?;
-            run_cmd(
-                &format!("build via conda [create {CONDA_ENV}]"),
+            run_cmd_tail(
+                &format!("build via conda [2/2] create {CONDA_ENV}"),
                 &vec![
                     conda_bin_s.clone(),
                     "create".to_string(),
@@ -577,6 +589,7 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                     "-y".to_string(),
                 ],
                 true,
+                10,
             )?;
             REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect()
         }
@@ -587,13 +600,13 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             &conda_bin_s,
             CONDA_ENV,
             &pkgs,
-            "build via conda [install missing]",
+            "build via conda [1/1] install missing",
         )?;
     }
     let missing_after = missing_tools_in_prefixed_runtime(&prefix)?;
     if !missing_after.is_empty() {
-        run_cmd(
-            "build via conda [rebuild env remove]",
+        run_cmd_tail(
+            "build via conda [1/3] rebuild remove env",
             &vec![
                 conda_bin_s.clone(),
                 "env".to_string(),
@@ -603,9 +616,10 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                 "-y".to_string(),
             ],
             true,
+            10,
         )?;
-        run_cmd(
-            &format!("build via conda [create {CONDA_ENV}]"),
+        run_cmd_tail(
+            &format!("build via conda [2/3] create {CONDA_ENV}"),
             &vec![
                 conda_bin_s.clone(),
                 "create".to_string(),
@@ -615,6 +629,7 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
                 "-y".to_string(),
             ],
             true,
+            10,
         )?;
         let all_pkgs = toolchain_packages_for_tools(
             &REQUIRED_TOOLS
@@ -626,7 +641,7 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             &conda_bin_s,
             CONDA_ENV,
             &all_pkgs,
-            "build via conda [rebuild install]",
+            "build via conda [3/3] rebuild install",
         )?;
         let missing_rebuilt = missing_tools_in_prefixed_runtime(&prefix)?;
         if !missing_rebuilt.is_empty() {
@@ -687,7 +702,7 @@ fn build_docker_runtime(python: &Path) -> Result<RuntimeRecord, String> {
             .to_string_lossy()
             .to_string(),
     ]);
-    run_cmd("build via docker", &cmd, true)?;
+    run_cmd_tail("build via docker", &cmd, true, 10)?;
 
     let mut verify_prefix = vec![
         docker_bin.to_string_lossy().to_string(),
@@ -1219,6 +1234,482 @@ fn run_cmd(desc: &str, argv: &[String], required: bool) -> Result<(), String> {
     Ok(())
 }
 
+struct LiveCmdResult {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    streamed: bool,
+}
+
+fn run_cmd_tail(
+    desc: &str,
+    argv: &[String],
+    required: bool,
+    max_lines: usize,
+) -> Result<(), String> {
+    if argv.is_empty() {
+        return Err(format!("{desc}: empty command"));
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let out = run_with_live_tail(&mut cmd, desc, max_lines)?;
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let mut msg = String::new();
+    msg.push_str(&out.stdout);
+    msg.push_str(&out.stderr);
+    let code = super::exit_code(out.status);
+
+    if required {
+        if out.streamed {
+            return Err(format!("{desc} failed with exit={code}."));
+        }
+        return Err(format!("{desc} failed with exit={code}.\n{}", msg.trim()));
+    }
+
+    eprintln!(
+        "{}",
+        super::style_yellow(&format!("Warning: {desc} failed (optional, exit={code})."))
+    );
+    Ok(())
+}
+
+fn run_with_live_tail(
+    cmd: &mut Command,
+    desc: &str,
+    max_lines: usize,
+) -> Result<LiveCmdResult, String> {
+    let is_tty = io::stdout().is_terminal();
+    let start = Instant::now();
+    if !is_tty {
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Failed to run command: {e}"))?;
+        return Ok(LiveCmdResult {
+            status: out.status,
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            streamed: false,
+        });
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run command: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture command stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture command stderr".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+    let out_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_out.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    let err_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_err.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    drop(tx);
+
+    let mut rendered = false;
+    let mut tail_mode_started = false;
+    let mut prelog_spinner_shown = true;
+    let mut streaming_title_started = false;
+    let mut out_text = String::new();
+    let mut err_text = String::new();
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
+    let mut channel_open = true;
+    let mut exit_status: Option<ExitStatus> = None;
+    let mut last_render = Instant::now();
+    let mut streamed_lines_before_tail = 0usize;
+    let mut saw_any_line = false;
+
+    render_prelog_spinner_line_dlc(desc, start.elapsed())?;
+
+    while channel_open {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((is_err, line)) => {
+                if prelog_spinner_shown && !tail_mode_started {
+                    if !streaming_title_started {
+                        render_streaming_title_init_dlc(desc, start.elapsed())?;
+                        streaming_title_started = true;
+                    }
+                    prelog_spinner_shown = false;
+                }
+                saw_any_line = true;
+                if is_err {
+                    err_text.push_str(&line);
+                    err_text.push('\n');
+                } else {
+                    out_text.push_str(&line);
+                    out_text.push('\n');
+                }
+                if max_lines > 0 {
+                    if tail.len() == max_lines {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.clone());
+                }
+
+                if max_lines == 0 {
+                    tail_mode_started = true;
+                    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    rendered = true;
+                    last_render = Instant::now();
+                    continue;
+                }
+
+                if !tail_mode_started {
+                    if tail.len() < max_lines {
+                        let width = dlc_terminal_line_width();
+                        let trimmed = dlc_truncate_plain_line(&line, width);
+                        if super::supports_color() {
+                            println!("\x1b[2m{}\x1b[0m", trimmed);
+                        } else {
+                            println!("{trimmed}");
+                        }
+                        streamed_lines_before_tail += 1;
+                        io::stdout()
+                            .flush()
+                            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+                    } else {
+                        if streamed_lines_before_tail > 0 {
+                            let mut up = streamed_lines_before_tail;
+                            if streaming_title_started {
+                                up = up.saturating_add(1);
+                            }
+                            print!("\x1b[{}A", up);
+                        }
+                        render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, false)?;
+                        rendered = true;
+                        tail_mode_started = true;
+                        last_render = Instant::now();
+                    }
+                } else {
+                    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    rendered = true;
+                    last_render = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if exit_status.is_none() {
+                    exit_status = child
+                        .try_wait()
+                        .map_err(|e| format!("Failed to poll command status: {e}"))?;
+                }
+                if !tail_mode_started && !saw_any_line {
+                    render_prelog_spinner_line_dlc(desc, start.elapsed())?;
+                    prelog_spinner_shown = true;
+                }
+                if !tail_mode_started
+                    && streaming_title_started
+                    && last_render.elapsed() >= Duration::from_millis(100)
+                {
+                    render_streaming_title_only_dlc(
+                        desc,
+                        start.elapsed(),
+                        streamed_lines_before_tail,
+                    )?;
+                    last_render = Instant::now();
+                }
+                if tail_mode_started && last_render.elapsed() >= Duration::from_millis(100) {
+                    render_tail_title_only_dlc(desc, start.elapsed(), max_lines)?;
+                    rendered = true;
+                    last_render = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                channel_open = false;
+            }
+        }
+    }
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+
+    let status = if let Some(s) = exit_status {
+        s
+    } else {
+        child
+            .wait()
+            .map_err(|e| format!("Failed to wait command process: {e}"))?
+    };
+    let elapsed = start.elapsed();
+
+    if prelog_spinner_shown {
+        print!("\r\x1b[2K");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    }
+    if tail_mode_started {
+        if status.success() {
+            render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
+        } else {
+            render_tail_block_dlc(desc, "✘", elapsed, &tail, max_lines, rendered)?;
+        }
+    } else if !status.success() && streaming_title_started {
+        render_streaming_failure_compact_dlc(desc, elapsed, streamed_lines_before_tail)?;
+    } else {
+        let width = dlc_terminal_line_width();
+        let title = dlc_truncate_plain_line(
+            &format!(
+                "{} {desc}[{}]",
+                if status.success() { "✔︎" } else { "✘" },
+                super::format_elapsed(elapsed)
+            ),
+            width,
+        );
+        if status.success() {
+            println!("{}", super::style_green(&title));
+        } else {
+            println!("{}", super::style_yellow(&title));
+        }
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    }
+
+    Ok(LiveCmdResult {
+        status,
+        stdout: out_text,
+        stderr: err_text,
+        streamed: saw_any_line,
+    })
+}
+
+fn render_tail_block_dlc(
+    desc: &str,
+    symbol: &str,
+    elapsed: Duration,
+    tail: &VecDeque<String>,
+    max_lines: usize,
+    rendered_before: bool,
+) -> Result<(), String> {
+    if rendered_before {
+        print!("\x1b[{}A", max_lines.saturating_add(1));
+    }
+    let width = dlc_terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    if symbol.is_empty() {
+        let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+        let title = dlc_truncate_plain_line(
+            &format!(
+                "{} {}[{}]",
+                frames[idx],
+                desc,
+                super::format_elapsed(elapsed)
+            ),
+            width,
+        );
+        print!("\x1b[2K\r{}\n", super::style_green(&title));
+    } else {
+        let title = dlc_truncate_plain_line(
+            &format!("{symbol} {desc}[{}]", super::format_elapsed(elapsed)),
+            width,
+        );
+        print!("\x1b[2K\r{}\n", super::style_yellow(&title));
+    }
+    let mut shown = 0usize;
+    for line in tail {
+        let trimmed = dlc_truncate_plain_line(line, width);
+        print!("\x1b[2K\r\x1b[2m{}\x1b[0m\n", trimmed);
+        shown += 1;
+    }
+    while shown < max_lines {
+        print!("\x1b[2K\r\n");
+        shown += 1;
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_tail_title_only_dlc(
+    desc: &str,
+    elapsed: Duration,
+    max_lines: usize,
+) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = dlc_truncate_plain_line(
+        &format!(
+            "{} {}[{}]",
+            frames[idx],
+            desc,
+            super::format_elapsed(elapsed)
+        ),
+        width,
+    );
+    print!("\x1b[{}A", max_lines.saturating_add(1));
+    print!("\x1b[2K\r{}\n", super::style_green(&title));
+    print!("\x1b[{}B", max_lines);
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_failure_compact_dlc(
+    desc: &str,
+    elapsed: Duration,
+    lines_below: usize,
+) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let title = dlc_truncate_plain_line(
+        &format!("✘ {desc}[{}]", super::format_elapsed(elapsed)),
+        width,
+    );
+    let up = lines_below.saturating_add(1);
+    print!("\x1b[{}A", up);
+    print!("\x1b[2K\r{}\n", super::style_yellow(&title));
+    if lines_below > 0 {
+        print!("\x1b[{}M", lines_below);
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_tail_success_compact_dlc(
+    desc: &str,
+    elapsed: Duration,
+    max_lines: usize,
+) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let title = dlc_truncate_plain_line(
+        &format!("✔︎ {desc}[{}]", super::format_elapsed(elapsed)),
+        width,
+    );
+    print!("\x1b[{}A", max_lines.saturating_add(1));
+    print!("\x1b[2K\r{}\n", super::style_green(&title));
+    if max_lines > 0 {
+        print!("\x1b[{}M", max_lines);
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_prelog_spinner_line_dlc(desc: &str, elapsed: Duration) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = dlc_truncate_plain_line(
+        &format!(
+            "{} {}[{}]",
+            frames[idx],
+            desc,
+            super::format_elapsed(elapsed)
+        ),
+        width,
+    );
+    print!("\r{}", super::style_green(&title));
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_title_init_dlc(desc: &str, elapsed: Duration) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = dlc_truncate_plain_line(
+        &format!(
+            "{} {}[{}]",
+            frames[idx],
+            desc,
+            super::format_elapsed(elapsed)
+        ),
+        width,
+    );
+    print!("\r\x1b[2K{}\n", super::style_green(&title));
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn render_streaming_title_only_dlc(
+    desc: &str,
+    elapsed: Duration,
+    lines_below: usize,
+) -> Result<(), String> {
+    let width = dlc_terminal_line_width();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
+    let title = dlc_truncate_plain_line(
+        &format!(
+            "{} {}[{}]",
+            frames[idx],
+            desc,
+            super::format_elapsed(elapsed)
+        ),
+        width,
+    );
+    let up = lines_below.saturating_add(1);
+    print!("\x1b[{}A", up);
+    print!("\x1b[2K\r{}\n", super::style_green(&title));
+    if lines_below > 0 {
+        print!("\x1b[{}B", lines_below);
+    }
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    Ok(())
+}
+
+fn dlc_terminal_line_width() -> usize {
+    let cols = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(80);
+    cols.saturating_sub(4).clamp(40, 68)
+}
+
+fn dlc_truncate_plain_line(s: &str, max_chars: usize) -> String {
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let mut out = String::new();
+    let mut n = 0usize;
+    for ch in s.chars() {
+        if n + 1 >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+        n += 1;
+    }
+    out
+}
+
 fn pipeline_dir_from_python(python: &Path) -> Result<PathBuf, String> {
     let out = Command::new(python)
         .arg("-c")
@@ -1495,7 +1986,7 @@ fn install_conda_packages(
     ];
     cmd.extend(packages.iter().cloned());
     cmd.push("-y".to_string());
-    run_cmd(label, &cmd, true)
+    run_cmd_tail(label, &cmd, true, 10)
 }
 
 fn should_rebuild_conda_env(err: &str) -> bool {

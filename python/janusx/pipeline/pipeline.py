@@ -1,10 +1,28 @@
 import subprocess
 import time
 import sys
+import re
 from pathlib import Path
 from typing import List, Literal, Optional, Union, Sequence, Any
 
 PathLike = Union[Path, str]
+
+_BENIGN_STDERR_PATTERNS = [
+    re.compile(r"no version information available\s*\(required by", re.IGNORECASE),
+]
+_FATAL_STDERR_PATTERNS = [
+    re.compile(r"traceback \(most recent call last\)", re.IGNORECASE),
+    re.compile(r"\bruntimeerror\b", re.IGNORECASE),
+    re.compile(r"\bexception\b", re.IGNORECASE),
+    re.compile(r"\bfatal\b", re.IGNORECASE),
+    re.compile(r"\berror\b", re.IGNORECASE),
+    re.compile(r"failed", re.IGNORECASE),
+    re.compile(r"no such file or directory", re.IGNORECASE),
+    re.compile(r"command not found", re.IGNORECASE),
+    re.compile(r"segmentation fault", re.IGNORECASE),
+    re.compile(r"killed", re.IGNORECASE),
+    re.compile(r"exited with exit code", re.IGNORECASE),
+]
 
 try:
     from janusx.script._common.status import (
@@ -62,6 +80,28 @@ def _safe_job_label(job: str) -> str:
     return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in s)
 
 
+def _is_benign_stderr_line(line: str) -> bool:
+    s = str(line or "").strip()
+    if len(s) == 0:
+        return True
+    for pat in _BENIGN_STDERR_PATTERNS:
+        if pat.search(s) is not None:
+            return True
+    return False
+
+
+def _is_likely_fatal_stderr_line(line: str) -> bool:
+    s = str(line or "").strip()
+    if len(s) == 0:
+        return False
+    if _is_benign_stderr_line(s):
+        return False
+    for pat in _FATAL_STDERR_PATTERNS:
+        if pat.search(s) is not None:
+            return True
+    return False
+
+
 def _find_failed_item_logs(
     items: List[dict[str, Any]],
     *,
@@ -90,7 +130,10 @@ def _find_failed_item_logs(
             lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
             if len(lines) == 0:
                 continue
-            head = " | ".join(lines[:max_lines])
+            fatal_lines = [ln for ln in lines if _is_likely_fatal_stderr_line(ln)]
+            if len(fatal_lines) == 0:
+                continue
+            head = " | ".join(fatal_lines[:max_lines])
             snippets.append(f"{item_id}: {head}")
             if len(snippets) >= max_items:
                 return snippets

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1821,6 +1821,7 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
     let tmp = PathBuf::from(format!("{}.tmp.download", dst.to_string_lossy()));
     let mut errs: Vec<String> = Vec::new();
     for (idx, url) in urls.iter().enumerate() {
+        let _ = fs::remove_file(&tmp);
         if idx > 0 {
             eprintln!(
                 "{}",
@@ -1834,7 +1835,6 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
         }
         let mut ok = false;
         if command_in_path("curl") {
-            let total_bytes = probe_content_length_with_curl(url);
             let cmd = vec![
                 "curl".to_string(),
                 "-L".to_string(),
@@ -1845,11 +1845,10 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp).is_ok() {
                 ok = true;
             }
         } else if command_in_path("wget") {
-            let total_bytes = probe_content_length_with_wget(url);
             let cmd = vec![
                 "wget".to_string(),
                 "-q".to_string(),
@@ -1857,7 +1856,7 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_download_with_progress(desc, &cmd, &tmp, total_bytes).is_ok() {
+            if run_download_with_progress(desc, &cmd, &tmp).is_ok() {
                 ok = true;
             }
         } else {
@@ -1881,7 +1880,6 @@ fn run_download_with_progress(
     desc: &str,
     argv: &[String],
     target_path: &Path,
-    total_bytes: Option<u64>,
 ) -> Result<(), String> {
     if argv.is_empty() {
         return Err(format!("{desc}: empty command"));
@@ -1909,77 +1907,111 @@ fn run_download_with_progress(
     }
 
     let mut child = cmd
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run download command: {e}"))?;
-    let stderr = child.stderr.take();
-    let (tx, rx) = mpsc::channel::<String>();
-    let stderr_handle = thread::spawn(move || {
-        if let Some(mut s) = stderr {
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            let _ = tx.send(buf);
-        } else {
-            let _ = tx.send(String::new());
-        }
-    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture download stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture download stderr".to_string())?;
 
-    let start = Instant::now();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut idx = 0usize;
-    let mut status: Option<ExitStatus> = None;
-
-    while status.is_none() {
-        status = child
-            .try_wait()
-            .map_err(|e| format!("Failed to poll download status: {e}"))?;
-        if status.is_some() {
-            break;
-        }
-        let elapsed = start.elapsed();
-        let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
-        if let Some(total) = total_bytes {
-            if total > 0 && downloaded >= total {
-                status = Some(
-                    child
-                        .wait()
-                        .map_err(|e| format!("Failed to wait download process: {e}"))?,
-                );
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+    let out_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_out.send((false, line)).is_err() {
                 break;
             }
         }
-        let (pct_txt, eta_txt) = match total_bytes {
-            Some(total) if total > 0 => {
-                let ratio = ((downloaded as f64) / (total as f64)).clamp(0.0, 1.0);
-                let pct = ratio * 100.0;
-                let eta = estimate_eta(total, downloaded, elapsed);
-                (
-                    format!("{pct:.1}%"),
-                    eta.unwrap_or_else(|| "--".to_string()),
-                )
+    });
+    let err_handle = thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_err.send((true, line)).is_err() {
+                break;
             }
-            _ => ("--.-%".to_string(), "--".to_string()),
-        };
-        let line = format!(
-            "\r{} {} ... [{} {}/{}]",
-            frames[idx % frames.len()],
-            desc,
-            pct_txt,
-            super::format_elapsed(elapsed),
-            eta_txt
-        );
-        if super::supports_color() {
-            print!("{}", super::style_green(&line));
-        } else {
-            print!("{line}");
         }
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("Failed to flush download progress: {e}"))?;
-        idx = idx.wrapping_add(1);
-        thread::sleep(Duration::from_millis(120));
+    });
+    drop(tx);
+
+    let start = Instant::now();
+    let max_lines = 10usize;
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines);
+    let mut rendered = true;
+    let mut status: Option<ExitStatus> = None;
+    let mut channel_open = true;
+    let mut out_text = String::new();
+    let mut err_text = String::new();
+    let mut last_render: Instant;
+    let mut last_probe = Instant::now() - Duration::from_secs(2);
+    let mut last_downloaded = 0u64;
+
+    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, false)?;
+    last_render = Instant::now();
+
+    while status.is_none() || channel_open {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((is_err, line)) => {
+                if is_err {
+                    err_text.push_str(&line);
+                    err_text.push('\n');
+                } else {
+                    out_text.push_str(&line);
+                    out_text.push('\n');
+                }
+                if !line.trim().is_empty() {
+                    if tail.len() == max_lines {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                    render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                    rendered = true;
+                    last_render = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                channel_open = false;
+            }
+        }
+
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|e| format!("Failed to poll download status: {e}"))?;
+        }
+
+        if status.is_none() && last_probe.elapsed() >= Duration::from_secs(1) {
+            let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+            if downloaded != last_downloaded || downloaded == 0 {
+                let probe_line = format!("downloaded {}", human_bytes(downloaded));
+                if tail.len() == max_lines {
+                    tail.pop_front();
+                }
+                tail.push_back(probe_line);
+                render_tail_block_dlc(desc, "", start.elapsed(), &tail, max_lines, rendered)?;
+                rendered = true;
+                last_render = Instant::now();
+                last_downloaded = downloaded;
+            }
+            last_probe = Instant::now();
+        }
+
+        if status.is_none() && rendered && last_render.elapsed() >= Duration::from_millis(100) {
+            render_tail_title_only_dlc(desc, start.elapsed(), max_lines)?;
+            last_render = Instant::now();
+        }
     }
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
 
     let status = match status {
         Some(s) => s,
@@ -1987,121 +2019,36 @@ fn run_download_with_progress(
             .wait()
             .map_err(|e| format!("Failed to wait download process: {e}"))?,
     };
-    let _ = stderr_handle.join();
-    let stderr_text = rx.recv().unwrap_or_default();
-    print!("\r\x1b[2K");
-    io::stdout()
-        .flush()
-        .map_err(|e| format!("Failed to flush download progress: {e}"))?;
+    let elapsed = start.elapsed();
 
     if status.success() {
-        let elapsed = start.elapsed();
-        super::print_success_line(&format!("{} [{}]", desc, super::format_elapsed(elapsed)));
+        render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
         return Ok(());
     }
+    render_tail_block_dlc(desc, "✘", elapsed, &tail, max_lines, rendered)?;
+    let mut msg = String::new();
+    msg.push_str(out_text.trim());
+    if !msg.is_empty() && !err_text.trim().is_empty() {
+        msg.push('\n');
+    }
+    msg.push_str(err_text.trim());
     Err(format!(
         "{desc} failed with exit={}: {}",
         super::exit_code(status),
-        stderr_text.trim()
+        msg.trim()
     ))
 }
 
-#[cfg(unix)]
-fn estimate_eta(total: u64, downloaded: u64, elapsed: Duration) -> Option<String> {
-    if downloaded == 0 || downloaded >= total {
-        return None;
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
-    let sec = elapsed.as_secs_f64();
-    if sec <= 0.5 {
-        return None;
-    }
-    let speed = downloaded as f64 / sec;
-    if speed <= 1.0 {
-        return None;
-    }
-    let remain = (total - downloaded) as f64 / speed;
-    Some(super::format_elapsed(Duration::from_secs_f64(
-        remain.max(0.0),
-    )))
-}
-
-#[cfg(not(unix))]
-fn estimate_eta(total: u64, downloaded: u64, elapsed: Duration) -> Option<String> {
-    if downloaded == 0 || downloaded >= total {
-        return None;
-    }
-    let sec = elapsed.as_secs_f64();
-    if sec <= 0.5 {
-        return None;
-    }
-    let speed = downloaded as f64 / sec;
-    if speed <= 1.0 {
-        return None;
-    }
-    let remain = (total - downloaded) as f64 / speed;
-    Some(super::format_elapsed(Duration::from_secs_f64(
-        remain.max(0.0),
-    )))
-}
-
-fn probe_content_length_with_curl(url: &str) -> Option<u64> {
-    let out = Command::new("curl")
-        .arg("-L")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--head")
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stdout))
-}
-
-fn probe_content_length_with_wget(url: &str) -> Option<u64> {
-    let out = Command::new("wget")
-        .arg("--spider")
-        .arg("--server-response")
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_content_length_from_headers(&String::from_utf8_lossy(&out.stderr))
-}
-
-fn parse_content_length_from_headers(text: &str) -> Option<u64> {
-    let mut out: Option<u64> = None;
-    for line in text.lines() {
-        let s = line.trim();
-        if s.is_empty() {
-            continue;
-        }
-        let lower = s.to_ascii_lowercase();
-        if !lower.starts_with("content-length:") {
-            continue;
-        }
-        let n = s.split_once(':').map(|(_, v)| v.trim()).and_then(|v| {
-            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                None
-            } else {
-                digits.parse::<u64>().ok()
-            }
-        });
-        if let Some(v) = n {
-            out = Some(v);
-        }
-    }
-    out
 }
 
 fn save_runtime_record(

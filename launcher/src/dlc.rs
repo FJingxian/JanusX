@@ -1,0 +1,1589 @@
+use std::collections::BTreeSet;
+use std::env;
+use std::fs;
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DLC_SLOT: &str = "active";
+const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
+const CONDA_ENV: &str = "janusxdlc";
+const REQUIRED_TOOLS: [&str; 8] = [
+    "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
+];
+const JANUSX_SIF_URLS: [&str; 2] = [
+    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+    "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
+];
+
+#[derive(Clone, Debug)]
+struct MethodStatus {
+    id: i32,
+    name: &'static str,
+    builder_id: i32,
+    checks: Vec<(&'static str, bool)>,
+    selectable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRecord {
+    method_id: i32,
+    runtime_mode: String,
+    image_tag: String,
+    conda_env: String,
+    sif_path: String,
+    installed_tools: Vec<String>,
+    status: String,
+    updated_at: String,
+}
+
+pub(crate) fn is_dlc_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fastp" | "bwa" | "samtools" | "gatk" | "bcftools" | "tabix" | "plink" | "beagle"
+    )
+}
+
+pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, String> {
+    fs::create_dir_all(runtime_home).map_err(|e| {
+        format!(
+            "Failed to create runtime home {}: {e}",
+            runtime_home.display()
+        )
+    })?;
+    let db_path = runtime_home.join(super::GWAS_HISTORY_DB_FILE);
+
+    println!(
+        "DLC check/build mode. db={}",
+        db_path.to_string_lossy().to_string()
+    );
+    let methods = collect_build_method_status();
+    print_build_method_status(&methods);
+    let selectable: Vec<i32> = methods
+        .iter()
+        .filter(|x| x.selectable)
+        .map(|x| x.id)
+        .collect();
+    if selectable.is_empty() {
+        println!(
+            "{}",
+            super::style_yellow("No available build method. Exit.")
+        );
+        return Ok(1);
+    }
+    let selected = prompt_build_method(&methods)?;
+    let Some(selected_entry) = methods.iter().find(|x| x.id == selected).cloned() else {
+        return Err("Invalid build method selection.".to_string());
+    };
+
+    if let Some(existing) = load_runtime_record(python, &db_path)? {
+        if existing.status == "ok" {
+            let (complete, detail) = runtime_completeness(&existing, runtime_home);
+            if complete {
+                println!(
+                    "{}",
+                    super::style_green(&format!(
+                        "Detected existing complete DLC runtime (mode={}).",
+                        existing.runtime_mode
+                    ))
+                );
+                let confirmed = prompt_yes_no(
+                    &format!(
+                        "Clear previous toolchain and reinstall via {}? [y/N]: ",
+                        selected_entry.name
+                    ),
+                    false,
+                )?;
+                if !confirmed {
+                    println!(
+                        "{}",
+                        super::style_yellow("Keep existing DLC runtime. Exit without reinstall.")
+                    );
+                    return Ok(0);
+                }
+            } else {
+                println!(
+                    "{}",
+                    super::style_yellow(&format!(
+                        "Detected existing incomplete DLC runtime (mode={}): {}. Reinstalling via {}.",
+                        existing.runtime_mode, detail, selected_entry.name
+                    ))
+                );
+            }
+        } else {
+            println!(
+                "{}",
+                super::style_yellow(&format!(
+                    "Detected previous DLC runtime with status=`{}`. Reinstalling via {}.",
+                    existing.status, selected_entry.name
+                ))
+            );
+        }
+        cleanup_previous_runtime(&existing, runtime_home)?;
+    }
+
+    let mut record = build_runtime(selected_entry.builder_id, python, runtime_home)?;
+    record.method_id = selected;
+    let missing_after = missing_tools_for_record(&record, runtime_home)?;
+    if !missing_after.is_empty() {
+        return Err(format!(
+            "Build failed: missing required tools -> {}",
+            missing_after.join(", ")
+        ));
+    }
+    record.installed_tools = REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect();
+    record.status = "ok".to_string();
+    record.updated_at = now_utc_epoch();
+    save_runtime_record(python, &db_path, &record)?;
+    println!(
+        "{}",
+        super::style_green(&format!(
+            "Build success. Saved to DB: {}",
+            db_path.to_string_lossy()
+        ))
+    );
+    println!(
+        "{}",
+        super::style_green(&format!(
+            "Installed tools: {}",
+            record.installed_tools.join(", ")
+        ))
+    );
+    Ok(0)
+}
+
+pub(crate) fn run_dlc_tool(
+    tool: &str,
+    args: &[String],
+    runtime_home: &Path,
+) -> Result<i32, String> {
+    if !is_dlc_tool(tool) {
+        return Err(format!("Unsupported DLC tool: {tool}"));
+    }
+    let python = super::venv_python(&runtime_home.join("venv"));
+    if !python.exists() {
+        return Err("DLC runtime is not ready. Please run `jx -update dlc`.".to_string());
+    }
+    let db_path = runtime_home.join(super::GWAS_HISTORY_DB_FILE);
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Some(record) = load_runtime_record(&python, &db_path)? else {
+        return Err("DLC runtime is not ready. Please run `jx -update dlc`.".to_string());
+    };
+    if record.status != "ok" {
+        return Err("DLC runtime is not ready. Please run `jx -update dlc`.".to_string());
+    }
+    let installed: BTreeSet<String> = record.installed_tools.iter().cloned().collect();
+    if !installed.contains(tool) {
+        return Err(format!(
+            "DLC runtime does not contain `{tool}`. Please run `jx -update dlc`."
+        ));
+    }
+
+    let mut cmd = build_tool_command(tool, args, &record, runtime_home)?;
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to run `jx {tool}`: {e}"))?;
+    Ok(super::exit_code(status))
+}
+
+fn collect_build_method_status() -> Vec<MethodStatus> {
+    let linux = cfg!(target_os = "linux");
+    let has_conda = command_in_path("conda");
+    let has_docker = command_in_path("docker");
+    let docker_daemon = if has_docker {
+        docker_daemon_running().0
+    } else {
+        false
+    };
+    let has_singularity = command_in_path("singularity");
+
+    if !linux {
+        let checks = vec![("docker", has_docker), ("daemon", docker_daemon)];
+        return vec![MethodStatus {
+            id: 1,
+            name: "docker",
+            builder_id: 3,
+            selectable: checks.iter().all(|x| x.1),
+            checks,
+        }];
+    }
+
+    let mut out = vec![
+        MethodStatus {
+            id: 1,
+            name: "env",
+            builder_id: 1,
+            checks: vec![("Linux", linux)],
+            selectable: false,
+        },
+        MethodStatus {
+            id: 2,
+            name: "conda",
+            builder_id: 2,
+            checks: vec![("Linux", linux), ("conda", has_conda)],
+            selectable: false,
+        },
+        MethodStatus {
+            id: 3,
+            name: "docker",
+            builder_id: 3,
+            checks: vec![("docker", has_docker), ("daemon", docker_daemon)],
+            selectable: false,
+        },
+        MethodStatus {
+            id: 4,
+            name: "singularity",
+            builder_id: 4,
+            checks: vec![("Linux", linux), ("singularity", has_singularity)],
+            selectable: false,
+        },
+    ];
+    for m in &mut out {
+        m.selectable = m.checks.iter().all(|x| x.1);
+    }
+    out
+}
+
+fn print_build_method_status(methods: &[MethodStatus]) {
+    for m in methods {
+        let mut segs = vec![format!("[{}] {}", m.id, m.name)];
+        for (n, ok) in &m.checks {
+            segs.push(format!("{n} {}", mark(*ok)));
+        }
+        let line = segs.join(" ");
+        if m.selectable {
+            println!("{}", super::style_green(&line));
+        } else {
+            println!("{}", super::style_yellow(&line));
+        }
+    }
+}
+
+fn prompt_build_method(methods: &[MethodStatus]) -> Result<i32, String> {
+    let selectable: Vec<i32> = methods
+        .iter()
+        .filter(|x| x.selectable)
+        .map(|x| x.id)
+        .collect();
+    if selectable.is_empty() {
+        return Err("No available build method in current system.".to_string());
+    }
+    let default_pick = selectable[0];
+
+    loop {
+        print!("Select build method (default {}): ", default_pick);
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut raw = String::new();
+        io::stdin()
+            .read_line(&mut raw)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        let v = raw.trim();
+        if v.is_empty() {
+            return Ok(default_pick);
+        }
+        let picked = v
+            .parse::<i32>()
+            .map_err(|_| "Please input method number.".to_string());
+        let picked = match picked {
+            Ok(x) => x,
+            Err(msg) => {
+                println!("{}", super::style_yellow(&msg));
+                continue;
+            }
+        };
+        let Some(entry) = methods.iter().find(|x| x.id == picked) else {
+            println!("{}", super::style_yellow("Invalid method number."));
+            continue;
+        };
+        if !entry.selectable {
+            println!("{}", super::style_yellow("Selected method is unavailable."));
+            continue;
+        }
+        return Ok(picked);
+    }
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
+    loop {
+        print!("{prompt}");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut raw = String::new();
+        io::stdin()
+            .read_line(&mut raw)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        let v = raw.trim().to_ascii_lowercase();
+        if v.is_empty() {
+            return Ok(default_yes);
+        }
+        if matches!(v.as_str(), "y" | "yes") {
+            return Ok(true);
+        }
+        if matches!(v.as_str(), "n" | "no") {
+            return Ok(false);
+        }
+        println!("{}", super::style_yellow("Please input y or n."));
+    }
+}
+
+fn build_runtime(
+    method_id: i32,
+    python: &Path,
+    runtime_home: &Path,
+) -> Result<RuntimeRecord, String> {
+    match method_id {
+        1 => build_env_runtime(runtime_home),
+        2 => build_conda_runtime(),
+        3 => build_docker_runtime(python),
+        4 => build_singularity_runtime(python),
+        _ => Err("Unknown build method.".to_string()),
+    }
+}
+
+fn runtime_completeness(record: &RuntimeRecord, runtime_home: &Path) -> (bool, String) {
+    match missing_tools_for_record(record, runtime_home) {
+        Ok(missing) => {
+            if missing.is_empty() {
+                (true, "ok".to_string())
+            } else {
+                (false, format!("missing {}", missing.join(", ")))
+            }
+        }
+        Err(e) => (false, e),
+    }
+}
+
+fn cleanup_previous_runtime(record: &RuntimeRecord, runtime_home: &Path) -> Result<(), String> {
+    match record.runtime_mode.as_str() {
+        "docker" => {
+            if let Some(docker_bin) = find_bin("docker") {
+                let image = if record.image_tag.trim().is_empty() {
+                    DEFAULT_IMAGE_TAG
+                } else {
+                    record.image_tag.as_str()
+                };
+                let _ = run_cmd(
+                    "cleanup old docker image",
+                    &vec![
+                        docker_bin.to_string_lossy().to_string(),
+                        "image".to_string(),
+                        "rm".to_string(),
+                        "-f".to_string(),
+                        image.to_string(),
+                    ],
+                    false,
+                );
+            }
+        }
+        "conda" => {
+            if let Some(conda_bin) = find_bin("conda") {
+                let env_name = if record.conda_env.trim().is_empty() {
+                    CONDA_ENV
+                } else {
+                    record.conda_env.as_str()
+                };
+                let _ = run_cmd(
+                    "cleanup old conda env",
+                    &vec![
+                        conda_bin.to_string_lossy().to_string(),
+                        "env".to_string(),
+                        "remove".to_string(),
+                        "-n".to_string(),
+                        env_name.to_string(),
+                        "-y".to_string(),
+                    ],
+                    false,
+                );
+            }
+        }
+        "singularity" => {
+            let sif = record.sif_path.trim();
+            if !sif.is_empty() {
+                let p = PathBuf::from(sif);
+                if p.exists() {
+                    fs::remove_file(&p)
+                        .map_err(|e| format!("Failed to remove old SIF {}: {e}", p.display()))?;
+                }
+            }
+        }
+        "env" | "local" => {}
+        _ => {}
+    }
+    let dlc_dir = runtime_home.join("dlc");
+    if dlc_dir.exists() {
+        fs::remove_dir_all(&dlc_dir).map_err(|e| {
+            format!(
+                "Failed to remove old DLC directory {}: {e}",
+                dlc_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("env method is Linux only.".to_string());
+    }
+    prepare_env_runtime_bin(runtime_home)?;
+    let missing_before = missing_local_tools();
+    if missing_before.is_empty() {
+        sync_env_runtime_bin(runtime_home)?;
+        return Ok(RuntimeRecord {
+            method_id: 1,
+            runtime_mode: "env".to_string(),
+            image_tag: String::new(),
+            conda_env: String::new(),
+            sif_path: String::new(),
+            installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+            status: "ok".to_string(),
+            updated_at: now_utc_epoch(),
+        });
+    }
+    let Some(pm) = linux_pkg_manager() else {
+        return Err(
+            "Unsupported Linux package manager (need apt-get/dnf/yum/pacman/zypper).".to_string(),
+        );
+    };
+    if pm == "apt-get" {
+        run_cmd(
+            &format!("build via env [{} update]", pm),
+            &with_sudo(vec!["apt-get".to_string(), "update".to_string()])?,
+            true,
+        )?;
+        run_cmd(
+            "build via env [apt core tools]",
+            &with_sudo(vec![
+                "apt-get".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "fastp".to_string(),
+                "bwa".to_string(),
+                "samtools".to_string(),
+                "bcftools".to_string(),
+                "tabix".to_string(),
+                "plink".to_string(),
+                "default-jre".to_string(),
+            ])?,
+            true,
+        )?;
+        run_cmd(
+            "build via env [apt gatk]",
+            &with_sudo(vec![
+                "apt-get".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "gatk".to_string(),
+            ])?,
+            false,
+        )?;
+        run_cmd(
+            "build via env [apt beagle]",
+            &with_sudo(vec![
+                "apt-get".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "beagle".to_string(),
+            ])?,
+            false,
+        )?;
+    } else if pm == "dnf" || pm == "yum" {
+        run_cmd(
+            &format!("build via env [{pm} core tools]"),
+            &with_sudo(vec![
+                pm.to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "fastp".to_string(),
+                "bwa".to_string(),
+                "samtools".to_string(),
+                "bcftools".to_string(),
+                "htslib".to_string(),
+                "plink".to_string(),
+                "java-17-openjdk".to_string(),
+            ])?,
+            true,
+        )?;
+        run_cmd(
+            &format!("build via env [{pm} gatk]"),
+            &with_sudo(vec![
+                pm.to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "gatk".to_string(),
+            ])?,
+            false,
+        )?;
+    } else if pm == "pacman" {
+        run_cmd(
+            "build via env [pacman core tools]",
+            &with_sudo(vec![
+                "pacman".to_string(),
+                "-Sy".to_string(),
+                "--noconfirm".to_string(),
+                "fastp".to_string(),
+                "bwa".to_string(),
+                "samtools".to_string(),
+                "bcftools".to_string(),
+                "htslib".to_string(),
+                "plink".to_string(),
+                "jre-openjdk".to_string(),
+            ])?,
+            true,
+        )?;
+    } else if pm == "zypper" {
+        run_cmd(
+            "build via env [zypper core tools]",
+            &with_sudo(vec![
+                "zypper".to_string(),
+                "--non-interactive".to_string(),
+                "install".to_string(),
+                "fastp".to_string(),
+                "bwa".to_string(),
+                "samtools".to_string(),
+                "bcftools".to_string(),
+                "tabix".to_string(),
+                "plink".to_string(),
+                "java-17-openjdk".to_string(),
+            ])?,
+            true,
+        )?;
+        run_cmd(
+            "build via env [zypper gatk]",
+            &with_sudo(vec![
+                "zypper".to_string(),
+                "--non-interactive".to_string(),
+                "install".to_string(),
+                "gatk".to_string(),
+            ])?,
+            false,
+        )?;
+    }
+
+    let missing_after = missing_local_tools();
+    if !missing_after.is_empty() {
+        return Err(format!(
+            "Host runtime is still missing tools: {}",
+            missing_after.join(", ")
+        ));
+    }
+    sync_env_runtime_bin(runtime_home)?;
+    Ok(RuntimeRecord {
+        method_id: 1,
+        runtime_mode: "env".to_string(),
+        image_tag: String::new(),
+        conda_env: String::new(),
+        sif_path: String::new(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
+}
+
+fn build_conda_runtime() -> Result<RuntimeRecord, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("conda method is Linux only.".to_string());
+    }
+    let Some(conda_bin) = find_bin("conda") else {
+        return Err("conda command not found in PATH.".to_string());
+    };
+    let prefix = vec![
+        conda_bin.to_string_lossy().to_string(),
+        "run".to_string(),
+        "--no-capture-output".to_string(),
+        "-n".to_string(),
+        CONDA_ENV.to_string(),
+    ];
+    let missing_now = missing_tools_in_prefixed_runtime(&prefix)?;
+    if missing_now.is_empty() {
+        return Ok(RuntimeRecord {
+            method_id: 2,
+            runtime_mode: "conda".to_string(),
+            image_tag: String::new(),
+            conda_env: CONDA_ENV.to_string(),
+            sif_path: String::new(),
+            installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+            status: "ok".to_string(),
+            updated_at: now_utc_epoch(),
+        });
+    }
+    if !conda_env_exists(&conda_bin, CONDA_ENV) {
+        run_cmd(
+            &format!("build via conda [create {CONDA_ENV}]"),
+            &vec![
+                conda_bin.to_string_lossy().to_string(),
+                "create".to_string(),
+                "-n".to_string(),
+                CONDA_ENV.to_string(),
+                "python=3.10".to_string(),
+                "-y".to_string(),
+            ],
+            true,
+        )?;
+    }
+    run_cmd(
+        "build via conda [install 1/2]",
+        &vec![
+            conda_bin.to_string_lossy().to_string(),
+            "install".to_string(),
+            "-n".to_string(),
+            CONDA_ENV.to_string(),
+            "-c".to_string(),
+            "conda-forge".to_string(),
+            "openjdk=17".to_string(),
+            "-y".to_string(),
+        ],
+        true,
+    )?;
+    run_cmd(
+        "build via conda [install 2/2]",
+        &vec![
+            conda_bin.to_string_lossy().to_string(),
+            "install".to_string(),
+            "-n".to_string(),
+            CONDA_ENV.to_string(),
+            "-c".to_string(),
+            "bioconda".to_string(),
+            "-c".to_string(),
+            "conda-forge".to_string(),
+            "fastp".to_string(),
+            "bwa".to_string(),
+            "samtools".to_string(),
+            "bcftools".to_string(),
+            "htslib".to_string(),
+            "plink".to_string(),
+            "beagle".to_string(),
+            "picard".to_string(),
+            "gatk4".to_string(),
+            "-y".to_string(),
+        ],
+        true,
+    )?;
+    let missing_after = missing_tools_in_prefixed_runtime(&prefix)?;
+    if !missing_after.is_empty() {
+        return Err(format!(
+            "Conda runtime is still missing tools: {}",
+            missing_after.join(", ")
+        ));
+    }
+    Ok(RuntimeRecord {
+        method_id: 2,
+        runtime_mode: "conda".to_string(),
+        image_tag: String::new(),
+        conda_env: CONDA_ENV.to_string(),
+        sif_path: String::new(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
+}
+
+fn build_docker_runtime(python: &Path) -> Result<RuntimeRecord, String> {
+    let Some(docker_bin) = find_bin("docker") else {
+        return Err("docker command not found in PATH.".to_string());
+    };
+    let (ready, err) = docker_daemon_running();
+    if !ready {
+        return Err(format!(
+            "Docker daemon is not running. detail: {}",
+            if err.is_empty() {
+                "docker daemon unavailable"
+            } else {
+                &err
+            }
+        ));
+    }
+    let dockerfile = pipeline_dockerfile_from_python(python)?;
+    if !dockerfile.exists() {
+        return Err(format!("Dockerfile not found: {}", dockerfile.display()));
+    }
+    let mut cmd = vec![
+        docker_bin.to_string_lossy().to_string(),
+        "build".to_string(),
+        "--progress=plain".to_string(),
+    ];
+    if let Some(platform) = docker_default_platform() {
+        cmd.push("--platform".to_string());
+        cmd.push(platform.to_string());
+    }
+    cmd.extend([
+        "-f".to_string(),
+        dockerfile.to_string_lossy().to_string(),
+        "-t".to_string(),
+        DEFAULT_IMAGE_TAG.to_string(),
+        dockerfile
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .to_string(),
+    ]);
+    run_cmd("build via docker", &cmd, true)?;
+
+    let mut verify_prefix = vec![
+        docker_bin.to_string_lossy().to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+    ];
+    if let Some(platform) = docker_default_platform() {
+        verify_prefix.push("--platform".to_string());
+        verify_prefix.push(platform.to_string());
+    }
+    verify_prefix.push(DEFAULT_IMAGE_TAG.to_string());
+    let missing = missing_tools_in_prefixed_runtime(&verify_prefix)?;
+    if !missing.is_empty() {
+        let _ = run_cmd(
+            "rollback via docker [remove failed image]",
+            &vec![
+                docker_bin.to_string_lossy().to_string(),
+                "image".to_string(),
+                "rm".to_string(),
+                "-f".to_string(),
+                DEFAULT_IMAGE_TAG.to_string(),
+            ],
+            false,
+        );
+        return Err(format!(
+            "Docker runtime is missing required tools: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(RuntimeRecord {
+        method_id: 3,
+        runtime_mode: "docker".to_string(),
+        image_tag: DEFAULT_IMAGE_TAG.to_string(),
+        conda_env: String::new(),
+        sif_path: String::new(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
+}
+
+fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("singularity method is Linux only.".to_string());
+    }
+    let Some(singularity_bin) = find_bin("singularity") else {
+        return Err("singularity command not found in PATH".to_string());
+    };
+    let pipeline_dir = pipeline_dir_from_python(python)?;
+    let bin_dir = pipeline_dir.join("bin");
+    fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
+    let sif_path = bin_dir.join("janusxext.sif");
+    if !sif_path.exists() {
+        print!("Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        let input = line.trim();
+        if input.is_empty() || input.eq_ignore_ascii_case("n") {
+            return Err("No SIF provided.".to_string());
+        }
+        let tmp_path = bin_dir.join("janusxext.tmp.sif");
+        if input.eq_ignore_ascii_case("y") {
+            download_with_fallback(&JANUSX_SIF_URLS, &tmp_path)?;
+        } else {
+            let src = PathBuf::from(input);
+            if !src.exists() {
+                return Err(format!("SIF path not found: {}", src.display()));
+            }
+            fs::copy(&src, &tmp_path).map_err(|e| {
+                format!(
+                    "Failed to copy SIF {} -> {}: {e}",
+                    src.display(),
+                    tmp_path.display()
+                )
+            })?;
+        }
+        fs::rename(&tmp_path, &sif_path).map_err(|e| {
+            format!(
+                "Failed to move {} -> {}: {e}",
+                tmp_path.display(),
+                sif_path.display()
+            )
+        })?;
+    }
+    let verify_prefix = vec![
+        singularity_bin.to_string_lossy().to_string(),
+        "exec".to_string(),
+        sif_path.to_string_lossy().to_string(),
+    ];
+    let missing = missing_tools_in_prefixed_runtime(&verify_prefix)?;
+    if !missing.is_empty() {
+        return Err(format!(
+            "Singularity image is missing required tools: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(RuntimeRecord {
+        method_id: 4,
+        runtime_mode: "singularity".to_string(),
+        image_tag: String::new(),
+        conda_env: String::new(),
+        sif_path: sif_path.to_string_lossy().to_string(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
+}
+
+fn build_tool_command(
+    tool: &str,
+    args: &[String],
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Result<Command, String> {
+    match record.runtime_mode.as_str() {
+        "env" | "local" => {
+            let tool_path = env_runtime_tool_path(runtime_home, tool);
+            if !tool_path.exists() {
+                return Err(format!(
+                    "DLC env runtime is missing `{}` at {}. Please run `jx -update dlc`.",
+                    tool,
+                    tool_path.display()
+                ));
+            }
+            let mut cmd = Command::new(tool_path);
+            cmd.args(args);
+            Ok(cmd)
+        }
+        "conda" => {
+            let Some(conda_bin) = find_bin("conda") else {
+                return Err("conda command not found in PATH.".to_string());
+            };
+            let env_name = if record.conda_env.trim().is_empty() {
+                CONDA_ENV
+            } else {
+                record.conda_env.as_str()
+            };
+            let mut cmd = Command::new(conda_bin);
+            cmd.arg("run")
+                .arg("--no-capture-output")
+                .arg("-n")
+                .arg(env_name)
+                .arg(tool)
+                .args(args);
+            Ok(cmd)
+        }
+        "docker" => {
+            let Some(docker_bin) = find_bin("docker") else {
+                return Err("docker command not found in PATH.".to_string());
+            };
+            let (ready, _) = docker_daemon_running();
+            if !ready {
+                return Err("Docker daemon is not running.".to_string());
+            }
+            let image = if record.image_tag.trim().is_empty() {
+                DEFAULT_IMAGE_TAG
+            } else {
+                record.image_tag.as_str()
+            };
+            let cwd = env::current_dir().map_err(|e| format!("Failed to get current dir: {e}"))?;
+            let mounts = collect_docker_mounts(args, &cwd);
+
+            let mut cmd = Command::new(docker_bin);
+            cmd.arg("run").arg("--rm");
+            if let Some(platform) = docker_default_platform() {
+                cmd.arg("--platform").arg(platform);
+            }
+            if let Some((uid, gid)) = current_uid_gid() {
+                cmd.arg("--user").arg(format!("{uid}:{gid}"));
+            }
+            for m in mounts {
+                let s = m.to_string_lossy().to_string();
+                cmd.arg("-v").arg(format!("{s}:{s}"));
+            }
+            cmd.arg("-w")
+                .arg(cwd.to_string_lossy().to_string())
+                .arg(image)
+                .arg(tool)
+                .args(args);
+            Ok(cmd)
+        }
+        "singularity" => {
+            let Some(singularity_bin) = find_bin("singularity") else {
+                return Err("singularity command not found in PATH.".to_string());
+            };
+            let sif = PathBuf::from(record.sif_path.trim());
+            if !sif.exists() {
+                return Err(
+                    "Saved singularity runtime is invalid. Please run `jx -update dlc`."
+                        .to_string(),
+                );
+            }
+            let mut cmd = Command::new(singularity_bin);
+            cmd.arg("exec").arg(sif).arg(tool).args(args);
+            Ok(cmd)
+        }
+        _ => Err("Unknown DLC runtime mode. Please run `jx -update dlc`.".to_string()),
+    }
+}
+
+fn missing_tools_for_record(
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Result<Vec<String>, String> {
+    match record.runtime_mode.as_str() {
+        "env" | "local" => Ok(missing_env_runtime_tools(runtime_home)),
+        "conda" => {
+            let Some(conda_bin) = find_bin("conda") else {
+                return Err("conda command not found in PATH.".to_string());
+            };
+            let env_name = if record.conda_env.trim().is_empty() {
+                CONDA_ENV
+            } else {
+                record.conda_env.as_str()
+            };
+            missing_tools_in_prefixed_runtime(&[
+                conda_bin.to_string_lossy().to_string(),
+                "run".to_string(),
+                "--no-capture-output".to_string(),
+                "-n".to_string(),
+                env_name.to_string(),
+            ])
+        }
+        "docker" => {
+            let Some(docker_bin) = find_bin("docker") else {
+                return Err("docker command not found in PATH.".to_string());
+            };
+            let image = if record.image_tag.trim().is_empty() {
+                DEFAULT_IMAGE_TAG
+            } else {
+                record.image_tag.as_str()
+            };
+            let mut prefix = vec![
+                docker_bin.to_string_lossy().to_string(),
+                "run".to_string(),
+                "--rm".to_string(),
+            ];
+            if let Some(platform) = docker_default_platform() {
+                prefix.push("--platform".to_string());
+                prefix.push(platform.to_string());
+            }
+            prefix.push(image.to_string());
+            missing_tools_in_prefixed_runtime(&prefix)
+        }
+        "singularity" => {
+            let Some(singularity_bin) = find_bin("singularity") else {
+                return Err("singularity command not found in PATH.".to_string());
+            };
+            let sif = record.sif_path.trim();
+            if sif.is_empty() {
+                return Err("Saved singularity runtime is invalid.".to_string());
+            }
+            missing_tools_in_prefixed_runtime(&[
+                singularity_bin.to_string_lossy().to_string(),
+                "exec".to_string(),
+                sif.to_string(),
+            ])
+        }
+        _ => Err("Unknown DLC runtime mode.".to_string()),
+    }
+}
+
+fn missing_local_tools() -> Vec<String> {
+    REQUIRED_TOOLS
+        .iter()
+        .filter(|x| !command_in_path(x))
+        .map(|x| (*x).to_string())
+        .collect()
+}
+
+fn prepare_env_runtime_bin(runtime_home: &Path) -> Result<(), String> {
+    let bin_dir = env_runtime_bin_dir(runtime_home);
+    fs::create_dir_all(&bin_dir).map_err(|e| {
+        format!(
+            "Failed to prepare DLC env bin directory {}: {e}",
+            bin_dir.display()
+        )
+    })
+}
+
+fn env_runtime_bin_dir(runtime_home: &Path) -> PathBuf {
+    runtime_home.join("dlc").join("bin")
+}
+
+fn env_runtime_tool_path(runtime_home: &Path, tool: &str) -> PathBuf {
+    env_runtime_bin_dir(runtime_home).join(tool)
+}
+
+fn sync_env_runtime_bin(runtime_home: &Path) -> Result<(), String> {
+    prepare_env_runtime_bin(runtime_home)?;
+    let bin_dir = env_runtime_bin_dir(runtime_home);
+    for tool in REQUIRED_TOOLS {
+        let Some(src) = find_bin(tool) else {
+            return Err(format!("Cannot locate host tool `{tool}` in PATH."));
+        };
+        let dst = bin_dir.join(tool);
+        write_tool_wrapper(&dst, &src)?;
+    }
+    Ok(())
+}
+
+fn write_tool_wrapper(dst: &Path, src: &Path) -> Result<(), String> {
+    let src_s = src.to_string_lossy().to_string();
+    let body = format!(
+        "#!/usr/bin/env bash\nexec '{}' \"$@\"\n",
+        sh_single_quote(&src_s)
+    );
+    if dst.exists() {
+        fs::remove_file(dst).map_err(|e| format!("Failed to replace {}: {e}", dst.display()))?;
+    }
+    fs::write(dst, body).map_err(|e| format!("Failed to write {}: {e}", dst.display()))?;
+    #[cfg(unix)]
+    {
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(dst, perms)
+            .map_err(|e| format!("Failed to set executable permission {}: {e}", dst.display()))?;
+    }
+    Ok(())
+}
+
+fn sh_single_quote(raw: &str) -> String {
+    raw.replace('\'', "'\"'\"'")
+}
+
+fn missing_env_runtime_tools(runtime_home: &Path) -> Vec<String> {
+    REQUIRED_TOOLS
+        .iter()
+        .filter_map(|tool| {
+            let p = env_runtime_tool_path(runtime_home, tool);
+            if p.exists() && p.is_file() {
+                None
+            } else {
+                Some((*tool).to_string())
+            }
+        })
+        .collect()
+}
+
+fn missing_tools_in_prefixed_runtime(prefix: &[String]) -> Result<Vec<String>, String> {
+    let script = format!(
+        "for t in {}; do command -v \"$t\" >/dev/null 2>&1 || echo \"$t\"; done",
+        REQUIRED_TOOLS.join(" ")
+    );
+    let mut cmd = Command::new(&prefix[0]);
+    cmd.args(&prefix[1..])
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let out = cmd
+        .output()
+        .map_err(|e| format!("Failed to verify runtime tools: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Err(format!(
+            "Runtime tool check command failed (exit={}): {}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let v = line.trim();
+        if !v.is_empty() {
+            missing.push(v.to_string());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
+}
+
+fn run_cmd(desc: &str, argv: &[String], required: bool) -> Result<(), String> {
+    if argv.is_empty() {
+        return Err(format!("{desc}: empty command"));
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (out, elapsed) = super::run_with_spinner(&mut cmd, &format!("{desc} ..."))?;
+    if out.status.success() {
+        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(elapsed)));
+        return Ok(());
+    }
+    let mut msg = String::new();
+    msg.push_str(&String::from_utf8_lossy(&out.stdout));
+    msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    if required {
+        return Err(format!(
+            "{desc} failed with exit={}.\n{}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+    eprintln!(
+        "{}",
+        super::style_yellow(&format!(
+            "Warning: {desc} failed (optional, exit={}).",
+            super::exit_code(out.status)
+        ))
+    );
+    Ok(())
+}
+
+fn pipeline_dir_from_python(python: &Path) -> Result<PathBuf, String> {
+    let out = Command::new(python)
+        .arg("-c")
+        .arg("import janusx.pipeline, pathlib; print(pathlib.Path(janusx.pipeline.__file__).resolve().parent)")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to resolve janusx.pipeline path: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Err(format!(
+            "Failed to locate janusx.pipeline path (exit={}): {}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() {
+        return Err("janusx.pipeline path is empty.".to_string());
+    }
+    Ok(PathBuf::from(p))
+}
+
+fn pipeline_dockerfile_from_python(python: &Path) -> Result<PathBuf, String> {
+    let pipeline_dir = pipeline_dir_from_python(python)?;
+    Ok(pipeline_dir.join("docker").join("dockerfile"))
+}
+
+fn download_with_fallback(urls: &[&str], dst: &Path) -> Result<(), String> {
+    let tmp = dst.with_extension("tmp.sif");
+    let mut errs: Vec<String> = Vec::new();
+    for url in urls {
+        let mut ok = false;
+        if command_in_path("curl") {
+            let cmd = vec![
+                "curl".to_string(),
+                "-L".to_string(),
+                "--fail".to_string(),
+                "--progress-bar".to_string(),
+                "-o".to_string(),
+                tmp.to_string_lossy().to_string(),
+                (*url).to_string(),
+            ];
+            if run_cmd("download SIF", &cmd, true).is_ok() {
+                ok = true;
+            }
+        } else if command_in_path("wget") {
+            let cmd = vec![
+                "wget".to_string(),
+                "-O".to_string(),
+                tmp.to_string_lossy().to_string(),
+                (*url).to_string(),
+            ];
+            if run_cmd("download SIF", &cmd, true).is_ok() {
+                ok = true;
+            }
+        } else {
+            return Err("Need `curl` or `wget` to download SIF.".to_string());
+        }
+        if ok {
+            fs::rename(&tmp, dst).map_err(|e| {
+                format!("Failed to move {} -> {}: {e}", tmp.display(), dst.display())
+            })?;
+            return Ok(());
+        }
+        errs.push((*url).to_string());
+    }
+    Err(format!(
+        "All SIF download sources failed: {}",
+        errs.join(", ")
+    ))
+}
+
+fn save_runtime_record(
+    python: &Path,
+    db_path: &Path,
+    record: &RuntimeRecord,
+) -> Result<(), String> {
+    let installed_csv = record.installed_tools.join(",");
+    let script = r#"
+import sqlite3, sys
+db, slot, method_id, runtime_mode, image_tag, conda_env, sif_path, installed_csv, status, updated_at = sys.argv[1:11]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_builds (
+    slot TEXT PRIMARY KEY,
+    method_id INTEGER NOT NULL,
+    runtime_mode TEXT NOT NULL,
+    image_tag TEXT NOT NULL,
+    conda_env TEXT NOT NULL,
+    sif_path TEXT NOT NULL,
+    installed_tools_csv TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+""")
+conn.execute("DELETE FROM dlc_builds")
+conn.execute(
+    "INSERT INTO dlc_builds (slot, method_id, runtime_mode, image_tag, conda_env, sif_path, installed_tools_csv, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    (slot, int(method_id), runtime_mode, image_tag, conda_env, sif_path, installed_csv, status, updated_at),
+)
+conn.commit()
+conn.close()
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(db_path.to_string_lossy().to_string())
+        .arg(DLC_SLOT)
+        .arg(record.method_id.to_string())
+        .arg(&record.runtime_mode)
+        .arg(&record.image_tag)
+        .arg(&record.conda_env)
+        .arg(&record.sif_path)
+        .arg(installed_csv)
+        .arg(&record.status)
+        .arg(&record.updated_at)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to save DLC runtime DB record: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut msg = String::new();
+    msg.push_str(&String::from_utf8_lossy(&out.stdout));
+    msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "Failed to save DLC runtime DB record (exit={}): {}",
+        super::exit_code(out.status),
+        msg.trim()
+    ))
+}
+
+fn load_runtime_record(python: &Path, db_path: &Path) -> Result<Option<RuntimeRecord>, String> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let script = r#"
+import sqlite3, sys
+db, slot = sys.argv[1:3]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_builds (
+    slot TEXT PRIMARY KEY,
+    method_id INTEGER NOT NULL,
+    runtime_mode TEXT NOT NULL,
+    image_tag TEXT NOT NULL,
+    conda_env TEXT NOT NULL,
+    sif_path TEXT NOT NULL,
+    installed_tools_csv TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+""")
+row = conn.execute(
+    "SELECT method_id, runtime_mode, image_tag, conda_env, sif_path, installed_tools_csv, status, updated_at FROM dlc_builds WHERE slot = ?",
+    (slot,)
+).fetchone()
+conn.close()
+if row is None:
+    sys.exit(2)
+vals = ["" if v is None else str(v).replace("\t", " ") for v in row]
+print("\t".join(vals))
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(db_path.to_string_lossy().to_string())
+        .arg(DLC_SLOT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to load DLC runtime DB record: {e}"))?;
+    let code = super::exit_code(out.status);
+    if code == 2 {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        if msg.contains("unable to open database file") {
+            return Ok(None);
+        }
+        return Err(format!(
+            "Failed to load DLC runtime DB record (exit={}): {}",
+            code,
+            msg.trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = text.split('\t').collect();
+    if parts.len() < 8 {
+        return Err("Invalid DLC runtime DB record format.".to_string());
+    }
+    let method_id = parts[0]
+        .parse::<i32>()
+        .map_err(|_| "Invalid method_id in DLC runtime DB record.".to_string())?;
+    let installed_tools = if parts[5].trim().is_empty() {
+        Vec::new()
+    } else {
+        parts[5]
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
+    Ok(Some(RuntimeRecord {
+        method_id,
+        runtime_mode: parts[1].to_string(),
+        image_tag: parts[2].to_string(),
+        conda_env: parts[3].to_string(),
+        sif_path: parts[4].to_string(),
+        installed_tools,
+        status: parts[6].to_string(),
+        updated_at: parts[7].to_string(),
+    }))
+}
+
+fn linux_pkg_manager() -> Option<&'static str> {
+    for name in ["apt-get", "dnf", "yum", "pacman", "zypper"] {
+        if command_in_path(name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn with_sudo(cmd: Vec<String>) -> Result<Vec<String>, String> {
+    if is_root() {
+        return Ok(cmd);
+    }
+    if !command_in_path("sudo") {
+        return Err("Host installation requires root privilege (sudo not found).".to_string());
+    }
+    let mut out = vec!["sudo".to_string()];
+    out.extend(cmd);
+    Ok(out)
+}
+
+fn is_root() -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let out = Command::new("id")
+        .arg("-u")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout).trim() == "0"
+}
+
+fn conda_env_exists(conda_bin: &Path, env_name: &str) -> bool {
+    Command::new(conda_bin)
+        .arg("run")
+        .arg("--no-capture-output")
+        .arg("-n")
+        .arg(env_name)
+        .arg("python")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn docker_daemon_running() -> (bool, String) {
+    let out = Command::new("docker")
+        .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return (false, "failed to call docker info".to_string());
+    };
+    if out.status.success() {
+        return (true, String::new());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.is_empty() {
+        (false, "docker daemon unavailable".to_string())
+    } else {
+        (false, err)
+    }
+}
+
+fn docker_default_platform() -> Option<&'static str> {
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Some("linux/amd64");
+    }
+    None
+}
+
+fn command_in_path(bin: &str) -> bool {
+    find_bin(bin).is_some()
+}
+
+fn find_bin(bin: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(bin);
+    if p.components().count() > 1 {
+        if p.exists() {
+            return Some(p);
+        }
+        return None;
+    }
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let cand = dir.join(bin);
+        if cand.exists() && cand.is_file() {
+            return Some(cand);
+        }
+        #[cfg(windows)]
+        {
+            for ext in [".exe", ".cmd", ".bat"] {
+                let c = dir.join(format!("{bin}{ext}"));
+                if c.exists() && c.is_file() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collect_docker_mounts(args: &[String], cwd: &Path) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Ok(c) = fs::canonicalize(cwd) {
+        out.insert(c);
+    } else {
+        out.insert(cwd.to_path_buf());
+    }
+
+    for arg in args {
+        maybe_add_mount(&mut out, cwd, arg);
+        if let Some((_, rhs)) = arg.split_once('=') {
+            maybe_add_mount(&mut out, cwd, rhs);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn maybe_add_mount(out: &mut BTreeSet<PathBuf>, cwd: &Path, raw: &str) {
+    let v = raw.trim();
+    if v.is_empty() || v.starts_with('-') || v.contains("://") {
+        return;
+    }
+    let p = PathBuf::from(v);
+    let abs = if p.is_absolute() { p } else { cwd.join(p) };
+    if abs.exists() {
+        if abs.is_dir() {
+            if let Ok(c) = fs::canonicalize(&abs) {
+                out.insert(c);
+            } else {
+                out.insert(abs);
+            }
+        } else if let Some(parent) = abs.parent() {
+            if parent.exists() {
+                if let Ok(c) = fs::canonicalize(parent) {
+                    out.insert(c);
+                } else {
+                    out.insert(parent.to_path_buf());
+                }
+            }
+        }
+        return;
+    }
+    if abs.is_absolute() {
+        if let Some(parent) = abs.parent() {
+            if parent.exists() {
+                if let Ok(c) = fs::canonicalize(parent) {
+                    out.insert(c);
+                } else {
+                    out.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+}
+
+fn current_uid_gid() -> Option<(u32, u32)> {
+    if cfg!(windows) {
+        return None;
+    }
+    let uid = Command::new("id")
+        .arg("-u")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let gid = Command::new("id")
+        .arg("-g")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !(uid.status.success() && gid.status.success()) {
+        return None;
+    }
+    let u = String::from_utf8_lossy(&uid.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let g = String::from_utf8_lossy(&gid.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    Some((u, g))
+}
+
+fn mark(ok: bool) -> &'static str {
+    if ok {
+        "✔︎"
+    } else {
+        "✘"
+    }
+}
+
+fn now_utc_epoch() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs();
+    ts.to_string()
+}

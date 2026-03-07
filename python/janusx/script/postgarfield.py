@@ -29,7 +29,11 @@ import pandas as pd
 from janusx.garfield.decode import decode
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.helptext import cli_help_formatter, minimal_help_epilog
+from janusx.script._common.helptext import (
+    CliArgumentParser,
+    cli_help_formatter,
+    minimal_help_epilog,
+)
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -126,7 +130,7 @@ def _filter_pseudomap_by_set_distance(pseudodf: pd.DataFrame, max_span_bp: int) 
 def main() -> None:
     t_start = time.time()
 
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx postgarfield",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
@@ -136,14 +140,14 @@ def main() -> None:
 
     # ------------------------- Required arguments -------------------------
     required_group = parser.add_argument_group("Required Arguments")
-    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group = required_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument("-bfile", "--bfile", type=str, help="Pseudo genotype PLINK prefix.")
     geno_group.add_argument("-vcf", "--vcf", type=str, help="Pseudo genotype VCF/VCF.GZ file.")
     required_group.add_argument(
-        "-p", "--pheno", type=str, required=True, help="Phenotype file."
+        "-p", "--pheno", type=str, required=False, help="Phenotype file."
     )
     required_group.add_argument(
-        "-k", "--grm", type=str, required=True,
+        "-k", "--grm", type=str, required=False,
         help="Required GRM file path for LMM (no auto-build).",
     )
 
@@ -248,7 +252,18 @@ def main() -> None:
         ),
     )
 
-    args = parser.parse_args()
+    args, extras = parser.parse_known_args()
+    missing_items: list[str] = []
+    if not (args.bfile or args.vcf):
+        missing_items.append("(-bfile BFILE | -vcf VCF)")
+    if not args.pheno:
+        missing_items.append("-p/--pheno")
+    if not args.grm:
+        missing_items.append("-k/--grm")
+    if len(missing_items) > 0:
+        parser.error("the following arguments are required: " + ", ".join(missing_items))
+    if len(extras) > 0:
+        parser.error("unrecognized arguments: " + " ".join(extras))
     if args.only_set is not None and args.only_set < 0:
         raise ValueError("--only-set must be >= 0.")
 

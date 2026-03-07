@@ -12,10 +12,11 @@ from ._common.gwas_history import (
     register_loaded_file,
     remove_loaded_file_by_id,
 )
+from ._common.helptext import CliArgumentParser
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = CliArgumentParser(
         prog="jx --load",
         description=(
             "List or register files for JanusX runtime.\n"

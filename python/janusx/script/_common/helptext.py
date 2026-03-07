@@ -57,6 +57,17 @@ def cli_help_formatter() -> type[argparse.HelpFormatter]:
     return _Formatter
 
 
+class CliArgumentParser(argparse.ArgumentParser):
+    """
+    Keep argparse usage formatting, but standardize error line as:
+    Error: <message>
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"Error: {message}\n")
+
+
 def minimal_help_epilog(examples: Sequence[str]) -> str:
     lines = [_heading_orange("Examples:")]
     for ex in examples:

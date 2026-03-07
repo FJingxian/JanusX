@@ -37,6 +37,7 @@ from ..script._common.gwas_history import (
     list_annotation_registry,
     list_gwas_history_rows,
     resolve_db_path,
+    resolve_jx_home,
     upsert_postgwas_run,
 )
 from .render import (
@@ -3034,6 +3035,7 @@ def _make_handler(state: WebUIState):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_root = str((resolve_jx_home() / "webui").resolve())
     parser = argparse.ArgumentParser(
         prog="jx webui",
         formatter_class=cli_help_formatter(),
@@ -3041,7 +3043,7 @@ def build_parser() -> argparse.ArgumentParser:
             [
                 "jx webui",
                 "jx webui --host 0.0.0.0 --port 8765",
-                "jx webui --root ~/.janusx_webui",
+                "jx webui --root ~/JanusX/.janusx/webui",
             ]
         ),
         description="JanusX Web UI (Post-GWAS first implementation).",
@@ -3061,7 +3063,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--root",
         type=str,
-        default=str(Path.home() / ".janusx_webui"),
+        default=default_root,
         help="WebUI runtime directory (jobs/logs) (default: %(default)s).",
     )
     parser.add_argument(

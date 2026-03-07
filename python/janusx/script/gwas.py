@@ -87,7 +87,7 @@ from janusx.gfreader import (
 from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -3567,7 +3567,7 @@ def run_farmcpu_fullmem(
 # ======================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx gwas",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
@@ -3578,7 +3578,7 @@ def parse_args():
 
     required_group = parser.add_argument_group("Required arguments")
 
-    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group = required_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
@@ -3594,7 +3594,7 @@ def parse_args():
     )
 
     required_group.add_argument(
-        "-p", "--pheno", type=str, required=True,
+        "-p", "--pheno", type=str, required=False,
         help="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
 
@@ -3685,7 +3685,24 @@ def parse_args():
         help="Prefix for output files (default: %(default)s).",
     )
 
-    return parser.parse_args()
+    args, extras = parser.parse_known_args()
+    has_genotype = bool(args.vcf or args.file or args.bfile)
+    has_pheno = bool(args.pheno)
+    if (not has_pheno) and (not has_genotype):
+        parser.error(
+            "the following arguments are required: -p/--pheno & "
+            "(-vcf VCF | -file FILE | -bfile BFILE)"
+        )
+    if not has_pheno:
+        parser.error("the following arguments are required: -p/--pheno")
+    if not has_genotype:
+        parser.error(
+            "the following arguments are required: "
+            "(-vcf VCF | -file FILE | -bfile BFILE)"
+        )
+    if len(extras) > 0:
+        parser.error("unrecognized arguments: " + " ".join(extras))
+    return args
 
 
 def main(log: bool = True):

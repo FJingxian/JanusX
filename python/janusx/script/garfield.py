@@ -22,7 +22,7 @@ from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus
-from janusx.script._common.helptext import cli_help_formatter
+from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 
 
 def _safe_trait_label(label: object) -> str:
@@ -112,13 +112,13 @@ def determine_genotype_source(args) -> tuple[str, str]:
 def main() -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx garfield",
         formatter_class=cli_help_formatter(),
     )
 
     required_group = parser.add_argument_group("Required Arguments")
-    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group = required_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
         help="Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).",
@@ -132,7 +132,7 @@ def main() -> None:
         help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
     )
     required_group.add_argument(
-        "-p", "--pheno", type=str, required=True,
+        "-p", "--pheno", type=str, required=False,
         help="Phenotype file (sample IDs in the first column).",
     )
 
@@ -191,7 +191,23 @@ def main() -> None:
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
 
-    args = parser.parse_args()
+    args, extras = parser.parse_known_args()
+    has_genotype = bool(args.vcf or args.file or args.bfile)
+    has_pheno = bool(args.pheno)
+    if (not has_pheno) and (not has_genotype):
+        parser.error(
+            "the following arguments are required: -p/--pheno & "
+            "(-vcf VCF | -file FILE | -bfile BFILE)"
+        )
+    if not has_pheno:
+        parser.error("the following arguments are required: -p/--pheno")
+    if not has_genotype:
+        parser.error(
+            "the following arguments are required: "
+            "(-vcf VCF | -file FILE | -bfile BFILE)"
+        )
+    if len(extras) > 0:
+        parser.error("unrecognized arguments: " + " ".join(extras))
 
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")

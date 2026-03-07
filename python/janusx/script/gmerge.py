@@ -28,7 +28,7 @@ import sys
 
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -65,7 +65,7 @@ def _infer_prefix(out: str, out_fmt: str) -> str:
 def main(log: bool = True):
     t_start = time.time()
 
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx gmerge",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([

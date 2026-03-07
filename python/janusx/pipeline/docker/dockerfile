@@ -3,10 +3,12 @@ FROM ubuntu:22.04
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GATK_VER="4.6.2.0"
 ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
+ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget unzip git \
-    tabix bcftools plink \
+    tabix bcftools \
+    bash gawk coreutils sed grep findutils \
     python3 python3-pip python3-venv \
     openjdk-17-jre-headless \
     bwa samtools fastp \
@@ -31,10 +33,28 @@ RUN mkdir -p /opt/beagle \
        > /usr/local/bin/beagle \
     && chmod +x /usr/local/bin/beagle
 
+RUN mkdir -p /opt/plink \
+    && wget -O /opt/plink/plink.zip "${PLINK19_URL}" \
+    && unzip /opt/plink/plink.zip -d /opt/plink \
+    && rm -f /opt/plink/plink.zip \
+    && if [ -x /opt/plink/plink ]; then ln -sf /opt/plink/plink /usr/local/bin/plink; fi \
+    && if [ -x /opt/plink/plink1.9 ]; then ln -sf /opt/plink/plink1.9 /usr/local/bin/plink; fi
+
 ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH" \
     GATK_LOCAL_JAR="/opt/gatk/gatk-${GATK_VER}/gatk-package-${GATK_VER}-local.jar" \
     MALLOC_ARENA_MAX=2 \
     JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
+
+RUN command -v fastp \
+    && command -v bwa \
+    && command -v samtools \
+    && command -v gatk \
+    && command -v bcftools \
+    && command -v tabix \
+    && command -v plink \
+    && command -v beagle \
+    && command -v awk \
+    && command -v sort
 
 WORKDIR /work
 

@@ -15,9 +15,7 @@ Examples
   jx fastq2vcf \\
     --reference /data/ref.fa \\
     --fastq-dir /data/fastq \\
-    --workdir /data/out \\
-    --backend nohup \\
-    --maxtask 2
+    --workdir /data/out
 """
 
 import os
@@ -29,18 +27,25 @@ import sys
 import subprocess
 import shutil
 import shlex
+import json
+import sqlite3
+import logging
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Optional, Sequence
+from collections import deque
+from queue import Queue, Empty
+from threading import Thread
+from typing import Any, Dict, List, Optional, Sequence
 
 import janusx.pipeline
 from janusx.pipeline.fastq2vcf import fastq2vcf, indexREF
 from janusx.pipeline.pipeline import wrap_cmd
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_dir_exists, ensure_file_exists
+from ._common.gwas_history import resolve_db_path
 from ._common.status import (
     CliStatus,
     get_rich_spinner_name,
@@ -89,16 +94,109 @@ REQUIRED_LOCAL_TOOLS = (
     "plink",
     "beagle",
 )
-DOCKER_IMAGE_TAG = "janusx-fastq2vcf:latest"
+DOCKER_IMAGE_TAG = "janusxdlc:latest"
 JANUSX_SIF_URLS = (
     "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
 )
-CONDA_BSA_ENV = "BSA"
+CONDA_BSA_ENV = "janusxdlc"
+FASTQ2VCF_BUILD_TABLE = "fastq2vcf_builds"
+FASTQ2VCF_BUILD_SLOT = "active"
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_PROGRESS_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%(?!\d)")
+_DOCKER_RUN_STEP_RE = re.compile(r"\[[^\]]*?(\d+)/(?:\d+)\]\s+RUN\b")
+_ENV_TOOL_PACKAGES: Dict[str, Dict[str, Sequence[str]]] = {
+    "apt-get": {
+        "fastp": ("fastp",),
+        "bwa": ("bwa",),
+        "samtools": ("samtools",),
+        "gatk": ("gatk",),
+        "bcftools": ("bcftools",),
+        "tabix": ("tabix",),
+        "plink": ("plink",),
+        "beagle": ("beagle", "default-jre"),
+    },
+    "dnf": {
+        "fastp": ("fastp",),
+        "bwa": ("bwa",),
+        "samtools": ("samtools",),
+        "gatk": ("gatk",),
+        "bcftools": ("bcftools",),
+        "tabix": ("htslib",),
+        "plink": ("plink",),
+        "beagle": ("beagle", "java-17-openjdk"),
+    },
+    "yum": {
+        "fastp": ("fastp",),
+        "bwa": ("bwa",),
+        "samtools": ("samtools",),
+        "gatk": ("gatk",),
+        "bcftools": ("bcftools",),
+        "tabix": ("htslib",),
+        "plink": ("plink",),
+        "beagle": ("beagle", "java-17-openjdk"),
+    },
+    "pacman": {
+        "fastp": ("fastp",),
+        "bwa": ("bwa",),
+        "samtools": ("samtools",),
+        "gatk": ("gatk",),
+        "bcftools": ("bcftools",),
+        "tabix": ("htslib",),
+        "plink": ("plink",),
+        "beagle": ("beagle", "jre-openjdk"),
+    },
+    "zypper": {
+        "fastp": ("fastp",),
+        "bwa": ("bwa",),
+        "samtools": ("samtools",),
+        "gatk": ("gatk",),
+        "bcftools": ("bcftools",),
+        "tabix": ("tabix",),
+        "plink": ("plink",),
+        "beagle": ("beagle", "java-17-openjdk"),
+    },
+}
+_CONDA_TOOL_PACKAGES: Dict[str, Sequence[str]] = {
+    "fastp": ("fastp",),
+    "bwa": ("bwa",),
+    "samtools": ("samtools",),
+    "gatk": ("gatk4",),
+    "bcftools": ("bcftools",),
+    "tabix": ("htslib",),
+    "plink": ("plink",),
+    "beagle": ("beagle", "openjdk"),
+}
 
 
 def _missing_binaries(commands: Sequence[str]) -> List[str]:
     return [cmd for cmd in commands if shutil.which(cmd) is None]
+
+
+def _missing_jx_tool_wrappers(commands: Sequence[str]) -> List[str]:
+    jx_bin = shutil.which("jx")
+    if jx_bin is None:
+        return [str(x) for x in list(commands or [])]
+    missing: List[str] = []
+    for tool in commands:
+        t = str(tool).strip()
+        if t == "":
+            continue
+        try:
+            p = subprocess.run(
+                [str(jx_bin), t, "-h"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=8,
+            )
+        except Exception:
+            missing.append(t)
+            continue
+        if int(p.returncode) != 0:
+            missing.append(t)
+    return missing
 
 
 def _dockerfile_path() -> Path:
@@ -136,24 +234,63 @@ def _docker_exec_prefix(image_tag: str, workdir: Path, mounts: Sequence[Path]) -
     return " ".join(shlex.quote(x) for x in parts)
 
 
+def _count_dockerfile_run_steps(dockerfile: Path) -> int:
+    try:
+        lines = dockerfile.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return 0
+
+    count = 0
+    stmt = ""
+    for raw in lines:
+        s = str(raw).strip()
+        if s == "" or s.startswith("#"):
+            continue
+
+        if stmt == "":
+            stmt = s
+        else:
+            stmt = f"{stmt} {s}"
+
+        if s.endswith("\\"):
+            stmt = stmt[:-1].rstrip()
+            continue
+
+        head = stmt.split(None, 1)[0].upper() if stmt else ""
+        if head == "RUN":
+            count += 1
+        stmt = ""
+
+    if stmt:
+        head = stmt.split(None, 1)[0].upper()
+        if head == "RUN":
+            count += 1
+    return max(0, int(count))
+
+
 def _build_docker_image(dockerfile: Path, image_tag: str, use_spinner: bool, logger) -> None:
     cmd = [
         "docker",
         "build",
+        "--progress=plain",
         "-f",
         str(dockerfile),
         "-t",
         image_tag,
         str(dockerfile.parent),
     ]
-    logger.info("Docker build: %s", " ".join(shlex.quote(x) for x in cmd))
-    with CliStatus("Building Docker image...", enabled=use_spinner) as task:
-        try:
-            subprocess.run(cmd, check=True)
-        except Exception:
-            task.fail("Docker image build ...Failed")
-            raise
-        task.complete("Docker image build ...Finished")
+    if sys.platform.startswith("darwin"):
+        # macOS (especially Apple Silicon) defaults to arm64; pin amd64 for tool compatibility.
+        cmd[2:2] = ["--platform", "linux/amd64"]
+    run_steps = _count_dockerfile_run_steps(dockerfile)
+    _run_cmd_live_tail(
+        cmd,
+        desc="Build via docker",
+        logger=logger,
+        max_lines=10,
+        step_total=run_steps,
+        step_mode=bool(run_steps > 0),
+    )
 
 
 def _docker_daemon_running(docker_bin: str) -> tuple[bool, str]:
@@ -172,6 +309,29 @@ def _docker_daemon_running(docker_bin: str) -> tuple[bool, str]:
         return True, ""
     err = (p.stderr or "").strip()
     return False, err if err else "docker daemon unavailable"
+
+
+def _detect_task_scheduler() -> tuple[str, str]:
+    """
+    Auto-select scheduler:
+    - use csub when command exists and can be executed
+    - fallback to nohup otherwise
+    """
+    csub_bin = shutil.which("csub")
+    if csub_bin is None:
+        return "nohup", "csub not found in PATH"
+    try:
+        subprocess.run(
+            [str(csub_bin), "-h"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception as e:
+        return "nohup", f"csub probe failed: {e}"
+    return "csub", f"detected csub at {csub_bin}"
 
 
 def _runtime_missing_tools(exec_prefix: str, tools: Sequence[str]) -> List[str]:
@@ -204,6 +364,300 @@ def _runtime_missing_tools(exec_prefix: str, tools: Sequence[str]) -> List[str]:
         if v:
             missing.append(v)
     return sorted(set(missing))
+
+
+def _tty_enabled() -> bool:
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _term_width(default: int = 120) -> int:
+    try:
+        w = int(shutil.get_terminal_size((default, 24)).columns)
+        return max(60, w)
+    except Exception:
+        return int(default)
+
+
+def _truncate_line(text: str, width: int) -> str:
+    s = str(text).replace("\r", "").replace("\n", "")
+    if len(s) <= width:
+        return s
+    if width <= 1:
+        return s[:width]
+    return s[: width - 1] + "…"
+
+
+def _style_green(text: str) -> str:
+    if _tty_enabled():
+        return f"\033[32m{text}\033[0m"
+    return str(text)
+
+
+def _style_yellow(text: str) -> str:
+    if _tty_enabled():
+        return f"\033[33m{text}\033[0m"
+    return str(text)
+
+
+def _style_dim(text: str) -> str:
+    if _tty_enabled():
+        return f"\033[2m{text}\033[0m"
+    return str(text)
+
+
+def _find_progress_percent(line: str) -> Optional[float]:
+    vals: List[float] = []
+    for m in _PROGRESS_RE.finditer(str(line or "")):
+        try:
+            vals.append(float(m.group(1)))
+        except Exception:
+            continue
+    vals = [v for v in vals if 0.0 <= v <= 100.0]
+    if len(vals) == 0:
+        return None
+    return float(vals[-1])
+
+
+def _format_progress_bar(percent: float, width: int = 20) -> str:
+    p = float(max(0.0, min(100.0, percent)))
+    n = max(10, int(width))
+    k = int(round((p / 100.0) * n))
+    if k < 0:
+        k = 0
+    if k > n:
+        k = n
+    bar = "█" * k + "░" * (n - k)
+    return f"[{bar}] {p:5.1f}%"
+
+
+def _render_live_block(
+    *,
+    desc: str,
+    start_ts: float,
+    tail: deque[str],
+    max_lines: int,
+    rendered_before: bool,
+    progress_percent: Optional[float],
+    step_progress: Optional[tuple[int, int]] = None,
+    final_symbol: str = "",
+) -> None:
+    width = _term_width()
+    total_rows = int(max_lines) + 1
+    if rendered_before:
+        print(f"\x1b[{total_rows}A", end="")
+
+    elapsed = format_elapsed(time.monotonic() - float(start_ts))
+    if final_symbol:
+        if step_progress is not None:
+            done = int(max(0, step_progress[0]))
+            total = int(max(1, step_progress[1]))
+            if done > total:
+                done = total
+            title = f"{final_symbol} [{done}/{total}] {desc}[{elapsed}]"
+        else:
+            title = f"{final_symbol} {desc}[{elapsed}]"
+    elif step_progress is not None:
+        done = int(max(0, step_progress[0]))
+        total = int(max(1, step_progress[1]))
+        if done > total:
+            done = total
+        title = f"[{done}/{total}] {desc}[{elapsed}]"
+    elif progress_percent is not None:
+        bar_w = max(12, min(26, width // 5))
+        title = f"{_format_progress_bar(progress_percent, bar_w)} {desc}[{elapsed}]"
+    else:
+        idx = int((time.monotonic() - float(start_ts)) * 10.0) % len(_SPINNER_FRAMES)
+        title = f"{_SPINNER_FRAMES[idx]} {desc}[{elapsed}]"
+
+    title = _truncate_line(title, width)
+    if final_symbol == "✘":
+        print(f"\x1b[2K\r{_style_yellow(title)}")
+    else:
+        print(f"\x1b[2K\r{_style_green(title)}")
+
+    shown = 0
+    for ln in list(tail):
+        print(f"\x1b[2K\r{_style_dim(_truncate_line(ln, width))}")
+        shown += 1
+    while shown < int(max_lines):
+        print("\x1b[2K\r")
+        shown += 1
+    sys.stdout.flush()
+
+
+def _run_cmd_live_tail(
+    cmd: Sequence[str],
+    *,
+    desc: str,
+    logger,
+    max_lines: int = 10,
+    step_total: int = 0,
+    step_mode: bool = False,
+) -> None:
+    run_cmd = [str(x) for x in list(cmd)]
+
+    def _log_file_only(message: str) -> None:
+        try:
+            lg = logger if isinstance(logger, logging.Logger) else logging.getLogger()
+            rec = lg.makeRecord(
+                lg.name,
+                logging.INFO,
+                __file__,
+                0,
+                str(message),
+                args=(),
+                exc_info=None,
+            )
+            for h in list(getattr(lg, "handlers", [])):
+                if isinstance(h, logging.FileHandler):
+                    h.handle(rec)
+        except Exception:
+            pass
+
+    cmd_txt = " ".join(shlex.quote(x) for x in run_cmd)
+    if _tty_enabled():
+        _log_file_only(f"Run ({desc}): {cmd_txt}")
+    else:
+        logger.info("Run (%s): %s", desc, cmd_txt)
+
+    if not _tty_enabled():
+        p = subprocess.run(
+            run_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        text = str(p.stdout or "")
+        for line in text.splitlines():
+            if line.strip():
+                logger.info("%s", line.rstrip())
+        if p.returncode != 0:
+            raise RuntimeError(f"{desc} failed with exit code {int(p.returncode)}")
+        return
+
+    child = subprocess.Popen(
+        run_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if child.stdout is None:
+        rc = int(child.wait())
+        if rc != 0:
+            raise RuntimeError(f"{desc} failed with exit code {rc}")
+        return
+
+    q: Queue[Optional[str]] = Queue()
+
+    def _reader() -> None:
+        try:
+            for line in child.stdout:
+                q.put(str(line).rstrip("\n"))
+        finally:
+            q.put(None)
+
+    reader = Thread(target=_reader, daemon=True)
+    reader.start()
+
+    start_ts = time.monotonic()
+    tail: deque[str] = deque(maxlen=max(1, int(max_lines)))
+    rendered = False
+    progress_percent: Optional[float] = None
+    step_total_i = int(max(0, step_total))
+    step_done = 0
+    step_seen: set[int] = set()
+    reader_done = False
+
+    while True:
+        drained = False
+        while True:
+            try:
+                item = q.get_nowait()
+            except Empty:
+                break
+            drained = True
+            if item is None:
+                reader_done = True
+                continue
+            s = str(item).strip()
+            if s:
+                tail.append(s)
+                _log_file_only(s)
+                if step_mode and step_total_i > 0:
+                    m = _DOCKER_RUN_STEP_RE.search(s)
+                    if m is not None:
+                        try:
+                            sid = int(m.group(1))
+                        except Exception:
+                            sid = -1
+                        if sid > 0 and sid not in step_seen:
+                            step_seen.add(sid)
+                            step_done = min(step_total_i, len(step_seen))
+                else:
+                    p = _find_progress_percent(s)
+                    if p is not None:
+                        progress_percent = p
+
+        if (not drained) and (not reader_done):
+            try:
+                item = q.get(timeout=0.1)
+                if item is None:
+                    reader_done = True
+                else:
+                    s = str(item).strip()
+                    if s:
+                        tail.append(s)
+                        _log_file_only(s)
+                        if step_mode and step_total_i > 0:
+                            m = _DOCKER_RUN_STEP_RE.search(s)
+                            if m is not None:
+                                try:
+                                    sid = int(m.group(1))
+                                except Exception:
+                                    sid = -1
+                                if sid > 0 and sid not in step_seen:
+                                    step_seen.add(sid)
+                                    step_done = min(step_total_i, len(step_seen))
+                        else:
+                            p = _find_progress_percent(s)
+                            if p is not None:
+                                progress_percent = p
+            except Empty:
+                pass
+
+        _render_live_block(
+            desc=desc,
+            start_ts=start_ts,
+            tail=tail,
+            max_lines=max_lines,
+            rendered_before=rendered,
+            progress_percent=progress_percent,
+            step_progress=((step_done, step_total_i) if (step_mode and step_total_i > 0) else None),
+            final_symbol="",
+        )
+        rendered = True
+
+        if reader_done and (child.poll() is not None) and q.empty():
+            break
+
+    rc = int(child.wait())
+    if rc == 0 and step_mode and step_total_i > 0:
+        step_done = step_total_i
+    _render_live_block(
+        desc=desc,
+        start_ts=start_ts,
+        tail=tail,
+        max_lines=max_lines,
+        rendered_before=rendered,
+        progress_percent=progress_percent,
+        step_progress=((step_done, step_total_i) if (step_mode and step_total_i > 0) else None),
+        final_symbol=("✔︎" if rc == 0 else "✘"),
+    )
+    print("", flush=True)
+    if rc != 0:
+        raise RuntimeError(f"{desc} failed with exit code {rc}")
 
 
 def _conda_exec_prefix(conda_bin: str, env_name: str) -> str:
@@ -256,14 +710,13 @@ def _prepare_conda_runtime(
 
     if not _conda_env_exists(conda_bin, env_name):
         create_cmd = [str(conda_bin), "create", "-n", str(env_name), "python=3.10", "-y"]
-        logger.info("Creating conda env: %s", " ".join(shlex.quote(x) for x in create_cmd))
-        with CliStatus(f"Creating conda env ({env_name})...", enabled=use_spinner) as task:
-            try:
-                subprocess.run(create_cmd, check=True)
-            except Exception:
-                task.fail(f"Conda env ({env_name}) creation ...Failed")
-                raise
-            task.complete(f"Conda env ({env_name}) creation ...Finished")
+        _run_install_step(
+            create_cmd,
+            label=f"build via conda [create {env_name}]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
 
     install_cmds = [
         [
@@ -280,14 +733,13 @@ def _prepare_conda_runtime(
         ],
     ]
     for i, cmd in enumerate(install_cmds, start=1):
-        logger.info("Conda install step %d: %s", i, " ".join(shlex.quote(x) for x in cmd))
-        with CliStatus(f"Installing conda dependencies ({i}/{len(install_cmds)})...", enabled=use_spinner) as task:
-            try:
-                subprocess.run(cmd, check=True)
-            except Exception:
-                task.fail("Conda dependency install ...Failed")
-                raise
-            task.complete("Conda dependency install ...Finished")
+        _run_install_step(
+            cmd,
+            label=f"build via conda [install {i}/{len(install_cmds)}]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
 
     missing_after = _runtime_missing_tools(prefix, REQUIRED_LOCAL_TOOLS)
     if len(missing_after) > 0:
@@ -295,6 +747,909 @@ def _prepare_conda_runtime(
             "Conda runtime is still missing tools: " + ", ".join(missing_after)
         )
     return prefix
+
+
+def _is_linux_root() -> bool:
+    try:
+        return bool(os.geteuid() == 0)
+    except Exception:
+        return False
+
+
+def _with_sudo_if_needed(cmd: Sequence[str]) -> List[str]:
+    c = [str(x) for x in list(cmd)]
+    if _is_linux_root():
+        return c
+    sudo_bin = shutil.which("sudo")
+    if sudo_bin is None:
+        raise RuntimeError(
+            "Host installation requires root privilege (sudo not found)."
+        )
+    return [str(sudo_bin)] + c
+
+
+def _linux_pkg_manager() -> str:
+    for name in ("apt-get", "dnf", "yum", "pacman", "zypper"):
+        if shutil.which(name) is not None:
+            return str(name)
+    return ""
+
+
+def _run_install_step(
+    cmd: Sequence[str],
+    *,
+    label: str,
+    use_spinner: bool,
+    logger,
+    required: bool = True,
+) -> None:
+    _ = use_spinner
+    run_cmd = [str(x) for x in list(cmd)]
+    try:
+        _run_cmd_live_tail(
+            run_cmd,
+            desc=str(label),
+            logger=logger,
+            max_lines=10,
+        )
+    except Exception:
+        if required:
+            raise
+
+
+def _prepare_env_runtime(*, use_spinner: bool, logger) -> str:
+    """
+    Linux host installation mode. Install required tools into host environment.
+    """
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("env method is Linux only.")
+
+    miss_before = _missing_binaries(REQUIRED_LOCAL_TOOLS)
+    if len(miss_before) == 0:
+        return ""
+
+    pm = _linux_pkg_manager()
+    if pm == "":
+        raise RuntimeError(
+            "Unsupported Linux package manager (need apt-get/dnf/yum/pacman/zypper)."
+        )
+
+    if pm == "apt-get":
+        _run_install_step(
+            _with_sudo_if_needed(["apt-get", "update"]),
+            label="build via env [apt update]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
+        _run_install_step(
+            _with_sudo_if_needed(
+                ["apt-get", "install", "-y", "fastp", "bwa", "samtools", "bcftools", "tabix", "plink", "default-jre"]
+            ),
+            label="build via env [apt core tools]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
+        _run_install_step(
+            _with_sudo_if_needed(["apt-get", "install", "-y", "gatk"]),
+            label="build via env [apt gatk]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=False,
+        )
+        _run_install_step(
+            _with_sudo_if_needed(["apt-get", "install", "-y", "beagle"]),
+            label="build via env [apt beagle]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=False,
+        )
+        return ""
+
+    if pm in {"dnf", "yum"}:
+        manager = pm
+        _run_install_step(
+            _with_sudo_if_needed(
+                [manager, "install", "-y", "fastp", "bwa", "samtools", "bcftools", "htslib", "plink", "java-17-openjdk"]
+            ),
+            label=f"build via env [{manager} core tools]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
+        _run_install_step(
+            _with_sudo_if_needed([manager, "install", "-y", "gatk"]),
+            label=f"build via env [{manager} gatk]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=False,
+        )
+        return ""
+
+    if pm == "pacman":
+        _run_install_step(
+            _with_sudo_if_needed(
+                ["pacman", "-Sy", "--noconfirm", "fastp", "bwa", "samtools", "bcftools", "htslib", "plink", "jre-openjdk"]
+            ),
+            label="build via env [pacman core tools]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
+        return ""
+
+    if pm == "zypper":
+        _run_install_step(
+            _with_sudo_if_needed(
+                ["zypper", "--non-interactive", "install", "fastp", "bwa", "samtools", "bcftools", "tabix", "plink", "java-17-openjdk"]
+            ),
+            label="build via env [zypper core tools]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=True,
+        )
+        _run_install_step(
+            _with_sudo_if_needed(["zypper", "--non-interactive", "install", "gatk"]),
+            label="build via env [zypper gatk]",
+            use_spinner=use_spinner,
+            logger=logger,
+            required=False,
+        )
+        return ""
+
+    raise RuntimeError("Unsupported Linux package manager.")
+
+
+def _prepare_docker_runtime(
+    *,
+    reference: Path,
+    fastq_dir: Path,
+    workdir: Path,
+    use_spinner: bool,
+    logger,
+) -> str:
+    docker_bin = shutil.which("docker")
+    if docker_bin is None:
+        raise RuntimeError("docker command not found in PATH")
+    docker_ready, docker_err = _docker_daemon_running(docker_bin)
+    if not docker_ready:
+        raise RuntimeError(
+            "Docker daemon is not running. detail: "
+            + (docker_err if docker_err else "docker daemon unavailable")
+        )
+    dockerfile = _dockerfile_path()
+    if not dockerfile.exists():
+        raise RuntimeError(f"Dockerfile not found: {dockerfile}")
+
+    _build_docker_image(
+        dockerfile=dockerfile,
+        image_tag=DOCKER_IMAGE_TAG,
+        use_spinner=use_spinner,
+        logger=logger,
+    )
+    docker_mounts = _collect_docker_mounts(
+        reference=reference,
+        fastq_dir=fastq_dir,
+        workdir=workdir,
+    )
+    exec_prefix = _docker_exec_prefix(
+        image_tag=DOCKER_IMAGE_TAG,
+        workdir=workdir,
+        mounts=docker_mounts,
+    )
+    missing_in_docker = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
+    if len(missing_in_docker) > 0:
+        raise RuntimeError(
+            "Docker runtime is missing required tools: " + ", ".join(missing_in_docker)
+        )
+    return exec_prefix
+
+
+def _prepare_singularity_runtime(*, logger) -> str:
+    singularity_bin = shutil.which("singularity")
+    if singularity_bin is None:
+        raise RuntimeError("singularity command not found in PATH")
+
+    binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
+    binary_path.mkdir(parents=True, exist_ok=True)
+    sif_path = binary_path / "janusxext.sif"
+    if not sif_path.exists():
+        user_input = input(
+            "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
+        ).strip()
+        if not user_input or user_input.lower() == "n":
+            raise RuntimeError("No SIF provided.")
+        tmp_path = binary_path / "janusxext.tmp.sif"
+        if user_input.lower() == "y":
+            download_with_fallback(JANUSX_SIF_URLS, tmp_path, logger)
+        else:
+            src = Path(user_input).expanduser().resolve()
+            if not src.exists():
+                raise RuntimeError(f"SIF path not found: {src}")
+            shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, sif_path)
+        logger.info("Saved in %s", sif_path)
+
+    exec_prefix = (
+        f"{shlex.quote(str(singularity_bin))} exec "
+        f"{shlex.quote(str(sif_path))}"
+    )
+    missing_in_sif = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
+    if len(missing_in_sif) > 0:
+        raise RuntimeError(
+            "Singularity image is missing required tools: " + ", ".join(missing_in_sif)
+        )
+    return exec_prefix
+
+
+def _packages_for_tools(
+    tool_map: Dict[str, Sequence[str]],
+    tools: Sequence[str],
+) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for tool in tools:
+        for pkg in list(tool_map.get(str(tool), ())):
+            p = str(pkg).strip()
+            if p == "" or p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _run_rollback_step(
+    cmd: Sequence[str],
+    *,
+    label: str,
+    logger,
+) -> None:
+    try:
+        _run_cmd_live_tail(
+            [str(x) for x in list(cmd)],
+            desc=label,
+            logger=logger,
+            max_lines=10,
+        )
+    except Exception as e:
+        try:
+            logger.warning("Rollback step failed (%s): %s", label, str(e))
+        except Exception:
+            pass
+
+
+def _collect_build_snapshot(method_id: int) -> Dict[str, Any]:
+    mid = int(method_id)
+    snap: Dict[str, Any] = {"method_id": mid}
+    if mid == 1:
+        snap["pkg_manager"] = _linux_pkg_manager()
+        snap["missing_before"] = _missing_binaries(REQUIRED_LOCAL_TOOLS)
+        return snap
+
+    if mid == 2:
+        conda_bin = shutil.which("conda")
+        snap["conda_bin"] = str(conda_bin or "")
+        env_exists = False
+        if conda_bin is not None:
+            env_exists = _conda_env_exists(str(conda_bin), CONDA_BSA_ENV)
+        snap["env_exists_before"] = bool(env_exists)
+        if conda_bin is not None and env_exists:
+            prefix = _conda_exec_prefix(str(conda_bin), CONDA_BSA_ENV)
+            snap["missing_before"] = _runtime_missing_tools(prefix, REQUIRED_LOCAL_TOOLS)
+        else:
+            snap["missing_before"] = list(REQUIRED_LOCAL_TOOLS)
+        return snap
+
+    if mid == 3:
+        snap["image_tag"] = DOCKER_IMAGE_TAG
+        snap["image_exists_before"] = _docker_image_exists(DOCKER_IMAGE_TAG)
+        snap["image_id_before"] = _docker_image_id(DOCKER_IMAGE_TAG)
+        return snap
+
+    if mid == 4:
+        sif_path = Path(janusx.pipeline.__file__).resolve().parent / "bin" / "janusxext.sif"
+        snap["sif_path"] = str(sif_path)
+        snap["sif_exists_before"] = bool(sif_path.exists())
+        return snap
+
+    return snap
+
+
+def _rollback_env_failed_install(*, snapshot: Dict[str, Any], logger) -> None:
+    pm = str(snapshot.get("pkg_manager", "")).strip()
+    if pm == "":
+        return
+    missing_before = [str(x) for x in list(snapshot.get("missing_before", []))]
+    if len(missing_before) == 0:
+        return
+    tool_map = _ENV_TOOL_PACKAGES.get(pm, {})
+    pkgs = _packages_for_tools(tool_map, missing_before)
+    if len(pkgs) == 0:
+        return
+
+    for pkg in pkgs:
+        try:
+            if pm == "apt-get":
+                cmd = _with_sudo_if_needed(["apt-get", "remove", "-y", str(pkg)])
+                label = f"rollback via env [apt remove {pkg}]"
+            elif pm in {"dnf", "yum"}:
+                cmd = _with_sudo_if_needed([pm, "remove", "-y", str(pkg)])
+                label = f"rollback via env [{pm} remove {pkg}]"
+            elif pm == "pacman":
+                cmd = _with_sudo_if_needed(["pacman", "-Rns", "--noconfirm", str(pkg)])
+                label = f"rollback via env [pacman remove {pkg}]"
+            elif pm == "zypper":
+                cmd = _with_sudo_if_needed(
+                    ["zypper", "--non-interactive", "remove", str(pkg)]
+                )
+                label = f"rollback via env [zypper remove {pkg}]"
+            else:
+                continue
+        except Exception as e:
+            try:
+                logger.warning("Rollback command prepare failed for %s: %s", pkg, str(e))
+            except Exception:
+                pass
+            continue
+        _run_rollback_step(cmd, label=label, logger=logger)
+
+
+def _rollback_conda_failed_install(
+    *,
+    snapshot: Dict[str, Any],
+    runtime_spec: Dict[str, Any],
+    logger,
+) -> None:
+    conda_bin = str(snapshot.get("conda_bin", "")).strip()
+    if conda_bin == "":
+        conda_bin = str(shutil.which("conda") or "").strip()
+    if conda_bin == "":
+        return
+
+    env_name = str(runtime_spec.get("env_name", CONDA_BSA_ENV)).strip() or CONDA_BSA_ENV
+    env_exists_before = bool(snapshot.get("env_exists_before", False))
+    if not env_exists_before:
+        _run_rollback_step(
+            [conda_bin, "env", "remove", "-n", env_name, "-y"],
+            label=f"rollback via conda [remove env {env_name}]",
+            logger=logger,
+        )
+        return
+
+    missing_before = [str(x) for x in list(snapshot.get("missing_before", []))]
+    pkgs = _packages_for_tools(_CONDA_TOOL_PACKAGES, missing_before)
+    for pkg in pkgs:
+        _run_rollback_step(
+            [conda_bin, "remove", "-n", env_name, "-y", str(pkg)],
+            label=f"rollback via conda [remove {pkg}]",
+            logger=logger,
+        )
+
+
+def _rollback_docker_failed_build(
+    *,
+    snapshot: Dict[str, Any],
+    runtime_spec: Dict[str, Any],
+    logger,
+) -> None:
+    docker_bin = shutil.which("docker")
+    if docker_bin is None:
+        return
+    image_tag = str(
+        runtime_spec.get("image_tag", snapshot.get("image_tag", DOCKER_IMAGE_TAG))
+    ).strip() or DOCKER_IMAGE_TAG
+
+    existed_before = bool(snapshot.get("image_exists_before", False))
+    before_id = str(snapshot.get("image_id_before", "")).strip()
+    now_id = _docker_image_id(image_tag)
+    if now_id == "":
+        return
+
+    if not existed_before:
+        _run_rollback_step(
+            [str(docker_bin), "image", "rm", "-f", image_tag],
+            label=f"rollback via docker [remove {image_tag}]",
+            logger=logger,
+        )
+        return
+
+    if before_id != "" and before_id != now_id:
+        _run_rollback_step(
+            [str(docker_bin), "tag", before_id, image_tag],
+            label=f"rollback via docker [restore {image_tag}]",
+            logger=logger,
+        )
+        _run_rollback_step(
+            [str(docker_bin), "image", "rm", "-f", now_id],
+            label="rollback via docker [remove failed image]",
+            logger=logger,
+        )
+
+
+def _rollback_singularity_failed_build(*, snapshot: Dict[str, Any], logger) -> None:
+    sif_txt = str(snapshot.get("sif_path", "")).strip()
+    if sif_txt == "":
+        sif_path = Path(janusx.pipeline.__file__).resolve().parent / "bin" / "janusxext.sif"
+    else:
+        sif_path = Path(sif_txt).expanduser().resolve()
+    existed_before = bool(snapshot.get("sif_exists_before", False))
+
+    tmp_path = sif_path.parent / "janusxext.tmp.sif"
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except Exception as e:
+            try:
+                logger.warning("Rollback cleanup failed for %s: %s", tmp_path, str(e))
+            except Exception:
+                pass
+
+    if (not existed_before) and sif_path.exists():
+        try:
+            sif_path.unlink()
+            logger.info("Rollback removed %s", sif_path)
+        except Exception as e:
+            try:
+                logger.warning("Rollback cleanup failed for %s: %s", sif_path, str(e))
+            except Exception:
+                pass
+
+
+def _rollback_failed_build(
+    method_id: int,
+    *,
+    snapshot: Dict[str, Any],
+    runtime_spec: Dict[str, Any],
+    logger,
+) -> None:
+    mid = int(method_id)
+    try:
+        logger.warning("Build failed. Start rollback for method=%d", mid)
+    except Exception:
+        pass
+
+    try:
+        if mid == 1:
+            _rollback_env_failed_install(snapshot=snapshot, logger=logger)
+            return
+        if mid == 2:
+            _rollback_conda_failed_install(
+                snapshot=snapshot,
+                runtime_spec=runtime_spec,
+                logger=logger,
+            )
+            return
+        if mid == 3:
+            _rollback_docker_failed_build(
+                snapshot=snapshot,
+                runtime_spec=runtime_spec,
+                logger=logger,
+            )
+            return
+        if mid == 4:
+            _rollback_singularity_failed_build(snapshot=snapshot, logger=logger)
+            return
+    except Exception as e:
+        try:
+            logger.warning("Rollback failed for method=%d: %s", mid, str(e))
+        except Exception:
+            pass
+
+
+def _ansi(text: str, color: str, enable: bool) -> str:
+    if not enable:
+        return str(text)
+    code = {
+        "green": "32",
+        "yellow": "33",
+        "red": "31",
+        "cyan": "36",
+        "bold": "1",
+    }.get(str(color), "")
+    if not code:
+        return str(text)
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _docker_image_exists(tag: str) -> bool:
+    docker_bin = shutil.which("docker")
+    if docker_bin is None:
+        return False
+    cmd = [str(docker_bin), "image", "inspect", str(tag)]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def _docker_image_id(tag: str) -> str:
+    docker_bin = shutil.which("docker")
+    if docker_bin is None:
+        return ""
+    cmd = [str(docker_bin), "image", "inspect", "--format", "{{.Id}}", str(tag)]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if p.returncode != 0:
+        return ""
+    return str(p.stdout or "").strip()
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ensure_fastq2vcf_build_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {FASTQ2VCF_BUILD_TABLE} (
+            slot TEXT PRIMARY KEY,
+            method_id INTEGER NOT NULL,
+            runtime_mode TEXT NOT NULL,
+            runtime_spec_json TEXT NOT NULL,
+            required_tools_json TEXT NOT NULL,
+            installed_tools_json TEXT NOT NULL DEFAULT '[]',
+            missing_tools_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({FASTQ2VCF_BUILD_TABLE})").fetchall()}
+    if "installed_tools_json" not in cols:
+        conn.execute(
+            f"ALTER TABLE {FASTQ2VCF_BUILD_TABLE} ADD COLUMN installed_tools_json TEXT NOT NULL DEFAULT '[]'"
+        )
+
+
+def _save_fastq2vcf_build_record(
+    *,
+    method_id: int,
+    runtime_mode: str,
+    runtime_spec: Dict[str, Any],
+    installed_tools: Sequence[str],
+    missing_tools: Sequence[str],
+) -> Path:
+    installed_list = [str(x) for x in list(installed_tools or [])]
+    missing_list = [str(x) for x in list(missing_tools or [])]
+    db_path = resolve_db_path()
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        _ensure_fastq2vcf_build_table(conn)
+        conn.execute(f"DELETE FROM {FASTQ2VCF_BUILD_TABLE}")
+        conn.execute(
+            f"""
+            INSERT INTO {FASTQ2VCF_BUILD_TABLE} (
+                slot, method_id, runtime_mode, runtime_spec_json,
+                required_tools_json, installed_tools_json,
+                missing_tools_json, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                FASTQ2VCF_BUILD_SLOT,
+                int(method_id),
+                str(runtime_mode),
+                json.dumps(dict(runtime_spec), ensure_ascii=False, sort_keys=True),
+                json.dumps(list(REQUIRED_LOCAL_TOOLS), ensure_ascii=False),
+                json.dumps(installed_list, ensure_ascii=False),
+                json.dumps(missing_list, ensure_ascii=False),
+                "ok" if len(missing_list) == 0 else "failed",
+                _utc_now(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _load_fastq2vcf_build_record() -> Optional[Dict[str, Any]]:
+    db_path = resolve_db_path()
+    if (not db_path.exists()) or (not db_path.is_file()):
+        return None
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        _ensure_fastq2vcf_build_table(conn)
+        row = conn.execute(
+            f"""
+            SELECT method_id, runtime_mode, runtime_spec_json,
+                   installed_tools_json, missing_tools_json, status, updated_at
+            FROM {FASTQ2VCF_BUILD_TABLE}
+            WHERE slot = ?
+            """,
+            (FASTQ2VCF_BUILD_SLOT,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    spec_obj: Dict[str, Any] = {}
+    installed_obj: List[str] = []
+    miss_obj: List[str] = []
+    try:
+        v = json.loads(str(row[2] or "{}"))
+        if isinstance(v, dict):
+            spec_obj = dict(v)
+    except Exception:
+        spec_obj = {}
+    try:
+        v = json.loads(str(row[3] or "[]"))
+        if isinstance(v, list):
+            installed_obj = [str(x) for x in v]
+    except Exception:
+        installed_obj = []
+    try:
+        v = json.loads(str(row[4] or "[]"))
+        if isinstance(v, list):
+            miss_obj = [str(x) for x in v]
+    except Exception:
+        miss_obj = []
+    return {
+        "method_id": int(row[0]),
+        "runtime_mode": str(row[1]),
+        "runtime_spec": spec_obj,
+        "installed_tools": installed_obj,
+        "missing_tools": miss_obj,
+        "status": str(row[5]),
+        "updated_at": str(row[6]),
+        "db_path": str(db_path),
+    }
+
+
+def _status_word(
+    ok: bool,
+    *,
+    enable_color: bool,
+    ok_text: str = "FOUND",
+    bad_text: str = "MISSING",
+    bad_color: str = "yellow",
+) -> str:
+    if ok:
+        return _ansi(ok_text, "green", enable_color)
+    return _ansi(bad_text, bad_color, enable_color)
+
+
+def _print_runtime_tool_status(exec_prefix: str, enable_color: bool) -> List[str]:
+    missing = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
+    miss_set = set(missing)
+    print(_ansi("Tool check:", "bold", enable_color))
+    for t in REQUIRED_LOCAL_TOOLS:
+        ok = t not in miss_set
+        print(f"  - {t:<10} {_status_word(ok, enable_color=enable_color)}")
+    return missing
+
+
+def _mark(ok: bool) -> str:
+    return "✔︎" if bool(ok) else "✘"
+
+
+def _collect_build_method_status() -> List[Dict[str, Any]]:
+    linux = bool(sys.platform.startswith("linux"))
+    has_conda = bool(shutil.which("conda") is not None)
+    has_docker = bool(shutil.which("docker") is not None)
+    docker_daemon = False
+    if has_docker:
+        docker_daemon, _ = _docker_daemon_running(str(shutil.which("docker")))
+    has_singularity = bool(shutil.which("singularity") is not None)
+
+    if not linux:
+        checks = [("docker", has_docker), ("daemon", docker_daemon)]
+        return [
+            {
+                "id": 1,
+                "name": "docker",
+                "builder_id": 3,
+                "checks": checks,
+                "selectable": bool(all(bool(v) for _, v in checks)),
+            }
+        ]
+
+    out: List[Dict[str, Any]] = [
+        {
+            "id": 1,
+            "name": "env",
+            "builder_id": 1,
+            "checks": [("Linux", linux)],
+        },
+        {
+            "id": 2,
+            "name": "conda",
+            "builder_id": 2,
+            "checks": [("Linux", linux), ("conda", has_conda)],
+        },
+        {
+            "id": 3,
+            "name": "docker",
+            "builder_id": 3,
+            "checks": [("docker", has_docker), ("daemon", docker_daemon)],
+        },
+        {
+            "id": 4,
+            "name": "singularity",
+            "builder_id": 4,
+            "checks": [("Linux", linux), ("singularity", has_singularity)],
+        },
+    ]
+    for m in out:
+        m["selectable"] = bool(all(bool(v) for _, v in list(m.get("checks", []))))
+    return out
+
+
+def _print_build_method_status(methods: Sequence[Dict[str, Any]], enable_color: bool) -> None:
+    for m in methods:
+        mid = int(m.get("id", 0))
+        name = str(m.get("name", "")).strip()
+        checks = list(m.get("checks", []))
+        ok = bool(m.get("selectable", False))
+        segs = [f"[{mid}] {name}"]
+        for ck_name, ck_ok in checks:
+            segs.append(f"{str(ck_name)} {_mark(bool(ck_ok))}")
+        line = " ".join(segs)
+        print(_ansi(line, "green" if ok else "yellow", enable_color))
+
+
+def _prompt_build_method(
+    methods: Sequence[Dict[str, Any]],
+    *,
+    enable_color: bool,
+) -> int:
+    by_id = {int(m.get("id", 0)): m for m in methods}
+    selectable = [int(m.get("id", 0)) for m in methods if bool(m.get("selectable", False))]
+    selectable = sorted(set(selectable))
+    if len(selectable) == 0:
+        raise RuntimeError("No available build method in current system.")
+    default_pick = int(selectable[0])
+
+    while True:
+        raw = input(f"Select build method (default {default_pick}): ").strip()
+        if raw == "":
+            return default_pick
+        if not raw.isdigit():
+            print(_ansi("Please input method number.", "yellow", enable_color))
+            continue
+        picked = int(raw)
+        if picked not in by_id:
+            print(_ansi("Invalid method number.", "yellow", enable_color))
+            continue
+        if picked not in selectable:
+            print(_ansi("Selected method is unavailable.", "yellow", enable_color))
+            continue
+        return picked
+
+
+def _docker_probe_exec_prefix(image_tag: str) -> str:
+    return " ".join(shlex.quote(x) for x in ["docker", "run", "--rm", str(image_tag)])
+
+
+def _build_runtime_by_method(
+    method_id: int,
+    *,
+    workdir: Path,
+    use_spinner: bool,
+    logger,
+) -> tuple[str, str, Dict[str, Any]]:
+    mid = int(method_id)
+    if mid == 1:
+        _prepare_env_runtime(use_spinner=use_spinner, logger=logger)
+        return "env", "", {}
+
+    if mid == 2:
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("conda method is Linux only.")
+        conda_bin = shutil.which("conda")
+        if conda_bin is None:
+            raise RuntimeError("conda command not found in PATH.")
+        prefix = _prepare_conda_runtime(
+            conda_bin=conda_bin,
+            env_name=CONDA_BSA_ENV,
+            use_spinner=use_spinner,
+            logger=logger,
+        )
+        return "conda", prefix, {"exec_prefix": prefix, "env_name": CONDA_BSA_ENV}
+
+    if mid == 3:
+        probe_ref = (workdir / "__janusx_probe_ref__.fa").resolve()
+        prefix = _prepare_docker_runtime(
+            reference=probe_ref,
+            fastq_dir=workdir,
+            workdir=workdir,
+            use_spinner=use_spinner,
+            logger=logger,
+        )
+        return "docker", prefix, {"image_tag": DOCKER_IMAGE_TAG}
+
+    if mid == 4:
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("singularity method is Linux only.")
+        prefix = _prepare_singularity_runtime(logger=logger)
+        return "singularity", prefix, {"exec_prefix": prefix}
+
+    raise RuntimeError("Unknown build method.")
+
+
+def _runtime_from_build_record(
+    *,
+    record: Dict[str, Any],
+    reference: Path,
+    fastq_dir: Path,
+    workdir: Path,
+) -> tuple[str, str]:
+    runtime_mode = str(record.get("runtime_mode", "")).strip().lower()
+    runtime_spec = record.get("runtime_spec", {})
+    if not isinstance(runtime_spec, dict):
+        runtime_spec = {}
+    if runtime_mode in {"env", "local"}:
+        exec_prefix = ""
+    elif runtime_mode == "conda":
+        exec_prefix = str(runtime_spec.get("exec_prefix", "")).strip()
+        if exec_prefix == "":
+            conda_bin = shutil.which("conda")
+            if conda_bin is None:
+                raise RuntimeError("Saved conda runtime is missing and conda is not in PATH.")
+            exec_prefix = _conda_exec_prefix(conda_bin, str(runtime_spec.get("env_name", CONDA_BSA_ENV)))
+    elif runtime_mode == "docker":
+        docker_bin = shutil.which("docker")
+        if docker_bin is None:
+            raise RuntimeError("Saved docker runtime requires docker command in PATH.")
+        docker_ready, docker_err = _docker_daemon_running(docker_bin)
+        if not docker_ready:
+            raise RuntimeError(
+                "Saved docker runtime requires docker daemon: "
+                + (docker_err or "unavailable")
+            )
+        image_tag = str(runtime_spec.get("image_tag", DOCKER_IMAGE_TAG)).strip() or DOCKER_IMAGE_TAG
+        if not _docker_image_exists(image_tag):
+            raise RuntimeError(
+                f"Saved docker image not found: {image_tag}. Please run `jx fastq2vcf --check`."
+            )
+        docker_mounts = _collect_docker_mounts(
+            reference=reference,
+            fastq_dir=fastq_dir,
+            workdir=workdir,
+        )
+        exec_prefix = _docker_exec_prefix(
+            image_tag=image_tag,
+            workdir=workdir,
+            mounts=docker_mounts,
+        )
+    elif runtime_mode == "singularity":
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError(
+                "Saved singularity runtime is Linux only. Please run `jx fastq2vcf --check`."
+            )
+        exec_prefix = str(runtime_spec.get("exec_prefix", "")).strip()
+        if exec_prefix == "":
+            raise RuntimeError(
+                "Saved singularity runtime is invalid. Please run `jx fastq2vcf --check`."
+            )
+    else:
+        raise RuntimeError(
+            "Unknown saved runtime mode. Please run `jx fastq2vcf --check`."
+        )
+
+    missing = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
+    if len(missing) > 0:
+        raise RuntimeError(
+            "Saved runtime is missing required tools: "
+            + ", ".join(missing)
+            + ". Please run `jx fastq2vcf --check`."
+        )
+    return runtime_mode, exec_prefix
 
 
 class _DownloadProgress:
@@ -547,39 +1902,52 @@ def main():
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx fastq2vcf",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx fastq2vcf -r ref.fa -i fastq_dir -w workdir",
+            "jx -update dlc",
         ]),
     )
 
     required_group = parser.add_argument_group("Required Arguments")
     required_group.add_argument(
-        "-r", "--reference", required=True, type=str,
+        "-r", "--reference", required=False, type=str,
         help="Reference genome FASTA file.",
     )
     required_group.add_argument(
-        "-i", "--fastq-dir", required=True, type=str,
+        "-i", "--fastq-dir", required=False, type=str,
         help="Directory containing FASTQ files.",
     )
     required_group.add_argument(
-        "-w", "--workdir", required=True, type=str,
+        "-w", "--workdir", required=False, type=str,
         help="Working directory for outputs.",
     )
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
-        "-b", "--backend", required=False, type=str,default='nohup',
-        choices=["nohup", "csub"],
-        help=f"Execution backend for the pipeline. (default: nohup)",
-    )
-    optional_group.add_argument(
-        "-m", "--maxtask", required=False, type=int,default=1,
-        help="Max concurrent jobs when backend=nohup. (default: 1)",
+        "-check", "--check",
+        action="store_true",
+        help="Deprecated. Use `jx -update dlc`.",
     )
 
     args = parser.parse_args()
+
+    color_enabled = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    check_mode = bool(args.check)
+
+    if check_mode:
+        print(
+            _ansi(
+                "`-check/--check` moved to launcher. Please run `jx -update dlc`.",
+                "yellow",
+                color_enabled,
+            )
+        )
+        raise SystemExit(1)
+
+    if (not args.reference) or (not args.fastq_dir) or (not args.workdir):
+        parser.error("`-r/--reference`, `-i/--fastq-dir`, and `-w/--workdir` are required.")
 
     workdir = Path(args.workdir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -596,6 +1964,13 @@ def main():
     if not ensure_dir_exists(logger, str(fastq_dir), "FASTQ directory"):
         raise SystemExit(1)
 
+    scheduler_backend, scheduler_reason = _detect_task_scheduler()
+    nohup_max_jobs = 1
+    if scheduler_backend == "csub":
+        logger.info("Task scheduler: csub (%s)", scheduler_reason)
+    else:
+        logger.info("Task scheduler: nohup (%s). nohup runs single-task mode.", scheduler_reason)
+
     emit_cli_configuration(
         logger,
         app_title="JanusX - Fastq2VCF",
@@ -608,134 +1983,34 @@ def main():
                     ("Reference", reference),
                     ("FASTQ dir", fastq_dir),
                     ("Workdir", workdir),
-                    ("Backend", args.backend),
-                    ("Max tasks (nohup)", args.maxtask),
+                    ("Scheduler (auto)", scheduler_backend),
+                    ("Scheduler reason", scheduler_reason),
+                    ("nohup max jobs", nohup_max_jobs),
                 ],
             )
         ],
         line_max_chars=60,
     )
 
-    exec_prefix = ""
-    runtime_mode = "local"
-    missing_tools = _missing_binaries(REQUIRED_LOCAL_TOOLS)
-    if len(missing_tools) == 0:
-        logger.info(
-            "Using local runtime. Found dependencies: %s",
-            ", ".join(REQUIRED_LOCAL_TOOLS),
+    missing_jx_tools = _missing_jx_tool_wrappers(REQUIRED_LOCAL_TOOLS)
+    if len(missing_jx_tools) > 0:
+        logger.error(
+            "Missing DLC tool wrappers: %s. Please run `jx -update dlc`.",
+            ", ".join(f"jx {x}" for x in missing_jx_tools),
         )
-    else:
-        logger.warning("Missing local dependencies: %s", ", ".join(missing_tools))
-        docker_bin = shutil.which("docker")
-        docker_ready = False
-        docker_err = ""
-        if docker_bin is not None:
-            docker_ready, docker_err = _docker_daemon_running(docker_bin)
-
-        if docker_bin is not None and docker_ready:
-            dockerfile = _dockerfile_path()
-            if not dockerfile.exists():
-                logger.error(f"Dockerfile not found: {dockerfile}")
-                raise SystemExit(1)
-            _build_docker_image(
-                dockerfile=dockerfile,
-                image_tag=DOCKER_IMAGE_TAG,
-                use_spinner=use_spinner,
-                logger=logger,
+        print(
+            _ansi(
+                "Missing DLC tool wrappers: "
+                + ", ".join(f"jx {x}" for x in missing_jx_tools)
+                + ". Please run `jx -update dlc`.",
+                "red",
+                color_enabled,
             )
-            docker_mounts = _collect_docker_mounts(
-                reference=reference,
-                fastq_dir=fastq_dir,
-                workdir=workdir,
-            )
-            exec_prefix = _docker_exec_prefix(
-                image_tag=DOCKER_IMAGE_TAG,
-                workdir=workdir,
-                mounts=docker_mounts,
-            )
-            runtime_mode = "docker"
-            logger.info("Docker runtime enabled.")
-            logger.info("Docker prefix: %s", exec_prefix)
-        else:
-            if docker_bin is not None and not docker_ready:
-                logger.warning(
-                    "Docker command found but daemon is not running. "
-                    "Falling back to next runtime. detail: %s",
-                    docker_err,
-                )
-            # Fallback order:
-            # 1) local tools
-            # 2) docker (daemon ready)
-            # 3) conda runtime on Linux
-            # 4) singularity
-            conda_bin = shutil.which("conda")
-            conda_ready = False
-            if sys.platform.startswith("linux") and conda_bin is not None:
-                try:
-                    exec_prefix = _prepare_conda_runtime(
-                        conda_bin=conda_bin,
-                        env_name=CONDA_BSA_ENV,
-                        use_spinner=use_spinner,
-                        logger=logger,
-                    )
-                    runtime_mode = "conda"
-                    conda_ready = True
-                    logger.info("Conda runtime enabled.")
-                    logger.info("Conda prefix: %s", exec_prefix)
-                except Exception as e:
-                    logger.warning(
-                        "Conda runtime setup failed. Falling back to singularity. detail: %s",
-                        str(e),
-                    )
+        )
+        raise SystemExit(1)
 
-            if not conda_ready:
-                singularity_bin = shutil.which("singularity")
-                if singularity_bin is None:
-                    logger.error(
-                        "Missing local dependencies (%s), and no usable runtime is available. "
-                        "Tried: local -> docker -> conda(Linux) -> singularity.",
-                        ", ".join(missing_tools)
-                    )
-                    raise SystemExit(1)
-
-                binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
-                binary_path.mkdir(parents=True, exist_ok=True)
-                sif_path = binary_path / "janusxext.sif"
-                if not sif_path.exists():
-                    user_input = input(
-                        "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
-                    ).strip()
-                    if not user_input or user_input.lower() == "n":
-                        raise SystemExit(1)
-                    tmp_path = binary_path / "janusxext.tmp.sif"
-                    if user_input.lower() == "y":
-                        download_with_fallback(JANUSX_SIF_URLS, tmp_path, logger)
-                    else:
-                        src = Path(user_input).expanduser().resolve()
-                        if not src.exists():
-                            logger.error(f"SIF path not found: {src}")
-                            raise SystemExit(1)
-                        shutil.copy2(src, tmp_path)
-
-                    os.replace(tmp_path, sif_path)
-                    logger.info(f"Saved in {sif_path}")
-
-                exec_prefix = (
-                    f"{shlex.quote(str(singularity_bin))} exec "
-                    f"{shlex.quote(str(sif_path))}"
-                )
-                missing_in_sif = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
-                if len(missing_in_sif) > 0:
-                    logger.error(
-                        "Singularity image is missing required tools: %s. "
-                        "This usually means the SIF is outdated/built from a different Dockerfile.",
-                        ", ".join(missing_in_sif),
-                    )
-                    raise SystemExit(1)
-                runtime_mode = "singularity"
-                logger.info("Singularity runtime enabled.")
-                logger.info("Singularity prefix: %s", exec_prefix)
-
+    exec_prefix = "jx"
+    runtime_mode = "dlc"
     logger.info("Execution runtime: %s", runtime_mode)
 
     fai_path = Path(f"{reference}.fai")
@@ -743,7 +2018,7 @@ def main():
     if not fai_path.exists() or not ann_path.exists():
         cmd = indexREF(str(reference), singularity=exec_prefix)
         logger.info(f"Indexing reference: {cmd}")
-        index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=args.backend)
+        index_job = wrap_cmd(cmd, "indexREF", 1, scheduler=scheduler_backend)
         with CliStatus("Indexing reference...", enabled=use_spinner) as task:
             try:
                 subprocess.run(index_job, shell=True, check=True, cwd=workdir)
@@ -781,8 +2056,8 @@ def main():
     fastq2vcf(
         metadata=metadata,
         workdir=workdir,
-        backbend=args.backend,
-        nohup_max_jobs=args.maxtask,
+        backbend=scheduler_backend,
+        nohup_max_jobs=nohup_max_jobs,
         singularity=exec_prefix,
     )
 

@@ -26,7 +26,7 @@ from janusx.gfreader import load_genotype_chunks
 from janusx.gfreader import inspect_genotype_file
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -230,7 +230,7 @@ def write_sites(outprefix: str, sites: List[Tuple[str, int, int]]):
 # CLI
 # -----------------------------
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx sim",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([

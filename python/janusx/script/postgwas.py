@@ -25,7 +25,7 @@ Citation
 import logging
 import os
 from ._common.log import setup_logging
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -3834,7 +3834,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
 def main():
     t_start = time.time()
 
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx postgwas",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([

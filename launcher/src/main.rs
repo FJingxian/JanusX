@@ -10,6 +10,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod dlc;
+
 const PYPI_SPEC: &str = "janusx";
 const GITHUB_SPEC_CN: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";
 const GITHUB_SPEC_ORIGIN: &str = "git+https://github.com/FJingxian/JanusX.git";
@@ -28,49 +30,28 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
+const KNOWN_MODULES: [&str; 14] = [
+    "grm",
+    "pca",
+    "gwas",
+    "postgwas",
+    "gs",
+    "garfield",
+    "postgarfield",
+    "postbsa",
+    "fastq2vcf",
+    "gmerge",
+    "webui",
+    "sim",
+    "simulation",
+    "loadanno",
+];
 const MIN_PYTHON_MAJOR: u32 = 3;
 const MIN_PYTHON_MINOR: u32 = 9;
 const RUSTUP_DIST_SERVER_CN: &str = "https://rsproxy.cn";
 const RUSTUP_UPDATE_ROOT_CN: &str = "https://rsproxy.cn/rustup";
 const RUSTUP_DIST_SERVER_ORIGIN: &str = "https://static.rust-lang.org";
 const RUSTUP_UPDATE_ROOT_ORIGIN: &str = "https://static.rust-lang.org/rustup";
-const CLI_HELP_TEXT: &str = r#"Usage:
-    jx <module> [options]
-
-Options:
-    -h, --help             Show this help message
-    -v, --version          Show version/build information
-    -update, --update      Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`
-    -load, --load          List/load files: `jx --load` or `jx --load <type> <name> <file>`
-    -clean, --clean        Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record
-    -uninstall, --uninstall  Remove JanusX runtime and launcher files
-
-Modules:
-    Genome-wide Association Studies (GWAS):
-    grm           Build genomic relationship matrix
-    pca           Principal component analysis for population structure
-    gwas          Run genome-wide association analysis
-    postgwas      Post-process GWAS results and downstream plots
-
-    Genomic Selection (GS):
-    gs            Genomic prediction and model-based selection
-
-    GARFIELD:
-    garfield      Random-forest based marker-trait association
-    postgarfield  Summarize and visualize GARFIELD outputs
-
-    Bulk Segregation Analysis (BSA):
-    postbsa       Post-process and visualize BSA results
-
-    Pipeline and utility:
-    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
-    gmerge        Merge genotype/variant tables
-    webui         Start JanusX web UI (postgwas first)
-
-    Benchmark:
-    sim           Quick simulation workflow
-    simulation    Extended simulation and benchmarking workflow
-"#;
 const LOGO: &str = r#"
        _                      __   __
       | |                     \ \ / /
@@ -83,6 +64,7 @@ const LOGO: &str = r#"
 
 #[derive(Clone, Debug)]
 enum UpdateSource {
+    Dlc,
     Pypi,
     Latest,
     Local(String),
@@ -167,11 +149,24 @@ fn run() -> Result<i32, String> {
     if matches!(head, "-uninstall" | "--uninstall") {
         return run_uninstall(&args[1..]);
     }
+    if dlc::is_dlc_tool(head) {
+        let home = runtime_home()?;
+        return dlc::run_dlc_tool(head, &args[1..], &home);
+    }
+    if !is_known_module(head) {
+        println!("{}", style_yellow(&format!("Unknown module: {head}")));
+        print_cli_help();
+        return Ok(1);
+    }
 
     let home = runtime_home()?;
     let python = ensure_runtime(false)?;
     let _ = maybe_auto_warmup(&home)?;
     run_python_janusx(&python, &args)
+}
+
+fn is_known_module(name: &str) -> bool {
+    KNOWN_MODULES.contains(&name)
 }
 
 fn is_installer_binary() -> bool {
@@ -1269,6 +1264,7 @@ fn normalize_version_token(raw: &str) -> Option<String> {
 }
 
 fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
+    let mut dlc = false;
     let mut latest = false;
     let mut local_source: Option<String> = None;
     let mut verbose = false;
@@ -1277,13 +1273,14 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
 
     for token in args {
         match token.as_str() {
+            "dlc" => dlc = true,
             "latest" | "--latest" => latest = true,
             "-e" | "--editable" => editable = true,
             "--verbose" => verbose = true,
             "--force-reinstall" | "--reinstall" | "--full" => force_reinstall = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Update usage:\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
+                    "Update usage:\n  jx --update dlc\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
                 );
                 return Err(String::new());
             }
@@ -1297,18 +1294,23 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown update option: {other}\nUpdate usage:\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
+                        "Unknown update option: {other}\nUpdate usage:\n  jx --update dlc\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
                     ));
                 }
             }
         }
     }
 
+    if dlc && (latest || local_source.is_some() || editable || force_reinstall) {
+        return Err("`jx --update dlc` does not accept other update source/options.".to_string());
+    }
     if latest && local_source.is_some() {
         return Err("`latest` and local path cannot be used together.".to_string());
     }
 
-    let source = if latest {
+    let source = if dlc {
+        UpdateSource::Dlc
+    } else if latest {
         UpdateSource::Latest
     } else if let Some(path) = local_source {
         UpdateSource::Local(path)
@@ -1317,7 +1319,9 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     };
 
     if editable && !matches!(source, UpdateSource::Local(_)) {
-        return Err("`-e/--editable` requires a local source path, e.g. `jx --update -e .`.".to_string());
+        return Err(
+            "`-e/--editable` requires a local source path, e.g. `jx --update -e .`.".to_string(),
+        );
     }
 
     Ok(UpdateOptions {
@@ -1329,6 +1333,12 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
 }
 
 fn run_update(opts: UpdateOptions) -> Result<i32, String> {
+    if matches!(opts.source, UpdateSource::Dlc) {
+        let home = runtime_home()?;
+        let python = ensure_runtime(false)?;
+        return dlc::run_dlc_update(&home, &python);
+    }
+
     let home = runtime_home()?;
     let pypi_spec = resolve_pypi_spec(&home);
     let python = ensure_venv()?;
@@ -1532,6 +1542,9 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
             return Ok(0);
         }
         UpdateSource::Pypi => {}
+        UpdateSource::Dlc => {
+            return Err("Unhandled update source: dlc".to_string());
+        }
     }
 
     if opts.verbose {
@@ -1716,19 +1729,28 @@ fn ensure_local_rust_toolchain(
         return Ok(());
     }
 
-    let (Some(url_cn), Some(url_origin)) =
-        (rustup_init_download_url_cn(), rustup_init_download_url_origin())
-    else {
+    let (Some(url_cn), Some(url_origin)) = (
+        rustup_init_download_url_cn(),
+        rustup_init_download_url_origin(),
+    ) else {
         return Err(
             "Current platform is not supported for local rustup bootstrap in `jx --update latest`."
                 .to_string(),
         );
     };
 
-    std::fs::create_dir_all(rustup_home(runtime_home))
-        .map_err(|e| format!("Failed to create {}: {e}", rustup_home(runtime_home).display()))?;
-    std::fs::create_dir_all(cargo_home(runtime_home))
-        .map_err(|e| format!("Failed to create {}: {e}", cargo_home(runtime_home).display()))?;
+    std::fs::create_dir_all(rustup_home(runtime_home)).map_err(|e| {
+        format!(
+            "Failed to create {}: {e}",
+            rustup_home(runtime_home).display()
+        )
+    })?;
+    std::fs::create_dir_all(cargo_home(runtime_home)).map_err(|e| {
+        format!(
+            "Failed to create {}: {e}",
+            cargo_home(runtime_home).display()
+        )
+    })?;
 
     let install_tmp = runtime_home.join(".rustup-bootstrap");
     std::fs::create_dir_all(&install_tmp)
@@ -3458,115 +3480,242 @@ fn style_white(text: &str) -> String {
 }
 
 fn print_cli_help() {
+    let width = help_line_width();
     println!("{LOGO}");
-    if !supports_color() {
-        println!("{}", CLI_HELP_TEXT.trim());
-        return;
-    }
-
     println!("{}", style_orange("Usage:"));
     println!("  {}", style_green("jx [flags]"));
     println!("  {}", style_green("jx [module] -h"));
     println!();
 
     println!("{}", style_orange("Flags:"));
-    println!(
-        "  {}  {}",
-        style_green("-h, --help"),
-        style_white("Show this help message")
+    print_help_entry(2, "-h, --help", "Show this help message", 24, width);
+    print_help_entry(
+        2,
+        "-v, --version",
+        "Show version/build information",
+        24,
+        width,
     );
-    println!(
-        "  {}  {}",
-        style_green("-v, --version"),
-        style_white("Show version/build information")
+    print_help_entry(
+        2,
+        "-update, --update",
+        "Update JanusX: `jx --update [dlc|latest|<local_path>] [-e|--editable] [--verbose]`",
+        24,
+        width,
     );
-    println!(
-        "  {}  {}",
-        style_green("-update, --update"),
-        style_white("Update JanusX: `jx --update [latest|<local_path>] [-e|--editable] [--verbose]`")
+    print_help_entry(
+        2,
+        "-load, --load",
+        "List/load files: `jx --load` or `jx --load <type> <name> <file>`",
+        24,
+        width,
     );
-    println!(
-        "  {}  {}",
-        style_green("-load, --load"),
-        style_white("List/load files: `jx --load` or `jx --load <type> <name> <file>`")
+    print_help_entry(
+        2,
+        "-clean, --clean",
+        "Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record",
+        24,
+        width,
     );
-    println!(
-        "  {}  {}",
-        style_green("-clean, --clean"),
-        style_white("Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record")
-    );
-    println!(
-        "  {}  {}",
-        style_green("-uninstall, --uninstall"),
-        style_white("Remove JanusX runtime and launcher files")
+    print_help_entry(
+        2,
+        "-uninstall, --uninstall",
+        "Remove JanusX runtime and launcher files",
+        24,
+        width,
     );
     println!();
 
     println!("{}", style_orange("Modules:"));
-    println!("  {}", style_blue("Genome-wide Association Studies (GWAS):"));
-    println!("    {:12} {}", style_green("grm"), style_white("Build genomic relationship matrix"));
     println!(
-        "    {:12} {}",
-        style_green("pca"),
-        style_white("Principal component analysis for population structure")
+        "  {}",
+        style_blue("Genome-wide Association Studies (GWAS):")
     );
-    println!("    {:12} {}", style_green("gwas"), style_white("Run genome-wide association analysis"));
-    println!(
-        "    {:12} {}",
-        style_green("postgwas"),
-        style_white("Post-process GWAS results and downstream plots")
+    print_help_entry(4, "grm", "Build genomic relationship matrix", 12, width);
+    print_help_entry(
+        4,
+        "pca",
+        "Principal component analysis for population structure",
+        12,
+        width,
+    );
+    print_help_entry(4, "gwas", "Run genome-wide association analysis", 12, width);
+    print_help_entry(
+        4,
+        "postgwas",
+        "Post-process GWAS results and downstream plots",
+        12,
+        width,
     );
     println!();
     println!("  {}", style_blue("Genomic Selection (GS):"));
-    println!(
-        "    {:12} {}",
-        style_green("gs"),
-        style_white("Genomic prediction and model-based selection")
+    print_help_entry(
+        4,
+        "gs",
+        "Genomic prediction and model-based selection",
+        12,
+        width,
     );
     println!();
     println!("  {}", style_blue("GARFIELD:"));
-    println!(
-        "    {:12} {}",
-        style_green("garfield"),
-        style_white("Random-forest based marker-trait association")
+    print_help_entry(
+        4,
+        "garfield",
+        "Random-forest based marker-trait association",
+        12,
+        width,
     );
-    println!(
-        "    {:12} {}",
-        style_green("postgarfield"),
-        style_white("Summarize and visualize GARFIELD outputs")
+    print_help_entry(
+        4,
+        "postgarfield",
+        "Summarize and visualize GARFIELD outputs",
+        12,
+        width,
     );
     println!();
     println!("  {}", style_blue("Bulk Segregation Analysis (BSA):"));
-    println!(
-        "    {:12} {}",
-        style_green("postbsa"),
-        style_white("Post-process and visualize BSA results")
+    print_help_entry(
+        4,
+        "postbsa",
+        "Post-process and visualize BSA results",
+        12,
+        width,
     );
     println!();
     println!("  {}", style_blue("Pipeline and utility:"));
-    println!(
-        "    {:12} {}",
-        style_green("fastq2vcf"),
-        style_white("Variant-calling pipeline from FASTQ to VCF")
+    print_help_entry(
+        4,
+        "fastq2vcf",
+        "Variant-calling pipeline from FASTQ to VCF",
+        12,
+        width,
     );
-    println!(
-        "    {:12} {}",
-        style_green("gmerge"),
-        style_white("Merge genotype/variant tables")
-    );
-    println!(
-        "    {:12} {}",
-        style_green("webui"),
-        style_white("Start JanusX web UI (postgwas first)")
+    print_help_entry(4, "gmerge", "Merge genotype/variant tables", 12, width);
+    print_help_entry(
+        4,
+        "webui",
+        "Start JanusX web UI (postgwas first)",
+        12,
+        width,
     );
     println!();
     println!("  {}", style_blue("Benchmark:"));
-    println!("    {:12} {}", style_green("sim"), style_white("Quick simulation workflow"));
-    println!(
-        "    {:12} {}",
-        style_green("simulation"),
-        style_white("Extended simulation and benchmarking workflow")
+    print_help_entry(4, "sim", "Quick simulation workflow", 12, width);
+    print_help_entry(
+        4,
+        "simulation",
+        "Extended simulation and benchmarking workflow",
+        12,
+        width,
     );
+}
+
+fn print_help_entry(indent: usize, key: &str, desc: &str, key_width: usize, total_width: usize) {
+    let lead = " ".repeat(indent);
+    let min_desc_width = 20usize;
+    let key_padded = format!("{key:<key_width$}");
+    let min_total = indent + key_width + 2 + min_desc_width;
+    if total_width <= min_total {
+        println!("{}{}", lead, style_green(key));
+        for line in wrap_help_text(
+            desc,
+            total_width.saturating_sub(indent + 2).max(min_desc_width),
+        ) {
+            println!("{}  {}", lead, style_white(&line));
+        }
+        return;
+    }
+
+    let desc_width = total_width - indent - key_width - 2;
+    let wrapped = wrap_help_text(desc, desc_width);
+    if wrapped.is_empty() {
+        println!("{}{}", lead, style_green(&key_padded));
+        return;
+    }
+    println!(
+        "{}{}  {}",
+        lead,
+        style_green(&key_padded),
+        style_white(&wrapped[0])
+    );
+    let pad = " ".repeat(key_width);
+    for line in wrapped.iter().skip(1) {
+        println!("{}{}  {}", lead, pad, style_white(line));
+    }
+}
+
+fn help_line_width() -> usize {
+    let cols = env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
+    cols.saturating_sub(2).clamp(48, 160)
+}
+
+fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
+    let w = width.max(8);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+
+    for word in text.split_whitespace() {
+        let len_word = word.chars().count();
+        if line.is_empty() {
+            if len_word <= w {
+                line.push_str(word);
+            } else {
+                let chunks = split_long_word(word, w);
+                if chunks.is_empty() {
+                    continue;
+                }
+                for ch in chunks.iter().take(chunks.len().saturating_sub(1)) {
+                    out.push(ch.to_string());
+                }
+                line = chunks.last().cloned().unwrap_or_default();
+            }
+            continue;
+        }
+
+        let len_line = line.chars().count();
+        if len_line + 1 + len_word <= w {
+            line.push(' ');
+            line.push_str(word);
+            continue;
+        }
+
+        out.push(std::mem::take(&mut line));
+        if len_word <= w {
+            line.push_str(word);
+        } else {
+            let chunks = split_long_word(word, w);
+            for ch in chunks.iter().take(chunks.len().saturating_sub(1)) {
+                out.push(ch.to_string());
+            }
+            line = chunks.last().cloned().unwrap_or_default();
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+fn split_long_word(word: &str, width: usize) -> Vec<String> {
+    let w = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0usize;
+    for ch in word.chars() {
+        cur.push(ch);
+        n += 1;
+        if n >= w {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration), String> {
@@ -3686,7 +3835,9 @@ fn build_pip_install_cmd(
     } else if is_pypi_janusx_spec(spec) {
         // Prefer wheel-only first for PyPI installs.
         // If wheel is unavailable, pip_install_update() will fall back to source build.
-        cmd.arg("--only-binary").arg("janusx").arg("--prefer-binary");
+        cmd.arg("--only-binary")
+            .arg("janusx")
+            .arg("--prefer-binary");
     }
     if force_reinstall {
         cmd.arg("--force-reinstall").arg("--no-cache-dir");
@@ -3848,9 +3999,9 @@ fn pip_install_tail(
                                     println!("{trimmed}");
                                 }
                                 streamed_lines_before_tail += 1;
-                                io::stdout()
-                                    .flush()
-                                    .map_err(|e| format!("Failed to flush pip progress output: {e}"))?;
+                                io::stdout().flush().map_err(|e| {
+                                    format!("Failed to flush pip progress output: {e}")
+                                })?;
                             } else {
                                 // Switch from normal streaming log to fixed tail-refresh mode.
                                 if streamed_lines_before_tail > 0 {
@@ -3860,7 +4011,14 @@ fn pip_install_tail(
                                     }
                                     print!("\x1b[{}A", up);
                                 }
-                                render_tail_block(desc, "", start.elapsed(), &tail, max_lines, false)?;
+                                render_tail_block(
+                                    desc,
+                                    "",
+                                    start.elapsed(),
+                                    &tail,
+                                    max_lines,
+                                    false,
+                                )?;
                                 rendered = true;
                                 tail_mode_started = true;
                                 last_render = Instant::now();
@@ -4074,7 +4232,11 @@ fn render_streaming_failure_compact(
     Ok(())
 }
 
-fn render_tail_success_compact(desc: &str, elapsed: Duration, max_lines: usize) -> Result<(), String> {
+fn render_tail_success_compact(
+    desc: &str,
+    elapsed: Duration,
+    max_lines: usize,
+) -> Result<(), String> {
     let width = terminal_line_width();
     let title = truncate_plain_line(&format!("✔︎ {desc}[{}]", format_elapsed(elapsed)), width);
     // Cursor is currently below the fixed block.

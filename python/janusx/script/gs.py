@@ -87,7 +87,7 @@ from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
-from ._common.helptext import cli_help_formatter, minimal_help_epilog
+from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -560,7 +560,7 @@ def _load_genotype_with_rust_gfreader(
 def main(log: bool = True) -> None:
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         prog="jx gs",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
@@ -574,7 +574,7 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     required_group = parser.add_argument_group("Required Arguments")
 
-    geno_group = required_group.add_mutually_exclusive_group(required=True)
+    geno_group = required_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-vcf", "--vcf",
         type=str,
@@ -589,7 +589,7 @@ def main(log: bool = True) -> None:
     required_group.add_argument(
         "-p", "--pheno",
         type=str,
-        required=True,
+        required=False,
         help="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
 
@@ -696,7 +696,20 @@ def main(log: bool = True) -> None:
              "(default: genotype basename).",
     )
 
-    args = parser.parse_args()
+    args, extras = parser.parse_known_args()
+    has_genotype = bool(args.vcf or args.bfile)
+    has_pheno = bool(args.pheno)
+    if (not has_pheno) and (not has_genotype):
+        parser.error(
+            "the following arguments are required: -p/--pheno & "
+            "(-vcf VCF | -bfile BFILE)"
+        )
+    if not has_pheno:
+        parser.error("the following arguments are required: -p/--pheno")
+    if not has_genotype:
+        parser.error("the following arguments are required: (-vcf VCF | -bfile BFILE)")
+    if len(extras) > 0:
+        parser.error("unrecognized arguments: " + " ".join(extras))
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix

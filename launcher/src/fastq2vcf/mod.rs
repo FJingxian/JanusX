@@ -1,3 +1,13 @@
+use super::pipeline::{run_pipeline_with_hook, PipelineOptions, PipelineStep, Scheduler, StepItem};
+mod cmd;
+mod state;
+use cmd::{
+    cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem, cmd_cgvcf, cmd_concat_imputed_vcfs, cmd_fastp,
+    cmd_filter_imputed_by_maf_and_missing, cmd_filtersnp, cmd_gvcf2vcf, cmd_markdup,
+    cmd_selectfiltersnp, cmd_snpvcf_to_gt_and_missing, cmd_vcf2snpvcf, cmd_vcf2table, sh_quote,
+    wrap_scheduler_cmd,
+};
+use state::WorkStateTracker;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
@@ -45,6 +55,12 @@ struct ParsedArgs {
     reference: PathBuf,
     fastq_dir: PathBuf,
     workdir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct FaiData {
+    order: Vec<String>,
+    lens: BTreeMap<String, u64>,
 }
 
 pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
@@ -119,12 +135,71 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             metadata_path.display()
         )
     })?;
+    let singularity = jx_cmd.to_string();
+    let steps = build_fastq2vcf_steps(
+        &reference,
+        &samples,
+        &chroms,
+        &workdir,
+        &backend,
+        &singularity,
+    )?;
+    let mut opts = PipelineOptions::default();
+    opts.scheduler = if backend == "csub" {
+        Scheduler::Csub
+    } else {
+        Scheduler::Nohup
+    };
+    opts.nohup_max_jobs = 1;
+    opts.skip_if_outputs_exist = true;
+    opts.poll_sec = 2.0;
+    opts.detect_failed_logs = true;
+
+    let state_path = workdir.join(".work.json");
+    let run_params_json = build_run_params_json(
+        &reference,
+        &samples,
+        &chroms,
+        &backend,
+        opts.nohup_max_jobs,
+        &singularity,
+    );
+    let input_files = build_input_files(&reference, &samples);
+    let (mut state_tracker, resumed) =
+        WorkStateTracker::init_or_resume(&state_path, &run_params_json, &input_files, &steps)?;
+    if resumed {
+        println!("Resuming pipeline from {}", state_path.display());
+    }
+    let summary = state_tracker.summary();
+    if summary.total_items > 0 && summary.done_items >= summary.total_items {
+        println!("All FASTQ2VCF tasks already completed (same parameters).");
+        println!(
+            "Re-checking all {} steps with rich progress...",
+            steps.len()
+        );
+    }
+    state_tracker.mark_running()?;
+
     let home = super::runtime_home()?;
-    let python = super::ensure_runtime(false)?;
+    let _python = super::ensure_runtime(false)?;
     let _ = super::maybe_auto_warmup(&home)?;
-    let status = run_python_fastq2vcf(&python, &metadata_path, &workdir, &backend, 1, jx_cmd)?;
-    if status != 0 {
-        return Ok(status);
+    let pipeline_result = {
+        let mut item_hook =
+            |step: &PipelineStep, item: &StepItem| state_tracker.mark_item_done(step, item);
+        run_pipeline_with_hook(&workdir, &steps, &opts, &mut item_hook)
+    };
+    match pipeline_result {
+        Ok(()) => {
+            state_tracker.mark_completed()?;
+        }
+        Err(err) => {
+            if let Err(mark_err) = state_tracker.mark_failed(&err) {
+                return Err(format!(
+                    "{err}\nAdditionally failed to update .work.json: {mark_err}"
+                ));
+            }
+            return Err(err);
+        }
     }
 
     let bulk_names = infer_bulks(samples.keys().cloned().collect::<Vec<String>>());
@@ -463,30 +538,47 @@ fn ensure_reference_indexes(
     job_name: &str,
 ) -> Result<(), String> {
     let reference = absolutize_path(reference)?;
-    let fai = reference_sidecar(&reference, ".fai");
-    let ann = reference_sidecar(&reference, ".ann");
-    let dict = reference_dict_path(&reference);
-    if fai.exists() && ann.exists() && dict.exists() {
+    if validate_reference_index_integrity(&reference).is_ok() {
         return Ok(());
     }
+    let initial_err = validate_reference_index_integrity(&reference)
+        .err()
+        .unwrap_or_else(|| "unknown index validation error".to_string());
+    eprintln!(
+        "{}",
+        super::style_yellow(&format!(
+            "Reference index check failed: {}. Rebuilding indexes...",
+            initial_err
+        ))
+    );
+
+    let fai = reference_sidecar(&reference, ".fai");
+    let dict = reference_dict_path(&reference);
+    let bwa_files = bwa_index_paths(&reference);
+    let mut wait_files = vec![fai, dict];
+    wait_files.extend(bwa_files);
+    let dict_path = wait_files[1].clone();
 
     let idx_cmd = format!(
-        "{} samtools faidx {} && {} bwa index {} && {} gatk CreateSequenceDictionary -R {} -O {}",
+        "{} samtools faidx {} && {} bwa index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
+        sh_quote(&dict_path.to_string_lossy()),
+        sh_quote(&dict_path.to_string_lossy()),
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
-        sh_quote(&dict.to_string_lossy()),
+        sh_quote(&dict_path.to_string_lossy()),
     );
     let wrapped = wrap_scheduler_cmd(&idx_cmd, job_name, 1, backend);
     run_shell_with_spinner(workdir, &wrapped, "Indexing reference")?;
     wait_for_paths(
-        &[fai, ann, dict],
+        &wait_files,
         "Waiting for reference index files",
         Duration::from_secs(2),
     )?;
+    validate_reference_index_integrity(&reference)?;
     Ok(())
 }
 
@@ -512,25 +604,174 @@ fn reference_dict_path(reference: &Path) -> PathBuf {
 fn read_chroms_from_fai(reference: &Path) -> Result<Vec<String>, String> {
     let reference = absolutize_path(reference)?;
     let fai = reference_sidecar(&reference, ".fai");
-    let file = File::open(&fai)
-        .map_err(|e| format!("Failed to open FASTA index {}: {e}", fai.display()))?;
-    let reader = BufReader::new(file);
-    let mut chroms = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read {}: {e}", fai.display()))?;
-        let mut parts = line.split('\t');
-        let Some(chrom) = parts.next() else {
+    let parsed = parse_fai_file(&fai)?;
+    Ok(parsed.order)
+}
+
+fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
+    let fai = reference_sidecar(reference, ".fai");
+    let dict = reference_dict_path(reference);
+
+    let fai_data = parse_fai_file(&fai)?;
+    validate_bwa_indexes(reference)?;
+    let dict_map = parse_dict_file(&dict)?;
+
+    let mut mismatch: Vec<String> = Vec::new();
+    for (chrom, fai_len) in &fai_data.lens {
+        let Some(dict_len) = dict_map.get(chrom) else {
+            mismatch.push(format!("missing in .dict: {chrom}"));
             continue;
         };
-        let c = chrom.trim();
-        if !c.is_empty() {
-            chroms.push(c.to_string());
+        if *dict_len != *fai_len {
+            mismatch.push(format!(
+                "length mismatch for {chrom} (.fai={fai_len}, .dict={dict_len})"
+            ));
         }
     }
-    if chroms.is_empty() {
+    for chrom in dict_map.keys() {
+        if !fai_data.lens.contains_key(chrom) {
+            mismatch.push(format!("extra contig in .dict: {chrom}"));
+        }
+    }
+    if !mismatch.is_empty() {
+        let show = mismatch
+            .into_iter()
+            .take(8)
+            .collect::<Vec<String>>()
+            .join("; ");
+        return Err(format!(
+            "reference index is inconsistent between {} and {}: {}",
+            fai.display(),
+            dict.display(),
+            show
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bwa_indexes(reference: &Path) -> Result<(), String> {
+    for p in bwa_index_paths(reference) {
+        check_readable_nonempty(&p)?;
+    }
+    Ok(())
+}
+
+fn bwa_index_paths(reference: &Path) -> Vec<PathBuf> {
+    [".amb", ".ann", ".bwt", ".pac", ".sa"]
+        .iter()
+        .map(|suffix| reference_sidecar(reference, suffix))
+        .collect()
+}
+
+fn check_readable_nonempty(path: &Path) -> Result<(), String> {
+    if !path.exists() || !path.is_file() {
+        return Err(format!("index file missing: {}", path.display()));
+    }
+    let md = fs::metadata(path).map_err(|e| format!("Failed to stat {}: {e}", path.display()))?;
+    if md.len() == 0 {
+        return Err(format!("index file is empty: {}", path.display()));
+    }
+    File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn parse_fai_file(fai: &Path) -> Result<FaiData, String> {
+    check_readable_nonempty(fai)?;
+    let file = File::open(fai)
+        .map_err(|e| format!("Failed to open FASTA index {}: {e}", fai.display()))?;
+    let reader = BufReader::new(file);
+    let mut order = Vec::new();
+    let mut lens: BTreeMap<String, u64> = BTreeMap::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read {}: {e}", fai.display()))?;
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = raw.split('\t').collect();
+        if cols.len() < 2 {
+            return Err(format!("Invalid .fai row in {}: {}", fai.display(), raw));
+        }
+        let chrom = cols[0].trim();
+        if chrom.is_empty() {
+            return Err(format!(
+                "Invalid .fai row with empty contig in {}",
+                fai.display()
+            ));
+        }
+        let len: u64 = cols[1].trim().parse().map_err(|_| {
+            format!(
+                "Invalid contig length in .fai {} for {}: {}",
+                fai.display(),
+                chrom,
+                cols[1].trim()
+            )
+        })?;
+        if lens.contains_key(chrom) {
+            return Err(format!(
+                "Duplicate contig in .fai {}: {}",
+                fai.display(),
+                chrom
+            ));
+        }
+        order.push(chrom.to_string());
+        lens.insert(chrom.to_string(), len);
+    }
+    if order.is_empty() {
         return Err(format!("Empty FASTA index: {}", fai.display()));
     }
-    Ok(chroms)
+    Ok(FaiData { order, lens })
+}
+
+fn parse_dict_file(dict: &Path) -> Result<BTreeMap<String, u64>, String> {
+    check_readable_nonempty(dict)?;
+    let file = File::open(dict)
+        .map_err(|e| format!("Failed to open sequence dict {}: {e}", dict.display()))?;
+    let reader = BufReader::new(file);
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read {}: {e}", dict.display()))?;
+        let raw = line.trim();
+        if !raw.starts_with("@SQ") {
+            continue;
+        }
+        let mut sn: Option<String> = None;
+        let mut ln: Option<u64> = None;
+        for field in raw.split('\t').skip(1) {
+            if let Some(v) = field.strip_prefix("SN:") {
+                let s = v.trim().to_string();
+                if !s.is_empty() {
+                    sn = Some(s);
+                }
+                continue;
+            }
+            if let Some(v) = field.strip_prefix("LN:") {
+                let n = v
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("Invalid LN field in {}: {}", dict.display(), raw))?;
+                ln = Some(n);
+            }
+        }
+        let Some(name) = sn else {
+            return Err(format!("Missing SN field in {}: {}", dict.display(), raw));
+        };
+        let Some(length) = ln else {
+            return Err(format!("Missing LN field in {}: {}", dict.display(), raw));
+        };
+        if out.insert(name.clone(), length).is_some() {
+            return Err(format!("Duplicate SN in {}: {}", dict.display(), name));
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "No @SQ entries found in sequence dict {}",
+            dict.display()
+        ));
+    }
+    Ok(out)
 }
 
 fn collect_fastq_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -791,51 +1032,62 @@ fn build_metadata_json(
     json
 }
 
-fn run_python_fastq2vcf(
-    python: &Path,
-    metadata_path: &Path,
-    workdir: &Path,
-    backend: &str,
-    nohup_max_jobs: i32,
+fn build_run_params_json(
+    reference: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    chroms: &[String],
+    scheduler: &str,
+    nohup_max_jobs: usize,
     singularity: &str,
-) -> Result<i32, String> {
-    let pycode = r#"
-import pathlib
-import sys
-from janusx.pipeline.fastq2vcf import fastq2vcf
+) -> String {
+    let mut json = String::new();
+    json.push('{');
+    json.push_str("\"chrom\":[");
+    for (idx, chrom) in chroms.iter().enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        json.push_str(&json_string(chrom));
+    }
+    json.push(']');
+    json.push_str(",\"nohup_max_jobs\":");
+    json.push_str(&nohup_max_jobs.to_string());
+    json.push_str(",\"reference\":");
+    json.push_str(&json_string(&reference.to_string_lossy()));
+    json.push_str(",\"samples\":{");
+    let mut first = true;
+    for (sample, (r1, r2)) in samples {
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push_str(&json_string(sample));
+        json.push(':');
+        json.push('[');
+        json.push_str(&json_string(&r1.to_string_lossy()));
+        json.push(',');
+        json.push_str(&json_string(&r2.to_string_lossy()));
+        json.push(']');
+    }
+    json.push('}');
+    json.push_str(",\"scheduler\":");
+    json.push_str(&json_string(scheduler));
+    json.push_str(",\"singularity\":");
+    json.push_str(&json_string(singularity));
+    json.push('}');
+    json
+}
 
-metadata_path = pathlib.Path(sys.argv[1]).resolve()
-metadata = metadata_path.read_text(encoding="utf-8")
-import json
-metadata = json.loads(metadata)
-workdir = pathlib.Path(sys.argv[2]).resolve()
-backend = str(sys.argv[3])
-nohup_max_jobs = int(sys.argv[4])
-singularity = str(sys.argv[5])
-
-fastq2vcf(
-    metadata=metadata,
-    workdir=workdir,
-    backbend=backend,
-    nohup_max_jobs=nohup_max_jobs,
-    singularity=singularity,
-)
-"#;
-    let status = Command::new(python)
-        .arg("-c")
-        .arg(pycode)
-        .arg(metadata_path.to_string_lossy().to_string())
-        .arg(workdir.to_string_lossy().to_string())
-        .arg(backend)
-        .arg(nohup_max_jobs.to_string())
-        .arg(singularity)
-        .current_dir(workdir)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("Failed to run fastq2vcf pipeline: {e}"))?;
-    Ok(super::exit_code(status))
+fn build_input_files(
+    reference: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+) -> Vec<PathBuf> {
+    let mut files = vec![reference.to_path_buf()];
+    for (r1, r2) in samples.values() {
+        files.push(r1.clone());
+        files.push(r2.clone());
+    }
+    dedup_paths(files)
 }
 
 fn infer_bulks(samples: Vec<String>) -> Vec<String> {
@@ -896,6 +1148,424 @@ fn latest_snp_table(workdir: &Path) -> Option<PathBuf> {
             .unwrap_or(SystemTime::UNIX_EPOCH)
     });
     tables.pop()
+}
+
+fn build_fastq2vcf_steps(
+    reference: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    chroms: &[String],
+    workdir: &Path,
+    backend: &str,
+    singularity: &str,
+) -> Result<Vec<PipelineStep>, String> {
+    let cleanfolder = workdir.join("1.clean");
+    let mappingfolder = workdir.join("2.mapping");
+    let gvcffolder = workdir.join("3.gvcf");
+    let mergefolder = workdir.join("4.merge");
+    let imputefolder = workdir.join("5.impute");
+    let genotypefolder = workdir.join("6.genotype");
+
+    for d in [
+        &cleanfolder,
+        &mappingfolder,
+        &gvcffolder,
+        &mergefolder,
+        &imputefolder,
+        &genotypefolder,
+    ] {
+        fs::create_dir_all(d).map_err(|e| format!("Failed to create {}: {e}", d.display()))?;
+    }
+
+    let sample_names: Vec<String> = samples.keys().cloned().collect();
+    let mut steps: Vec<PipelineStep> = Vec::new();
+
+    let mut step1_cmds = Vec::new();
+    let mut step1_inputs = Vec::new();
+    let mut step1_outputs = Vec::new();
+    let mut step1_items = Vec::new();
+    for sample in &sample_names {
+        let Some((fq1, fq2)) = samples.get(sample) else {
+            return Err(format!("Sample missing FASTQ pair in metadata: {sample}"));
+        };
+        step1_inputs.push(fq1.clone());
+        step1_inputs.push(fq2.clone());
+        let out_r1 = cleanfolder.join(format!("{sample}.R1.clean.fastq.gz"));
+        let out_r2 = cleanfolder.join(format!("{sample}.R2.clean.fastq.gz"));
+        let out_html = cleanfolder.join(format!("{sample}.html"));
+        let out_json = cleanfolder.join(format!("{sample}.json"));
+        let raw = cmd_fastp(sample, fq1, fq2, &cleanfolder, 16, singularity);
+        step1_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("fastp.{sample}"),
+            16,
+            backend,
+        ));
+        let outs = vec![out_r1, out_r2, out_html, out_json];
+        step1_outputs.extend(outs.clone());
+        step1_items.push(StepItem {
+            id: format!("fastp.{sample}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step1_fastp".to_string(),
+        name: "fastp".to_string(),
+        eta_minutes: Some(15),
+        commands: step1_cmds,
+        inputs: dedup_paths(step1_inputs),
+        outputs: dedup_paths(step1_outputs),
+        items: step1_items,
+    });
+
+    let mut step2_cmds = Vec::new();
+    let mut step2_inputs = Vec::new();
+    let mut step2_outputs = Vec::new();
+    let mut step2_items = Vec::new();
+    for sample in &sample_names {
+        let r1 = cleanfolder.join(format!("{sample}.R1.clean.fastq.gz"));
+        let r2 = cleanfolder.join(format!("{sample}.R2.clean.fastq.gz"));
+        step2_inputs.push(r1.clone());
+        step2_inputs.push(r2.clone());
+        let out_bam = mappingfolder.join(format!("{sample}.sorted.bam"));
+        let out_done = mappingfolder.join(format!("{sample}.sorted.bam.finished"));
+        let raw = cmd_bwamem(reference, sample, &r1, &r2, &mappingfolder, 64, singularity);
+        step2_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("bwamem.{sample}"),
+            64,
+            backend,
+        ));
+        let outs = vec![out_bam, out_done];
+        step2_outputs.extend(outs.clone());
+        step2_items.push(StepItem {
+            id: format!("bwamem.{sample}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step2_bwamem".to_string(),
+        name: "bwamem".to_string(),
+        eta_minutes: Some(255),
+        commands: step2_cmds,
+        inputs: dedup_paths(step2_inputs),
+        outputs: dedup_paths(step2_outputs),
+        items: step2_items,
+    });
+
+    let mut step3_cmds = Vec::new();
+    let mut step3_inputs = Vec::new();
+    let mut step3_outputs = Vec::new();
+    let mut step3_items = Vec::new();
+    for sample in &sample_names {
+        let bam = mappingfolder.join(format!("{sample}.sorted.bam"));
+        step3_inputs.push(bam.clone());
+        let out_md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
+        let out_md_metrics = mappingfolder.join(format!("{sample}.Markdup.metrics.txt"));
+        let raw = cmd_markdup(sample, &bam, &mappingfolder, 16, 200, singularity);
+        step3_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("markdup.{sample}"),
+            16,
+            backend,
+        ));
+        let outs = vec![out_md_bam, out_md_metrics];
+        step3_outputs.extend(outs.clone());
+        step3_items.push(StepItem {
+            id: format!("markdup.{sample}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step3_markdup".to_string(),
+        name: "markdup".to_string(),
+        eta_minutes: Some(73),
+        commands: step3_cmds,
+        inputs: dedup_paths(step3_inputs),
+        outputs: dedup_paths(step3_outputs),
+        items: step3_items,
+    });
+
+    let mut step4_cmds = Vec::new();
+    let mut step4_inputs = Vec::new();
+    let mut step4_outputs = Vec::new();
+    let mut step4_items = Vec::new();
+    for sample in &sample_names {
+        let md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
+        step4_inputs.push(md_bam.clone());
+        for chrom in chroms {
+            let out_g = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"));
+            let out_tbi = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz.tbi"));
+            let raw = cmd_bam2gvcf(
+                reference,
+                sample,
+                &md_bam,
+                chrom,
+                &gvcffolder,
+                2,
+                singularity,
+            );
+            step4_cmds.push(wrap_scheduler_cmd(
+                &raw,
+                &format!("bam2gvcf.{sample}.{chrom}"),
+                2,
+                backend,
+            ));
+            let outs = vec![out_g, out_tbi];
+            step4_outputs.extend(outs.clone());
+            step4_items.push(StepItem {
+                id: format!("bam2gvcf.{sample}.{chrom}"),
+                outputs: outs,
+            });
+        }
+    }
+    steps.push(PipelineStep {
+        id: "step4_bam2gvcf".to_string(),
+        name: "bam2gvcf".to_string(),
+        eta_minutes: Some(451),
+        commands: step4_cmds,
+        inputs: dedup_paths(step4_inputs),
+        outputs: dedup_paths(step4_outputs),
+        items: step4_items,
+    });
+
+    let mut step5_cmds = Vec::new();
+    let mut step5_inputs = Vec::new();
+    let mut step5_outputs = Vec::new();
+    let mut step5_items = Vec::new();
+    for chrom in chroms {
+        let mut gvcfs: Vec<PathBuf> = Vec::new();
+        for sample in &sample_names {
+            let p = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"));
+            step5_inputs.push(p.clone());
+            gvcfs.push(p);
+        }
+        let out_g = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz"));
+        let out_tbi = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz.tbi"));
+        let raw = cmd_cgvcf(reference, chrom, &gvcfs, &mergefolder, singularity);
+        step5_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("cgvcf.{chrom}"),
+            1,
+            backend,
+        ));
+        let outs = vec![out_g, out_tbi];
+        step5_outputs.extend(outs.clone());
+        step5_items.push(StepItem {
+            id: format!("cgvcf.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step5_cgvcf".to_string(),
+        name: "cgvcf".to_string(),
+        eta_minutes: Some(36),
+        commands: step5_cmds,
+        inputs: dedup_paths(step5_inputs),
+        outputs: dedup_paths(step5_outputs),
+        items: step5_items,
+    });
+
+    let mut step6_cmds = Vec::new();
+    let mut step6_inputs = Vec::new();
+    let mut step6_outputs = Vec::new();
+    let mut step6_items = Vec::new();
+    for chrom in chroms {
+        let in_g = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz"));
+        step6_inputs.push(in_g);
+        let out_snp_f = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
+        let out_snp_f_tbi = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
+        let out_snp_tsv = mergefolder.join(format!("Merge.{chrom}.SNP.tsv"));
+        let cmd6 = [
+            cmd_gvcf2vcf(reference, chrom, &mergefolder, 1, 50, singularity),
+            cmd_vcf2snpvcf(reference, chrom, &mergefolder, singularity),
+            cmd_filtersnp(reference, chrom, &mergefolder, singularity),
+            cmd_selectfiltersnp(reference, chrom, &mergefolder, singularity),
+            cmd_vcf2table(reference, chrom, &mergefolder, singularity),
+        ]
+        .join(" && ");
+        step6_cmds.push(wrap_scheduler_cmd(
+            &cmd6,
+            &format!("gvcf2vcf.{chrom}"),
+            1,
+            backend,
+        ));
+        let outs = vec![out_snp_f, out_snp_f_tbi, out_snp_tsv];
+        step6_outputs.extend(outs.clone());
+        step6_items.push(StepItem {
+            id: format!("gvcf2vcf.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step6_gvcf2vcf".to_string(),
+        name: "gvcf2vcf".to_string(),
+        eta_minutes: Some(32),
+        commands: step6_cmds,
+        inputs: dedup_paths(step6_inputs),
+        outputs: dedup_paths(step6_outputs),
+        items: step6_items,
+    });
+
+    let mut step7_cmds = Vec::new();
+    let mut step7_inputs = Vec::new();
+    let mut step7_outputs = Vec::new();
+    let mut step7_items = Vec::new();
+    for chrom in chroms {
+        let in_vcf = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
+        step7_inputs.push(in_vcf);
+        let out_gt = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
+        let out_gt_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz.tbi"));
+        let out_lmiss = imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss"));
+        let out_imiss = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss"));
+        let raw = cmd_snpvcf_to_gt_and_missing(
+            chrom,
+            &mergefolder,
+            &imputefolder,
+            5,
+            20,
+            2,
+            2,
+            singularity,
+        );
+        step7_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("gtprep.{chrom}"),
+            2,
+            backend,
+        ));
+        let outs = vec![out_gt, out_gt_tbi, out_lmiss, out_imiss];
+        step7_outputs.extend(outs.clone());
+        step7_items.push(StepItem {
+            id: format!("gtprep.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step7_gtprep".to_string(),
+        name: "gtprep".to_string(),
+        eta_minutes: Some(40),
+        commands: step7_cmds,
+        inputs: dedup_paths(step7_inputs),
+        outputs: dedup_paths(step7_outputs),
+        items: step7_items,
+    });
+
+    let mut step8_cmds = Vec::new();
+    let mut step8_inputs = Vec::new();
+    let mut step8_outputs = Vec::new();
+    let mut step8_items = Vec::new();
+    for chrom in chroms {
+        let in_gt = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
+        step8_inputs.push(in_gt);
+        let out_imp = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
+        let out_imp_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"));
+        let raw = cmd_beagle_impute(chrom, &imputefolder, 2, singularity);
+        step8_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("beagle.{chrom}"),
+            2,
+            backend,
+        ));
+        let outs = vec![out_imp, out_imp_tbi];
+        step8_outputs.extend(outs.clone());
+        step8_items.push(StepItem {
+            id: format!("beagle.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step8_impute".to_string(),
+        name: "impute".to_string(),
+        eta_minutes: Some(120),
+        commands: step8_cmds,
+        inputs: dedup_paths(step8_inputs),
+        outputs: dedup_paths(step8_outputs),
+        items: step8_items,
+    });
+
+    let mut step9_cmds = Vec::new();
+    let mut step9_inputs = Vec::new();
+    let mut step9_outputs = Vec::new();
+    let mut step9_items = Vec::new();
+    for chrom in chroms {
+        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz")));
+        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss")));
+        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss")));
+        let out_vcf = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"));
+        let out_tbi = imputefolder.join(format!(
+            "Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
+        ));
+        let raw = cmd_filter_imputed_by_maf_and_missing(
+            chrom,
+            chroms,
+            &imputefolder,
+            0.02,
+            0.2,
+            2,
+            singularity,
+        );
+        step9_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("impfilter.{chrom}"),
+            2,
+            backend,
+        ));
+        let outs = vec![out_vcf, out_tbi];
+        step9_outputs.extend(outs.clone());
+        step9_items.push(StepItem {
+            id: format!("impfilter.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step9_impfilter".to_string(),
+        name: "impfilter".to_string(),
+        eta_minutes: Some(24),
+        commands: step9_cmds,
+        inputs: dedup_paths(step9_inputs),
+        outputs: dedup_paths(step9_outputs),
+        items: step9_items,
+    });
+
+    let mut step10_inputs = Vec::new();
+    for chrom in chroms {
+        step10_inputs
+            .push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz")));
+    }
+    let out_merge_vcf = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz");
+    let out_merge_tbi = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi");
+    let raw10 = cmd_concat_imputed_vcfs(chroms, &imputefolder, &genotypefolder, 2, singularity);
+    let step10_cmds = vec![wrap_scheduler_cmd(&raw10, "mergevcf.all", 2, backend)];
+    let step10_outputs = vec![out_merge_vcf, out_merge_tbi];
+    let step10_items = vec![StepItem {
+        id: "mergevcf.all".to_string(),
+        outputs: step10_outputs.clone(),
+    }];
+    steps.push(PipelineStep {
+        id: "step10_mergevcf".to_string(),
+        name: "mergevcf".to_string(),
+        eta_minutes: Some(8),
+        commands: step10_cmds,
+        inputs: dedup_paths(step10_inputs),
+        outputs: dedup_paths(step10_outputs),
+        items: step10_items,
+    });
+
+    Ok(steps)
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = BTreeMap::<String, ()>::new();
+    for p in paths {
+        let key = p.to_string_lossy().to_string();
+        if seen.contains_key(&key) {
+            continue;
+        }
+        seen.insert(key, ());
+        out.push(p);
+    }
+    out
 }
 
 fn run_shell_with_spinner(cwd: &Path, cmdline: &str, desc: &str) -> Result<(), String> {
@@ -961,37 +1631,6 @@ fn wait_for_paths(paths: &[PathBuf], desc: &str, poll: Duration) -> Result<(), S
     Ok(())
 }
 
-fn wrap_scheduler_cmd(cmd: &str, job: &str, threads: usize, backend: &str) -> String {
-    if backend == "csub" {
-        let safe_job = safe_job_label(job);
-        return format!(
-            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} \"{}\"",
-            job, safe_job, safe_job, threads, cmd
-        );
-    }
-    let safe_cmd = cmd.replace('"', "\\\"");
-    format!(
-        "nohup bash -c \"{}\" > ./log/{}.o 2> ./log/{}.e",
-        safe_cmd, job, job
-    )
-}
-
-fn safe_job_label(raw: &str) -> String {
-    let mut out = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "job".to_string()
-    } else {
-        out
-    }
-}
-
 fn shell_cmd(cmdline: &str) -> Command {
     #[cfg(windows)]
     {
@@ -1025,11 +1664,6 @@ fn json_string(raw: &str) -> String {
     }
     out.push('"');
     out
-}
-
-fn sh_quote(raw: &str) -> String {
-    let escaped = raw.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
 }
 
 fn absolutize_path(path: &Path) -> Result<PathBuf, String> {

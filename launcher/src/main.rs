@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dlc;
 mod fastq2vcf;
+mod pipeline;
 
 const PYPI_SPEC: &str = "janusx";
 const GITHUB_SPEC_CN: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";

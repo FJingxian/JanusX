@@ -473,10 +473,39 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
             updated_at: now_utc_epoch(),
         });
     }
-    let micromamba_bin = ensure_micromamba(runtime_home)?;
-    if !env_prefix.exists() {
+    let ordered_missing = ordered_required_tools(&host_missing);
+    let mm_bin = env_runtime_micromamba_bin(runtime_home);
+    let mm_root = env_runtime_micromamba_root(runtime_home);
+    let mm_archive = mm_root.join("micromamba.tar.bz2");
+    let need_mm_download = !mm_bin.exists() && !mm_archive.exists();
+    let need_mm_extract = !mm_bin.exists();
+    let need_env_create = !env_prefix.exists();
+    let total_steps = ordered_missing.len()
+        + usize::from(need_mm_download)
+        + usize::from(need_mm_extract)
+        + usize::from(need_env_create);
+    let mut step_idx = 1usize;
+
+    let mut dl_desc: Option<String> = None;
+    if need_mm_download {
+        dl_desc = Some(format!("[{}/{}] Download micromamba", step_idx, total_steps));
+        step_idx += 1;
+    }
+    let mut ex_desc: Option<String> = None;
+    if need_mm_extract {
+        ex_desc = Some(format!("[{}/{}] Extract micromamba", step_idx, total_steps));
+        step_idx += 1;
+    }
+
+    let micromamba_bin = ensure_micromamba(
+        runtime_home,
+        dl_desc.as_deref(),
+        ex_desc.as_deref(),
+    )?;
+    if need_env_create {
+        let desc = format!("[{}/{}] Create local env via env", step_idx, total_steps);
         run_cmd_tail_with_conda_channel_fallback(
-            "build via env [prepare] create local env",
+            &desc,
             &[
                 micromamba_bin.to_string_lossy().to_string(),
                 "create".to_string(),
@@ -487,12 +516,15 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
             &["python=3.10".to_string()],
             10,
         )?;
+        step_idx += 1;
     }
-    install_tools_stepwise_env(
+    let _ = install_tools_stepwise_env(
         &micromamba_bin.to_string_lossy(),
         &env_prefix,
-        &host_missing,
+        &ordered_missing,
         "Build",
+        step_idx,
+        total_steps.max(step_idx.saturating_sub(1)),
     )?;
     sync_env_runtime_bin_mixed(runtime_home, &env_prefix)?;
     let missing_after = missing_env_runtime_tools(runtime_home);
@@ -1018,7 +1050,11 @@ fn missing_host_tools() -> Vec<String> {
         .collect()
 }
 
-fn ensure_micromamba(runtime_home: &Path) -> Result<PathBuf, String> {
+fn ensure_micromamba(
+    runtime_home: &Path,
+    download_desc: Option<&str>,
+    extract_desc: Option<&str>,
+) -> Result<PathBuf, String> {
     let mm_bin = env_runtime_micromamba_bin(runtime_home);
     if mm_bin.exists() {
         return Ok(mm_bin);
@@ -1037,10 +1073,12 @@ fn ensure_micromamba(runtime_home: &Path) -> Result<PathBuf, String> {
     }
     let archive = mm_root.join("micromamba.tar.bz2");
     if !archive.exists() {
-        download_with_fallback("download micromamba", &MICROMAMBA_URLS, &archive)?;
+        let desc = download_desc.unwrap_or("download micromamba");
+        download_with_fallback(desc, &MICROMAMBA_URLS, &archive)?;
     }
+    let extract_desc = extract_desc.unwrap_or("build via env [extract micromamba]");
     run_cmd(
-        "build via env [extract micromamba]",
+        extract_desc,
         &vec![
             "tar".to_string(),
             "-xjf".to_string(),
@@ -1901,6 +1939,16 @@ fn run_download_with_progress(
         }
         let elapsed = start.elapsed();
         let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+        if let Some(total) = total_bytes {
+            if total > 0 && downloaded >= total {
+                status = Some(
+                    child
+                        .wait()
+                        .map_err(|e| format!("Failed to wait download process: {e}"))?,
+                );
+                break;
+            }
+        }
         let (pct_txt, eta_txt) = match total_bytes {
             Some(total) if total > 0 => {
                 let ratio = ((downloaded as f64) / (total as f64)).clamp(0.0, 1.0);
@@ -1914,8 +1962,9 @@ fn run_download_with_progress(
             _ => ("--.-%".to_string(), "--".to_string()),
         };
         let line = format!(
-            "\r{} Downloading ... [{} {}/{}]",
+            "\r{} {} ... [{} {}/{}]",
             frames[idx % frames.len()],
+            desc,
             pct_txt,
             super::format_elapsed(elapsed),
             eta_txt
@@ -2317,12 +2366,14 @@ fn install_tools_stepwise_env(
     env_prefix: &Path,
     tools: &[String],
     action: &str,
-) -> Result<(), String> {
+    start_index: usize,
+    total_steps: usize,
+) -> Result<usize, String> {
     let ordered = ordered_required_tools(tools);
     if ordered.is_empty() {
-        return Ok(());
+        return Ok(start_index);
     }
-    let total = ordered.len();
+    let total = total_steps.max(start_index.saturating_sub(1) + ordered.len());
     for (idx, tool) in ordered.iter().enumerate() {
         let pkgs = toolchain_packages_for_tools(std::slice::from_ref(tool));
         if pkgs.is_empty() {
@@ -2336,10 +2387,11 @@ fn install_tools_stepwise_env(
         ];
         let mut packages = vec!["-y".to_string()];
         packages.extend(pkgs);
-        let desc = format!("[{}/{}] {} {} via env", idx + 1, total, action, tool);
+        let step_no = start_index + idx;
+        let desc = format!("[{}/{}] {} {} via env", step_no, total, action, tool);
         run_cmd_tail_with_conda_channel_fallback(&desc, &cmd, &packages, 10)?;
     }
-    Ok(())
+    Ok(start_index + ordered.len())
 }
 
 fn ordered_required_tools(tools: &[String]) -> Vec<String> {

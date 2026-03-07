@@ -1948,8 +1948,6 @@ def main():
     )
     args = parser.parse_args()
 
-    color_enabled = bool(getattr(sys.stdout, "isatty", lambda: False)())
-
     if (not args.reference) or (not args.fastq_dir) or (not args.workdir):
         parser.error("`-r/--reference`, `-i/--fastq-dir`, and `-w/--workdir` are required.")
 
@@ -1971,9 +1969,20 @@ def main():
     scheduler_backend, scheduler_reason = _detect_task_scheduler()
     nohup_max_jobs = 1
     if scheduler_backend == "csub":
-        logger.info("Task scheduler: csub (%s)", scheduler_reason)
+        logger.info("Selected backend: csub")
+        logger.info("Backend probe: %s", scheduler_reason)
     else:
-        logger.info("Task scheduler: nohup (%s). nohup runs single-task mode.", scheduler_reason)
+        logger.info("Selected backend: nohup")
+        logger.info("Backend probe: %s. nohup runs single-task mode.", scheduler_reason)
+
+    general_rows: List[tuple[str, object]] = [
+        ("Reference", reference),
+        ("FASTQ dir", fastq_dir),
+        ("Workdir", workdir),
+        ("Selected backend", scheduler_backend),
+    ]
+    if scheduler_backend == "nohup":
+        general_rows.append(("nohup max jobs", nohup_max_jobs))
 
     emit_cli_configuration(
         logger,
@@ -1983,14 +1992,7 @@ def main():
         sections=[
             (
                 "General",
-                [
-                    ("Reference", reference),
-                    ("FASTQ dir", fastq_dir),
-                    ("Workdir", workdir),
-                    ("Scheduler (auto)", scheduler_backend),
-                    ("Scheduler reason", scheduler_reason),
-                    ("nohup max jobs", nohup_max_jobs),
-                ],
+                general_rows,
             )
         ],
         line_max_chars=60,

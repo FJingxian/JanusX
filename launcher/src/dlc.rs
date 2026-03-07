@@ -21,10 +21,12 @@ const JANUSX_SIF_MIRROR_URL: &str =
 const JANUSX_SIF_ORIGIN_URL: &str =
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
 const JANUSX_SIF_URLS: [&str; 2] = [JANUSX_SIF_MIRROR_URL, JANUSX_SIF_ORIGIN_URL];
-const MICROMAMBA_MIRROR_URL: &str =
-    "https://gh-proxy.org/https://micro.mamba.pm/api/micromamba/linux-64/latest";
-const MICROMAMBA_ORIGIN_URL: &str = "https://micro.mamba.pm/api/micromamba/linux-64/latest";
-const MICROMAMBA_URLS: [&str; 2] = [MICROMAMBA_MIRROR_URL, MICROMAMBA_ORIGIN_URL];
+const MICROMAMBA_BIN_MIRROR_URL: &str = "https://gh-proxy.org/https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64";
+const MICROMAMBA_BIN_ORIGIN_URL: &str =
+    "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64";
+const MICROMAMBA_BIN_URLS: [&str; 2] = [MICROMAMBA_BIN_MIRROR_URL, MICROMAMBA_BIN_ORIGIN_URL];
+const MICROMAMBA_ARCHIVE_ORIGIN_URL: &str = "https://micro.mamba.pm/api/micromamba/linux-64/latest";
+const MICROMAMBA_ARCHIVE_URLS: [&str; 1] = [MICROMAMBA_ARCHIVE_ORIGIN_URL];
 const CONDA_BIOCONDA_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda";
 const CONDA_FORGE_MIRROR_URL: &str =
@@ -368,7 +370,7 @@ fn build_runtime(
 ) -> Result<RuntimeRecord, String> {
     match method_id {
         1 => build_env_runtime(runtime_home),
-        2 => build_conda_runtime(),
+        2 => build_conda_runtime(runtime_home),
         3 => build_docker_runtime(python),
         4 => build_singularity_runtime(python),
         _ => Err("Unknown build method.".to_string()),
@@ -478,33 +480,18 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     }
     let ordered_missing = ordered_required_tools(&host_missing);
     let mm_bin = env_runtime_micromamba_bin(runtime_home);
-    let mm_root = env_runtime_micromamba_root(runtime_home);
-    let mm_archive = mm_root.join("micromamba.tar.bz2");
-    let need_mm_download = !mm_bin.exists() && !mm_archive.exists();
-    let need_mm_extract = !mm_bin.exists();
+    let need_mm_setup = !mm_bin.exists();
     let need_env_create = !env_prefix.exists();
-    let total_steps = ordered_missing.len()
-        + usize::from(need_mm_download)
-        + usize::from(need_mm_extract)
-        + usize::from(need_env_create);
+    let total_steps =
+        ordered_missing.len() + usize::from(need_mm_setup) + usize::from(need_env_create);
     let mut step_idx = 1usize;
 
     let mut dl_desc: Option<String> = None;
-    if need_mm_download {
+    if need_mm_setup {
         dl_desc = Some(format!("[{}/{}] Download micromamba", step_idx, total_steps));
         step_idx += 1;
     }
-    let mut ex_desc: Option<String> = None;
-    if need_mm_extract {
-        ex_desc = Some(format!("[{}/{}] Extract micromamba", step_idx, total_steps));
-        step_idx += 1;
-    }
-
-    let micromamba_bin = ensure_micromamba(
-        runtime_home,
-        dl_desc.as_deref(),
-        ex_desc.as_deref(),
-    )?;
+    let micromamba_bin = ensure_micromamba(runtime_home, dl_desc.as_deref(), None)?;
     if need_env_create {
         let desc = format!("[{}/{}] Create local env via env", step_idx, total_steps);
         run_cmd_tail_with_conda_channel_fallback(
@@ -549,14 +536,32 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     })
 }
 
-fn build_conda_runtime() -> Result<RuntimeRecord, String> {
+fn build_conda_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     if !cfg!(target_os = "linux") {
         return Err("conda method is Linux only.".to_string());
     }
     let Some(conda_bin) = find_bin("conda") else {
         return Err("conda command not found in PATH.".to_string());
     };
+    let host_missing = ordered_required_tools(&missing_host_tools());
+    if host_missing.is_empty() {
+        return Ok(RuntimeRecord {
+            method_id: 2,
+            runtime_mode: "conda".to_string(),
+            image_tag: String::new(),
+            conda_env: CONDA_ENV.to_string(),
+            sif_path: String::new(),
+            installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+            status: "ok".to_string(),
+            updated_at: now_utc_epoch(),
+        });
+    }
+    let host_missing_set: BTreeSet<String> = host_missing.iter().cloned().collect();
     let conda_bin_s = conda_bin.to_string_lossy().to_string();
+
+    let mirror_yml = write_conda_dlc_yml(runtime_home, &host_missing, true)?;
+    let official_yml = write_conda_dlc_yml(runtime_home, &host_missing, false)?;
+
     let mut removed_broken_env = false;
     let mut env_exists = conda_env_named_exists(&conda_bin, CONDA_ENV);
     if env_exists && !conda_env_exists(&conda_bin, CONDA_ENV) {
@@ -576,25 +581,18 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
         removed_broken_env = true;
         env_exists = false;
     }
-    if !env_exists {
-        let create_desc = if removed_broken_env {
-            format!("build via conda [2/2] create {CONDA_ENV}")
-        } else {
-            format!("build via conda [1/1] create {CONDA_ENV}")
-        };
-        run_cmd_tail_with_conda_channel_fallback(
-            &create_desc,
-            &[
-                conda_bin_s.clone(),
-                "create".to_string(),
-                "-n".to_string(),
-                CONDA_ENV.to_string(),
-                "-y".to_string(),
-            ],
-            &["python=3.10".to_string()],
-            10,
-        )?;
-    }
+    let apply_desc = if removed_broken_env {
+        "build via conda [2/2] apply dlc.yml".to_string()
+    } else {
+        "build via conda [1/1] apply dlc.yml".to_string()
+    };
+    run_conda_dlc_yml_with_fallback(
+        &conda_bin_s,
+        env_exists,
+        &mirror_yml,
+        &official_yml,
+        &apply_desc,
+    )?;
 
     let prefix = vec![
         conda_bin_s.clone(),
@@ -604,44 +602,12 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
         CONDA_ENV.to_string(),
     ];
 
-    let missing_now = match missing_tools_in_prefixed_runtime(&prefix) {
-        Ok(v) => v,
-        Err(e) => {
-            if !should_rebuild_conda_env(&e) {
-                return Err(e);
-            }
-            run_cmd_tail(
-                "build via conda [1/2] remove invalid env",
-                &vec![
-                    conda_bin_s.clone(),
-                    "env".to_string(),
-                    "remove".to_string(),
-                    "-n".to_string(),
-                    CONDA_ENV.to_string(),
-                    "-y".to_string(),
-                ],
-                true,
-                10,
-            )?;
-            run_cmd_tail_with_conda_channel_fallback(
-                &format!("build via conda [2/2] create {CONDA_ENV}"),
-                &[
-                    conda_bin_s.clone(),
-                    "create".to_string(),
-                    "-n".to_string(),
-                    CONDA_ENV.to_string(),
-                    "-y".to_string(),
-                ],
-                &["python=3.10".to_string()],
-                10,
-            )?;
-            REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect()
-        }
-    };
-    if !missing_now.is_empty() {
-        install_tools_stepwise_conda(&conda_bin_s, CONDA_ENV, &missing_now, "Build")?;
-    }
-    let missing_after = missing_tools_in_prefixed_runtime(&prefix)?;
+    let missing_after = ordered_required_tools(
+        &missing_tools_in_prefixed_runtime(&prefix)?
+            .into_iter()
+            .filter(|x| host_missing_set.contains(x))
+            .collect::<Vec<String>>(),
+    );
     if !missing_after.is_empty() {
         run_cmd_tail(
             "build via conda [1/3] rebuild remove env",
@@ -656,24 +622,19 @@ fn build_conda_runtime() -> Result<RuntimeRecord, String> {
             true,
             10,
         )?;
-        run_cmd_tail_with_conda_channel_fallback(
-            &format!("build via conda [2/3] create {CONDA_ENV}"),
-            &[
-                conda_bin_s.clone(),
-                "create".to_string(),
-                "-n".to_string(),
-                CONDA_ENV.to_string(),
-                "-y".to_string(),
-            ],
-            &["python=3.10".to_string()],
-            10,
+        run_conda_dlc_yml_with_fallback(
+            &conda_bin_s,
+            false,
+            &mirror_yml,
+            &official_yml,
+            "build via conda [2/3] recreate via dlc.yml",
         )?;
-        let all_tools = REQUIRED_TOOLS
-            .iter()
-            .map(|x| (*x).to_string())
-            .collect::<Vec<String>>();
-        install_tools_stepwise_conda(&conda_bin_s, CONDA_ENV, &all_tools, "Rebuild")?;
-        let missing_rebuilt = missing_tools_in_prefixed_runtime(&prefix)?;
+        let missing_rebuilt = ordered_required_tools(
+            &missing_tools_in_prefixed_runtime(&prefix)?
+                .into_iter()
+                .filter(|x| host_missing_set.contains(x))
+                .collect::<Vec<String>>(),
+        );
         if !missing_rebuilt.is_empty() {
             return Err(format!(
                 "Conda runtime is still missing tools: {}",
@@ -872,6 +833,11 @@ fn build_tool_command(
             Ok(cmd)
         }
         "conda" => {
+            if let Some(host_tool) = find_bin(tool) {
+                let mut cmd = Command::new(host_tool);
+                cmd.args(args);
+                return Ok(cmd);
+            }
             let Some(conda_bin) = find_bin("conda") else {
                 return Err("conda command not found in PATH.".to_string());
             };
@@ -954,6 +920,10 @@ fn missing_tools_for_record(
     match record.runtime_mode.as_str() {
         "env" | "local" => Ok(missing_env_runtime_tools(runtime_home)),
         "conda" => {
+            let host_missing_set: BTreeSet<String> = missing_host_tools().into_iter().collect();
+            if host_missing_set.is_empty() {
+                return Ok(Vec::new());
+            }
             let Some(conda_bin) = find_bin("conda") else {
                 return Err("conda command not found in PATH.".to_string());
             };
@@ -962,13 +932,18 @@ fn missing_tools_for_record(
             } else {
                 record.conda_env.as_str()
             };
-            missing_tools_in_prefixed_runtime(&[
+            Ok(ordered_required_tools(
+                &missing_tools_in_prefixed_runtime(&[
                 conda_bin.to_string_lossy().to_string(),
                 "run".to_string(),
                 "--no-capture-output".to_string(),
                 "-n".to_string(),
                 env_name.to_string(),
-            ])
+                ])?
+                .into_iter()
+                .filter(|x| host_missing_set.contains(x))
+                .collect::<Vec<String>>(),
+            ))
         }
         "docker" => {
             let Some(docker_bin) = find_bin("docker") else {
@@ -1069,15 +1044,48 @@ fn ensure_micromamba(
             mm_root.display()
         )
     })?;
+    let desc = download_desc.unwrap_or("download micromamba");
+    if let Some(mm_parent) = mm_bin.parent() {
+        fs::create_dir_all(mm_parent).map_err(|e| {
+            format!(
+                "Failed to prepare micromamba bin directory {}: {e}",
+                mm_parent.display()
+            )
+        })?;
+    }
+    match download_with_fallback(desc, &MICROMAMBA_BIN_URLS, &mm_bin) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(&mm_bin, perms).map_err(|e| {
+                    format!(
+                        "Failed to set executable permission {}: {e}",
+                        mm_bin.display()
+                    )
+                })?;
+            }
+            return Ok(mm_bin);
+        }
+        Err(bin_err) => {
+            eprintln!(
+                "{}",
+                super::style_yellow(&format!(
+                    "Micromamba binary download failed, fallback to archive source: {bin_err}"
+                ))
+            );
+        }
+    }
+
     if !command_in_path("tar") {
         return Err(
-            "`tar` command not found in PATH (required for env local install).".to_string(),
+            "`tar` command not found in PATH (required for micromamba archive fallback)."
+                .to_string(),
         );
     }
     let archive = mm_root.join("micromamba.tar.bz2");
     if !archive.exists() {
-        let desc = download_desc.unwrap_or("download micromamba");
-        download_with_fallback(desc, &MICROMAMBA_URLS, &archive)?;
+        download_with_fallback(desc, &MICROMAMBA_ARCHIVE_URLS, &archive)?;
     }
     let extract_desc = extract_desc.unwrap_or("build via env [extract micromamba]");
     run_cmd(
@@ -1884,7 +1892,6 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
                 "2".to_string(),
                 "--retry-delay".to_string(),
                 "2".to_string(),
-                "--retry-all-errors".to_string(),
                 "--connect-timeout".to_string(),
                 "15".to_string(),
                 "-o".to_string(),
@@ -1899,7 +1906,7 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
             let cmd = vec![
                 "wget".to_string(),
                 "-q".to_string(),
-                "--tries=2".to_string(),
+                "--tries=1".to_string(),
                 "--timeout=15".to_string(),
                 "-O".to_string(),
                 tmp.to_string_lossy().to_string(),
@@ -1993,29 +2000,34 @@ fn run_download_with_progress(
 
     let start = Instant::now();
     let max_lines = 10usize;
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines);
-    let mut rendered = true;
+    let mut rendered = false;
+    let mut tail_mode_started = false;
+    let mut prelog_spinner_shown = true;
+    let mut streaming_title_started = false;
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(max_lines.max(1));
     let mut status: Option<ExitStatus> = None;
     let mut channel_open = true;
     let mut out_text = String::new();
     let mut err_text = String::new();
-    let mut last_render: Instant;
+    let mut last_render = Instant::now();
+    let mut streamed_lines_before_tail = 0usize;
+    let mut saw_any_line = false;
 
     let downloaded0 = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
     let mut last_progress_desc = download_desc_with_progress(desc, downloaded0, total_bytes);
-    render_tail_block_dlc(
-        &last_progress_desc,
-        "",
-        start.elapsed(),
-        &tail,
-        max_lines,
-        false,
-    )?;
-    last_render = Instant::now();
+    render_prelog_spinner_line_dlc(&last_progress_desc, start.elapsed())?;
 
-    while status.is_none() || channel_open {
+    while channel_open {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok((is_err, line)) => {
+                if prelog_spinner_shown && !tail_mode_started {
+                    if !streaming_title_started {
+                        render_streaming_title_init_dlc(&last_progress_desc, start.elapsed())?;
+                        streaming_title_started = true;
+                    }
+                    prelog_spinner_shown = false;
+                }
+                saw_any_line = true;
                 if is_err {
                     err_text.push_str(&line);
                     err_text.push('\n');
@@ -2023,27 +2035,113 @@ fn run_download_with_progress(
                     out_text.push_str(&line);
                     out_text.push('\n');
                 }
-                if !line.trim().is_empty() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                if max_lines > 0 {
                     if tail.len() == max_lines {
                         tail.pop_front();
                     }
-                    tail.push_back(line);
-                    let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
-                    let desc_now = download_desc_with_progress(desc, downloaded, total_bytes);
+                    tail.push_back(line.clone());
+                }
+
+                let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+                last_progress_desc = download_desc_with_progress(desc, downloaded, total_bytes);
+
+                if max_lines == 0 {
+                    tail_mode_started = true;
                     render_tail_block_dlc(
-                        &desc_now,
+                        &last_progress_desc,
                         "",
                         start.elapsed(),
                         &tail,
                         max_lines,
                         rendered,
                     )?;
-                    last_progress_desc = desc_now;
+                    rendered = true;
+                    last_render = Instant::now();
+                    continue;
+                }
+
+                if !tail_mode_started {
+                    if tail.len() < max_lines {
+                        let width = dlc_terminal_line_width();
+                        let trimmed = dlc_truncate_plain_line(&line, width);
+                        if super::supports_color() {
+                            println!("\x1b[2m{}\x1b[0m", trimmed);
+                        } else {
+                            println!("{trimmed}");
+                        }
+                        streamed_lines_before_tail += 1;
+                        io::stdout()
+                            .flush()
+                            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+                    } else {
+                        if streamed_lines_before_tail > 0 {
+                            let mut up = streamed_lines_before_tail;
+                            if streaming_title_started {
+                                up = up.saturating_add(1);
+                            }
+                            print!("\x1b[{}A", up);
+                        }
+                        render_tail_block_dlc(
+                            &last_progress_desc,
+                            "",
+                            start.elapsed(),
+                            &tail,
+                            max_lines,
+                            false,
+                        )?;
+                        rendered = true;
+                        tail_mode_started = true;
+                        last_render = Instant::now();
+                    }
+                } else {
+                    render_tail_block_dlc(
+                        &last_progress_desc,
+                        "",
+                        start.elapsed(),
+                        &tail,
+                        max_lines,
+                        rendered,
+                    )?;
                     rendered = true;
                     last_render = Instant::now();
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if status.is_none() {
+                    status = child
+                        .try_wait()
+                        .map_err(|e| format!("Failed to poll download status: {e}"))?;
+                }
+                if status.is_none() {
+                    let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
+                    last_progress_desc =
+                        download_desc_with_progress(desc, downloaded, total_bytes);
+                }
+                if !tail_mode_started && !saw_any_line {
+                    render_prelog_spinner_line_dlc(&last_progress_desc, start.elapsed())?;
+                    prelog_spinner_shown = true;
+                }
+                if !tail_mode_started
+                    && streaming_title_started
+                    && last_render.elapsed() >= Duration::from_millis(100)
+                {
+                    render_streaming_title_only_dlc(
+                        &last_progress_desc,
+                        start.elapsed(),
+                        streamed_lines_before_tail,
+                    )?;
+                    last_render = Instant::now();
+                }
+                if tail_mode_started && last_render.elapsed() >= Duration::from_millis(100) {
+                    render_tail_title_only_dlc(&last_progress_desc, start.elapsed(), max_lines)?;
+                    rendered = true;
+                    last_render = Instant::now();
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 channel_open = false;
             }
@@ -2053,19 +2151,6 @@ fn run_download_with_progress(
             status = child
                 .try_wait()
                 .map_err(|e| format!("Failed to poll download status: {e}"))?;
-        }
-
-        if status.is_none() {
-            let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
-            let desc_now = download_desc_with_progress(desc, downloaded, total_bytes);
-            if desc_now != last_progress_desc {
-                last_progress_desc = desc_now;
-            }
-        }
-
-        if status.is_none() && rendered && last_render.elapsed() >= Duration::from_millis(100) {
-            render_tail_title_only_dlc(&last_progress_desc, start.elapsed(), max_lines)?;
-            last_render = Instant::now();
         }
     }
 
@@ -2080,11 +2165,43 @@ fn run_download_with_progress(
     };
     let elapsed = start.elapsed();
 
-    if status.success() {
-        render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
-        return Ok(());
+    if prelog_spinner_shown {
+        print!("\r\x1b[2K");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
     }
-    render_tail_block_dlc(&last_progress_desc, "✘", elapsed, &tail, max_lines, rendered)?;
+    if tail_mode_started {
+        if status.success() {
+            render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
+            return Ok(());
+        }
+        render_tail_block_dlc(&last_progress_desc, "✘", elapsed, &tail, max_lines, rendered)?;
+    } else if !status.success() && streaming_title_started {
+        render_streaming_failure_compact_dlc(&last_progress_desc, elapsed, streamed_lines_before_tail)?;
+    } else {
+        let width = dlc_terminal_line_width();
+        let title = dlc_truncate_plain_line(
+            &format!(
+                "{} {}[{}]",
+                if status.success() { "✔︎" } else { "✘" },
+                desc,
+                super::format_elapsed(elapsed)
+            ),
+            width,
+        );
+        if status.success() {
+            println!("{}", super::style_green(&title));
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+            return Ok(());
+        }
+        println!("{}", super::style_yellow(&title));
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+    }
     let mut msg = String::new();
     msg.push_str(out_text.trim());
     if !msg.is_empty() && !err_text.trim().is_empty() {
@@ -2408,34 +2525,86 @@ fn conda_env_named_exists(conda_bin: &Path, env_name: &str) -> bool {
     false
 }
 
-fn install_tools_stepwise_conda(
+fn write_conda_dlc_yml(
+    runtime_home: &Path,
+    missing_tools: &[String],
+    use_mirror: bool,
+) -> Result<PathBuf, String> {
+    let yml_dir = runtime_home.join("dlc").join("conda");
+    fs::create_dir_all(&yml_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", yml_dir.display()))?;
+    let yml_path = yml_dir.join(if use_mirror {
+        "dlc.mirror.yml"
+    } else {
+        "dlc.official.yml"
+    });
+
+    let mut content = String::new();
+    content.push_str(&format!("name: {CONDA_ENV}\n"));
+    content.push_str("channels:\n");
+    if use_mirror {
+        content.push_str(&format!("  - {CONDA_BIOCONDA_MIRROR_URL}\n"));
+        content.push_str(&format!("  - {CONDA_FORGE_MIRROR_URL}\n"));
+    } else {
+        content.push_str(&format!("  - {CONDA_BIOCONDA_OFFICIAL}\n"));
+        content.push_str(&format!("  - {CONDA_FORGE_OFFICIAL}\n"));
+    }
+    content.push_str("dependencies:\n");
+    content.push_str("  - python=3.10\n");
+    for pkg in toolchain_packages_for_tools(missing_tools) {
+        content.push_str(&format!("  - {pkg}\n"));
+    }
+    fs::write(&yml_path, content)
+        .map_err(|e| format!("Failed to write {}: {e}", yml_path.display()))?;
+    Ok(yml_path)
+}
+
+fn build_conda_apply_dlc_yml_cmd(
     conda_bin: &str,
-    env_name: &str,
-    tools: &[String],
-    action: &str,
+    env_exists: bool,
+    yml_path: &Path,
+) -> Vec<String> {
+    let mut cmd = vec![
+        conda_bin.to_string(),
+        "env".to_string(),
+        if env_exists {
+            "update".to_string()
+        } else {
+            "create".to_string()
+        },
+        "-n".to_string(),
+        CONDA_ENV.to_string(),
+        "-f".to_string(),
+        yml_path.to_string_lossy().to_string(),
+    ];
+    if env_exists {
+        cmd.push("--prune".to_string());
+    }
+    cmd
+}
+
+fn run_conda_dlc_yml_with_fallback(
+    conda_bin: &str,
+    env_exists: bool,
+    mirror_yml: &Path,
+    official_yml: &Path,
+    desc: &str,
 ) -> Result<(), String> {
-    let ordered = ordered_required_tools(tools);
-    if ordered.is_empty() {
-        return Ok(());
-    }
-    let total = ordered.len();
-    for (idx, tool) in ordered.iter().enumerate() {
-        let pkgs = toolchain_packages_for_tools(std::slice::from_ref(tool));
-        if pkgs.is_empty() {
-            continue;
+    let mirror_cmd = build_conda_apply_dlc_yml_cmd(conda_bin, env_exists, mirror_yml);
+    match run_cmd_tail(desc, &mirror_cmd, true, 10) {
+        Ok(()) => Ok(()),
+        Err(mirror_err) => {
+            eprintln!(
+                "{}",
+                super::style_yellow(
+                    "conda dlc.yml mirror channels failed, fallback to official channels.",
+                )
+            );
+            let official_cmd = build_conda_apply_dlc_yml_cmd(conda_bin, env_exists, official_yml);
+            run_cmd_tail(desc, &official_cmd, true, 10)
+                .map_err(|e| format!("{e}\nMirror attempt error: {mirror_err}"))
         }
-        let cmd = vec![
-            conda_bin.to_string(),
-            "install".to_string(),
-            "-n".to_string(),
-            env_name.to_string(),
-        ];
-        let mut packages = vec!["-y".to_string()];
-        packages.extend(pkgs);
-        let desc = format!("[{}/{}] {} {} via conda", idx + 1, total, action, tool);
-        run_cmd_tail_with_conda_channel_fallback(&desc, &cmd, &packages, 10)?;
     }
-    Ok(())
 }
 
 fn install_tools_stepwise_env(
@@ -2489,13 +2658,6 @@ fn ordered_required_tools(tools: &[String]) -> Vec<String> {
         ordered.push(x);
     }
     ordered
-}
-
-fn should_rebuild_conda_env(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("environmentlocationnotfound")
-        || e.contains("not a conda environment")
-        || e.contains("condaenvironmenterror")
 }
 
 fn conda_env_exists(conda_bin: &Path, env_name: &str) -> bool {

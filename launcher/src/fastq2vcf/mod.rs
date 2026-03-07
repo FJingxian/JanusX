@@ -95,7 +95,9 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     let jx_cmd = "jx";
-    let missing_wrappers = missing_dlc_tool_wrappers()?;
+    let toolchain = probe_dlc_toolchain()?;
+    print_toolchain_line(&toolchain);
+    let missing_wrappers = missing_tools_from_probe(&toolchain);
     if !missing_wrappers.is_empty() {
         return Err(format!(
             "Missing DLC tool wrappers: {}. Please run `jx -update dlc`.",
@@ -481,40 +483,61 @@ fn detect_backend() -> (String, String) {
     )
 }
 
-fn missing_dlc_tool_wrappers() -> Result<Vec<String>, String> {
+fn probe_dlc_toolchain() -> Result<Vec<(String, bool)>, String> {
     let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
-    let mut missing = Vec::new();
+    let mut out = Vec::new();
 
     for tool in REQUIRED_DLC_TOOLS {
-        let out = Command::new(&jx_bin)
+        let out_cmd = Command::new(&jx_bin)
             .arg(tool)
             .arg("-h")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
-        let out = match out {
+        let out_cmd = match out_cmd {
             Ok(v) => v,
             Err(_) => {
-                missing.push(tool.to_string());
+                out.push((tool.to_string(), false));
                 continue;
             }
         };
-        if out.status.success() {
+        if out_cmd.status.success() {
+            out.push((tool.to_string(), true));
             continue;
         }
         let mut merged = String::new();
-        merged.push_str(&String::from_utf8_lossy(&out.stdout));
+        merged.push_str(&String::from_utf8_lossy(&out_cmd.stdout));
         merged.push('\n');
-        merged.push_str(&String::from_utf8_lossy(&out.stderr));
-        if wrapper_missing_by_output(&merged) {
-            missing.push(tool.to_string());
-        }
+        merged.push_str(&String::from_utf8_lossy(&out_cmd.stderr));
+        out.push((tool.to_string(), !wrapper_missing_by_output(&merged)));
     }
 
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0 == b.0);
+    Ok(out)
+}
+
+fn print_toolchain_line(toolchain: &[(String, bool)]) {
+    let mut segs = Vec::with_capacity(toolchain.len());
+    for (tool, ok) in toolchain {
+        if *ok {
+            segs.push(super::style_green(tool));
+        } else {
+            segs.push(super::style_yellow(tool));
+        }
+    }
+    println!("{}", segs.join(" "));
+}
+
+fn missing_tools_from_probe(toolchain: &[(String, bool)]) -> Vec<String> {
+    let mut missing = toolchain
+        .iter()
+        .filter_map(|(tool, ok)| if *ok { None } else { Some(tool.clone()) })
+        .collect::<Vec<String>>();
     missing.sort();
     missing.dedup();
-    Ok(missing)
+    missing
 }
 
 fn wrapper_missing_by_output(text: &str) -> bool {

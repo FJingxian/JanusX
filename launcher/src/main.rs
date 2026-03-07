@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dlc;
+mod fastq2vcf;
 
 const PYPI_SPEC: &str = "janusx";
 const GITHUB_SPEC_CN: &str = "git+https://gh-proxy.org/https://github.com/FJingxian/JanusX.git";
@@ -152,6 +153,9 @@ fn run() -> Result<i32, String> {
     if dlc::is_dlc_tool(head) {
         let home = runtime_home()?;
         return dlc::run_dlc_tool(head, &args[1..], &home);
+    }
+    if head == "fastq2vcf" {
+        return fastq2vcf::run_fastq2vcf_module(&args[1..]);
     }
     if !is_known_module(head) {
         println!("{}", style_yellow(&format!("Unknown module: {head}")));

@@ -16,10 +16,11 @@ const CONDA_ENV: &str = "janusxdlc";
 const REQUIRED_TOOLS: [&str; 8] = [
     "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
 ];
-const JANUSX_SIF_URLS: [&str; 2] = [
-    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
-    "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
-];
+const JANUSX_SIF_MIRROR_URL: &str =
+    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
+const JANUSX_SIF_ORIGIN_URL: &str =
+    "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
+const JANUSX_SIF_URLS: [&str; 2] = [JANUSX_SIF_MIRROR_URL, JANUSX_SIF_ORIGIN_URL];
 const MICROMAMBA_URLS: [&str; 1] = ["https://micro.mamba.pm/api/micromamba/linux-64/latest"];
 
 #[derive(Clone, Debug)]
@@ -122,6 +123,14 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
                 super::style_yellow(&format!(
                     "Detected previous DLC runtime with status=`{}`. Reinstalling via {}.",
                     existing.status, selected_entry.name
+                ))
+            );
+        }
+        if let Err(e) = clear_runtime_record(python, &db_path) {
+            eprintln!(
+                "{}",
+                super::style_yellow(&format!(
+                    "Warning: failed to clear previous DLC runtime record: {e}"
                 ))
             );
         }
@@ -775,7 +784,7 @@ fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
         }
         let tmp_path = bin_dir.join("janusxext.tmp.sif");
         if input.eq_ignore_ascii_case("y") {
-            download_with_fallback(&JANUSX_SIF_URLS, &tmp_path)?;
+            download_with_fallback("download SIF", &JANUSX_SIF_URLS, &tmp_path)?;
         } else {
             let src = PathBuf::from(input);
             if !src.exists() {
@@ -1042,7 +1051,7 @@ fn ensure_micromamba(runtime_home: &Path) -> Result<PathBuf, String> {
     }
     let archive = mm_root.join("micromamba.tar.bz2");
     if !archive.exists() {
-        download_with_fallback(&MICROMAMBA_URLS, &archive)?;
+        download_with_fallback("download micromamba", &MICROMAMBA_URLS, &archive)?;
     }
     run_cmd(
         "build via env [extract micromamba]",
@@ -1741,10 +1750,21 @@ fn pipeline_dockerfile_from_python(python: &Path) -> Result<PathBuf, String> {
     Ok(pipeline_dir.join("docker").join("dockerfile"))
 }
 
-fn download_with_fallback(urls: &[&str], dst: &Path) -> Result<(), String> {
-    let tmp = dst.with_extension("tmp.sif");
+fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), String> {
+    let tmp = PathBuf::from(format!("{}.tmp.download", dst.to_string_lossy()));
     let mut errs: Vec<String> = Vec::new();
-    for url in urls {
+    for (idx, url) in urls.iter().enumerate() {
+        if idx > 0 {
+            eprintln!(
+                "{}",
+                super::style_yellow(&format!(
+                    "{desc}: source {} failed, fallback to source {}/{}",
+                    idx,
+                    idx + 1,
+                    urls.len()
+                ))
+            );
+        }
         let mut ok = false;
         if command_in_path("curl") {
             let cmd = vec![
@@ -1756,7 +1776,7 @@ fn download_with_fallback(urls: &[&str], dst: &Path) -> Result<(), String> {
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_cmd("download SIF", &cmd, true).is_ok() {
+            if run_cmd_passthrough(desc, &cmd, true).is_ok() {
                 ok = true;
             }
         } else if command_in_path("wget") {
@@ -1766,7 +1786,7 @@ fn download_with_fallback(urls: &[&str], dst: &Path) -> Result<(), String> {
                 tmp.to_string_lossy().to_string(),
                 (*url).to_string(),
             ];
-            if run_cmd("download SIF", &cmd, true).is_ok() {
+            if run_cmd_passthrough(desc, &cmd, true).is_ok() {
                 ok = true;
             }
         } else {
@@ -1784,6 +1804,39 @@ fn download_with_fallback(urls: &[&str], dst: &Path) -> Result<(), String> {
         "All SIF download sources failed: {}",
         errs.join(", ")
     ))
+}
+
+fn run_cmd_passthrough(desc: &str, argv: &[String], required: bool) -> Result<(), String> {
+    if argv.is_empty() {
+        return Err(format!("{desc}: empty command"));
+    }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let start = Instant::now();
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to run command `{}`: {e}", argv[0]))?;
+    if status.success() {
+        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(start.elapsed())));
+        return Ok(());
+    }
+    if required {
+        return Err(format!(
+            "{desc} failed with exit={}.",
+            super::exit_code(status)
+        ));
+    }
+    eprintln!(
+        "{}",
+        super::style_yellow(&format!(
+            "Warning: {desc} failed (optional, exit={}).",
+            super::exit_code(status)
+        ))
+    );
+    Ok(())
 }
 
 fn save_runtime_record(
@@ -1843,6 +1896,54 @@ conn.close()
     msg.push_str(&String::from_utf8_lossy(&out.stderr));
     Err(format!(
         "Failed to save DLC runtime DB record (exit={}): {}",
+        super::exit_code(out.status),
+        msg.trim()
+    ))
+}
+
+fn clear_runtime_record(python: &Path, db_path: &Path) -> Result<(), String> {
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let script = r#"
+import sqlite3, sys
+db, slot = sys.argv[1:3]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_builds (
+    slot TEXT PRIMARY KEY,
+    method_id INTEGER NOT NULL,
+    runtime_mode TEXT NOT NULL,
+    image_tag TEXT NOT NULL,
+    conda_env TEXT NOT NULL,
+    sif_path TEXT NOT NULL,
+    installed_tools_csv TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+""")
+conn.execute("DELETE FROM dlc_builds WHERE slot = ?", (slot,))
+conn.commit()
+conn.close()
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(db_path.to_string_lossy().to_string())
+        .arg(DLC_SLOT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to clear DLC runtime DB record: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut msg = String::new();
+    msg.push_str(&String::from_utf8_lossy(&out.stdout));
+    msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "Failed to clear DLC runtime DB record (exit={}): {}",
         super::exit_code(out.status),
         msg.trim()
     ))

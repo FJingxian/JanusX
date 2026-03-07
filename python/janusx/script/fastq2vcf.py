@@ -177,6 +177,25 @@ def _missing_jx_tool_wrappers(commands: Sequence[str]) -> List[str]:
     jx_bin = shutil.which("jx")
     if jx_bin is None:
         return [str(x) for x in list(commands or [])]
+
+    def _wrapper_missing_by_output(text: str) -> bool:
+        msg = str(text or "").lower()
+        if msg == "":
+            return False
+        if "please run `jx -update dlc`" in msg:
+            return True
+        if "dlc runtime is not ready" in msg:
+            return True
+        if "dlc runtime does not contain" in msg:
+            return True
+        if "dlc env runtime is missing" in msg:
+            return True
+        if "unsupported dlc tool" in msg:
+            return True
+        if "unknown module:" in msg:
+            return True
+        return False
+
     missing: List[str] = []
     for tool in commands:
         t = str(tool).strip()
@@ -185,8 +204,8 @@ def _missing_jx_tool_wrappers(commands: Sequence[str]) -> List[str]:
         try:
             p = subprocess.run(
                 [str(jx_bin), t, "-h"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 timeout=8,
@@ -194,7 +213,10 @@ def _missing_jx_tool_wrappers(commands: Sequence[str]) -> List[str]:
         except Exception:
             missing.append(t)
             continue
-        if int(p.returncode) != 0:
+        if int(p.returncode) == 0:
+            continue
+        merged = f"{p.stdout or ''}\n{p.stderr or ''}"
+        if _wrapper_missing_by_output(merged):
             missing.append(t)
     return missing
 
@@ -1979,15 +2001,6 @@ def main():
         logger.error(
             "Missing DLC tool wrappers: %s. Please run `jx -update dlc`.",
             ", ".join(f"jx {x}" for x in missing_jx_tools),
-        )
-        print(
-            _ansi(
-                "Missing DLC tool wrappers: "
-                + ", ".join(f"jx {x}" for x in missing_jx_tools)
-                + ". Please run `jx -update dlc`.",
-                "red",
-                color_enabled,
-            )
         )
         raise SystemExit(1)
 

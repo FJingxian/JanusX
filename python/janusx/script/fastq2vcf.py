@@ -94,6 +94,7 @@ JANUSX_SIF_URLS = (
     "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
     "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif",
 )
+CONDA_BSA_ENV = "BSA"
 
 
 def _missing_binaries(commands: Sequence[str]) -> List[str]:
@@ -171,6 +172,129 @@ def _docker_daemon_running(docker_bin: str) -> tuple[bool, str]:
         return True, ""
     err = (p.stderr or "").strip()
     return False, err if err else "docker daemon unavailable"
+
+
+def _runtime_missing_tools(exec_prefix: str, tools: Sequence[str]) -> List[str]:
+    """
+    Check binary availability inside a prefixed runtime (e.g. conda run / singularity exec).
+    Returns missing tool names.
+    """
+    if not exec_prefix.strip():
+        return _missing_binaries(tools)
+    script = (
+        "for t in " + " ".join(shlex.quote(str(t)) for t in tools) + "; do "
+        "command -v \"$t\" >/dev/null 2>&1 || echo \"$t\"; "
+        "done"
+    )
+    cmd = f"{exec_prefix} /bin/sh -lc {shlex.quote(script)}"
+    try:
+        p = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return list(tools)
+    missing: List[str] = []
+    for line in str(p.stdout or "").splitlines():
+        v = str(line).strip()
+        if v:
+            missing.append(v)
+    return sorted(set(missing))
+
+
+def _conda_exec_prefix(conda_bin: str, env_name: str) -> str:
+    return " ".join(
+        shlex.quote(x)
+        for x in [str(conda_bin), "run", "--no-capture-output", "-n", str(env_name)]
+    )
+
+
+def _conda_env_exists(conda_bin: str, env_name: str) -> bool:
+    cmd = [str(conda_bin), "env", "list", "--json"]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if p.returncode != 0:
+            return False
+        import json as _json
+        obj = _json.loads(p.stdout or "{}")
+        envs = obj.get("envs", []) if isinstance(obj, dict) else []
+        for e in envs:
+            if Path(str(e)).name == str(env_name):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _prepare_conda_runtime(
+    conda_bin: str,
+    *,
+    env_name: str,
+    use_spinner: bool,
+    logger,
+) -> str:
+    """
+    Ensure Linux conda runtime contains required tools and return `conda run` prefix.
+    """
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Conda runtime fallback is only enabled on Linux.")
+
+    prefix = _conda_exec_prefix(conda_bin, env_name)
+    missing_now = _runtime_missing_tools(prefix, REQUIRED_LOCAL_TOOLS)
+    if len(missing_now) == 0:
+        return prefix
+
+    if not _conda_env_exists(conda_bin, env_name):
+        create_cmd = [str(conda_bin), "create", "-n", str(env_name), "python=3.10", "-y"]
+        logger.info("Creating conda env: %s", " ".join(shlex.quote(x) for x in create_cmd))
+        with CliStatus(f"Creating conda env ({env_name})...", enabled=use_spinner) as task:
+            try:
+                subprocess.run(create_cmd, check=True)
+            except Exception:
+                task.fail(f"Conda env ({env_name}) creation ...Failed")
+                raise
+            task.complete(f"Conda env ({env_name}) creation ...Finished")
+
+    install_cmds = [
+        [
+            str(conda_bin), "install", "-n", str(env_name),
+            "-c", "conda-forge",
+            "openjdk=17", "-y",
+        ],
+        [
+            str(conda_bin), "install", "-n", str(env_name),
+            "-c", "bioconda", "-c", "conda-forge",
+            "fastp", "bwa", "samtools", "bcftools", "htslib",
+            "plink", "beagle", "picard", "gatk4",
+            "-y",
+        ],
+    ]
+    for i, cmd in enumerate(install_cmds, start=1):
+        logger.info("Conda install step %d: %s", i, " ".join(shlex.quote(x) for x in cmd))
+        with CliStatus(f"Installing conda dependencies ({i}/{len(install_cmds)})...", enabled=use_spinner) as task:
+            try:
+                subprocess.run(cmd, check=True)
+            except Exception:
+                task.fail("Conda dependency install ...Failed")
+                raise
+            task.complete("Conda dependency install ...Finished")
+
+    missing_after = _runtime_missing_tools(prefix, REQUIRED_LOCAL_TOOLS)
+    if len(missing_after) > 0:
+        raise RuntimeError(
+            "Conda runtime is still missing tools: " + ", ".join(missing_after)
+        )
+    return prefix
 
 
 class _DownloadProgress:
@@ -536,47 +660,81 @@ def main():
             if docker_bin is not None and not docker_ready:
                 logger.warning(
                     "Docker command found but daemon is not running. "
-                    "Falling back to singularity. detail: %s",
+                    "Falling back to next runtime. detail: %s",
                     docker_err,
                 )
-            singularity_bin = shutil.which("singularity")
-            if singularity_bin is None:
-                logger.error(
-                    "Missing local dependencies (%s), and no usable container runtime is available.",
-                    ", ".join(missing_tools)
-                )
-                raise SystemExit(1)
+            # Fallback order:
+            # 1) local tools
+            # 2) docker (daemon ready)
+            # 3) conda runtime on Linux
+            # 4) singularity
+            conda_bin = shutil.which("conda")
+            conda_ready = False
+            if sys.platform.startswith("linux") and conda_bin is not None:
+                try:
+                    exec_prefix = _prepare_conda_runtime(
+                        conda_bin=conda_bin,
+                        env_name=CONDA_BSA_ENV,
+                        use_spinner=use_spinner,
+                        logger=logger,
+                    )
+                    runtime_mode = "conda"
+                    conda_ready = True
+                    logger.info("Conda runtime enabled.")
+                    logger.info("Conda prefix: %s", exec_prefix)
+                except Exception as e:
+                    logger.warning(
+                        "Conda runtime setup failed. Falling back to singularity. detail: %s",
+                        str(e),
+                    )
 
-            binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
-            binary_path.mkdir(parents=True, exist_ok=True)
-            sif_path = binary_path / "janusxext.sif"
-            if not sif_path.exists():
-                user_input = input(
-                    "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
-                ).strip()
-                if not user_input or user_input.lower() == "n":
+            if not conda_ready:
+                singularity_bin = shutil.which("singularity")
+                if singularity_bin is None:
+                    logger.error(
+                        "Missing local dependencies (%s), and no usable runtime is available. "
+                        "Tried: local -> docker -> conda(Linux) -> singularity.",
+                        ", ".join(missing_tools)
+                    )
                     raise SystemExit(1)
-                tmp_path = binary_path / "janusxext.tmp.sif"
-                if user_input.lower() == "y":
-                    download_with_fallback(JANUSX_SIF_URLS, tmp_path, logger)
-                else:
-                    src = Path(user_input).expanduser().resolve()
-                    if not src.exists():
-                        logger.error(f"SIF path not found: {src}")
+
+                binary_path = Path(janusx.pipeline.__file__).resolve().parent / "bin"
+                binary_path.mkdir(parents=True, exist_ok=True)
+                sif_path = binary_path / "janusxext.sif"
+                if not sif_path.exists():
+                    user_input = input(
+                        "Download JanusX Singularity Image (~800MB)? [y/N or /path/to.sif]: "
+                    ).strip()
+                    if not user_input or user_input.lower() == "n":
                         raise SystemExit(1)
-                    shutil.copy2(src, tmp_path)
+                    tmp_path = binary_path / "janusxext.tmp.sif"
+                    if user_input.lower() == "y":
+                        download_with_fallback(JANUSX_SIF_URLS, tmp_path, logger)
+                    else:
+                        src = Path(user_input).expanduser().resolve()
+                        if not src.exists():
+                            logger.error(f"SIF path not found: {src}")
+                            raise SystemExit(1)
+                        shutil.copy2(src, tmp_path)
 
-                # subprocess.run([str(tmp_path), "gatk", "-version"], shell=True, check=True)
-                os.replace(tmp_path, sif_path)
-                logger.info(f"Saved in {sif_path}")
+                    os.replace(tmp_path, sif_path)
+                    logger.info(f"Saved in {sif_path}")
 
-            exec_prefix = (
-                f"{shlex.quote(str(singularity_bin))} exec "
-                f"{shlex.quote(str(sif_path))}"
-            )
-            runtime_mode = "singularity"
-            logger.info("Singularity runtime enabled.")
-            logger.info("Singularity prefix: %s", exec_prefix)
+                exec_prefix = (
+                    f"{shlex.quote(str(singularity_bin))} exec "
+                    f"{shlex.quote(str(sif_path))}"
+                )
+                missing_in_sif = _runtime_missing_tools(exec_prefix, REQUIRED_LOCAL_TOOLS)
+                if len(missing_in_sif) > 0:
+                    logger.error(
+                        "Singularity image is missing required tools: %s. "
+                        "This usually means the SIF is outdated/built from a different Dockerfile.",
+                        ", ".join(missing_in_sif),
+                    )
+                    raise SystemExit(1)
+                runtime_mode = "singularity"
+                logger.info("Singularity runtime enabled.")
+                logger.info("Singularity prefix: %s", exec_prefix)
 
     logger.info("Execution runtime: %s", runtime_mode)
 

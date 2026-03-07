@@ -48,6 +48,22 @@ const KNOWN_MODULES: [&str; 14] = [
     "simulation",
     "loadanno",
 ];
+const MODULE_LIST_ENTRIES: [(&str, &str); 14] = [
+    ("grm", "Build genomic relationship matrix"),
+    ("pca", "Principal component analysis for population structure"),
+    ("gwas", "Run genome-wide association analysis"),
+    ("postgwas", "Post-process GWAS results and downstream plots"),
+    ("gs", "Genomic prediction and model-based selection"),
+    ("garfield", "Random-forest based marker-trait association"),
+    ("postgarfield", "Summarize and visualize GARFIELD outputs"),
+    ("postbsa", "Post-process and visualize BSA results"),
+    ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
+    ("gmerge", "Merge genotype/variant tables"),
+    ("webui", "Start JanusX web UI (postgwas first)"),
+    ("sim", "Quick simulation workflow"),
+    ("simulation", "Extended simulation and benchmarking workflow"),
+    ("loadanno", "Load annotation resources"),
+];
 const MIN_PYTHON_MAJOR: u32 = 3;
 const MIN_PYTHON_MINOR: u32 = 9;
 const RUSTUP_DIST_SERVER_CN: &str = "https://rsproxy.cn";
@@ -132,6 +148,9 @@ fn run() -> Result<i32, String> {
         }
         print_version(&python, &home);
         return Ok(0);
+    }
+    if matches!(head, "-list" | "--list") {
+        return run_list(&args[1..]);
     }
 
     if matches!(head, "-update" | "--update") {
@@ -3576,6 +3595,13 @@ fn print_cli_help() {
     );
     print_help_entry(
         2,
+        "-list, --list",
+        "List available modules or DLC tools: `jx --list [module|dlc]`",
+        24,
+        width,
+    );
+    print_help_entry(
+        2,
         "-load, --load",
         "List/load files: `jx --load` or `jx --load <type> <name> <file>`",
         24,
@@ -3679,6 +3705,50 @@ fn print_cli_help() {
         12,
         width,
     );
+}
+
+fn run_list(args: &[String]) -> Result<i32, String> {
+    if args.len() > 1 {
+        return Err("List usage:\n  jx --list [module|dlc]".to_string());
+    }
+    let target = args
+        .first()
+        .map(|x| x.to_ascii_lowercase())
+        .unwrap_or_else(|| "module".to_string());
+    match target.as_str() {
+        "module" | "modules" => {
+            print_module_list();
+            Ok(0)
+        }
+        "dlc" => print_dlc_list().map(|_| 0),
+        _ => Err(format!(
+            "Unknown list target: {target}\nList usage:\n  jx --list [module|dlc]"
+        )),
+    }
+}
+
+fn print_module_list() {
+    let width = help_line_width();
+    println!("{}", style_orange("Available Modules:"));
+    for (name, desc) in MODULE_LIST_ENTRIES {
+        print_help_entry(2, name, desc, 14, width);
+    }
+}
+
+fn print_dlc_list() -> Result<(), String> {
+    let home = runtime_home()?;
+    let tools = dlc::list_dlc_tool_locators(&home)?;
+    println!("{}", style_orange("Available External Tools (DLC):"));
+    for item in tools {
+        let head = format!("{:<14}", item.tool);
+        let line = format!("{head} {}", item.route);
+        if item.ready {
+            println!("  {}", style_green(&line));
+        } else {
+            println!("  {}", style_yellow(&line));
+        }
+    }
+    Ok(())
 }
 
 fn print_help_entry(indent: usize, key: &str, desc: &str, key_width: usize, total_width: usize) {

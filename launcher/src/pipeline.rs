@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -100,8 +101,13 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         fs::write(&sh, script).map_err(|e| format!("Failed to write {}: {e}", sh.display()))?;
         set_script_executable(&sh)?;
 
+        let existing_error_logs = if opts.detect_failed_logs && matches!(opts.scheduler, Scheduler::Csub) {
+            collect_existing_item_error_logs(workdir, step)?
+        } else {
+            HashSet::new()
+        };
         run_step_script(workdir, &sh, opts)?;
-        wait_step_outputs(workdir, &step_text, step, opts, hook)?;
+        wait_step_outputs(workdir, &step_text, step, opts, hook, &existing_error_logs)?;
         let elapsed = super::format_elapsed(Duration::from_secs(0));
         let _ = elapsed;
     }
@@ -204,6 +210,7 @@ fn wait_step_outputs(
     step: &PipelineStep,
     opts: &PipelineOptions,
     hook: &mut impl PipelineHook,
+    ignore_error_logs: &HashSet<PathBuf>,
 ) -> Result<(), String> {
     let stall_timeout = resolve_no_progress_timeout(step, opts);
 
@@ -289,7 +296,8 @@ fn wait_step_outputs(
             let scan_interval = Duration::from_secs_f64((opts.poll_sec * 3.0).max(5.0));
             if last_error_scan.elapsed() >= scan_interval {
                 last_error_scan = Instant::now();
-                let failed = find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4)?;
+                let failed =
+                    find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4, ignore_error_logs)?;
                 if !failed.is_empty() {
                     return Err(format!(
                         "{step_text} detected failed subtasks. Example stderr:\n{}",
@@ -436,6 +444,7 @@ fn find_failed_item_logs_for_pending(
     pending_idx: &[usize],
     max_items: usize,
     max_lines: usize,
+    ignore_error_logs: &HashSet<PathBuf>,
 ) -> Result<Vec<String>, String> {
     let log_dir = workdir.join("log");
     if !log_dir.exists() {
@@ -467,6 +476,9 @@ fn find_failed_item_logs_for_pending(
                 || (name.starts_with(&(safe_id.clone() + ".")) && name.ends_with(".e")))
                 && fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0
             {
+                if ignore_error_logs.contains(&path) {
+                    continue;
+                }
                 err_files.push(path);
             }
         }
@@ -497,6 +509,49 @@ fn find_failed_item_logs_for_pending(
         }
     }
     Ok(snippets)
+}
+
+fn collect_existing_item_error_logs(
+    workdir: &Path,
+    step: &PipelineStep,
+) -> Result<HashSet<PathBuf>, String> {
+    let mut ignore: HashSet<PathBuf> = HashSet::new();
+    let log_dir = workdir.join("log");
+    if !log_dir.exists() || step.items.is_empty() {
+        return Ok(ignore);
+    }
+
+    let mut safe_ids: Vec<String> = step.items.iter().map(|x| safe_job_label(&x.id)).collect();
+    safe_ids.sort();
+    safe_ids.dedup();
+
+    for entry in
+        fs::read_dir(&log_dir).map_err(|e| format!("Failed to read {}: {e}", log_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".e") {
+            continue;
+        }
+        for safe_id in &safe_ids {
+            if name == format!("{safe_id}.e")
+                || (name.starts_with(&(safe_id.clone() + ".")) && name.ends_with(".e"))
+            {
+                ignore.insert(path.clone());
+                break;
+            }
+        }
+    }
+    Ok(ignore)
 }
 
 fn is_likely_fatal_stderr_line(line: &str) -> bool {

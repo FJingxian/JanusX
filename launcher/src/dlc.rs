@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -11,10 +11,21 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DLC_SLOT: &str = "active";
+const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const REQUIRED_TOOLS: [&str; 8] = [
     "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
+];
+const DLC_TOOL_ENTRIES: [(&str, &str); 8] = [
+    ("bcftools", "VCF/BCF manipulation"),
+    ("beagle", "Phasing and imputation"),
+    ("bwa", "Short-read alignment"),
+    ("fastp", "FASTQ quality control"),
+    ("gatk", "Variant discovery toolkit"),
+    ("plink", "Genotype association toolkit"),
+    ("samtools", "Alignment and BAM/CRAM utilities"),
+    ("tabix", "BGZF indexing and queries"),
 ];
 const JANUSX_SIF_MIRROR_URL: &str =
     "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
@@ -55,11 +66,140 @@ struct RuntimeRecord {
     updated_at: String,
 }
 
+#[derive(Clone, Debug)]
+struct ToolCacheEntry {
+    tool: String,
+    backend: String,
+    locator: String,
+    runtime_sig: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolLocatorStatus {
+    pub tool: String,
+    pub route: String,
+    pub ready: bool,
+}
+
 pub(crate) fn is_dlc_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "fastp" | "bwa" | "samtools" | "gatk" | "bcftools" | "tabix" | "plink" | "beagle"
-    )
+    DLC_TOOL_ENTRIES.iter().any(|(tool, _)| *tool == name)
+}
+
+pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLocatorStatus>, String> {
+    let mut tools = REQUIRED_TOOLS
+        .iter()
+        .map(|x| (*x).to_string())
+        .collect::<Vec<String>>();
+    tools.sort();
+
+    let python = super::venv_python(&runtime_home.join("venv"));
+    if !python.exists() {
+        return Ok(tools
+            .into_iter()
+            .map(|tool| ToolLocatorStatus {
+                tool,
+                route: "none:-".to_string(),
+                ready: false,
+            })
+            .collect());
+    }
+    let db_path = runtime_home.join(super::GWAS_HISTORY_DB_FILE);
+    let Some(record) = load_runtime_record(&python, &db_path)? else {
+        return Ok(tools
+            .into_iter()
+            .map(|tool| ToolLocatorStatus {
+                tool,
+                route: "none:-".to_string(),
+                ready: false,
+            })
+            .collect());
+    };
+
+    let runtime_sig = runtime_signature(&record);
+    let (cached_sig, cached_entries) = load_tool_cache_entries(&python, &db_path)?;
+    let use_cache = cached_sig
+        .map(|s| s == runtime_sig)
+        .unwrap_or(false);
+
+    if !use_cache {
+        let probed = probe_tool_locators_parallel(&record, runtime_home)?;
+        let ready_cache = probed
+            .iter()
+            .filter(|x| x.ready)
+            .map(|x| ToolCacheEntry {
+                tool: x.tool.clone(),
+                backend: route_backend_name(&record.runtime_mode).to_string(),
+                locator: route_locator_from_route(&x.route),
+                runtime_sig: runtime_sig.clone(),
+            })
+            .collect::<Vec<ToolCacheEntry>>();
+        save_tool_cache_entries(&python, &db_path, &runtime_sig, &ready_cache)?;
+        return Ok(probed);
+    }
+
+    let mut cache_map: HashMap<String, ToolCacheEntry> = HashMap::new();
+    for entry in cached_entries {
+        if entry.runtime_sig == runtime_sig {
+            cache_map.insert(entry.tool.clone(), entry);
+        }
+    }
+    let mut out = Vec::with_capacity(tools.len());
+    let mut handles: Vec<(String, thread::JoinHandle<bool>)> = Vec::new();
+    let mut pending_routes: HashMap<String, String> = HashMap::new();
+
+    for tool in &tools {
+        if let Some(entry) = cache_map.get(tool) {
+            let route = format!("{}:{}", entry.backend, entry.locator);
+            pending_routes.insert(tool.clone(), route);
+            let backend = entry.backend.clone();
+            let locator = entry.locator.clone();
+            handles.push((
+                tool.clone(),
+                thread::spawn(move || validate_cached_locator(&backend, &locator)),
+            ));
+        } else {
+            let backend = route_backend_name(&record.runtime_mode);
+            out.push(ToolLocatorStatus {
+                tool: tool.clone(),
+                route: format!("{backend}:-"),
+                ready: false,
+            });
+        }
+    }
+
+    let mut ready_map: HashMap<String, bool> = HashMap::new();
+    for (tool, handle) in handles {
+        let ready = handle.join().unwrap_or(false);
+        ready_map.insert(tool, ready);
+    }
+
+    for tool in &tools {
+        if let Some(route) = pending_routes.get(tool) {
+            let ready = ready_map.get(tool).copied().unwrap_or(false);
+            out.push(ToolLocatorStatus {
+                tool: tool.clone(),
+                route: route.clone(),
+                ready,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.tool.cmp(&b.tool));
+
+    let ready_cache = out
+        .iter()
+        .filter(|x| x.ready)
+        .map(|x| {
+            let (backend, locator) = split_route(&x.route);
+            ToolCacheEntry {
+                tool: x.tool.clone(),
+                backend: backend.to_string(),
+                locator: locator.to_string(),
+                runtime_sig: runtime_sig.clone(),
+            }
+        })
+        .collect::<Vec<ToolCacheEntry>>();
+    save_tool_cache_entries(&python, &db_path, &runtime_sig, &ready_cache)?;
+    Ok(out)
 }
 
 pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, String> {
@@ -215,6 +355,204 @@ pub(crate) fn run_dlc_tool(
         .status()
         .map_err(|e| format!("Failed to run `jx {tool}`: {e}"))?;
     Ok(super::exit_code(status))
+}
+
+fn route_backend_name(runtime_mode: &str) -> &'static str {
+    match runtime_mode {
+        "env" | "local" => "env",
+        "conda" => "conda",
+        "docker" => "docker",
+        "singularity" => "sif",
+        _ => "none",
+    }
+}
+
+fn runtime_signature(record: &RuntimeRecord) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        record.runtime_mode.trim(),
+        record.image_tag.trim(),
+        record.conda_env.trim(),
+        record.sif_path.trim()
+    )
+}
+
+fn split_route(route: &str) -> (&str, &str) {
+    match route.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => ("none", route),
+    }
+}
+
+fn route_locator_from_route(route: &str) -> String {
+    split_route(route).1.to_string()
+}
+
+fn validate_cached_locator(backend: &str, locator: &str) -> bool {
+    let loc = locator.trim();
+    if loc.is_empty() || loc == "-" {
+        return false;
+    }
+    match backend {
+        "env" | "conda" | "sif" => Path::new(loc).exists(),
+        "docker" => !loc.is_empty(),
+        _ => false,
+    }
+}
+
+fn probe_tool_locators_parallel(
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Result<Vec<ToolLocatorStatus>, String> {
+    let mut tools = REQUIRED_TOOLS
+        .iter()
+        .map(|x| (*x).to_string())
+        .collect::<Vec<String>>();
+    tools.sort();
+    let mode = record.runtime_mode.clone();
+    let env_dir = env_runtime_bin_dir(runtime_home);
+    let conda_env = if record.conda_env.trim().is_empty() {
+        CONDA_ENV.to_string()
+    } else {
+        record.conda_env.trim().to_string()
+    };
+    let docker_image = if record.image_tag.trim().is_empty() {
+        DEFAULT_IMAGE_TAG.to_string()
+    } else {
+        record.image_tag.trim().to_string()
+    };
+    let docker_ready_once = if mode == "docker" {
+        docker_image_ready(&docker_image)
+    } else {
+        false
+    };
+    let sif_path = record.sif_path.trim().to_string();
+    let backend = route_backend_name(&mode).to_string();
+
+    let mut handles: Vec<(String, thread::JoinHandle<ToolLocatorStatus>)> = Vec::new();
+    for tool in tools {
+        let tool_name = tool.clone();
+        let mode_c = mode.clone();
+        let env_dir_c = env_dir.clone();
+        let conda_env_c = conda_env.clone();
+        let docker_image_c = docker_image.clone();
+        let docker_ready_c = docker_ready_once;
+        let sif_path_c = sif_path.clone();
+        let backend_c = backend.clone();
+        handles.push((
+            tool_name.clone(),
+            thread::spawn(move || {
+                match mode_c.as_str() {
+                    "env" | "local" => {
+                        let p = env_dir_c.join(&tool_name);
+                        let loc = p.to_string_lossy().to_string();
+                        let ready = p.exists();
+                        ToolLocatorStatus {
+                            tool: tool_name,
+                            route: format!("{backend_c}:{loc}"),
+                            ready,
+                        }
+                    }
+                    "conda" => {
+                        let loc = resolve_conda_tool_path(&conda_env_c, &tool_name)
+                            .unwrap_or_else(|| "-".to_string());
+                        let ready = Path::new(&loc).exists();
+                        ToolLocatorStatus {
+                            tool: tool_name,
+                            route: format!("{backend_c}:{loc}"),
+                            ready,
+                        }
+                    }
+                    "docker" => {
+                        ToolLocatorStatus {
+                            tool: tool_name,
+                            route: format!("{backend_c}:{docker_image_c}"),
+                            ready: docker_ready_c,
+                        }
+                    }
+                    "singularity" => {
+                        let ready = !sif_path_c.is_empty() && Path::new(&sif_path_c).exists();
+                        ToolLocatorStatus {
+                            tool: tool_name,
+                            route: format!("{backend_c}:{sif_path_c}"),
+                            ready,
+                        }
+                    }
+                    _ => ToolLocatorStatus {
+                        tool: tool_name,
+                        route: "none:-".to_string(),
+                        ready: false,
+                    },
+                }
+            }),
+        ));
+    }
+
+    let mut out = Vec::new();
+    for (_, handle) in handles {
+        let item = handle.join().unwrap_or(ToolLocatorStatus {
+            tool: String::new(),
+            route: "none:-".to_string(),
+            ready: false,
+        });
+        if !item.tool.is_empty() {
+            out.push(item);
+        }
+    }
+    out.sort_by(|a, b| a.tool.cmp(&b.tool));
+    Ok(out)
+}
+
+fn resolve_conda_tool_path(env_name: &str, tool: &str) -> Option<String> {
+    let conda_bin = find_bin("conda")?;
+    let out = Command::new(conda_bin)
+        .arg("run")
+        .arg("--no-capture-output")
+        .arg("-n")
+        .arg(env_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(format!("command -v {tool} || true"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|x| x.trim())
+        .find(|x| !x.is_empty())?
+        .to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+fn docker_image_ready(image: &str) -> bool {
+    if image.trim().is_empty() {
+        return false;
+    }
+    let Some(docker_bin) = find_bin("docker") else {
+        return false;
+    };
+    if !docker_daemon_running().0 {
+        return false;
+    }
+    Command::new(docker_bin)
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .status()
+        .map(|x| x.success())
+        .unwrap_or(false)
 }
 
 fn collect_build_method_status() -> Vec<MethodStatus> {
@@ -2298,6 +2636,177 @@ fn parse_content_length_from_headers(text: &str) -> Option<u64> {
     out
 }
 
+fn save_tool_cache_entries(
+    python: &Path,
+    db_path: &Path,
+    runtime_sig: &str,
+    entries: &[ToolCacheEntry],
+) -> Result<(), String> {
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                sanitize_db_field(&e.tool),
+                sanitize_db_field(&e.backend),
+                sanitize_db_field(&e.locator),
+                sanitize_db_field(&e.runtime_sig)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+    let script = r#"
+import sqlite3, sys
+db, slot, meta_key, runtime_sig, payload = sys.argv[1:6]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_tool_cache (
+    slot TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    runtime_sig TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (slot, tool)
+)
+""")
+conn.execute("DELETE FROM dlc_tool_cache WHERE slot = ?", (slot,))
+conn.execute(
+    "INSERT INTO dlc_tool_cache (slot, tool, backend, locator, runtime_sig, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+    (slot, meta_key, "", "", runtime_sig),
+)
+for raw in payload.splitlines():
+    if not raw.strip():
+        continue
+    parts = raw.split("\t")
+    if len(parts) < 4:
+        continue
+    tool, backend, locator, sig = parts[:4]
+    conn.execute(
+        "INSERT INTO dlc_tool_cache (slot, tool, backend, locator, runtime_sig, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        (slot, tool, backend, locator, sig),
+    )
+conn.commit()
+conn.close()
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(db_path.to_string_lossy().to_string())
+        .arg(DLC_SLOT)
+        .arg(DLC_TOOL_CACHE_META_KEY)
+        .arg(runtime_sig)
+        .arg(payload)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to save DLC tool cache: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut msg = String::new();
+    msg.push_str(&String::from_utf8_lossy(&out.stdout));
+    msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "Failed to save DLC tool cache (exit={}): {}",
+        super::exit_code(out.status),
+        msg.trim()
+    ))
+}
+
+fn load_tool_cache_entries(
+    python: &Path,
+    db_path: &Path,
+) -> Result<(Option<String>, Vec<ToolCacheEntry>), String> {
+    if !db_path.exists() {
+        return Ok((None, Vec::new()));
+    }
+    let script = r#"
+import sqlite3, sys
+db, slot = sys.argv[1:3]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_tool_cache (
+    slot TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    runtime_sig TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (slot, tool)
+)
+""")
+rows = conn.execute(
+    "SELECT tool, backend, locator, runtime_sig FROM dlc_tool_cache WHERE slot = ? ORDER BY tool",
+    (slot,)
+).fetchall()
+conn.close()
+for row in rows:
+    vals = ["" if v is None else str(v).replace("\t", " ").replace("\n", " ") for v in row]
+    print("\t".join(vals))
+"#;
+    let out = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(db_path.to_string_lossy().to_string())
+        .arg(DLC_SLOT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to load DLC tool cache: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        if msg.contains("unable to open database file") {
+            return Ok((None, Vec::new()));
+        }
+        return Err(format!(
+            "Failed to load DLC tool cache (exit={}): {}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+    let mut meta_sig: Option<String> = None;
+    let mut entries: Vec<ToolCacheEntry> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let p = line.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = p.split('\t').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let tool = parts[0].trim().to_string();
+        let backend = parts[1].trim().to_string();
+        let locator = parts[2].trim().to_string();
+        let runtime_sig = parts[3].trim().to_string();
+        if tool == DLC_TOOL_CACHE_META_KEY {
+            meta_sig = Some(runtime_sig);
+            continue;
+        }
+        entries.push(ToolCacheEntry {
+            tool,
+            backend,
+            locator,
+            runtime_sig,
+        });
+    }
+    Ok((meta_sig, entries))
+}
+
+fn sanitize_db_field(raw: &str) -> String {
+    raw.replace('\t', " ")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
 fn save_runtime_record(
     python: &Path,
     db_path: &Path,
@@ -2381,7 +2890,19 @@ CREATE TABLE IF NOT EXISTS dlc_builds (
     updated_at TEXT NOT NULL
 )
 """)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS dlc_tool_cache (
+    slot TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    runtime_sig TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (slot, tool)
+)
+""")
 conn.execute("DELETE FROM dlc_builds WHERE slot = ?", (slot,))
+conn.execute("DELETE FROM dlc_tool_cache WHERE slot = ?", (slot,))
 conn.commit()
 conn.close()
 "#;

@@ -1924,27 +1924,9 @@ def main():
         "-w", "--workdir", required=False, type=str,
         help="Working directory for outputs.",
     )
-    optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-check", "--check",
-        action="store_true",
-        help="Deprecated. Use `jx -update dlc`.",
-    )
-
     args = parser.parse_args()
 
     color_enabled = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    check_mode = bool(args.check)
-
-    if check_mode:
-        print(
-            _ansi(
-                "`-check/--check` moved to launcher. Please run `jx -update dlc`.",
-                "yellow",
-                color_enabled,
-            )
-        )
-        raise SystemExit(1)
 
     if (not args.reference) or (not args.fastq_dir) or (not args.workdir):
         parser.error("`-r/--reference`, `-i/--fastq-dir`, and `-w/--workdir` are required.")

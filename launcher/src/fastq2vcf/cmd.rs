@@ -306,8 +306,12 @@ pub(super) fn cmd_beagle_impute(
 ) -> String {
     let prefix = cmd_prefix(singularity);
     let in_gt = impute_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
-    let out_prefix = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp"));
     let out_imp = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
+    let out_imp_tbi = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"));
+    let out_ok = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.ok"));
+    let tmp_prefix = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.tmp"));
+    let tmp_imp = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.tmp.vcf.gz"));
+    let tmp_imp_tbi = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.tmp.vcf.gz.tbi"));
     let heap_gb = core.saturating_mul(4).clamp(16, 256);
     let xmx_expr = format!("${{JANUSX_BEAGLE_XMX_GB:-{heap_gb}}}");
     let java_opts = format!(
@@ -316,12 +320,28 @@ pub(super) fn cmd_beagle_impute(
     let beagle_cmd = format!(
         "{java_opts} {prefix}beagle gt={} out={} nthreads={core}",
         qpath(&in_gt),
-        qpath(&out_prefix),
+        qpath(&tmp_prefix),
     );
-    let index_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_imp));
-    let copy_empty_cmd = format!(
-        "{prefix}bcftools view -Oz -o {} {} && {index_cmd}",
+    let index_tmp_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&tmp_imp));
+    let cleanup_cmd = format!(
+        "rm -f {} {} {} {} {}",
+        qpath(&tmp_imp),
+        qpath(&tmp_imp_tbi),
         qpath(&out_imp),
+        qpath(&out_imp_tbi),
+        qpath(&out_ok),
+    );
+    let finalize_cmd = format!(
+        "mv {} {} && mv {} {} && touch {}",
+        qpath(&tmp_imp),
+        qpath(&out_imp),
+        qpath(&tmp_imp_tbi),
+        qpath(&out_imp_tbi),
+        qpath(&out_ok),
+    );
+    let copy_empty_cmd = format!(
+        "{prefix}bcftools view -Oz -o {} {} && {index_tmp_cmd} && {finalize_cmd}",
+        qpath(&tmp_imp),
         qpath(&in_gt),
     );
     let npos_cmd = format!(
@@ -329,7 +349,7 @@ pub(super) fn cmd_beagle_impute(
         qpath(&in_gt),
     );
     format!(
-        "NVAR=$({prefix}bcftools index -n {}) && {npos_cmd} && if [ \"${{NVAR:-0}}\" -gt 1 ] && [ \"${{NPOS:-0}}\" -gt 1 ]; then {beagle_cmd} && {index_cmd}; else {copy_empty_cmd}; fi",
+        "NVAR=$({prefix}bcftools index -n {}) && {npos_cmd} && {cleanup_cmd} && if [ \"${{NVAR:-0}}\" -gt 1 ] && [ \"${{NPOS:-0}}\" -gt 1 ]; then {beagle_cmd} && {index_tmp_cmd} && {finalize_cmd}; else {copy_empty_cmd}; fi",
         qpath(&in_gt),
     )
 }

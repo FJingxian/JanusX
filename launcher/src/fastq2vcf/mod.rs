@@ -1927,6 +1927,7 @@ fn build_fastq2vcf_steps(
         step8_inputs.push(in_gt);
         let out_imp = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
         let out_imp_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"));
+        let out_imp_ok = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.ok"));
         let chrom_threads = dynamic_impute_threads(chrom, chrom_lens, impute_threads_max);
         let raw = cmd_beagle_impute(chrom, &imputefolder, chrom_threads, singularity);
         step8_cmds.push(wrap_scheduler_cmd(
@@ -1935,7 +1936,7 @@ fn build_fastq2vcf_steps(
             chrom_threads,
             backend,
         ));
-        let outs = vec![out_imp, out_imp_tbi];
+        let outs = vec![out_imp, out_imp_tbi, out_imp_ok];
         step8_outputs.extend(outs.clone());
         step8_items.push(StepItem {
             id: format!("beagle.{chrom}"),
@@ -1958,6 +1959,7 @@ fn build_fastq2vcf_steps(
     let mut step9_items = Vec::new();
     for chrom in chroms {
         step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz")));
+        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.ok")));
         step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss")));
         step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss")));
         let out_vcf = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"));

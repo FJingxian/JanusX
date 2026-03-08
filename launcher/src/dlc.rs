@@ -15,6 +15,7 @@ const DLC_SLOT: &str = "active";
 const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
+const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
 const REQUIRED_TOOLS: [&str; 8] = [
     "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
 ];
@@ -890,24 +891,12 @@ fn build_conda_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     let Some(conda_bin) = find_bin("conda") else {
         return Err("conda command not found in PATH.".to_string());
     };
-    let host_missing = ordered_required_tools(&missing_host_tools());
-    if host_missing.is_empty() {
-        return Ok(RuntimeRecord {
-            method_id: 2,
-            runtime_mode: "conda".to_string(),
-            image_tag: String::new(),
-            conda_env: CONDA_ENV.to_string(),
-            sif_path: String::new(),
-            installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
-            status: "ok".to_string(),
-            updated_at: now_utc_epoch(),
-        });
-    }
-    let host_missing_set: BTreeSet<String> = host_missing.iter().cloned().collect();
+    let conda_required = conda_required_tools_for_runtime();
+    let conda_required_set: BTreeSet<String> = conda_required.iter().cloned().collect();
     let conda_bin_s = conda_bin.to_string_lossy().to_string();
 
-    let mirror_yml = write_conda_dlc_yml(runtime_home, &host_missing, true)?;
-    let official_yml = write_conda_dlc_yml(runtime_home, &host_missing, false)?;
+    let mirror_yml = write_conda_dlc_yml(runtime_home, &conda_required, true)?;
+    let official_yml = write_conda_dlc_yml(runtime_home, &conda_required, false)?;
 
     let mut removed_broken_env = false;
     let mut env_exists = conda_env_named_exists(&conda_bin, CONDA_ENV);
@@ -952,7 +941,7 @@ fn build_conda_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     let missing_after = ordered_required_tools(
         &missing_tools_in_prefixed_runtime(&prefix)?
             .into_iter()
-            .filter(|x| host_missing_set.contains(x))
+            .filter(|x| conda_required_set.contains(x))
             .collect::<Vec<String>>(),
     );
     if !missing_after.is_empty() {
@@ -979,7 +968,7 @@ fn build_conda_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
         let missing_rebuilt = ordered_required_tools(
             &missing_tools_in_prefixed_runtime(&prefix)?
                 .into_iter()
-                .filter(|x| host_missing_set.contains(x))
+                .filter(|x| conda_required_set.contains(x))
                 .collect::<Vec<String>>(),
         );
         if !missing_rebuilt.is_empty() {
@@ -1176,14 +1165,17 @@ fn build_tool_command(
                 ));
             }
             let mut cmd = Command::new(tool_path);
+            apply_env_runtime_exec_env(&mut cmd, runtime_home);
             cmd.args(args);
             Ok(cmd)
         }
         "conda" => {
-            if let Some(host_tool) = find_bin(tool) {
-                let mut cmd = Command::new(host_tool);
-                cmd.args(args);
-                return Ok(cmd);
+            if !should_force_conda_run(tool) {
+                if let Some(host_tool) = find_bin(tool) {
+                    let mut cmd = Command::new(host_tool);
+                    cmd.args(args);
+                    return Ok(cmd);
+                }
             }
             let Some(conda_bin) = find_bin("conda") else {
                 return Err("conda command not found in PATH.".to_string());
@@ -1260,6 +1252,34 @@ fn build_tool_command(
     }
 }
 
+fn apply_env_runtime_exec_env(cmd: &mut Command, runtime_home: &Path) {
+    let env_prefix = env_runtime_prefix_dir(runtime_home);
+    let env_bin = env_prefix.join("bin");
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if env_bin.exists() && env_bin.is_dir() {
+        paths.push(env_bin.clone());
+    }
+    if let Some(curr) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&curr));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+    if env_prefix.exists() && env_prefix.is_dir() {
+        cmd.env("CONDA_PREFIX", &env_prefix);
+    }
+    let java_bin = if cfg!(windows) {
+        env_bin.join("java.exe")
+    } else {
+        env_bin.join("java")
+    };
+    if java_bin.exists() && java_bin.is_file() {
+        cmd.env("JAVA_HOME", &env_prefix);
+        cmd.env("GATK_JAVA", &java_bin);
+    }
+}
+
 fn missing_tools_for_record(
     record: &RuntimeRecord,
     runtime_home: &Path,
@@ -1267,10 +1287,8 @@ fn missing_tools_for_record(
     match record.runtime_mode.as_str() {
         "env" | "local" => Ok(missing_env_runtime_tools(runtime_home)),
         "conda" => {
-            let host_missing_set: BTreeSet<String> = missing_host_tools().into_iter().collect();
-            if host_missing_set.is_empty() {
-                return Ok(Vec::new());
-            }
+            let conda_required_set: BTreeSet<String> =
+                conda_required_tools_for_runtime().into_iter().collect();
             let Some(conda_bin) = find_bin("conda") else {
                 return Err("conda command not found in PATH.".to_string());
             };
@@ -1288,7 +1306,7 @@ fn missing_tools_for_record(
                 env_name.to_string(),
                 ])?
                 .into_iter()
-                .filter(|x| host_missing_set.contains(x))
+                .filter(|x| conda_required_set.contains(x))
                 .collect::<Vec<String>>(),
             ))
         }
@@ -3218,6 +3236,21 @@ fn ordered_required_tools(tools: &[String]) -> Vec<String> {
         ordered.push(x);
     }
     ordered
+}
+
+fn should_force_conda_run(tool: &str) -> bool {
+    CONDA_FORCE_RUNTIME_TOOLS.contains(&tool)
+}
+
+fn conda_required_tools_for_runtime() -> Vec<String> {
+    let mut merged: BTreeSet<String> = BTreeSet::new();
+    for t in missing_host_tools() {
+        merged.insert(t);
+    }
+    for t in CONDA_FORCE_RUNTIME_TOOLS {
+        merged.insert(t.to_string());
+    }
+    ordered_required_tools(&merged.into_iter().collect::<Vec<String>>())
 }
 
 fn conda_env_exists(conda_bin: &Path, env_name: &str) -> bool {

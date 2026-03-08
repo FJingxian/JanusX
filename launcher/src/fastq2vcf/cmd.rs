@@ -15,18 +15,18 @@ fn qpath(path: &Path) -> String {
 }
 
 pub(super) fn wrap_scheduler_cmd(cmd: &str, job: &str, threads: usize, backend: &str) -> String {
+    let safe_job = safe_job_label(job);
     if backend == "csub" {
-        let safe_job = safe_job_label(job);
         let quoted_cmd = sh_quote(cmd);
         return format!(
             "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
-            job, safe_job, safe_job, threads, quoted_cmd
+            safe_job, safe_job, safe_job, threads, quoted_cmd
         );
     }
     let quoted_cmd = sh_quote(cmd);
     format!(
         "nohup bash -lc {} > ./log/{}.o 2> ./log/{}.e",
-        quoted_cmd, job, job
+        quoted_cmd, safe_job, safe_job
     )
 }
 
@@ -62,6 +62,7 @@ pub(super) fn cmd_bwamem(
     fq2: &Path,
     out: &Path,
     core: usize,
+    aligner_tool: &str,
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
@@ -73,13 +74,13 @@ pub(super) fn cmd_bwamem(
         "@RG\\tID:{sample}\\tPL:illumina\\tLB:{sample}\\tSM:{sample}"
     ));
     let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; SORT_TMP=\"$TMPDIR_BASE/{}.sorted.bam.tmp\"",
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; SORT_TMP=\"$TMPDIR_BASE/{}.sorted.bam.tmp\"",
         qpath(out),
         tmp_tag,
     );
     let cleanup_cmd = format!("rm -f {} {} {} \"$SORT_TMP\"*", qpath(&out_bam), qpath(&out_bai), qpath(&out_done),);
     format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}bwa-mem2 mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}{aligner_tool} mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
         qpath(reference),
         qpath(fq1),
         qpath(fq2),
@@ -111,7 +112,7 @@ pub(super) fn cmd_markdup(
         qpath(&out_metric),
     );
     let tmpdir_setup_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
         qpath(out),
     );
     let markdup_cmd = format!(
@@ -167,13 +168,17 @@ pub(super) fn cmd_cgvcf(
         .collect::<Vec<String>>()
         .join(" ");
     let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; GDB_TMP=\"$TMPDIR_BASE/{}.gendb.tmp\"",
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; GDB_TMP=\"$TMPDIR_BASE/{}.gendb.tmp\"; mkdir -p \"$GDB_TMP\"",
         qpath(out),
         tmp_tag,
     );
-    let cleanup_cmd = format!("rm -rf {} \"$GDB_TMP\" && rm -f {}", qpath(&db_dir), qpath(&done));
+    let cleanup_cmd = format!(
+        "rm -rf {} \"$GDB_TMP\" && mkdir -p \"$GDB_TMP\" && rm -f {}",
+        qpath(&db_dir),
+        qpath(&done)
+    );
     format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}gatk GenomicsDBImport -R {} -L {} --genomicsdb-workspace-path {} --tmp-dir \"$GDB_TMP\" --reader-threads {core} {} && touch {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}gatk GenomicsDBImport -R {} -L {} --genomicsdb-workspace-path {} --tmp-dir \"$GDB_TMP\" --reader-threads {core} {} && touch {} && rm -rf \"$GDB_TMP\"",
         qpath(reference),
         sh_quote(chrom),
         qpath(&db_dir),
@@ -201,7 +206,7 @@ pub(super) fn cmd_gvcf2snp_table(
         "QUAL>=30 && INFO/FS<=60 && INFO/QD>=2 && INFO/SOR<=3 && INFO/MQ>=40 && INFO/ReadPosRankSum>=-8 && INFO/MQRankSum>=-12.5",
     );
     let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
         qpath(out),
     );
     let cleanup_cmd = format!(
@@ -236,7 +241,8 @@ pub(super) fn cmd_gvcf2snp_table(
         qpath(&out_snp_tsv),
     );
     format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {genotype_cmd} && {filter_cmd} && {index_cmd} && {header_cmd} && {table_cmd} && rm -f {} {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {genotype_cmd} && {filter_cmd} && {index_cmd} && {header_cmd} && {table_cmd} && test -s {} && rm -f {} {}",
+        qpath(&out_snp_tsv),
         qpath(&raw_vcf),
         qpath(&raw_tbi),
     )

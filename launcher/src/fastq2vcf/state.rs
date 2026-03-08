@@ -56,6 +56,107 @@ pub(super) struct WorkStateTracker {
     steps_meta: Vec<StepMeta>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkStateParamStatus {
+    NotFound,
+    Match,
+    Mismatch,
+}
+
+pub(super) fn inspect_work_state_params(
+    state_path: &Path,
+    params_compact: &str,
+) -> Result<WorkStateParamStatus, String> {
+    if !state_path.exists() {
+        return Ok(WorkStateParamStatus::NotFound);
+    }
+    let Some(old_state) = read_work_state(state_path)? else {
+        return Ok(WorkStateParamStatus::NotFound);
+    };
+    let signature = signature_from_params(params_compact);
+    let old_params = to_json_compact(&old_state.params);
+    if old_state.signature == signature || old_params == params_compact {
+        return Ok(WorkStateParamStatus::Match);
+    }
+    Ok(WorkStateParamStatus::Mismatch)
+}
+
+pub(super) fn inspect_work_state_basic_params(
+    state_path: &Path,
+    reference: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    scheduler: &str,
+    nohup_max_jobs: usize,
+    singularity: &str,
+) -> Result<WorkStateParamStatus, String> {
+    if !state_path.exists() {
+        return Ok(WorkStateParamStatus::NotFound);
+    }
+    let Some(old_state) = read_work_state(state_path)? else {
+        return Ok(WorkStateParamStatus::NotFound);
+    };
+    if basic_params_match(
+        &old_state.params,
+        reference,
+        samples,
+        scheduler,
+        nohup_max_jobs,
+        singularity,
+    ) {
+        return Ok(WorkStateParamStatus::Match);
+    }
+    Ok(WorkStateParamStatus::Mismatch)
+}
+
+fn basic_params_match(
+    params: &JsonValue,
+    reference: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    scheduler: &str,
+    nohup_max_jobs: usize,
+    singularity: &str,
+) -> bool {
+    let Some(obj) = as_object(params) else {
+        return false;
+    };
+    match obj.get("reference") {
+        Some(JsonValue::String(v)) if v == &reference.to_string_lossy() => {}
+        _ => return false,
+    }
+    match obj.get("scheduler") {
+        Some(JsonValue::String(v)) if v == scheduler => {}
+        _ => return false,
+    }
+    match obj.get("singularity") {
+        Some(JsonValue::String(v)) if v == singularity => {}
+        _ => return false,
+    }
+    match obj.get("nohup_max_jobs") {
+        Some(JsonValue::Number(v)) if (*v as usize) == nohup_max_jobs => {}
+        _ => return false,
+    }
+    let Some(JsonValue::Object(old_samples)) = obj.get("samples") else {
+        return false;
+    };
+    if old_samples.len() != samples.len() {
+        return false;
+    }
+    for (sample, (r1, r2)) in samples {
+        let Some(JsonValue::Array(arr)) = old_samples.get(sample) else {
+            return false;
+        };
+        if arr.len() != 2 {
+            return false;
+        }
+        let ok1 = matches!(&arr[0], JsonValue::String(v) if v == &r1.to_string_lossy());
+        let ok2 = matches!(&arr[1], JsonValue::String(v) if v == &r2.to_string_lossy());
+        if !ok1 || !ok2 {
+            return false;
+        }
+    }
+    true
+}
+
 impl WorkStateTracker {
     pub(super) fn init_or_resume(
         state_path: &Path,

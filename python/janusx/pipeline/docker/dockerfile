@@ -1,18 +1,31 @@
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR="archive.ubuntu.com"
+ARG APT_SECURITY_MIRROR="security.ubuntu.com"
 ARG GATK_VER="4.6.2.0"
 ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
 ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -ri "s@http://(archive.ubuntu.com|ports.ubuntu.com)/ubuntu@http://${APT_MIRROR}/ubuntu@g" /etc/apt/sources.list \
+ && sed -ri "s@http://security.ubuntu.com/ubuntu@http://${APT_SECURITY_MIRROR}/ubuntu@g" /etc/apt/sources.list \
+ && printf 'deb http://%s/ubuntu jammy universe\n' "${APT_MIRROR}" > /etc/apt/sources.list.d/janusx-universe.list \
+ && printf 'deb http://%s/ubuntu jammy-updates universe\n' "${APT_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
+ && printf 'deb http://%s/ubuntu jammy-security universe\n' "${APT_SECURITY_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
+ && apt-get update -o Acquire::Retries=3 \
+ && apt-get install -y --no-install-recommends \
     ca-certificates curl wget unzip git \
     tabix bcftools \
     bash gawk coreutils sed grep findutils \
     python3 python3-pip python3-venv \
     openjdk-17-jre-headless \
-    bwa-mem2 samtools sambamba fastp \
+    bwa samtools sambamba fastp \
     libgomp1 \
+ && (apt-get install -y --no-install-recommends bwa-mem2 || true) \
+ && if ! command -v bwa-mem2 >/dev/null 2>&1; then \
+      printf '%s\n' '#!/usr/bin/env bash' 'exec bwa "$@"' > /usr/local/bin/bwa-mem2; \
+      chmod +x /usr/local/bin/bwa-mem2; \
+    fi \
  && ln -sf /usr/bin/python3 /usr/local/bin/python \
  && rm -rf /var/lib/apt/lists/*
 

@@ -68,24 +68,21 @@ pub(super) fn cmd_bwamem(
     let out_bam = out.join(format!("{sample}.sorted.bam"));
     let out_done = out.join(format!("{sample}.sorted.bam.finished"));
     let out_bai = out.join(format!("{sample}.sorted.bam.bai"));
-    let sort_tmp_prefix = out.join(format!("{sample}.sorted.bam.tmp"));
-    let sort_tmp_glob = format!("{}*", qpath(&sort_tmp_prefix));
+    let tmp_tag = safe_job_label(sample);
     let rg = sh_quote(&format!(
         "@RG\\tID:{sample}\\tPL:illumina\\tLB:{sample}\\tSM:{sample}"
     ));
-    let cleanup_cmd = format!(
-        "rm -f {} {} {} {}",
-        qpath(&out_bam),
-        qpath(&out_bai),
-        qpath(&out_done),
-        sort_tmp_glob,
+    let setup_tmp_cmd = format!(
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; SORT_TMP=\"$TMPDIR_BASE/{}.sorted.bam.tmp\"",
+        qpath(out),
+        tmp_tag,
     );
+    let cleanup_cmd = format!("rm -f {} {} {} \"$SORT_TMP\"*", qpath(&out_bam), qpath(&out_bai), qpath(&out_done),);
     format!(
-        "{cleanup_cmd} && {prefix}bwa mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T {} -o {} && touch {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}bwa-mem2 mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
         qpath(reference),
         qpath(fq1),
         qpath(fq2),
-        qpath(&sort_tmp_prefix),
         qpath(&out_bam),
         qpath(&out_done),
     )
@@ -157,24 +154,35 @@ pub(super) fn cmd_cgvcf(
     chrom: &str,
     gvcfs: &[PathBuf],
     out: &Path,
+    core: usize,
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
-    let out_g = out.join(format!("Merge.{chrom}.g.vcf.gz"));
+    let db_dir = out.join(format!("Merge.{chrom}.gendb"));
+    let done = out.join(format!("Merge.{chrom}.gendb.done"));
+    let tmp_tag = safe_job_label(chrom);
     let variants = gvcfs
         .iter()
         .map(|p| format!("--variant {}", qpath(p)))
         .collect::<Vec<String>>()
         .join(" ");
+    let setup_tmp_cmd = format!(
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; GDB_TMP=\"$TMPDIR_BASE/{}.gendb.tmp\"",
+        qpath(out),
+        tmp_tag,
+    );
+    let cleanup_cmd = format!("rm -rf {} \"$GDB_TMP\" && rm -f {}", qpath(&db_dir), qpath(&done));
     format!(
-        "{prefix}gatk CombineGVCFs -R {} {} -O {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}gatk GenomicsDBImport -R {} -L {} --genomicsdb-workspace-path {} --tmp-dir \"$GDB_TMP\" --reader-threads {core} {} && touch {}",
         qpath(reference),
+        sh_quote(chrom),
+        qpath(&db_dir),
         variants,
-        qpath(&out_g),
+        qpath(&done),
     )
 }
 
-pub(super) fn cmd_gvcf2vcf(
+pub(super) fn cmd_gvcf2snp_table(
     reference: &Path,
     chrom: &str,
     out: &Path,
@@ -183,81 +191,54 @@ pub(super) fn cmd_gvcf2vcf(
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
-    let in_g = out.join(format!("Merge.{chrom}.g.vcf.gz"));
-    let out_vcf = out.join(format!("Merge.{chrom}.vcf.gz"));
-    format!(
+    let db_dir = out.join(format!("Merge.{chrom}.gendb"));
+    let raw_vcf = out.join(format!("Merge.{chrom}.raw.vcf.gz"));
+    let raw_tbi = out.join(format!("Merge.{chrom}.raw.vcf.gz.tbi"));
+    let out_snp_f = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
+    let out_snp_f_tbi = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
+    let out_snp_tsv = out.join(format!("Merge.{chrom}.SNP.tsv"));
+    let filter_expr = sh_quote(
+        "QUAL>=30 && INFO/FS<=60 && INFO/QD>=2 && INFO/SOR<=3 && INFO/MQ>=40 && INFO/ReadPosRankSum>=-8 && INFO/MQRankSum>=-12.5",
+    );
+    let setup_tmp_cmd = format!(
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
+        qpath(out),
+    );
+    let cleanup_cmd = format!(
+        "rm -f {} {} {} {} {}",
+        qpath(&raw_vcf),
+        qpath(&raw_tbi),
+        qpath(&out_snp_f),
+        qpath(&out_snp_f_tbi),
+        qpath(&out_snp_tsv),
+    );
+    let genotype_cmd = format!(
         "{prefix}gatk --java-options '-Xmx{mem}G -XX:ParallelGCThreads={core}' GenotypeGVCFs -R {} -V {} -O {}",
         qpath(reference),
-        qpath(&in_g),
-        qpath(&out_vcf),
-    )
-}
-
-pub(super) fn cmd_vcf2snpvcf(
-    reference: &Path,
-    chrom: &str,
-    out: &Path,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let in_vcf = out.join(format!("Merge.{chrom}.vcf.gz"));
-    let out_snp = out.join(format!("Merge.{chrom}.SNP.vcf.gz"));
+        sh_quote(&format!("gendb://{}", db_dir.to_string_lossy())),
+        qpath(&raw_vcf),
+    );
+    let filter_cmd = format!(
+        "{prefix}bcftools view --threads {core} -m2 -M2 -v snps {} -Ou | {prefix}bcftools filter --threads {core} -i {} -Oz -o {}",
+        qpath(&raw_vcf),
+        filter_expr,
+        qpath(&out_snp_f),
+    );
+    let index_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_snp_f));
+    let header_cmd = format!(
+        "SAMPLE_COLS=$({prefix}bcftools query -l {} | awk '{{printf \"\\t%s.DP\\t%s.AD\\t%s.GQ\", $1,$1,$1}}'); printf 'CHROM\\tPOS\\tREF\\tALT%s\\n' \"$SAMPLE_COLS\" > {}",
+        qpath(&out_snp_f),
+        qpath(&out_snp_tsv),
+    );
+    let table_cmd = format!(
+        "{prefix}bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%DP\\t%AD\\t%GQ]\\n' {} >> {}",
+        qpath(&out_snp_f),
+        qpath(&out_snp_tsv),
+    );
     format!(
-        "{prefix}gatk SelectVariants -R {} -V {} --select-type SNP --restrict-alleles-to BIALLELIC -O {}",
-        qpath(reference),
-        qpath(&in_vcf),
-        qpath(&out_snp),
-    )
-}
-
-pub(super) fn cmd_filtersnp(
-    reference: &Path,
-    chrom: &str,
-    out: &Path,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let in_snp = out.join(format!("Merge.{chrom}.SNP.vcf.gz"));
-    let out_filtered = out.join(format!("Merge.{chrom}.SNP.filter.vcf.gz"));
-    format!(
-        "{prefix}gatk VariantFiltration -R {} -V {} -O {} --filter-name 'QUAL30' --filter-expression 'QUAL < 30.0' --filter-name 'FS60' --filter-expression 'FS > 60.0' --filter-name 'QD2' --filter-expression 'QD < 2.0' --filter-name 'SOR3' --filter-expression 'SOR > 3.0' --filter-name 'MQ40' --filter-expression 'MQ < 40.0' --filter-name 'ReadPosRankSum-8' --filter-expression 'ReadPosRankSum < -8.0' --filter-name 'MQRankSum-12.5' --filter-expression 'MQRankSum < -12.5'",
-        qpath(reference),
-        qpath(&in_snp),
-        qpath(&out_filtered),
-    )
-}
-
-pub(super) fn cmd_selectfiltersnp(
-    reference: &Path,
-    chrom: &str,
-    out: &Path,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let in_filtered = out.join(format!("Merge.{chrom}.SNP.filter.vcf.gz"));
-    let out_pass = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-    format!(
-        "{prefix}gatk SelectVariants -R {} -V {} --exclude-filtered -O {}",
-        qpath(reference),
-        qpath(&in_filtered),
-        qpath(&out_pass),
-    )
-}
-
-pub(super) fn cmd_vcf2table(
-    reference: &Path,
-    chrom: &str,
-    out: &Path,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let in_pass = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-    let out_tsv = out.join(format!("Merge.{chrom}.SNP.tsv"));
-    format!(
-        "{prefix}gatk VariantsToTable -R {} -V {} -F CHROM -F POS -F REF -F ALT -GF DP -GF AD -GF GQ -O {}",
-        qpath(reference),
-        qpath(&in_pass),
-        qpath(&out_tsv),
+        "{setup_tmp_cmd} && {cleanup_cmd} && {genotype_cmd} && {filter_cmd} && {index_cmd} && {header_cmd} && {table_cmd} && rm -f {} {}",
+        qpath(&raw_vcf),
+        qpath(&raw_tbi),
     )
 }
 

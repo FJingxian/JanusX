@@ -3,8 +3,8 @@ mod cmd;
 mod state;
 use cmd::{
     cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem, cmd_cgvcf, cmd_concat_imputed_vcfs, cmd_fastp,
-    cmd_filter_imputed_by_maf_and_missing, cmd_filtersnp, cmd_gvcf2vcf, cmd_markdup,
-    cmd_selectfiltersnp, cmd_snpvcf_to_gt_and_missing, cmd_vcf2snpvcf, cmd_vcf2table, sh_quote,
+    cmd_filter_imputed_by_maf_and_missing, cmd_gvcf2snp_table, cmd_markdup,
+    cmd_snpvcf_to_gt_and_missing, sh_quote,
     wrap_scheduler_cmd,
 };
 use state::WorkStateTracker;
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const REQUIRED_DLC_TOOLS: [&str; 10] = [
     "fastp",
-    "bwa",
+    "bwa-mem2",
     "samtools",
     "sambamba",
     "gatk",
@@ -119,7 +119,8 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     ensure_reference_indexes(&reference, &workdir, &backend, jx_cmd, "indexREF")?;
-    let chroms = read_chroms_from_fai(&reference)?;
+    let fai_data = read_fai_data_from_reference(&reference)?;
+    let chroms = fai_data.order.clone();
     let fastq_files = collect_fastq_files(&fastq_dir)?;
     if fastq_files.is_empty() {
         return Err(format!("No FASTQ files found in {}", fastq_dir.display()));
@@ -151,6 +152,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         &reference,
         &samples,
         &chroms,
+        &fai_data.lens,
         &workdir,
         &backend,
         &singularity,
@@ -594,13 +596,13 @@ fn ensure_reference_indexes(
 
     let fai = reference_sidecar(&reference, ".fai");
     let dict = reference_dict_path(&reference);
-    let bwa_files = bwa_index_paths(&reference);
+    let bwa_files = bwa_mem2_index_paths(&reference);
     let mut wait_files = vec![fai, dict];
     wait_files.extend(bwa_files);
     let dict_path = wait_files[1].clone();
 
     let idx_cmd = format!(
-        "{} samtools faidx {} && {} bwa index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
+        "{} samtools faidx {} && {} bwa-mem2 index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
         jx_prefix,
@@ -641,11 +643,10 @@ fn reference_dict_path(reference: &Path) -> PathBuf {
     PathBuf::from(format!("{s}.dict"))
 }
 
-fn read_chroms_from_fai(reference: &Path) -> Result<Vec<String>, String> {
+fn read_fai_data_from_reference(reference: &Path) -> Result<FaiData, String> {
     let reference = absolutize_path(reference)?;
     let fai = reference_sidecar(&reference, ".fai");
-    let parsed = parse_fai_file(&fai)?;
-    Ok(parsed.order)
+    parse_fai_file(&fai)
 }
 
 fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
@@ -653,7 +654,7 @@ fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
     let dict = reference_dict_path(reference);
 
     let fai_data = parse_fai_file(&fai)?;
-    validate_bwa_indexes(reference)?;
+    validate_bwa_mem2_indexes(reference)?;
     let dict_map = parse_dict_file(&dict)?;
 
     let mut mismatch: Vec<String> = Vec::new();
@@ -689,15 +690,15 @@ fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_bwa_indexes(reference: &Path) -> Result<(), String> {
-    for p in bwa_index_paths(reference) {
+fn validate_bwa_mem2_indexes(reference: &Path) -> Result<(), String> {
+    for p in bwa_mem2_index_paths(reference) {
         check_readable_nonempty(&p)?;
     }
     Ok(())
 }
 
-fn bwa_index_paths(reference: &Path) -> Vec<PathBuf> {
-    [".amb", ".ann", ".bwt", ".pac", ".sa"]
+fn bwa_mem2_index_paths(reference: &Path) -> Vec<PathBuf> {
+    [".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac"]
         .iter()
         .map(|suffix| reference_sidecar(reference, suffix))
         .collect()
@@ -1194,6 +1195,7 @@ fn build_fastq2vcf_steps(
     reference: &Path,
     samples: &BTreeMap<String, (PathBuf, PathBuf)>,
     chroms: &[String],
+    chrom_lens: &BTreeMap<String, u64>,
     workdir: &Path,
     backend: &str,
     singularity: &str,
@@ -1296,17 +1298,18 @@ fn build_fastq2vcf_steps(
     let mut step3_inputs = Vec::new();
     let mut step3_outputs = Vec::new();
     let mut step3_items = Vec::new();
+    let markdup_threads = 8usize;
     for sample in &sample_names {
         let bam = mappingfolder.join(format!("{sample}.sorted.bam"));
         step3_inputs.push(bam.clone());
         let out_md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
         let out_md_bai = mappingfolder.join(format!("{sample}.Markdup.bam.bai"));
         let out_md_metrics = mappingfolder.join(format!("{sample}.Markdup.metrics.txt"));
-        let raw = cmd_markdup(sample, &bam, &mappingfolder, 16, 200, singularity);
+        let raw = cmd_markdup(sample, &bam, &mappingfolder, markdup_threads, 200, singularity);
         step3_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("markdup.{sample}"),
-            16,
+            markdup_threads,
             backend,
         ));
         let outs = vec![out_md_bam, out_md_bai, out_md_metrics];
@@ -1319,7 +1322,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step3_markdup".to_string(),
         name: "markdup".to_string(),
-        eta_minutes: Some(73),
+        eta_minutes: Some(30),
         commands: step3_cmds,
         inputs: dedup_paths(step3_inputs),
         outputs: dedup_paths(step3_outputs),
@@ -1380,16 +1383,16 @@ fn build_fastq2vcf_steps(
             step5_inputs.push(p.clone());
             gvcfs.push(p);
         }
-        let out_g = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz"));
-        let out_tbi = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz.tbi"));
-        let raw = cmd_cgvcf(reference, chrom, &gvcfs, &mergefolder, singularity);
+        let out_gendb = mergefolder.join(format!("Merge.{chrom}.gendb"));
+        let out_gendb_done = mergefolder.join(format!("Merge.{chrom}.gendb.done"));
+        let raw = cmd_cgvcf(reference, chrom, &gvcfs, &mergefolder, 2, singularity);
         step5_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("cgvcf.{chrom}"),
-            1,
+            2,
             backend,
         ));
-        let outs = vec![out_g, out_tbi];
+        let outs = vec![out_gendb, out_gendb_done];
         step5_outputs.extend(outs.clone());
         step5_items.push(StepItem {
             id: format!("cgvcf.{chrom}"),
@@ -1411,23 +1414,18 @@ fn build_fastq2vcf_steps(
     let mut step6_outputs = Vec::new();
     let mut step6_items = Vec::new();
     for chrom in chroms {
-        let in_g = mergefolder.join(format!("Merge.{chrom}.g.vcf.gz"));
-        step6_inputs.push(in_g);
+        let in_gendb = mergefolder.join(format!("Merge.{chrom}.gendb"));
+        let in_done = mergefolder.join(format!("Merge.{chrom}.gendb.done"));
+        step6_inputs.push(in_gendb);
+        step6_inputs.push(in_done);
         let out_snp_f = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
         let out_snp_f_tbi = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
         let out_snp_tsv = mergefolder.join(format!("Merge.{chrom}.SNP.tsv"));
-        let cmd6 = [
-            cmd_gvcf2vcf(reference, chrom, &mergefolder, 1, 50, singularity),
-            cmd_vcf2snpvcf(reference, chrom, &mergefolder, singularity),
-            cmd_filtersnp(reference, chrom, &mergefolder, singularity),
-            cmd_selectfiltersnp(reference, chrom, &mergefolder, singularity),
-            cmd_vcf2table(reference, chrom, &mergefolder, singularity),
-        ]
-        .join(" && ");
+        let cmd6 = cmd_gvcf2snp_table(reference, chrom, &mergefolder, 2, 50, singularity);
         step6_cmds.push(wrap_scheduler_cmd(
             &cmd6,
             &format!("gvcf2vcf.{chrom}"),
-            1,
+            2,
             backend,
         ));
         let outs = vec![out_snp_f, out_snp_f_tbi, out_snp_tsv];
@@ -1495,16 +1493,18 @@ fn build_fastq2vcf_steps(
     let mut step8_inputs = Vec::new();
     let mut step8_outputs = Vec::new();
     let mut step8_items = Vec::new();
+    let impute_threads_max = 32usize;
     for chrom in chroms {
         let in_gt = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
         step8_inputs.push(in_gt);
         let out_imp = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
         let out_imp_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"));
-        let raw = cmd_beagle_impute(chrom, &imputefolder, 2, singularity);
+        let chrom_threads = dynamic_impute_threads(chrom, chrom_lens, impute_threads_max);
+        let raw = cmd_beagle_impute(chrom, &imputefolder, chrom_threads, singularity);
         step8_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("beagle.{chrom}"),
-            2,
+            chrom_threads,
             backend,
         ));
         let outs = vec![out_imp, out_imp_tbi];
@@ -1607,6 +1607,31 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         out.push(p);
     }
     out
+}
+
+fn dynamic_impute_threads(chrom: &str, chrom_lens: &BTreeMap<String, u64>, max_threads: usize) -> usize {
+    let max_threads = max_threads.max(1);
+    if max_threads <= 4 {
+        return max_threads;
+    }
+    let Some(max_len) = chrom_lens.values().copied().max() else {
+        return max_threads;
+    };
+    if max_len == 0 {
+        return max_threads;
+    }
+    let len = chrom_lens.get(chrom).copied().unwrap_or(max_len);
+    let ratio = (len as f64) / (max_len as f64);
+    let t = if ratio >= 0.70 {
+        32
+    } else if ratio >= 0.40 {
+        16
+    } else if ratio >= 0.20 {
+        8
+    } else {
+        4
+    };
+    t.min(max_threads).max(1)
 }
 
 fn run_shell_with_spinner(cwd: &Path, cmdline: &str, desc: &str) -> Result<(), String> {

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sync project versions in pyproject.toml and Cargo.toml from a git tag.
+Sync project versions from a git tag.
+
+Files synced:
+  - pyproject.toml
+  - Cargo.toml
+  - launcher/Cargo.toml
 
 Usage:
   python scripts/sync_version_from_tag.py v1.2.3
@@ -20,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 CARGO = ROOT / "Cargo.toml"
+LAUNCHER_CARGO = ROOT / "launcher" / "Cargo.toml"
 JANUSX_CLI = ROOT / "python" / "janusx" / "script" / "JanusX.py"
 
 
@@ -97,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     build_date = _git_head_date()
     _replace_section_version(PYPROJECT, "project", version)
     _replace_section_version(CARGO, "package", version)
+    _replace_section_version(LAUNCHER_CARGO, "package", version)
     _replace_build_date_fallback(JANUSX_CLI, build_date)
     print(
         "Synchronized version/build date:\n"

@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash gawk coreutils sed grep findutils \
     python3 python3-pip python3-venv \
     openjdk-17-jre-headless \
-    bwa samtools sambamba fastp \
+    bwa-mem2 samtools sambamba fastp \
     libgomp1 \
  && ln -sf /usr/bin/python3 /usr/local/bin/python \
  && rm -rf /var/lib/apt/lists/*
@@ -46,7 +46,7 @@ ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH" \
     JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
 
 RUN command -v fastp \
-    && command -v bwa \
+    && command -v bwa-mem2 \
     && command -v samtools \
     && command -v sambamba \
     && command -v gatk \

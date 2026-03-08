@@ -3,6 +3,9 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,6 +61,37 @@ pub(crate) trait PipelineHook {
     }
 }
 
+static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static INSTALL_SIGNAL_HANDLER_ONCE: Once = Once::new();
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+#[cfg(unix)]
+extern "C" fn janusx_signal_handler(_sig: i32) {
+    INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn setup_interrupt_trap() {
+    #[cfg(unix)]
+    {
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        INSTALL_SIGNAL_HANDLER_ONCE.call_once(|| unsafe {
+            let _ = signal(SIGINT, janusx_signal_handler as usize);
+            let _ = signal(SIGTERM, janusx_signal_handler as usize);
+        });
+    }
+    INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+fn interrupt_requested() -> bool {
+    INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+}
+
 impl<F> PipelineHook for F
 where
     F: FnMut(&PipelineStep, &StepItem) -> Result<(), String>,
@@ -73,6 +107,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
     opts: &PipelineOptions,
     hook: &mut H,
 ) -> Result<(), String> {
+    setup_interrupt_trap();
     fs::create_dir_all(workdir.join("tmp"))
         .map_err(|e| format!("Failed to create {}: {e}", workdir.join("tmp").display()))?;
     fs::create_dir_all(workdir.join("log"))
@@ -80,6 +115,9 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
 
     for (idx, step) in steps.iter().enumerate() {
         let step_text = format_step_label(idx, steps.len(), step);
+        if interrupt_requested() {
+            return Err("Interrupted by signal.".to_string());
+        }
         if opts.skip_if_outputs_exist && all_outputs_ready(&step.outputs) {
             super::print_success_line(&format!("{step_text} ...Skipped"));
             continue;
@@ -97,16 +135,74 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         }
 
         let sh = workdir.join("tmp").join(format!("{}.sh", idx));
-        let script = build_step_script(step, opts);
-        fs::write(&sh, script).map_err(|e| format!("Failed to write {}: {e}", sh.display()))?;
-        set_script_executable(&sh)?;
-
         let existing_error_logs = if opts.detect_failed_logs && matches!(opts.scheduler, Scheduler::Csub) {
             collect_existing_item_error_logs(workdir, step)?
         } else {
             HashSet::new()
         };
-        run_step_script(workdir, &sh, opts)?;
+
+        let mut commands_to_submit: Vec<String> = step.commands.clone();
+        let mut skip_submit = false;
+        if matches!(opts.scheduler, Scheduler::Csub)
+            && opts.detect_failed_logs
+            && !step.items.is_empty()
+            && step.commands.len() == step.items.len()
+        {
+            let pending_idx = pending_item_indices(step);
+            if !pending_idx.is_empty() {
+                if let Ok(running_idx) = find_running_csub_items_for_pending(step, &pending_idx) {
+                    if !running_idx.is_empty() {
+                        let submit_idx: Vec<usize> = pending_idx
+                            .iter()
+                            .copied()
+                            .filter(|i| !running_idx.contains(i))
+                            .collect();
+                        if submit_idx.is_empty() {
+                            skip_submit = true;
+                            println!(
+                                "{}",
+                                super::style_yellow(&format!(
+                                    "{step_text} detected existing running csub jobs; skip re-submit and continue waiting."
+                                ))
+                            );
+                        } else if submit_idx.len() < pending_idx.len() {
+                            println!(
+                                "{}",
+                                super::style_yellow(&format!(
+                                    "{step_text} detected existing running csub jobs; only submit missing subtasks ({}/{}).",
+                                    submit_idx.len(),
+                                    pending_idx.len()
+                                ))
+                            );
+                            commands_to_submit = submit_idx
+                                .iter()
+                                .map(|i| step.commands[*i].clone())
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+
+        if !skip_submit {
+            let script = build_step_script_from_commands(&commands_to_submit, opts);
+            fs::write(&sh, script).map_err(|e| format!("Failed to write {}: {e}", sh.display()))?;
+            set_script_executable(&sh)?;
+            if let Err(e) = run_step_script(workdir, &sh, opts) {
+                if interrupt_requested() {
+                    return handle_interrupt_for_step(
+                        &step_text,
+                        step,
+                        opts,
+                        &pending_item_indices(step),
+                    );
+                }
+                return Err(e);
+            }
+        }
+        if interrupt_requested() {
+            return handle_interrupt_for_step(&step_text, step, opts, &pending_item_indices(step));
+        }
         wait_step_outputs(workdir, &step_text, step, opts, hook, &existing_error_logs)?;
         let elapsed = super::format_elapsed(Duration::from_secs(0));
         let _ = elapsed;
@@ -143,37 +239,254 @@ fn format_eta(minutes: u64) -> String {
     }
 }
 
-fn build_step_script(step: &PipelineStep, opts: &PipelineOptions) -> String {
-    if step.commands.is_empty() {
+fn build_step_script_from_commands(commands: &[String], opts: &PipelineOptions) -> String {
+    if commands.is_empty() {
         return "echo 'empty step'\n".to_string();
     }
     match opts.scheduler {
         Scheduler::Csub => {
-            let mut text = step.commands.join("\n");
+            let mut text = commands.join("\n");
             if !text.ends_with('\n') {
                 text.push('\n');
             }
             text
         }
         Scheduler::Nohup => {
+            let mut preamble: Vec<String> = vec![
+                "JANUSX_CHILD_PIDS=\"\"".to_string(),
+                "janusx_cleanup_children() {".to_string(),
+                "  for pid in $JANUSX_CHILD_PIDS; do".to_string(),
+                "    if kill -0 \"$pid\" 2>/dev/null; then".to_string(),
+                "      kill \"$pid\" 2>/dev/null || true".to_string(),
+                "    fi".to_string(),
+                "  done".to_string(),
+                "  wait 2>/dev/null || true".to_string(),
+                "}".to_string(),
+                "trap 'janusx_cleanup_children; exit 130' INT TERM".to_string(),
+            ];
             if opts.nohup_max_jobs > 0 {
                 let mut parts = vec![format!("MAX_JOBS={}", opts.nohup_max_jobs)];
-                for line in &step.commands {
+                parts.append(&mut preamble);
+                for line in commands {
                     parts.push(
                         "while [ \"$(jobs -pr | wc -l)\" -ge \"$MAX_JOBS\" ]; do sleep 2; done"
                             .to_string(),
                     );
                     parts.push(format!("{line} &"));
+                    parts.push("JANUSX_CHILD_PIDS=\"$JANUSX_CHILD_PIDS $!\"".to_string());
                 }
                 parts.push("wait".to_string());
+                parts.push("rc=$?".to_string());
+                parts.push("trap - INT TERM".to_string());
+                parts.push("exit $rc".to_string());
                 parts.join("\n") + "\n"
             } else {
-                let mut lines: Vec<String> =
-                    step.commands.iter().map(|x| format!("{x} &")).collect();
+                let mut lines: Vec<String> = Vec::new();
+                lines.append(&mut preamble);
+                for line in commands {
+                    lines.push(format!("{line} &"));
+                    lines.push("JANUSX_CHILD_PIDS=\"$JANUSX_CHILD_PIDS $!\"".to_string());
+                }
                 lines.push("wait".to_string());
+                lines.push("rc=$?".to_string());
+                lines.push("trap - INT TERM".to_string());
+                lines.push("exit $rc".to_string());
                 lines.join("\n") + "\n"
             }
         }
+    }
+}
+
+fn pending_item_indices(step: &PipelineStep) -> Vec<usize> {
+    let mut pending: Vec<usize> = Vec::new();
+    for (idx, item) in step.items.iter().enumerate() {
+        if !all_outputs_ready(&item.outputs) {
+            pending.push(idx);
+        }
+    }
+    pending
+}
+
+#[derive(Clone, Debug)]
+struct CsubJobInfo {
+    job_id: String,
+    job_name: String,
+}
+
+fn find_running_csub_items_for_pending(
+    step: &PipelineStep,
+    pending_idx: &[usize],
+) -> Result<HashSet<usize>, String> {
+    let running_jobs = query_cjobs_active_jobs()?;
+    if running_jobs.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut out: HashSet<usize> = HashSet::new();
+    for idx in pending_idx {
+        let Some(item) = step.items.get(*idx) else {
+            continue;
+        };
+        if running_jobs
+            .iter()
+            .any(|job| csub_job_matches_item(&job.job_name, &item.id))
+        {
+            out.insert(*idx);
+        }
+    }
+    Ok(out)
+}
+
+fn query_cjobs_active_jobs() -> Result<Vec<CsubJobInfo>, String> {
+    let out = Command::new("cjobs")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run cjobs: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Err(format!(
+            "cjobs exited with code {}: {}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+
+    let mut jobs: Vec<CsubJobInfo> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let raw = line.trim();
+        if raw.is_empty() || raw.starts_with("JOBID") {
+            continue;
+        }
+        let cols: Vec<&str> = raw.split_whitespace().collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let stat = cols[2].to_ascii_uppercase();
+        let active = matches!(
+            stat.as_str(),
+            "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP"
+        );
+        if !active {
+            continue;
+        }
+        let job_id = cols[0].trim().to_string();
+        let job_name = cols[6].trim().to_string();
+        if job_id.is_empty() || job_name.is_empty() {
+            continue;
+        }
+        let key = (job_id.clone(), job_name.clone());
+        if seen.insert(key) {
+            jobs.push(CsubJobInfo { job_id, job_name });
+        }
+    }
+    Ok(jobs)
+}
+
+fn csub_job_matches_item(job_name: &str, item_id: &str) -> bool {
+    let safe = safe_job_label(item_id);
+    let j = job_name.trim();
+    if j.is_empty() {
+        return false;
+    }
+    if safe == j {
+        return true;
+    }
+    let j1 = j.trim_start_matches('*');
+    if !j1.is_empty() && (safe == j1 || safe.ends_with(j1)) {
+        return true;
+    }
+    let j2 = j.trim_matches('*');
+    !j2.is_empty() && (safe == j2 || safe.ends_with(j2))
+}
+
+fn collect_csub_job_ids_for_pending(step: &PipelineStep, pending_idx: &[usize]) -> Result<Vec<String>, String> {
+    if pending_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+    let running_jobs = query_cjobs_active_jobs()?;
+    if running_jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids: HashSet<String> = HashSet::new();
+    for idx in pending_idx {
+        let Some(item) = step.items.get(*idx) else {
+            continue;
+        };
+        for job in &running_jobs {
+            if csub_job_matches_item(&job.job_name, &item.id) {
+                ids.insert(job.job_id.clone());
+            }
+        }
+    }
+    let mut out: Vec<String> = ids.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
+fn ckill_job_ids(job_ids: &[String]) -> Result<(), String> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for job_id in job_ids {
+        let out = Command::new("ckill")
+            .arg(job_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match out {
+            Ok(v) => {
+                if !v.status.success() {
+                    let mut msg = String::new();
+                    msg.push_str(&String::from_utf8_lossy(&v.stdout));
+                    msg.push_str(&String::from_utf8_lossy(&v.stderr));
+                    errors.push(format!(
+                        "JOBID {}: exit={} {}",
+                        job_id,
+                        super::exit_code(v.status),
+                        msg.trim()
+                    ));
+                }
+            }
+            Err(e) => {
+                errors.push(format!("JOBID {}: {}", job_id, e));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" | "))
+    }
+}
+
+fn handle_interrupt_for_step(
+    step_text: &str,
+    step: &PipelineStep,
+    opts: &PipelineOptions,
+    pending_idx: &[usize],
+) -> Result<(), String> {
+    if !matches!(opts.scheduler, Scheduler::Csub) {
+        return Err("Interrupted by signal.".to_string());
+    }
+    let job_ids = collect_csub_job_ids_for_pending(step, pending_idx)?;
+    if job_ids.is_empty() {
+        return Err("Interrupted by signal.".to_string());
+    }
+    match ckill_job_ids(&job_ids) {
+        Ok(()) => Err(format!(
+            "{step_text} interrupted. Cancelled csub jobs: {}",
+            job_ids.join(", ")
+        )),
+        Err(e) => Err(format!(
+            "{step_text} interrupted. Failed to cancel some csub jobs: {e}"
+        )),
     }
 }
 
@@ -223,6 +536,10 @@ fn wait_step_outputs(
         let mut spinner_tick = 0usize;
 
         loop {
+            if interrupt_requested() {
+                clear_progress_line_if_tty()?;
+                return handle_interrupt_for_step(step_text, step, opts, &[]);
+            }
             let done = if all_outputs_ready(&step.outputs) {
                 total
             } else {
@@ -277,6 +594,10 @@ fn wait_step_outputs(
     }
 
     loop {
+        if interrupt_requested() {
+            clear_progress_line_if_tty()?;
+            return handle_interrupt_for_step(step_text, step, opts, &pending);
+        }
         if !pending.is_empty() {
             let mut next_pending: Vec<usize> = Vec::with_capacity(pending.len());
             for idx in &pending {

@@ -23,6 +23,7 @@ const GITHUB_ARCHIVE_ORIGIN: &str =
     "https://github.com/FJingxian/JanusX/archive/refs/heads/main.tar.gz";
 const UPDATE_TIME_MARKER: &str = ".python_core_updated_at";
 const COMMIT_MARKER: &str = ".python_core_commit";
+const LAUNCHER_CARGO_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
 const VERSION_CONTACT: &str = "fujingxian@yzwlab.cn";
 const RUNTIME_HOME_CONFIG: &str = ".jx_home";
@@ -161,11 +162,11 @@ fn run() -> Result<i32, String> {
     }
     if matches!(head, "-v" | "--version") {
         let home = runtime_home()?;
-        let python = ensure_runtime(false)?;
-        if maybe_auto_warmup(&home)? {
+        let core_python = ready_core_python(&home);
+        if core_python.is_some() && maybe_auto_warmup(&home)? {
             return Ok(0);
         }
-        print_version(&python, &home);
+        print_version(core_python.as_deref(), &home);
         return Ok(0);
     }
     if matches!(head, "-list" | "--list") {
@@ -1328,11 +1329,11 @@ fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
 
     for token in args {
         match token.as_str() {
-            "latest" | "--latest" => latest = true,
-            "--verbose" => verbose = true,
+            "latest" | "-latest" | "--latest" => latest = true,
+            "-verbose" | "--verbose" => verbose = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Upgrade usage:\n  jx --upgrade\n  jx --upgrade latest [--verbose]\n  jx --upgrade <local_path> [--verbose]"
+                    "Upgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]"
                 );
                 return Err(String::new());
             }
@@ -1340,13 +1341,13 @@ fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
                 if Path::new(other).exists() {
                     if local_source.is_some() {
                         return Err(
-                            "Only one local source path is allowed for `--upgrade`.".to_string()
+                            "Only one local source path is allowed for `-upgrade`.".to_string()
                         );
                     }
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown upgrade option: {other}\nUpgrade usage:\n  jx --upgrade\n  jx --upgrade latest [--verbose]\n  jx --upgrade <local_path> [--verbose]"
+                        "Unknown upgrade option: {other}\nUpgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]"
                     ));
                 }
             }
@@ -1698,13 +1699,14 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     for token in args {
         match token.as_str() {
             "dlc" => dlc = true,
-            "latest" | "--latest" => latest = true,
-            "-e" | "--editable" => editable = true,
-            "--verbose" => verbose = true,
-            "--force-reinstall" | "--reinstall" | "--full" => force_reinstall = true,
+            "latest" | "-latest" | "--latest" => latest = true,
+            "-e" | "-editable" | "--editable" => editable = true,
+            "-verbose" | "--verbose" => verbose = true,
+            "-force-reinstall" | "-reinstall" | "-full" | "--force-reinstall" | "--reinstall"
+            | "--full" => force_reinstall = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Update usage:\n  jx --update dlc\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
+                    "Update usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose] [-force-reinstall]\n  Example: jx -update -e ."
                 );
                 return Err(String::new());
             }
@@ -1712,13 +1714,13 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
                 if Path::new(other).exists() {
                     if local_source.is_some() {
                         return Err(
-                            "Only one local source path is allowed for `--update`.".to_string()
+                            "Only one local source path is allowed for `-update`.".to_string()
                         );
                     }
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown update option: {other}\nUpdate usage:\n  jx --update dlc\n  jx --update [latest|<local_path>] [-e|--editable] [--verbose] [--force-reinstall]\n  Example: jx --update -e ."
+                        "Unknown update option: {other}\nUpdate usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose] [-force-reinstall]\n  Example: jx -update -e ."
                     ));
                 }
             }
@@ -1726,7 +1728,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     }
 
     if dlc && (latest || local_source.is_some() || editable || force_reinstall) {
-        return Err("`jx --update dlc` does not accept other update source/options.".to_string());
+        return Err("`jx -update dlc` does not accept other update source/options.".to_string());
     }
     if latest && local_source.is_some() {
         return Err("`latest` and local path cannot be used together.".to_string());
@@ -1744,7 +1746,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
 
     if editable && !matches!(source, UpdateSource::Local(_)) {
         return Err(
-            "`-e/--editable` requires a local source path, e.g. `jx --update -e .`.".to_string(),
+            "`-e/-editable` requires a local source path, e.g. `jx -update -e .`.".to_string(),
         );
     }
 
@@ -1786,7 +1788,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
                     format_elapsed(check_start.elapsed())
                 ));
                 if github_has_newer_release_hint(&python, &home, &current, opts.verbose) {
-                    println!("Use `jx --update latest` for GitHub latest.");
+                    println!("Use `jx -update latest` for GitHub latest.");
                 }
                 return Ok(0);
             }
@@ -1999,7 +2001,7 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
         }
         if let Some(v) = before.as_deref() {
             if github_has_newer_release_hint(&python, &home, v, opts.verbose) {
-                println!("Use `jx --update latest` for GitHub latest.");
+                println!("Use `jx -update latest` for GitHub latest.");
             }
         }
         return Ok(0);
@@ -2182,7 +2184,7 @@ fn ensure_local_rust_toolchain(
         rustup_init_download_url_origin(),
     ) else {
         return Err(
-            "Current platform is not supported for local rustup bootstrap in `jx --update latest`."
+            "Current platform is not supported for local rustup bootstrap in `jx -update latest`."
                 .to_string(),
         );
     };
@@ -2853,11 +2855,11 @@ fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), Strin
 
 fn run_clean(args: &[String]) -> Result<i32, String> {
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("Clean usage:\n  jx --clean\n  jx --clean <load_id>");
+        println!("Clean usage:\n  jx -clean\n  jx -clean <load_id>");
         return Ok(0);
     }
     if args.len() > 1 {
-        return Err("Clean usage:\n  jx --clean\n  jx --clean <load_id>".to_string());
+        return Err("Clean usage:\n  jx -clean\n  jx -clean <load_id>".to_string());
     }
     if args.len() == 1 {
         let python = ensure_runtime(false)?;
@@ -2915,11 +2917,11 @@ fn run_clean(args: &[String]) -> Result<i32, String> {
 
 fn run_load(args: &[String]) -> Result<i32, String> {
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("Load usage:\n  jx --load\n  jx --load <type> <name> <file>");
+        println!("Load usage:\n  jx -load\n  jx -load <type> <name> <file>");
         return Ok(0);
     }
     if !args.is_empty() && args.len() != 3 {
-        return Err("Load usage:\n  jx --load\n  jx --load <type> <name> <file>".to_string());
+        return Err("Load usage:\n  jx -load\n  jx -load <type> <name> <file>".to_string());
     }
     let python = ensure_runtime(false)?;
     let mut cmd = Command::new(&python);
@@ -2940,14 +2942,14 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
     let mut yes = false;
     for token in args {
         match token.as_str() {
-            "-y" | "--yes" => yes = true,
+            "-y" | "-yes" | "--yes" => yes = true,
             "-h" | "--help" | "help" => {
-                println!("Uninstall usage:\n  jx --uninstall [--yes]");
+                println!("Uninstall usage:\n  jx -uninstall [-yes]");
                 return Ok(0);
             }
             other => {
                 return Err(format!(
-                    "Unknown uninstall option: {other}\nUninstall usage:\n  jx --uninstall [--yes]"
+                    "Unknown uninstall option: {other}\nUninstall usage:\n  jx -uninstall [-yes]"
                 ));
             }
         }
@@ -3613,23 +3615,115 @@ fn installed_version(python: &Path) -> Option<String> {
     }
 }
 
-fn print_version(python: &Path, runtime_home: &Path) {
-    let version = installed_version(python).unwrap_or_else(|| "0.0.0".to_string());
-    let build_time =
-        python_core_update_time(python, runtime_home).unwrap_or_else(|| "unknown".to_string());
+fn ready_core_python(runtime_home: &Path) -> Option<PathBuf> {
+    let py = venv_python(&runtime_home.join("venv"));
+    if !py.exists() {
+        return None;
+    }
+    if !python_path_meets_min_version(&py) {
+        return None;
+    }
+    if !is_janusx_installed(&py) {
+        return None;
+    }
+    Some(py)
+}
+
+fn print_version(core_python: Option<&Path>, runtime_home: &Path) {
+    let launcher_version = normalize_version_token(LAUNCHER_CARGO_VERSION)
+        .unwrap_or_else(|| LAUNCHER_CARGO_VERSION.to_string());
+    let launcher_time = launcher_build_time(core_python, runtime_home).unwrap_or_else(|| "unknown".to_string());
+    let core_version = core_python.and_then(installed_version);
+    let core_time = core_python.and_then(|py| python_core_update_time(py, runtime_home));
+
     println!("{LOGO}");
+    let title_version = core_version
+        .clone()
+        .unwrap_or_else(|| launcher_version.clone());
     if supports_color() {
-        println!("{}", style_cyan(&format!("JanusX v{version}")));
-        println!("{} {}", style_green("Author:"), VERSION_AUTHOR);
-        println!("{} <{}>", style_green("Contact:"), VERSION_CONTACT);
-        println!("{} {}", style_green("Build time:"), build_time);
+        println!(
+            "{}",
+            style_white(&format!("JanusX v{title_version}, {VERSION_AUTHOR}"))
+        );
+        println!("{}", style_white(&format!("Contact: <{VERSION_CONTACT}>")));
+        println!(
+            "{} {} {}",
+            style_green("Launcher:"),
+            style_white(&format!("v{launcher_version}")),
+            style_white(&launcher_time)
+        );
+        if let Some(core_ver) = &core_version {
+            println!(
+                "{} {} {}",
+                style_green("Core packages:"),
+                style_white(&format!("v{core_ver}")),
+                style_white(core_time.as_deref().unwrap_or("unknown"))
+            );
+            if let Some(warn) = version_mismatch_hint(&launcher_version, core_ver) {
+                println!("{}", style_yellow(&format!("Warning: {warn}")));
+            }
+        } else {
+            println!("{}", style_green("Core packages: not installed"));
+        }
         println!();
         return;
     }
-    println!("JanusX v{version} by {VERSION_AUTHOR}");
-    println!("Please report issues to <{VERSION_CONTACT}>");
-    println!("Build time: {build_time}");
+    println!("JanusX v{title_version}, {VERSION_AUTHOR}");
+    println!("Contact: <{VERSION_CONTACT}>");
+    println!("Launcher: v{launcher_version} {launcher_time}");
+    if let Some(core_ver) = &core_version {
+        println!(
+            "Core packages: v{core_ver} {}",
+            core_time.as_deref().unwrap_or("unknown")
+        );
+        if let Some(warn) = version_mismatch_hint(&launcher_version, core_ver) {
+            println!("Warning: {warn}");
+        }
+    } else {
+        println!("Core packages: not installed");
+    }
     println!();
+}
+
+fn version_mismatch_hint(launcher_version: &str, core_version: &str) -> Option<String> {
+    match compare_version_tokens(launcher_version, core_version) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some(
+            "launcher version is lower than core packages. Please run `jx -upgrade`."
+                .to_string(),
+        ),
+        std::cmp::Ordering::Greater => Some(
+            "core packages version is lower than launcher. Please run `jx -update latest`."
+                .to_string(),
+        ),
+    }
+}
+
+fn launcher_build_time(core_python: Option<&Path>, _runtime_home: &Path) -> Option<String> {
+    let exe = env::current_exe().ok()?;
+    let exe_s = exe.to_string_lossy().to_string();
+    let py = match core_python {
+        Some(v) => v.to_path_buf(),
+        None => {
+            let sys = find_system_python()?;
+            PathBuf::from(sys)
+        }
+    };
+    let out = Command::new(&py)
+        .arg("-c")
+        .arg("import datetime, pathlib, sys; p=pathlib.Path(sys.argv[1]); print(datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M'))")
+        .arg(exe_s)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn python_core_update_time(python: &Path, runtime_home: &Path) -> Option<String> {
@@ -3940,14 +4034,6 @@ fn style_yellow(text: &str) -> String {
     }
 }
 
-fn style_cyan(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[36m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
 fn style_blue(text: &str) -> String {
     if supports_color() {
         format!("\x1b[34m{text}\x1b[0m")
@@ -3974,6 +4060,7 @@ fn style_white(text: &str) -> String {
 
 fn print_cli_help() {
     let width = help_line_width();
+    let flag_key_width = 12usize;
     println!("{LOGO}");
     println!("{}", style_orange("Usage:"));
     println!("  {}", style_green("jx [flags]"));
@@ -3981,54 +4068,54 @@ fn print_cli_help() {
     println!();
 
     println!("{}", style_orange("Flags:"));
-    print_help_entry(2, "-h, --help", "Show this help message", 24, width);
+    print_help_entry(2, "-h", "Show this help message", flag_key_width, width);
     print_help_entry(
         2,
-        "-v, --version",
+        "-v",
         "Show version/build information",
-        24,
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-update, --update",
-        "Update JanusX: `jx --update [dlc|latest|<local_path>] [-e|--editable] [--verbose]`",
-        24,
+        "-update",
+        "Update JanusX: `jx -update [dlc|latest|<local_path>] [-e|-editable] [-verbose]`",
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-upgrade, --upgrade",
-        "Upgrade launcher only from source: `jx --upgrade [latest|<local_path>] [--verbose]`",
-        24,
+        "-upgrade",
+        "Upgrade launcher only from source: `jx -upgrade [latest|<local_path>] [-verbose]`",
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-list, --list",
-        "List available modules or DLC tools: `jx --list [module|dlc]`",
-        24,
+        "-list",
+        "List available modules or DLC tools: `jx -list [module|dlc]`",
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-load, --load",
-        "List/load files: `jx --load` or `jx --load <type> <name> <file>`",
-        24,
+        "-load",
+        "List/load files: `jx -load` or `jx -load <type> <name> <file>`",
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-clean, --clean",
-        "Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record",
-        24,
+        "-clean",
+        "Clear GWAS history DB, or `jx -clean <load_id>` to remove one loaded file record",
+        flag_key_width,
         width,
     );
     print_help_entry(
         2,
-        "-uninstall, --uninstall",
+        "-uninstall",
         "Remove JanusX runtime and launcher files",
-        24,
+        flag_key_width,
         width,
     );
     println!();
@@ -4119,7 +4206,7 @@ fn print_cli_help() {
 
 fn run_list(args: &[String]) -> Result<i32, String> {
     if args.len() > 1 {
-        return Err("List usage:\n  jx --list [module|dlc]".to_string());
+        return Err("List usage:\n  jx -list [module|dlc]".to_string());
     }
     let target = args
         .first()
@@ -4132,7 +4219,7 @@ fn run_list(args: &[String]) -> Result<i32, String> {
         }
         "dlc" => print_dlc_list().map(|_| 0),
         _ => Err(format!(
-            "Unknown list target: {target}\nList usage:\n  jx --list [module|dlc]"
+            "Unknown list target: {target}\nList usage:\n  jx -list [module|dlc]"
         )),
     }
 }
@@ -4196,11 +4283,66 @@ fn print_help_entry(indent: usize, key: &str, desc: &str, key_width: usize, tota
 }
 
 fn help_line_width() -> usize {
-    let cols = env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100);
+    let cols = detect_help_terminal_columns().unwrap_or(100);
     cols.saturating_sub(2).clamp(48, 160)
+}
+
+fn detect_help_terminal_columns() -> Option<usize> {
+    if let Ok(v) = env::var("COLUMNS") {
+        if let Ok(cols) = v.parse::<usize>() {
+            if cols > 0 {
+                return Some(cols);
+            }
+        }
+    }
+
+    if io::stdout().is_terminal() {
+        if let Some(cols) = query_stty_columns() {
+            return Some(cols);
+        }
+        if let Some(cols) = query_tput_columns() {
+            return Some(cols);
+        }
+    }
+    None
+}
+
+fn query_stty_columns() -> Option<usize> {
+    if !io::stdin().is_terminal() {
+        return None;
+    }
+    let out = Command::new("stty")
+        .arg("size")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cols = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|x| x.parse::<usize>().ok())?;
+    (cols > 0).then_some(cols)
+}
+
+fn query_tput_columns() -> Option<usize> {
+    let out = Command::new("tput")
+        .arg("cols")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cols = text.trim().parse::<usize>().ok()?;
+    (cols > 0).then_some(cols)
 }
 
 fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
@@ -4929,7 +5071,7 @@ fn ensure_git_available() -> Result<(), String> {
 
 fn git_install_hint() -> String {
     if cfg!(windows) {
-        return "Git is required for `jx --update latest`, but it was not found in PATH.\n\
+        return "Git is required for `jx -update latest`, but it was not found in PATH.\n\
 Windows install options:\n\
   1) winget: winget install --id Git.Git -e\n\
   2) choco:  choco install git -y\n\
@@ -4937,13 +5079,13 @@ Windows install options:\n\
             .to_string();
     }
     if cfg!(target_os = "macos") {
-        return "Git is required for `jx --update latest`, but it was not found in PATH.\n\
+        return "Git is required for `jx -update latest`, but it was not found in PATH.\n\
 macOS install options:\n\
   1) xcode-select --install\n\
   2) brew install git"
             .to_string();
     }
-    "Git is required for `jx --update latest`, but it was not found in PATH.\n\
+    "Git is required for `jx -update latest`, but it was not found in PATH.\n\
 Linux install options:\n\
   Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y git\n\
   RHEL/CentOS/Fedora: sudo dnf install -y git (or: sudo yum install -y git)\n\

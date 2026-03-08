@@ -18,7 +18,7 @@ const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
 const REQUIRED_TOOLS: [&str; 10] = [
     "fastp",
-    "bwa",
+    "bwa-mem2",
     "samtools",
     "sambamba",
     "gatk",
@@ -32,7 +32,7 @@ const DLC_TOOL_ENTRIES: [(&str, &str); 10] = [
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
-    ("bwa", "Short-read alignment"),
+    ("bwa-mem2", "Short-read alignment"),
     ("fastp", "FASTQ quality control"),
     ("gatk", "Variant discovery toolkit"),
     ("plink", "Genotype association toolkit"),
@@ -57,6 +57,70 @@ const CONDA_FORGE_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
 const CONDA_BIOCONDA_OFFICIAL: &str = "bioconda";
 const CONDA_FORGE_OFFICIAL: &str = "conda-forge";
+const EMBEDDED_DOCKERFILE: &str = r#"FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GATK_VER="4.6.2.0"
+ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
+ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget unzip git \
+    tabix bcftools \
+    bash gawk coreutils sed grep findutils \
+    python3 python3-pip python3-venv \
+    openjdk-17-jre-headless \
+    bwa-mem2 samtools sambamba fastp \
+    libgomp1 \
+ && ln -sf /usr/bin/python3 /usr/local/bin/python \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel
+
+WORKDIR /opt
+
+RUN mkdir -p /opt/gatk \
+    && wget -O /opt/gatk/gatk-${GATK_VER}.zip \
+        https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip \
+    && unzip /opt/gatk/gatk-${GATK_VER}.zip -d /opt/gatk \
+    && rm -f /opt/gatk/gatk-${GATK_VER}.zip
+
+RUN mkdir -p /opt/beagle \
+    && wget -O /opt/beagle/beagle.jar "${BEAGLE_JAR_URL}" \
+    && printf '%s\n' '#!/usr/bin/env bash' \
+       'exec java -jar /opt/beagle/beagle.jar "$@"' \
+       > /usr/local/bin/beagle \
+    && chmod +x /usr/local/bin/beagle
+
+RUN mkdir -p /opt/plink \
+    && wget -O /opt/plink/plink.zip "${PLINK19_URL}" \
+    && unzip /opt/plink/plink.zip -d /opt/plink \
+    && rm -f /opt/plink/plink.zip \
+    && if [ -x /opt/plink/plink ]; then ln -sf /opt/plink/plink /usr/local/bin/plink; fi \
+    && if [ -x /opt/plink/plink1.9 ]; then ln -sf /opt/plink/plink1.9 /usr/local/bin/plink; fi
+
+ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH" \
+    GATK_LOCAL_JAR="/opt/gatk/gatk-${GATK_VER}/gatk-package-${GATK_VER}-local.jar" \
+    MALLOC_ARENA_MAX=2 \
+    JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
+
+RUN command -v fastp \
+    && command -v bwa-mem2 \
+    && command -v samtools \
+    && command -v sambamba \
+    && command -v gatk \
+    && command -v bcftools \
+    && command -v tabix \
+    && command -v bgzip \
+    && command -v plink \
+    && command -v beagle \
+    && command -v awk \
+    && command -v sort
+
+WORKDIR /work
+
+CMD ["/bin/bash"]
+"#;
 static DLC_INLINE_STEP_LINE_OPEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
@@ -785,7 +849,7 @@ fn build_runtime(
     match method_id {
         1 => build_env_runtime(runtime_home),
         2 => build_conda_runtime(runtime_home),
-        3 => build_docker_runtime(python),
+        3 => build_docker_runtime(runtime_home),
         4 => build_singularity_runtime(python),
         _ => Err("Unknown build method.".to_string()),
     }
@@ -1264,7 +1328,7 @@ fn build_conda_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     })
 }
 
-fn build_docker_runtime(python: &Path) -> Result<RuntimeRecord, String> {
+fn build_docker_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     let Some(docker_bin) = find_bin("docker") else {
         return Err("docker command not found in PATH.".to_string());
     };
@@ -1279,10 +1343,7 @@ fn build_docker_runtime(python: &Path) -> Result<RuntimeRecord, String> {
             }
         ));
     }
-    let dockerfile = pipeline_dockerfile_from_python(python)?;
-    if !dockerfile.exists() {
-        return Err(format!("Dockerfile not found: {}", dockerfile.display()));
-    }
+    let dockerfile = ensure_embedded_dockerfile(runtime_home)?;
     let mut cmd = vec![
         docker_bin.to_string_lossy().to_string(),
         "build".to_string(),
@@ -1776,8 +1837,8 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
             "fastp" => {
                 out.insert("fastp".to_string());
             }
-            "bwa" => {
-                out.insert("bwa".to_string());
+            "bwa-mem2" => {
+                out.insert("bwa-mem2".to_string());
             }
             "samtools" => {
                 out.insert("samtools".to_string());
@@ -2489,9 +2550,24 @@ fn pipeline_dir_from_python(python: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(p))
 }
 
-fn pipeline_dockerfile_from_python(python: &Path) -> Result<PathBuf, String> {
-    let pipeline_dir = pipeline_dir_from_python(python)?;
-    Ok(pipeline_dir.join("docker").join("dockerfile"))
+fn ensure_embedded_dockerfile(runtime_home: &Path) -> Result<PathBuf, String> {
+    let docker_dir = runtime_home.join("dlc").join("docker");
+    fs::create_dir_all(&docker_dir).map_err(|e| {
+        format!(
+            "Failed to create Docker build directory {}: {e}",
+            docker_dir.display()
+        )
+    })?;
+    let dockerfile = docker_dir.join("dockerfile");
+    let need_write = match fs::read_to_string(&dockerfile) {
+        Ok(v) => v != EMBEDDED_DOCKERFILE,
+        Err(_) => true,
+    };
+    if need_write {
+        fs::write(&dockerfile, EMBEDDED_DOCKERFILE)
+            .map_err(|e| format!("Failed to write embedded Dockerfile {}: {e}", dockerfile.display()))?;
+    }
+    Ok(dockerfile)
 }
 
 fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), String> {

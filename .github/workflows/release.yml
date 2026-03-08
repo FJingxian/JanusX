@@ -64,6 +64,21 @@ jobs:
         with:
           targets: ${{ matrix.rust_targets }}
 
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          REF="${{ github.event.inputs.ref || github.ref_name }}"
+          if [[ "$REF" == refs/tags/* ]]; then
+            REF="${REF#refs/tags/}"
+          fi
+          if [[ ! "$REF" =~ ^v ]]; then
+            echo "Skip sync_version_from_tag.py (non-tag ref: $REF)"
+            exit 0
+          fi
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          $PY scripts/sync_version_from_tag.py "$REF"
+
       - name: Set up Zig (Linux compatibility build)
         if: ${{ matrix.use_zigbuild }}
         uses: goto-bus-stop/setup-zig@v2
@@ -465,13 +480,13 @@ jobs:
       - name: Commit and push changes
         shell: bash
         run: |
-          if git diff --quiet -- pyproject.toml Cargo.toml python/janusx/script/JanusX.py; then
+          if git diff --quiet -- pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py; then
             echo "No version/build-date changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml Cargo.toml python/janusx/script/JanusX.py
+          git add pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py
           git commit -m "chore(release): sync version from ${GITHUB_REF_NAME}"
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin HEAD:"${{ github.event.repository.default_branch }}"

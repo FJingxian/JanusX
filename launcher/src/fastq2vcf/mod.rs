@@ -1,4 +1,6 @@
-use super::pipeline::{run_pipeline_with_hook, PipelineOptions, PipelineStep, Scheduler, StepItem};
+use super::pipeline::{
+    all_outputs_ready, run_pipeline_with_hook, PipelineOptions, PipelineStep, Scheduler, StepItem,
+};
 mod cmd;
 mod state;
 use cmd::{
@@ -7,19 +9,22 @@ use cmd::{
     cmd_snpvcf_to_gt_and_missing, sh_quote,
     wrap_scheduler_cmd,
 };
-use state::WorkStateTracker;
-use std::collections::BTreeMap;
+use state::{
+    inspect_work_state_basic_params, inspect_work_state_params, WorkStateParamStatus,
+    WorkStateTracker,
+};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const REQUIRED_DLC_TOOLS: [&str; 10] = [
+const REQUIRED_DLC_TOOLS: [&str; 9] = [
     "fastp",
-    "bwa-mem2",
     "samtools",
     "sambamba",
     "gatk",
@@ -29,6 +34,8 @@ const REQUIRED_DLC_TOOLS: [&str; 10] = [
     "plink",
     "beagle",
 ];
+type ToolProbe = (String, bool, bool, String);
+const FASTQ2VCF_TOTAL_STEPS: usize = 10;
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +79,21 @@ struct FaiData {
     lens: BTreeMap<String, u64>,
 }
 
+#[derive(Clone, Debug)]
+struct ReferenceIndexTask {
+    reference: PathBuf,
+    workdir: PathBuf,
+    safe_job: String,
+    ignore_error_logs: HashSet<PathBuf>,
+    is_csub: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceWaitStatus {
+    Ready,
+    Pending,
+}
+
 pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     if args.iter().any(|x| matches!(x.as_str(), "-h" | "--help")) {
         print_fastq2vcf_help();
@@ -93,6 +115,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             workdir.join("tmp").display()
         )
     })?;
+    let reference = prepare_reference_for_pipeline(&reference, &workdir)?;
 
     let (backend, backend_reason) = detect_backend();
     println!(
@@ -104,7 +127,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     let jx_cmd = "jx";
-    let toolchain = probe_dlc_toolchain()?;
+    let (toolchain, aligner_tool) = probe_dlc_toolchain()?;
     print_toolchain_line(&toolchain);
     let missing_wrappers = missing_tools_from_probe(&toolchain);
     if !missing_wrappers.is_empty() {
@@ -112,22 +135,23 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             "Missing DLC tool wrappers: {}. Please run `jx -update dlc`.",
             missing_wrappers
                 .iter()
-                .map(|x| format!("jx {x}"))
+                .map(|x| x.to_string())
                 .collect::<Vec<String>>()
                 .join(", ")
         ));
     }
 
-    ensure_reference_indexes(&reference, &workdir, &backend, jx_cmd, "indexREF")?;
-    let fai_data = read_fai_data_from_reference(&reference)?;
-    let chroms = fai_data.order.clone();
     let fastq_files = collect_fastq_files(&fastq_dir)?;
     if fastq_files.is_empty() {
         return Err(format!("No FASTQ files found in {}", fastq_dir.display()));
     }
     let samples = classify_fastq_pairs(&fastq_files)?;
     if samples.is_empty() {
-        return Err("No valid paired FASTQ files were detected.".to_string());
+        return Err(format!(
+            "Detected 0 paired samples from {} FASTQ files.\n{}",
+            fastq_files.len(),
+            recognized_fastq_pairing_hint()
+        ));
     }
 
     println!(
@@ -139,24 +163,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         ))
     );
 
-    let metadata_json = build_metadata_json(&reference, &chroms, &samples);
-    let metadata_path = workdir.join(".fastq2vcf.metadata.json");
-    fs::write(&metadata_path, metadata_json).map_err(|e| {
-        format!(
-            "Failed to write metadata file {}: {e}",
-            metadata_path.display()
-        )
-    })?;
     let singularity = jx_cmd.to_string();
-    let steps = build_fastq2vcf_steps(
-        &reference,
-        &samples,
-        &chroms,
-        &fai_data.lens,
-        &workdir,
-        &backend,
-        &singularity,
-    )?;
     let mut opts = PipelineOptions::default();
     opts.scheduler = if backend == "csub" {
         Scheduler::Csub
@@ -165,10 +172,118 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     };
     opts.nohup_max_jobs = 1;
     opts.skip_if_outputs_exist = true;
-    opts.poll_sec = 2.0;
+    opts.poll_sec = 0.5;
     opts.detect_failed_logs = true;
 
     let state_path = workdir.join(".work.json");
+    let mut param_mismatch_confirmed = false;
+    match inspect_work_state_basic_params(
+        &state_path,
+        &reference,
+        &samples,
+        &backend,
+        opts.nohup_max_jobs,
+        &singularity,
+    )? {
+        WorkStateParamStatus::Mismatch => {
+            println!(
+                "{}",
+                super::style_yellow(&format!(
+                    "Warning: detected existing {} with different run parameters.",
+                    state_path.display()
+                ))
+            );
+            let proceed = prompt_yes_no(
+                "Continue with current parameters in the same workdir? [y/N]: ",
+                false,
+            )?;
+            if !proceed {
+                return Err("Cancelled by user due to parameter mismatch.".to_string());
+            }
+            param_mismatch_confirmed = true;
+        }
+        WorkStateParamStatus::Match | WorkStateParamStatus::NotFound => {}
+    }
+
+    let index_task = start_reference_indexing(
+        &reference,
+        &workdir,
+        &backend,
+        jx_cmd,
+        "indexREF",
+        &aligner_tool,
+    )?;
+
+    let fastp_step = build_fastp_step(&samples, &workdir, &backend, &singularity)?;
+    let fastp_skipped_by_outputs = opts.skip_if_outputs_exist && all_outputs_ready(&fastp_step.outputs);
+    if let Some(task) = index_task.clone() {
+        if fastp_skipped_by_outputs {
+            wait_reference_indexes(&task)?;
+            super::print_success_line("Step 1/10: fastp (~15m) ...Skipped");
+        } else {
+            let mut fastp_opts = opts.clone();
+            fastp_opts.step_index_offset = 0;
+            fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
+            fastp_opts.emit_completion_line = false;
+            fastp_opts.emit_progress_line = false;
+            let (fastp_elapsed, index_elapsed) = run_fastp_and_index_parallel(
+                &workdir,
+                &fastp_step,
+                &fastp_opts,
+                &task,
+            )?;
+            super::print_success_line(&format!(
+                "Reference index check ...Finished [{}]",
+                super::format_elapsed_live(index_elapsed)
+            ));
+            super::print_success_line(&format!(
+                "Step 1/10: fastp (~15m) ...Finished [{}]",
+                super::format_elapsed_live(fastp_elapsed)
+            ));
+        }
+    } else {
+        let fastp_start = Instant::now();
+        let mut fastp_opts = opts.clone();
+        fastp_opts.step_index_offset = 0;
+        fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
+        fastp_opts.emit_completion_line = false;
+        let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
+        run_pipeline_with_hook(
+            &workdir,
+            std::slice::from_ref(&fastp_step),
+            &fastp_opts,
+            &mut noop_hook,
+        )?;
+        let fastp_elapsed = fastp_start.elapsed();
+        if fastp_skipped_by_outputs {
+            super::print_success_line("Step 1/10: fastp (~15m) ...Skipped");
+        } else {
+            super::print_success_line(&format!(
+                "Step 1/10: fastp (~15m) ...Finished [{}]",
+                super::format_elapsed_live(fastp_elapsed)
+            ));
+        }
+    }
+
+    let fai_data = read_fai_data_from_reference(&reference)?;
+    let chroms = fai_data.order.clone();
+
+    let legacy_metadata_path = workdir.join(".fastq2vcf.metadata.json");
+    if legacy_metadata_path.exists() {
+        let _ = fs::remove_file(&legacy_metadata_path);
+    }
+    let steps = build_fastq2vcf_steps(
+        &reference,
+        &samples,
+        &chroms,
+        &fai_data.lens,
+        &workdir,
+        &backend,
+        &aligner_tool,
+        &singularity,
+        true,
+    )?;
+
     let run_params_json = build_run_params_json(
         &reference,
         &samples,
@@ -177,6 +292,27 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         opts.nohup_max_jobs,
         &singularity,
     );
+    if !param_mismatch_confirmed {
+        match inspect_work_state_params(&state_path, &run_params_json)? {
+            WorkStateParamStatus::Mismatch => {
+                println!(
+                    "{}",
+                    super::style_yellow(&format!(
+                        "Warning: detected existing {} with different run parameters.",
+                        state_path.display()
+                    ))
+                );
+                let proceed = prompt_yes_no(
+                    "Continue with current parameters in the same workdir? [y/N]: ",
+                    false,
+                )?;
+                if !proceed {
+                    return Err("Cancelled by user due to parameter mismatch.".to_string());
+                }
+            }
+            WorkStateParamStatus::Match | WorkStateParamStatus::NotFound => {}
+        }
+    }
     let input_files = build_input_files(&reference, &samples);
     let (mut state_tracker, resumed) =
         WorkStateTracker::init_or_resume(&state_path, &run_params_json, &input_files, &steps)?;
@@ -199,7 +335,14 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     let pipeline_result = {
         let mut item_hook =
             |step: &PipelineStep, item: &StepItem| state_tracker.mark_item_done(step, item);
-        run_pipeline_with_hook(&workdir, &steps, &opts, &mut item_hook)
+        let mut main_opts = opts.clone();
+        main_opts.step_index_offset = 1;
+        main_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
+        if steps.len() <= 1 {
+            Ok(())
+        } else {
+            run_pipeline_with_hook(&workdir, &steps[1..], &main_opts, &mut item_hook)
+        }
     };
     match pipeline_result {
         Ok(()) => {
@@ -235,6 +378,11 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             }
         }
     };
+    let postbsa_glob = workdir
+        .join("4.merge")
+        .join("Merge.*.SNP.tsv")
+        .to_string_lossy()
+        .to_string();
     println!();
     println!(
         "{}",
@@ -252,13 +400,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         super::style_green(&format!("Latest SNP table: {tsv_text}"))
     );
     println!("Next step suggestion:");
-    println!("  jx postbsa -file {tsv_text} -b1 [bulk1] -b2 [bulk2]");
-    if bulk_names.len() >= 2 {
-        println!(
-            "  Example: jx postbsa -file {tsv_text} -b1 {} -b2 {}",
-            bulk_names[0], bulk_names[1]
-        );
-    }
+    println!("  jx postbsa -file {postbsa_glob} -b1 [bulk1] -b2 [bulk2]");
 
     Ok(0)
 }
@@ -469,12 +611,131 @@ fn validate_and_resolve_inputs(args: &ParsedArgs) -> Result<(PathBuf, PathBuf, P
     Ok((reference, fastq_dir, workdir))
 }
 
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
+    if !io::stdin().is_terminal() {
+        return Ok(default_yes);
+    }
+    loop {
+        print!("{prompt}");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        let mut raw = String::new();
+        io::stdin()
+            .read_line(&mut raw)
+            .map_err(|e| format!("Failed to read input: {e}"))?;
+        let v = raw.trim().to_ascii_lowercase();
+        if v.is_empty() {
+            return Ok(default_yes);
+        }
+        if matches!(v.as_str(), "y" | "yes") {
+            return Ok(true);
+        }
+        if matches!(v.as_str(), "n" | "no") {
+            return Ok(false);
+        }
+        println!("{}", super::style_yellow("Please input y or n."));
+    }
+}
+
+fn prepare_reference_for_pipeline(reference: &Path, workdir: &Path) -> Result<PathBuf, String> {
+    let reference = absolutize_path(reference)?;
+    if !is_gzip_reference_path(&reference) {
+        println!(
+            "{}",
+            super::style_green(&format!("Reference path: {}", reference.display()))
+        );
+        return Ok(reference);
+    }
+    let Some(gzip_bin) = find_in_path("gzip") else {
+        return Err(
+            "Reference is gzip-compressed but `gzip` command is not found in PATH.".to_string(),
+        );
+    };
+    let ref_dir = workdir.join(".reference");
+    fs::create_dir_all(&ref_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", ref_dir.display()))?;
+
+    let out_name = decompressed_reference_name(&reference);
+    let out_path = ref_dir.join(out_name);
+    let needs_refresh = reference_decompress_needed(&reference, &out_path)?;
+    if needs_refresh {
+        let tmp_path = out_path.with_extension(format!(
+            "{}.tmp",
+            out_path
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or_default()
+        ));
+        let cmdline = format!(
+            "{} -dc {} > {}",
+            sh_quote(&gzip_bin.to_string_lossy()),
+            sh_quote(&reference.to_string_lossy()),
+            sh_quote(&tmp_path.to_string_lossy()),
+        );
+        run_shell_capture(workdir, &cmdline, "reference gunzip")?;
+        if out_path.exists() {
+            let _ = fs::remove_file(&out_path);
+        }
+        fs::rename(&tmp_path, &out_path).map_err(|e| {
+            format!(
+                "Failed to finalize decompressed reference {} -> {}: {e}",
+                tmp_path.display(),
+                out_path.display()
+            )
+        })?;
+    }
+    check_readable_nonempty(&out_path)?;
+    println!(
+        "{}",
+        super::style_yellow(&format!(
+            "Unzipped reference path: {}",
+            out_path.display()
+        ))
+    );
+    Ok(out_path)
+}
+
+fn is_gzip_reference_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".gz")
+}
+
+fn decompressed_reference_name(reference: &Path) -> String {
+    let name = reference
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("reference.fa.gz");
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".gz") && name.len() > 3 {
+        return name[..name.len() - 3].to_string();
+    }
+    "reference.fa".to_string()
+}
+
+fn reference_decompress_needed(src_gz: &Path, dst_plain: &Path) -> Result<bool, String> {
+    if !dst_plain.exists() {
+        return Ok(true);
+    }
+    let dst_md =
+        fs::metadata(dst_plain).map_err(|e| format!("Failed to stat {}: {e}", dst_plain.display()))?;
+    if !dst_md.is_file() || dst_md.len() == 0 {
+        return Ok(true);
+    }
+    let src_md =
+        fs::metadata(src_gz).map_err(|e| format!("Failed to stat {}: {e}", src_gz.display()))?;
+    let src_m = src_md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let dst_m = dst_md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    Ok(dst_m < src_m)
+}
+
 fn detect_backend() -> (String, String) {
     let Some(csub_bin) = find_in_path("csub") else {
-        return (
-            "nohup".to_string(),
-            "Backend probe: csub not found in PATH.".to_string(),
-        );
+        return ("nohup".to_string(), String::new());
     };
     let mut probe = Command::new(&csub_bin);
     probe
@@ -494,17 +755,93 @@ fn detect_backend() -> (String, String) {
     )
 }
 
-fn probe_dlc_toolchain() -> Result<Vec<(String, bool, bool)>, String> {
+fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
     let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
-    let mut out = Vec::new();
+    let mut out: Vec<ToolProbe> = Vec::new();
 
     for tool in REQUIRED_DLC_TOOLS {
-        out.push((tool.to_string(), probe_dlc_tool_wrapper(&jx_bin, tool), true));
+        out.push((
+            tool.to_string(),
+            probe_dlc_tool_wrapper(&jx_bin, tool),
+            true,
+            format!("jx {tool}"),
+        ));
+    }
+
+    let (aligner_display, aligner_ok, aligner_invoke, aligner_missing_hint) =
+        probe_aligner_tool(&jx_bin);
+    out.push((
+        aligner_display,
+        aligner_ok,
+        true,
+        format!("jx {aligner_missing_hint}"),
+    ));
+
+    if !aligner_ok {
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        return Ok((out, aligner_invoke));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok(out)
+    Ok((out, aligner_invoke))
+}
+
+fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
+    let mem2_ok = probe_dlc_tool_wrapper(jx_bin, "bwa-mem2");
+    let bwa_ok = probe_dlc_tool_wrapper(jx_bin, "bwa");
+    if mem2_ok {
+        let display = if !bwa_ok && bwa_mem2_is_bwa_alias(jx_bin) {
+            "bwa".to_string()
+        } else {
+            "bwa-mem2".to_string()
+        };
+        return (display, true, "bwa-mem2".to_string(), "bwa-mem2 or bwa".to_string());
+    }
+    if bwa_ok {
+        return (
+            "bwa".to_string(),
+            true,
+            "bwa".to_string(),
+            "bwa-mem2 or bwa".to_string(),
+        );
+    }
+    (
+        "bwa|bwa-mem2".to_string(),
+        false,
+        "bwa-mem2".to_string(),
+        "bwa-mem2 or bwa".to_string(),
+    )
+}
+
+fn bwa_mem2_is_bwa_alias(jx_bin: &Path) -> bool {
+    let out_cmd = Command::new(jx_bin)
+        .arg("bwa-mem2")
+        .arg("mem")
+        .arg("-h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let out = match out_cmd {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut merged = String::new();
+    merged.push_str(&String::from_utf8_lossy(&out.stdout));
+    merged.push('\n');
+    merged.push_str(&String::from_utf8_lossy(&out.stderr));
+    if wrapper_missing_by_output(&merged) {
+        return false;
+    }
+    let msg = merged.to_ascii_lowercase();
+    if msg.contains("bwa-mem2") {
+        return false;
+    }
+    msg.contains("program: bwa")
+        || msg.contains("usage: bwa ")
+        || msg.contains("burrows-wheeler transformation")
 }
 
 fn probe_dlc_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
@@ -529,9 +866,9 @@ fn probe_dlc_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
     !wrapper_missing_by_output(&merged)
 }
 
-fn print_toolchain_line(toolchain: &[(String, bool, bool)]) {
+fn print_toolchain_line(toolchain: &[ToolProbe]) {
     let mut segs = Vec::with_capacity(toolchain.len());
-    for (tool, ok, _) in toolchain {
+    for (tool, ok, _, _) in toolchain {
         if *ok {
             segs.push(super::style_green(tool));
         } else {
@@ -541,13 +878,13 @@ fn print_toolchain_line(toolchain: &[(String, bool, bool)]) {
     println!("{}", segs.join(" "));
 }
 
-fn missing_tools_from_probe(toolchain: &[(String, bool, bool)]) -> Vec<String> {
+fn missing_tools_from_probe(toolchain: &[ToolProbe]) -> Vec<String> {
     let mut missing = toolchain
         .iter()
         .filter_map(
-            |(tool, ok, required)| {
+            |(_, ok, required, missing_hint)| {
                 if *required && !*ok {
-                    Some(tool.clone())
+                    Some(missing_hint.clone())
                 } else {
                     None
                 }
@@ -572,40 +909,33 @@ fn wrapper_missing_by_output(text: &str) -> bool {
         || msg.contains("unknown module:")
 }
 
-fn ensure_reference_indexes(
+fn start_reference_indexing(
     reference: &Path,
     workdir: &Path,
     backend: &str,
     jx_prefix: &str,
     job_name: &str,
-) -> Result<(), String> {
+    aligner_tool: &str,
+) -> Result<Option<ReferenceIndexTask>, String> {
     let reference = absolutize_path(reference)?;
+    fs::create_dir_all(workdir.join("log")).map_err(|e| {
+        format!(
+            "Failed to create log directory {}: {e}",
+            workdir.join("log").display()
+        )
+    })?;
     if validate_reference_index_integrity(&reference).is_ok() {
-        return Ok(());
+        return Ok(None);
     }
-    let initial_err = validate_reference_index_integrity(&reference)
-        .err()
-        .unwrap_or_else(|| "unknown index validation error".to_string());
-    eprintln!(
-        "{}",
-        super::style_yellow(&format!(
-            "Reference index check failed: {}. Rebuilding indexes...",
-            initial_err
-        ))
-    );
 
-    let fai = reference_sidecar(&reference, ".fai");
-    let dict = reference_dict_path(&reference);
-    let bwa_files = bwa_mem2_index_paths(&reference);
-    let mut wait_files = vec![fai, dict];
-    wait_files.extend(bwa_files);
-    let dict_path = wait_files[1].clone();
+    let dict_path = reference_dict_path(&reference);
 
     let idx_cmd = format!(
-        "{} samtools faidx {} && {} bwa-mem2 index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
+        "{} samtools faidx {} && {} {} index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
         jx_prefix,
+        aligner_tool,
         sh_quote(&reference.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
@@ -613,15 +943,55 @@ fn ensure_reference_indexes(
         sh_quote(&reference.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
     );
-    let wrapped = wrap_scheduler_cmd(&idx_cmd, job_name, 1, backend);
-    run_shell_with_spinner(workdir, &wrapped, "Indexing reference")?;
-    wait_for_paths(
-        &wait_files,
-        "Waiting for reference index files",
-        Duration::from_secs(2),
-    )?;
-    validate_reference_index_integrity(&reference)?;
-    Ok(())
+    let safe_job = crate::pipeline::safe_job_label(job_name);
+    let ignore_error_logs = collect_existing_step_error_logs(workdir, &safe_job)?;
+    let wrapped = wrap_reference_submit_cmd(&idx_cmd, &safe_job, backend);
+    run_shell_capture(workdir, &wrapped, "indexing reference submit")?;
+    Ok(Some(ReferenceIndexTask {
+        reference,
+        workdir: workdir.to_path_buf(),
+        safe_job,
+        ignore_error_logs,
+        is_csub: backend == "csub",
+    }))
+}
+
+fn wrap_reference_submit_cmd(cmd: &str, safe_job: &str, backend: &str) -> String {
+    let quoted_cmd = sh_quote(cmd);
+    if backend == "csub" {
+        return format!(
+            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n 1 {}",
+            safe_job, safe_job, safe_job, quoted_cmd
+        );
+    }
+    format!(
+        "nohup bash -lc {} > ./log/{}.o 2> ./log/{}.e &",
+        quoted_cmd, safe_job, safe_job
+    )
+}
+
+fn wait_reference_indexes(task: &ReferenceIndexTask) -> Result<(), String> {
+    match wait_for_reference_index_ready(
+        task,
+        "Reference index check failed, Rebuilding indexes...",
+        Duration::from_millis(500),
+        None,
+        true,
+    )? {
+        ReferenceWaitStatus::Ready | ReferenceWaitStatus::Pending => Ok(()),
+    }
+}
+
+fn wait_reference_indexes_silent(task: &ReferenceIndexTask) -> Result<(), String> {
+    match wait_for_reference_index_ready(
+        task,
+        "Reference index check failed, Rebuilding indexes...",
+        Duration::from_millis(500),
+        None,
+        false,
+    )? {
+        ReferenceWaitStatus::Ready | ReferenceWaitStatus::Pending => Ok(()),
+    }
 }
 
 fn reference_sidecar(reference: &Path, suffix: &str) -> PathBuf {
@@ -654,7 +1024,7 @@ fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
     let dict = reference_dict_path(reference);
 
     let fai_data = parse_fai_file(&fai)?;
-    validate_bwa_mem2_indexes(reference)?;
+    validate_bwa_or_bwa_mem2_indexes(reference)?;
     let dict_map = parse_dict_file(&dict)?;
 
     let mut mismatch: Vec<String> = Vec::new();
@@ -690,15 +1060,41 @@ fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_bwa_mem2_indexes(reference: &Path) -> Result<(), String> {
+fn validate_bwa_or_bwa_mem2_indexes(reference: &Path) -> Result<(), String> {
+    let mut mem2_missing: Vec<String> = Vec::new();
     for p in bwa_mem2_index_paths(reference) {
-        check_readable_nonempty(&p)?;
+        if let Err(e) = check_readable_nonempty(&p) {
+            mem2_missing.push(e);
+        }
     }
-    Ok(())
+    if mem2_missing.is_empty() {
+        return Ok(());
+    }
+    let mut bwa_missing: Vec<String> = Vec::new();
+    for p in bwa_index_paths(reference) {
+        if let Err(e) = check_readable_nonempty(&p) {
+            bwa_missing.push(e);
+        }
+    }
+    if bwa_missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "BWA index not ready (need either bwa-mem2 or bwa files). bwa-mem2 missing: {}; bwa missing: {}",
+        mem2_missing.join(" | "),
+        bwa_missing.join(" | ")
+    ))
 }
 
 fn bwa_mem2_index_paths(reference: &Path) -> Vec<PathBuf> {
     [".0123", ".amb", ".ann", ".bwt.2bit.64", ".pac"]
+        .iter()
+        .map(|suffix| reference_sidecar(reference, suffix))
+        .collect()
+}
+
+fn bwa_index_paths(reference: &Path) -> Vec<PathBuf> {
+    [".amb", ".ann", ".bwt", ".pac", ".sa"]
         .iter()
         .map(|suffix| reference_sidecar(reference, suffix))
         .collect()
@@ -930,6 +1326,22 @@ fn classify_fastq_pairs(files: &[PathBuf]) -> Result<BTreeMap<String, (PathBuf, 
     Ok(complete)
 }
 
+fn recognized_fastq_pairing_hint() -> String {
+    let suffix_hint = FASTQ_SUFFIXES.join(", ");
+    let read_hint = [
+        "_R1/_R2",
+        ".R1/.R2",
+        "_READ1/_READ2",
+        "_1/_2",
+        ".1/.2",
+        "_R1_001/_R2_001",
+    ]
+    .join(", ");
+    format!(
+        "No valid paired FASTQ files were detected.\nRecognized FASTQ suffixes: {suffix_hint}\nRecognized R1/R2 naming tokens: {read_hint}\nExamples: sample_R1.fastq.gz + sample_R2.fastq.gz; sample.1.fq.gz + sample.2.fq.gz"
+    )
+}
+
 fn strip_fastq_suffix(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     for suffix in FASTQ_SUFFIXES {
@@ -1033,44 +1445,6 @@ fn sanitize_sample_key(raw: &str) -> String {
         }
     }
     out.trim_matches('_').to_string()
-}
-
-fn build_metadata_json(
-    reference: &Path,
-    chroms: &[String],
-    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
-) -> String {
-    let mut json = String::new();
-    json.push('{');
-    json.push_str("\"reference\":");
-    json.push_str(&json_string(&reference.to_string_lossy()));
-    json.push_str(",\"samples\":{");
-
-    let mut first = true;
-    for (sample, (r1, r2)) in samples {
-        if !first {
-            json.push(',');
-        }
-        first = false;
-        json.push_str(&json_string(sample));
-        json.push(':');
-        json.push('[');
-        json.push_str(&json_string(&r1.to_string_lossy()));
-        json.push(',');
-        json.push_str(&json_string(&r2.to_string_lossy()));
-        json.push(']');
-    }
-    json.push('}');
-    json.push_str(",\"chrom\":[");
-    for (idx, chrom) in chroms.iter().enumerate() {
-        if idx > 0 {
-            json.push(',');
-        }
-        json.push_str(&json_string(chrom));
-    }
-    json.push(']');
-    json.push('}');
-    json
 }
 
 fn build_run_params_json(
@@ -1191,6 +1565,56 @@ fn latest_snp_table(workdir: &Path) -> Option<PathBuf> {
     tables.pop()
 }
 
+fn build_fastp_step(
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    workdir: &Path,
+    backend: &str,
+    singularity: &str,
+) -> Result<PipelineStep, String> {
+    let cleanfolder = workdir.join("1.clean");
+    fs::create_dir_all(&cleanfolder)
+        .map_err(|e| format!("Failed to create {}: {e}", cleanfolder.display()))?;
+
+    let sample_names: Vec<String> = samples.keys().cloned().collect();
+    let mut step_cmds = Vec::new();
+    let mut step_inputs = Vec::new();
+    let mut step_outputs = Vec::new();
+    let mut step_items = Vec::new();
+    for sample in &sample_names {
+        let Some((fq1, fq2)) = samples.get(sample) else {
+            return Err(format!("Sample missing FASTQ pair in metadata: {sample}"));
+        };
+        step_inputs.push(fq1.clone());
+        step_inputs.push(fq2.clone());
+        let out_r1 = cleanfolder.join(format!("{sample}.R1.clean.fastq.gz"));
+        let out_r2 = cleanfolder.join(format!("{sample}.R2.clean.fastq.gz"));
+        let out_html = cleanfolder.join(format!("{sample}.html"));
+        let out_json = cleanfolder.join(format!("{sample}.json"));
+        let raw = cmd_fastp(sample, fq1, fq2, &cleanfolder, 16, singularity);
+        step_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("fastp.{sample}"),
+            16,
+            backend,
+        ));
+        let outs = vec![out_r1, out_r2, out_html, out_json];
+        step_outputs.extend(outs.clone());
+        step_items.push(StepItem {
+            id: format!("fastp.{sample}"),
+            outputs: outs,
+        });
+    }
+    Ok(PipelineStep {
+        id: "step1_fastp".to_string(),
+        name: "fastp".to_string(),
+        eta_minutes: Some(15),
+        commands: step_cmds,
+        inputs: dedup_paths(step_inputs),
+        outputs: dedup_paths(step_outputs),
+        items: step_items,
+    })
+}
+
 fn build_fastq2vcf_steps(
     reference: &Path,
     samples: &BTreeMap<String, (PathBuf, PathBuf)>,
@@ -1198,7 +1622,9 @@ fn build_fastq2vcf_steps(
     chrom_lens: &BTreeMap<String, u64>,
     workdir: &Path,
     backend: &str,
+    aligner_tool: &str,
     singularity: &str,
+    include_fastp_step: bool,
 ) -> Result<Vec<PipelineStep>, String> {
     let cleanfolder = workdir.join("1.clean");
     let mappingfolder = workdir.join("2.mapping");
@@ -1221,43 +1647,9 @@ fn build_fastq2vcf_steps(
     let sample_names: Vec<String> = samples.keys().cloned().collect();
     let mut steps: Vec<PipelineStep> = Vec::new();
 
-    let mut step1_cmds = Vec::new();
-    let mut step1_inputs = Vec::new();
-    let mut step1_outputs = Vec::new();
-    let mut step1_items = Vec::new();
-    for sample in &sample_names {
-        let Some((fq1, fq2)) = samples.get(sample) else {
-            return Err(format!("Sample missing FASTQ pair in metadata: {sample}"));
-        };
-        step1_inputs.push(fq1.clone());
-        step1_inputs.push(fq2.clone());
-        let out_r1 = cleanfolder.join(format!("{sample}.R1.clean.fastq.gz"));
-        let out_r2 = cleanfolder.join(format!("{sample}.R2.clean.fastq.gz"));
-        let out_html = cleanfolder.join(format!("{sample}.html"));
-        let out_json = cleanfolder.join(format!("{sample}.json"));
-        let raw = cmd_fastp(sample, fq1, fq2, &cleanfolder, 16, singularity);
-        step1_cmds.push(wrap_scheduler_cmd(
-            &raw,
-            &format!("fastp.{sample}"),
-            16,
-            backend,
-        ));
-        let outs = vec![out_r1, out_r2, out_html, out_json];
-        step1_outputs.extend(outs.clone());
-        step1_items.push(StepItem {
-            id: format!("fastp.{sample}"),
-            outputs: outs,
-        });
+    if include_fastp_step {
+        steps.push(build_fastp_step(samples, workdir, backend, singularity)?);
     }
-    steps.push(PipelineStep {
-        id: "step1_fastp".to_string(),
-        name: "fastp".to_string(),
-        eta_minutes: Some(15),
-        commands: step1_cmds,
-        inputs: dedup_paths(step1_inputs),
-        outputs: dedup_paths(step1_outputs),
-        items: step1_items,
-    });
 
     let mut step2_cmds = Vec::new();
     let mut step2_inputs = Vec::new();
@@ -1270,7 +1662,16 @@ fn build_fastq2vcf_steps(
         step2_inputs.push(r2.clone());
         let out_bam = mappingfolder.join(format!("{sample}.sorted.bam"));
         let out_done = mappingfolder.join(format!("{sample}.sorted.bam.finished"));
-        let raw = cmd_bwamem(reference, sample, &r1, &r2, &mappingfolder, 64, singularity);
+        let raw = cmd_bwamem(
+            reference,
+            sample,
+            &r1,
+            &r2,
+            &mappingfolder,
+            64,
+            aligner_tool,
+            singularity,
+        );
         step2_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("bwamem.{sample}"),
@@ -1634,15 +2035,16 @@ fn dynamic_impute_threads(chrom: &str, chrom_lens: &BTreeMap<String, u64>, max_t
     t.min(max_threads).max(1)
 }
 
-fn run_shell_with_spinner(cwd: &Path, cmdline: &str, desc: &str) -> Result<(), String> {
+fn run_shell_capture(cwd: &Path, cmdline: &str, desc: &str) -> Result<(), String> {
     let mut cmd = shell_cmd(cmdline);
     cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (out, elapsed) = super::run_with_spinner(&mut cmd, &format!("{desc} ..."))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("Failed to run command for {desc}: {e}"))?;
     if out.status.success() {
-        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(elapsed)));
         return Ok(());
     }
     let mut msg = String::new();
@@ -1655,34 +2057,123 @@ fn run_shell_with_spinner(cwd: &Path, cmdline: &str, desc: &str) -> Result<(), S
     ))
 }
 
-fn wait_for_paths(paths: &[PathBuf], desc: &str, poll: Duration) -> Result<(), String> {
-    if paths.iter().all(|p| p.exists()) {
-        return Ok(());
+fn wait_for_reference_index_ready(
+    task: &ReferenceIndexTask,
+    desc: &str,
+    _poll: Duration,
+    soft_wait: Option<Duration>,
+    emit_ui: bool,
+) -> Result<ReferenceWaitStatus, String> {
+    if validate_reference_index_integrity(&task.reference).is_ok() {
+        return Ok(ReferenceWaitStatus::Ready);
     }
     let start = Instant::now();
-    let is_tty = io::stdout().is_terminal();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut i = 0usize;
-
-    while !paths.iter().all(|p| p.exists()) {
+    let max_wait_non_csub = Duration::from_secs(30 * 60);
+    let max_wait_csub_hard = Duration::from_secs(72 * 60 * 60);
+    let csub_inactive_timeout = Duration::from_secs(30 * 60);
+    let mut csub_last_active = Instant::now();
+    let mut csub_probe_issue: Option<String> = None;
+    let is_tty = emit_ui && io::stdout().is_terminal();
+    loop {
+        match validate_reference_index_integrity(&task.reference) {
+            Ok(()) => break,
+            Err(_) => {}
+        }
+        if let Some(err) = find_failed_step_error_snippet(task)? {
+            if is_tty {
+                print!("\r\x1b[2K");
+                io::stdout()
+                    .flush()
+                    .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+            }
+            return Err(format!("{desc} failed: {err}"));
+        }
+        if let Some(limit) = soft_wait {
+            if start.elapsed() >= limit {
+                if is_tty {
+                    print!("\r\x1b[2K");
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+                }
+                return Ok(ReferenceWaitStatus::Pending);
+            }
+        }
+        if task.is_csub {
+            match csub_job_is_active(&task.safe_job) {
+                Ok(true) => {
+                    csub_last_active = Instant::now();
+                    csub_probe_issue = None;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    csub_probe_issue = Some(e);
+                    // Do not treat cjobs probe failure as immediate inactivity.
+                    csub_last_active = Instant::now();
+                }
+            }
+            if start.elapsed() >= max_wait_csub_hard {
+                if is_tty {
+                    print!("\r\x1b[2K");
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+                }
+                let probe_tip = csub_probe_issue
+                    .as_ref()
+                    .map(|e| format!(" Last cjobs probe error: {e}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{desc} timeout after {} (hard limit) with csub mode. Please check {} and queue status.{probe_tip}",
+                    super::format_elapsed(max_wait_csub_hard),
+                    task.workdir.join("log").display()
+                ));
+            }
+            if csub_last_active.elapsed() >= csub_inactive_timeout {
+                if is_tty {
+                    print!("\r\x1b[2K");
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+                }
+                return Err(format!(
+                    "{desc} timeout: no active csub job named `{}` for {} and indexes are still incomplete. Check {}.",
+                    task.safe_job,
+                    super::format_elapsed(csub_inactive_timeout),
+                    task.workdir.join("log").display()
+                ));
+            }
+        } else if start.elapsed() >= max_wait_non_csub {
+            if is_tty {
+                print!("\r\x1b[2K");
+                io::stdout()
+                    .flush()
+                    .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+            }
+            return Err(format!(
+                "{desc} timeout after {}. Please check log files under {}.",
+                super::format_elapsed(max_wait_non_csub),
+                task.workdir.join("log").display()
+            ));
+        }
         if is_tty {
+            let elapsed = start.elapsed();
             let line = format!(
                 "\r{} {} [{}]",
-                frames[i % frames.len()],
+                super::spinner_frame_for_elapsed(elapsed),
                 desc,
-                super::format_elapsed(start.elapsed())
+                super::format_elapsed_live(elapsed)
             );
             if super::supports_color() {
-                print!("{}", super::style_green(&line));
+                print!("{}", super::style_yellow(&line));
             } else {
                 print!("{line}");
             }
             io::stdout()
                 .flush()
                 .map_err(|e| format!("Failed to flush progress output: {e}"))?;
-            i += 1;
         }
-        thread::sleep(poll);
+        thread::sleep(super::spinner_refresh_interval(start.elapsed()));
     }
     if is_tty {
         print!("\r\x1b[2K");
@@ -1690,11 +2181,335 @@ fn wait_for_paths(paths: &[PathBuf], desc: &str, poll: Duration) -> Result<(), S
             .flush()
             .map_err(|e| format!("Failed to flush progress output: {e}"))?;
     }
-    super::print_success_line(&format!(
-        "{desc}[{}]",
-        super::format_elapsed(start.elapsed())
-    ));
-    Ok(())
+    if emit_ui {
+        super::print_success_line(&format!(
+            "{} ...Finished [{}]",
+            "Reference index check",
+            super::format_elapsed_live(start.elapsed())
+        ));
+    }
+    Ok(ReferenceWaitStatus::Ready)
+}
+
+fn run_fastp_and_index_parallel(
+    workdir: &Path,
+    fastp_step: &PipelineStep,
+    fastp_opts: &PipelineOptions,
+    index_task: &ReferenceIndexTask,
+) -> Result<(Duration, Duration), String> {
+    let workdir_c = workdir.to_path_buf();
+    let fastp_step_c = fastp_step.clone();
+    let fastp_opts_c = fastp_opts.clone();
+    let index_task_c = index_task.clone();
+
+    let (tx_fastp, rx_fastp) = mpsc::channel::<Result<(), String>>();
+    let (tx_index, rx_index) = mpsc::channel::<Result<(), String>>();
+
+    let fastp_start = Instant::now();
+    let index_start = Instant::now();
+
+    thread::spawn(move || {
+        let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
+        let res = run_pipeline_with_hook(
+            &workdir_c,
+            std::slice::from_ref(&fastp_step_c),
+            &fastp_opts_c,
+            &mut noop_hook,
+        );
+        let _ = tx_fastp.send(res);
+    });
+
+    thread::spawn(move || {
+        let res = wait_reference_indexes_silent(&index_task_c);
+        let _ = tx_index.send(res);
+    });
+
+    let mut fastp_done: Option<Result<(), String>> = None;
+    let mut index_done: Option<Result<(), String>> = None;
+    let mut fastp_elapsed = Duration::from_secs(0);
+    let mut index_elapsed = Duration::from_secs(0);
+    let is_tty = io::stdout().is_terminal();
+    let mut rendered = false;
+
+    if is_tty {
+        // Reserve exactly two lines for deterministic in-place refresh:
+        // line 1 = reference index, line 2 = fastp step.
+        print!("\n\n");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to initialize parallel progress block: {e}"))?;
+    }
+
+    loop {
+        if fastp_done.is_none() {
+            match rx_fastp.try_recv() {
+                Ok(v) => {
+                    fastp_elapsed = fastp_start.elapsed();
+                    fastp_done = Some(v);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    fastp_elapsed = fastp_start.elapsed();
+                    fastp_done = Some(Err("fastp worker disconnected unexpectedly".to_string()));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if index_done.is_none() {
+            match rx_index.try_recv() {
+                Ok(v) => {
+                    index_elapsed = index_start.elapsed();
+                    index_done = Some(v);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    index_elapsed = index_start.elapsed();
+                    index_done = Some(Err("reference index worker disconnected unexpectedly".to_string()));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        if is_tty {
+            // Always move to the beginning of the reserved two-line block.
+            print!("\x1b[2F");
+
+            let idx_elapsed_now = if index_done.is_some() {
+                index_elapsed
+            } else {
+                index_start.elapsed()
+            };
+            let idx_line = if index_done.is_some() {
+                format!(
+                    "✔︎ Reference index check ...Finished [{}]",
+                    super::format_elapsed_live(idx_elapsed_now)
+                )
+            } else {
+                format!(
+                    "{} Reference index check failed, Rebuilding indexes... [{}]",
+                    super::spinner_frame_for_elapsed(idx_elapsed_now),
+                    super::format_elapsed_live(idx_elapsed_now)
+                )
+            };
+            print!("\x1b[2K\r{}\n", super::style_yellow(&idx_line));
+
+            let fp_elapsed_now = if fastp_done.is_some() {
+                fastp_elapsed
+            } else {
+                fastp_start.elapsed()
+            };
+            let fp_line = if fastp_done.is_some() {
+                format!(
+                    "✔︎ Step 1/10: fastp (~15m) ...Finished [{}]",
+                    super::format_elapsed_live(fp_elapsed_now)
+                )
+            } else {
+                format!(
+                    "{} Step 1/10: fastp (~15m) [{}]",
+                    super::spinner_frame_for_elapsed(fp_elapsed_now),
+                    super::format_elapsed_live(fp_elapsed_now)
+                )
+            };
+            print!("\x1b[2K\r{}\n", super::style_green(&fp_line));
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("Failed to flush parallel progress output: {e}"))?;
+            rendered = true;
+        }
+
+        if fastp_done.is_some() && index_done.is_some() {
+            break;
+        }
+        let tick_elapsed = if index_done.is_none() {
+            index_start.elapsed()
+        } else {
+            fastp_start.elapsed()
+        };
+        thread::sleep(super::spinner_refresh_interval(tick_elapsed));
+    }
+
+    if is_tty && rendered {
+        // Delete the reserved two-line block so no blank lines remain.
+        // Cursor is at the line below block; move to block start then delete 2 lines.
+        print!("\x1b[2F\x1b[2M\r");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to clear parallel progress block: {e}"))?;
+    }
+
+    if let Some(Err(e)) = index_done {
+        return Err(e);
+    }
+    if let Some(Err(e)) = fastp_done {
+        return Err(e);
+    }
+    Ok((fastp_elapsed, index_elapsed))
+}
+
+fn csub_job_is_active(safe_job: &str) -> Result<bool, String> {
+    let out = Command::new("cjobs")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run cjobs: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Err(format!(
+            "cjobs exited with code {}: {}",
+            super::exit_code(out.status),
+            msg.trim()
+        ));
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let raw = line.trim();
+        if raw.is_empty() || raw.starts_with("JOBID") {
+            continue;
+        }
+        let cols: Vec<&str> = raw.split_whitespace().collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let stat = cols[2].trim().to_ascii_uppercase();
+        let active = matches!(
+            stat.as_str(),
+            "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP"
+        );
+        if !active {
+            continue;
+        }
+        if csub_job_name_matches_safe(cols[6].trim(), safe_job) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn csub_job_name_matches_safe(job_name: &str, safe_job: &str) -> bool {
+    let j = job_name.trim();
+    if j.is_empty() {
+        return false;
+    }
+    if j == safe_job {
+        return true;
+    }
+    let j1 = j.trim_start_matches('*');
+    if !j1.is_empty() && (j1 == safe_job || safe_job.ends_with(j1)) {
+        return true;
+    }
+    let j2 = j.trim_matches('*');
+    !j2.is_empty() && (j2 == safe_job || safe_job.ends_with(j2))
+}
+
+fn collect_existing_step_error_logs(
+    workdir: &Path,
+    safe_job: &str,
+) -> Result<HashSet<PathBuf>, String> {
+    let mut ignore: HashSet<PathBuf> = HashSet::new();
+    let log_dir = workdir.join("log");
+    if !log_dir.exists() {
+        return Ok(ignore);
+    }
+    for entry in
+        fs::read_dir(&log_dir).map_err(|e| format!("Failed to read {}: {e}", log_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if name == format!("{safe_job}.e")
+            || (name.starts_with(&(safe_job.to_string() + ".")) && name.ends_with(".e"))
+        {
+            ignore.insert(path);
+        }
+    }
+    Ok(ignore)
+}
+
+fn find_failed_step_error_snippet(task: &ReferenceIndexTask) -> Result<Option<String>, String> {
+    let log_dir = task.workdir.join("log");
+    if !log_dir.exists() {
+        return Ok(None);
+    }
+    let mut err_files: Vec<PathBuf> = Vec::new();
+    for entry in
+        fs::read_dir(&log_dir).map_err(|e| format!("Failed to read {}: {e}", log_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if (name == format!("{}.e", task.safe_job)
+            || (name.starts_with(&(task.safe_job.clone() + ".")) && name.ends_with(".e")))
+            && fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0
+            && !task.ignore_error_logs.contains(&path)
+        {
+            err_files.push(path);
+        }
+    }
+    err_files.sort();
+    for ef in err_files {
+        let text = fs::read_to_string(&ef).unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let fatal = text
+            .lines()
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty() && is_likely_fatal_stderr_line(x))
+            .take(4)
+            .collect::<Vec<String>>();
+        if !fatal.is_empty() {
+            return Ok(Some(fatal.join(" | ")));
+        }
+    }
+    Ok(None)
+}
+
+fn is_likely_fatal_stderr_line(line: &str) -> bool {
+    let s = line.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    if s.contains("no version information available (required by") {
+        return false;
+    }
+    if s.starts_with("job ") && s.contains(" stderr output") {
+        return true;
+    }
+    let keys = [
+        "traceback (most recent call last)",
+        "runtimeerror",
+        "exception",
+        "fatal",
+        "error",
+        "failed",
+        "daemon is not running",
+        "no such file or directory",
+        "command not found",
+        "permission denied",
+        "segmentation fault",
+        "killed",
+        "terminated",
+        "cancelled",
+        "canceled",
+        "sigterm",
+        "sigkill",
+        "out of memory",
+        "oom",
+    ];
+    keys.iter().any(|k| s.contains(k))
 }
 
 fn shell_cmd(cmdline: &str) -> Command {

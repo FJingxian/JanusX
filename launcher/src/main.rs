@@ -268,13 +268,12 @@ fn warm_up_jx(jx_bin: &Path, runtime_home: &Path) -> Result<(), String> {
     let warm_done_c = Arc::clone(&warm_done);
     let warm_progress = if io::stdout().is_terminal() {
         Some(thread::spawn(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0usize;
             while !warm_done_c.load(Ordering::Relaxed) {
+                let elapsed = warm_start.elapsed();
                 let line = format!(
                     "{} Warming up ...[{}]",
-                    frames[i % frames.len()],
-                    format_elapsed(warm_start.elapsed())
+                    spinner_frame_for_elapsed(elapsed),
+                    format_elapsed_live(elapsed)
                 );
                 if supports_color() {
                     print!("\r{}", style_green(&line));
@@ -282,8 +281,7 @@ fn warm_up_jx(jx_bin: &Path, runtime_home: &Path) -> Result<(), String> {
                     print!("\r{}", line);
                 }
                 let _ = io::stdout().flush();
-                i += 1;
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(spinner_refresh_interval(elapsed));
             }
             print!("\r\x1b[2K");
             let _ = io::stdout().flush();
@@ -4003,6 +4001,40 @@ fn format_elapsed(d: Duration) -> String {
     format!("{h}h{m:02}m")
 }
 
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub(crate) fn spinner_refresh_interval(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_secs(60) {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+pub(crate) fn format_elapsed_live(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60.0 {
+        let tenths = (secs * 10.0).floor() / 10.0;
+        return format!("{tenths:.1}s");
+    }
+    if secs < 3600.0 {
+        let total = secs.floor() as u64;
+        let m = total / 60;
+        let s = total % 60;
+        return format!("{m}m{s:02}s");
+    }
+    let total_min = (secs / 60.0).floor() as u64;
+    let h = total_min / 60;
+    let m = total_min % 60;
+    format!("{h}h{m:02}m")
+}
+
+pub(crate) fn spinner_frame_for_elapsed(elapsed: Duration) -> &'static str {
+    let step_ms = spinner_refresh_interval(elapsed).as_millis().max(1);
+    let idx = ((elapsed.as_millis() / step_ms) as usize) % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
 fn print_success_line(msg: &str) {
     let tty = io::stdout().is_terminal();
     if tty && supports_color() {
@@ -4420,19 +4452,21 @@ fn run_with_spinner(cmd: &mut Command, desc: &str) -> Result<(Output, Duration),
 
     let spinner = if is_tty {
         Some(thread::spawn(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0usize;
             while !done_c.load(Ordering::Relaxed) {
-                let elapsed = format_elapsed(start.elapsed());
-                let line = format!("\r{} {} [{}]", frames[i % frames.len()], desc_s, elapsed);
+                let elapsed = start.elapsed();
+                let line = format!(
+                    "\r{} {} [{}]",
+                    spinner_frame_for_elapsed(elapsed),
+                    desc_s,
+                    format_elapsed_live(elapsed)
+                );
                 if supports_color() {
                     print!("{}", style_green(&line));
                 } else {
                     print!("{line}");
                 }
                 let _ = io::stdout().flush();
-                i += 1;
-                thread::sleep(Duration::from_millis(80));
+                thread::sleep(spinner_refresh_interval(elapsed));
             }
             print!("\r\x1b[2K");
             let _ = io::stdout().flush();
@@ -4645,6 +4679,7 @@ fn pip_install_tail(
     if is_tty {
         render_prelog_spinner_line(desc, start.elapsed())?;
         prelog_spinner_shown = true;
+        last_render = Instant::now();
     }
 
     while channel_open {
@@ -4730,23 +4765,30 @@ fn pip_install_tail(
                         .try_wait()
                         .map_err(|e| format!("Failed to poll pip install status: {e}"))?;
                 }
-                if is_tty && !tail_mode_started && !saw_any_line {
-                    render_prelog_spinner_line(desc, start.elapsed())?;
+                let elapsed = start.elapsed();
+                let refresh_every = spinner_refresh_interval(elapsed);
+                if is_tty
+                    && !tail_mode_started
+                    && !saw_any_line
+                    && last_render.elapsed() >= refresh_every
+                {
+                    render_prelog_spinner_line(desc, elapsed)?;
                     prelog_spinner_shown = true;
+                    last_render = Instant::now();
                 }
                 if is_tty
                     && !tail_mode_started
                     && streaming_title_started
-                    && last_render.elapsed() >= Duration::from_millis(100)
+                    && last_render.elapsed() >= refresh_every
                 {
-                    render_streaming_title_only(desc, start.elapsed(), streamed_lines_before_tail)?;
+                    render_streaming_title_only(desc, elapsed, streamed_lines_before_tail)?;
                     last_render = Instant::now();
                 }
                 if is_tty
                     && tail_mode_started
-                    && last_render.elapsed() >= Duration::from_millis(100)
+                    && last_render.elapsed() >= refresh_every
                 {
-                    render_tail_title_only(desc, start.elapsed(), max_lines)?;
+                    render_tail_title_only(desc, elapsed, max_lines)?;
                     rendered = true;
                     last_render = Instant::now();
                 }
@@ -4801,7 +4843,7 @@ fn pip_install_tail(
                 } else {
                     let width = terminal_line_width();
                     let title = truncate_plain_line(
-                        &format!("{final_symbol} {desc}[{}]", format_elapsed(start.elapsed())),
+                        &format!("{final_symbol} {desc}[{}]", format_elapsed_live(start.elapsed())),
                         width,
                     );
                     if status.success() {
@@ -4852,17 +4894,20 @@ fn render_tail_block(
         print!("\x1b[{}A", max_lines.saturating_add(1));
     }
     let width = terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if symbol.is_empty() {
-        let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
         let title = truncate_plain_line(
-            &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+            &format!(
+                "{} {}[{}]",
+                spinner_frame_for_elapsed(elapsed),
+                desc,
+                format_elapsed_live(elapsed)
+            ),
             width,
         );
         print!("\x1b[2K\r{}\n", style_green(&title));
     } else {
         let title = truncate_plain_line(
-            &format!("{symbol} {desc}[{}]", format_elapsed(elapsed)),
+            &format!("{symbol} {desc}[{}]", format_elapsed_live(elapsed)),
             width,
         );
         if symbol == "✘" {
@@ -4889,10 +4934,13 @@ fn render_tail_block(
 
 fn render_tail_title_only(desc: &str, elapsed: Duration, max_lines: usize) -> Result<(), String> {
     let width = terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = truncate_plain_line(
-        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        &format!(
+            "{} {}[{}]",
+            spinner_frame_for_elapsed(elapsed),
+            desc,
+            format_elapsed_live(elapsed)
+        ),
         width,
     );
     // Cursor is at the bottom of the fixed block; move to title row, rewrite title only, then return.
@@ -4911,7 +4959,7 @@ fn render_streaming_failure_compact(
     lines_below: usize,
 ) -> Result<(), String> {
     let width = terminal_line_width();
-    let title = truncate_plain_line(&format!("✘ {desc}[{}]", format_elapsed(elapsed)), width);
+    let title = truncate_plain_line(&format!("✘ {desc}[{}]", format_elapsed_live(elapsed)), width);
     // Move to title row, rewrite as failure, then delete streamed log rows entirely.
     let up = lines_below.saturating_add(1);
     print!("\x1b[{}A", up);
@@ -4931,7 +4979,7 @@ fn render_tail_success_compact(
     max_lines: usize,
 ) -> Result<(), String> {
     let width = terminal_line_width();
-    let title = truncate_plain_line(&format!("✔︎ {desc}[{}]", format_elapsed(elapsed)), width);
+    let title = truncate_plain_line(&format!("✔︎ {desc}[{}]", format_elapsed_live(elapsed)), width);
     // Cursor is currently below the fixed block.
     // Move to title row, print success title, then delete tail log rows entirely.
     print!("\x1b[{}A", max_lines.saturating_add(1));
@@ -4961,10 +5009,13 @@ fn clear_tail_title_only(max_lines: usize) -> Result<(), String> {
 
 fn render_prelog_spinner_line(desc: &str, elapsed: Duration) -> Result<(), String> {
     let width = terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = truncate_plain_line(
-        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        &format!(
+            "{} {}[{}]",
+            spinner_frame_for_elapsed(elapsed),
+            desc,
+            format_elapsed_live(elapsed)
+        ),
         width,
     );
     if supports_color() {
@@ -4980,10 +5031,13 @@ fn render_prelog_spinner_line(desc: &str, elapsed: Duration) -> Result<(), Strin
 
 fn render_streaming_title_init(desc: &str, elapsed: Duration) -> Result<(), String> {
     let width = terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = truncate_plain_line(
-        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        &format!(
+            "{} {}[{}]",
+            spinner_frame_for_elapsed(elapsed),
+            desc,
+            format_elapsed_live(elapsed)
+        ),
         width,
     );
     print!("\r\x1b[2K{}\n", style_green(&title));
@@ -4999,10 +5053,13 @@ fn render_streaming_title_only(
     lines_below: usize,
 ) -> Result<(), String> {
     let width = terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = truncate_plain_line(
-        &format!("{} {}[{}]", frames[idx], desc, format_elapsed(elapsed)),
+        &format!(
+            "{} {}[{}]",
+            spinner_frame_for_elapsed(elapsed),
+            desc,
+            format_elapsed_live(elapsed)
+        ),
         width,
     );
     let up = lines_below.saturating_add(1);
@@ -5147,4 +5204,54 @@ Linux examples:\n\
 
 fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn spinner_refresh_interval_rule() {
+        assert_eq!(
+            spinner_refresh_interval(Duration::from_millis(0)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            spinner_refresh_interval(Duration::from_millis(59_999)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            spinner_refresh_interval(Duration::from_secs(60)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            spinner_refresh_interval(Duration::from_secs(3600)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn format_elapsed_live_rule() {
+        assert_eq!(format_elapsed_live(Duration::from_millis(0)), "0.0s");
+        assert_eq!(format_elapsed_live(Duration::from_millis(50)), "0.0s");
+        assert_eq!(format_elapsed_live(Duration::from_millis(59900)), "59.9s");
+        assert_eq!(format_elapsed_live(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed_live(Duration::from_secs(3599)), "59m59s");
+        assert_eq!(format_elapsed_live(Duration::from_secs(3600)), "1h00m");
+        assert_eq!(format_elapsed_live(Duration::from_secs(3661)), "1h01m");
+    }
+
+    #[test]
+    fn spinner_frame_changes_follow_refresh_step() {
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(0)), "⠋");
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(50)), "⠋");
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(100)), "⠙");
+
+        let frame_60_100 = spinner_frame_for_elapsed(Duration::from_millis(60_100));
+        let frame_60_900 = spinner_frame_for_elapsed(Duration::from_millis(60_900));
+        let frame_61_000 = spinner_frame_for_elapsed(Duration::from_millis(61_000));
+        assert_eq!(frame_60_100, frame_60_900);
+        assert_ne!(frame_60_900, frame_61_000);
+    }
 }

@@ -39,6 +39,12 @@ const FASTQ2VCF_TOTAL_STEPS: usize = 10;
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlignerFlavor {
+    Bwa,
+    BwaMem2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadKind {
     R1,
     R2,
@@ -86,6 +92,7 @@ struct ReferenceIndexTask {
     safe_job: String,
     ignore_error_logs: HashSet<PathBuf>,
     is_csub: bool,
+    aligner_flavor: AlignerFlavor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +134,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     let jx_cmd = "jx";
-    let (toolchain, aligner_cmd) = probe_dlc_toolchain()?;
+    let (toolchain, aligner_cmd, aligner_flavor) = probe_dlc_toolchain()?;
     print_toolchain_line(&toolchain);
     let missing_wrappers = missing_tools_from_probe(&toolchain);
     if !missing_wrappers.is_empty() {
@@ -218,6 +225,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         jx_cmd,
         "indexREF",
         &aligner_cmd,
+        aligner_flavor,
     )?;
 
     let fastp_step = build_fastp_step(&samples, &workdir, &backend, &singularity)?;
@@ -761,7 +769,7 @@ fn detect_backend() -> (String, String) {
     )
 }
 
-fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
+fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String, AlignerFlavor), String> {
     let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
     let mut out: Vec<ToolProbe> = Vec::new();
 
@@ -774,7 +782,7 @@ fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
         ));
     }
 
-    let (aligner_display, aligner_ok, aligner_cmd, aligner_missing_hint) =
+    let (aligner_display, aligner_ok, aligner_cmd, aligner_missing_hint, aligner_flavor) =
         probe_aligner_tool(&jx_bin);
     out.push((
         aligner_display,
@@ -786,28 +794,35 @@ fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
     if !aligner_ok {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out.dedup_by(|a, b| a.0 == b.0);
-        return Ok((out, aligner_cmd));
+        return Ok((out, aligner_cmd, aligner_flavor));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok((out, aligner_cmd))
+    Ok((out, aligner_cmd, aligner_flavor))
 }
 
-fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
+fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String, AlignerFlavor) {
     let mem2_ok = probe_dlc_tool_wrapper(jx_bin, "bwa-mem2");
     let bwa_ok = probe_dlc_tool_wrapper(jx_bin, "bwa");
     if mem2_ok {
-        let display = if !bwa_ok && bwa_mem2_is_bwa_alias(jx_bin) {
+        let mem2_is_alias = !bwa_ok && bwa_mem2_is_bwa_alias(jx_bin);
+        let display = if mem2_is_alias {
             "bwa".to_string()
         } else {
             "bwa-mem2".to_string()
+        };
+        let flavor = if mem2_is_alias {
+            AlignerFlavor::Bwa
+        } else {
+            AlignerFlavor::BwaMem2
         };
         return (
             display,
             true,
             "jx bwa-mem2".to_string(),
             "bwa-mem2 or bwa".to_string(),
+            flavor,
         );
     }
     if bwa_ok {
@@ -816,6 +831,7 @@ fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
             true,
             "jx bwa".to_string(),
             "bwa-mem2 or bwa".to_string(),
+            AlignerFlavor::Bwa,
         );
     }
     if let Some(mem2_bin) = find_in_path("bwa-mem2") {
@@ -824,6 +840,7 @@ fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
             true,
             sh_quote(&mem2_bin.to_string_lossy()),
             "bwa-mem2 or bwa".to_string(),
+            AlignerFlavor::BwaMem2,
         );
     }
     if let Some(bwa_bin) = find_in_path("bwa") {
@@ -832,6 +849,7 @@ fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
             true,
             sh_quote(&bwa_bin.to_string_lossy()),
             "bwa-mem2 or bwa".to_string(),
+            AlignerFlavor::Bwa,
         );
     }
     (
@@ -839,6 +857,7 @@ fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
         false,
         "jx bwa-mem2".to_string(),
         "bwa-mem2 or bwa".to_string(),
+        AlignerFlavor::BwaMem2,
     )
 }
 
@@ -943,6 +962,7 @@ fn start_reference_indexing(
     jx_prefix: &str,
     job_name: &str,
     aligner_cmd: &str,
+    aligner_flavor: AlignerFlavor,
 ) -> Result<Option<ReferenceIndexTask>, String> {
     let reference = absolutize_path(reference)?;
     fs::create_dir_all(workdir.join("log")).map_err(|e| {
@@ -951,7 +971,7 @@ fn start_reference_indexing(
             workdir.join("log").display()
         )
     })?;
-    if validate_reference_index_integrity(&reference).is_ok() {
+    if validate_reference_index_integrity(&reference, aligner_flavor).is_ok() {
         return Ok(None);
     }
 
@@ -979,6 +999,7 @@ fn start_reference_indexing(
         safe_job,
         ignore_error_logs,
         is_csub: backend == "csub",
+        aligner_flavor,
     }))
 }
 
@@ -1045,12 +1066,15 @@ fn read_fai_data_from_reference(reference: &Path) -> Result<FaiData, String> {
     parse_fai_file(&fai)
 }
 
-fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
+fn validate_reference_index_integrity(
+    reference: &Path,
+    aligner_flavor: AlignerFlavor,
+) -> Result<(), String> {
     let fai = reference_sidecar(reference, ".fai");
     let dict = reference_dict_path(reference);
 
     let fai_data = parse_fai_file(&fai)?;
-    validate_bwa_or_bwa_mem2_indexes(reference)?;
+    validate_required_aligner_indexes(reference, aligner_flavor)?;
     let dict_map = parse_dict_file(&dict)?;
 
     let mut mismatch: Vec<String> = Vec::new();
@@ -1086,29 +1110,26 @@ fn validate_reference_index_integrity(reference: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_bwa_or_bwa_mem2_indexes(reference: &Path) -> Result<(), String> {
-    let mut mem2_missing: Vec<String> = Vec::new();
-    for p in bwa_mem2_index_paths(reference) {
+fn validate_required_aligner_indexes(
+    reference: &Path,
+    aligner_flavor: AlignerFlavor,
+) -> Result<(), String> {
+    let (paths, aligner_name): (Vec<PathBuf>, &str) = match aligner_flavor {
+        AlignerFlavor::BwaMem2 => (bwa_mem2_index_paths(reference), "bwa-mem2"),
+        AlignerFlavor::Bwa => (bwa_index_paths(reference), "bwa"),
+    };
+    let mut missing: Vec<String> = Vec::new();
+    for p in paths {
         if let Err(e) = check_readable_nonempty(&p) {
-            mem2_missing.push(e);
+            missing.push(e);
         }
     }
-    if mem2_missing.is_empty() {
-        return Ok(());
-    }
-    let mut bwa_missing: Vec<String> = Vec::new();
-    for p in bwa_index_paths(reference) {
-        if let Err(e) = check_readable_nonempty(&p) {
-            bwa_missing.push(e);
-        }
-    }
-    if bwa_missing.is_empty() {
+    if missing.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "BWA index not ready (need either bwa-mem2 or bwa files). bwa-mem2 missing: {}; bwa missing: {}",
-        mem2_missing.join(" | "),
-        bwa_missing.join(" | ")
+        "{aligner_name} index not ready for current aligner: {}",
+        missing.join(" | ")
     ))
 }
 
@@ -2161,7 +2182,7 @@ fn wait_for_reference_index_ready(
     soft_wait: Option<Duration>,
     emit_ui: bool,
 ) -> Result<ReferenceWaitStatus, String> {
-    if validate_reference_index_integrity(&task.reference).is_ok() {
+    if validate_reference_index_integrity(&task.reference, task.aligner_flavor).is_ok() {
         return Ok(ReferenceWaitStatus::Ready);
     }
     let start = Instant::now();
@@ -2172,7 +2193,7 @@ fn wait_for_reference_index_ready(
     let mut csub_probe_issue: Option<String> = None;
     let is_tty = emit_ui && io::stdout().is_terminal();
     loop {
-        match validate_reference_index_integrity(&task.reference) {
+        match validate_reference_index_integrity(&task.reference, task.aligner_flavor) {
             Ok(()) => break,
             Err(_) => {}
         }

@@ -1989,13 +1989,14 @@ fn run_update_internal(
             }
         }
         UpdateSource::Local(path) => {
+            let local_spec = resolve_local_update_spec(path)?;
             if opts.verbose {
-                println!("Updating from local source: {path}");
+                println!("Updating from local source: {local_spec}");
             }
             let _ = pip_install_update(
                 &python,
                 &home,
-                path,
+                &local_spec,
                 opts.force_reinstall,
                 opts.editable,
                 opts.verbose,
@@ -2046,6 +2047,33 @@ fn run_update_internal(
     }
     warm_up_after_update(jx_bin.as_deref(), &home)?;
     Ok(0)
+}
+
+fn is_python_project_root(path: &Path) -> bool {
+    path.join("pyproject.toml").is_file() || path.join("setup.py").is_file()
+}
+
+fn resolve_local_update_spec(path: &str) -> Result<String, String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err(format!("Local source path does not exist: {path}"));
+    }
+    if p.is_file() {
+        return Ok(path.to_string());
+    }
+    if is_python_project_root(p) {
+        return Ok(path.to_string());
+    }
+    let python_sub = p.join("python");
+    if is_python_project_root(&python_sub) {
+        return Ok(python_sub.to_string_lossy().to_string());
+    }
+    Err(format!(
+        "Local source path `{}` is not a Python project (missing pyproject.toml/setup.py).\n\
+Try repo root with pyproject.toml, or use `{}`.",
+        path,
+        python_sub.display()
+    ))
 }
 
 fn ensure_rust_toolchain_for_update_source(

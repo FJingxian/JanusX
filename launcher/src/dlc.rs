@@ -57,21 +57,37 @@ const CONDA_FORGE_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
 const CONDA_BIOCONDA_OFFICIAL: &str = "bioconda";
 const CONDA_FORGE_OFFICIAL: &str = "conda-forge";
+const DOCKER_APT_MIRROR_CN: &str = "mirrors.tuna.tsinghua.edu.cn";
+const DOCKER_APT_MIRROR_DEFAULT: &str = "archive.ubuntu.com";
+const DOCKER_APT_SECURITY_DEFAULT: &str = "security.ubuntu.com";
 const EMBEDDED_DOCKERFILE: &str = r#"FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR="archive.ubuntu.com"
+ARG APT_SECURITY_MIRROR="security.ubuntu.com"
 ARG GATK_VER="4.6.2.0"
 ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
 ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -ri "s@http://(archive.ubuntu.com|ports.ubuntu.com)/ubuntu@http://${APT_MIRROR}/ubuntu@g" /etc/apt/sources.list \
+ && sed -ri "s@http://security.ubuntu.com/ubuntu@http://${APT_SECURITY_MIRROR}/ubuntu@g" /etc/apt/sources.list \
+ && printf 'deb http://%s/ubuntu jammy universe\n' "${APT_MIRROR}" > /etc/apt/sources.list.d/janusx-universe.list \
+ && printf 'deb http://%s/ubuntu jammy-updates universe\n' "${APT_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
+ && printf 'deb http://%s/ubuntu jammy-security universe\n' "${APT_SECURITY_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
+ && apt-get update -o Acquire::Retries=3 \
+ && apt-get install -y --no-install-recommends \
     ca-certificates curl wget unzip git \
     tabix bcftools \
     bash gawk coreutils sed grep findutils \
     python3 python3-pip python3-venv \
     openjdk-17-jre-headless \
-    bwa-mem2 samtools sambamba fastp \
+    bwa samtools sambamba fastp \
     libgomp1 \
+ && (apt-get install -y --no-install-recommends bwa-mem2 || true) \
+ && if ! command -v bwa-mem2 >/dev/null 2>&1; then \
+      printf '%s\n' '#!/usr/bin/env bash' 'exec bwa "$@"' > /usr/local/bin/bwa-mem2; \
+      chmod +x /usr/local/bin/bwa-mem2; \
+    fi \
  && ln -sf /usr/bin/python3 /usr/local/bin/python \
  && rm -rf /var/lib/apt/lists/*
 
@@ -1344,6 +1360,7 @@ fn build_docker_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
         ));
     }
     let dockerfile = ensure_embedded_dockerfile(runtime_home)?;
+    let (apt_mirror, apt_security_mirror) = docker_build_apt_mirror_pair();
     let mut cmd = vec![
         docker_bin.to_string_lossy().to_string(),
         "build".to_string(),
@@ -1354,6 +1371,10 @@ fn build_docker_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
         cmd.push(platform.to_string());
     }
     cmd.extend([
+        "--build-arg".to_string(),
+        format!("APT_MIRROR={apt_mirror}"),
+        "--build-arg".to_string(),
+        format!("APT_SECURITY_MIRROR={apt_security_mirror}"),
         "-f".to_string(),
         dockerfile.to_string_lossy().to_string(),
         "-t".to_string(),
@@ -1546,7 +1567,7 @@ fn build_tool_command(
             let mounts = collect_docker_mounts(args, &cwd);
 
             let mut cmd = Command::new(docker_bin);
-            cmd.arg("run").arg("--rm");
+            cmd.arg("run").arg("--rm").arg("-i");
             if let Some(platform) = docker_default_platform() {
                 cmd.arg("--platform").arg(platform);
             }
@@ -2211,23 +2232,26 @@ fn run_with_live_tail(
                         .try_wait()
                         .map_err(|e| format!("Failed to poll command status: {e}"))?;
                 }
-                if !tail_mode_started && !saw_any_line {
-                    render_prelog_spinner_line_dlc(desc, start.elapsed())?;
+                let elapsed = start.elapsed();
+                let refresh_every = super::spinner_refresh_interval(elapsed);
+                if !tail_mode_started && !saw_any_line && last_render.elapsed() >= refresh_every {
+                    render_prelog_spinner_line_dlc(desc, elapsed)?;
                     prelog_spinner_shown = true;
+                    last_render = Instant::now();
                 }
                 if !tail_mode_started
                     && streaming_title_started
-                    && last_render.elapsed() >= Duration::from_millis(100)
+                    && last_render.elapsed() >= refresh_every
                 {
                     render_streaming_title_only_dlc(
                         desc,
-                        start.elapsed(),
+                        elapsed,
                         streamed_lines_before_tail,
                     )?;
                     last_render = Instant::now();
                 }
-                if tail_mode_started && last_render.elapsed() >= Duration::from_millis(100) {
-                    render_tail_title_only_dlc(desc, start.elapsed(), max_lines)?;
+                if tail_mode_started && last_render.elapsed() >= refresh_every {
+                    render_tail_title_only_dlc(desc, elapsed, max_lines)?;
                     rendered = true;
                     last_render = Instant::now();
                 }
@@ -2272,7 +2296,7 @@ fn run_with_live_tail(
             &format!(
                 "{} {desc}[{}]",
                 if status.success() { "✔︎" } else { "✘" },
-                super::format_elapsed(elapsed)
+                super::format_elapsed_live(elapsed)
             ),
             width,
         );
@@ -2313,22 +2337,20 @@ fn render_tail_block_dlc(
         print!("\x1b[{}A", max_lines.saturating_add(1));
     }
     let width = dlc_terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     if symbol.is_empty() {
-        let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
         let title = dlc_truncate_plain_line(
             &format!(
                 "{} {}[{}]",
-                frames[idx],
+                super::spinner_frame_for_elapsed(elapsed),
                 desc,
-                super::format_elapsed(elapsed)
+                super::format_elapsed_live(elapsed)
             ),
             width,
         );
         print!("\x1b[2K\r{}\n", super::style_green(&title));
     } else {
         let title = dlc_truncate_plain_line(
-            &format!("{symbol} {desc}[{}]", super::format_elapsed(elapsed)),
+            &format!("{symbol} {desc}[{}]", super::format_elapsed_live(elapsed)),
             width,
         );
         print!("\x1b[2K\r{}\n", super::style_yellow(&title));
@@ -2355,14 +2377,12 @@ fn render_tail_title_only_dlc(
     max_lines: usize,
 ) -> Result<(), String> {
     let width = dlc_terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = dlc_truncate_plain_line(
         &format!(
             "{} {}[{}]",
-            frames[idx],
+            super::spinner_frame_for_elapsed(elapsed),
             desc,
-            super::format_elapsed(elapsed)
+            super::format_elapsed_live(elapsed)
         ),
         width,
     );
@@ -2382,7 +2402,7 @@ fn render_streaming_failure_compact_dlc(
 ) -> Result<(), String> {
     let width = dlc_terminal_line_width();
     let title = dlc_truncate_plain_line(
-        &format!("✘ {desc}[{}]", super::format_elapsed(elapsed)),
+        &format!("✘ {desc}[{}]", super::format_elapsed_live(elapsed)),
         width,
     );
     let up = lines_below.saturating_add(1);
@@ -2404,7 +2424,7 @@ fn render_tail_success_compact_dlc(
 ) -> Result<(), String> {
     let width = dlc_terminal_line_width();
     let title = dlc_truncate_plain_line(
-        &format!("✔︎ {desc}[{}]", super::format_elapsed(elapsed)),
+        &format!("✔︎ {desc}[{}]", super::format_elapsed_live(elapsed)),
         width,
     );
     print!("\x1b[{}A", max_lines.saturating_add(1));
@@ -2420,14 +2440,12 @@ fn render_tail_success_compact_dlc(
 
 fn render_prelog_spinner_line_dlc(desc: &str, elapsed: Duration) -> Result<(), String> {
     let width = dlc_terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = dlc_truncate_plain_line(
         &format!(
             "{} {}[{}]",
-            frames[idx],
+            super::spinner_frame_for_elapsed(elapsed),
             desc,
-            super::format_elapsed(elapsed)
+            super::format_elapsed_live(elapsed)
         ),
         width,
     );
@@ -2440,14 +2458,12 @@ fn render_prelog_spinner_line_dlc(desc: &str, elapsed: Duration) -> Result<(), S
 
 fn render_streaming_title_init_dlc(desc: &str, elapsed: Duration) -> Result<(), String> {
     let width = dlc_terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = dlc_truncate_plain_line(
         &format!(
             "{} {}[{}]",
-            frames[idx],
+            super::spinner_frame_for_elapsed(elapsed),
             desc,
-            super::format_elapsed(elapsed)
+            super::format_elapsed_live(elapsed)
         ),
         width,
     );
@@ -2464,14 +2480,12 @@ fn render_streaming_title_only_dlc(
     lines_below: usize,
 ) -> Result<(), String> {
     let width = dlc_terminal_line_width();
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = ((elapsed.as_millis() / 100) as usize) % frames.len();
     let title = dlc_truncate_plain_line(
         &format!(
             "{} {}[{}]",
-            frames[idx],
+            super::spinner_frame_for_elapsed(elapsed),
             desc,
-            super::format_elapsed(elapsed)
+            super::format_elapsed_live(elapsed)
         ),
         width,
     );
@@ -2863,23 +2877,26 @@ fn run_download_with_progress(
                     last_progress_desc =
                         download_desc_with_progress(desc, downloaded, total_bytes);
                 }
-                if !tail_mode_started && !saw_any_line {
-                    render_prelog_spinner_line_dlc(&last_progress_desc, start.elapsed())?;
+                let elapsed = start.elapsed();
+                let refresh_every = super::spinner_refresh_interval(elapsed);
+                if !tail_mode_started && !saw_any_line && last_render.elapsed() >= refresh_every {
+                    render_prelog_spinner_line_dlc(&last_progress_desc, elapsed)?;
                     prelog_spinner_shown = true;
+                    last_render = Instant::now();
                 }
                 if !tail_mode_started
                     && streaming_title_started
-                    && last_render.elapsed() >= Duration::from_millis(100)
+                    && last_render.elapsed() >= refresh_every
                 {
                     render_streaming_title_only_dlc(
                         &last_progress_desc,
-                        start.elapsed(),
+                        elapsed,
                         streamed_lines_before_tail,
                     )?;
                     last_render = Instant::now();
                 }
-                if tail_mode_started && last_render.elapsed() >= Duration::from_millis(100) {
-                    render_tail_title_only_dlc(&last_progress_desc, start.elapsed(), max_lines)?;
+                if tail_mode_started && last_render.elapsed() >= refresh_every {
+                    render_tail_title_only_dlc(&last_progress_desc, elapsed, max_lines)?;
                     rendered = true;
                     last_render = Instant::now();
                 }
@@ -2930,7 +2947,7 @@ fn run_download_with_progress(
                 "{} {}[{}]",
                 if status.success() { "✔︎" } else { "✘" },
                 desc,
-                super::format_elapsed(elapsed)
+                super::format_elapsed_live(elapsed)
             ),
             width,
         );
@@ -3678,6 +3695,45 @@ fn docker_default_platform() -> Option<&'static str> {
         return Some("linux/amd64");
     }
     None
+}
+
+fn docker_build_apt_mirror_pair() -> (String, String) {
+    let apt_mirror = env::var("JX_DOCKER_APT_MIRROR")
+        .ok()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .unwrap_or_else(|| {
+            if prefers_cn_mirror() {
+                DOCKER_APT_MIRROR_CN.to_string()
+            } else {
+                DOCKER_APT_MIRROR_DEFAULT.to_string()
+            }
+        });
+    let apt_security = env::var("JX_DOCKER_APT_SECURITY_MIRROR")
+        .ok()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .unwrap_or_else(|| {
+            if apt_mirror == DOCKER_APT_MIRROR_DEFAULT {
+                DOCKER_APT_SECURITY_DEFAULT.to_string()
+            } else {
+                apt_mirror.clone()
+            }
+        });
+    (apt_mirror, apt_security)
+}
+
+fn prefers_cn_mirror() -> bool {
+    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
+        let Ok(v) = env::var(key) else {
+            continue;
+        };
+        let s = v.to_ascii_lowercase();
+        if s.contains("zh_cn") || s.contains("asia/shanghai") {
+            return true;
+        }
+    }
+    false
 }
 
 fn command_in_path(bin: &str) -> bool {

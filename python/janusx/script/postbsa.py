@@ -26,6 +26,7 @@ import concurrent.futures as cf
 import glob
 import logging
 import os
+import re
 import socket
 import tempfile
 import time
@@ -225,7 +226,7 @@ def resolve_input_tables(file_arg: str) -> list[str]:
     if raw == "":
         return []
     if has_glob_magic(raw):
-        paths = sorted(glob.glob(raw))
+        paths = sorted(glob.glob(raw), key=path_sort_key)
     else:
         paths = [raw]
     out = []
@@ -272,14 +273,60 @@ def clean_chr(chr_series: pd.Series) -> pd.Series:
 
 
 def chr_sort_key(x) -> tuple[int, object]:
+    def natural_text_key(text: str) -> tuple[tuple[int, object], ...]:
+        parts = re.findall(r"\d+|\D+", text)
+        if len(parts) == 0:
+            return ((1, ""),)
+        out: list[tuple[int, object]] = []
+        for part in parts:
+            if part.isdigit():
+                out.append((0, int(part)))
+            else:
+                out.append((1, part))
+        return tuple(out)
+
     try:
-        if isinstance(x, (int, float)):
-            return (0, float(x))
-        if str(x).replace(".", "", 1).isdigit():
-            return (0, float(x))
-        return (1, str(x))
+        if pd.isna(x):
+            return (9, "")
     except Exception:
-        return (2, str(x))
+        pass
+
+    if isinstance(x, (int, float)):
+        return (0, float(x))
+
+    text = str(x).strip()
+    if text == "":
+        return (9, "")
+
+    upper = text.upper()
+    for prefix in ("CHR", "CHROMOSOME"):
+        if upper.startswith(prefix):
+            upper = upper[len(prefix):].strip()
+            break
+
+    if upper.replace(".", "", 1).isdigit():
+        return (0, float(upper))
+    if upper == "X":
+        return (1, 23)
+    if upper == "Y":
+        return (1, 24)
+    if upper in {"M", "MT", "MITO", "MITOCHONDRIA"}:
+        return (1, 25)
+
+    m = re.match(r"^([A-Z_\\-]+?)(\d+(?:\.\d+)?)$", upper)
+    if m is not None:
+        prefix, num = m.groups()
+        return (2, (prefix, float(num)))
+
+    return (3, natural_text_key(upper))
+
+
+def path_sort_key(path_text: str) -> tuple[tuple[int, object], tuple[int, object]]:
+    name = Path(path_text).name
+    stem = strip_known_suffix(name)
+    m = re.search(r"merge\.(.+?)\.snp", stem, flags=re.IGNORECASE)
+    token = m.group(1) if m is not None else stem
+    return chr_sort_key(token), chr_sort_key(name)
 
 
 def change_chr_loc(
@@ -294,16 +341,7 @@ def change_chr_loc(
         raise ValueError(f"DataFrame must contain '{chr_col}' and '{loc_col}' columns")
 
     out = df.copy()
-    chr_unique = []
-    for chr_val in out[chr_col].dropna().unique():
-        try:
-            num_val = float(chr_val) if "." in str(chr_val) else int(chr_val)
-            chr_unique.append((0, num_val, chr_val))
-        except (ValueError, TypeError):
-            chr_unique.append((1, str(chr_val), chr_val))
-
-    chr_unique.sort()
-    chr_sorted = [item[2] for item in chr_unique]
+    chr_sorted = sorted(out[chr_col].dropna().unique(), key=chr_sort_key)
     chr_max = out.groupby(chr_col, sort=False)[loc_col].max().reindex(chr_sorted)
     total_loc = chr_max.fillna(0).sum()
     chr_interval = int(total_loc * interval)

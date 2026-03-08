@@ -380,9 +380,10 @@ pub(super) fn cmd_filter_imputed_by_maf_and_missing(
         .join(" ");
 
     let build_sample_keep = format!(
-        "if [ ! -s {} ]; then if mkdir {} 2>/dev/null; then awk 'NR==1{{next}} {{id=$2; miss[id]+=$4; geno[id]+=$5}} END{{for (id in miss) if (geno[id]>0 && miss[id]/geno[id]<={}) print id}}' {} | sort > {} && mv {} {}; rmdir {}; else while [ -d {} ]; do sleep 1; done; fi; fi",
+        "if [ ! -s {} ]; then if mkdir {} 2>/dev/null; then : > {} && (awk 'NR==1{{next}} {{id=$2; miss[id]+=$4; geno[id]+=$5}} END{{for (id in miss) if (geno[id]>0 && miss[id]/geno[id]<={}) print id}}' {} 2>/dev/null | sort > {} || true) && mv {} {} && rmdir {} || true; else while [ -d {} ]; do sleep 1; done; fi; fi; [ -f {} ] || : > {}",
         qpath(&sample_keep),
         qpath(&sample_lock),
+        qpath(&sample_tmp),
         max_missing,
         all_imiss_txt,
         qpath(&sample_tmp),
@@ -390,9 +391,12 @@ pub(super) fn cmd_filter_imputed_by_maf_and_missing(
         qpath(&sample_keep),
         qpath(&sample_lock),
         qpath(&sample_lock),
+        qpath(&sample_keep),
+        qpath(&sample_keep),
     );
     let build_site_keep = format!(
-        "awk 'NR>1 && $5<={} {{n=split($2,a,\":\"); if (n>=2) print a[1]\"\\t\"a[2]}}' {} > {}",
+        ": > {} && (awk 'NR>1 && $5<={} {{n=split($2,a,\":\"); if (n>=2) print a[1]\"\\t\"a[2]}}' {} > {} || true)",
+        qpath(&site_keep),
         max_missing,
         qpath(&site_lmiss),
         qpath(&site_keep),
@@ -411,8 +415,10 @@ pub(super) fn cmd_filter_imputed_by_maf_and_missing(
         qpath(&in_imp),
     );
     format!(
-        "NVAR=$({prefix}bcftools index -n {}) && if [ \"${{NVAR:-0}}\" -gt 0 ]; then {build_sample_keep} && {build_site_keep} && {filter_cmd} && {index_cmd}; else {copy_empty_cmd}; fi",
+        "NVAR=$({prefix}bcftools index -n {}) && if [ \"${{NVAR:-0}}\" -gt 0 ]; then {build_sample_keep} && {build_site_keep} && if [ -s {} ] && [ -s {} ]; then {filter_cmd} && {index_cmd}; else {copy_empty_cmd}; fi; else {copy_empty_cmd}; fi",
         qpath(&in_imp),
+        qpath(&sample_keep),
+        qpath(&site_keep),
     )
 }
 

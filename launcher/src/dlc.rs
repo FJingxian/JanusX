@@ -16,11 +16,20 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 8] = [
-    "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
+const REQUIRED_TOOLS: [&str; 9] = [
+    "fastp",
+    "bwa",
+    "samtools",
+    "gatk",
+    "bcftools",
+    "tabix",
+    "bgzip",
+    "plink",
+    "beagle",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 8] = [
+const DLC_TOOL_ENTRIES: [(&str, &str); 9] = [
     ("bcftools", "VCF/BCF manipulation"),
+    ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
     ("bwa", "Short-read alignment"),
     ("fastp", "FASTQ quality control"),
@@ -1512,6 +1521,9 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
                 out.insert("bcftools".to_string());
             }
             "tabix" => {
+                out.insert("htslib".to_string());
+            }
+            "bgzip" => {
                 out.insert("htslib".to_string());
             }
             "plink" => {

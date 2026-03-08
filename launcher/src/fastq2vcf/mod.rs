@@ -17,10 +17,17 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const REQUIRED_DLC_TOOLS: [&str; 8] = [
-    "fastp", "bwa", "samtools", "gatk", "bcftools", "tabix", "plink", "beagle",
+const REQUIRED_DLC_TOOLS: [&str; 9] = [
+    "fastp",
+    "bwa",
+    "samtools",
+    "gatk",
+    "bcftools",
+    "tabix",
+    "bgzip",
+    "plink",
+    "beagle",
 ];
-const OPTIONAL_HOST_TOOLS: [&str; 1] = ["bgzip"];
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,9 +497,6 @@ fn probe_dlc_toolchain() -> Result<Vec<(String, bool, bool)>, String> {
 
     for tool in REQUIRED_DLC_TOOLS {
         out.push((tool.to_string(), probe_dlc_tool_wrapper(&jx_bin, tool), true));
-    }
-    for tool in OPTIONAL_HOST_TOOLS {
-        out.push((tool.to_string(), find_in_path(tool).is_some(), false));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));

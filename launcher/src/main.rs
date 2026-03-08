@@ -1331,7 +1331,7 @@ fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
             "-verbose" | "--verbose" => verbose = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Upgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]"
+                    "Upgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]\nNote: `jx -upgrade` upgrades launcher first, then runs core update logic equivalent to `jx -update latest`."
                 );
                 return Err(String::new());
             }
@@ -1345,7 +1345,7 @@ fn parse_upgrade_args(args: &[String]) -> Result<UpgradeOptions, String> {
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown upgrade option: {other}\nUpgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]"
+                        "Unknown upgrade option: {other}\nUpgrade usage:\n  jx -upgrade\n  jx -upgrade latest [-verbose]\n  jx -upgrade <local_path> [-verbose]\nNote: `jx -upgrade` upgrades launcher first, then runs core update logic equivalent to `jx -update latest`."
                     ));
                 }
             }
@@ -1394,7 +1394,21 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
             println!("Re-run `jx -h` to verify the upgraded launcher.");
         }
     }
-    Ok(0)
+    let core_update = UpdateOptions {
+        source: UpdateSource::Latest,
+        verbose: opts.verbose,
+        force_reinstall: false,
+        editable: false,
+    };
+    match run_update_internal(core_update, false) {
+        Ok(_) => {
+            print_success_line("Core package update completed via `jx -update latest`.");
+            Ok(0)
+        }
+        Err(e) => Err(format!(
+            "Launcher upgrade completed, but core package update (`jx -update latest`) failed: {e}"
+        )),
+    }
 }
 
 fn select_python_for_launcher_upgrade(runtime_home: &Path) -> Result<PathBuf, String> {
@@ -1757,6 +1771,13 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
 }
 
 fn run_update(opts: UpdateOptions) -> Result<i32, String> {
+    run_update_internal(opts, true)
+}
+
+fn run_update_internal(
+    opts: UpdateOptions,
+    allow_launcher_self_update: bool,
+) -> Result<i32, String> {
     if matches!(opts.source, UpdateSource::Dlc) {
         let home = runtime_home()?;
         let python = ensure_runtime(false)?;
@@ -1770,7 +1791,8 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
     let before = installed_version(&python);
     let jx_bin = env::current_exe().ok();
 
-    if matches!(opts.source, UpdateSource::Pypi)
+    if allow_launcher_self_update
+        && matches!(opts.source, UpdateSource::Pypi)
         && maybe_self_update_launcher_from_pypi_check(&python, &home, opts.verbose)?
     {
         return Ok(0);
@@ -1795,7 +1817,9 @@ fn run_update(opts: UpdateOptions) -> Result<i32, String> {
 
     match &opts.source {
         UpdateSource::Latest => {
-            if maybe_self_update_launcher_from_release(&python, &home, opts.verbose)? {
+            if allow_launcher_self_update
+                && maybe_self_update_launcher_from_release(&python, &home, opts.verbose)?
+            {
                 return Ok(0);
             }
             if ensure_git_available().is_err() {
@@ -4118,7 +4142,7 @@ fn print_cli_help() {
     print_help_entry(
         2,
         "-upgrade",
-        "Upgrade launcher only from source: `jx -upgrade [latest|<local_path>] [-verbose]`",
+        "Upgrade launcher from source, then run core latest update: `jx -upgrade [latest|<local_path>] [-verbose]`",
         flag_key_width,
         width,
     );

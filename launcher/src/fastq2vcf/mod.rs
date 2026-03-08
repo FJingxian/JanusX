@@ -1665,6 +1665,7 @@ fn build_fastq2vcf_steps(
     }
 
     let sample_names: Vec<String> = samples.keys().cloned().collect();
+    let dynamic_eta = estimate_step5_to_step10_eta_minutes(chroms, chrom_lens, sample_names.len());
     let mut steps: Vec<PipelineStep> = Vec::new();
 
     if include_fastp_step {
@@ -1823,7 +1824,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step5_cgvcf".to_string(),
         name: "cgvcf".to_string(),
-        eta_minutes: Some(36),
+        eta_minutes: Some(dynamic_eta.step5_cgvcf),
         commands: step5_cmds,
         inputs: dedup_paths(step5_inputs),
         outputs: dedup_paths(step5_outputs),
@@ -1859,7 +1860,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step6_gvcf2vcf".to_string(),
         name: "gvcf2vcf".to_string(),
-        eta_minutes: Some(32),
+        eta_minutes: Some(dynamic_eta.step6_gvcf2vcf),
         commands: step6_cmds,
         inputs: dedup_paths(step6_inputs),
         outputs: dedup_paths(step6_outputs),
@@ -1903,7 +1904,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step7_gtprep".to_string(),
         name: "gtprep".to_string(),
-        eta_minutes: Some(40),
+        eta_minutes: Some(dynamic_eta.step7_gtprep),
         commands: step7_cmds,
         inputs: dedup_paths(step7_inputs),
         outputs: dedup_paths(step7_outputs),
@@ -1938,7 +1939,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step8_impute".to_string(),
         name: "impute".to_string(),
-        eta_minutes: Some(120),
+        eta_minutes: Some(dynamic_eta.step8_impute),
         commands: step8_cmds,
         inputs: dedup_paths(step8_inputs),
         outputs: dedup_paths(step8_outputs),
@@ -1982,7 +1983,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step9_impfilter".to_string(),
         name: "impfilter".to_string(),
-        eta_minutes: Some(24),
+        eta_minutes: Some(dynamic_eta.step9_impfilter),
         commands: step9_cmds,
         inputs: dedup_paths(step9_inputs),
         outputs: dedup_paths(step9_outputs),
@@ -2006,7 +2007,7 @@ fn build_fastq2vcf_steps(
     steps.push(PipelineStep {
         id: "step10_mergevcf".to_string(),
         name: "mergevcf".to_string(),
-        eta_minutes: Some(8),
+        eta_minutes: Some(dynamic_eta.step10_mergevcf),
         commands: step10_cmds,
         inputs: dedup_paths(step10_inputs),
         outputs: dedup_paths(step10_outputs),
@@ -2028,6 +2029,74 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         out.push(p);
     }
     out
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicEtaStep5To10 {
+    step5_cgvcf: u64,
+    step6_gvcf2vcf: u64,
+    step7_gtprep: u64,
+    step8_impute: u64,
+    step9_impfilter: u64,
+    step10_mergevcf: u64,
+}
+
+fn estimate_step5_to_step10_eta_minutes(
+    chroms: &[String],
+    chrom_lens: &BTreeMap<String, u64>,
+    sample_count: usize,
+) -> DynamicEtaStep5To10 {
+    // Use reference locus scale as "site count" proxy before VCF is generated.
+    let locus_count: f64 = chroms
+        .iter()
+        .map(|c| chrom_lens.get(c).copied().unwrap_or(0) as f64)
+        .sum();
+    let site_factor = (locus_count / 500_000_000.0).clamp(0.35, 10.0);
+    let site_factor_sqrt = site_factor.sqrt();
+
+    let samples = sample_count.max(1) as f64;
+    let pop_factor_linear = (samples / 2.0).clamp(0.7, 20.0);
+    let pop_factor_sqrt = pop_factor_linear.sqrt();
+
+    let chrom_factor = ((chroms.len().max(1) as f64) / 10.0).clamp(0.4, 4.0);
+
+    DynamicEtaStep5To10 {
+        step5_cgvcf: scale_eta_minutes(
+            36.0 * site_factor_sqrt * pop_factor_sqrt,
+            8,
+            12 * 60,
+        ),
+        step6_gvcf2vcf: scale_eta_minutes(
+            32.0 * site_factor_sqrt * (0.6 + 0.4 * pop_factor_sqrt),
+            6,
+            10 * 60,
+        ),
+        step7_gtprep: scale_eta_minutes(
+            40.0 * site_factor_sqrt * (0.5 + 0.5 * pop_factor_sqrt),
+            8,
+            12 * 60,
+        ),
+        step8_impute: scale_eta_minutes(
+            120.0 * site_factor_sqrt * (0.7 + 0.6 * pop_factor_sqrt),
+            20,
+            24 * 60,
+        ),
+        step9_impfilter: scale_eta_minutes(
+            24.0 * site_factor_sqrt * (0.7 + 0.3 * pop_factor_sqrt),
+            5,
+            6 * 60,
+        ),
+        step10_mergevcf: scale_eta_minutes(
+            8.0 * chrom_factor * site_factor_sqrt * (0.8 + 0.2 * pop_factor_sqrt),
+            2,
+            4 * 60,
+        ),
+    }
+}
+
+fn scale_eta_minutes(value: f64, min_minutes: u64, max_minutes: u64) -> u64 {
+    let raw = if value.is_finite() { value.round() } else { min_minutes as f64 };
+    raw.max(min_minutes as f64).min(max_minutes as f64) as u64
 }
 
 fn dynamic_impute_threads(chrom: &str, chrom_lens: &BTreeMap<String, u64>, max_threads: usize) -> usize {

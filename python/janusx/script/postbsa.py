@@ -22,6 +22,8 @@ The input file must contain these columns:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
+import glob
 import logging
 import os
 import socket
@@ -35,7 +37,23 @@ from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_all_true, ensure_file_exists
-from ._common.status import CliStatus
+from ._common.status import (
+    CliStatus,
+    format_elapsed,
+    get_rich_spinner_name,
+    print_failure,
+    print_success,
+)
+
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
 
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -196,6 +214,44 @@ def strip_known_suffix(path: str) -> str:
         if lower.endswith(ext):
             return name[: -len(ext)]
     return Path(path).stem
+
+
+def has_glob_magic(text: str) -> bool:
+    return any(ch in text for ch in ["*", "?", "["])
+
+
+def resolve_input_tables(file_arg: str) -> list[str]:
+    raw = str(file_arg).strip()
+    if raw == "":
+        return []
+    if has_glob_magic(raw):
+        paths = sorted(glob.glob(raw))
+    else:
+        paths = [raw]
+    out = []
+    for p in paths:
+        path = Path(p)
+        if path.is_file():
+            out.append(str(path))
+    return out
+
+
+def dedup_paths_keep_order(paths: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        key = str(Path(p).resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(str(Path(p)))
+    return out
+
+
+def default_prefix_for_inputs(file_arg: str, files: list[str]) -> str:
+    if len(files) <= 1 and not has_glob_magic(file_arg):
+        return strip_known_suffix(file_arg)
+    return "allchr"
 
 
 def clean_chr(chr_series: pd.Series) -> pd.Series:
@@ -401,6 +457,65 @@ def try_rust_preprocess(
     except Exception as exc:
         logger.warning(f"Rust preprocessing failed; falling back to Python: {exc}")
         return None
+
+
+def preprocess_single_table(
+    table_path: str,
+    bulk1: str,
+    bulk2: str,
+    total_dp_threshold: tuple[int, int],
+    min_dp: int,
+    min_gq: int,
+    ref_allele_freq: float,
+    depth_difference: int,
+    window_mb: float,
+    step_mb: float,
+    ed_power: int,
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rust_result = try_rust_preprocess(
+        table_path=table_path,
+        bulk1=bulk1,
+        bulk2=bulk2,
+        total_dp_threshold=total_dp_threshold,
+        min_dp=min_dp,
+        min_gq=min_gq,
+        ref_allele_freq=ref_allele_freq,
+        depth_difference=depth_difference,
+        window_mb=window_mb,
+        step_mb=step_mb,
+        ed_power=ed_power,
+        logger=logger,
+    )
+    if rust_result is not None:
+        raw_df, smooth_df = rust_result
+    else:
+        raw_df = load_bsa_in_python(
+            table_path=table_path,
+            bulk1=bulk1,
+            bulk2=bulk2,
+            total_dp_threshold=total_dp_threshold,
+            min_dp=min_dp,
+            min_gq=min_gq,
+            ref_allele_freq=ref_allele_freq,
+            depth_difference=depth_difference,
+            logger=logger,
+        )
+        bulk1_name = f"{bulk1}.SNPindex"
+        bulk2_name = f"{bulk2}.SNPindex"
+        deltaindex_name = f"Delta.SNPindex({bulk2}-{bulk1})"
+        smooth_df = compute_smooth_df(
+            raw_df=raw_df,
+            bulk1_name=bulk1_name,
+            bulk2_name=bulk2_name,
+            deltaindex_name=deltaindex_name,
+            ed_power=ed_power,
+            window_mb=window_mb,
+            step_mb=step_mb,
+        )
+    raw_df = normalize_position_columns(raw_df)
+    smooth_df = normalize_position_columns(smooth_df)
+    return raw_df, smooth_df
 
 
 def load_bsa_in_python(
@@ -651,6 +766,182 @@ def normalize_position_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def sort_by_chr_pos(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "chr" not in df.columns:
+        return df
+    out = df.copy()
+    out["_chr_key"] = out["chr"].map(chr_sort_key)
+    pos_col = "pos_raw" if "pos_raw" in out.columns else "pos" if "pos" in out.columns else None
+    order_cols = ["_chr_key"]
+    if pos_col is not None:
+        order_cols.append(pos_col)
+    out = out.sort_values(order_cols, kind="mergesort").drop(columns=["_chr_key"])
+    return out.reset_index(drop=True)
+
+
+def preprocess_tables_parallel(
+    input_files: list[str],
+    worker_count: int,
+    bulk1: str,
+    bulk2: str,
+    total_dp_threshold: tuple[int, int],
+    min_dp: int,
+    min_gq: int,
+    ref_allele_freq: float,
+    depth_difference: int,
+    window_mb: float,
+    step_mb: float,
+    ed_power: int,
+    logger: logging.Logger,
+    use_spinner: bool,
+    bulk1_name: str,
+    bulk2_name: str,
+    deltaindex_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw_parts: list[pd.DataFrame] = []
+    smooth_parts: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    def _submit(executor: cf.ThreadPoolExecutor, table_path: str) -> cf.Future:
+        return executor.submit(
+            preprocess_single_table,
+            table_path,
+            bulk1,
+            bulk2,
+            total_dp_threshold,
+            min_dp,
+            min_gq,
+            ref_allele_freq,
+            depth_difference,
+            window_mb,
+            step_mb,
+            ed_power,
+            logger,
+        )
+
+    if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+        total_start_ts = time.monotonic()
+        n_total = len(input_files)
+        file_to_idx = {f: i for i, f in enumerate(input_files, start=1)}
+        basenames = [os.path.basename(f) for f in input_files]
+        idx_width = len(str(n_total))
+        name_width = max((len(x) for x in basenames), default=0)
+        task_start_ts: dict[str, float] = {}
+        progress = Progress(
+            SpinnerColumn(
+                spinner_name=get_rich_spinner_name(),
+                style="cyan",
+                finished_text=" ",
+            ),
+            TextColumn("Task {task.fields[task_label]}: {task.fields[file_pad]}"),
+            transient=True,
+        )
+        with progress:
+            with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
+                fut_map: dict[cf.Future, str] = {}
+                task_map: dict[cf.Future, int] = {}
+                for table_path in input_files:
+                    fut = _submit(ex, table_path)
+                    fut_map[fut] = table_path
+                    task_start_ts[table_path] = time.monotonic()
+                    idx = file_to_idx.get(table_path, 0)
+                    task_map[fut] = progress.add_task(
+                        description="",
+                        total=None,
+                        task_label=f"{idx:>{idx_width}}/{n_total}",
+                        file_pad=os.path.basename(table_path).ljust(name_width),
+                    )
+
+                while len(fut_map) > 0:
+                    done, _ = cf.wait(
+                        list(fut_map.keys()),
+                        timeout=0.1,
+                        return_when=cf.FIRST_COMPLETED,
+                    )
+                    if len(done) == 0:
+                        continue
+                    for fut in sorted(done, key=lambda x: file_to_idx.get(fut_map[x], 0)):
+                        table_path = fut_map.pop(fut)
+                        tid = task_map.pop(fut, None)
+                        if tid is not None:
+                            try:
+                                progress.remove_task(tid)
+                            except Exception:
+                                pass
+                        elapsed = format_elapsed(
+                            time.monotonic()
+                            - task_start_ts.get(table_path, time.monotonic())
+                        )
+                        try:
+                            raw_part, smooth_part = fut.result()
+                            raw_parts.append(raw_part)
+                            smooth_parts.append(smooth_part)
+                            logger.info(
+                                f"Finished {table_path}: "
+                                f"raw={raw_part.shape}, smooth={smooth_part.shape}"
+                            )
+                        except Exception as exc:
+                            errors.append(f"{table_path}: {exc}")
+                            idx = file_to_idx.get(table_path, 0)
+                            print_failure(
+                                f"Task {idx}/{n_total}: "
+                                f"{os.path.basename(table_path)} ...Failed [{elapsed}]"
+                            )
+
+        if errors:
+            raise RuntimeError("Failed chromosome tables:\n- " + "\n- ".join(errors))
+        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+        print_success(f"Task {len(raw_parts)}/{n_total} ...Finished [{total_elapsed}]")
+    else:
+        with CliStatus(
+            f"Preprocessing {len(input_files)} chromosome tables...",
+            enabled=use_spinner,
+        ) as task:
+            try:
+                with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
+                    fut_map = {_submit(ex, table_path): table_path for table_path in input_files}
+                    for fut in cf.as_completed(fut_map):
+                        table_path = fut_map[fut]
+                        try:
+                            raw_part, smooth_part = fut.result()
+                            raw_parts.append(raw_part)
+                            smooth_parts.append(smooth_part)
+                            logger.info(
+                                f"Finished {table_path}: "
+                                f"raw={raw_part.shape}, smooth={smooth_part.shape}"
+                            )
+                        except Exception as exc:
+                            errors.append(f"{table_path}: {exc}")
+                if errors:
+                    raise RuntimeError("Failed chromosome tables:\n- " + "\n- ".join(errors))
+            except Exception:
+                task.fail("Preprocessing chromosome tables ...Failed")
+                raise
+            task.complete("Preprocessing chromosome tables ...Finished")
+
+    if not raw_parts:
+        raise RuntimeError("No valid loci remained across all chromosome tables.")
+
+    raw_df = pd.concat(raw_parts, axis=0, ignore_index=True)
+    smooth_df = (
+        pd.concat(smooth_parts, axis=0, ignore_index=True)
+        if len(smooth_parts) > 0
+        else pd.DataFrame(
+            columns=[
+                "chr",
+                "pos",
+                "pos_raw",
+                bulk1_name,
+                bulk2_name,
+                deltaindex_name,
+                "ED_power",
+                "Gprime",
+            ]
+        )
+    )
+    return raw_df, smooth_df
+
+
 def downsample_scatter_points(
     df: pd.DataFrame,
     max_points: int = DEFAULT_SNPIDX_SCATTER_MAX_POINTS_PER_CHR,
@@ -882,6 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2",
+            "jx postbsa -file '4.merge/Merge.*.SNP.tsv' -b1 Bulk1 -b2 Bulk2 -t 8",
         ]),
     )
 
@@ -890,8 +1182,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-file",
         "--file",
         type=str,
+        nargs="+",
         required=True,
-        help="Input BSA table (tab-delimited).",
+        help=(
+            "Input BSA table (tab-delimited), or a glob pattern such as "
+            "`Merge.*.SNP.tsv` for per-chromosome files."
+        ),
     )
     required_group.add_argument(
         "-b1",
@@ -1005,7 +1301,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--thread",
         type=int,
         default=-1,
-        help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
+        help=(
+            "Number of CPU threads (-1 uses all available cores; default: %(default)s). "
+            "For glob input, this is also the max parallel chromosome jobs."
+        ),
     )
     return parser
 
@@ -1024,17 +1323,40 @@ def main() -> None:
 
     if args.thread <= 0:
         args.thread = cpu_count()
-    os.environ["RAYON_NUM_THREADS"] = str(args.thread)
+
+    file_args = list(args.file) if isinstance(args.file, list) else [str(args.file)]
+    input_files: list[str] = []
+    if len(file_args) == 1:
+        input_files = resolve_input_tables(file_args[0])
+    else:
+        for token in file_args:
+            token_matches = resolve_input_tables(token)
+            if len(token_matches) == 0 and Path(token).is_file():
+                token_matches = [token]
+            input_files.extend(token_matches)
+        input_files = dedup_paths_keep_order(input_files)
+    input_hint = " ".join(file_args)
 
     args.out = args.out if args.out else "."
     os.makedirs(args.out, mode=0o755, exist_ok=True)
 
     if args.prefix is None:
-        args.prefix = strip_known_suffix(args.file)
+        args.prefix = default_prefix_for_inputs(input_hint, input_files)
     output_stem = build_output_stem(args.out, args.prefix, args.bulk1, args.bulk2)
 
     log_path = f"{output_stem}.postbsa.log"
     logger = setup_logging(log_path)
+
+    if len(input_files) == 0:
+        logger.error(f"No input BSA table matched: {input_hint}")
+        raise SystemExit(1)
+
+    if len(input_files) > 1:
+        worker_count = max(1, min(int(args.thread), len(input_files)))
+        os.environ["RAYON_NUM_THREADS"] = "1"
+    else:
+        worker_count = 1
+        os.environ["RAYON_NUM_THREADS"] = str(args.thread)
 
     emit_cli_configuration(
         logger,
@@ -1045,7 +1367,8 @@ def main() -> None:
             (
                 "General",
                 [
-                    ("Input file", args.file),
+                    ("Input file", input_hint),
+                    ("Input tables", len(input_files)),
                     ("Bulk1", args.bulk1),
                     ("Bulk2", args.bulk2),
                     ("Window (Mb)", args.window),
@@ -1063,47 +1386,34 @@ def main() -> None:
         ],
         footer_rows=[
             ("Threads", f"{args.thread} ({cpu_count()} available)"),
+            ("Parallel jobs", worker_count if len(input_files) > 1 else 1),
             ("Output stem", output_stem),
         ],
         line_max_chars=60,
     )
 
-    checks = [ensure_file_exists(logger, args.file, "Input BSA table")]
+    checks = [ensure_file_exists(logger, p, "Input BSA table") for p in input_files]
     if not ensure_all_true(checks):
         raise SystemExit(1)
-
-    with CliStatus("Preprocessing BSA table...", enabled=use_spinner) as task:
-        try:
-            rust_result = try_rust_preprocess(
-                table_path=args.file,
-                bulk1=args.bulk1,
-                bulk2=args.bulk2,
-                total_dp_threshold=args.total_dp,
-                min_dp=args.min_dp,
-                min_gq=args.min_gq,
-                ref_allele_freq=args.ref_allele_freq,
-                depth_difference=args.depth_difference,
-                window_mb=args.window,
-                step_mb=args.step,
-                ed_power=args.ed_power,
-                logger=logger,
-            )
-        except Exception:
-            task.fail("Preprocessing BSA table ...Failed")
-            raise
-        task.complete("Preprocessing BSA table ...Finished")
+    if len(input_files) > 1:
+        logger.info(
+            f"Glob mode: detected {len(input_files)} chromosome tables, "
+            f"running with {worker_count} parallel jobs."
+        )
+        if args.thread > 1:
+            logger.info("Glob mode sets RAYON_NUM_THREADS=1 to avoid nested oversubscription.")
 
     bulk1_name = f"{args.bulk1}.SNPindex"
     bulk2_name = f"{args.bulk2}.SNPindex"
     deltaindex_name = f"Delta.SNPindex({args.bulk2}-{args.bulk1})"
 
-    if rust_result is not None:
-        raw_df, smooth_df = rust_result
-    else:
-        with CliStatus("Loading BSA table (Python)...", enabled=use_spinner) as task:
+    raw_df: pd.DataFrame
+    smooth_df: pd.DataFrame
+    if len(input_files) == 1:
+        with CliStatus("Preprocessing BSA table...", enabled=use_spinner) as task:
             try:
-                raw_df = load_bsa_in_python(
-                    table_path=args.file,
+                raw_df, smooth_df = preprocess_single_table(
+                    table_path=input_files[0],
                     bulk1=args.bulk1,
                     bulk2=args.bulk2,
                     total_dp_threshold=args.total_dp,
@@ -1111,30 +1421,38 @@ def main() -> None:
                     min_gq=args.min_gq,
                     ref_allele_freq=args.ref_allele_freq,
                     depth_difference=args.depth_difference,
+                    window_mb=args.window,
+                    step_mb=args.step,
+                    ed_power=args.ed_power,
                     logger=logger,
                 )
             except Exception:
-                task.fail("Loading BSA table (Python) ...Failed")
+                task.fail("Preprocessing BSA table ...Failed")
                 raise
-            task.complete("Loading BSA table (Python) ...Finished")
-        with CliStatus("Computing sliding-window smooth...", enabled=use_spinner) as task:
-            try:
-                smooth_df = compute_smooth_df(
-                    raw_df=raw_df,
-                    bulk1_name=bulk1_name,
-                    bulk2_name=bulk2_name,
-                    deltaindex_name=deltaindex_name,
-                    ed_power=args.ed_power,
-                    window_mb=args.window,
-                    step_mb=args.step,
-                )
-            except Exception:
-                task.fail("Computing sliding-window smooth ...Failed")
-                raise
-            task.complete("Computing sliding-window smooth ...Finished")
+            task.complete("Preprocessing BSA table ...Finished")
+    else:
+        raw_df, smooth_df = preprocess_tables_parallel(
+            input_files=input_files,
+            worker_count=worker_count,
+            bulk1=args.bulk1,
+            bulk2=args.bulk2,
+            total_dp_threshold=args.total_dp,
+            min_dp=args.min_dp,
+            min_gq=args.min_gq,
+            ref_allele_freq=args.ref_allele_freq,
+            depth_difference=args.depth_difference,
+            window_mb=args.window,
+            step_mb=args.step,
+            ed_power=args.ed_power,
+            logger=logger,
+            use_spinner=use_spinner,
+            bulk1_name=bulk1_name,
+            bulk2_name=bulk2_name,
+            deltaindex_name=deltaindex_name,
+        )
 
-    raw_df = normalize_position_columns(raw_df)
-    smooth_df = normalize_position_columns(smooth_df)
+    raw_df = sort_by_chr_pos(normalize_position_columns(raw_df))
+    smooth_df = sort_by_chr_pos(normalize_position_columns(smooth_df))
     save_table(smooth_df, f"{output_stem}.smooth.tsv", logger, "Smoothed table")
 
     with CliStatus("Plotting BSA figures...", enabled=use_spinner) as task:

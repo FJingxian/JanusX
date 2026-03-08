@@ -779,12 +779,16 @@ def sort_by_chr_pos(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "chr" not in df.columns:
         return df
     out = df.copy()
-    out["_chr_key"] = out["chr"].map(chr_sort_key)
+    chr_values = [x for x in pd.unique(out["chr"]) if not pd.isna(x)]
+    chr_sorted = sorted(chr_values, key=chr_sort_key)
+    chr_rank = {label: idx for idx, label in enumerate(chr_sorted)}
+    out["_chr_rank"] = out["chr"].map(chr_rank)
+    out["_chr_rank"] = pd.to_numeric(out["_chr_rank"], errors="coerce").fillna(len(chr_sorted)).astype(np.int64)
     pos_col = "pos_raw" if "pos_raw" in out.columns else "pos" if "pos" in out.columns else None
-    order_cols = ["_chr_key"]
+    order_cols = ["_chr_rank"]
     if pos_col is not None:
         order_cols.append(pos_col)
-    out = out.sort_values(order_cols, kind="mergesort").drop(columns=["_chr_key"])
+    out = out.sort_values(order_cols, kind="mergesort").drop(columns=["_chr_rank"])
     return out.reset_index(drop=True)
 
 

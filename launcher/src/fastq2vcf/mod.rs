@@ -127,7 +127,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     let jx_cmd = "jx";
-    let (toolchain, aligner_tool) = probe_dlc_toolchain()?;
+    let (toolchain, aligner_cmd) = probe_dlc_toolchain()?;
     print_toolchain_line(&toolchain);
     let missing_wrappers = missing_tools_from_probe(&toolchain);
     if !missing_wrappers.is_empty() {
@@ -211,7 +211,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         &backend,
         jx_cmd,
         "indexREF",
-        &aligner_tool,
+        &aligner_cmd,
     )?;
 
     let fastp_step = build_fastp_step(&samples, &workdir, &backend, &singularity)?;
@@ -279,7 +279,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         &fai_data.lens,
         &workdir,
         &backend,
-        &aligner_tool,
+        &aligner_cmd,
         &singularity,
         true,
     )?;
@@ -768,7 +768,7 @@ fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
         ));
     }
 
-    let (aligner_display, aligner_ok, aligner_invoke, aligner_missing_hint) =
+    let (aligner_display, aligner_ok, aligner_cmd, aligner_missing_hint) =
         probe_aligner_tool(&jx_bin);
     out.push((
         aligner_display,
@@ -780,12 +780,12 @@ fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String), String> {
     if !aligner_ok {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out.dedup_by(|a, b| a.0 == b.0);
-        return Ok((out, aligner_invoke));
+        return Ok((out, aligner_cmd));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok((out, aligner_invoke))
+    Ok((out, aligner_cmd))
 }
 
 fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
@@ -797,20 +797,41 @@ fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String) {
         } else {
             "bwa-mem2".to_string()
         };
-        return (display, true, "bwa-mem2".to_string(), "bwa-mem2 or bwa".to_string());
+        return (
+            display,
+            true,
+            "jx bwa-mem2".to_string(),
+            "bwa-mem2 or bwa".to_string(),
+        );
     }
     if bwa_ok {
         return (
             "bwa".to_string(),
             true,
+            "jx bwa".to_string(),
+            "bwa-mem2 or bwa".to_string(),
+        );
+    }
+    if let Some(mem2_bin) = find_in_path("bwa-mem2") {
+        return (
+            "bwa-mem2".to_string(),
+            true,
+            sh_quote(&mem2_bin.to_string_lossy()),
+            "bwa-mem2 or bwa".to_string(),
+        );
+    }
+    if let Some(bwa_bin) = find_in_path("bwa") {
+        return (
             "bwa".to_string(),
+            true,
+            sh_quote(&bwa_bin.to_string_lossy()),
             "bwa-mem2 or bwa".to_string(),
         );
     }
     (
         "bwa|bwa-mem2".to_string(),
         false,
-        "bwa-mem2".to_string(),
+        "jx bwa-mem2".to_string(),
         "bwa-mem2 or bwa".to_string(),
     )
 }
@@ -915,7 +936,7 @@ fn start_reference_indexing(
     backend: &str,
     jx_prefix: &str,
     job_name: &str,
-    aligner_tool: &str,
+    aligner_cmd: &str,
 ) -> Result<Option<ReferenceIndexTask>, String> {
     let reference = absolutize_path(reference)?;
     fs::create_dir_all(workdir.join("log")).map_err(|e| {
@@ -931,11 +952,10 @@ fn start_reference_indexing(
     let dict_path = reference_dict_path(&reference);
 
     let idx_cmd = format!(
-        "{} samtools faidx {} && {} {} index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
+        "{} samtools faidx {} && {} index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
         jx_prefix,
         sh_quote(&reference.to_string_lossy()),
-        jx_prefix,
-        aligner_tool,
+        aligner_cmd,
         sh_quote(&reference.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
@@ -1622,7 +1642,7 @@ fn build_fastq2vcf_steps(
     chrom_lens: &BTreeMap<String, u64>,
     workdir: &Path,
     backend: &str,
-    aligner_tool: &str,
+    aligner_cmd: &str,
     singularity: &str,
     include_fastp_step: bool,
 ) -> Result<Vec<PipelineStep>, String> {
@@ -1669,7 +1689,7 @@ fn build_fastq2vcf_steps(
             &r2,
             &mappingfolder,
             64,
-            aligner_tool,
+            aligner_cmd,
             singularity,
         );
         step2_cmds.push(wrap_scheduler_cmd(

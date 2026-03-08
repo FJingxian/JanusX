@@ -62,7 +62,7 @@ pub(super) fn cmd_bwamem(
     fq2: &Path,
     out: &Path,
     core: usize,
-    aligner_tool: &str,
+    aligner_cmd: &str,
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
@@ -80,7 +80,7 @@ pub(super) fn cmd_bwamem(
     );
     let cleanup_cmd = format!("rm -f {} {} {} \"$SORT_TMP\"*", qpath(&out_bam), qpath(&out_bai), qpath(&out_done),);
     format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}{aligner_tool} mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
+        "{setup_tmp_cmd} && {cleanup_cmd} && {aligner_cmd} mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
         qpath(reference),
         qpath(fq1),
         qpath(fq2),

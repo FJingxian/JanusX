@@ -308,8 +308,13 @@ pub(super) fn cmd_beagle_impute(
     let in_gt = impute_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
     let out_prefix = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp"));
     let out_imp = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
+    let heap_gb = core.saturating_mul(4).clamp(16, 256);
+    let xmx_expr = format!("${{JANUSX_BEAGLE_XMX_GB:-{heap_gb}}}g");
+    let java_opts = format!(
+        "JAVA_OPTS=\"-Xmx{xmx_expr} ${{JAVA_OPTS:-}}\" JAVA_TOOL_OPTIONS=\"-Djava.io.tmpdir=/tmp ${{JAVA_TOOL_OPTIONS:-}}\""
+    );
     let beagle_cmd = format!(
-        "{prefix}beagle gt={} out={} nthreads={core}",
+        "{java_opts} {prefix}beagle gt={} out={} nthreads={core}",
         qpath(&in_gt),
         qpath(&out_prefix),
     );

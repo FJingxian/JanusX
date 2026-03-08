@@ -4356,7 +4356,13 @@ fn format_dlc_route_for_display(route: &str) -> String {
         None => ("none", route.trim()),
     };
     match backend {
-        "host" => "本机path".to_string(),
+        "host" => {
+            if locator.is_empty() || locator == "-" {
+                "host:-".to_string()
+            } else {
+                format!("host:{locator}")
+            }
+        }
         "conda" => {
             let env_name = locator
                 .split_once('|')

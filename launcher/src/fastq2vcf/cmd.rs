@@ -324,8 +324,12 @@ pub(super) fn cmd_beagle_impute(
         qpath(&out_imp),
         qpath(&in_gt),
     );
+    let npos_cmd = format!(
+        "NPOS=$({prefix}bcftools query -f '%POS\\n' {} | awk 'NR==1{{first=$1;next}} NR>1 && $1!=first{{found=1; print 2; exit}} END{{if(found==0){{if(NR==0) print 0; else print 1}}}}')",
+        qpath(&in_gt),
+    );
     format!(
-        "NVAR=$({prefix}bcftools index -n {}) && if [ \"${{NVAR:-0}}\" -gt 0 ]; then {beagle_cmd} && {index_cmd}; else {copy_empty_cmd}; fi",
+        "NVAR=$({prefix}bcftools index -n {}) && {npos_cmd} && if [ \"${{NVAR:-0}}\" -gt 1 ] && [ \"${{NPOS:-0}}\" -gt 1 ]; then {beagle_cmd} && {index_cmd}; else {copy_empty_cmd}; fi",
         qpath(&in_gt),
     )
 }

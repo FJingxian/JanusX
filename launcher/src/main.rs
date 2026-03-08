@@ -1721,7 +1721,6 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     let mut latest = false;
     let mut local_source: Option<String> = None;
     let mut verbose = false;
-    let mut force_reinstall = false;
     let mut editable = false;
 
     for token in args {
@@ -1730,11 +1729,9 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
             "latest" | "-latest" | "--latest" => latest = true,
             "-e" | "-editable" | "--editable" => editable = true,
             "-verbose" | "--verbose" => verbose = true,
-            "-force-reinstall" | "-reinstall" | "-full" | "--force-reinstall" | "--reinstall"
-            | "--full" => force_reinstall = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Update usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose] [-force-reinstall]\n  Example: jx -update -e ."
+                    "Update usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
                 );
                 return Err(String::new());
             }
@@ -1748,14 +1745,14 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown update option: {other}\nUpdate usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose] [-force-reinstall]\n  Example: jx -update -e ."
+                        "Unknown update option: {other}\nUpdate usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
                     ));
                 }
             }
         }
     }
 
-    if dlc && (latest || local_source.is_some() || editable || force_reinstall) {
+    if dlc && (latest || local_source.is_some() || editable) {
         return Err("`jx -update dlc` does not accept other update source/options.".to_string());
     }
     if latest && local_source.is_some() {
@@ -1781,7 +1778,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
     Ok(UpdateOptions {
         source,
         verbose,
-        force_reinstall,
+        force_reinstall: false,
         editable,
     })
 }
@@ -1895,7 +1892,7 @@ fn run_update_internal(
             }
             let repo_url_cn = repo_url_from_spec(GITHUB_SPEC_CN);
             let repo_url_origin = repo_url_from_spec(GITHUB_SPEC_ORIGIN);
-            let (repo_url, remote_head, using_cn_repo) =
+            let (_repo_url, remote_head, using_cn_repo) =
                 if let Some(head) = remote_head_commit(&repo_url_cn) {
                     (repo_url_cn.clone(), Some(head), true)
                 } else if let Some(head) = remote_head_commit(&repo_url_origin) {
@@ -1903,48 +1900,11 @@ fn run_update_internal(
                 } else {
                     (repo_url_cn.clone(), None, true)
                 };
-            let local_commit = read_commit_marker(&home);
-            if let (Some(local), Some(remote)) = (local_commit.as_deref(), remote_head.as_deref()) {
-                if local == remote {
-                    print_success_line("Already at latest GitHub commit.");
-                    warm_up_after_update(jx_bin.as_deref(), &home)?;
-                    return Ok(0);
-                }
-                let start = Instant::now();
-                match try_fast_python_update_latest(
-                    &python,
-                    &home,
-                    &repo_url,
-                    local,
-                    remote,
-                    opts.verbose,
-                ) {
-                    Ok(true) => {
-                        print_success_line(&format!(
-                            "JanusX python-only update completed. [{}]",
-                            format_elapsed(start.elapsed())
-                        ));
-                        warm_up_after_update(jx_bin.as_deref(), &home)?;
-                        return Ok(0);
-                    }
-                    Ok(false) => {
-                        if opts.verbose {
-                            if !using_cn_repo {
-                                println!("CN GitHub mirror is unavailable; using source for fast update.");
-                            }
-                            println!("Rust or build files changed; falling back to full update.");
-                        }
-                    }
-                    Err(err) => {
-                        if opts.verbose {
-                            eprintln!("Fast update path failed: {err}");
-                            eprintln!("Falling back to full update...");
-                        }
-                    }
-                }
+            if opts.verbose && !using_cn_repo {
+                println!("CN GitHub mirror is unavailable; using source.");
             }
-            // Default latest update should be incremental; full reinstall only when explicitly requested.
-            let gh_force_reinstall = opts.force_reinstall;
+            // `jx -update latest` always performs a full reinstall.
+            let gh_force_reinstall = true;
             if opts.verbose {
                 println!("Updating from GitHub (CN mirror) ...");
             }

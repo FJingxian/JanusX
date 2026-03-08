@@ -7,8 +7,6 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import hsv_to_rgb, to_rgba
 
-from janusx.bioplotkit.stat import multiple_comparison_groupby
-
 
 GenotypeChunks = Iterable[Tuple[np.ndarray, Sequence[object]]]
 GenotypeInput = Union[pd.DataFrame, GenotypeChunks, Tuple[GenotypeChunks, Sequence[str]]]
@@ -464,6 +462,68 @@ def _group_values_by_index(
     return out
 
 
+def _wilson_ci(k: float, n: float, z: float = 1.959963984540054) -> tuple[float, float]:
+    if n <= 0:
+        return 0.0, 0.0
+    p = float(k) / float(n)
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    delta = z * np.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n) / denom
+    low = max(0.0, center - delta)
+    high = min(1.0, center + delta)
+    return float(low), float(high)
+
+
+def _build_binomial_summary(
+    merged: pd.DataFrame,
+    site_cols: Sequence[object],
+    ascending: bool,
+) -> pd.DataFrame:
+    vals = pd.to_numeric(merged["_pheno"], errors="coerce")
+    if vals.isna().any():
+        raise ValueError(
+            "mode='binomial' requires phenotype values encoded as numeric 0/1."
+        )
+    uniq = {float(x) for x in pd.unique(vals)}
+    if not uniq.issubset({0.0, 1.0}):
+        shown = ", ".join(str(x) for x in sorted(uniq))
+        raise ValueError(
+            "mode='binomial' requires phenotype values in {0,1}; "
+            f"got: {shown}."
+        )
+
+    merged = merged.copy()
+    merged["_pheno"] = vals.astype(float)
+
+    grouped = merged.groupby(list(site_cols))["_pheno"]
+    n = grouped.size().astype(int)
+    k = grouped.sum().round().astype(int)
+    mean = (k / n).astype(float)
+
+    ci_low = []
+    ci_high = []
+    for kk, nn in zip(k.to_numpy(dtype=float), n.to_numpy(dtype=float)):
+        lo, hi = _wilson_ci(kk, nn)
+        ci_low.append(lo)
+        ci_high.append(hi)
+
+    out = pd.DataFrame(
+        {
+            "mean": mean,
+            "n": n,
+            "k": k,
+            "ci_low": np.asarray(ci_low, dtype=float),
+            "ci_high": np.asarray(ci_high, dtype=float),
+        }
+    )
+    out["label"] = [f"{int(kk)}/{int(nn)}" for kk, nn in zip(out["k"], out["n"])]
+    out["letters"] = ""
+    out["sem"] = np.nan
+    out = out.sort_values("mean", ascending=bool(ascending))
+    return out
+
+
 def _format_haplotype_label(g: object) -> str:
     if isinstance(g, tuple):
         return "|".join(str(x) for x in g)
@@ -658,6 +718,7 @@ def plot_haplotype(
     palette: Optional[Union[str, dict]] = "default",
     min_haplotype_n: int = 30,
     ascending: bool = False,
+    mode: Literal["continuous", "binomial"] = "continuous",
     orient: Literal['vertical','horizontal'] = "horizontal",
     ax: Optional[plt.Axes] = None,
     **kwargs: Any,
@@ -679,9 +740,13 @@ def plot_haplotype(
           2) chunks iterator from `load_genotype_chunks`,
           3) (chunks, sample_ids) tuple.
     draw_letters
-        Draw compact-letter-display annotations.
+        Draw annotations:
+        - continuous mode: compact-letter-display;
+        - binomial mode: k/n label.
     draw_bar
-        Draw the combined violin+box+errorbar+scatter panel.
+        Draw bar panel:
+        - continuous mode: violin+box+errorbar+scatter;
+        - binomial mode: proportion bar+95% CI+scatter.
     draw_matrix
         Draw sample-by-site genotype matrix using imshow and per-cell allele labels.
     advantage_sites
@@ -698,6 +763,9 @@ def plot_haplotype(
     ascending
         Sort haplotype plotting order by phenotype mean.
         False: high-to-low (default), True: low-to-high.
+    mode
+        `continuous`: violin+box style for quantitative phenotype;
+        `binomial`: proportion bar + 95% Wilson CI for 0/1 phenotype.
     orient
         'horizontal'/'h' or 'vertical'/'v'.
     ax
@@ -706,7 +774,8 @@ def plot_haplotype(
     Returns
     -------
     (ax, summary_df)
-        summary_df columns: ['mean', 'n', 'letters', 'sem'].
+        continuous columns: ['mean', 'n', 'letters', 'sem'].
+        binomial adds: ['k', 'ci_low', 'ci_high', 'label'].
     """
     legacy_draw_violin = kwargs.pop("draw_violin", None)
     legacy_draw_box = kwargs.pop("draw_box", None)
@@ -769,16 +838,31 @@ def plot_haplotype(
             f"No haplotypes remain after filtering by min_haplotype_n={int(min_haplotype_n)}."
         )
 
-    summary = multiple_comparison_groupby(
-        merged,
-        value_col="_pheno",
-        group_cols=site_cols,
-    )
-    summary["sem"] = merged.groupby(site_cols)["_pheno"].sem()
-    summary = summary.sort_values("mean", ascending=bool(ascending))
+    mode_key = str(mode).strip().lower()
+    if mode_key in {"continuous", "cont"}:
+        mode_key = "continuous"
+    elif mode_key in {"binomial", "binary", "bin"}:
+        mode_key = "binomial"
+    else:
+        raise ValueError("`mode` must be 'continuous' or 'binomial'.")
+
+    if mode_key == "continuous":
+        from janusx.bioplotkit.stat import multiple_comparison_groupby
+
+        summary = multiple_comparison_groupby(
+            merged,
+            value_col="_pheno",
+            group_cols=site_cols,
+        )
+        summary["sem"] = merged.groupby(site_cols)["_pheno"].sem()
+        summary = summary.sort_values("mean", ascending=bool(ascending))
+    else:
+        summary = _build_binomial_summary(merged, site_cols, ascending=bool(ascending))
+
     summary.attrs["min_haplotype_n"] = int(min_haplotype_n)
     summary.attrs["removed_haplotype_groups"] = int(removed_counts.shape[0])
     summary.attrs["removed_haplotype_samples"] = int(removed_counts.sum())
+    summary.attrs["mode"] = mode_key
 
     group_values = _group_values_by_index(
         merged, "_pheno", site_cols, summary.index
@@ -786,166 +870,287 @@ def plot_haplotype(
     positions = np.arange(1, len(group_values) + 1)
 
     if draw_bar:
-        # Unified violin+box rendering:
-        # if either flag is enabled, draw violin with no border and embed box inside.
         base_color = tuple(palette_cfg["violin_face"])
         violin_fill = _mix_rgb(base_color, (1.0, 1.0, 1.0, 1.0), 0.45, 0.55)
         scatter_color = _mix_rgb(base_color, (0.0, 0.0, 0.0, 1.0), 0.78, 0.22)
+        if mode_key == "binomial":
+            mean_vals = summary["mean"].astype(float).to_numpy()
+            ci_low = summary["ci_low"].astype(float).to_numpy()
+            ci_high = summary["ci_high"].astype(float).to_numpy()
+            err_low = np.clip(mean_vals - ci_low, 0.0, 1.0)
+            err_high = np.clip(ci_high - mean_vals, 0.0, 1.0)
 
-        vp = ax.violinplot(
-            group_values,
-            positions=positions,
-            vert=vert,
-            showmeans=False,
-            showextrema=False,
-            showmedians=False,
-        )
-        for body in vp.get("bodies", []):
-            body.set_facecolor(violin_fill)
-            body.set_edgecolor("none")
-            body.set_linewidth(0.0)
-            body.set_alpha(max(0.35, float(palette_cfg["violin_alpha"]) * 0.75))
-            body.set_zorder(1.0)
-        for key in ("cmeans", "cbars", "cmins", "cmaxes"):
-            artist = vp.get(key, None)
-            if artist is not None:
-                artist.set_visible(False)
+            bar_fill = _mix_rgb(base_color, (1.0, 1.0, 1.0, 1.0), 0.50, 0.50)
+            edge_color = (0.0, 0.0, 0.0, 1.0)
+            point_face = scatter_color
+            point_edge = scatter_color
 
-        bp = ax.boxplot(
-            group_values,
-            positions=positions,
-            vert=vert,
-            widths=0.22,
-            patch_artist=True,
-            showfliers=False,
-            boxprops={
-                "facecolor": (1.0, 1.0, 1.0, 0.96),
-                "edgecolor": (0.0, 0.0, 0.0, 1.0),
-                "linewidth": 1.0,
-            },
-            whiskerprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.0},
-            capprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.0},
-            medianprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.2},
-        )
-        for patch in bp.get("boxes", []):
-            patch.set_facecolor((1.0, 1.0, 1.0, 0.96))
-            patch.set_edgecolor((0.0, 0.0, 0.0, 1.0))
-            patch.set_zorder(2.0)
-        for key in ("whiskers", "caps", "medians"):
-            for artist in bp.get(key, []):
-                artist.set_color((0.0, 0.0, 0.0, 1.0))
-                artist.set_zorder(2.1)
-
-        mean_vals = summary["mean"].astype(float).to_numpy()
-        sem_vals = summary["sem"].astype(float).fillna(0.0).to_numpy()
-        err_color = (0.0, 0.0, 0.0, 1.0)
-        if vert:
-            ax.errorbar(
-                positions,
-                mean_vals,
-                yerr=sem_vals,
-                fmt="none",
-                ecolor=err_color,
-                elinewidth=1.0,
-                capsize=0.0,
-                capthick=1.0,
-                zorder=2.2,
-            )
-        else:
-            ax.errorbar(
-                mean_vals,
-                positions,
-                xerr=sem_vals,
-                fmt="none",
-                ecolor=err_color,
-                elinewidth=1.0,
-                capsize=0.0,
-                capthick=1.0,
-                zorder=2.2,
-            )
-
-        point_face = scatter_color
-        point_edge = scatter_color
-
-        # Scatter points on top.
-        rng = np.random.default_rng(42)
-        for pos, vals in zip(positions, group_values):
-            if vals.size == 0:
-                continue
-            jitter = rng.normal(loc=pos, scale=0.04, size=vals.size)
             if vert:
-                ax.scatter(
-                    jitter,
-                    vals,
-                    s=8,
-                    c=[point_face],
-                    edgecolors=[point_edge],
-                    linewidths=0.4,
-                    alpha=float(palette_cfg["point_alpha"]),
-                    zorder=3.0,
+                ax.bar(
+                    positions,
+                    mean_vals,
+                    width=0.56,
+                    color=bar_fill,
+                    edgecolor=edge_color,
+                    linewidth=1.0,
+                    zorder=1.5,
+                )
+                ax.errorbar(
+                    positions,
+                    mean_vals,
+                    yerr=np.vstack([err_low, err_high]),
+                    fmt="none",
+                    ecolor=edge_color,
+                    elinewidth=1.0,
+                    capsize=2.0,
+                    capthick=1.0,
+                    zorder=2.2,
                 )
             else:
-                ax.scatter(
-                    vals,
-                    jitter,
-                    s=8,
-                    c=[point_face],
-                    edgecolors=[point_edge],
-                    linewidths=0.4,
-                    alpha=float(palette_cfg["point_alpha"]),
-                    zorder=3.0,
+                ax.barh(
+                    positions,
+                    mean_vals,
+                    height=0.56,
+                    color=bar_fill,
+                    edgecolor=edge_color,
+                    linewidth=1.0,
+                    zorder=1.5,
+                )
+                ax.errorbar(
+                    mean_vals,
+                    positions,
+                    xerr=np.vstack([err_low, err_high]),
+                    fmt="none",
+                    ecolor=edge_color,
+                    elinewidth=1.0,
+                    capsize=2.0,
+                    capthick=1.0,
+                    zorder=2.2,
                 )
 
-        hap_labels = [_format_haplotype_label(g) for g in summary.index]
-        if vert:
-            ax.set_xticks(positions, hap_labels, ha="right")
-            # ax.set_xlabel("Haplotype")
-            ax.set_ylabel(pheno_name)
-        else:
-            ax.set_yticks(positions, hap_labels)
-            # ax.set_ylabel("Haplotype")
-            ax.set_xlabel(pheno_name)
-
-        if draw_letters:
-            all_vals = np.concatenate([v for v in group_values if v.size > 0]) if any(
-                v.size > 0 for v in group_values
-            ) else np.array([0.0])
-            vmin = float(np.nanmin(all_vals))
-            vmax = float(np.nanmax(all_vals))
-            span = max(vmax - vmin, 1e-9)
-            pad = span * 0.05
-            letters_seq = summary["letters"].astype(str).tolist()
-            means_seq = summary["mean"].astype(float).tolist()
-
-            for pos, vals, letter, mean_v in zip(positions, group_values, letters_seq, means_seq):
-                anchor = float(np.nanmax(vals)) if vals.size > 0 else float(mean_v)
+            rng = np.random.default_rng(42)
+            for pos, vals in zip(positions, group_values):
+                if vals.size == 0:
+                    continue
+                v = np.clip(vals.astype(float), 0.0, 1.0)
+                jitter_a = rng.normal(loc=pos, scale=0.035, size=v.size)
+                jitter_b = rng.normal(loc=0.0, scale=0.015, size=v.size)
                 if vert:
-                    ax.text(
-                        pos,
-                        anchor + pad,
-                        letter,
-                        ha="center",
-                        va="bottom",
-                        fontsize=10,
-                        color="black",
+                    yy = np.clip(v + jitter_b, 0.0, 1.0)
+                    ax.scatter(
+                        jitter_a,
+                        yy,
+                        s=8,
+                        c=[point_face],
+                        edgecolors=[point_edge],
+                        linewidths=0.4,
+                        alpha=float(palette_cfg["point_alpha"]),
+                        zorder=3.0,
                     )
                 else:
-                    ax.text(
-                        anchor + pad,
-                        pos,
-                        letter,
-                        ha="left",
-                        va="center",
-                        fontsize=10,
-                        color="black",
+                    xx = np.clip(v + jitter_b, 0.0, 1.0)
+                    ax.scatter(
+                        xx,
+                        jitter_a,
+                        s=8,
+                        c=[point_face],
+                        edgecolors=[point_edge],
+                        linewidths=0.4,
+                        alpha=float(palette_cfg["point_alpha"]),
+                        zorder=3.0,
                     )
 
+            hap_labels = [_format_haplotype_label(g) for g in summary.index]
             if vert:
-                ymin, ymax = ax.get_ylim()
-                ax.set_ylim(ymin, ymax + pad * 2.0)
+                ax.set_xticks(positions, hap_labels, ha="right")
+                ax.set_ylabel(f"{pheno_name} (proportion)")
+                ax.set_ylim(0.0, 1.06)
             else:
-                xmin, xmax = ax.get_xlim()
-                ax.set_xlim(xmin, xmax + pad * 2.0)
+                ax.set_yticks(positions, hap_labels)
+                ax.set_xlabel(f"{pheno_name} (proportion)")
+                ax.set_xlim(0.0, 1.06)
+
+            if draw_letters:
+                labels = summary["label"].astype(str).tolist()
+                if vert:
+                    for pos, y, txt in zip(positions, mean_vals, labels):
+                        ax.text(
+                            pos,
+                            min(1.05, float(y) + 0.03),
+                            txt,
+                            ha="center",
+                            va="bottom",
+                            fontsize=9,
+                            color="black",
+                            zorder=4.0,
+                        )
+                else:
+                    for pos, x, txt in zip(positions, mean_vals, labels):
+                        ax.text(
+                            min(1.05, float(x) + 0.03),
+                            pos,
+                            txt,
+                            ha="left",
+                            va="center",
+                            fontsize=9,
+                            color="black",
+                            zorder=4.0,
+                        )
+        else:
+            # continuous mode: combined violin + box + errorbar + points
+            vp = ax.violinplot(
+                group_values,
+                positions=positions,
+                vert=vert,
+                showmeans=False,
+                showextrema=False,
+                showmedians=False,
+            )
+            for body in vp.get("bodies", []):
+                body.set_facecolor(violin_fill)
+                body.set_edgecolor("none")
+                body.set_linewidth(0.0)
+                body.set_alpha(max(0.35, float(palette_cfg["violin_alpha"]) * 0.75))
+                body.set_zorder(1.0)
+            for key in ("cmeans", "cbars", "cmins", "cmaxes"):
+                artist = vp.get(key, None)
+                if artist is not None:
+                    artist.set_visible(False)
+
+            bp = ax.boxplot(
+                group_values,
+                positions=positions,
+                vert=vert,
+                widths=0.22,
+                patch_artist=True,
+                showfliers=False,
+                boxprops={
+                    "facecolor": (1.0, 1.0, 1.0, 0.96),
+                    "edgecolor": (0.0, 0.0, 0.0, 1.0),
+                    "linewidth": 1.0,
+                },
+                whiskerprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.0},
+                capprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.0},
+                medianprops={"color": (0.0, 0.0, 0.0, 1.0), "linewidth": 1.2},
+            )
+            for patch in bp.get("boxes", []):
+                patch.set_facecolor((1.0, 1.0, 1.0, 0.96))
+                patch.set_edgecolor((0.0, 0.0, 0.0, 1.0))
+                patch.set_zorder(2.0)
+            for key in ("whiskers", "caps", "medians"):
+                for artist in bp.get(key, []):
+                    artist.set_color((0.0, 0.0, 0.0, 1.0))
+                    artist.set_zorder(2.1)
+
+            mean_vals = summary["mean"].astype(float).to_numpy()
+            sem_vals = summary["sem"].astype(float).fillna(0.0).to_numpy()
+            err_color = (0.0, 0.0, 0.0, 1.0)
+            if vert:
+                ax.errorbar(
+                    positions,
+                    mean_vals,
+                    yerr=sem_vals,
+                    fmt="none",
+                    ecolor=err_color,
+                    elinewidth=1.0,
+                    capsize=0.0,
+                    capthick=1.0,
+                    zorder=2.2,
+                )
+            else:
+                ax.errorbar(
+                    mean_vals,
+                    positions,
+                    xerr=sem_vals,
+                    fmt="none",
+                    ecolor=err_color,
+                    elinewidth=1.0,
+                    capsize=0.0,
+                    capthick=1.0,
+                    zorder=2.2,
+                )
+
+            point_face = scatter_color
+            point_edge = scatter_color
+
+            rng = np.random.default_rng(42)
+            for pos, vals in zip(positions, group_values):
+                if vals.size == 0:
+                    continue
+                jitter = rng.normal(loc=pos, scale=0.04, size=vals.size)
+                if vert:
+                    ax.scatter(
+                        jitter,
+                        vals,
+                        s=8,
+                        c=[point_face],
+                        edgecolors=[point_edge],
+                        linewidths=0.4,
+                        alpha=float(palette_cfg["point_alpha"]),
+                        zorder=3.0,
+                    )
+                else:
+                    ax.scatter(
+                        vals,
+                        jitter,
+                        s=8,
+                        c=[point_face],
+                        edgecolors=[point_edge],
+                        linewidths=0.4,
+                        alpha=float(palette_cfg["point_alpha"]),
+                        zorder=3.0,
+                    )
+
+            hap_labels = [_format_haplotype_label(g) for g in summary.index]
+            if vert:
+                ax.set_xticks(positions, hap_labels, ha="right")
+                ax.set_ylabel(pheno_name)
+            else:
+                ax.set_yticks(positions, hap_labels)
+                ax.set_xlabel(pheno_name)
+
+            if draw_letters:
+                all_vals = np.concatenate([v for v in group_values if v.size > 0]) if any(
+                    v.size > 0 for v in group_values
+                ) else np.array([0.0])
+                vmin = float(np.nanmin(all_vals))
+                vmax = float(np.nanmax(all_vals))
+                span = max(vmax - vmin, 1e-9)
+                pad = span * 0.05
+                letters_seq = summary["letters"].astype(str).tolist()
+                means_seq = summary["mean"].astype(float).tolist()
+
+                for pos, vals, letter, mean_v in zip(
+                    positions, group_values, letters_seq, means_seq
+                ):
+                    anchor = float(np.nanmax(vals)) if vals.size > 0 else float(mean_v)
+                    if vert:
+                        ax.text(
+                            pos,
+                            anchor + pad,
+                            letter,
+                            ha="center",
+                            va="bottom",
+                            fontsize=10,
+                            color="black",
+                        )
+                    else:
+                        ax.text(
+                            anchor + pad,
+                            pos,
+                            letter,
+                            ha="left",
+                            va="center",
+                            fontsize=10,
+                            color="black",
+                        )
+
+                if vert:
+                    ymin, ymax = ax.get_ylim()
+                    ax.set_ylim(ymin, ymax + pad * 2.0)
+                else:
+                    xmin, xmax = ax.get_xlim()
+                    ax.set_xlim(xmin, xmax + pad * 2.0)
 
     if draw_matrix:
         matrix_ax = ax

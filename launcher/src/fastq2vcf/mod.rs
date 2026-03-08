@@ -991,7 +991,11 @@ fn start_reference_indexing(
     );
     let safe_job = crate::pipeline::safe_job_label(job_name);
     let ignore_error_logs = collect_existing_step_error_logs(workdir, &safe_job)?;
-    let wrapped = wrap_reference_submit_cmd(&idx_cmd, &safe_job, backend);
+    let index_csub_ncpu = match aligner_flavor {
+        AlignerFlavor::BwaMem2 => 8,
+        AlignerFlavor::Bwa => 2,
+    };
+    let wrapped = wrap_reference_submit_cmd(&idx_cmd, &safe_job, backend, index_csub_ncpu);
     run_shell_capture(workdir, &wrapped, "indexing reference submit")?;
     Ok(Some(ReferenceIndexTask {
         reference,
@@ -1003,12 +1007,21 @@ fn start_reference_indexing(
     }))
 }
 
-fn wrap_reference_submit_cmd(cmd: &str, safe_job: &str, backend: &str) -> String {
+fn wrap_reference_submit_cmd(
+    cmd: &str,
+    safe_job: &str,
+    backend: &str,
+    csub_ncpu: usize,
+) -> String {
     let quoted_cmd = sh_quote(cmd);
     if backend == "csub" {
         return format!(
-            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n 1 {}",
-            safe_job, safe_job, safe_job, quoted_cmd
+            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
+            safe_job,
+            safe_job,
+            safe_job,
+            csub_ncpu.max(1),
+            quoted_cmd
         );
     }
     format!(
@@ -2604,7 +2617,9 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
         return false;
     }
     if s.starts_with("job ") && s.contains(" stderr output") {
-        return true;
+        // csub may print this marker line before real stderr payload arrives.
+        // Treating it as fatal causes false-positive early failures.
+        return false;
     }
     let keys = [
         "traceback (most recent call last)",
@@ -2622,6 +2637,7 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
         "terminated",
         "cancelled",
         "canceled",
+        "memlimit",
         "sigterm",
         "sigkill",
         "out of memory",

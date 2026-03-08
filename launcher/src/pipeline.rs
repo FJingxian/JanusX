@@ -129,13 +129,17 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
             return Err("Interrupted by signal.".to_string());
         }
         if opts.skip_if_outputs_exist && all_outputs_ready(&step.outputs) {
-            super::print_success_line(&format!("{step_text} ...Skipped"));
+            if opts.emit_completion_line {
+                super::print_success_line(&format!("{step_text} ...Skipped"));
+            }
             continue;
         }
         if opts.skip_if_outputs_exist && !step.items.is_empty() {
             let pending_idx = pending_item_indices(step);
             if pending_idx.is_empty() {
-                super::print_success_line(&format!("{step_text} ...Skipped"));
+                if opts.emit_completion_line {
+                    super::print_success_line(&format!("{step_text} ...Skipped"));
+                }
                 continue;
             }
         }

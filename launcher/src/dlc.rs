@@ -777,6 +777,9 @@ fn build_tool_command_from_preferred_binding(
                 apply_env_runtime_exec_env(&mut cmd, runtime_home);
             }
             cmd.args(args);
+            if tool == "beagle" {
+                apply_beagle_exec_env(&mut cmd, args);
+            }
             Ok(Some(cmd))
         }
         "conda" => {
@@ -786,6 +789,9 @@ fn build_tool_command_from_preferred_binding(
                 let mut cmd = Command::new(&tool_path);
                 apply_prefixed_tool_exec_env(&mut cmd, &tool_path);
                 cmd.args(args);
+                if tool == "beagle" {
+                    apply_beagle_exec_env(&mut cmd, args);
+                }
                 return Ok(Some(cmd));
             }
             if !env_name.is_empty() {
@@ -799,6 +805,9 @@ fn build_tool_command_from_preferred_binding(
                     .arg(env_name)
                     .arg(tool)
                     .args(args);
+                if tool == "beagle" {
+                    apply_beagle_exec_env(&mut cmd, args);
+                }
                 return Ok(Some(cmd));
             }
             if path.is_empty() || !Path::new(path).exists() {
@@ -806,6 +815,9 @@ fn build_tool_command_from_preferred_binding(
             }
             let mut cmd = Command::new(path);
             cmd.args(args);
+            if tool == "beagle" {
+                apply_beagle_exec_env(&mut cmd, args);
+            }
             Ok(Some(cmd))
         }
         "docker" => {
@@ -1793,6 +1805,9 @@ fn build_tool_command(
             let mut cmd = Command::new(tool_path);
             apply_env_runtime_exec_env(&mut cmd, runtime_home);
             cmd.args(args);
+            if tool == "beagle" {
+                apply_beagle_exec_env(&mut cmd, args);
+            }
             Ok(cmd)
         }
         "conda" => {
@@ -1800,6 +1815,9 @@ fn build_tool_command(
                 if let Some(host_tool) = find_bin(tool) {
                     let mut cmd = Command::new(host_tool);
                     cmd.args(args);
+                    if tool == "beagle" {
+                        apply_beagle_exec_env(&mut cmd, args);
+                    }
                     return Ok(cmd);
                 }
             }
@@ -1818,6 +1836,9 @@ fn build_tool_command(
                 .arg(env_name)
                 .arg(tool)
                 .args(args);
+            if tool == "beagle" {
+                apply_beagle_exec_env(&mut cmd, args);
+            }
             Ok(cmd)
         }
         "docker" => {
@@ -1843,6 +1864,17 @@ fn build_tool_command(
             }
             if let Some((uid, gid)) = current_uid_gid() {
                 cmd.arg("--user").arg(format!("{uid}:{gid}"));
+            }
+            if tool == "beagle" {
+                let heap_gb = env::var("JANUSX_BEAGLE_XMX_GB")
+                    .ok()
+                    .and_then(|x| x.trim().parse::<usize>().ok())
+                    .filter(|x| *x > 0)
+                    .unwrap_or_else(|| beagle_heap_gb_from_args(args));
+                cmd.arg("-e")
+                    .arg(format!("_JAVA_OPTIONS=-Xmx{}g", heap_gb))
+                    .arg("-e")
+                    .arg("JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=/tmp");
             }
             for m in mounts {
                 let s = m.to_string_lossy().to_string();
@@ -1872,6 +1904,9 @@ fn build_tool_command(
             }
             let mut cmd = Command::new(singularity_bin);
             cmd.arg("exec").arg(sif).arg(tool).args(args);
+            if tool == "beagle" {
+                apply_beagle_exec_env(&mut cmd, args);
+            }
             Ok(cmd)
         }
         _ => Err("Unknown DLC runtime mode. Please run `jx -update dlc`.".to_string()),
@@ -1945,6 +1980,50 @@ fn apply_prefixed_tool_exec_env(cmd: &mut Command, tool_path: &Path) {
         cmd.env("JAVA_HOME", prefix);
         cmd.env("GATK_JAVA", &java_bin);
     }
+}
+
+fn beagle_heap_gb_from_args(args: &[String]) -> usize {
+    let mut nthreads: Option<usize> = None;
+    for arg in args {
+        if let Some(v) = arg.trim().strip_prefix("nthreads=") {
+            if let Ok(x) = v.trim().parse::<usize>() {
+                if x > 0 {
+                    nthreads = Some(x);
+                    break;
+                }
+            }
+        }
+    }
+    let t = nthreads.unwrap_or(4).max(1);
+    t.saturating_mul(4).clamp(16, 256)
+}
+
+fn apply_beagle_exec_env(cmd: &mut Command, args: &[String]) {
+    let heap_gb = env::var("JANUSX_BEAGLE_XMX_GB")
+        .ok()
+        .and_then(|x| x.trim().parse::<usize>().ok())
+        .filter(|x| *x > 0)
+        .unwrap_or_else(|| beagle_heap_gb_from_args(args));
+
+    let prior_java_opts = env::var("_JAVA_OPTIONS").unwrap_or_default();
+    let xmx = format!("-Xmx{}g", heap_gb);
+    let merged_java_opts = if prior_java_opts.trim().is_empty() {
+        xmx
+    } else {
+        format!("{xmx} {}", prior_java_opts.trim())
+    };
+    cmd.env("_JAVA_OPTIONS", merged_java_opts);
+
+    let prior_tool_opts = env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
+    let tmp_flag = "-Djava.io.tmpdir=/tmp";
+    let merged_tool_opts = if prior_tool_opts.contains(tmp_flag) {
+        prior_tool_opts
+    } else if prior_tool_opts.trim().is_empty() {
+        tmp_flag.to_string()
+    } else {
+        format!("{tmp_flag} {}", prior_tool_opts.trim())
+    };
+    cmd.env("JAVA_TOOL_OPTIONS", merged_tool_opts);
 }
 
 fn missing_tools_for_record(

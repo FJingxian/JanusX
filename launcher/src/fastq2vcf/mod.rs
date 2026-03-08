@@ -177,14 +177,15 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
 
     let state_path = workdir.join(".work.json");
     let mut param_mismatch_confirmed = false;
-    match inspect_work_state_basic_params(
+    let basic_param_status = inspect_work_state_basic_params(
         &state_path,
         &reference,
         &samples,
         &backend,
         opts.nohup_max_jobs,
         &singularity,
-    )? {
+    )?;
+    match basic_param_status {
         WorkStateParamStatus::Mismatch => {
             println!(
                 "{}",
@@ -203,6 +204,11 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             param_mismatch_confirmed = true;
         }
         WorkStateParamStatus::Match | WorkStateParamStatus::NotFound => {}
+    }
+    let mut resumed_line_printed = false;
+    if matches!(basic_param_status, WorkStateParamStatus::Match) && state_path.exists() {
+        println!("Resuming pipeline from {}", state_path.display());
+        resumed_line_printed = true;
     }
 
     let index_task = start_reference_indexing(
@@ -316,7 +322,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     let input_files = build_input_files(&reference, &samples);
     let (mut state_tracker, resumed) =
         WorkStateTracker::init_or_resume(&state_path, &run_params_json, &input_files, &steps)?;
-    if resumed {
+    if resumed && !resumed_line_printed {
         println!("Resuming pipeline from {}", state_path.display());
     }
     let summary = state_tracker.summary();

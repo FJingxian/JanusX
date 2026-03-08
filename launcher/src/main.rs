@@ -1943,8 +1943,8 @@ fn run_update_internal(
                     }
                 }
             }
-            // GitHub latest should refresh even when package version string is unchanged.
-            let gh_force_reinstall = true;
+            // Default latest update should be incremental; full reinstall only when explicitly requested.
+            let gh_force_reinstall = opts.force_reinstall;
             if opts.verbose {
                 println!("Updating from GitHub (CN mirror) ...");
             }

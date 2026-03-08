@@ -92,6 +92,7 @@ DEFAULT_DEPTH_DIFFERENCE = 150
 DEFAULT_ED_POWER = 4
 DEFAULT_SNPIDX_SCATTER_MAX_POINTS_PER_CHR = 5000
 DEFAULT_RICH_ACTIVE_TASKS = 5
+DEFAULT_MIN_CONTIG_LOCI = 500
 SUBPLOT_HEIGHT = 4.5
 
 
@@ -290,6 +291,13 @@ def _freeze_sort_key(obj):
 def chr_sort_key(x) -> tuple[int, object]:
     # Keep postbsa chromosome ordering fully aligned with manhanden.py.
     return _freeze_sort_key(_chrom_sort_key(x))
+
+
+def is_contig_chr(label: object) -> bool:
+    if pd.isna(label):
+        return False
+    text = str(label).strip().upper()
+    return text.startswith("CONTIG")
 
 
 def path_sort_key(path_text: str) -> tuple[tuple[int, object], tuple[int, object]]:
@@ -792,6 +800,40 @@ def sort_by_chr_pos(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def filter_low_loci_contigs(
+    raw_df: pd.DataFrame,
+    smooth_df: pd.DataFrame,
+    logger: logging.Logger,
+    min_loci: int = DEFAULT_MIN_CONTIG_LOCI,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if raw_df.empty or "chr" not in raw_df.columns:
+        return raw_df, smooth_df
+
+    counts = raw_df.groupby("chr", sort=False).size()
+    contig_counts = counts[counts.index.map(is_contig_chr)]
+    if contig_counts.empty:
+        return raw_df, smooth_df
+
+    drop_counts = contig_counts[contig_counts < int(min_loci)]
+    if drop_counts.empty:
+        logger.info(
+            f"Contig loci filter (<{int(min_loci)}): no contigs removed before plotting."
+        )
+        return raw_df, smooth_df
+
+    drop_set = set(drop_counts.index.tolist())
+    raw_out = raw_df.loc[~raw_df["chr"].isin(drop_set)].reset_index(drop=True)
+    if "chr" in smooth_df.columns:
+        smooth_out = smooth_df.loc[~smooth_df["chr"].isin(drop_set)].reset_index(drop=True)
+    else:
+        smooth_out = smooth_df
+    logger.info(
+        f"Contig loci filter (<{int(min_loci)}): removed {len(drop_set)} contigs "
+        f"({int(drop_counts.sum())} raw loci)."
+    )
+    return raw_out, smooth_out
+
+
 def reoffset_global_chr_positions(
     raw_df: pd.DataFrame,
     smooth_df: pd.DataFrame,
@@ -1074,6 +1116,25 @@ def plot_bsa(
 
     raw_df = raw_df.copy()
     smooth_df = smooth_df.copy()
+    if "chr" in raw_df.columns:
+        contig_mask_raw = raw_df["chr"].map(is_contig_chr)
+        removed_contig_n = int(contig_mask_raw.sum())
+        if removed_contig_n > 0:
+            raw_df = raw_df.loc[~contig_mask_raw].reset_index(drop=True)
+            if "chr" in smooth_df.columns:
+                smooth_df = smooth_df.loc[~smooth_df["chr"].map(is_contig_chr)].reset_index(
+                    drop=True
+                )
+            logger.info(
+                f"Excluded contigs from final figures: {removed_contig_n} raw loci "
+                "from Contig* chromosomes."
+            )
+    if raw_df.empty:
+        logger.warning("Only contig loci remain after filtering; skip plotting.")
+        return
+    if smooth_df.empty:
+        logger.warning("No non-contig sliding-window results remain; skip plotting.")
+        return
     raw_df["ED_power"] = np.power(raw_df["ED"].to_numpy(dtype=float), ed_power)
 
     chr_list = sorted(raw_df["chr"].dropna().unique(), key=chr_sort_key)
@@ -1554,6 +1615,7 @@ def main() -> None:
         )
 
     raw_df, smooth_df = reoffset_global_chr_positions(raw_df, smooth_df)
+    raw_df, smooth_df = filter_low_loci_contigs(raw_df, smooth_df, logger)
     raw_df = sort_by_chr_pos(normalize_position_columns(raw_df))
     smooth_df = sort_by_chr_pos(normalize_position_columns(smooth_df))
     save_table(smooth_df, f"{output_stem}.smooth.tsv", logger, "Smoothed table")

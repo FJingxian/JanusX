@@ -279,9 +279,17 @@ def clean_chr(chr_series: pd.Series) -> pd.Series:
     return chr_str.apply(try_convert)
 
 
+def _freeze_sort_key(obj):
+    if isinstance(obj, list):
+        return tuple(_freeze_sort_key(x) for x in obj)
+    if isinstance(obj, tuple):
+        return tuple(_freeze_sort_key(x) for x in obj)
+    return obj
+
+
 def chr_sort_key(x) -> tuple[int, object]:
     # Keep postbsa chromosome ordering fully aligned with manhanden.py.
-    return _chrom_sort_key(x)
+    return _freeze_sort_key(_chrom_sort_key(x))
 
 
 def path_sort_key(path_text: str) -> tuple[tuple[int, object], tuple[int, object]]:

@@ -33,6 +33,7 @@ import time
 import sys
 from pathlib import Path
 from typing import Optional
+from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
@@ -90,6 +91,7 @@ DEFAULT_REF_ALLELE_FREQ = 0.2
 DEFAULT_DEPTH_DIFFERENCE = 150
 DEFAULT_ED_POWER = 4
 DEFAULT_SNPIDX_SCATTER_MAX_POINTS_PER_CHR = 5000
+DEFAULT_RICH_ACTIVE_TASKS = 5
 SUBPLOT_HEIGHT = 4.5
 
 
@@ -256,7 +258,12 @@ def default_prefix_for_inputs(file_arg: str, files: list[str]) -> str:
 
 
 def clean_chr(chr_series: pd.Series) -> pd.Series:
-    chr_str = chr_series.astype(str).str.upper().str.replace("CHR", "", regex=False).str.strip()
+    chr_str = (
+        chr_series.astype(str)
+        .str.strip()
+        .str.replace(r"^(?i:chr)", "", regex=True)
+        .str.strip()
+    )
 
     def try_convert(x: str):
         if pd.isna(x) or x == "" or str(x).lower() in ["nan", "na", "null"]:
@@ -273,52 +280,8 @@ def clean_chr(chr_series: pd.Series) -> pd.Series:
 
 
 def chr_sort_key(x) -> tuple[int, object]:
-    def natural_text_key(text: str) -> tuple[tuple[int, object], ...]:
-        parts = re.findall(r"\d+|\D+", text)
-        if len(parts) == 0:
-            return ((1, ""),)
-        out: list[tuple[int, object]] = []
-        for part in parts:
-            if part.isdigit():
-                out.append((0, int(part)))
-            else:
-                out.append((1, part))
-        return tuple(out)
-
-    try:
-        if pd.isna(x):
-            return (9, "")
-    except Exception:
-        pass
-
-    if isinstance(x, (int, float)):
-        return (0, float(x))
-
-    text = str(x).strip()
-    if text == "":
-        return (9, "")
-
-    upper = text.upper()
-    for prefix in ("CHR", "CHROMOSOME"):
-        if upper.startswith(prefix):
-            upper = upper[len(prefix):].strip()
-            break
-
-    if upper.replace(".", "", 1).isdigit():
-        return (0, float(upper))
-    if upper == "X":
-        return (1, 23)
-    if upper == "Y":
-        return (1, 24)
-    if upper in {"M", "MT", "MITO", "MITOCHONDRIA"}:
-        return (1, 25)
-
-    m = re.match(r"^([A-Z_\\-]+?)(\d+(?:\.\d+)?)$", upper)
-    if m is not None:
-        prefix, num = m.groups()
-        return (2, (prefix, float(num)))
-
-    return (3, natural_text_key(upper))
+    # Keep postbsa chromosome ordering fully aligned with manhanden.py.
+    return _chrom_sort_key(x)
 
 
 def path_sort_key(path_text: str) -> tuple[tuple[int, object], tuple[int, object]]:
@@ -817,6 +780,53 @@ def sort_by_chr_pos(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def reoffset_global_chr_positions(
+    raw_df: pd.DataFrame,
+    smooth_df: pd.DataFrame,
+    interval: float = 1 / 50,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if raw_df.empty or "chr" not in raw_df.columns:
+        return raw_df, smooth_df
+
+    raw_base_col = "pos_raw" if "pos_raw" in raw_df.columns else "pos"
+    if raw_base_col not in raw_df.columns:
+        return raw_df, smooth_df
+
+    raw_base = pd.to_numeric(raw_df[raw_base_col], errors="coerce")
+    key_df = pd.DataFrame({"chr": raw_df["chr"], "base": raw_base}).dropna()
+    if key_df.empty:
+        return raw_df, smooth_df
+
+    chr_sorted = sorted(key_df["chr"].dropna().unique(), key=chr_sort_key)
+    chr_max = key_df.groupby("chr", sort=False)["base"].max().reindex(chr_sorted).fillna(0.0)
+    total_loc = float(chr_max.sum())
+    chr_interval = int(total_loc * interval)
+
+    offsets: dict[object, float] = {}
+    running = 0.0
+    for chr_id in chr_sorted:
+        offsets[chr_id] = running
+        running += float(chr_max.loc[chr_id]) + chr_interval
+
+    def _apply(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "chr" not in df.columns:
+            return df
+        out = df.copy()
+        base_col = "pos_raw" if "pos_raw" in out.columns else "pos"
+        if base_col not in out.columns:
+            return out
+        base = pd.to_numeric(out[base_col], errors="coerce")
+        if "pos_raw" not in out.columns:
+            out["pos_raw"] = base
+        mapped = out["chr"].map(offsets)
+        new_pos = base + mapped
+        old_pos = pd.to_numeric(out["pos"], errors="coerce") if "pos" in out.columns else base
+        out["pos"] = new_pos.where(new_pos.notna(), old_pos)
+        return out
+
+    return _apply(raw_df), _apply(smooth_df)
+
+
 def preprocess_tables_parallel(
     input_files: list[str],
     worker_count: int,
@@ -891,17 +901,37 @@ def preprocess_tables_parallel(
                 with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
                     fut_map: dict[cf.Future, str] = {}
                     task_map: dict[cf.Future, int] = {}
-                    for table_path in input_files:
+                    display_limit = max(1, min(DEFAULT_RICH_ACTIVE_TASKS, n_total))
+
+                    def _submit_only(table_path: str) -> None:
                         fut = _submit(ex, table_path)
                         fut_map[fut] = table_path
                         task_start_ts[table_path] = time.monotonic()
-                        idx = file_to_idx.get(table_path, 0)
-                        task_map[fut] = progress.add_task(
-                            description="",
-                            total=None,
-                            task_label=f"{idx:>{idx_width}}/{n_total}",
-                            file_pad=os.path.basename(table_path).ljust(name_width),
+
+                    def _fill_visible_slots() -> None:
+                        if len(task_map) >= display_limit:
+                            return
+                        pending = sorted(
+                            [
+                                fut
+                                for fut in fut_map.keys()
+                                if (fut not in task_map) and (not fut.done())
+                            ],
+                            key=lambda x: file_to_idx.get(fut_map[x], 0),
                         )
+                        for fut in pending[: display_limit - len(task_map)]:
+                            table_path = fut_map[fut]
+                            idx = file_to_idx.get(table_path, 0)
+                            task_map[fut] = progress.add_task(
+                                description="",
+                                total=None,
+                                task_label=f"{idx:>{idx_width}}/{n_total}",
+                                file_pad=os.path.basename(table_path).ljust(name_width),
+                            )
+
+                    for table_path in input_files:
+                        _submit_only(table_path)
+                    _fill_visible_slots()
 
                     while len(fut_map) > 0:
                         done, _ = cf.wait(
@@ -938,6 +968,7 @@ def preprocess_tables_parallel(
                                     f"Task {idx}/{n_total}: "
                                     f"{os.path.basename(table_path)} ...Failed [{elapsed}]"
                                 )
+                        _fill_visible_slots()
         finally:
             for h, level in muted_console_handlers:
                 h.setLevel(level)
@@ -1510,6 +1541,7 @@ def main() -> None:
             deltaindex_name=deltaindex_name,
         )
 
+    raw_df, smooth_df = reoffset_global_chr_positions(raw_df, smooth_df)
     raw_df = sort_by_chr_pos(normalize_position_columns(raw_df))
     smooth_df = sort_by_chr_pos(normalize_position_columns(smooth_df))
     save_table(smooth_df, f"{output_stem}.smooth.tsv", logger, "Smoothed table")

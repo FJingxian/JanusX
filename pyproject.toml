@@ -11,6 +11,7 @@ dependencies = [
     "scikit-learn",
     "psutil",
     "tqdm",
+    "statsmodels",
     "rich",
     "rich-argparse",
     "dynamicTreeCut",

@@ -3280,10 +3280,39 @@ fn should_retry_after_installing_rust(err: &str) -> bool {
 }
 
 fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {
-    let Some(jx_path) = jx_bin else {
-        return Ok(());
-    };
-    warm_up_jx(jx_path, runtime_home)
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = jx_bin {
+        candidates.push(p.to_path_buf());
+        if let Some(stripped) = strip_deleted_exe_suffix(p) {
+            candidates.push(stripped);
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        candidates.push(exe.clone());
+        if let Some(stripped) = strip_deleted_exe_suffix(&exe) {
+            candidates.push(stripped);
+        }
+    }
+
+    for cand in candidates {
+        if cand.exists() && cand.is_file() {
+            return warm_up_jx(&cand, runtime_home);
+        }
+    }
+    Ok(())
+}
+
+fn strip_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let suffix = " (deleted)";
+    if !raw.ends_with(suffix) {
+        return None;
+    }
+    let trimmed = &raw[..raw.len().saturating_sub(suffix.len())];
+    if trimmed.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 fn run_python_janusx(python: &Path, args: &[String]) -> Result<i32, String> {

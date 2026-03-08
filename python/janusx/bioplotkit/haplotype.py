@@ -475,16 +475,69 @@ def _wilson_ci(k: float, n: float, z: float = 1.959963984540054) -> tuple[float,
     return float(low), float(high)
 
 
+def _holm_adjust(pvals: np.ndarray) -> np.ndarray:
+    p = np.asarray(pvals, dtype=float)
+    m = int(p.size)
+    if m == 0:
+        return p
+    order = np.argsort(p)
+    adjusted = np.empty(m, dtype=float)
+    prev = 0.0
+    for i, idx in enumerate(order):
+        val = (m - i) * float(p[idx])
+        if val < prev:
+            val = prev
+        prev = val
+        adjusted[idx] = min(1.0, val)
+    return adjusted
+
+
+def _compact_letter_display_local(
+    sig_matrix: pd.DataFrame,
+    means: pd.Series,
+) -> dict[object, str]:
+    groups = list(means.sort_values(ascending=False).index)
+    letter_sets: list[set] = []
+    group_letters: dict[object, set] = {g: set() for g in groups}
+
+    for g in groups:
+        placed = False
+        for i, members in enumerate(letter_sets):
+            if all(not bool(sig_matrix.at[g, m]) for m in members):
+                members.add(g)
+                group_letters[g].add(i)
+                placed = True
+        if not placed:
+            letter_sets.append({g})
+            group_letters[g].add(len(letter_sets) - 1)
+
+    for i, members in enumerate(letter_sets):
+        for g in groups:
+            if g in members:
+                continue
+            if all(not bool(sig_matrix.at[g, m]) for m in members):
+                members.add(g)
+                group_letters[g].add(i)
+
+    letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if len(letter_sets) > len(letters):
+        raise ValueError("Too many significance letter groups (>52).")
+    out: dict[object, str] = {}
+    for g in groups:
+        idxs = sorted(group_letters[g])
+        out[g] = "".join(letters[i] for i in idxs)
+    return out
+
+
 def _build_binomial_summary(
     merged: pd.DataFrame,
     site_cols: Sequence[object],
     ascending: bool,
+    alpha: float = 0.05,
 ) -> pd.DataFrame:
     vals = pd.to_numeric(merged["_pheno"], errors="coerce")
     if vals.isna().any():
-        raise ValueError(
-            "mode='binomial' requires phenotype values encoded as numeric 0/1."
-        )
+        raise ValueError("mode='binomial' requires phenotype values encoded as numeric 0/1.")
     uniq = {float(x) for x in pd.unique(vals)}
     if not uniq.issubset({0.0, 1.0}):
         shown = ", ".join(str(x) for x in sorted(uniq))
@@ -521,6 +574,60 @@ def _build_binomial_summary(
     out["letters"] = ""
     out["sem"] = np.nan
     out = out.sort_values("mean", ascending=bool(ascending))
+
+    if out.shape[0] >= 2:
+        try:
+            from scipy.stats import chi2_contingency, fisher_exact
+        except Exception as e:
+            raise RuntimeError("mode='binomial' significance test requires scipy.") from e
+
+        gidx = list(out.index)
+        succ = out["k"].astype(int)
+        fail = (out["n"] - out["k"]).astype(int)
+
+        table = np.column_stack([succ.loc[gidx].to_numpy(), fail.loc[gidx].to_numpy()])
+        p_omnibus = np.nan
+        try:
+            _chi2, p_omnibus, _dof, _exp = chi2_contingency(table, correction=False)
+        except Exception:
+            p_omnibus = np.nan
+
+        sig = pd.DataFrame(False, index=gidx, columns=gidx, dtype=bool)
+        means = out["mean"].astype(float)
+
+        if len(gidx) == 2:
+            g1, g2 = gidx
+            _, p = fisher_exact(
+                [[int(succ.loc[g1]), int(fail.loc[g1])], [int(succ.loc[g2]), int(fail.loc[g2])]]
+            )
+            reject = bool(np.isfinite(p) and float(p) < float(alpha))
+            sig.at[g1, g2] = reject
+            sig.at[g2, g1] = reject
+        elif np.isfinite(p_omnibus) and float(p_omnibus) < float(alpha):
+            pairs: list[tuple[object, object]] = []
+            pvals: list[float] = []
+            for i in range(len(gidx)):
+                for j in range(i + 1, len(gidx)):
+                    gi, gj = gidx[i], gidx[j]
+                    _, p = fisher_exact(
+                        [
+                            [int(succ.loc[gi]), int(fail.loc[gi])],
+                            [int(succ.loc[gj]), int(fail.loc[gj])],
+                        ]
+                    )
+                    pairs.append((gi, gj))
+                    pvals.append(float(p))
+
+            p_adj = _holm_adjust(np.asarray(pvals, dtype=float))
+            for (gi, gj), pv in zip(pairs, p_adj):
+                reject = bool(np.isfinite(pv) and float(pv) < float(alpha))
+                sig.at[gi, gj] = reject
+                sig.at[gj, gi] = reject
+
+        letters_map = _compact_letter_display_local(sig, means)
+        out["letters"] = [letters_map.get(g, "") for g in out.index]
+        out.attrs["p_omnibus"] = float(p_omnibus) if np.isfinite(p_omnibus) else np.nan
+
     return out
 
 
@@ -719,6 +826,7 @@ def plot_haplotype(
     min_haplotype_n: int = 30,
     ascending: bool = False,
     mode: Literal["continuous", "binomial"] = "continuous",
+    alpha: float = 0.05,
     orient: Literal['vertical','horizontal'] = "horizontal",
     ax: Optional[plt.Axes] = None,
     **kwargs: Any,
@@ -742,7 +850,7 @@ def plot_haplotype(
     draw_letters
         Draw annotations:
         - continuous mode: compact-letter-display;
-        - binomial mode: k/n label.
+        - binomial mode: significance letters + k/n label.
     draw_bar
         Draw bar panel:
         - continuous mode: violin+box+errorbar+scatter;
@@ -764,8 +872,10 @@ def plot_haplotype(
         Sort haplotype plotting order by phenotype mean.
         False: high-to-low (default), True: low-to-high.
     mode
-        `continuous`: violin+box style for quantitative phenotype;
-        `binomial`: proportion bar + 95% Wilson CI for 0/1 phenotype.
+        `continuous`: quantitative phenotype mode.
+        `binomial`: binary phenotype mode (0/1).
+    alpha
+        Significance threshold used by statistical tests (default: 0.05).
     orient
         'horizontal'/'h' or 'vertical'/'v'.
     ax
@@ -853,11 +963,17 @@ def plot_haplotype(
             merged,
             value_col="_pheno",
             group_cols=site_cols,
+            alpha=float(alpha),
         )
         summary["sem"] = merged.groupby(site_cols)["_pheno"].sem()
         summary = summary.sort_values("mean", ascending=bool(ascending))
     else:
-        summary = _build_binomial_summary(merged, site_cols, ascending=bool(ascending))
+        summary = _build_binomial_summary(
+            merged,
+            site_cols,
+            ascending=bool(ascending),
+            alpha=float(alpha),
+        )
 
     summary.attrs["min_haplotype_n"] = int(min_haplotype_n)
     summary.attrs["removed_haplotype_groups"] = int(removed_counts.shape[0])
@@ -972,8 +1088,10 @@ def plot_haplotype(
 
             if draw_letters:
                 labels = summary["label"].astype(str).tolist()
+                letters = summary["letters"].astype(str).tolist()
+                annos = [f"{lt}\n{lb}" if lt.strip() else lb for lt, lb in zip(letters, labels)]
                 if vert:
-                    for pos, y, txt in zip(positions, mean_vals, labels):
+                    for pos, y, txt in zip(positions, mean_vals, annos):
                         ax.text(
                             pos,
                             min(1.05, float(y) + 0.03),
@@ -985,7 +1103,7 @@ def plot_haplotype(
                             zorder=4.0,
                         )
                 else:
-                    for pos, x, txt in zip(positions, mean_vals, labels):
+                    for pos, x, txt in zip(positions, mean_vals, annos):
                         ax.text(
                             min(1.05, float(x) + 0.03),
                             pos,
@@ -997,7 +1115,6 @@ def plot_haplotype(
                             zorder=4.0,
                         )
         else:
-            # continuous mode: combined violin + box + errorbar + points
             vp = ax.violinplot(
                 group_values,
                 positions=positions,
@@ -1072,7 +1189,6 @@ def plot_haplotype(
 
             point_face = scatter_color
             point_edge = scatter_color
-
             rng = np.random.default_rng(42)
             for pos, vals in zip(positions, group_values):
                 if vals.size == 0:

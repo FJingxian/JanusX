@@ -297,7 +297,26 @@ def is_contig_chr(label: object) -> bool:
     if pd.isna(label):
         return False
     text = str(label).strip().upper()
-    return text.startswith("CONTIG")
+    compact = text.replace("-", "").replace("_", "")
+    if compact.startswith("CONTIG") or compact.startswith("SCAFFOLD"):
+        return True
+    if compact.startswith("CHRUN") or compact.startswith("UNPLACED"):
+        return True
+    if "RANDOM" in compact:
+        return True
+    if text.startswith("NW_") or text.startswith("NT_") or text.startswith("GL"):
+        return True
+    return False
+
+
+def is_primary_chr_label(label: object) -> bool:
+    if pd.isna(label):
+        return False
+    text = str(label).strip().upper()
+    text = re.sub(r"^CHR", "", text)
+    if text in {"X", "Y", "M", "MT"}:
+        return True
+    return bool(re.fullmatch(r"\d+", text))
 
 
 def path_sort_key(path_text: str) -> tuple[tuple[int, object], tuple[int, object]]:
@@ -810,27 +829,45 @@ def filter_low_loci_contigs(
         return raw_df, smooth_df
 
     counts = raw_df.groupby("chr", sort=False).size()
-    contig_counts = counts[counts.index.map(is_contig_chr)]
-    if contig_counts.empty:
+    if counts.empty:
         return raw_df, smooth_df
 
-    drop_counts = contig_counts[contig_counts < int(min_loci)]
-    if drop_counts.empty:
+    sorted_counts = counts.sort_values(ascending=False)
+    top_n = max(3, min(10, len(sorted_counts)))
+    baseline = float(np.median(sorted_counts.iloc[:top_n].to_numpy(dtype=float)))
+    dynamic_threshold = max(int(min_loci), int(baseline * 0.1))
+
+    drop_set: set[object] = set()
+    for chr_id, n_loci in counts.items():
+        if is_contig_chr(chr_id):
+            drop_set.add(chr_id)
+            continue
+        # Non-primary labels (e.g., scaffold/NW-like) are treated as contig-like
+        # when they are clearly below autosome-scale loci counts.
+        if (not is_primary_chr_label(chr_id)) and int(n_loci) < dynamic_threshold:
+            drop_set.add(chr_id)
+
+    if len(drop_set) == 0:
         logger.info(
-            f"Contig loci filter (<{int(min_loci)}): no contigs removed before plotting."
+            "Contig loci filter: no contig-like chromosomes removed before plotting "
+            f"(threshold={dynamic_threshold}, baseline={int(baseline)})."
         )
         return raw_df, smooth_df
 
-    drop_set = set(drop_counts.index.tolist())
+    drop_counts = counts[counts.index.isin(drop_set)]
     raw_out = raw_df.loc[~raw_df["chr"].isin(drop_set)].reset_index(drop=True)
     if "chr" in smooth_df.columns:
         smooth_out = smooth_df.loc[~smooth_df["chr"].isin(drop_set)].reset_index(drop=True)
     else:
         smooth_out = smooth_df
     logger.info(
-        f"Contig loci filter (<{int(min_loci)}): removed {len(drop_set)} contigs "
-        f"({int(drop_counts.sum())} raw loci)."
+        "Contig loci filter: removed "
+        f"{len(drop_set)} contig-like chromosomes ({int(drop_counts.sum())} raw loci), "
+        f"threshold={dynamic_threshold}, baseline={int(baseline)}."
     )
+    preview = ", ".join([str(x) for x in list(drop_counts.sort_values().index[:8])])
+    if preview:
+        logger.info(f"Filtered contig-like labels (first 8): {preview}")
     return raw_out, smooth_out
 
 
@@ -1620,25 +1657,58 @@ def main() -> None:
     smooth_df = sort_by_chr_pos(normalize_position_columns(smooth_df))
     save_table(smooth_df, f"{output_stem}.smooth.tsv", logger, "Smoothed table")
 
-    with CliStatus("Plotting BSA figures...", enabled=use_spinner) as task:
-        try:
-            plot_bsa(
-                raw_df=raw_df,
-                smooth_df=smooth_df,
-                bulk1_name=bulk1_name,
-                bulk2_name=bulk2_name,
-                deltaindex_name=deltaindex_name,
-                output_stem=output_stem,
-                output_format=args.format,
-                subplot_ratio=args.ratio,
-                ed_power=args.ed_power,
-                window_mb=args.window,
-                logger=logger,
-            )
-        except Exception:
-            task.fail("Plotting BSA figures ...Failed")
-            raise
-        task.complete("Plotting BSA figures ...Finished")
+    plot_info_lines: list[str] = []
+    muted_console_handlers: list[tuple[logging.Handler, int]] = []
+    capture_handler: Optional[logging.Handler] = None
+    if use_spinner:
+        for h in logger.handlers:
+            if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
+                muted_console_handlers.append((h, h.level))
+                h.setLevel(logging.WARNING)
+
+        class _PlotInfoBufferHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.levelno != logging.INFO:
+                    return
+                try:
+                    msg = self.format(record)
+                except Exception:
+                    msg = record.getMessage()
+                text = str(msg).strip()
+                if text:
+                    plot_info_lines.append(text)
+
+        capture_handler = _PlotInfoBufferHandler(level=logging.INFO)
+        capture_handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(capture_handler)
+
+    try:
+        with CliStatus("Plotting BSA figures...", enabled=use_spinner) as task:
+            try:
+                plot_bsa(
+                    raw_df=raw_df,
+                    smooth_df=smooth_df,
+                    bulk1_name=bulk1_name,
+                    bulk2_name=bulk2_name,
+                    deltaindex_name=deltaindex_name,
+                    output_stem=output_stem,
+                    output_format=args.format,
+                    subplot_ratio=args.ratio,
+                    ed_power=args.ed_power,
+                    window_mb=args.window,
+                    logger=logger,
+                )
+            except Exception:
+                task.fail("Plotting BSA figures ...Failed")
+                raise
+            task.complete("Plotting BSA figures ...Finished")
+    finally:
+        if capture_handler is not None:
+            logger.removeHandler(capture_handler)
+        for h, level in muted_console_handlers:
+            h.setLevel(level)
+        if plot_info_lines:
+            print("\n".join(plot_info_lines))
 
     lt = time.localtime()
     logger.info(

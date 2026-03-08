@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import math
 from itertools import cycle
 from shutil import get_terminal_size
 from threading import Thread
@@ -42,14 +43,22 @@ def format_elapsed(seconds: Optional[float]) -> str:
         return "0.0s"
     s = float(max(0.0, seconds))
     if s < 60.0:
-        return f"{s:.1f}s"
-    total_seconds = int(round(s))
+        tenths = math.floor(s * 10.0) / 10.0
+        return f"{tenths:.1f}s"
+    total_seconds = int(math.floor(s))
     if total_seconds < 3600:
         minutes, rem = divmod(total_seconds, 60)
         return f"{minutes}m{rem:02d}s"
-    hours, rem_seconds = divmod(total_seconds, 3600)
-    mins = rem_seconds // 60
+    total_minutes = int(math.floor(s / 60.0))
+    hours, mins = divmod(total_minutes, 60)
     return f"{hours}h{mins:02d}m"
+
+
+def spinner_refresh_interval(seconds: Optional[float]) -> float:
+    s = float(max(0.0, float(seconds or 0.0)))
+    if s < 60.0:
+        return 0.1
+    return 1.0
 
 
 def ensure_rich_spinner_registered() -> None:
@@ -129,7 +138,7 @@ class CliStatus:
             if self._plain_done:
                 break
             print(f"\r{frame} {self._running_line()}", flush=True, end="")
-            sleep(self.timeout)
+            sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
     def _animate_rich(self) -> None:
         while not self._plain_done:
@@ -139,7 +148,7 @@ class CliStatus:
                 self._status_cm.update(self._running_line())
             except Exception:
                 break
-            sleep(self.timeout)
+            sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
     def __enter__(self) -> "CliStatus":
         self._start_ts = monotonic()

@@ -95,23 +95,38 @@ pub(super) fn cmd_markdup(
     bam: &Path,
     out: &Path,
     core: usize,
-    mem: usize,
+    _mem: usize,
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
     let out_bam = out.join(format!("{sample}.Markdup.bam"));
+    let out_bai = out.join(format!("{sample}.Markdup.bam.bai"));
     let out_flag = out.join(format!("{sample}.flagstat"));
     let out_cov = out.join(format!("{sample}.coverage"));
     let out_metric = out.join(format!("{sample}.Markdup.metrics.txt"));
-    format!(
-        "{prefix}gatk --java-options '-Xmx{mem}G -XX:ParallelGCThreads={core}' MarkDuplicates -I {} -O {} --CREATE_INDEX true --REMOVE_DUPLICATES false --METRICS_FILE {} && {prefix}samtools flagstat {} > {} && {prefix}samtools coverage {} > {}",
+    let cleanup_cmd = format!(
+        "rm -f {} {} {} {} {}",
+        qpath(&out_bam),
+        qpath(&out_bai),
+        qpath(&out_flag),
+        qpath(&out_cov),
+        qpath(&out_metric),
+    );
+    let tmpdir_setup_cmd = format!(
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
+        qpath(out),
+    );
+    let markdup_cmd = format!(
+        "{prefix}sambamba markdup -t {core} --tmpdir \"$TMPDIR_BASE\" {} {}",
         qpath(bam),
         qpath(&out_bam),
-        qpath(&out_metric),
-        qpath(&out_bam),
-        qpath(&out_flag),
-        qpath(&out_bam),
-        qpath(&out_cov),
+    );
+    let index_cmd = format!("{prefix}samtools index -@ {core} {}", qpath(&out_bam));
+    let metric_cmd = format!("printf 'tool\\tsambamba markdup\\n' > {}", qpath(&out_metric));
+    let flagstat_cmd = format!("{prefix}samtools flagstat {} > {}", qpath(&out_bam), qpath(&out_flag));
+    let coverage_cmd = format!("{prefix}samtools coverage {} > {}", qpath(&out_bam), qpath(&out_cov));
+    format!(
+        "{cleanup_cmd} && {tmpdir_setup_cmd} && {markdup_cmd} && {index_cmd} && {metric_cmd} && {flagstat_cmd} && {coverage_cmd}",
     )
 }
 

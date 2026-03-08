@@ -573,6 +573,9 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
     if is_benign_stderr_line(&s) {
         return false;
     }
+    if is_csub_failure_marker_line(&s) {
+        return true;
+    }
     let keys = [
         "traceback (most recent call last)",
         "runtimeerror",
@@ -585,8 +588,24 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
         "segmentation fault",
         "exited with exit code",
         "killed",
+        "terminated",
+        "cancelled",
+        "canceled",
+        "sigterm",
+        "sigkill",
+        "signal",
+        "out of memory",
+        "oom",
     ];
     keys.iter().any(|k| s.contains(k))
+}
+
+fn is_csub_failure_marker_line(s: &str) -> bool {
+    // csub frequently emits this line when a task stderr is produced.
+    // For pending items this is a strong failure signal even when detailed
+    // stderr lines are missing or delayed.
+    s.starts_with("job ")
+        && s.contains(" stderr output")
 }
 
 fn is_benign_stderr_line(line: &str) -> bool {

@@ -17,10 +17,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const REQUIRED_DLC_TOOLS: [&str; 9] = [
+const REQUIRED_DLC_TOOLS: [&str; 10] = [
     "fastp",
     "bwa",
     "samtools",
+    "sambamba",
     "gatk",
     "bcftools",
     "tabix",
@@ -1299,6 +1300,7 @@ fn build_fastq2vcf_steps(
         let bam = mappingfolder.join(format!("{sample}.sorted.bam"));
         step3_inputs.push(bam.clone());
         let out_md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
+        let out_md_bai = mappingfolder.join(format!("{sample}.Markdup.bam.bai"));
         let out_md_metrics = mappingfolder.join(format!("{sample}.Markdup.metrics.txt"));
         let raw = cmd_markdup(sample, &bam, &mappingfolder, 16, 200, singularity);
         step3_cmds.push(wrap_scheduler_cmd(
@@ -1307,7 +1309,7 @@ fn build_fastq2vcf_steps(
             16,
             backend,
         ));
-        let outs = vec![out_md_bam, out_md_metrics];
+        let outs = vec![out_md_bam, out_md_bai, out_md_metrics];
         step3_outputs.extend(outs.clone());
         step3_items.push(StepItem {
             id: format!("markdup.{sample}"),

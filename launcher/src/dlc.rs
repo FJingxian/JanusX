@@ -16,10 +16,11 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 9] = [
+const REQUIRED_TOOLS: [&str; 10] = [
     "fastp",
     "bwa",
     "samtools",
+    "sambamba",
     "gatk",
     "bcftools",
     "tabix",
@@ -27,7 +28,7 @@ const REQUIRED_TOOLS: [&str; 9] = [
     "plink",
     "beagle",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 9] = [
+const DLC_TOOL_ENTRIES: [(&str, &str); 10] = [
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
@@ -35,6 +36,7 @@ const DLC_TOOL_ENTRIES: [(&str, &str); 9] = [
     ("fastp", "FASTQ quality control"),
     ("gatk", "Variant discovery toolkit"),
     ("plink", "Genotype association toolkit"),
+    ("sambamba", "Duplicate marking for BAM"),
     ("samtools", "Alignment and BAM/CRAM utilities"),
     ("tabix", "BGZF indexing and queries"),
 ];
@@ -248,6 +250,7 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
 
     if let Some(existing) = load_runtime_record(python, &db_path)? {
         if existing.status == "ok" {
+            let missing_now = missing_tools_for_record(&existing, runtime_home).unwrap_or_default();
             let (complete, detail) = runtime_completeness(&existing, runtime_home);
             if complete {
                 println!(
@@ -272,13 +275,67 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
                     return Ok(0);
                 }
             } else {
-                println!(
-                    "{}",
-                    super::style_yellow(&format!(
-                        "Detected existing incomplete DLC runtime (mode={}): {}. Reinstalling via {}.",
-                        existing.runtime_mode, detail, selected_entry.name
-                    ))
-                );
+                if runtime_mode_matches_builder(&existing.runtime_mode, selected_entry.builder_id)
+                    && supports_incremental_repair_builder(selected_entry.builder_id)
+                    && !missing_now.is_empty()
+                {
+                    println!(
+                        "{}",
+                        super::style_yellow(&format!(
+                            "Detected existing incomplete DLC runtime (mode={}): {}. Installing missing tools via {}.",
+                            existing.runtime_mode, detail, selected_entry.name
+                        ))
+                    );
+                    let mut repaired = match repair_runtime_missing_tools(
+                        selected_entry.builder_id,
+                        &existing,
+                        runtime_home,
+                        python,
+                        &missing_now,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            ensure_dlc_inline_step_newline();
+                            return Err(e);
+                        }
+                    };
+                    ensure_dlc_inline_step_newline();
+                    repaired.method_id = selected;
+                    let missing_after = missing_tools_for_record(&repaired, runtime_home)?;
+                    if !missing_after.is_empty() {
+                        return Err(format!(
+                            "Repair failed: missing required tools -> {}",
+                            missing_after.join(", ")
+                        ));
+                    }
+                    repaired.installed_tools = REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect();
+                    repaired.status = "ok".to_string();
+                    repaired.updated_at = now_utc_epoch();
+                    save_runtime_record(python, &db_path, &repaired)?;
+                    println!(
+                        "{}",
+                        super::style_green(&format!(
+                            "Repair success. Saved to DB: {}",
+                            db_path.to_string_lossy()
+                        ))
+                    );
+                    println!(
+                        "{}",
+                        super::style_green(&format!(
+                            "Installed tools: {}",
+                            repaired.installed_tools.join(", ")
+                        ))
+                    );
+                    return Ok(0);
+                } else {
+                    println!(
+                        "{}",
+                        super::style_yellow(&format!(
+                            "Detected existing incomplete DLC runtime (mode={}): {}. Reinstalling via {}.",
+                            existing.runtime_mode, detail, selected_entry.name
+                        ))
+                    );
+                }
             }
         } else {
             println!(
@@ -732,6 +789,214 @@ fn build_runtime(
         4 => build_singularity_runtime(python),
         _ => Err("Unknown build method.".to_string()),
     }
+}
+
+fn runtime_mode_matches_builder(runtime_mode: &str, builder_id: i32) -> bool {
+    match builder_id {
+        1 => matches!(runtime_mode, "env" | "local"),
+        2 => runtime_mode == "conda",
+        3 => runtime_mode == "docker",
+        4 => runtime_mode == "singularity",
+        _ => false,
+    }
+}
+
+fn supports_incremental_repair_builder(builder_id: i32) -> bool {
+    matches!(builder_id, 1 | 2)
+}
+
+fn repair_runtime_missing_tools(
+    builder_id: i32,
+    existing: &RuntimeRecord,
+    runtime_home: &Path,
+    _python: &Path,
+    missing: &[String],
+) -> Result<RuntimeRecord, String> {
+    match builder_id {
+        1 => repair_env_runtime_missing_tools(existing, runtime_home, missing),
+        2 => repair_conda_runtime_missing_tools(existing, runtime_home, missing),
+        _ => Err(format!(
+            "Incremental repair is not supported for method={builder_id}. Please reinstall."
+        )),
+    }
+}
+
+fn repair_env_runtime_missing_tools(
+    existing: &RuntimeRecord,
+    runtime_home: &Path,
+    missing: &[String],
+) -> Result<RuntimeRecord, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("env method is Linux only.".to_string());
+    }
+    prepare_env_runtime_bin(runtime_home)?;
+    let env_prefix = env_runtime_prefix_dir(runtime_home);
+    let ordered_missing = ordered_required_tools(missing);
+
+    let mm_bin = env_runtime_micromamba_bin(runtime_home);
+    let need_mm_setup = !mm_bin.exists();
+    let need_env_create = !env_prefix.exists();
+    let total_steps =
+        ordered_missing.len() + usize::from(need_mm_setup) + usize::from(need_env_create);
+    let mut step_idx = 1usize;
+
+    let mut dl_desc: Option<String> = None;
+    if need_mm_setup {
+        dl_desc = Some(format!("[{}/{}] Download micromamba", step_idx, total_steps.max(1)));
+        step_idx += 1;
+    }
+    let micromamba_bin = if need_mm_setup || need_env_create || !ordered_missing.is_empty() {
+        ensure_micromamba(runtime_home, dl_desc.as_deref(), None)?
+    } else {
+        mm_bin
+    };
+
+    if need_env_create {
+        let desc = format!("[{}/{}] Create local env via env", step_idx, total_steps.max(step_idx));
+        run_cmd_tail_with_conda_channel_fallback(
+            &desc,
+            &[
+                micromamba_bin.to_string_lossy().to_string(),
+                "create".to_string(),
+                "-y".to_string(),
+                "-p".to_string(),
+                env_prefix.to_string_lossy().to_string(),
+            ],
+            &["python=3.10".to_string()],
+            10,
+        )?;
+        step_idx += 1;
+    }
+    if !ordered_missing.is_empty() {
+        let _ = install_tools_stepwise_env(
+            &micromamba_bin.to_string_lossy(),
+            &env_prefix,
+            &ordered_missing,
+            "Install",
+            step_idx,
+            total_steps.max(step_idx.saturating_sub(1)),
+        )?;
+    }
+    sync_env_runtime_bin_mixed(runtime_home, &env_prefix)?;
+    Ok(RuntimeRecord {
+        method_id: existing.method_id,
+        runtime_mode: if existing.runtime_mode.trim().is_empty() {
+            "env".to_string()
+        } else {
+            existing.runtime_mode.clone()
+        },
+        image_tag: String::new(),
+        conda_env: String::new(),
+        sif_path: String::new(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
+}
+
+fn repair_conda_runtime_missing_tools(
+    existing: &RuntimeRecord,
+    _runtime_home: &Path,
+    missing: &[String],
+) -> Result<RuntimeRecord, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("conda method is Linux only.".to_string());
+    }
+    let Some(conda_bin) = find_bin("conda") else {
+        return Err("conda command not found in PATH.".to_string());
+    };
+    let conda_bin_s = conda_bin.to_string_lossy().to_string();
+    let env_name = if existing.conda_env.trim().is_empty() {
+        CONDA_ENV
+    } else {
+        existing.conda_env.as_str()
+    };
+    let ordered_missing = ordered_required_tools(missing);
+    let mut packages = toolchain_packages_for_tools(&ordered_missing);
+    if packages.is_empty() && !ordered_missing.is_empty() {
+        packages.extend(ordered_missing.clone());
+    }
+
+    let env_exists_named = conda_env_named_exists(&conda_bin, env_name);
+    let env_exists_ready = conda_env_exists(&conda_bin, env_name);
+    let need_remove_broken = env_exists_named && !env_exists_ready;
+    let need_create = !env_exists_ready;
+    let need_install = !packages.is_empty();
+    let total_steps =
+        usize::from(need_remove_broken) + usize::from(need_create) + usize::from(need_install);
+    let mut step_idx = 1usize;
+
+    if need_remove_broken {
+        let desc = format!(
+            "[{}/{}] Repair conda env [remove broken env]",
+            step_idx,
+            total_steps.max(1)
+        );
+        run_cmd_tail(
+            &desc,
+            &vec![
+                conda_bin_s.clone(),
+                "env".to_string(),
+                "remove".to_string(),
+                "-n".to_string(),
+                env_name.to_string(),
+                "-y".to_string(),
+            ],
+            true,
+            10,
+        )?;
+        step_idx += 1;
+    }
+    if need_create {
+        let desc = format!(
+            "[{}/{}] Repair conda env [create env]",
+            step_idx,
+            total_steps.max(step_idx)
+        );
+        run_cmd_tail_with_conda_channel_fallback(
+            &desc,
+            &[
+                conda_bin_s.clone(),
+                "create".to_string(),
+                "-y".to_string(),
+                "-n".to_string(),
+                env_name.to_string(),
+            ],
+            &["python=3.10".to_string()],
+            10,
+        )?;
+        step_idx += 1;
+    }
+    if need_install {
+        let desc = format!(
+            "[{}/{}] Repair conda env [install missing tools]",
+            step_idx,
+            total_steps.max(step_idx)
+        );
+        run_cmd_tail_with_conda_channel_fallback(
+            &desc,
+            &[
+                conda_bin_s.clone(),
+                "install".to_string(),
+                "-y".to_string(),
+                "-n".to_string(),
+                env_name.to_string(),
+            ],
+            &packages,
+            10,
+        )?;
+    }
+
+    Ok(RuntimeRecord {
+        method_id: existing.method_id,
+        runtime_mode: "conda".to_string(),
+        image_tag: String::new(),
+        conda_env: env_name.to_string(),
+        sif_path: String::new(),
+        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
+        status: "ok".to_string(),
+        updated_at: now_utc_epoch(),
+    })
 }
 
 fn runtime_completeness(record: &RuntimeRecord, runtime_home: &Path) -> (bool, String) {
@@ -1516,6 +1781,9 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
             }
             "samtools" => {
                 out.insert("samtools".to_string());
+            }
+            "sambamba" => {
+                out.insert("sambamba".to_string());
             }
             "bcftools" => {
                 out.insert("bcftools".to_string());

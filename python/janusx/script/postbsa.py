@@ -488,7 +488,7 @@ def try_rust_preprocess(
             )
             raw_df = pd.read_csv(raw_path, sep="\t")
             smooth_df = pd.read_csv(smooth_path, sep="\t")
-        logger.info(
+        logger.debug(
             f"Rust preprocessing finished: raw={raw_df.shape}, smooth={smooth_df.shape}"
         )
         return raw_df, smooth_df
@@ -857,7 +857,19 @@ def preprocess_tables_parallel(
             logger,
         )
 
+    def _is_valid_concat_part(df: pd.DataFrame) -> bool:
+        if not isinstance(df, pd.DataFrame):
+            return False
+        if df.empty:
+            return False
+        return not bool(df.isna().all(axis=None))
+
     if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+        muted_console_handlers: list[tuple[logging.Handler, int]] = []
+        for h in logger.handlers:
+            if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
+                muted_console_handlers.append((h, h.level))
+                h.setLevel(logging.WARNING)
         total_start_ts = time.monotonic()
         n_total = len(input_files)
         file_to_idx = {f: i for i, f in enumerate(input_files, start=1)}
@@ -874,57 +886,61 @@ def preprocess_tables_parallel(
             TextColumn("Task {task.fields[task_label]}: {task.fields[file_pad]}"),
             transient=True,
         )
-        with progress:
-            with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
-                fut_map: dict[cf.Future, str] = {}
-                task_map: dict[cf.Future, int] = {}
-                for table_path in input_files:
-                    fut = _submit(ex, table_path)
-                    fut_map[fut] = table_path
-                    task_start_ts[table_path] = time.monotonic()
-                    idx = file_to_idx.get(table_path, 0)
-                    task_map[fut] = progress.add_task(
-                        description="",
-                        total=None,
-                        task_label=f"{idx:>{idx_width}}/{n_total}",
-                        file_pad=os.path.basename(table_path).ljust(name_width),
-                    )
-
-                while len(fut_map) > 0:
-                    done, _ = cf.wait(
-                        list(fut_map.keys()),
-                        timeout=0.1,
-                        return_when=cf.FIRST_COMPLETED,
-                    )
-                    if len(done) == 0:
-                        continue
-                    for fut in sorted(done, key=lambda x: file_to_idx.get(fut_map[x], 0)):
-                        table_path = fut_map.pop(fut)
-                        tid = task_map.pop(fut, None)
-                        if tid is not None:
-                            try:
-                                progress.remove_task(tid)
-                            except Exception:
-                                pass
-                        elapsed = format_elapsed(
-                            time.monotonic()
-                            - task_start_ts.get(table_path, time.monotonic())
+        try:
+            with progress:
+                with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
+                    fut_map: dict[cf.Future, str] = {}
+                    task_map: dict[cf.Future, int] = {}
+                    for table_path in input_files:
+                        fut = _submit(ex, table_path)
+                        fut_map[fut] = table_path
+                        task_start_ts[table_path] = time.monotonic()
+                        idx = file_to_idx.get(table_path, 0)
+                        task_map[fut] = progress.add_task(
+                            description="",
+                            total=None,
+                            task_label=f"{idx:>{idx_width}}/{n_total}",
+                            file_pad=os.path.basename(table_path).ljust(name_width),
                         )
-                        try:
-                            raw_part, smooth_part = fut.result()
-                            raw_parts.append(raw_part)
-                            smooth_parts.append(smooth_part)
-                            logger.info(
-                                f"Finished {table_path}: "
-                                f"raw={raw_part.shape}, smooth={smooth_part.shape}"
+
+                    while len(fut_map) > 0:
+                        done, _ = cf.wait(
+                            list(fut_map.keys()),
+                            timeout=0.1,
+                            return_when=cf.FIRST_COMPLETED,
+                        )
+                        if len(done) == 0:
+                            continue
+                        for fut in sorted(done, key=lambda x: file_to_idx.get(fut_map[x], 0)):
+                            table_path = fut_map.pop(fut)
+                            tid = task_map.pop(fut, None)
+                            if tid is not None:
+                                try:
+                                    progress.remove_task(tid)
+                                except Exception:
+                                    pass
+                            elapsed = format_elapsed(
+                                time.monotonic()
+                                - task_start_ts.get(table_path, time.monotonic())
                             )
-                        except Exception as exc:
-                            errors.append(f"{table_path}: {exc}")
-                            idx = file_to_idx.get(table_path, 0)
-                            print_failure(
-                                f"Task {idx}/{n_total}: "
-                                f"{os.path.basename(table_path)} ...Failed [{elapsed}]"
-                            )
+                            try:
+                                raw_part, smooth_part = fut.result()
+                                raw_parts.append(raw_part)
+                                smooth_parts.append(smooth_part)
+                                logger.info(
+                                    f"Finished {table_path}: "
+                                    f"raw={raw_part.shape}, smooth={smooth_part.shape}"
+                                )
+                            except Exception as exc:
+                                errors.append(f"{table_path}: {exc}")
+                                idx = file_to_idx.get(table_path, 0)
+                                print_failure(
+                                    f"Task {idx}/{n_total}: "
+                                    f"{os.path.basename(table_path)} ...Failed [{elapsed}]"
+                                )
+        finally:
+            for h, level in muted_console_handlers:
+                h.setLevel(level)
 
         if errors:
             raise RuntimeError("Failed chromosome tables:\n- " + "\n- ".join(errors))
@@ -957,13 +973,16 @@ def preprocess_tables_parallel(
                 raise
             task.complete("Preprocessing chromosome tables ...Finished")
 
+    raw_parts = [x for x in raw_parts if _is_valid_concat_part(x)]
+    smooth_parts = [x for x in smooth_parts if _is_valid_concat_part(x)]
+
     if not raw_parts:
         raise RuntimeError("No valid loci remained across all chromosome tables.")
 
     raw_df = pd.concat(raw_parts, axis=0, ignore_index=True)
     smooth_df = (
         pd.concat(smooth_parts, axis=0, ignore_index=True)
-        if len(smooth_parts) > 0
+        if smooth_parts
         else pd.DataFrame(
             columns=[
                 "chr",
@@ -1373,6 +1392,8 @@ def main() -> None:
                 token_matches = [token]
             input_files.extend(token_matches)
         input_files = dedup_paths_keep_order(input_files)
+    if len(input_files) > 1:
+        input_files = sorted(input_files, key=path_sort_key)
     input_hint = " ".join(file_args)
 
     args.out = args.out if args.out else "."

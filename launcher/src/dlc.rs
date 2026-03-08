@@ -348,6 +348,16 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
                     false,
                 )?;
                 if !confirmed {
+                    if let Err(e) =
+                        refresh_preferred_tool_bindings(python, &db_path, &existing, runtime_home)
+                    {
+                        eprintln!(
+                            "{}",
+                            super::style_yellow(&format!(
+                                "Warning: failed to refresh preferred DLC bindings: {e}"
+                            ))
+                        );
+                    }
                     println!(
                         "{}",
                         super::style_yellow("Keep existing DLC runtime. Exit without reinstall.")
@@ -392,6 +402,16 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
                     repaired.status = "ok".to_string();
                     repaired.updated_at = now_utc_epoch();
                     save_runtime_record(python, &db_path, &repaired)?;
+                    if let Err(e) =
+                        refresh_preferred_tool_bindings(python, &db_path, &repaired, runtime_home)
+                    {
+                        eprintln!(
+                            "{}",
+                            super::style_yellow(&format!(
+                                "Warning: failed to refresh preferred DLC bindings: {e}"
+                            ))
+                        );
+                    }
                     println!(
                         "{}",
                         super::style_green(&format!(
@@ -457,6 +477,14 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
     record.status = "ok".to_string();
     record.updated_at = now_utc_epoch();
     save_runtime_record(python, &db_path, &record)?;
+    if let Err(e) = refresh_preferred_tool_bindings(python, &db_path, &record, runtime_home) {
+        eprintln!(
+            "{}",
+            super::style_yellow(&format!(
+                "Warning: failed to refresh preferred DLC bindings: {e}"
+            ))
+        );
+    }
     println!(
         "{}",
         super::style_green(&format!(
@@ -503,7 +531,13 @@ pub(crate) fn run_dlc_tool(
         ));
     }
 
-    let mut cmd = build_tool_command(tool, args, &record, runtime_home)?;
+    let mut cmd = if let Some(bound) =
+        build_tool_command_from_preferred_binding(tool, args, &record, runtime_home, &python, &db_path)?
+    {
+        bound
+    } else {
+        build_tool_command(tool, args, &record, runtime_home)?
+    };
     let status = cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -550,9 +584,238 @@ fn validate_cached_locator(backend: &str, locator: &str) -> bool {
         return false;
     }
     match backend {
-        "env" | "conda" | "sif" => Path::new(loc).exists(),
+        "host" | "env" | "sif" => Path::new(loc).exists(),
+        "conda" => {
+            let (_, path) = parse_conda_locator(loc);
+            !path.is_empty() && Path::new(path).exists()
+        }
         "docker" => !loc.is_empty(),
         _ => false,
+    }
+}
+
+fn parse_conda_locator(locator: &str) -> (&str, &str) {
+    match locator.split_once('|') {
+        Some((env_name, path)) => (env_name.trim(), path.trim()),
+        None => ("", locator.trim()),
+    }
+}
+
+fn build_conda_locator(env_name: &str, path: &str) -> String {
+    format!("{}|{}", env_name.trim(), path.trim())
+}
+
+fn refresh_preferred_tool_bindings(
+    python: &Path,
+    db_path: &Path,
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Result<(), String> {
+    let runtime_sig = runtime_signature(record);
+    let entries = build_preferred_tool_bindings(record, runtime_home, &runtime_sig);
+    save_tool_cache_entries(python, db_path, &runtime_sig, &entries)
+}
+
+fn build_preferred_tool_bindings(
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+    runtime_sig: &str,
+) -> Vec<ToolCacheEntry> {
+    let mut out: Vec<ToolCacheEntry> = Vec::new();
+    for tool in REQUIRED_TOOLS {
+        if let Some((backend, locator)) = detect_preferred_binding_for_tool(tool, record, runtime_home) {
+            out.push(ToolCacheEntry {
+                tool: tool.to_string(),
+                backend,
+                locator,
+                runtime_sig: runtime_sig.to_string(),
+            });
+        }
+    }
+    out
+}
+
+fn detect_preferred_binding_for_tool(
+    tool: &str,
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Option<(String, String)> {
+    if let Some(host_path) = find_bin(tool) {
+        let env_bin_dir = env_runtime_bin_dir(runtime_home);
+        if host_path.starts_with(&env_bin_dir) {
+            return Some((
+                "env".to_string(),
+                host_path.to_string_lossy().to_string(),
+            ));
+        }
+        if let Some((env_name, conda_path)) = detect_active_conda_binding(tool, &host_path) {
+            return Some(("conda".to_string(), build_conda_locator(&env_name, &conda_path)));
+        }
+        return Some((
+            "host".to_string(),
+            host_path.to_string_lossy().to_string(),
+        ));
+    }
+    runtime_binding_for_tool(tool, record, runtime_home)
+}
+
+fn detect_active_conda_binding(tool: &str, host_path: &Path) -> Option<(String, String)> {
+    if !path_looks_like_conda(host_path) || !command_in_path("conda") {
+        return None;
+    }
+    let env_name = env::var("CONDA_DEFAULT_ENV")
+        .ok()
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .or_else(|| infer_conda_env_name_from_path(host_path))?;
+    let resolved = resolve_conda_tool_path(&env_name, tool)?;
+    if resolved.trim().is_empty() || !Path::new(&resolved).exists() {
+        return None;
+    }
+    Some((env_name, resolved))
+}
+
+fn path_looks_like_conda(path: &Path) -> bool {
+    if let Ok(prefix) = env::var("CONDA_PREFIX") {
+        let p = PathBuf::from(prefix);
+        if !p.as_os_str().is_empty() && path.starts_with(&p) {
+            return true;
+        }
+    }
+    let s = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    s.contains("/envs/") || s.contains("miniconda") || s.contains("anaconda") || s.contains("mambaforge")
+}
+
+fn infer_conda_env_name_from_path(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if let Some((_, rest)) = s.split_once("/envs/") {
+        let name = rest.split('/').next().unwrap_or_default().trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if s.to_ascii_lowercase().contains("conda") {
+        return Some("base".to_string());
+    }
+    None
+}
+
+fn runtime_binding_for_tool(
+    tool: &str,
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+) -> Option<(String, String)> {
+    match record.runtime_mode.as_str() {
+        "env" | "local" => {
+            let p = env_runtime_tool_path(runtime_home, tool);
+            if p.exists() {
+                Some(("env".to_string(), p.to_string_lossy().to_string()))
+            } else {
+                None
+            }
+        }
+        "conda" => {
+            let env_name = if record.conda_env.trim().is_empty() {
+                CONDA_ENV.to_string()
+            } else {
+                record.conda_env.trim().to_string()
+            };
+            let path = resolve_conda_tool_path(&env_name, tool)?;
+            Some(("conda".to_string(), build_conda_locator(&env_name, &path)))
+        }
+        "docker" => {
+            let image = if record.image_tag.trim().is_empty() {
+                DEFAULT_IMAGE_TAG.to_string()
+            } else {
+                record.image_tag.trim().to_string()
+            };
+            if image.is_empty() {
+                None
+            } else {
+                Some(("docker".to_string(), image))
+            }
+        }
+        "singularity" => {
+            let sif = record.sif_path.trim().to_string();
+            if sif.is_empty() {
+                None
+            } else {
+                Some(("sif".to_string(), sif))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn build_tool_command_from_preferred_binding(
+    tool: &str,
+    args: &[String],
+    record: &RuntimeRecord,
+    runtime_home: &Path,
+    python: &Path,
+    db_path: &Path,
+) -> Result<Option<Command>, String> {
+    let runtime_sig = runtime_signature(record);
+    let (cached_sig, entries) = load_tool_cache_entries(python, db_path)?;
+    if cached_sig.as_deref() != Some(runtime_sig.as_str()) {
+        return Ok(None);
+    }
+    let Some(entry) = entries
+        .into_iter()
+        .find(|x| x.tool == tool && x.runtime_sig == runtime_sig)
+    else {
+        return Ok(None);
+    };
+    if !validate_cached_locator(&entry.backend, &entry.locator) {
+        return Ok(None);
+    }
+
+    match entry.backend.as_str() {
+        "host" | "env" => {
+            let mut cmd = Command::new(&entry.locator);
+            if entry.backend == "env" {
+                apply_env_runtime_exec_env(&mut cmd, runtime_home);
+            }
+            cmd.args(args);
+            Ok(Some(cmd))
+        }
+        "conda" => {
+            let (env_name, path) = parse_conda_locator(&entry.locator);
+            if !env_name.is_empty() {
+                let Some(conda_bin) = find_bin("conda") else {
+                    return Ok(None);
+                };
+                let mut cmd = Command::new(conda_bin);
+                cmd.arg("run")
+                    .arg("--no-capture-output")
+                    .arg("-n")
+                    .arg(env_name)
+                    .arg(tool)
+                    .args(args);
+                return Ok(Some(cmd));
+            }
+            if path.is_empty() || !Path::new(path).exists() {
+                return Ok(None);
+            }
+            let mut cmd = Command::new(path);
+            cmd.args(args);
+            Ok(Some(cmd))
+        }
+        "docker" => {
+            let mut route_record = record.clone();
+            route_record.runtime_mode = "docker".to_string();
+            route_record.image_tag = entry.locator.clone();
+            let cmd = build_tool_command(tool, args, &route_record, runtime_home)?;
+            Ok(Some(cmd))
+        }
+        "sif" => {
+            let mut route_record = record.clone();
+            route_record.runtime_mode = "singularity".to_string();
+            route_record.sif_path = entry.locator.clone();
+            let cmd = build_tool_command(tool, args, &route_record, runtime_home)?;
+            Ok(Some(cmd))
+        }
+        _ => Ok(None),
     }
 }
 

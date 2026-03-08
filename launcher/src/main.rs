@@ -4270,7 +4270,8 @@ fn print_dlc_list() -> Result<(), String> {
     println!("{}", style_orange("Available External Tools (DLC):"));
     for item in tools {
         let head = format!("{:<14}", item.tool);
-        let line = format!("{head} {}", item.route);
+        let route = format_dlc_route_for_display(&item.route);
+        let line = format!("{head} {route}");
         if item.ready {
             println!("  {}", style_green(&line));
         } else {
@@ -4278,6 +4279,31 @@ fn print_dlc_list() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn format_dlc_route_for_display(route: &str) -> String {
+    let (backend, locator) = match route.split_once(':') {
+        Some((b, l)) => (b.trim(), l.trim()),
+        None => ("none", route.trim()),
+    };
+    match backend {
+        "host" => "本机path".to_string(),
+        "conda" => {
+            let env_name = locator
+                .split_once('|')
+                .map(|(n, _)| n.trim())
+                .unwrap_or_default();
+            if env_name.is_empty() {
+                "conda".to_string()
+            } else {
+                format!("conda:{env_name}")
+            }
+        }
+        "docker" => format!("docker:{locator}"),
+        "sif" => format!("sif:{locator}"),
+        "env" => format!("env:{locator}"),
+        _ => route.to_string(),
+    }
 }
 
 fn print_help_entry(indent: usize, key: &str, desc: &str, key_width: usize, total_width: usize) {

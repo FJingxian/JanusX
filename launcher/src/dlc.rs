@@ -781,6 +781,13 @@ fn build_tool_command_from_preferred_binding(
         }
         "conda" => {
             let (env_name, path) = parse_conda_locator(&entry.locator);
+            if !path.is_empty() && Path::new(path).exists() {
+                let tool_path = PathBuf::from(path);
+                let mut cmd = Command::new(&tool_path);
+                apply_prefixed_tool_exec_env(&mut cmd, &tool_path);
+                cmd.args(args);
+                return Ok(Some(cmd));
+            }
             if !env_name.is_empty() {
                 let Some(conda_bin) = find_bin("conda") else {
                     return Ok(None);
@@ -1895,6 +1902,47 @@ fn apply_env_runtime_exec_env(cmd: &mut Command, runtime_home: &Path) {
     };
     if java_bin.exists() && java_bin.is_file() {
         cmd.env("JAVA_HOME", &env_prefix);
+        cmd.env("GATK_JAVA", &java_bin);
+    }
+}
+
+fn apply_prefixed_tool_exec_env(cmd: &mut Command, tool_path: &Path) {
+    let Some(bin_dir) = tool_path.parent() else {
+        return;
+    };
+    let Some(prefix) = bin_dir.parent() else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
+    if let Some(curr) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&curr));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+    cmd.env("CONDA_PREFIX", prefix);
+
+    #[cfg(unix)]
+    {
+        let lib_dir = prefix.join("lib");
+        if lib_dir.exists() && lib_dir.is_dir() {
+            let mut libs: Vec<PathBuf> = vec![lib_dir];
+            if let Some(curr) = env::var_os("LD_LIBRARY_PATH") {
+                libs.extend(env::split_paths(&curr));
+            }
+            if let Ok(joined) = env::join_paths(libs) {
+                cmd.env("LD_LIBRARY_PATH", joined);
+            }
+        }
+    }
+
+    let java_bin = if cfg!(windows) {
+        bin_dir.join("java.exe")
+    } else {
+        bin_dir.join("java")
+    };
+    if java_bin.exists() && java_bin.is_file() {
+        cmd.env("JAVA_HOME", prefix);
         cmd.env("GATK_JAVA", &java_bin);
     }
 }

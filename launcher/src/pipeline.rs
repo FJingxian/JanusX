@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::Once;
@@ -40,6 +40,10 @@ pub(crate) struct PipelineOptions {
     pub poll_sec: f64,
     pub detect_failed_logs: bool,
     pub no_progress_timeout_sec: Option<u64>,
+    pub step_index_offset: usize,
+    pub display_total_steps: Option<usize>,
+    pub emit_completion_line: bool,
+    pub emit_progress_line: bool,
 }
 
 impl Default for PipelineOptions {
@@ -51,6 +55,10 @@ impl Default for PipelineOptions {
             poll_sec: 2.0,
             detect_failed_logs: true,
             no_progress_timeout_sec: None,
+            step_index_offset: 0,
+            display_total_steps: None,
+            emit_completion_line: true,
+            emit_progress_line: true,
         }
     }
 }
@@ -114,13 +122,22 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         .map_err(|e| format!("Failed to create {}: {e}", workdir.join("log").display()))?;
 
     for (idx, step) in steps.iter().enumerate() {
-        let step_text = format_step_label(idx, steps.len(), step);
+        let step_no = idx + opts.step_index_offset;
+        let total_steps = opts.display_total_steps.unwrap_or(steps.len());
+        let step_text = format_step_label(step_no, total_steps, step);
         if interrupt_requested() {
             return Err("Interrupted by signal.".to_string());
         }
         if opts.skip_if_outputs_exist && all_outputs_ready(&step.outputs) {
             super::print_success_line(&format!("{step_text} ...Skipped"));
             continue;
+        }
+        if opts.skip_if_outputs_exist && !step.items.is_empty() {
+            let pending_idx = pending_item_indices(step);
+            if pending_idx.is_empty() {
+                super::print_success_line(&format!("{step_text} ...Skipped"));
+                continue;
+            }
         }
         if !all_paths_exist(&step.inputs) {
             return Err(format!(
@@ -135,7 +152,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         }
 
         let sh = workdir.join("tmp").join(format!("{}.sh", idx));
-        let existing_error_logs = if opts.detect_failed_logs && matches!(opts.scheduler, Scheduler::Csub) {
+        let existing_error_logs = if opts.detect_failed_logs && !step.items.is_empty() {
             collect_existing_item_error_logs(workdir, step)?
         } else {
             HashSet::new()
@@ -184,11 +201,17 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
             }
         }
 
+        let step_exec_start = Instant::now();
+        let mut submitted_this_round = false;
+        let mut script_child: Option<Child> = None;
         if !skip_submit {
+            submitted_this_round = true;
             let script = build_step_script_from_commands(&commands_to_submit, opts);
             fs::write(&sh, script).map_err(|e| format!("Failed to write {}: {e}", sh.display()))?;
             set_script_executable(&sh)?;
-            if let Err(e) = run_step_script(workdir, &sh, opts) {
+            if matches!(opts.scheduler, Scheduler::Nohup) {
+                script_child = Some(start_step_script_async(workdir, &sh)?);
+            } else if let Err(e) = run_step_script(workdir, &sh, opts) {
                 if interrupt_requested() {
                     return handle_interrupt_for_step(
                         &step_text,
@@ -197,13 +220,47 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
                         &pending_item_indices(step),
                     );
                 }
+                if opts.detect_failed_logs && !step.items.is_empty() {
+                    let pending_now = pending_item_indices(step);
+                    if let Ok(failed) = find_failed_item_logs_for_pending(
+                        workdir,
+                        step,
+                        &pending_now,
+                        3,
+                        4,
+                        &existing_error_logs,
+                    ) {
+                        if !failed.is_empty() {
+                            return Err(format!(
+                                "{step_text} detected failed subtasks. Example stderr:\n{}",
+                                failed
+                                    .iter()
+                                    .map(|x| format!("- {x}"))
+                                    .collect::<Vec<String>>()
+                                    .join("\n")
+                            ));
+                        }
+                    }
+                }
                 return Err(e);
             }
         }
         if interrupt_requested() {
+            terminate_step_script(&mut script_child);
             return handle_interrupt_for_step(&step_text, step, opts, &pending_item_indices(step));
         }
-        wait_step_outputs(workdir, &step_text, step, opts, hook, &existing_error_logs)?;
+        let pre_wait_elapsed = step_exec_start.elapsed();
+        wait_step_outputs(
+            workdir,
+            &step_text,
+            step,
+            opts,
+            hook,
+            &existing_error_logs,
+            submitted_this_round,
+            pre_wait_elapsed,
+            script_child,
+        )?;
         let elapsed = super::format_elapsed(Duration::from_secs(0));
         let _ = elapsed;
     }
@@ -517,6 +574,50 @@ fn run_step_script(workdir: &Path, sh: &Path, opts: &PipelineOptions) -> Result<
     ))
 }
 
+fn start_step_script_async(workdir: &Path, sh: &Path) -> Result<Child, String> {
+    Command::new("bash")
+        .arg(sh)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start {}: {e}", sh.display()))
+}
+
+fn poll_script_exit(script_child: &mut Option<Child>) -> Result<Option<ExitStatus>, String> {
+    let status = match script_child.as_mut() {
+        Some(child) => child
+            .try_wait()
+            .map_err(|e| format!("Failed to poll step script status: {e}"))?,
+        None => return Ok(None),
+    };
+    if let Some(st) = status {
+        *script_child = None;
+        return Ok(Some(st));
+    }
+    Ok(None)
+}
+
+fn terminate_step_script(script_child: &mut Option<Child>) {
+    let Some(mut child) = script_child.take() else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        thread::sleep(Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn wait_step_outputs(
     workdir: &Path,
     step_text: &str,
@@ -524,20 +625,23 @@ fn wait_step_outputs(
     opts: &PipelineOptions,
     hook: &mut impl PipelineHook,
     ignore_error_logs: &HashSet<PathBuf>,
+    submitted_this_round: bool,
+    pre_wait_elapsed: Duration,
+    script_child: Option<Child>,
 ) -> Result<(), String> {
+    let mut script_child = script_child;
     let stall_timeout = resolve_no_progress_timeout(step, opts);
 
     if step.items.is_empty() {
         let total = 1usize;
         let start = Instant::now();
-        let poll = Duration::from_secs_f64(opts.poll_sec.max(0.5));
         let mut last_progress = Instant::now();
         let mut last_done = 0usize;
-        let mut spinner_tick = 0usize;
 
         loop {
             if interrupt_requested() {
                 clear_progress_line_if_tty()?;
+                terminate_step_script(&mut script_child);
                 return handle_interrupt_for_step(step_text, step, opts, &[]);
             }
             let done = if all_outputs_ready(&step.outputs) {
@@ -545,12 +649,64 @@ fn wait_step_outputs(
             } else {
                 0
             };
+            if let Some(status) = poll_script_exit(&mut script_child)? {
+                if !status.success() {
+                    clear_progress_line_if_tty()?;
+                    return Err(format!(
+                        "{step_text} failed with exit={}.",
+                        super::exit_code(status)
+                    ));
+                }
+                if done < total {
+                    clear_progress_line_if_tty()?;
+                    let miss = step
+                        .outputs
+                        .iter()
+                        .filter(|p| !is_output_ready(p))
+                        .take(5)
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ");
+                    return Err(format!(
+                        "{step_text} finished but outputs are incomplete: {miss}"
+                    ));
+                }
+            }
+                if done >= total {
+                    if script_child.is_some() {
+                        if opts.emit_progress_line {
+                            render_step_progress(
+                                step_text,
+                                done,
+                                total,
+                                pre_wait_elapsed + start.elapsed(),
+                                0,
+                            )?;
+                        }
+                    thread::sleep(super::spinner_refresh_interval(
+                        pre_wait_elapsed + start.elapsed(),
+                    ));
+                    continue;
+                }
+                let elapsed = pre_wait_elapsed + start.elapsed();
+                if opts.emit_completion_line {
+                    if opts.skip_if_outputs_exist && !submitted_this_round {
+                        super::print_success_line(&format!("{step_text} ...Skipped"));
+                    } else {
+                        super::print_success_line(&format!(
+                            "{} ...Finished [{}]",
+                            step_text,
+                            super::format_elapsed(elapsed)
+                        ));
+                    }
+                } else if opts.emit_progress_line {
+                    clear_progress_line_if_tty()?;
+                }
+                return Ok(());
+            }
             if done > last_done {
                 last_done = done;
                 last_progress = Instant::now();
-            }
-            if done >= total {
-                break;
             }
 
             if let Some(timeout) = stall_timeout {
@@ -563,27 +719,27 @@ fn wait_step_outputs(
                 }
             }
 
-            render_step_progress(step_text, done, total, start.elapsed(), spinner_tick)?;
-            spinner_tick = spinner_tick.wrapping_add(1);
-            thread::sleep(poll);
+            if opts.emit_progress_line {
+                render_step_progress(
+                    step_text,
+                    done,
+                    total,
+                    pre_wait_elapsed + start.elapsed(),
+                    0,
+                )?;
+            }
+            thread::sleep(super::spinner_refresh_interval(
+                pre_wait_elapsed + start.elapsed(),
+            ));
         }
-        clear_progress_line_if_tty()?;
-        super::print_success_line(&format!(
-            "{} ...Finished [{}]",
-            step_text,
-            super::format_elapsed(start.elapsed())
-        ));
-        return Ok(());
     }
 
     let total = step.items.len();
     let start = Instant::now();
     let mut last_error_scan = Instant::now();
-    let poll = Duration::from_secs_f64(opts.poll_sec.max(0.5));
     let mut pending: Vec<usize> = Vec::new();
     let mut done = 0usize;
     let mut last_progress = Instant::now();
-    let mut spinner_tick = 0usize;
 
     for (idx, item) in step.items.iter().enumerate() {
         if all_outputs_ready(&item.outputs) {
@@ -592,10 +748,27 @@ fn wait_step_outputs(
             pending.push(idx);
         }
     }
+    if done >= total && script_child.is_none() {
+        if opts.emit_completion_line {
+            if opts.skip_if_outputs_exist && !submitted_this_round {
+                super::print_success_line(&format!("{step_text} ...Skipped"));
+            } else {
+                super::print_success_line(&format!(
+                    "{} ...Finished [{}]",
+                    step_text,
+                    super::format_elapsed(pre_wait_elapsed)
+                ));
+            }
+        } else if opts.emit_progress_line {
+            clear_progress_line_if_tty()?;
+        }
+        return Ok(());
+    }
 
     loop {
         if interrupt_requested() {
             clear_progress_line_if_tty()?;
+            terminate_step_script(&mut script_child);
             return handle_interrupt_for_step(step_text, step, opts, &pending);
         }
         if !pending.is_empty() {
@@ -613,12 +786,35 @@ fn wait_step_outputs(
             pending = next_pending;
         }
 
-        if done >= total {
+        if let Some(status) = poll_script_exit(&mut script_child)? {
+            if !status.success() {
+                clear_progress_line_if_tty()?;
+                return Err(format!(
+                    "{step_text} failed with exit={}.",
+                    super::exit_code(status)
+                ));
+            }
+            if done < total {
+                clear_progress_line_if_tty()?;
+                let miss = pending
+                    .iter()
+                    .take(5)
+                    .filter_map(|idx| step.items.get(*idx))
+                    .map(|x| x.id.clone())
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                return Err(format!(
+                    "{step_text} finished but outputs are incomplete for: {miss}"
+                ));
+            }
+        }
+
+        if done >= total && script_child.is_none() {
             break;
         }
 
-        if opts.detect_failed_logs && matches!(opts.scheduler, Scheduler::Csub) {
-            let scan_interval = Duration::from_secs_f64((opts.poll_sec * 3.0).max(5.0));
+        if opts.detect_failed_logs {
+            let scan_interval = Duration::from_secs_f64((opts.poll_sec * 3.0).max(2.0));
             if last_error_scan.elapsed() >= scan_interval {
                 last_error_scan = Instant::now();
                 let failed =
@@ -646,16 +842,29 @@ fn wait_step_outputs(
             }
         }
 
-        render_step_progress(step_text, done, total, start.elapsed(), spinner_tick)?;
-        spinner_tick = spinner_tick.wrapping_add(1);
-        thread::sleep(poll);
+        if opts.emit_progress_line {
+            render_step_progress(
+                step_text,
+                done,
+                total,
+                pre_wait_elapsed + start.elapsed(),
+                0,
+            )?;
+        }
+        thread::sleep(super::spinner_refresh_interval(
+            pre_wait_elapsed + start.elapsed(),
+        ));
     }
-    clear_progress_line_if_tty()?;
-    super::print_success_line(&format!(
-        "{} ...Finished [{}]",
-        step_text,
-        super::format_elapsed(start.elapsed())
-    ));
+    if opts.emit_progress_line {
+        clear_progress_line_if_tty()?;
+    }
+    if opts.emit_completion_line {
+        super::print_success_line(&format!(
+            "{} ...Finished [{}]",
+            step_text,
+            super::format_elapsed(pre_wait_elapsed + start.elapsed())
+        ));
+    }
     Ok(())
 }
 
@@ -664,20 +873,18 @@ fn render_step_progress(
     done: usize,
     total: usize,
     elapsed: Duration,
-    spinner_tick: usize,
+    _spinner_tick: usize,
 ) -> Result<(), String> {
     if !io::stdout().is_terminal() {
         return Ok(());
     }
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let idx = spinner_tick % frames.len();
     let line = format!(
         "\r{} {} [{}/{}] [{}]",
-        frames[idx],
+        super::spinner_frame_for_elapsed(elapsed),
         step_text,
         done,
         total,
-        super::format_elapsed(elapsed)
+        super::format_elapsed_live(elapsed)
     );
     if super::supports_color() {
         print!("{}", super::style_green(&line));
@@ -904,8 +1111,10 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
         "fatal",
         "error",
         "failed",
+        "daemon is not running",
         "no such file or directory",
         "command not found",
+        "permission denied",
         "segmentation fault",
         "exited with exit code",
         "killed",

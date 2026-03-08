@@ -1394,19 +1394,35 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
             println!("Re-run `jx -h` to verify the upgraded launcher.");
         }
     }
-    let core_update = UpdateOptions {
-        source: UpdateSource::Latest,
-        verbose: opts.verbose,
-        force_reinstall: false,
-        editable: false,
+    let (core_update, core_update_hint) = match &opts.source {
+        UpgradeSource::Latest => (
+            UpdateOptions {
+                source: UpdateSource::Latest,
+                verbose: opts.verbose,
+                force_reinstall: false,
+                editable: false,
+            },
+            "jx -update latest".to_string(),
+        ),
+        UpgradeSource::Local(path) => (
+            UpdateOptions {
+                source: UpdateSource::Local(path.clone()),
+                verbose: opts.verbose,
+                force_reinstall: false,
+                editable: true,
+            },
+            format!("jx -update -e {path}"),
+        ),
     };
     match run_update_internal(core_update, false) {
         Ok(_) => {
-            print_success_line("Core package update completed via `jx -update latest`.");
+            print_success_line(&format!(
+                "Core package update completed via `{core_update_hint}`."
+            ));
             Ok(0)
         }
         Err(e) => Err(format!(
-            "Launcher upgrade completed, but core package update (`jx -update latest`) failed: {e}"
+            "Launcher upgrade completed, but core package update (`{core_update_hint}`) failed: {e}"
         )),
     }
 }
@@ -4142,7 +4158,7 @@ fn print_cli_help() {
     print_help_entry(
         2,
         "-upgrade",
-        "Upgrade launcher from source, then run core latest update: `jx -upgrade [latest|<local_path>] [-verbose]`",
+        "Upgrade launcher from source, then update core (`latest` or `-e <local_path>`): `jx -upgrade [latest|<local_path>] [-verbose]`",
         flag_key_width,
         width,
     );

@@ -17,15 +17,16 @@ fn qpath(path: &Path) -> String {
 pub(super) fn wrap_scheduler_cmd(cmd: &str, job: &str, threads: usize, backend: &str) -> String {
     if backend == "csub" {
         let safe_job = safe_job_label(job);
+        let quoted_cmd = sh_quote(cmd);
         return format!(
-            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} \"{}\"",
-            job, safe_job, safe_job, threads, cmd
+            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
+            job, safe_job, safe_job, threads, quoted_cmd
         );
     }
-    let safe_cmd = cmd.replace('"', "\\\"");
+    let quoted_cmd = sh_quote(cmd);
     format!(
-        "nohup bash -c \"{}\" > ./log/{}.o 2> ./log/{}.e",
-        safe_cmd, job, job
+        "nohup bash -lc {} > ./log/{}.o 2> ./log/{}.e",
+        quoted_cmd, job, job
     )
 }
 

@@ -1668,8 +1668,20 @@ def _draw_empty_ldblock(
 ) -> None:
     n = max(2, int(n_sites))
     LDblock(np.zeros((n, n), dtype=np.float32), ax=ax, vmin=0, vmax=1, cmap="Greys")
+    # Keep LD triangle body filling the whole panel width.
+    ax.set_xlim(0.5, float(n) - 0.5)
+    ax.margins(x=0.0)
     if text:
         ax.text(n / 2.0, -n / 2.0, text, ha="center", va="center", fontsize=6)
+
+
+def _ld_min_height_over_width(n_sites: int) -> float:
+    """
+    Minimal LD panel height/width ratio that keeps LDblock (aspect=0.5)
+    from shrinking panel width for small SNP counts under xlim=0.5..n-0.5.
+    """
+    n = max(2, int(n_sites))
+    return 0.5 * (float(n) / float(n - 1))
 
 
 def _build_layout_from_bimrange_tuples(
@@ -2486,19 +2498,17 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     )
                     qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
                     if np.isfinite(qq_xmax) and qq_xmax > 0:
-                        x_left = 0.0
                         x_right = float(qq_xmax)
                     else:
-                        x_left, x_right = ax2.get_xlim()
-                        x_left = float(x_left)
-                        x_right = float(x_right)
-                    if x_right <= x_left:
-                        x_left, x_right = (0.0, max(1.0, x_right))
+                        _x_right = ax2.get_xlim()[1]
+                        x_right = float(_x_right)
+                    x_right = max(1.0, x_right)
                     if manh_ylim is not None:
                         ax2.set_ylim(manh_ylim)
                     # Keep QQ x-range adaptive to QQ data; only align y-range to Manhattan.
-                    x_pad = max(1e-9, 0.02 * float(x_right - x_left))
-                    ax2.set_xlim(x_left - x_pad, x_right + x_pad)
+                    # Left bound is always 0 for QQ axis.
+                    x_pad = max(1e-9, 0.02 * float(x_right))
+                    ax2.set_xlim(0.0, x_right + x_pad)
                     if manh_yticks is not None and manh_ylim is not None:
                         y0, y1 = ax2.get_ylim()
                         lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
@@ -2632,8 +2642,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     cmap=ld_cmap,
                     rasterize_threshold=100,
                 )
+                n_ld = max(2, int(ld_mat.shape[0]))
+                # Keep LD triangle body filling the whole panel width.
+                ax.set_xlim(0.5, float(n_ld) - 0.5)
+                ax.margins(x=0.0)
                 if ld_overlay_text:
-                    n_ld = int(ld_mat.shape[0])
                     ax.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
 
             def _build_manh_ld_pairs(
@@ -2747,7 +2760,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 gene_xlim = (0.0, 1.0)
             gene_plot_xlim = manh_xlim if manh_xlim is not None else gene_xlim
 
+            ld_n_sites = max(2, int(ld_mat.shape[0]))
             ld_h_in = width_in / effective_ldblock_ratio
+            ld_min_h_in = width_in * _ld_min_height_over_width(ld_n_sites)
+            ld_h_in = max(float(ld_h_in), float(ld_min_h_in))
             fig_ld = plt.figure(
                 figsize=(width_in, ld_h_in),
                 dpi=dpi,
@@ -2850,7 +2866,14 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 / effective_ldblock_ratio
                 / ld_row_layout_factor
             )
-            ld_h_in_combo = max(0.5, float(ld_h_in_combo))
+            ld_h_in_combo_min = (
+                width_in
+                * manh_drawable_frac
+                * ld_panel_frac_in_manh
+                * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
+                / ld_row_layout_factor
+            )
+            ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
             manhld_total_h_in = manhld_manh_h_in + mid_h_in + ld_h_in_combo
             fig_manhld = plt.figure(
                 figsize=(width_in, manhld_total_h_in),
@@ -3512,11 +3535,12 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             ax.set_ylim(manh_ylim_pair)
         if exp_xmax > exp_xmin:
             x_pad = max(1e-9, 0.02 * float(exp_xmax - exp_xmin))
-            ax.set_xlim(exp_xmin - x_pad, exp_xmax + x_pad)
+            x_right = exp_xmax + x_pad
         else:
             eps = max(1e-9, abs(exp_xmin) * 1e-9)
             x_pad = max(1e-9, 0.02 * float(eps))
-            ax.set_xlim(exp_xmin - eps - x_pad, exp_xmax + eps + x_pad)
+            x_right = exp_xmax + eps + x_pad
+        ax.set_xlim(0.0, max(1.0, float(x_right)))
         ax.margins(x=0.0)
         line_left, line_right = ax.get_xlim()
         ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")
@@ -3606,11 +3630,15 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             gene_line_color = str(two_color_style["gene_line_color"])
 
         ld_h_in = width_in / effective_ldblock_ratio
+        ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
         fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
         ax_ld = fig_ld.add_subplot(111)
         LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+        n_ld = max(2, int(ld_mat.shape[0]))
+        # Keep LD triangle body filling the whole panel width.
+        ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
+        ax_ld.margins(x=0.0)
         if ld_overlay_text:
-            n_ld = int(ld_mat.shape[0])
             ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
         fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
         if manh_axes_bounds is not None:
@@ -4032,6 +4060,7 @@ def main():
     )
     optional_group.add_argument(
         "-full", "--full", "-fullscatter", "--fullscatter",
+        dest="fullscatter",
         action="store_true",
         default=False,
         help=(
@@ -4245,6 +4274,9 @@ def main():
             "Single GWAS input detected; forcing --thread to 1."
         )
         args.thread = 1
+
+    if not hasattr(args, "fullscatter"):
+        args.fullscatter = bool(getattr(args, "full", False))
 
     no_plot_or_anno = (
         args.manh_ratio is None

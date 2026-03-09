@@ -216,6 +216,37 @@ def _emit_info_to_stream_handlers(logger: logging.Logger, message: str) -> None:
             handler.handle(record)
 
 
+def _detach_stream_handlers(logger: logging.Logger) -> list[logging.Handler]:
+    """
+    Temporarily detach non-file handlers from logger.
+    Used by parallel workers to prevent progress-line corruption on TTY.
+    """
+    removed: list[logging.Handler] = []
+    try:
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                continue
+            try:
+                logger.removeHandler(handler)
+                removed.append(handler)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return removed
+
+
+def _restore_handlers(logger: logging.Logger, handlers: list[logging.Handler]) -> None:
+    if len(handlers) == 0:
+        return
+    try:
+        for handler in handlers:
+            if handler not in logger.handlers:
+                logger.addHandler(handler)
+    except Exception:
+        return
+
+
 def _truncate_config_line(
     text: object,
     *,
@@ -1915,12 +1946,14 @@ def _draw_manh_gene_ld_links(
     *,
     gene_cds_bottom: float = -0.05,
     force_line_color: Optional[str] = None,
+    nonsig_line_color: str = "grey",
 ) -> None:
     """
     Draw connectors:
       1) y=0.2 -> y=gene_cds_bottom vertical line at Manhattan SNP x
       2) y=gene_cds_bottom -> y=-0.2 diagonal line from gene x to LD-mapped x
-    Significant SNP lines are red; others are black.
+    Significant SNP lines are red; non-significant SNP lines use
+    `nonsig_line_color`.
     """
     if len(pairs) == 0:
         return
@@ -1943,7 +1976,7 @@ def _draw_manh_gene_ld_links(
         if force_line_color is not None:
             line_color = str(force_line_color)
         else:
-            line_color = "red" if bool(is_sig) else "black"
+            line_color = "red" if bool(is_sig) else str(nonsig_line_color)
         ax_gene.plot(
             [x_top_g, x_top_g],
             [0.2, float(gene_cds_bottom)],
@@ -2705,9 +2738,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ax_bridge: plt.Axes,
                 ax_manh: plt.Axes,
                 ax_ld: plt.Axes,
-                pairs: list[tuple[float, float]],
+                pairs: list[tuple[float, float, bool]],
                 *,
-                line_color: str = "black",
+                line_color: str = "grey",
+                sig_line_color: str = "red",
             ) -> None:
                 ax_bridge.set_xlim(0.0, 1.0)
                 ax_bridge.set_ylim(0.0, 1.0)
@@ -2723,7 +2757,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 y_manh_ref = float(ax_manh.get_ylim()[0])
                 y_ld_ref = 0.0
                 to_bridge = ax_bridge.transAxes.inverted()
-                for x_top, x_ld in pairs:
+                for x_top, x_ld, is_sig in pairs:
                     p_top_disp = ax_manh.transData.transform((float(x_top), y_manh_ref))
                     p_ld_disp = ax_ld.transData.transform((float(x_ld), y_ld_ref))
                     x_top_n = float(to_bridge.transform(p_top_disp)[0])
@@ -2735,10 +2769,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     joint_y = 0.84
                     bottom_y = 0.06
                     # Draw as one polyline to avoid tiny rendering gap at the joint.
+                    poly_color = str(sig_line_color) if bool(is_sig) else str(line_color)
                     ax_bridge.plot(
                         [x_top_n, x_top_n, x_ld_n],
                         [1.04, joint_y, bottom_y],
-                        color=line_color,
+                        color=poly_color,
                         linewidth=0.25,
                         alpha=0.8,
                         clip_on=False,
@@ -2936,7 +2971,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             fig_manhld.canvas.draw()
 
             bridge_pairs = _build_manh_ld_pairs(ax_manhld_top, ax_manhld_bot)
-            transition_line_color = "grey"
             if use_gene_bridge:
                 ax_manhld_mid.set_xlim(ax_manhld_top.get_xlim())
                 ax_manhld_mid.set_ylim(mid_gene_ymin, mid_gene_ymax)
@@ -2947,16 +2981,16 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax_manhld_bot,
                     bridge_pairs,
                     gene_cds_bottom=-0.1 * gene_bridge_scale + mid_gene_y_offset,
-                    force_line_color=transition_line_color,
+                    nonsig_line_color="grey",
                 )
             else:
-                bridge_pairs_plain = [(x1, x2) for x1, x2, _ in bridge_pairs]
                 _draw_bridge_axis(
                     ax_manhld_mid,
                     ax_manhld_top,
                     ax_manhld_bot,
-                    bridge_pairs_plain,
+                    bridge_pairs,
                     line_color="grey",
+                    sig_line_color="red",
                 )
             if not (args.bimrange_tuples is not None and len(args.bimrange_tuples) == 1):
                 _show_end_locs_without_xticks(
@@ -3745,7 +3779,15 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
 
 def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
-    GWASplot(file, args, logger)
+    mute_stream = bool(getattr(args, "_postgwas_worker_mute_stream", False))
+    detached_handlers: list[logging.Handler] = []
+    if mute_stream:
+        detached_handlers = _detach_stream_handlers(logger)
+    try:
+        GWASplot(file, args, logger)
+    finally:
+        if mute_stream:
+            _restore_handlers(logger, detached_handlers)
     return str(file)
 
 
@@ -3755,6 +3797,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         return
     if len(files) == 1:
         setattr(args, "_postgwas_job_workers", 1)
+        setattr(args, "_postgwas_worker_mute_stream", False)
         GWASplot(files[0], args, logger)
         return
 
@@ -3764,6 +3807,8 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     if req_threads == -1:
         req_threads = int(os.cpu_count() or 1)
     logical_workers = max(1, min(req_threads, len(files)))
+    # In parallel mode, keep worker logs in file only to avoid spinner/pbar corruption.
+    setattr(args, "_postgwas_worker_mute_stream", True)
 
     if _HAS_RICH_PROGRESS and sys.stdout.isatty():
         n_total = len(files)

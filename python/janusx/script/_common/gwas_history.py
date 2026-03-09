@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -733,6 +734,244 @@ def _safe_vcf_filename(name: str) -> str:
     return ""
 
 
+def _safe_gwas_filename(name: str) -> str:
+    raw = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out.append(ch)
+    s = "".join(out).strip(".")
+    low = s.lower()
+    if (
+        low.endswith(".tsv")
+        or low.endswith(".txt")
+        or low.endswith(".csv")
+        or low.endswith(".tsv.gz")
+        or low.endswith(".txt.gz")
+        or low.endswith(".csv.gz")
+    ):
+        return s
+    return ""
+
+
+def _split_auto_line(line: str) -> tuple[list[str], str]:
+    t = str(line or "").rstrip("\n\r")
+    if "\t" in t:
+        return [x.strip() for x in t.split("\t")], "tab"
+    if "," in t:
+        return [x.strip() for x in t.split(",")], "csv"
+    return t.strip().split(), "ws"
+
+
+def _header_key(v: object) -> str:
+    s = str(v or "").strip().lower()
+    if s.startswith("#"):
+        s = s[1:]
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+_GWAS_CHR_CANDIDATES = [
+    "#CHROM",
+    "chrom",
+    "chr",
+    "chromosome",
+    "chromosome_id",
+    "chrom_id",
+    "chrom_name",
+    "chr_id",
+    "seqid",
+    "seqname",
+    "contig",
+    "scaffold",
+]
+_GWAS_POS_CANDIDATES = [
+    "POS",
+    "pos",
+    "position",
+    "bp",
+    "ps",
+    "base_pair",
+    "basepair",
+    "bp_position",
+    "physical_position",
+    "physical_pos",
+    "coordinate",
+    "coord",
+    "location",
+    "loc",
+]
+_GWAS_P_CANDIDATES = [
+    "p",
+    "pvalue",
+    "p_value",
+    "pval",
+    "p_val",
+    "pwald",
+    "p_wald",
+    "wald_p",
+    "waldp",
+    "p_lrt",
+    "lrt_p",
+    "prob",
+]
+
+
+def _pick_gwas_header_column(cols: list[str], candidates: list[str], *, kind: str = "") -> str | None:
+    cmap = {_header_key(c): str(c) for c in cols}
+    for c in candidates:
+        hit = cmap.get(_header_key(c))
+        if hit is not None:
+            return hit
+    best_col = None
+    best_score = 0
+    for c in cols:
+        k = _header_key(c)
+        if k == "":
+            continue
+        score = 0
+        if kind == "chrom":
+            if ("chromosome" in k) or k.startswith("chrom"):
+                score = 100
+            elif k.startswith("chr"):
+                score = 95
+            elif ("contig" in k) or ("scaffold" in k) or ("seqid" in k) or ("seqname" in k):
+                score = 90
+        elif kind == "pos":
+            if k in {"pos", "bp", "ps"}:
+                score = 100
+            elif "position" in k:
+                score = 98
+            elif k.startswith("pos") or k.endswith("bp"):
+                score = 95
+            elif ("basepair" in k) or ("coordinate" in k) or ("location" in k):
+                score = 90
+        elif kind == "p":
+            if k == "p":
+                score = 100
+            elif k in {"pvalue", "pval", "pwald", "pvaluewald", "waldp", "waldpvalue"}:
+                score = 98
+            elif k.startswith("pvalue") or k.startswith("pval"):
+                score = 96
+            elif ("pwald" in k) or ("wald" in k and k.startswith("p")):
+                score = 94
+            elif ("lrt" in k and k.startswith("p")):
+                score = 90
+        if score > best_score:
+            best_score = score
+            best_col = c
+    if best_score >= 90:
+        return str(best_col)
+    return None
+
+
+def _detect_gwas_columns(path: Path) -> tuple[str, str, str]:
+    fh: Any = None
+    try:
+        low = path.name.lower()
+        if low.endswith(".gz"):
+            fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        else:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+        header_cols: list[str] = []
+        for line in fh:
+            t = line.strip()
+            if t == "":
+                continue
+            if t.startswith("##"):
+                continue
+            header_cols, _ = _split_auto_line(t)
+            break
+        if len(header_cols) == 0:
+            raise ValueError("GWAS file is empty.")
+        c_chr = _pick_gwas_header_column(header_cols, _GWAS_CHR_CANDIDATES, kind="chrom")
+        c_pos = _pick_gwas_header_column(header_cols, _GWAS_POS_CANDIDATES, kind="pos")
+        c_p = _pick_gwas_header_column(header_cols, _GWAS_P_CANDIDATES, kind="p")
+        if c_chr is None or c_pos is None or c_p is None:
+            raise ValueError(
+                "Cannot detect required columns (chrom/pos/pvalue)."
+            )
+        return str(c_chr), str(c_pos), str(c_p)
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _extract_chr_from_gwas_file(path: Path, *, max_lines: int = 300_000) -> list[str]:
+    fh: Any = None
+    try:
+        low = path.name.lower()
+        if low.endswith(".gz"):
+            fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        else:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+        header_cols: list[str] = []
+        mode = "tab"
+        for line in fh:
+            t = line.strip()
+            if t == "":
+                continue
+            if t.startswith("##"):
+                continue
+            header_cols, mode = _split_auto_line(t)
+            break
+        if len(header_cols) == 0:
+            return []
+        c_chr = _pick_gwas_header_column(header_cols, _GWAS_CHR_CANDIDATES, kind="chrom")
+        if c_chr is None:
+            return []
+        idx = -1
+        for i, c in enumerate(header_cols):
+            if str(c) == str(c_chr):
+                idx = i
+                break
+        if idx < 0:
+            return []
+        chroms: set[str] = set()
+        for i, line in enumerate(fh):
+            if i >= max_lines:
+                break
+            t = line.strip()
+            if t == "" or t.startswith("#"):
+                continue
+            if mode == "tab":
+                parts = [x.strip() for x in t.split("\t")]
+            elif mode == "csv":
+                parts = [x.strip() for x in t.split(",")]
+            else:
+                parts = t.split()
+            if idx >= len(parts):
+                continue
+            c = str(parts[idx]).strip()
+            if c != "":
+                chroms.add(c)
+        out = list(chroms)
+        out.sort(key=_chr_sort_key)
+        return out
+    except Exception:
+        return []
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _strip_known_suffixes(file_name: str) -> str:
+    s = str(file_name or "").strip()
+    low = s.lower()
+    for ext in (".tsv.gz", ".txt.gz", ".csv.gz", ".vcf.gz", ".gff3.gz", ".gff.gz", ".bed.gz"):
+        if low.endswith(ext):
+            return s[: -len(ext)]
+    for ext in (".tsv", ".txt", ".csv", ".vcf", ".gff3", ".gff", ".bed", ".gz"):
+        if low.endswith(ext):
+            return s[: -len(ext)]
+    return Path(s).stem
+
+
 def _normalize_bfile_prefix(raw_path: str) -> Path:
     p = Path(str(raw_path or "").strip()).expanduser()
     s = str(p)
@@ -932,7 +1171,7 @@ def register_loaded_file(file_type: str, name: str, source_path: str) -> dict[st
         if not copied.exists():
             shutil.copy2(src_file, copied)
         stored_path = str(copied)
-        gzip_started = _schedule_gzip_background(copied)
+        gzip_started = bool(t in {"gff", "vcf"} and _schedule_gzip_background(copied))
     else:
         stored_path = src_path
         gzip_started = False
@@ -1009,6 +1248,87 @@ def register_loaded_file(file_type: str, name: str, source_path: str) -> dict[st
         "imported_at": imported_at,
         "status": status,
         "gzip_started": bool(gzip_started),
+        "db_path": str(db_path),
+    }
+
+
+def register_loaded_gwas_result(source_path: str) -> dict[str, Any]:
+    raw = str(source_path or "").strip()
+    if raw == "":
+        raise ValueError("gwas file path is required.")
+    src = Path(raw).expanduser().resolve()
+    if not src.exists() or not src.is_file():
+        raise ValueError(f"source file not found: {src}")
+    if _safe_gwas_filename(src.name) == "":
+        raise ValueError("gwas type requires .tsv/.txt/.csv (or .gz).")
+
+    stem = _strip_known_suffixes(src.name)
+    alias = _safe_load_name(stem)
+    if alias == "":
+        alias = f"gwas_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    load_meta = register_loaded_file("gwas", alias, str(src))
+    c_chr, c_pos, c_p = _detect_gwas_columns(src)
+    chroms = _extract_chr_from_gwas_file(src)
+    model = _infer_model_from_result_file(str(src))
+    if model == "":
+        model = "LMM"
+    run_id = f"load-gwas-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(0, 0xFFFFFF):06x}"
+    pheno = _safe_alias(stem)
+    if pheno == "":
+        pheno = alias
+
+    summary_rows = [
+        {
+            "phenotype": pheno,
+            "model": model,
+            "pheno_col_idx": -1,
+            "result_file": str(src),
+            "nidv": 0,
+            "eff_snp": 0,
+        }
+    ]
+    args_data = {
+        "source": "jx-load-gwas",
+        "model": "upload",
+        "chr": c_chr,
+        "pos": c_pos,
+        "pvalue": c_p,
+        "load_alias": alias,
+    }
+    created_at = _now_str()
+    db_path = record_gwas_run(
+        run_id=run_id,
+        status="done",
+        genofile=str(src),
+        genofile_kind="tsv",
+        phenofile=str(src),
+        outprefix=str(src),
+        log_file="",
+        result_files=[str(src)],
+        summary_rows=summary_rows,
+        args_data=args_data,
+        error_text="",
+        created_at=created_at,
+        genofile_md5="",
+        phenofile_md5=_file_stat_fingerprint(str(src)),
+    )
+    return {
+        "type": "gwas",
+        "name": alias,
+        "file_name": src.name,
+        "source_path": str(src),
+        "stored_path": str(load_meta.get("stored_path", "")),
+        "id": str(load_meta.get("id", "")),
+        "history_id": f"{run_id}|0",
+        "run_id": run_id,
+        "status": "imported",
+        "model": model,
+        "phenotype": pheno,
+        "chr_col": c_chr,
+        "pos_col": c_pos,
+        "p_col": c_p,
+        "chroms": chroms,
         "db_path": str(db_path),
     }
 

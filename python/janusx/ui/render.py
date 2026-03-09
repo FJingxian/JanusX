@@ -25,12 +25,53 @@ import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.gridspec import GridSpec
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, FancyArrowPatch
 
 
-_CHROM_CANDIDATES = ["chrom", "#CHROM", "chr", "CHR", "Chromosome", "chromosome"]
-_POS_CANDIDATES = ["pos", "POS", "bp", "position", "Position", "BP"]
-_P_CANDIDATES = ["pwald", "p", "pvalue", "P", "PVALUE", "p_wald", "p_wald"]
+_CHROM_CANDIDATES = [
+    "#CHROM",
+    "chrom",
+    "chr",
+    "chromosome",
+    "chromosome_id",
+    "chrom_id",
+    "chrom_name",
+    "chr_id",
+    "seqid",
+    "seqname",
+    "contig",
+    "scaffold",
+]
+_POS_CANDIDATES = [
+    "POS",
+    "pos",
+    "position",
+    "bp",
+    "ps",
+    "base_pair",
+    "basepair",
+    "bp_position",
+    "physical_position",
+    "physical_pos",
+    "coordinate",
+    "coord",
+    "location",
+    "loc",
+]
+_P_CANDIDATES = [
+    "p",
+    "pvalue",
+    "p_value",
+    "pval",
+    "p_val",
+    "pwald",
+    "p_wald",
+    "wald_p",
+    "waldp",
+    "p_lrt",
+    "lrt_p",
+    "prob",
+]
 _LD_CACHE: dict[str, tuple[np.ndarray, list[tuple[str, int]]]] = {}
 _META_CACHE: dict[str, int] = {}
 _ANNO_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
@@ -41,6 +82,7 @@ _LARGE_MATRIX_ROWS = 1_000_000
 _LARGE_MATRIX_P_THRESH = 1e-3
 _WEBUI_RASTER_DPI = 180
 _WEBUI_VECTOR_DPI = 150
+_AUTO_SIG_TARGET_POINTS = 100_000
 
 
 @dataclass(frozen=True)
@@ -67,13 +109,62 @@ class HighlightRange:
     ld_keys: tuple[tuple[str, int], ...] = ()
 
 
-def _pick_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+def _column_key(v: object) -> str:
+    s = str(v or "").strip().lower()
+    if s.startswith("#"):
+        s = s[1:]
+    # Keep alnum only, so CHR/chr/chr_id/chr-id/chr.id all map consistently.
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _pick_existing_column(df: pd.DataFrame, candidates: list[str], *, kind: str = "") -> str | None:
     cols = list(df.columns)
-    cmap = {str(c).strip().lower(): str(c) for c in cols}
+    cmap = {_column_key(c): str(c) for c in cols}
     for c in candidates:
-        hit = cmap.get(str(c).strip().lower())
+        hit = cmap.get(_column_key(c))
         if hit is not None:
             return hit
+    # Heuristic fallback for non-standard headers.
+    best_col = None
+    best_score = 0
+    for c in cols:
+        name = str(c)
+        k = _column_key(name)
+        if k == "":
+            continue
+        score = 0
+        if kind == "chrom":
+            if ("chromosome" in k) or k.startswith("chrom"):
+                score = 100
+            elif k.startswith("chr"):
+                score = 95
+            elif ("contig" in k) or ("scaffold" in k) or ("seqid" in k) or ("seqname" in k):
+                score = 90
+        elif kind == "pos":
+            if k in {"pos", "bp", "ps"}:
+                score = 100
+            elif "position" in k:
+                score = 98
+            elif k.startswith("pos") or k.endswith("bp"):
+                score = 95
+            elif ("basepair" in k) or ("coordinate" in k) or ("location" in k):
+                score = 90
+        elif kind == "p":
+            if k == "p":
+                score = 100
+            elif k in {"pvalue", "pval", "pwald", "pvaluewald", "waldp", "waldpvalue"}:
+                score = 98
+            elif k.startswith("pvalue") or k.startswith("pval"):
+                score = 96
+            elif ("pwald" in k) or ("wald" in k and k.startswith("p")):
+                score = 94
+            elif ("lrt" in k and k.startswith("p")):
+                score = 90
+        if score > best_score:
+            best_score = score
+            best_col = name
+    if best_score >= 90:
+        return str(best_col)
     return None
 
 
@@ -179,6 +270,67 @@ def _parse_float(raw: Any, default: float, *, min_value: float | None = None) ->
     return float(v)
 
 
+def _min_fig_h_for_ld_triangle(
+    *,
+    fig_w: float,
+    left: float,
+    right: float,
+    top: float,
+    bottom: float,
+    height_ratios: list[float],
+    ld_ratio_index: int = 2,
+) -> float:
+    """
+    Minimum figure height so that LD panel can keep an isosceles-right triangle
+    while sharing the exact Manhattan width.
+    """
+    wr = max(1e-9, float(right) - float(left))
+    hr = max(1e-9, float(top) - float(bottom))
+    hsum = float(np.sum(np.asarray(height_ratios, dtype=float)))
+    if hsum <= 0.0:
+        return 1.0
+    ld_frac = max(1e-9, float(height_ratios[int(ld_ratio_index)]) / hsum)
+    # Triangle in LDblock uses aspect=0.5, so required LD panel height ~= width*0.5.
+    need = (float(fig_w) * wr * 0.5) / (hr * ld_frac)
+    return float(max(1.0, need))
+
+
+def _transition_ratio_from_manhattan(top_ratio: float) -> float:
+    """
+    Transition-layer height follows Manhattan panel height in WebUI.
+    """
+    return float(np.clip(0.11 * float(top_ratio), 0.025, 0.16))
+
+
+def _ld_layout_for_webui(
+    *,
+    fig_w: float,
+    left: float,
+    right: float,
+    top: float,
+    bottom: float,
+    manh_ratio: float,
+) -> tuple[float, list[float]]:
+    """
+    Compute figure height + GridSpec height ratios for WebUI (with LD block),
+    while keeping:
+    1) Manhattan panel width/height ratio == manh_ratio
+    2) LD block panel suitable for isosceles-right triangle (height ~= width * 0.5)
+    3) Transition panel scales with Manhattan height
+    """
+    wr = max(1e-9, float(right) - float(left))
+    hr = max(1e-9, float(top) - float(bottom))
+    panel_w = float(fig_w) * wr
+    ratio = max(0.2, float(manh_ratio))
+
+    top_h = panel_w / ratio
+    ld_h = panel_w * 0.5
+    mid_h = float(np.clip(0.11 * top_h, 0.03, 1.20))
+
+    fig_h = (top_h + mid_h + ld_h) / hr
+    return float(max(1.0, fig_h)), [float(top_h), float(mid_h), float(ld_h)]
+
+
 def _normalize_marker(raw: Any) -> str:
     m = str(raw or "o").strip()
     allowed = {"o", ".", ",", "x", "+", "s", "^", "v", "D", "*", "P", "X", "h", "H", "d", "p", "<", ">"}
@@ -186,7 +338,8 @@ def _normalize_marker(raw: Any) -> str:
 
 
 def _resolve_manh_color_set(palette: Any, tone: dict[str, Any] | None = None) -> list[str]:
-    p = str(palette or "auto").strip().lower()
+    p_raw = str(palette or "").strip()
+    p = p_raw.lower() if p_raw != "" else "auto"
     if p == "tab10":
         cmap = plt.get_cmap("tab10")
         vals = getattr(cmap, "colors", None)
@@ -197,10 +350,69 @@ def _resolve_manh_color_set(palette: Any, tone: dict[str, Any] | None = None) ->
         vals = getattr(cmap, "colors", None)
         if vals is not None and len(vals) > 0:
             return [mcolors.to_hex(c) for c in vals]
+    elif p not in {"", "auto"}:
+        # Accept explicit single color value (e.g. #1f77b4, rgb name).
+        try:
+            return [mcolors.to_hex(mcolors.to_rgb(p_raw))]
+        except Exception:
+            pass
 
     # auto: use high-contrast tone pair from LD/Gene color picker.
     t = tone or _derive_tone_palette("#4b5563")
     return [str(t.get("dark", "#111111")), str(t.get("light", "#8a8a8a"))]
+
+
+def _parse_color_rgb(raw: Any) -> tuple[float, float, float] | None:
+    try:
+        return tuple(float(x) for x in mcolors.to_rgb(str(raw)))
+    except Exception:
+        return None
+
+
+def _resolve_single_contrast_manh_colors(
+    *,
+    manh_palette: Any,
+    ld_color: Any,
+    tone: dict[str, Any] | None = None,
+) -> list[str]:
+    """
+    Single-GWAS WebUI color policy:
+    - keep a same-hue high-contrast pair (dark/light), not complementary inversion
+    - if user selected a manhattan color, use it as the base hue
+    """
+    p_txt = str(manh_palette or "").strip()
+    p_lc = p_txt.lower()
+    manh_rgb = None if p_lc in {"", "auto", "tab10", "tab20"} else _parse_color_rgb(p_txt)
+    ld_rgb = _parse_color_rgb(ld_color)
+
+    if manh_rgb is not None:
+        base = manh_rgb
+    elif ld_rgb is not None:
+        base = ld_rgb
+    else:
+        t = tone or _derive_tone_palette("#4b5563")
+        base = _parse_color_rgb(str(t.get("mid", "#4b5563"))) or (0.30, 0.34, 0.39)
+
+    lum = _luminance(base)
+    if lum <= 0.28:
+        dark = _mix_color(base, (0.0, 0.0, 0.0), 0.10)
+        light = _mix_color(base, (1.0, 1.0, 1.0), 0.62)
+    elif lum <= 0.60:
+        dark = _mix_color(base, (0.0, 0.0, 0.0), 0.30)
+        light = _mix_color(base, (1.0, 1.0, 1.0), 0.45)
+    else:
+        dark = _mix_color(base, (0.0, 0.0, 0.0), 0.48)
+        light = _mix_color(base, (1.0, 1.0, 1.0), 0.18)
+
+    dark = _boost_saturation(dark, 1.18)
+    light = _boost_saturation(light, 1.06)
+
+    # Ensure visible contrast for alternating chromosomes while preserving hue.
+    if abs(_luminance(dark) - _luminance(light)) < 0.24:
+        dark = _mix_color(dark, (0.0, 0.0, 0.0), 0.16)
+        light = _mix_color(light, (1.0, 1.0, 1.0), 0.16)
+
+    return [mcolors.to_hex(dark), mcolors.to_hex(light)]
 
 
 def _parse_bimrange(text: str) -> Bimrange:
@@ -405,20 +617,62 @@ def _draw_highlight_spans(
 
 
 def _resolve_result_file(row: dict[str, Any]) -> Path:
+    def _base_dirs_for_row(row_data: dict[str, Any]) -> list[Path]:
+        bases: list[Path] = []
+        for p in [Path.cwd()]:
+            if p not in bases:
+                bases.append(p)
+        for key in ("outprefix", "log_file", "phenofile", "genofile"):
+            v = str(row_data.get(key, "")).strip()
+            if v == "":
+                continue
+            try:
+                parent = Path(v).expanduser().parent.resolve()
+            except Exception:
+                parent = Path(v).expanduser().parent
+            if parent not in bases:
+                bases.append(parent)
+        return bases
+
+    def _resolve_existing_path(raw_path: str, base_dirs: list[Path]) -> Path | None:
+        txt = str(raw_path or "").strip()
+        if txt == "":
+            return None
+        p = Path(txt).expanduser()
+        if p.exists():
+            try:
+                return p.resolve()
+            except Exception:
+                return p
+        if p.is_absolute():
+            return None
+        for bd in base_dirs:
+            try:
+                cand = (bd / p).expanduser()
+            except Exception:
+                continue
+            if cand.exists():
+                try:
+                    return cand.resolve()
+                except Exception:
+                    return cand
+        return None
+
+    base_dirs = _base_dirs_for_row(row)
     p = str(row.get("result_file", "")).strip()
     if p != "":
-        path = Path(p).expanduser()
-        if path.exists():
-            return path.resolve()
+        resolved = _resolve_existing_path(p, base_dirs)
+        if resolved is not None:
+            return resolved
     run_files = row.get("result_files", [])
     if isinstance(run_files, list):
         for r in run_files:
             rp = str(r).strip()
             if rp == "":
                 continue
-            path = Path(rp).expanduser()
-            if path.exists():
-                return path.resolve()
+            resolved = _resolve_existing_path(rp, base_dirs)
+            if resolved is not None:
+                return resolved
     raise FileNotFoundError("No valid GWAS result file found in history row.")
 
 
@@ -535,9 +789,9 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
     try:
         sep_kind = _sniff_sep(path)
         head = _read_fast(path, sep_kind, nrows=0)
-        c_chr = _pick_existing_column(head, _CHROM_CANDIDATES)
-        c_pos = _pick_existing_column(head, _POS_CANDIDATES)
-        c_p = _pick_existing_column(head, _P_CANDIDATES)
+        c_chr = _pick_existing_column(head, _CHROM_CANDIDATES, kind="chrom")
+        c_pos = _pick_existing_column(head, _POS_CANDIDATES, kind="pos")
+        c_p = _pick_existing_column(head, _P_CANDIDATES, kind="p")
         if c_chr is not None and c_pos is not None and c_p is not None:
             df = _read_fast(path, sep_kind, usecols=[c_chr, c_pos, c_p])
     except Exception:
@@ -548,9 +802,9 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
             df_full = pd.read_csv(path, sep=None, engine="python")
         except Exception as exc:
             raise RuntimeError(f"Failed to read GWAS file: {path}") from exc
-        c_chr = _pick_existing_column(df_full, _CHROM_CANDIDATES)
-        c_pos = _pick_existing_column(df_full, _POS_CANDIDATES)
-        c_p = _pick_existing_column(df_full, _P_CANDIDATES)
+        c_chr = _pick_existing_column(df_full, _CHROM_CANDIDATES, kind="chrom")
+        c_pos = _pick_existing_column(df_full, _POS_CANDIDATES, kind="pos")
+        c_p = _pick_existing_column(df_full, _P_CANDIDATES, kind="p")
         if c_chr is None or c_pos is None or c_p is None:
             raise RuntimeError(
                 "Cannot detect required columns (chrom/pos/pvalue). "
@@ -561,9 +815,9 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
     if df.shape[0] == 0:
         raise RuntimeError("GWAS file has no rows.")
     if c_chr is None or c_pos is None or c_p is None:
-        c_chr = _pick_existing_column(df, _CHROM_CANDIDATES)
-        c_pos = _pick_existing_column(df, _POS_CANDIDATES)
-        c_p = _pick_existing_column(df, _P_CANDIDATES)
+        c_chr = _pick_existing_column(df, _CHROM_CANDIDATES, kind="chrom")
+        c_pos = _pick_existing_column(df, _POS_CANDIDATES, kind="pos")
+        c_p = _pick_existing_column(df, _P_CANDIDATES, kind="p")
     if c_chr is None or c_pos is None or c_p is None:
         raise RuntimeError("Cannot detect required columns (chrom/pos/pvalue).")
 
@@ -600,6 +854,22 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
         }
     )
     return out, {"chr": c_chr, "pos": c_pos, "p": c_p}
+
+
+def detect_gwas_columns(path: Path) -> dict[str, Any]:
+    """
+    Validate GWAS table and report detected key columns for WebUI upload.
+    """
+    tbl, cols = _load_table(Path(path))
+    chroms = sorted(pd.unique(tbl["chrom_norm"]).astype(str).tolist(), key=_natural_key)
+    return {
+        "chr": str(cols.get("chr", "")),
+        "pos": str(cols.get("pos", "")),
+        "pvalue": str(cols.get("p", "")),
+        "n_rows": int(tbl.shape[0]),
+        "n_chrom": int(len(chroms)),
+        "chroms": chroms,
+    }
 
 
 def _load_sig_table_cached(path: Path) -> pd.DataFrame:
@@ -670,6 +940,21 @@ def _compute_x_for_segments(df: pd.DataFrame, segs: list[Segment]) -> tuple[np.n
     return x, seg_idx
 
 
+def _ld_bridge_x_from_index(idx: int, n_ld: int) -> float:
+    """
+    Bridge anchor x for LD panel.
+    Avoid top sawtooth tips (0.5-step anchors) and map to the visible
+    center band of LD diamonds.
+    """
+    n = int(max(1, n_ld))
+    i = int(max(0, min(int(idx), n - 1)))
+    if n <= 1:
+        return 0.5
+    if n == 2:
+        return 1.0
+    return float(1.0 + (float(i) * float(n - 2) / float(n - 1)))
+
+
 def _compute_global_x(df: pd.DataFrame) -> tuple[np.ndarray, list[tuple[float, str]], list[float]]:
     chroms = sorted(pd.unique(df["chrom_norm"]).tolist(), key=_natural_key)
     starts: dict[str, float] = {}
@@ -705,6 +990,66 @@ def _downsample_for_qq(expected: np.ndarray, observed: np.ndarray, max_points: i
     return expected[idx], observed[idx]
 
 
+def _auto_threshold_from_pvals_bisect(
+    pvals: np.ndarray,
+    *,
+    target_points: int = _AUTO_SIG_TARGET_POINTS,
+) -> tuple[float, int]:
+    pv = np.asarray(pvals, dtype=float)
+    pv = pv[np.isfinite(pv) & (pv > 0.0)]
+    if pv.size == 0:
+        return (np.nan, 0)
+    pv = np.clip(pv, np.nextafter(0.0, 1.0), 1.0)
+    n = int(pv.size)
+    tgt = int(max(1, min(int(target_points), n)))
+    if n <= tgt:
+        return (1.0, n)
+
+    lo = float(np.nextafter(0.0, 1.0))
+    hi = 1.0
+    best_thr = hi
+    best_cnt = int(np.count_nonzero(pv <= hi))
+    best_gap = abs(best_cnt - tgt)
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        cnt = int(np.count_nonzero(pv <= mid))
+        gap = abs(cnt - tgt)
+        if gap < best_gap or (gap == best_gap and cnt >= tgt and best_cnt < tgt):
+            best_gap = gap
+            best_thr = mid
+            best_cnt = cnt
+        if cnt < tgt:
+            lo = mid
+        else:
+            hi = mid
+    return (float(best_thr), int(best_cnt))
+
+
+def _resolve_sig_threshold(
+    table: pd.DataFrame,
+    threshold: Any,
+) -> tuple[float, int]:
+    raw = str(threshold).strip().lower() if threshold is not None else ""
+    if raw in {"", "auto", "none", "nan"}:
+        return _auto_threshold_from_pvals_bisect(
+            pd.to_numeric(table["p"], errors="coerce").to_numpy(dtype=float, copy=False),
+            target_points=_AUTO_SIG_TARGET_POINTS,
+        )
+    try:
+        thr = float(threshold)
+    except Exception:
+        return _auto_threshold_from_pvals_bisect(
+            pd.to_numeric(table["p"], errors="coerce").to_numpy(dtype=float, copy=False),
+            target_points=_AUTO_SIG_TARGET_POINTS,
+        )
+    if not np.isfinite(thr) or thr <= 0.0:
+        return _auto_threshold_from_pvals_bisect(
+            pd.to_numeric(table["p"], errors="coerce").to_numpy(dtype=float, copy=False),
+            target_points=_AUTO_SIG_TARGET_POINTS,
+        )
+    return (float(min(thr, 1.0)), -1)
+
+
 def _parse_gff_attrs(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in str(text or "").split(";"):
@@ -724,14 +1069,14 @@ def _parse_gff_attrs(text: str) -> dict[str, str]:
 def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
     """
     Load full gene-structure annotation into memory cache for current task.
-    Columns: chrom_norm,start,end,name,feature,parent
+    Columns: chrom_norm,start,end,name,feature,parent,strand
     """
     txt = str(anno_file or "").strip()
     if txt == "":
-        return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent"])
+        return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
     p = Path(txt).expanduser()
     if not p.exists() or not p.is_file():
-        return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent"])
+        return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
 
     try:
         rp = str(p.resolve())
@@ -760,7 +1105,7 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
         fmt = "bed" if p.suffix.lower() == ".bed" else "gff"
 
     opener = gzip.open if is_gz else open
-    rows: list[tuple[str, int, int, str, str, str]] = []
+    rows: list[tuple[str, int, int, str, str, str, str]] = []
     try:
         with opener(p, "rt", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -779,6 +1124,7 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
                     name = arr[3] if len(arr) > 3 else f"{chrom}:{s}-{e}"
                     feature = "gene"
                     parent = str(name)
+                    strand = str(arr[5]).strip() if len(arr) > 5 else "+"
                 else:
                     if len(arr) < 5:
                         continue
@@ -793,6 +1139,7 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
                         continue
                     attrs = arr[8] if len(arr) > 8 else ""
                     ad = _parse_gff_attrs(attrs)
+                    strand = str(arr[6]).strip() if len(arr) > 6 else "+"
                     name = (
                         ad.get("name")
                         or ad.get("gene")
@@ -809,14 +1156,15 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
                     )
                 if e < s:
                     s, e = e, s
-                rows.append((str(chrom), int(s), int(e), str(name), str(feature), str(parent)))
+                strand = strand if strand in {"+", "-"} else "+"
+                rows.append((str(chrom), int(s), int(e), str(name), str(feature), str(parent), str(strand)))
     except Exception:
-        out_empty = pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent"])
+        out_empty = pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
         _TRACK_ANNO_CACHE[rp] = (mtime, out_empty)
         return out_empty
 
     if len(rows) == 0:
-        out_empty = pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent"])
+        out_empty = pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
         _TRACK_ANNO_CACHE[rp] = (mtime, out_empty)
         return out_empty
 
@@ -834,6 +1182,7 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
             "name": arr[:, 3].astype(str),
             "feature": pd.Categorical(arr[:, 4].astype(str)),
             "parent": arr[:, 5].astype(str),
+            "strand": pd.Categorical(arr[:, 6].astype(str)),
         }
     )
     out = out.sort_values(["chrom_norm", "start", "end"], kind="mergesort").reset_index(drop=True)
@@ -858,7 +1207,10 @@ def _read_gene_track(anno_file: str, br: Bimrange | None, max_rows: int = 1200) 
     )
     if not np.any(m):
         return []
-    sub = df.loc[m, ["start", "end", "name", "feature", "parent"]]
+    cols = ["start", "end", "name", "feature", "parent"]
+    if "strand" in df.columns:
+        cols.append("strand")
+    sub = df.loc[m, cols]
     if int(max_rows) > 0 and sub.shape[0] > int(max_rows):
         sub = sub.iloc[: int(max_rows)].copy()
 
@@ -875,6 +1227,7 @@ def _read_gene_track(anno_file: str, br: Bimrange | None, max_rows: int = 1200) 
                 "name": str(r["name"]),
                 "feature": str(r["feature"]),
                 "parent": str(r["parent"]),
+                "strand": str(r["strand"]) if "strand" in cols else "+",
             }
         )
     return out
@@ -1151,6 +1504,13 @@ def _lead_vs_all_r2(geno_block: np.ndarray) -> np.ndarray:
 
 def _clean_anno_token(v: object) -> str:
     x = str(v).strip()
+    # Normalize simple serialized list-like wrappers, e.g. "['geneA']".
+    if x.startswith("[") and x.endswith("]"):
+        inner = x[1:-1].strip()
+        if inner != "" and "," not in inner:
+            x = inner
+    if len(x) >= 2 and ((x[0] == "'" and x[-1] == "'") or (x[0] == '"' and x[-1] == '"')):
+        x = x[1:-1].strip()
     if x == "" or x.lower() in {"na", "nan", "none", "null"}:
         return "NA"
     return re.sub(r"\s+", " ", x)
@@ -1265,12 +1625,43 @@ def _annotate_sig_rows_with_genes(rows: list[dict[str, Any]], anno_file: str) ->
     }
     for r in rows:
         chrom = _normalize_chrom(r.get("chrom", ""))
-        try:
-            s = int(r.get("start", 0))
-            e = int(r.get("end", 0))
-        except Exception:
+        if chrom == "":
             r["Gene"] = "NA"
             continue
+        try:
+            p = r.get("pos", None)
+            p_i = int(p) if p is not None else None
+        except Exception:
+            p_i = None
+
+        try:
+            s_raw = r.get("start", None)
+            s_i = int(s_raw) if s_raw is not None else None
+        except Exception:
+            s_i = None
+        try:
+            e_raw = r.get("end", None)
+            e_i = int(e_raw) if e_raw is not None else None
+        except Exception:
+            e_i = None
+
+        # Sig rows usually carry only `pos`; fallback to point interval.
+        if s_i is None and e_i is None:
+            if p_i is None:
+                r["Gene"] = "NA"
+                continue
+            s_i, e_i = p_i, p_i
+        else:
+            if s_i is None:
+                s_i = p_i if p_i is not None else e_i
+            if e_i is None:
+                e_i = p_i if p_i is not None else s_i
+            if s_i is None or e_i is None:
+                r["Gene"] = "NA"
+                continue
+
+        s = int(s_i)
+        e = int(e_i)
         if s > e:
             s, e = e, s
         g = by_chr.get(chrom, None)
@@ -1285,28 +1676,33 @@ def _annotate_sig_rows_with_genes(rows: list[dict[str, Any]], anno_file: str) ->
         r["Gene"] = _format_sig_gene_hits(hits)
 
 
+def annotate_sig_rows_with_genes(rows: list[dict[str, Any]], anno_file: str) -> None:
+    """
+    Public wrapper for server-side selective annotation.
+    """
+    _annotate_sig_rows_with_genes(rows, anno_file)
+
+
 def build_sig_table(
     row: dict[str, Any],
     *,
-    threshold: Any = 1e-6,
+    threshold: Any = "auto",
     window_bp: int = 10_000,
     r2_thr: float = 0.8,
     anno_file: str = "",
+    annotate_rows: bool = True,
 ) -> dict[str, Any]:
     """
-    Build threshold-passing SNP table with LD clump de-redundancy.
+    Build threshold-passing SNP table.
+    Threshold defaults to pwald bisection (~100k SNPs).
     """
+    _ = window_bp
+    _ = r2_thr
     gwas_path = _resolve_result_file(row)
     table = _load_sig_table_cached(gwas_path)
-
-    try:
-        thr = float(threshold)
-    except Exception:
-        thr = 1e-6
+    thr, _auto_cnt = _resolve_sig_threshold(table, threshold)
     if not np.isfinite(thr) or thr <= 0.0:
-        thr = 1e-6
-    if thr > 1.0:
-        thr = 1.0
+        return {"threshold": float("nan"), "n_sig": 0, "n_leads": 0, "rows": []}
 
     work = table.loc[table["p"].values <= float(thr), ["chrom_norm", "pos", "p"]].copy()
     if work.shape[0] == 0:
@@ -1334,145 +1730,37 @@ def build_sig_table(
         .drop_duplicates(subset=["chrom_norm", "pos"], keep="first")
         .reset_index(drop=True)
     )
-    n_sig = int(work.shape[0])
-    n = int(work.shape[0])
-    if n == 0:
+    if int(work.shape[0]) == 0:
         return {
             "threshold": float(thr),
             "n_sig": 0,
             "n_leads": 0,
             "rows": [],
         }
-
-    chrom_arr = work["chrom_norm"].to_numpy(dtype=object)
-    pos_arr = work["pos"].to_numpy(dtype=np.int64)
-    p_arr = work["p"].to_numpy(dtype=float)
-    all_keys = [(str(chrom_arr[i]), int(pos_arr[i])) for i in range(n)]
-
-    genofile = str(row.get("genofile", "")).strip()
-    preloaded_geno: np.ndarray | None = None
-    if genofile != "":
-        try:
-            chunks: list[np.ndarray] = []
-            for chunk, _sites in load_genotype_chunks(
-                genofile,
-                chunk_size=max(1, min(20_000, n)),
-                maf=0.0,
-                missing_rate=1.0,
-                impute=True,
-                snp_sites=all_keys,
-            ):
-                chunks.append(np.asarray(chunk, dtype=np.float32))
-            if len(chunks) > 0:
-                preloaded_geno = np.vstack(chunks).astype(np.float32, copy=False)
-            if preloaded_geno is None or int(preloaded_geno.shape[0]) != n:
-                preloaded_geno = None
-        except Exception:
-            preloaded_geno = None
-
-    # Build per-chromosome sorted position index for O(log n) window lookup.
-    chr_window_index: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for c in pd.unique(chrom_arr):
-        idx = np.flatnonzero(chrom_arr == c).astype(np.int64, copy=False)
-        if idx.size == 0:
-            continue
-        ord_pos = np.argsort(pos_arr[idx], kind="mergesort")
-        sorted_idx = idx[ord_pos]
-        sorted_pos = pos_arr[sorted_idx]
-        chr_window_index[str(c)] = (sorted_idx, sorted_pos)
-
-    remaining = np.ones(n, dtype=bool)
-    out_rows: list[dict[str, Any]] = []
-    wb = int(window_bp)
-    r2_cut = float(r2_thr)
-
-    for lead_i in range(n):
-        if not bool(remaining[lead_i]):
-            continue
-        lead_chr = str(chrom_arr[lead_i])
-        lead_pos = int(pos_arr[lead_i])
-        lead_p = float(p_arr[lead_i])
-
-        sorted_pack = chr_window_index.get(lead_chr, None)
-        if sorted_pack is None:
-            cand_idx = np.array([lead_i], dtype=np.int64)
-        else:
-            sorted_idx, sorted_pos = sorted_pack
-            left = int(np.searchsorted(sorted_pos, lead_pos - wb, side="left"))
-            right = int(np.searchsorted(sorted_pos, lead_pos + wb, side="right"))
-            cand_idx = sorted_idx[left:right]
-            if cand_idx.size > 0:
-                cand_idx = cand_idx[remaining[cand_idx]]
-            if cand_idx.size == 0:
-                cand_idx = np.array([lead_i], dtype=np.int64)
-            elif int(cand_idx[0]) != int(lead_i):
-                cand_idx = np.concatenate(
-                    (
-                        np.array([lead_i], dtype=np.int64),
-                        cand_idx[cand_idx != int(lead_i)],
-                    ),
-                    axis=0,
-                )
-
-        clump_idx = np.array([lead_i], dtype=np.int64)
-        mean_r2 = 1.0
-        if preloaded_geno is not None and cand_idx.size > 1:
-            try:
-                geno_block = preloaded_geno[cand_idx, :]
-                r2_vec = _lead_vs_all_r2(geno_block)
-                keep = np.asarray(r2_vec >= r2_cut, dtype=bool)
-                if keep.shape[0] != cand_idx.shape[0]:
-                    keep = np.zeros(cand_idx.shape[0], dtype=bool)
-                    keep[0] = True
-                clump_idx = cand_idx[keep]
-                if clump_idx.size == 0:
-                    clump_idx = np.array([lead_i], dtype=np.int64)
-                elif int(clump_idx[0]) != int(lead_i):
-                    clump_idx = np.concatenate(
-                        (
-                            np.array([lead_i], dtype=np.int64),
-                            clump_idx[clump_idx != int(lead_i)],
-                        ),
-                        axis=0,
-                    )
-                if np.any(keep):
-                    mean_r2 = float(np.mean(r2_vec[keep]))
-            except Exception:
-                clump_idx = np.array([lead_i], dtype=np.int64)
-                mean_r2 = 1.0
-
-        clump_pos = pos_arr[clump_idx]
-        order = np.argsort(clump_pos, kind="mergesort")
-        clump_idx = clump_idx[order]
-        ld_start = int(np.min(clump_pos))
-        ld_end = int(np.max(clump_pos))
-        ldclump_text = ";".join([f"{str(chrom_arr[j])}_{int(pos_arr[j])}" for j in clump_idx])
-        out_rows.append(
-            {
-                "chrom": str(lead_chr),
-                "pos": int(lead_pos),
-                "p": float(lead_p),
-                "logp": float(-np.log10(max(float(lead_p), np.nextafter(0.0, 1.0)))),
-                "start": int(ld_start),
-                "end": int(ld_end),
-                "nsnps": int(clump_idx.size),
-                "MeanR2": float(mean_r2),
-                "LDclump": ldclump_text,
-            }
-        )
-        remaining[clump_idx] = False
-
-    out_rows = sorted(out_rows, key=lambda x: (_natural_key(x["chrom"]), int(x["pos"])))
+    out_rows = [
+        {
+            "chrom": str(r["chrom_norm"]),
+            "pos": int(r["pos"]),
+            "p": float(r["p"]),
+            "logp": float(-np.log10(max(float(r["p"]), np.nextafter(0.0, 1.0)))),
+        }
+        for _, r in work.iterrows()
+    ]
+    out_rows = sorted(
+        out_rows,
+        key=lambda x: (_natural_key(x["chrom"]), int(x["pos"]), float(x["p"])),
+    )
     anno_txt = str(anno_file or "").strip()
-    if anno_txt != "":
+    if bool(annotate_rows) and anno_txt != "":
         _annotate_sig_rows_with_genes(out_rows, anno_txt)
     else:
         for r in out_rows:
             r["Gene"] = ""
+    n_sig = int(len(out_rows))
     return {
         "threshold": float(thr),
         "n_sig": int(n_sig),
-        "n_leads": int(len(out_rows)),
+        "n_leads": int(n_sig),
         "rows": out_rows,
     }
 
@@ -1480,33 +1768,58 @@ def build_sig_table(
 def build_merged_sig_table(
     rows: list[dict[str, Any]],
     *,
-    threshold: Any = 1e-6,
+    threshold: Any = "auto",
     window_bp: int = 10_000,
     r2_thr: float = 0.8,
     anno_file: str = "",
+    annotate_rows: bool = True,
 ) -> dict[str, Any]:
     """
     Build merged sig table across multiple GWAS results:
     1) keep SNPs that pass threshold in every GWAS (intersection)
     2) aggregate p by min-p across GWAS
-    3) LD-clump on the shared SNP set
     """
+    _ = window_bp
+    _ = r2_thr
     if not isinstance(rows, list) or len(rows) == 0:
-        return {"threshold": 1e-6, "n_sig": 0, "n_leads": 0, "rows": []}
+        return {"threshold": float("nan"), "n_sig": 0, "n_leads": 0, "rows": []}
 
-    try:
-        thr = float(threshold)
-    except Exception:
-        thr = 1e-6
-    if not np.isfinite(thr) or thr <= 0.0:
-        thr = 1e-6
-    if thr > 1.0:
-        thr = 1.0
-
-    per_maps: list[dict[tuple[str, int], float]] = []
+    tables: list[pd.DataFrame] = []
+    first_pvals: np.ndarray | None = None
     for row in rows:
         gwas_path = _resolve_result_file(row)
         table = _load_sig_table_cached(gwas_path)
+        tables.append(table)
+        if first_pvals is None:
+            first_pvals = pd.to_numeric(table["p"], errors="coerce").to_numpy(dtype=float, copy=False)
+    base_pvals = first_pvals if first_pvals is not None else np.asarray([], dtype=float)
+    if str(threshold).strip().lower() in {"", "auto", "none", "nan"}:
+        thr, _auto_cnt = _auto_threshold_from_pvals_bisect(
+            base_pvals,
+            target_points=_AUTO_SIG_TARGET_POINTS,
+        )
+    else:
+        try:
+            thr = float(threshold)
+        except Exception:
+            thr, _auto_cnt = _auto_threshold_from_pvals_bisect(
+                base_pvals,
+                target_points=_AUTO_SIG_TARGET_POINTS,
+            )
+        else:
+            if not np.isfinite(thr) or thr <= 0.0:
+                thr, _auto_cnt = _auto_threshold_from_pvals_bisect(
+                    base_pvals,
+                    target_points=_AUTO_SIG_TARGET_POINTS,
+                )
+            else:
+                thr = float(min(thr, 1.0))
+
+    if not np.isfinite(thr) or thr <= 0.0:
+        return {"threshold": float("nan"), "n_sig": 0, "n_leads": 0, "rows": []}
+
+    per_maps: list[dict[tuple[str, int], float]] = []
+    for table in tables:
         work = table.loc[table["p"].values <= float(thr), ["chrom_norm", "pos", "p"]].copy()
         if int(work.shape[0]) == 0:
             return {"threshold": float(thr), "n_sig": 0, "n_leads": 0, "rows": []}
@@ -1549,144 +1862,29 @@ def build_merged_sig_table(
         if len(vals) == 0:
             continue
         pmin = float(np.min(np.asarray(vals, dtype=float)))
-        rows0.append({"chrom": str(c), "pos": int(p), "p": pmin})
+        rows0.append(
+            {
+                "chrom": str(c),
+                "pos": int(p),
+                "p": pmin,
+                "logp": float(-np.log10(max(float(pmin), np.nextafter(0.0, 1.0)))),
+            }
+        )
     if len(rows0) == 0:
         return {"threshold": float(thr), "n_sig": 0, "n_leads": 0, "rows": []}
 
-    rows0 = sorted(rows0, key=lambda x: (float(x["p"]), _natural_key(x["chrom"]), int(x["pos"])))
-    n = len(rows0)
-    chrom_arr = np.asarray([str(r["chrom"]) for r in rows0], dtype=object)
-    pos_arr = np.asarray([int(r["pos"]) for r in rows0], dtype=np.int64)
-    p_arr = np.asarray([float(r["p"]) for r in rows0], dtype=float)
-    n_sig = int(n)
-
-    # Use first row genotype (server already checks genotype consistency).
-    gref = rows[0] if len(rows) > 0 else {}
-    genofile = str(gref.get("genofile", "")).strip()
-    preloaded_geno: np.ndarray | None = None
-    if genofile != "":
-        all_keys = [(str(chrom_arr[i]), int(pos_arr[i])) for i in range(n)]
-        try:
-            chunks: list[np.ndarray] = []
-            for chunk, _sites in load_genotype_chunks(
-                genofile,
-                chunk_size=max(1, min(20_000, n)),
-                maf=0.0,
-                missing_rate=1.0,
-                impute=True,
-                snp_sites=all_keys,
-            ):
-                chunks.append(np.asarray(chunk, dtype=np.float32))
-            if len(chunks) > 0:
-                preloaded_geno = np.vstack(chunks).astype(np.float32, copy=False)
-            if preloaded_geno is None or int(preloaded_geno.shape[0]) != n:
-                preloaded_geno = None
-        except Exception:
-            preloaded_geno = None
-
-    # Build per-chromosome sorted index for window lookup.
-    chr_window_index: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for c in pd.unique(chrom_arr):
-        idx = np.flatnonzero(chrom_arr == c).astype(np.int64, copy=False)
-        if idx.size == 0:
-            continue
-        ord_pos = np.argsort(pos_arr[idx], kind="mergesort")
-        sorted_idx = idx[ord_pos]
-        sorted_pos = pos_arr[sorted_idx]
-        chr_window_index[str(c)] = (sorted_idx, sorted_pos)
-
-    remaining = np.ones(n, dtype=bool)
-    out_rows: list[dict[str, Any]] = []
-    wb = int(window_bp)
-    r2_cut = float(r2_thr)
-
-    for lead_i in range(n):
-        if not bool(remaining[lead_i]):
-            continue
-        lead_chr = str(chrom_arr[lead_i])
-        lead_pos = int(pos_arr[lead_i])
-        lead_p = float(p_arr[lead_i])
-
-        sorted_pack = chr_window_index.get(lead_chr, None)
-        if sorted_pack is None:
-            cand_idx = np.array([lead_i], dtype=np.int64)
-        else:
-            sorted_idx, sorted_pos = sorted_pack
-            left = int(np.searchsorted(sorted_pos, lead_pos - wb, side="left"))
-            right = int(np.searchsorted(sorted_pos, lead_pos + wb, side="right"))
-            cand_idx = sorted_idx[left:right]
-            if cand_idx.size > 0:
-                cand_idx = cand_idx[remaining[cand_idx]]
-            if cand_idx.size == 0:
-                cand_idx = np.array([lead_i], dtype=np.int64)
-            elif int(cand_idx[0]) != int(lead_i):
-                cand_idx = np.concatenate(
-                    (
-                        np.array([lead_i], dtype=np.int64),
-                        cand_idx[cand_idx != int(lead_i)],
-                    ),
-                    axis=0,
-                )
-
-        clump_idx = np.array([lead_i], dtype=np.int64)
-        mean_r2 = 1.0
-        if preloaded_geno is not None and cand_idx.size > 1:
-            try:
-                geno_block = preloaded_geno[cand_idx, :]
-                r2_vec = _lead_vs_all_r2(geno_block)
-                keep = np.asarray(r2_vec >= r2_cut, dtype=bool)
-                if keep.shape[0] != cand_idx.shape[0]:
-                    keep = np.zeros(cand_idx.shape[0], dtype=bool)
-                    keep[0] = True
-                clump_idx = cand_idx[keep]
-                if clump_idx.size == 0:
-                    clump_idx = np.array([lead_i], dtype=np.int64)
-                elif int(clump_idx[0]) != int(lead_i):
-                    clump_idx = np.concatenate(
-                        (
-                            np.array([lead_i], dtype=np.int64),
-                            clump_idx[clump_idx != int(lead_i)],
-                        ),
-                        axis=0,
-                    )
-                if np.any(keep):
-                    mean_r2 = float(np.mean(r2_vec[keep]))
-            except Exception:
-                clump_idx = np.array([lead_i], dtype=np.int64)
-                mean_r2 = 1.0
-
-        clump_pos = pos_arr[clump_idx]
-        order = np.argsort(clump_pos, kind="mergesort")
-        clump_idx = clump_idx[order]
-        ld_start = int(np.min(clump_pos))
-        ld_end = int(np.max(clump_pos))
-        ldclump_text = ";".join([f"{str(chrom_arr[j])}_{int(pos_arr[j])}" for j in clump_idx])
-        out_rows.append(
-            {
-                "chrom": str(lead_chr),
-                "pos": int(lead_pos),
-                "p": float(lead_p),
-                "logp": float(-np.log10(max(float(lead_p), np.nextafter(0.0, 1.0)))),
-                "start": int(ld_start),
-                "end": int(ld_end),
-                "nsnps": int(clump_idx.size),
-                "MeanR2": float(mean_r2),
-                "LDclump": ldclump_text,
-            }
-        )
-        remaining[clump_idx] = False
-
-    out_rows = sorted(out_rows, key=lambda x: (_natural_key(x["chrom"]), int(x["pos"])))
+    out_rows = sorted(rows0, key=lambda x: (_natural_key(x["chrom"]), int(x["pos"]), float(x["p"])))
     anno_txt = str(anno_file or "").strip()
-    if anno_txt != "":
+    if bool(annotate_rows) and anno_txt != "":
         _annotate_sig_rows_with_genes(out_rows, anno_txt)
     else:
         for r in out_rows:
             r["Gene"] = ""
+    n_sig = int(len(out_rows))
     return {
         "threshold": float(thr),
         "n_sig": int(n_sig),
-        "n_leads": int(len(out_rows)),
+        "n_leads": int(n_sig),
         "rows": out_rows,
     }
 
@@ -1710,8 +1908,10 @@ def render_merged_manhattan_svg(
     bimrange_text: Any = "",
     manh_ratio: float = 2.0,
     manh_palette: str = "auto",
+    manh_alpha: float = 0.7,
     manh_marker: str = "o",
     manh_size: float = 16.0,
+    series_styles: Any = None,
     ld_color: str = "#4b5563",
     ld_p_threshold: Any = "auto",
     render_qq: bool = True,
@@ -1789,10 +1989,32 @@ def render_merged_manhattan_svg(
         color_base = ["#111111", "#8a8a8a"]
 
     ratio = _parse_float(manh_ratio, 2.0, min_value=0.2)
+    alpha_default = float(np.clip(_parse_float(manh_alpha, 0.7, min_value=0.0), 0.0, 1.0))
     marker = _normalize_marker(manh_marker)
     msize = _parse_float(manh_size, 16.0, min_value=0.1)
     rasterize_main = (not bool(editable_svg))
     fig_dpi = int(_WEBUI_RASTER_DPI if rasterize_main else _WEBUI_VECTOR_DPI)
+
+    style_by_history: dict[str, dict[str, Any]] = {}
+    style_by_index: dict[int, dict[str, Any]] = {}
+    if isinstance(series_styles, list):
+        for j, raw in enumerate(series_styles):
+            if not isinstance(raw, dict):
+                continue
+            st: dict[str, Any] = {}
+            c_raw = str(raw.get("color", "")).strip()
+            if c_raw != "":
+                try:
+                    st["color"] = mcolors.to_hex(mcolors.to_rgb(c_raw))
+                except Exception:
+                    pass
+            st["marker"] = _normalize_marker(raw.get("marker", "o"))
+            st["size"] = _parse_float(raw.get("size", 16.0), 16.0, min_value=0.1)
+            st["alpha"] = float(np.clip(_parse_float(raw.get("alpha", 0.7), 0.7, min_value=0.0), 0.0, 1.0))
+            hid = str(raw.get("history_id", "")).strip()
+            if hid != "":
+                style_by_history[hid] = dict(st)
+            style_by_index[int(j)] = dict(st)
 
     # Keep merge behavior aligned with single-GWAS:
     # - bimrange mode: Manhattan + LD only (no QQ)
@@ -1800,18 +2022,30 @@ def render_merged_manhattan_svg(
     show_ld = len(brs) > 0
     show_qq = (not show_ld) and bool(render_qq)
     if show_ld:
-        top_ratio = float(np.clip(2.0 / float(ratio), 0.08, 2.50))
-        fig = plt.figure(figsize=(15.0, 8.8), dpi=fig_dpi)
+        fig_w = 15.0
+        left = 0.05
+        right = 0.995
+        top = 0.965
+        bottom = 0.06
+        fig_h, h_ratios = _ld_layout_for_webui(
+            fig_w=fig_w,
+            left=left,
+            right=right,
+            top=top,
+            bottom=bottom,
+            manh_ratio=float(ratio),
+        )
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=fig_dpi)
         gs = GridSpec(
             3,
             1,
             figure=fig,
             width_ratios=[1.0],
-            height_ratios=[top_ratio, 0.11, 1.05],
-            left=0.05,
-            right=0.995,
-            top=0.965,
-            bottom=0.06,
+            height_ratios=h_ratios,
+            left=left,
+            right=right,
+            top=top,
+            bottom=bottom,
             hspace=0.018,
             wspace=0.0,
         )
@@ -1916,14 +2150,25 @@ def render_merged_manhattan_svg(
         x_left = min(x_left, float(np.nanmin(xk)))
         x_right = max(x_right, float(np.nanmax(xk)))
         y_top = max(y_top, float(np.nanmax(yk)))
-        col = color_base[i % len(color_base)]
+        row_hid = str(s.get("row", {}).get("history_id", "")).strip()
+        st = style_by_history.get(row_hid, style_by_index.get(i, {}))
+        col = str(st.get("color", color_base[i % len(color_base)]))
+        alpha_i = float(
+            np.clip(
+                _parse_float(st.get("alpha", alpha_default), alpha_default, min_value=0.0),
+                0.0,
+                1.0,
+            )
+        )
+        marker_i = str(st.get("marker", marker))
+        size_i = float(st.get("size", msize))
         ax_manh.scatter(
             xk,
             yk,
-            s=msize,
+            s=size_i,
             c=col,
-            alpha=0.68,
-            marker=marker,
+            alpha=alpha_i,
+            marker=marker_i,
             linewidths=0.0,
             rasterized=rasterize_main,
             label=str(s["label"]),
@@ -1944,10 +2189,10 @@ def render_merged_manhattan_svg(
                     ax_qq.scatter(
                         exp,
                         obs,
-                        s=max(2.0, msize * 0.55),
+                        s=max(2.0, size_i * 0.55),
                         c=col,
-                        alpha=0.68,
-                        marker=marker,
+                        alpha=alpha_i,
+                        marker=marker_i,
                         linewidths=0.0,
                         rasterized=rasterize_main,
                     )
@@ -2057,6 +2302,7 @@ def render_merged_manhattan_svg(
 
     # LD block in merge+bimrange mode.
     ld_n = 0
+    ld_has_matrix = False
     if show_ld and ax_ld is not None:
         selected_keys: set[tuple[str, int]] | None = None
         if 0.0 < float(ld_thr) < 1.0:
@@ -2115,24 +2361,27 @@ def render_merged_manhattan_svg(
                 rasterized=rasterize_main,
                 rasterize_threshold=120 if rasterize_main else None,
             )
+            ld_has_matrix = True
             # Draw merge bridge lines: Manhattan SNP position -> LD block order.
             if ax_bridge is not None:
                 try:
                     pairs: list[tuple[float, float]] = []
                     # Build x mapping from LD keys to Manhattan x coordinates.
                     if len(brs) == 1:
-                        for i, k0 in enumerate(ld_keys[: int(ld_r2.shape[0])]):
+                        n_ld = int(ld_r2.shape[0])
+                        for i, k0 in enumerate(ld_keys[:n_ld]):
                             c0 = _normalize_chrom(k0[0])
                             if c0 != brs[0].chrom:
                                 continue
                             x_top = float(k0[1]) / 1e6
-                            x_ld = float(i) + 0.5
+                            x_ld = _ld_bridge_x_from_index(i, n_ld)
                             pairs.append((x_top, x_ld))
                     else:
                         seg_by_chrom = {}
                         for seg in segs:
                             seg_by_chrom.setdefault(seg.br.chrom, []).append(seg)
-                        for i, k0 in enumerate(ld_keys[: int(ld_r2.shape[0])]):
+                        n_ld = int(ld_r2.shape[0])
+                        for i, k0 in enumerate(ld_keys[:n_ld]):
                             c0 = _normalize_chrom(k0[0])
                             p0 = int(k0[1])
                             x_top = None
@@ -2142,7 +2391,7 @@ def render_merged_manhattan_svg(
                                     break
                             if x_top is None:
                                 continue
-                            x_ld = float(i) + 0.5
+                            x_ld = _ld_bridge_x_from_index(i, n_ld)
                             pairs.append((float(x_top), x_ld))
                     if len(pairs) > 0:
                         to_bridge = ax_bridge.transAxes.inverted()
@@ -2180,8 +2429,11 @@ def render_merged_manhattan_svg(
                 bridge_pos = ax_bridge.get_position()
                 ax_bridge.set_position([manh_pos.x0, bridge_pos.y0, manh_pos.width, bridge_pos.height])
             ld_pos = ax_ld.get_position()
-            ax_ld.set_adjustable("datalim")
+            ax_ld.set_adjustable("box")
             ax_ld.set_position([manh_pos.x0, ld_pos.y0, manh_pos.width, ld_pos.height])
+            if ld_has_matrix:
+                ax_ld.set_aspect(0.5, adjustable="box")
+                ax_ld.set_anchor("N")
         except Exception:
             pass
 
@@ -2196,6 +2448,7 @@ def render_merged_manhattan_svg(
     info = {
         "n_tasks": int(len(series)),
         "palette": str(p_use),
+        "manh_alpha": float(alpha_default),
         "n_total": int(sum(int(s["full"].shape[0]) for s in series)),
         "legend": [str(s["label"]) for s in series],
         "mode": mode,
@@ -2216,6 +2469,7 @@ def render_single_svg(
     full_plot: bool = False,
     manh_ratio: float = 2.0,
     manh_palette: str = "auto",
+    manh_alpha: float = 0.7,
     manh_marker: str = "o",
     manh_size: float = 16.0,
     ld_color: str = "#4b5563",
@@ -2264,9 +2518,15 @@ def render_single_svg(
     df = _filter_by_bimranges(table, brs)
     tone = _derive_tone_palette(ld_color)
     ratio = _parse_float(manh_ratio, 2.0, min_value=0.2)
+    alpha_main = float(np.clip(_parse_float(manh_alpha, 0.7, min_value=0.0), 0.0, 1.0))
     marker = _normalize_marker(manh_marker)
     msize = _parse_float(manh_size, 16.0, min_value=0.1)
-    manh_color_set = _resolve_manh_color_set(manh_palette, tone)
+    # Single-GWAS mode: use same-hue high-contrast (dark/light) colors.
+    manh_color_set = _resolve_single_contrast_manh_colors(
+        manh_palette=manh_palette,
+        ld_color=ld_color,
+        tone=tone,
+    )
     ld_auto = False
     raw_thr = str(ld_p_threshold).strip().lower() if ld_p_threshold is not None else ""
     if raw_thr in {"", "auto", "none", "default"}:
@@ -2350,17 +2610,29 @@ def render_single_svg(
         # Keep Manhattan panel responsive to larger ratio values in bimrange mode.
         # 2 -> 1.0, 4 -> 0.5, 8 -> 0.25, 20 -> 0.10
         # Clamp only to avoid collapsing completely.
-        top_ratio = float(np.clip(2.0 / float(ratio), 0.08, 2.50))
-        fig = plt.figure(figsize=(9.8, 12.8), dpi=fig_dpi)
+        fig_w = 9.8
+        left = 0.055
+        right = 0.995
+        top = 0.985
+        bottom = 0.05
+        fig_h, h_ratios = _ld_layout_for_webui(
+            fig_w=fig_w,
+            left=left,
+            right=right,
+            top=top,
+            bottom=bottom,
+            manh_ratio=float(ratio),
+        )
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=fig_dpi)
         gs = GridSpec(
             3,
             1,
             figure=fig,
-            height_ratios=[top_ratio, 0.11, 1.05],
-            left=0.055,
-            right=0.995,
-            top=0.985,
-            bottom=0.05,
+            height_ratios=h_ratios,
+            left=left,
+            right=right,
+            top=top,
+            bottom=bottom,
             hspace=0.018,
             wspace=0.0,
         )
@@ -2414,6 +2686,11 @@ def render_single_svg(
             marker=marker,
             rasterized=rasterize_main,
         )
+        for coll in ax_manh.collections:
+            try:
+                coll.set_alpha(alpha_main)
+            except Exception:
+                pass
         # WebUI: no chromosome gap; use full-height dashed separators.
         for xsep in np.asarray(getattr(plotmodel_ui, "_chr_separators", []), dtype=float):
             if np.isfinite(xsep):
@@ -2476,7 +2753,7 @@ def render_single_svg(
             y,
             s=msize,
             c=manh_color_set[0] if len(manh_color_set) > 0 else "#111111",
-            alpha=0.72,
+            alpha=alpha_main,
             marker=marker,
             linewidths=0.0,
             rasterized=rasterize_main,
@@ -2530,7 +2807,7 @@ def render_single_svg(
                 y[m],
                 s=msize,
                 c=color,
-                alpha=0.72,
+                alpha=alpha_main,
                 marker=marker,
                 linewidths=0.0,
                 rasterized=rasterize_main,
@@ -2679,6 +2956,11 @@ def render_single_svg(
             qq_fast_max_points=120_000,
             qq_band_max_points=20_000,
         )
+        for coll in ax_qq.collections:
+            try:
+                coll.set_alpha(alpha_main)
+            except Exception:
+                pass
         # Keep QQ ylim identical to Manhattan ylim.
         # Keep QQ xlim adaptive to QQ expected range.
         qq_xmin, qq_xmax = ax_qq.get_xlim()
@@ -2737,6 +3019,7 @@ def render_single_svg(
 
     ld_r2 = None
     ld_keys: list[tuple[str, int]] = []
+    ld_has_matrix = False
     if show_track and ax_gene is not None and ax_ld is not None:
         # Gene panel
         ax_gene.set_yticks([])
@@ -2754,6 +3037,7 @@ def render_single_svg(
                         "name": str(rec.get("name", "")),
                         "feature": str(rec.get("feature", "gene")).lower(),
                         "parent": str(rec.get("parent", rec.get("name", ""))),
+                        "strand": str(rec.get("strand", "+")),
                     }
                 )
         else:
@@ -2773,64 +3057,213 @@ def render_single_svg(
                             "name": str(rec.get("name", "")),
                             "feature": str(rec.get("feature", "gene")).lower(),
                             "parent": str(rec.get("parent", rec.get("name", ""))),
+                            "strand": str(rec.get("strand", "+")),
                         }
                     )
 
         if len(mapped_records) > 0:
-            rows = 6
+            row_slots = 6
             row_by_gene: dict[str, int] = {}
+            gene_segments: list[tuple[float, float, float, float]] = []
+
+            def _norm_gene_key(raw: object) -> str:
+                txt = str(raw or "").strip()
+                if txt == "":
+                    return ""
+                # Parent may contain multiple IDs.
+                txt = txt.split(",")[0].strip()
+                # Normalize common prefixes while preserving stable matching.
+                if ":" in txt:
+                    prefix, rest = txt.split(":", 1)
+                    p = prefix.lower()
+                    if p in {"gene", "transcript", "mrna", "rna"} and rest.strip() != "":
+                        txt = rest.strip()
+                return txt.lower()
+
+            def _pick_row_for_feature(
+                *,
+                parent_key: str,
+                name_key: str,
+                x0: float,
+                x1: float,
+                fallback_row: float,
+            ) -> float:
+                keys = [
+                    str(parent_key or "").strip(),
+                    str(name_key or "").strip(),
+                    _norm_gene_key(parent_key),
+                    _norm_gene_key(name_key),
+                ]
+                for k in keys:
+                    if k and k in row_by_gene:
+                        return float(row_by_gene[k])
+                if len(gene_segments) == 0:
+                    return float(fallback_row)
+
+                c = 0.5 * (float(x0) + float(x1))
+                best_overlap = -1.0
+                best_dist = float("inf")
+                best_row = float(fallback_row)
+                for gy, gx0, gx1, gc in gene_segments:
+                    ov = max(0.0, min(float(x1), gx1) - max(float(x0), gx0))
+                    dist = abs(float(c) - float(gc))
+                    if ov > best_overlap + 1e-12:
+                        best_overlap = ov
+                        best_dist = dist
+                        best_row = float(gy)
+                    elif abs(ov - best_overlap) <= 1e-12 and dist < best_dist:
+                        best_dist = dist
+                        best_row = float(gy)
+                return float(best_row)
+
             genes = [r for r in mapped_records if r.get("feature") == "gene"]
             genes.sort(key=lambda r: (float(r.get("x0", 0.0)), float(r.get("x1", 0.0))))
+            used_rows = int(max(1, min(int(row_slots), len(genes) if len(genes) > 0 else 1)))
+            row_offset = int(max(0, (int(row_slots) - int(used_rows)) // 2))
             for i, r in enumerate(genes):
-                gid = str(r.get("parent") or r.get("name") or i)
-                row_by_gene[gid] = int(i % rows)
+                yrow = int(row_offset + (i % used_rows))
+                g_parent = str(r.get("parent") or "")
+                g_name = str(r.get("name") or "")
+                gx0 = float(r.get("x0", 0.0))
+                gx1 = float(r.get("x1", 0.0))
+                gcen = 0.5 * (gx0 + gx1)
+                for k in {
+                    g_parent,
+                    g_name,
+                    _norm_gene_key(g_parent),
+                    _norm_gene_key(g_name),
+                }:
+                    if str(k).strip() != "":
+                        row_by_gene[str(k).strip()] = int(yrow)
+                gene_segments.append((float(yrow), gx0, gx1, gcen))
 
             n_label = 0
-            # Draw gene skeleton line (dark).
+            x_lo, x_hi = ax_manh.get_xlim()
+            span = max(1e-6, float(x_hi) - float(x_lo))
+            arrow_step = max(0.006, span / 160.0)
+            gene_line_w = 1.15
+            end_tick_half = 0.09
+            cds_h = 0.36
+            utr_h = 0.22
+            # Draw gene skeleton line + strand arrows (dark).
             for i, r in enumerate(genes):
-                gid = str(r.get("parent") or r.get("name") or i)
-                yrow = float(row_by_gene.get(gid, i % rows))
-                xs = float(r.get("x0", 0.0))
-                xe = float(r.get("x1", 0.0))
+                yrow = _pick_row_for_feature(
+                    parent_key=str(r.get("parent") or ""),
+                    name_key=str(r.get("name") or ""),
+                    x0=float(r.get("x0", 0.0)),
+                    x1=float(r.get("x1", 0.0)),
+                    fallback_row=float(row_offset + (i % used_rows)),
+                )
+                x0 = float(r.get("x0", 0.0))
+                x1 = float(r.get("x1", 0.0))
+                xs = min(x0, x1)
+                xe = max(x0, x1)
+                yc = float(yrow) + 0.5
                 ax_gene.plot(
                     [xs, xe],
-                    [yrow + 0.5, yrow + 0.5],
+                    [yc, yc],
                     color=str(tone["dark"]),
-                    linewidth=1.1,
+                    linewidth=gene_line_w,
                     solid_capstyle="round",
                     alpha=0.95,
                 )
+                ax_gene.plot(
+                    [xs, xs],
+                    [yc - end_tick_half, yc + end_tick_half],
+                    color=str(tone["dark"]),
+                    linewidth=gene_line_w,
+                    alpha=0.95,
+                )
+                ax_gene.plot(
+                    [xe, xe],
+                    [yc - end_tick_half, yc + end_tick_half],
+                    color=str(tone["dark"]),
+                    linewidth=gene_line_w,
+                    alpha=0.95,
+                )
+                strand = str(r.get("strand", "+")).strip()
+                if strand not in {"+", "-"}:
+                    strand = "+"
+                if (xe - xs) > (arrow_step * 0.66):
+                    if strand == "-":
+                        for seg_end in np.arange(xe, xs, -arrow_step):
+                            seg_start = max(seg_end - arrow_step, xs)
+                            arrow = FancyArrowPatch(
+                                (float(seg_end), yc),
+                                (float(seg_start), yc),
+                                arrowstyle="->",
+                                mutation_scale=7.0,
+                                linewidth=gene_line_w,
+                                color=str(tone["dark"]),
+                                alpha=0.9,
+                            )
+                            ax_gene.add_patch(arrow)
+                    else:
+                        for seg_start in np.arange(xs, xe, arrow_step):
+                            seg_end = min(seg_start + arrow_step, xe)
+                            arrow = FancyArrowPatch(
+                                (float(seg_start), yc),
+                                (float(seg_end), yc),
+                                arrowstyle="->",
+                                mutation_scale=7.0,
+                                linewidth=gene_line_w,
+                                color=str(tone["dark"]),
+                                alpha=0.9,
+                            )
+                            ax_gene.add_patch(arrow)
                 if n_label < 14:
                     ax_gene.text(
-                        xs,
-                        yrow + 0.86,
+                        0.5 * (xs + xe),
+                        yc + 0.34,
                         str(r.get("name", "")),
                         fontsize=6,
                         color=str(tone["dark"]),
+                        ha="center",
+                        va="center",
+                        bbox={
+                            "facecolor": "white",
+                            "alpha": 0.78,
+                            "edgecolor": "none",
+                            "boxstyle": "round,pad=0.2",
+                        },
                     )
                     n_label += 1
 
-            # Draw CDS/UTR blocks (middle tone).
+            # Draw CDS/UTR blocks (CDS thicker, UTR thinner).
             for i, r in enumerate(mapped_records):
                 ft = str(r.get("feature", "gene")).lower()
-                if ft == "gene":
+                if ft not in {"cds", "utr", "five_prime_utr", "three_prime_utr"}:
                     continue
-                gid = str(r.get("parent") or r.get("name") or i)
-                yrow = float(row_by_gene.get(gid, i % rows))
-                xs = float(r.get("x0", 0.0))
-                xe = float(r.get("x1", 0.0))
+                x0 = float(r.get("x0", 0.0))
+                x1 = float(r.get("x1", 0.0))
+                xs = min(x0, x1)
+                xe = max(x0, x1)
+                yrow = _pick_row_for_feature(
+                    parent_key=str(r.get("parent") or ""),
+                    name_key=str(r.get("name") or ""),
+                    x0=xs,
+                    x1=xe,
+                    fallback_row=float(row_offset + (i % used_rows)),
+                )
+                yc = float(yrow) + 0.5
+                if ft == "cds":
+                    block_h = cds_h
+                    face_color = str(tone["mid"])
+                else:
+                    block_h = utr_h
+                    face_color = str(tone["light"])
                 rect = Rectangle(
-                    (xs, yrow + 0.34),
+                    (xs, yc - 0.5 * block_h),
                     max(xe - xs, 1e-6),
-                    0.32,
-                    facecolor=str(tone["mid"]),
-                    edgecolor=str(tone["mid"]),
+                    block_h,
+                    facecolor=face_color,
+                    edgecolor=face_color,
                     linewidth=0.0,
-                    alpha=0.95,
+                    alpha=0.96,
                 )
                 ax_gene.add_patch(rect)
             ax_gene.set_xlim(ax_manh.get_xlim())
-            ax_gene.set_ylim(0, float(rows + 0.5))
+            ax_gene.set_ylim(-0.15, float(row_slots) + 0.15)
         else:
             # No annotation: keep a transition-only middle layer.
             ax_gene.set_xlim(0.0, 1.0)
@@ -2910,11 +3343,12 @@ def render_single_svg(
                 rasterized=rasterize_main,
                 rasterize_threshold=120 if rasterize_main else None,
             )
+            ld_has_matrix = True
             # Keep LD panel width strictly aligned with Manhattan panel in WebUI.
             try:
                 manh_pos = ax_manh.get_position()
                 ld_pos = ax_ld.get_position()
-                ax_ld.set_adjustable("datalim")
+                ax_ld.set_adjustable("box")
                 ax_ld.set_position([manh_pos.x0, ld_pos.y0, manh_pos.width, ld_pos.height])
             except Exception:
                 pass
@@ -2932,7 +3366,7 @@ def render_single_svg(
                 x_top = key_to_x.get((str(k0[0]), int(k0[1])))
                 if x_top is None:
                     continue
-                x_ld = float(i) + 0.5
+                x_ld = _ld_bridge_x_from_index(i, n_ld)
                 pairs.append((float(x_top), x_ld))
             _draw_bridge_overlay(ax_gene, ax_manh, ax_ld, pairs, line_color=str(tone["dark"]))
 
@@ -2948,8 +3382,11 @@ def render_single_svg(
             gene_pos = ax_gene.get_position()
             ld_pos = ax_ld.get_position()
             ax_gene.set_position([manh_pos.x0, gene_pos.y0, manh_pos.width, gene_pos.height])
-            ax_ld.set_adjustable("datalim")
+            ax_ld.set_adjustable("box")
             ax_ld.set_position([manh_pos.x0, ld_pos.y0, manh_pos.width, ld_pos.height])
+            if ld_has_matrix:
+                ax_ld.set_aspect(0.5, adjustable="box")
+                ax_ld.set_anchor("N")
         except Exception:
             pass
 
@@ -2970,6 +3407,7 @@ def render_single_svg(
         "ld_p_threshold_auto": bool(ld_auto),
         "manh_ratio": float(ratio),
         "manh_palette": str(manh_palette or "auto"),
+        "manh_alpha": float(alpha_main),
         "manh_marker": str(marker),
         "manh_size": float(msize),
         "highlight_n": int(highlight_points_n),

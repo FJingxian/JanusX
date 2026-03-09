@@ -23,6 +23,8 @@ import time
 import uuid
 import webbrowser
 import numpy as np
+from email import policy
+from email.parser import BytesParser
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +39,7 @@ from ..script._common.gwas_history import (
     get_gwas_run,
     list_annotation_registry,
     list_gwas_history_rows,
+    record_gwas_run,
     resolve_db_path,
     resolve_jx_home,
     upsert_postgwas_run,
@@ -46,7 +49,9 @@ from .render import (
     render_merged_manhattan_svg,
     build_sig_table,
     build_merged_sig_table,
+    annotate_sig_rows_with_genes,
     activate_task_cache,
+    detect_gwas_columns,
 )
 
 
@@ -119,6 +124,14 @@ _CHR_COL_CANDIDATES = {
     "chrom",
     "chr",
     "chromosome",
+    "chromosomeid",
+    "chromid",
+    "chrid",
+    "chromname",
+    "seqid",
+    "seqname",
+    "contig",
+    "scaffold",
     "chromosome_id",
     "chrom_id",
 }
@@ -140,6 +153,62 @@ def _split_fields(line: str, delim: str | None) -> list[str]:
     if delim is None:
         return re.split(r"\s+", txt.strip())
     return txt.split(delim)
+
+
+def _parse_multipart_form_data(content_type: str, raw: bytes) -> dict[str, Any]:
+    ctype = str(content_type or "").strip()
+    if "multipart/form-data" not in ctype.lower():
+        raise ValueError("Content-Type must be multipart/form-data.")
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) == 0:
+        return {}
+    head = f"Content-Type: {ctype}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8", errors="replace")
+    msg = BytesParser(policy=policy.default).parsebytes(head + bytes(raw))
+    if not msg.is_multipart():
+        raise ValueError("invalid multipart payload.")
+
+    out: dict[str, Any] = {}
+
+    def _put(name: str, value: Any) -> None:
+        if name not in out:
+            out[name] = value
+            return
+        cur = out.get(name)
+        if isinstance(cur, list):
+            cur.append(value)
+            out[name] = cur
+        else:
+            out[name] = [cur, value]
+
+    for part in msg.iter_parts():
+        name = str(part.get_param("name", header="content-disposition") or "").strip()
+        if name == "":
+            continue
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename is not None:
+            _put(
+                name,
+                {
+                    "filename": str(filename),
+                    "content_type": str(part.get_content_type() or ""),
+                    "data": bytes(payload),
+                },
+            )
+        else:
+            charset = str(part.get_content_charset() or "utf-8")
+            try:
+                txt = bytes(payload).decode(charset, errors="replace")
+            except Exception:
+                txt = bytes(payload).decode("utf-8", errors="replace")
+            _put(name, txt)
+    return out
+
+
+def _col_key(v: object) -> str:
+    s = str(v or "").strip().lower()
+    if s.startswith("#"):
+        s = s[1:]
+    return re.sub(r"[^a-z0-9]+", "", s)
 
 
 def _chrom_sort_key(value: object) -> tuple[int, object]:
@@ -171,7 +240,12 @@ def _extract_chromosomes_from_gwas(path: Path, *, max_lines: int | None = None) 
     if not path.exists() or not path.is_file():
         return []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
+        if str(path.name).lower().endswith(".gz"):
+            import gzip
+            fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        else:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+        with fh as f:
             header = f.readline()
             if not header:
                 return []
@@ -181,7 +255,8 @@ def _extract_chromosomes_from_gwas(path: Path, *, max_lines: int | None = None) 
                 return []
             chrom_idx = 0
             for i, c in enumerate(cols):
-                if c.strip().lower() in _CHR_COL_CANDIDATES:
+                ck = _col_key(c)
+                if ck in _CHR_COL_CANDIDATES or ck.startswith("chr") or ("chrom" in ck):
                     chrom_idx = i
                     break
             out: list[str] = []
@@ -228,14 +303,19 @@ class WebUIState:
         self.db_path = resolve_db_path()
         self.anno_dir = self.db_path.parent / "anno"
         self.anno_dir.mkdir(parents=True, exist_ok=True)
+        self.gwas_upload_dir = self.db_path.parent / "uploaded" / "gwas"
+        self.gwas_upload_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._render_cache: dict[str, tuple[float, Any, dict[str, str]]] = {}
         self._chrom_cache: dict[str, tuple[float, list[str]]] = {}
         self._sig_cache: dict[str, dict[str, Any]] = {}
         self._history_error: str = ""
         self._startup_cleanup_report: dict[str, Any] = {
+            "db_scanned": 0,
             "scanned": 0,
             "removed": 0,
+            "pruned_runs": 0,
+            "pruned_summary_rows": 0,
             "removed_missing_genotype": 0,
             "removed_missing_result": 0,
             "error": "",
@@ -247,6 +327,29 @@ class WebUIState:
 
     def startup_cleanup_report(self) -> dict[str, Any]:
         return dict(self._startup_cleanup_report)
+
+    def _history_db_paths(self) -> list[Path]:
+        out: list[Path] = []
+        seen: set[str] = set()
+
+        def _add(p: Path) -> None:
+            try:
+                rp = p.expanduser().resolve()
+            except Exception:
+                rp = p.expanduser()
+            key = str(rp)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(rp)
+
+        env_home = str(os.environ.get("JX_HOME", "")).strip()
+        if env_home != "":
+            _add(Path(env_home) / "janusx_tasks.db")
+        _add(Path.home() / "JanusX" / ".janusx" / "janusx_tasks.db")
+        _add(Path.home() / ".janusx" / "janusx_tasks.db")
+        _add(self.db_path)
+        return out
 
     def _run_base_dirs(self, run_row: dict[str, Any]) -> list[Path]:
         bases: list[Path] = []
@@ -324,68 +427,217 @@ class WebUIState:
 
     def _cleanup_gwas_history_db_startup(self) -> dict[str, Any]:
         report: dict[str, Any] = {
+            "db_scanned": 0,
             "scanned": 0,
             "removed": 0,
+            "pruned_runs": 0,
+            "pruned_summary_rows": 0,
             "removed_missing_genotype": 0,
             "removed_missing_result": 0,
             "error": "",
         }
-        if not self.db_path.exists():
-            return report
-        conn = sqlite3.connect(str(self.db_path), timeout=30)
-        try:
-            rows = conn.execute(
-                """
-                SELECT run_id, genofile, genofile_kind, phenofile, outprefix, log_file,
-                       result_files_json, summary_json
-                FROM gwas_runs
-                """
-            ).fetchall()
-            for row in rows:
-                run_id = str(row[0] or "").strip()
-                if run_id == "":
+        db_paths = self._history_db_paths()
+        for db_path in db_paths:
+            if not db_path.exists():
+                continue
+            report["db_scanned"] = int(report["db_scanned"]) + 1
+            conn = sqlite3.connect(str(db_path), timeout=30)
+            try:
+                has_gwas = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gwas_runs' LIMIT 1"
+                ).fetchone()
+                if has_gwas is None:
                     continue
-                run_row: dict[str, Any] = {
-                    "run_id": run_id,
-                    "genofile": str(row[1] or ""),
-                    "genofile_kind": str(row[2] or ""),
-                    "phenofile": str(row[3] or ""),
-                    "outprefix": str(row[4] or ""),
-                    "log_file": str(row[5] or ""),
-                    "result_files": [],
-                    "summary_rows": [],
-                }
-                try:
-                    rf = json.loads(str(row[6] or "[]"))
-                    if isinstance(rf, list):
-                        run_row["result_files"] = rf
-                except Exception:
-                    pass
-                try:
-                    sr = json.loads(str(row[7] or "[]"))
-                    if isinstance(sr, list):
-                        run_row["summary_rows"] = sr
-                except Exception:
-                    pass
-                report["scanned"] = int(report["scanned"]) + 1
-                base_dirs = self._run_base_dirs(run_row)
-                missing_geno = not self._has_valid_genotype(run_row, base_dirs)
-                missing_result = not self._has_valid_result_file(run_row, base_dirs)
-                if not missing_geno and not missing_result:
-                    continue
-                conn.execute("DELETE FROM gwas_runs WHERE run_id = ?", (run_id,))
-                conn.execute(
-                    "DELETE FROM postgwas_runs WHERE run_id = ? OR history_id LIKE ?",
-                    (run_id, f"{run_id}|%"),
-                )
-                report["removed"] = int(report["removed"]) + 1
-                if missing_geno:
-                    report["removed_missing_genotype"] = int(report["removed_missing_genotype"]) + 1
-                if missing_result:
-                    report["removed_missing_result"] = int(report["removed_missing_result"]) + 1
-            conn.commit()
-        finally:
-            conn.close()
+                has_postgwas = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='postgwas_runs' LIMIT 1"
+                ).fetchone() is not None
+                rows = conn.execute(
+                    """
+                    SELECT run_id, genofile, genofile_kind, phenofile, outprefix, log_file,
+                           result_files_json, summary_json, args_json
+                    FROM gwas_runs
+                    """
+                ).fetchall()
+                for row in rows:
+                    run_id = str(row[0] or "").strip()
+                    if run_id == "":
+                        continue
+                    run_row: dict[str, Any] = {
+                        "run_id": run_id,
+                        "genofile": str(row[1] or ""),
+                        "genofile_kind": str(row[2] or ""),
+                        "phenofile": str(row[3] or ""),
+                        "outprefix": str(row[4] or ""),
+                        "log_file": str(row[5] or ""),
+                        "result_files": [],
+                        "summary_rows": [],
+                        "args": {},
+                    }
+                    try:
+                        rf = json.loads(str(row[6] or "[]"))
+                        if isinstance(rf, list):
+                            run_row["result_files"] = rf
+                    except Exception:
+                        pass
+                    try:
+                        sr = json.loads(str(row[7] or "[]"))
+                        if isinstance(sr, list):
+                            run_row["summary_rows"] = sr
+                    except Exception:
+                        pass
+                    try:
+                        aj = json.loads(str(row[8] or "{}"))
+                        if isinstance(aj, dict):
+                            run_row["args"] = aj
+                    except Exception:
+                        pass
+                    report["scanned"] = int(report["scanned"]) + 1
+                    repaired_genofile = False
+                    gfile0 = str(run_row.get("genofile", "")).strip()
+                    gkind0 = str(run_row.get("genofile_kind", "")).strip().lower()
+                    args0 = run_row.get("args", {})
+                    src0 = ""
+                    if isinstance(args0, dict):
+                        src0 = str(args0.get("source", "")).strip().lower()
+                    # Backward compatibility:
+                    # old `jx -load gwas` records wrote empty genofile and were
+                    # pruned by startup cleanup. Repair them in-place.
+                    if gfile0 == "" and src0 == "jx-load-gwas":
+                        cand = str(run_row.get("phenofile", "")).strip()
+                        if cand != "":
+                            run_row["genofile"] = cand
+                            run_row["genofile_kind"] = "tsv" if gkind0 == "" else gkind0
+                            repaired_genofile = True
+
+                    base_dirs = self._run_base_dirs(run_row)
+                    missing_geno = not self._has_valid_genotype(run_row, base_dirs)
+
+                    orig_result_files = run_row.get("result_files", [])
+                    orig_summary_rows = run_row.get("summary_rows", [])
+                    repaired_summary_rows: list[dict[str, Any]] = []
+                    repaired_pheno = False
+                    if isinstance(orig_summary_rows, list):
+                        for srow in orig_summary_rows:
+                            if not isinstance(srow, dict):
+                                continue
+                            new_row = dict(srow)
+                            old_pheno = str(new_row.get("phenotype", "")).strip()
+                            rf = str(new_row.get("result_file", "")).strip()
+                            if self._looks_temp_upload_phenotype(old_pheno):
+                                src_name = Path(rf).name if rf != "" else ""
+                                new_pheno = self._infer_phenotype_from_name(src_name)
+                                if new_pheno != "" and new_pheno != old_pheno:
+                                    new_row["phenotype"] = new_pheno
+                                    repaired_pheno = True
+                            repaired_summary_rows.append(new_row)
+                    if repaired_pheno:
+                        orig_summary_rows = repaired_summary_rows
+                        run_row["summary_rows"] = repaired_summary_rows
+                    valid_result_files: list[str] = []
+                    if isinstance(orig_result_files, list):
+                        for rf in orig_result_files:
+                            p = str(rf or "").strip()
+                            if p == "":
+                                continue
+                            if _resolve_existing_path(p, base_dirs) != "":
+                                valid_result_files.append(p)
+                    valid_summary_rows: list[dict[str, Any]] = []
+                    if isinstance(orig_summary_rows, list):
+                        for srow in orig_summary_rows:
+                            if not isinstance(srow, dict):
+                                continue
+                            rf = str(srow.get("result_file", "")).strip()
+                            if rf == "":
+                                continue
+                            if _resolve_existing_path(rf, base_dirs) != "":
+                                valid_summary_rows.append(dict(srow))
+                    removed_summary_n = max(
+                        0,
+                        (len(orig_summary_rows) if isinstance(orig_summary_rows, list) else 0)
+                        - len(valid_summary_rows),
+                    )
+                    has_any_result = (len(valid_summary_rows) > 0) or (len(valid_result_files) > 0)
+                    missing_result = not has_any_result
+
+                    if missing_geno or missing_result:
+                        conn.execute("DELETE FROM gwas_runs WHERE run_id = ?", (run_id,))
+                        if has_postgwas:
+                            conn.execute(
+                                "DELETE FROM postgwas_runs WHERE run_id = ? OR history_id LIKE ?",
+                                (run_id, f"{run_id}|%"),
+                            )
+                        report["removed"] = int(report["removed"]) + 1
+                        if missing_geno:
+                            report["removed_missing_genotype"] = int(report["removed_missing_genotype"]) + 1
+                        if missing_result:
+                            report["removed_missing_result"] = int(report["removed_missing_result"]) + 1
+                        continue
+
+                    pruned = False
+                    if isinstance(orig_result_files, list) and len(valid_result_files) != len(orig_result_files):
+                        pruned = True
+                    if isinstance(orig_summary_rows, list) and len(valid_summary_rows) != len(orig_summary_rows):
+                        pruned = True
+                    if pruned:
+                        if repaired_genofile:
+                            conn.execute(
+                                "UPDATE gwas_runs SET genofile = ?, genofile_kind = ?, result_files_json = ?, summary_json = ? WHERE run_id = ?",
+                                (
+                                    str(run_row.get("genofile", "")),
+                                    str(run_row.get("genofile_kind", "")),
+                                    json.dumps(valid_result_files, ensure_ascii=False),
+                                    json.dumps(valid_summary_rows, ensure_ascii=False),
+                                    run_id,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE gwas_runs SET result_files_json = ?, summary_json = ? WHERE run_id = ?",
+                                (
+                                    json.dumps(valid_result_files, ensure_ascii=False),
+                                    json.dumps(valid_summary_rows, ensure_ascii=False),
+                                    run_id,
+                                ),
+                            )
+                        if has_postgwas:
+                            # history_id is run_id|idx; summary-row reindex would stale old mappings.
+                            conn.execute(
+                                "DELETE FROM postgwas_runs WHERE run_id = ? OR history_id LIKE ?",
+                                (run_id, f"{run_id}|%"),
+                            )
+                        report["pruned_runs"] = int(report["pruned_runs"]) + 1
+                        report["pruned_summary_rows"] = int(report["pruned_summary_rows"]) + int(removed_summary_n)
+                    elif repaired_pheno or repaired_genofile:
+                        if repaired_pheno and repaired_genofile:
+                            conn.execute(
+                                "UPDATE gwas_runs SET genofile = ?, genofile_kind = ?, summary_json = ? WHERE run_id = ?",
+                                (
+                                    str(run_row.get("genofile", "")),
+                                    str(run_row.get("genofile_kind", "")),
+                                    json.dumps(valid_summary_rows, ensure_ascii=False),
+                                    run_id,
+                                ),
+                            )
+                        elif repaired_genofile:
+                            conn.execute(
+                                "UPDATE gwas_runs SET genofile = ?, genofile_kind = ? WHERE run_id = ?",
+                                (
+                                    str(run_row.get("genofile", "")),
+                                    str(run_row.get("genofile_kind", "")),
+                                    run_id,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE gwas_runs SET summary_json = ? WHERE run_id = ?",
+                                (
+                                    json.dumps(valid_summary_rows, ensure_ascii=False),
+                                    run_id,
+                                ),
+                            )
+                conn.commit()
+            finally:
+                conn.close()
         return report
 
     def list_anno_files(self) -> list[dict[str, Any]]:
@@ -406,6 +658,226 @@ class WebUIState:
                 }
             )
         return out
+
+    @staticmethod
+    def _safe_upload_filename(name: str) -> str:
+        raw = str(name or "").strip().replace("\\", "/").split("/")[-1]
+        out = []
+        for ch in raw:
+            if ch.isalnum() or ch in ("-", "_", "."):
+                out.append(ch)
+            elif ch in (" ",):
+                out.append("_")
+        s = "".join(out).strip("._")
+        if s == "":
+            return "uploaded_gwas.tsv"
+        # Windows reserved device names
+        p = Path(s)
+        stem = p.stem.strip(" .")
+        suffix = p.suffix
+        reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        }
+        if stem.upper() in reserved:
+            stem = f"_{stem}"
+        # Keep filename reasonably short for portability.
+        if len(stem) > 80:
+            stem = stem[:80]
+        s = f"{stem}{suffix}" if suffix else stem
+        if s == "":
+            return "uploaded_gwas.tsv"
+        return s
+
+    def _upload_storage_path(self, original_name: str, idx: int) -> Path:
+        safe = self._safe_upload_filename(original_name)
+        low = safe.lower()
+        ext = ".tsv"
+        if low.endswith(".vcf.gz"):
+            ext = ".vcf.gz"
+        elif low.endswith(".tsv.gz"):
+            ext = ".tsv.gz"
+        elif low.endswith(".txt.gz"):
+            ext = ".txt.gz"
+        else:
+            p = Path(safe)
+            if p.suffix:
+                ext = p.suffix
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"{stamp}-{int(idx):03d}-{uuid.uuid4().hex[:10]}{ext}"
+        return self.gwas_upload_dir / name
+
+    @staticmethod
+    def _infer_model_from_name(name: str) -> str:
+        low = str(name or "").lower()
+        if low.endswith(".lmm.tsv") or ".lmm." in low:
+            return "LMM"
+        if low.endswith(".farmcpu.tsv") or ".farmcpu." in low:
+            return "FarmCPU"
+        if low.endswith(".lm.tsv") or ".lm." in low:
+            return "LM"
+        return "LMM"
+
+    @staticmethod
+    def _infer_phenotype_from_name(name: str) -> str:
+        raw = str(name or "").strip()
+        if raw == "":
+            return "phenotype"
+        base = Path(raw).name
+        low = base.lower()
+        for ext in (".tsv.gz", ".txt.gz", ".csv.gz", ".vcf.gz"):
+            if low.endswith(ext):
+                base = base[: -len(ext)]
+                low = base.lower()
+                break
+        for ext in (".tsv", ".txt", ".csv", ".vcf", ".gz"):
+            if low.endswith(ext):
+                base = base[: -len(ext)]
+                low = base.lower()
+                break
+        parts = [p for p in base.split(".") if str(p).strip() != ""]
+        if len(parts) == 0:
+            return "phenotype"
+        assoc_tail = {"lmm", "lm", "farmcpu"}
+        genetic_tail = {"add", "dom", "rec", "het"}
+        while len(parts) > 0 and parts[-1].lower() in assoc_tail:
+            parts.pop()
+        while len(parts) > 0 and parts[-1].lower() in genetic_tail:
+            parts.pop()
+        if len(parts) == 0:
+            return Path(raw).stem
+        if len(parts) >= 3:
+            cand = ".".join(parts[1:]).strip()
+            if cand != "":
+                return cand
+        return ".".join(parts).strip() or "phenotype"
+
+    @staticmethod
+    def _looks_temp_upload_phenotype(name: str) -> bool:
+        txt = str(name or "").strip()
+        if txt == "":
+            return False
+        # Legacy upload filename pattern: YYYYMMDD-HHMMSS-<idx>-<hex>
+        return re.fullmatch(r"\d{8}-\d{6}-\d{3}-[0-9a-fA-F]{8,16}", txt) is not None
+
+    def _resolve_upload_genofile(self, genofile: str, genofile_kind: str, *, base: Path) -> tuple[str, str]:
+        gtxt = str(genofile or "").strip()
+        ktxt = str(genofile_kind or "").strip().lower()
+        base_dirs = [Path.cwd(), self.root_dir, self.db_path.parent, base]
+        if gtxt == "":
+            try:
+                return str(base.expanduser().absolute()), "tsv"
+            except Exception:
+                return str(base), "tsv"
+        if ktxt == "bfile":
+            rp = self._resolve_bfile_prefix(gtxt, base_dirs)
+            if rp == "":
+                raise ValueError(f"PLINK prefix not found or incomplete: {gtxt} (.bed/.bim/.fam required)")
+            return rp, "bfile"
+        rp = _resolve_existing_path(gtxt, base_dirs)
+        if rp == "":
+            raise ValueError(f"genofile not found: {gtxt}")
+        low = str(rp).lower()
+        if low.endswith(".vcf") or low.endswith(".vcf.gz"):
+            return rp, "vcf"
+        return rp, "tsv"
+
+    def register_uploaded_gwas(
+        self,
+        *,
+        file_path: Path,
+        original_name: str = "",
+        phenotype: str = "",
+        model: str = "",
+        genofile: str = "",
+        genofile_kind: str = "",
+    ) -> dict[str, Any]:
+        p0 = Path(file_path).expanduser()
+        try:
+            p = p0.absolute()
+        except Exception:
+            p = p0
+        if (not p.exists()) or (not p.is_file()):
+            raise ValueError(f"uploaded file not found: {p}")
+        try:
+            det = detect_gwas_columns(p)
+        except Exception as exc:
+            raise RuntimeError(f"detect-columns failed for {p.name}: {exc}") from exc
+        pheno = str(phenotype or "").strip()
+        if pheno == "":
+            pheno = self._infer_phenotype_from_name(str(original_name or p.name))
+        mdl = str(model or "").strip()
+        if mdl == "":
+            mdl = self._infer_model_from_name(str(original_name or p.name))
+        try:
+            gpath, gkind = self._resolve_upload_genofile(genofile, genofile_kind, base=p.parent)
+        except Exception as exc:
+            raise RuntimeError(f"resolve-genofile failed: {exc}") from exc
+
+        run_id = f"webui-upload-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        uploads_dir = self.root_dir / "uploads"
+        try:
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            outprefix = str((uploads_dir / p.stem).absolute())
+        except Exception:
+            outprefix = str(uploads_dir / p.stem)
+        try:
+            log_file = str((uploads_dir / f"{p.stem}.log").absolute())
+        except Exception:
+            log_file = str(uploads_dir / f"{p.stem}.log")
+        summary_rows = [
+            {
+                "phenotype": pheno,
+                "model": mdl,
+                "pheno_col_idx": -1,
+                "result_file": str(p),
+                "nidv": 0,
+                "eff_snp": int(det.get("n_rows", 0) or 0),
+            }
+        ]
+        args_data = {
+            "model": "upload",
+            "source": "webui-upload",
+            "detected_columns": {
+                "chr": str(det.get("chr", "")),
+                "pos": str(det.get("pos", "")),
+                "pvalue": str(det.get("pvalue", "")),
+            },
+        }
+        try:
+            record_gwas_run(
+                run_id=run_id,
+                status="completed",
+                genofile=str(gpath),
+                genofile_kind=str(gkind),
+                phenofile=str(p),
+                outprefix=outprefix,
+                log_file=log_file,
+                result_files=[str(p)],
+                summary_rows=summary_rows,
+                args_data=args_data,
+                error_text="",
+                created_at=_now_str(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"record-db failed: {exc}") from exc
+        return {
+            "run_id": run_id,
+            "history_id": f"{run_id}|0",
+            "path": str(p),
+            "file_name": str(p.name),
+            "detected": {
+                "chr": str(det.get("chr", "")),
+                "pos": str(det.get("pos", "")),
+                "pvalue": str(det.get("pvalue", "")),
+            },
+            "n_rows": int(det.get("n_rows", 0) or 0),
+            "n_chrom": int(det.get("n_chrom", 0) or 0),
+        }
 
     def _job_dir(self, job_id: str) -> Path:
         return (self.jobs_dir / job_id).resolve()
@@ -519,6 +991,7 @@ class WebUIState:
         full: bool = False,
         manh_ratio: Any = 2.0,
         manh_palette: str = "auto",
+        manh_alpha: Any = 0.7,
         manh_marker: str = "o",
         manh_size: Any = 16.0,
         ld_color: str = "#4b5563",
@@ -538,6 +1011,7 @@ class WebUIState:
                 full_plot=bool(full),
                 manh_ratio=manh_ratio,
                 manh_palette=str(manh_palette or "auto"),
+                manh_alpha=manh_alpha,
                 manh_marker=str(manh_marker or "o"),
                 manh_size=manh_size,
                 ld_color=str(ld_color or "").strip(),
@@ -554,8 +1028,10 @@ class WebUIState:
         bimrange: Any = "",
         manh_ratio: Any = 2.0,
         manh_palette: str = "auto",
+        manh_alpha: Any = 0.7,
         manh_marker: str = "o",
         manh_size: Any = 16.0,
+        series_styles: Any = None,
         ld_color: str = "#4b5563",
         ld_p_threshold: Any = "auto",
         render_qq: bool = True,
@@ -571,8 +1047,10 @@ class WebUIState:
                 bimrange_text=bimrange,
                 manh_ratio=manh_ratio,
                 manh_palette=str(manh_palette or "auto"),
+                manh_alpha=manh_alpha,
                 manh_marker=str(manh_marker or "o"),
                 manh_size=manh_size,
+                series_styles=series_styles,
                 ld_color=str(ld_color or "").strip(),
                 ld_p_threshold=ld_p_threshold,
                 render_qq=bool(render_qq),
@@ -584,7 +1062,7 @@ class WebUIState:
         return svg, info
 
     def _resolve_history_result_path(self, row: dict[str, Any]) -> str:
-        base_dirs = [Path.cwd(), self.root_dir, self.db_path.parent]
+        base_dirs = self._run_base_dirs(row)
         row_result = str(row.get("result_file", "")).strip()
         if row_result:
             rp = _resolve_existing_path(row_result, base_dirs)
@@ -626,10 +1104,8 @@ class WebUIState:
         self,
         history_id: str,
         *,
-        threshold: Any = 1e-6,
+        threshold: Any = "auto",
         anno_file: str = "",
-        ld_window_kb: Any = 50,
-        ld_r2: Any = 0.6,
         search: str = "",
         limit: int = 2000,
     ) -> dict[str, Any]:
@@ -652,28 +1128,9 @@ class WebUIState:
         try:
             thr = float(threshold)
         except Exception:
-            thr = 1e-6
-        if not (thr > 0.0):
-            thr = 1e-6
-        if thr > 1.0:
-            thr = 1.0
-        try:
-            win_kb = float(ld_window_kb)
-        except Exception:
-            win_kb = 50.0
-        if not np.isfinite(win_kb) or win_kb <= 0.0:
-            win_kb = 50.0
-        window_bp = int(round(win_kb * 1000.0))
-        if window_bp < 1:
-            window_bp = 1
-
-        try:
-            r2_thr = float(ld_r2)
-        except Exception:
-            r2_thr = 0.6
-        if not np.isfinite(r2_thr):
-            r2_thr = 0.6
-        r2_thr = float(np.clip(r2_thr, 0.0, 1.0))
+            thr = float("nan")
+        if not np.isfinite(thr):
+            thr = float("nan")
 
         anno_txt = str(anno_file or "").strip()
         anno_tag = ""
@@ -688,8 +1145,7 @@ class WebUIState:
             anno_tag = f"|anno={arp}|anno_m={am:.6f}"
 
         cache_key = (
-            f"{history_id}|{rp}|{mtime:.6f}|thr={thr:.3e}"
-            f"|wkb={win_kb:.6f}|r2={r2_thr:.6f}{anno_tag}"
+            f"{history_id}|{rp}|{mtime:.6f}|thr={thr:.3e}{anno_tag}"
         )
         with self._lock:
             cached = self._sig_cache.get(cache_key)
@@ -697,9 +1153,8 @@ class WebUIState:
             sig = build_sig_table(
                 row,
                 threshold=thr,
-                window_bp=window_bp,
-                r2_thr=r2_thr,
                 anno_file=anno_txt,
+                annotate_rows=False,
             )
             with self._lock:
                 self._sig_cache[cache_key] = dict(sig)
@@ -711,26 +1166,43 @@ class WebUIState:
         if not isinstance(rows_raw, list):
             rows_raw = []
         rows = list(rows_raw)
+
+        def _p_rank_key(r: dict[str, Any]) -> tuple[float, str, int]:
+            try:
+                p = float(r.get("p", np.nan))
+            except Exception:
+                p = np.nan
+            if (not np.isfinite(p)) or p <= 0.0:
+                p = float("inf")
+            chrom = str(r.get("chrom", ""))
+            try:
+                pos = int(r.get("pos", 0))
+            except Exception:
+                pos = 0
+            return (p, chrom, pos)
+
         q = str(search or "").strip().lower()
         if q:
+            if anno_txt != "":
+                annotate_sig_rows_with_genes(rows, anno_txt)
+
             def _hit(r: dict[str, Any]) -> bool:
                 txt = " ".join(
                     [
                         str(r.get("chrom", "")),
                         str(r.get("pos", "")),
                         str(r.get("p", "")),
-                        str(r.get("start", "")),
-                        str(r.get("end", "")),
-                        str(r.get("LDclump", "")),
                         str(r.get("Gene", "")),
                     ]
                 ).lower()
                 return q in txt
 
             rows = [r for r in rows if _hit(r)]
-
-        lim = int(max(1, limit))
-        rows = rows[:lim]
+        else:
+            # Default UI view: only show top 100 significant sites.
+            rows = sorted(rows, key=_p_rank_key)[:100]
+            if anno_txt != "":
+                annotate_sig_rows_with_genes(rows, anno_txt)
         return {
             "history_id": str(history_id),
             "threshold": float(data.get("threshold", thr)),
@@ -744,10 +1216,8 @@ class WebUIState:
         self,
         history_ids: list[str],
         *,
-        threshold: Any = 1e-6,
+        threshold: Any = "auto",
         anno_file: str = "",
-        ld_window_kb: Any = 50,
-        ld_r2: Any = 0.6,
         search: str = "",
         limit: int = 2000,
     ) -> dict[str, Any]:
@@ -768,29 +1238,9 @@ class WebUIState:
         try:
             thr = float(threshold)
         except Exception:
-            thr = 1e-6
-        if not (thr > 0.0):
-            thr = 1e-6
-        if thr > 1.0:
-            thr = 1.0
-
-        try:
-            win_kb = float(ld_window_kb)
-        except Exception:
-            win_kb = 50.0
-        if not np.isfinite(win_kb) or win_kb <= 0.0:
-            win_kb = 50.0
-        window_bp = int(round(win_kb * 1000.0))
-        if window_bp < 1:
-            window_bp = 1
-
-        try:
-            r2_thr = float(ld_r2)
-        except Exception:
-            r2_thr = 0.6
-        if not np.isfinite(r2_thr):
-            r2_thr = 0.6
-        r2_thr = float(np.clip(r2_thr, 0.0, 1.0))
+            thr = float("nan")
+        if not np.isfinite(thr):
+            thr = float("nan")
 
         # Cache key depends on all selected result files + params.
         path_tokens: list[str] = []
@@ -823,7 +1273,7 @@ class WebUIState:
         cache_key = (
             "merge|"
             + "|".join(path_tokens)
-            + f"|thr={thr:.3e}|wkb={win_kb:.6f}|r2={r2_thr:.6f}{anno_tag}"
+            + f"|thr={thr:.3e}{anno_tag}"
         )
         with self._lock:
             cached = self._sig_cache.get(cache_key)
@@ -831,9 +1281,8 @@ class WebUIState:
             sig = build_merged_sig_table(
                 rows,
                 threshold=thr,
-                window_bp=window_bp,
-                r2_thr=r2_thr,
                 anno_file=anno_txt,
+                annotate_rows=False,
             )
             with self._lock:
                 self._sig_cache[cache_key] = dict(sig)
@@ -845,26 +1294,43 @@ class WebUIState:
         if not isinstance(rows_raw, list):
             rows_raw = []
         out_rows = list(rows_raw)
+
+        def _p_rank_key(r: dict[str, Any]) -> tuple[float, str, int]:
+            try:
+                p = float(r.get("p", np.nan))
+            except Exception:
+                p = np.nan
+            if (not np.isfinite(p)) or p <= 0.0:
+                p = float("inf")
+            chrom = str(r.get("chrom", ""))
+            try:
+                pos = int(r.get("pos", 0))
+            except Exception:
+                pos = 0
+            return (p, chrom, pos)
+
         q = str(search or "").strip().lower()
         if q:
+            if anno_txt != "":
+                annotate_sig_rows_with_genes(out_rows, anno_txt)
+
             def _hit(r: dict[str, Any]) -> bool:
                 txt = " ".join(
                     [
                         str(r.get("chrom", "")),
                         str(r.get("pos", "")),
                         str(r.get("p", "")),
-                        str(r.get("start", "")),
-                        str(r.get("end", "")),
-                        str(r.get("LDclump", "")),
                         str(r.get("Gene", "")),
                     ]
                 ).lower()
                 return q in txt
 
             out_rows = [r for r in out_rows if _hit(r)]
-
-        lim = int(max(1, limit))
-        out_rows = out_rows[:lim]
+        else:
+            # Default UI view: only show top 100 significant sites.
+            out_rows = sorted(out_rows, key=_p_rank_key)[:100]
+            if anno_txt != "":
+                annotate_sig_rows_with_genes(out_rows, anno_txt)
         return {
             "history_ids": ids,
             "threshold": float(data.get("threshold", thr)),
@@ -1471,6 +1937,17 @@ def _html_page() -> str:
     .anno-card { margin-top:10px; border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; }
     .anno-card h2 { margin:0 0 6px; font-size:13px; }
     .ctrl-actions { margin-top:auto; justify-content:flex-end; align-items:flex-end; gap:8px; margin-bottom:0; }
+    .style-scroll {
+      margin-top:2px;
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:6px;
+      max-height:160px;
+      min-height:52px;
+      overflow-y:auto;
+      overflow-x:hidden;
+      background:#fff;
+    }
     .action-btn { background:#334155 !important; color:#fff !important; border:0; width:auto; min-width:96px; font-weight:600; font-size:13px; letter-spacing:0; }
     .search-box { position:relative; flex:3 1 50%; width:50%; }
     .search-box .search-icon {
@@ -1496,6 +1973,11 @@ def _html_page() -> str:
       <div class="card left-card">
         <div class="left-top">
           <h2>GWAS History</h2>
+          <div class="toolbar" style="margin-bottom:6px;">
+            <input id="gwas_upload_file" type="file" multiple style="flex:1 1 auto;" />
+            <button id="gwas_upload_btn" class="action-btn" style="min-width:110px;">Upload GWAS</button>
+          </div>
+          <div id="upload_msg" class="muted" style="margin-bottom:6px;"></div>
           <input id="search_box" autocomplete="off" placeholder="fuzzy search genotype/phenotype/model/type/grm/qcov/cov/date"/>
           <div id="history_msg" class="muted" style="margin-top:6px;">history loading...</div>
           <div class="history-wrap">
@@ -1518,19 +2000,17 @@ def _html_page() -> str:
         </div>
         <div class="left-bottom">
           <div class="toolbar" style="margin-bottom:4px; gap:6px;">
-            <input id="sig_thr" value="1e-6" title="P threshold" placeholder="threshold" style="flex:1 1 16.6667%; width:16.6667%;"/>
-            <input id="sig_ld_window_kb" value="50" placeholder="LD kb" title="LD clump window size (kb)" style="flex:1 1 16.6667%; width:16.6667%;"/>
-            <input id="sig_ld_r2" value="0.6" placeholder="r2" title="LD clump r2 threshold" style="flex:1 1 16.6667%; width:16.6667%;"/>
+            <input id="sig_thr" value="auto" title="P threshold (auto≈100k)" placeholder="auto" style="flex:1 1 25%; width:25%;"/>
             <div class="search-box">
               <span class="search-icon">🔍</span>
-              <input id="sig_search" placeholder="search site (chr/pos/ldclump)"/>
+              <input id="sig_search" placeholder="search all sites (chr/pos/gene)"/>
             </div>
           </div>
           <div class="sig-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Chr</th><th>Pos</th><th>-log10P</th><th>Start</th><th>End</th><th>Gene</th><th>nSNP</th><th>MeanR2</th><th>LDclump</th>
+                  <th>Chr</th><th>Pos</th><th>-log10P</th><th>Gene</th>
                 </tr>
               </thead>
               <tbody id="sig_tbody"></tbody>
@@ -1559,27 +2039,17 @@ def _html_page() -> str:
         </div>
         <div class="ctrl-pane">
           <h2 style="margin-top:0;">Realtime Parameters</h2>
-          <div class="toolbar" style="margin-top:2px; gap:4px; align-items:center;">
-            <input id="manh_ratio" type="text" value="2" title="Manhattan ratio (W/H)" placeholder="ratio" style="flex:0 0 54px; width:54px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"/>
-            <select id="manh_palette" title="Palette" style="flex:0 0 92px;">
-              <option value="auto" selected>auto</option>
-              <option value="tab10">tab10</option>
-              <option value="tab20">tab20</option>
-            </select>
-            <select id="manh_marker" title="Marker" style="flex:0 0 66px;">
-              <option value="o">o</option>
-              <option value=".">.</option>
-              <option value="s">s</option>
-              <option value="^">^</option>
-              <option value="v">v</option>
-              <option value="D">D</option>
-              <option value="x">x</option>
-              <option value="+">+</option>
-              <option value="*">*</option>
-            </select>
-            <input id="manh_size" type="text" value="16" title="Scatter size" placeholder="size" style="flex:0 0 54px; width:54px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"/>
-          </div>
-          <div class="toolbar" style="margin-top:2px; gap:4px; align-items:center;">
+          <div class="toolbar" style="margin-top:2px; gap:2px; align-items:center; flex-wrap:wrap;">
+            <span class="muted" style="flex:0 0 auto; margin-right:2px;">global</span>
+            <span class="muted" style="flex:0 0 auto; margin-right:2px;">ratio</span>
+            <input
+              id="manh_ratio"
+              type="text"
+              value="2"
+              title="Manhattan width/height ratio"
+              placeholder="2"
+              style="flex:0 0 72px; width:72px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"
+            />
             <select id="bim_chr1" style="flex:1 1 8%;">
               <option value="1">1</option>
             </select>
@@ -1607,6 +2077,9 @@ def _html_page() -> str:
               title="LD/Gene color"
               style="flex:0 0 34px; width:34px; height:34px; padding:0; border:1px solid #334155; border-radius:6px; background:#0f172a;"
             />
+          </div>
+          <div class="style-scroll">
+            <div id="series_style_rows" style="display:flex; flex-direction:column; gap:4px;"></div>
           </div>
           <div id="bim_msg" class="muted"></div>
           <div class="toolbar ctrl-actions">
@@ -1656,7 +2129,11 @@ def _html_page() -> str:
     let pollTimer = null;
     let sigTimer = null;
     let startBtnSpinTimer = null;
+    let styleRefreshTimer = null;
+    let seriesStyleMap = {};
     const SPIN_FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+    const STYLE_DEFAULT_COLORS = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"];
+    const STYLE_MARKERS = ["o",".","s","^","v","D","x","+","*"];
     const viewer = { scale: 1.0, tx: 0.0, ty: 0.0, dragging: false, dragEnabled: true, x: 0.0, y: 0.0 };
     function _stopStartBtnSpin() {
       if (startBtnSpinTimer) {
@@ -1767,6 +2244,7 @@ def _html_page() -> str:
       _markStartInvalidated();
       _syncPrimarySelection();
       renderHistoryTable();
+      renderSeriesStyleRows();
       loadChromOptionsForSelection();
       const preview = document.getElementById("img_preview");
       if (_isMergeMode()) {
@@ -1781,6 +2259,214 @@ def _html_page() -> str:
       renderSigTable([]);
     }
 
+    function _rowByHistoryId(hid) {
+      const key = String(hid || "").trim();
+      if (key === "") return null;
+      return gwasRows.find((r) => String(r.history_id || "") === key) || null;
+    }
+
+    function _currentStyleHistoryIds() {
+      if (_isMergeMode()) {
+        return (Array.isArray(selectedHistoryIds) ? selectedHistoryIds : [])
+          .map((x) => String(x || "").trim())
+          .filter((x) => x !== "");
+      }
+      const hid = String(selectedHistoryId || "").trim();
+      return hid ? [hid] : [];
+    }
+
+    function _defaultStyleByIndex(idx) {
+      return {
+        color: STYLE_DEFAULT_COLORS[idx % STYLE_DEFAULT_COLORS.length],
+        alpha: 0.7,
+        marker: "o",
+        size: 16,
+      };
+    }
+
+    function _ensureStyleFor(hid, idx) {
+      const key = String(hid || "").trim();
+      if (key === "") return _defaultStyleByIndex(idx);
+      if (!seriesStyleMap[key]) {
+        seriesStyleMap[key] = _defaultStyleByIndex(idx);
+      }
+      const st = seriesStyleMap[key] || {};
+      const sizeNum = Number(st.size);
+      return {
+        color: String(st.color || _defaultStyleByIndex(idx).color),
+        alpha: Number.isFinite(Number(st.alpha)) ? Math.max(0, Math.min(1, Number(st.alpha))) : 0.7,
+        marker: String(st.marker || "o"),
+        size: Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : 16,
+      };
+    }
+
+    function _collectSeriesStyles() {
+      const ids = _currentStyleHistoryIds();
+      return ids.map((hid, idx) => {
+        const st = _ensureStyleFor(hid, idx);
+        return {
+          history_id: String(hid),
+          index: Number(idx),
+          color: String(st.color || ""),
+          alpha: Number.isFinite(Number(st.alpha)) ? Math.max(0, Math.min(1, Number(st.alpha))) : 0.7,
+          marker: String(st.marker || "o"),
+          size: Number(st.size || 16),
+        };
+      });
+    }
+
+    function _readManhRatio() {
+      const el = document.getElementById("manh_ratio");
+      const raw = el ? String(el.value || "").trim() : "";
+      const v = Number(raw);
+      if (!Number.isFinite(v) || v <= 0) {
+        if (el) el.value = "2";
+        return "2";
+      }
+      const out = String(v);
+      if (el) el.value = out;
+      return out;
+    }
+
+    function _styleLabelFor(hid, idx) {
+      const row = _rowByHistoryId(hid);
+      const base = `gwas${idx + 1}`;
+      if (!row) return base;
+      const ph = String(row.phenotype || "").trim();
+      return ph ? `${base}: ${ph}` : base;
+    }
+
+    function _triggerStyleRefresh() {
+      if (!_isStartedForCurrent()) return;
+      if (styleRefreshTimer) clearTimeout(styleRefreshTimer);
+      styleRefreshTimer = setTimeout(() => {
+        refreshAllByHistory(selectedHistoryId).catch((e) => {
+          _setText("bim_msg", String(e));
+        });
+      }, 150);
+    }
+
+    function renderSeriesStyleRows() {
+      const box = document.getElementById("series_style_rows");
+      if (!box) return;
+      const ids = _currentStyleHistoryIds();
+      box.innerHTML = "";
+      if (ids.length === 0) {
+        box.innerHTML = '<div class="muted">Select GWAS task(s) to adjust style.</div>';
+        return;
+      }
+      ids.forEach((hid, idx) => {
+        const st = _ensureStyleFor(hid, idx);
+        const row = document.createElement("div");
+        row.className = "toolbar";
+        row.style.gap = "6px";
+        row.style.alignItems = "center";
+        row.style.marginTop = "0";
+
+        const lab = document.createElement("span");
+        lab.className = "muted";
+        lab.style.flex = "0 0 190px";
+        lab.style.width = "190px";
+        lab.textContent = _styleLabelFor(hid, idx);
+        row.appendChild(lab);
+
+        const c = document.createElement("input");
+        c.type = "color";
+        c.value = String(st.color || "#1f77b4");
+        c.title = "Color";
+        c.style.flex = "0 0 34px";
+        c.style.width = "34px";
+        c.style.height = "34px";
+        c.style.padding = "0";
+        c.style.border = "1px solid #334155";
+        c.style.borderRadius = "6px";
+        c.style.background = "#0f172a";
+        c.addEventListener("input", () => {
+          const cur = _ensureStyleFor(hid, idx);
+          cur.color = String(c.value || cur.color || "#1f77b4");
+          seriesStyleMap[String(hid)] = cur;
+          _triggerStyleRefresh();
+        });
+        row.appendChild(c);
+
+        const a = document.createElement("input");
+        a.type = "text";
+        a.value = String(
+          Number.isFinite(Number(st.alpha)) ? Math.max(0, Math.min(1, Number(st.alpha))) : 0.7
+        );
+        a.placeholder = "alpha";
+        a.title = "Alpha (0-1)";
+        a.style.flex = "0 0 62px";
+        a.style.width = "62px";
+        a.style.height = "34px";
+        a.style.padding = "4px 6px";
+        a.style.border = "1px solid #334155";
+        a.style.borderRadius = "6px";
+        a.style.background = "#0f172a";
+        a.style.color = "#e2e8f0";
+        const _commitAlpha = () => {
+          const cur = _ensureStyleFor(hid, idx);
+          const v = Number(a.value);
+          cur.alpha = (Number.isFinite(v)) ? Math.max(0, Math.min(1, v)) : 0.7;
+          a.value = String(cur.alpha);
+          seriesStyleMap[String(hid)] = cur;
+          _triggerStyleRefresh();
+        };
+        a.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") _commitAlpha();
+        });
+        a.addEventListener("blur", _commitAlpha);
+        row.appendChild(a);
+
+        const mk = document.createElement("select");
+        mk.title = "Marker";
+        mk.style.flex = "0 0 66px";
+        STYLE_MARKERS.forEach((m) => {
+          const op = document.createElement("option");
+          op.value = m;
+          op.textContent = m;
+          if (String(st.marker || "o") === m) op.selected = true;
+          mk.appendChild(op);
+        });
+        mk.addEventListener("change", () => {
+          const cur = _ensureStyleFor(hid, idx);
+          cur.marker = String(mk.value || "o");
+          seriesStyleMap[String(hid)] = cur;
+          _triggerStyleRefresh();
+        });
+        row.appendChild(mk);
+
+        const sz = document.createElement("input");
+        sz.type = "text";
+        sz.value = String(st.size || 16);
+        sz.placeholder = "size";
+        sz.title = "Marker size";
+        sz.style.flex = "0 0 64px";
+        sz.style.width = "64px";
+        sz.style.height = "34px";
+        sz.style.padding = "4px 6px";
+        sz.style.border = "1px solid #334155";
+        sz.style.borderRadius = "6px";
+        sz.style.background = "#0f172a";
+        sz.style.color = "#e2e8f0";
+        const _commitSize = () => {
+          const cur = _ensureStyleFor(hid, idx);
+          const v = Number(sz.value);
+          cur.size = (Number.isFinite(v) && v > 0) ? v : 16;
+          sz.value = String(cur.size);
+          seriesStyleMap[String(hid)] = cur;
+          _triggerStyleRefresh();
+        };
+        sz.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") _commitSize();
+        });
+        sz.addEventListener("blur", _commitSize);
+        row.appendChild(sz);
+
+        box.appendChild(row);
+      });
+    }
+
     function esc(s) {
       return String(s)
         .replace(/&/g, "&amp;")
@@ -1793,6 +2479,30 @@ def _html_page() -> str:
         init.headers["Content-Type"] = "application/json";
         init.body = JSON.stringify(body);
       }
+      let timer = null;
+      let ctl = null;
+      if (Number(timeoutMs) > 0 && typeof AbortController !== "undefined") {
+        ctl = new AbortController();
+        init.signal = ctl.signal;
+        timer = setTimeout(() => {
+          try { ctl.abort(); } catch (_e) {}
+        }, Number(timeoutMs));
+      }
+      let r = null;
+      try {
+        r = await fetch(path, init);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const t = await r.text();
+      let j = {};
+      try { j = JSON.parse(t || "{}"); } catch (_e) { j = {error: t}; }
+      if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+      return j;
+    }
+
+    async function apiForm(path, formData, timeoutMs=0) {
+      const init = { method: "POST", body: formData };
       let timer = null;
       let ctl = null;
       if (Number(timeoutMs) > 0 && typeof AbortController !== "undefined") {
@@ -2244,10 +2954,9 @@ def _html_page() -> str:
         }
         const thisRange = {
           chrom: String(r.chrom || ""),
-          start: _toInt(r.start),
-          end: _toInt(r.end),
+          start: _toInt(r.pos),
+          end: _toInt(r.pos),
           logp: Number.isFinite(logp) ? Number(logp) : null,
-          ldclump: String(r.LDclump || ""),
         };
         if (_sameSigRange(selectedSigRange, thisRange)) {
           tr.className = "sel";
@@ -2255,8 +2964,7 @@ def _html_page() -> str:
         }
         tr.style.cursor = "pointer";
         const ptxt = Number.isFinite(logp) ? logp.toFixed(3) : "";
-        const mtxt = Number.isFinite(Number(r.MeanR2)) ? Number(r.MeanR2).toFixed(2) : String(r.MeanR2 || "");
-        tr.innerHTML = `<td>${esc(r.chrom || "")}</td><td>${esc(r.pos || "")}</td><td>${esc(ptxt)}</td><td>${esc(r.start || "")}</td><td>${esc(r.end || "")}</td><td>${esc(r.Gene || "")}</td><td>${esc(r.nsnps || "")}</td><td>${esc(mtxt)}</td><td>${esc(r.LDclump || "")}</td>`;
+        tr.innerHTML = `<td>${esc(r.chrom || "")}</td><td>${esc(r.pos || "")}</td><td>${esc(ptxt)}</td><td>${esc(r.Gene || "")}</td>`;
         tr.onclick = () => {
           if (_sameSigRange(selectedSigRange, thisRange)) {
             selectedSigRange = null;
@@ -2278,13 +2986,9 @@ def _html_page() -> str:
       const copyBtn = document.getElementById("sig_copy_btn");
       const _sigThrEl = document.getElementById("sig_thr");
       const _sigSearchEl = document.getElementById("sig_search");
-      const _sigLdkbEl = document.getElementById("sig_ld_window_kb");
-      const _sigLdr2El = document.getElementById("sig_ld_r2");
       const _annoSelEl = document.getElementById("anno_sel");
-      const thr = String((_sigThrEl ? _sigThrEl.value : "") || "1e-6").trim();
+      const thr = String((_sigThrEl ? _sigThrEl.value : "") || "auto").trim();
       const q = String((_sigSearchEl ? _sigSearchEl.value : "") || "").trim();
-      const ldkb = String((_sigLdkbEl ? _sigLdkbEl.value : "") || "50").trim();
-      const ldr2 = String((_sigLdr2El ? _sigLdr2El.value : "") || "0.6").trim();
       const annoPath = String((_annoSelEl ? _annoSelEl.value : "") || "").trim();
       if (_isMergeMode()) {
         if (!_isStartedForCurrent()) {
@@ -2299,16 +3003,14 @@ def _html_page() -> str:
         try {
           const out = await api("/api/gwas-history/sigsites-merged", "POST", {
             history_ids: selectedHistoryIds,
-            threshold: thr || "1e-6",
+            threshold: thr || "auto",
             anno: annoPath,
-            ld_window_kb: ldkb || "50",
-            ld_r2: ldr2 || "0.6",
             search: q,
             limit: 3000,
           });
           renderSigTable(out.rows || []);
           lastSigRows = Array.isArray(out.rows) ? out.rows : [];
-          lastSigSummary = `threshold=${out.threshold}, sig=${out.n_sig}, clumped=${out.n_leads}, show=${out.n_show}`;
+          lastSigSummary = `threshold=${out.threshold}, sig=${out.n_sig}, show=${out.n_show}`;
           if (copyBtn) copyBtn.disabled = lastSigRows.length === 0;
           msg.textContent = lastSigSummary;
         } catch (e) {
@@ -2339,16 +3041,14 @@ def _html_page() -> str:
       msg.textContent = "Loading threshold SNPs...";
       try {
         const out = await api(`/api/gwas-history/${encodeURIComponent(historyId)}/sigsites`, "POST", {
-          threshold: thr || "1e-6",
+          threshold: thr || "auto",
           anno: annoPath,
-          ld_window_kb: ldkb || "50",
-          ld_r2: ldr2 || "0.6",
           search: q,
           limit: 3000,
         });
         renderSigTable(out.rows || []);
         lastSigRows = Array.isArray(out.rows) ? out.rows : [];
-        lastSigSummary = `threshold=${out.threshold}, sig=${out.n_sig}, clumped=${out.n_leads}, show=${out.n_show}`;
+        lastSigSummary = `threshold=${out.threshold}, sig=${out.n_sig}, show=${out.n_show}`;
         if (copyBtn) copyBtn.disabled = lastSigRows.length === 0;
         msg.textContent = lastSigSummary;
       } catch (e) {
@@ -2400,6 +3100,7 @@ def _html_page() -> str:
       if (hmsg) hmsg.textContent = `history received ${gwasRows.length} row(s)...`;
       try {
         renderHistoryTable();
+        renderSeriesStyleRows();
       } catch (e2) {
         const msg = `history render failed: ${String(e2)}`;
         if (hmsg) hmsg.textContent = msg;
@@ -2412,6 +3113,72 @@ def _html_page() -> str:
       }
     }
 
+    async function uploadGwas() {
+      const fileEl = document.getElementById("gwas_upload_file");
+      const btn = document.getElementById("gwas_upload_btn");
+      const msg = document.getElementById("upload_msg");
+      const files = (fileEl && fileEl.files) ? Array.from(fileEl.files) : [];
+      if (files.length === 0) {
+        if (msg) msg.textContent = "Select GWAS file(s) first.";
+        return;
+      }
+      let timer = null;
+      let k = 0;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = SPIN_FRAMES[0];
+        timer = setInterval(() => {
+          k = (k + 1) % SPIN_FRAMES.length;
+          if (btn) btn.textContent = SPIN_FRAMES[k];
+        }, 90);
+      }
+      if (msg) msg.textContent = `Uploading ${files.length} GWAS file(s)...`;
+      try {
+        const fd = new FormData();
+        for (const f of files) {
+          fd.append("file", f);
+        }
+        const out = await apiForm("/api/gwas-upload", fd, 300000);
+        const uploaded = Array.isArray(out.uploaded) ? out.uploaded : [];
+        const failed = Array.isArray(out.failed) ? out.failed : [];
+        const upN = Number(out.uploaded_count || uploaded.length || 0);
+        const failN = Number(out.failed_count || failed.length || 0);
+        const first = uploaded.length > 0 ? uploaded[0] : null;
+        const det = first ? (first.detected || {}) : {};
+        let text = `Uploaded ${upN}/${files.length} file(s)`;
+        if (failN > 0) {
+          const e0 = String((failed[0] && failed[0].error) ? failed[0].error : "").trim();
+          text += `, failed ${failN}`;
+          if (e0) text += ` (first error: ${e0})`;
+        }
+        if (first) {
+          text += ` | chr=${String(det.chr || "")}, pos=${String(det.pos || "")}, p=${String(det.pvalue || "")}, rows=${Number(first.n_rows || 0)}`;
+        }
+        if (msg) {
+          msg.textContent = text;
+        }
+        const hid = String(
+          (first && first.history_id) || out.history_id || ""
+        ).trim();
+        await loadHistory();
+        if (hid) {
+          const row = gwasRows.find((r) => String(r.history_id || "") === hid);
+          if (row) {
+            await selectHistoryRow(row);
+          }
+        }
+        if (fileEl) fileEl.value = "";
+      } catch (e) {
+        if (msg) msg.textContent = String(e);
+      } finally {
+        if (timer) clearInterval(timer);
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Upload GWAS";
+        }
+      }
+    }
+
     async function refreshCompositeByHistory(historyId) {
       const preview = document.getElementById("img_preview");
       const selIds = Array.isArray(selectedHistoryIds) ? selectedHistoryIds.slice() : [];
@@ -2419,16 +3186,15 @@ def _html_page() -> str:
         preview.innerHTML = '<div class="muted">Waiting for selection...</div>';
         return;
       }
-      const _ratioEl = document.getElementById("manh_ratio");
-      const _paletteEl = document.getElementById("manh_palette");
-      const _markerEl = document.getElementById("manh_marker");
-      const _sizeEl = document.getElementById("manh_size");
       const _ldColorEl = document.getElementById("ld_color");
       const _ldThrEl = document.getElementById("ld_thr");
-      const manhRatio = String((_ratioEl ? _ratioEl.value : "") || "2").trim();
-      const manhPalette = String((_paletteEl ? _paletteEl.value : "") || "auto").trim();
-      const manhMarker = String((_markerEl ? _markerEl.value : "") || "o").trim();
-      const manhSize = String((_sizeEl ? _sizeEl.value : "") || "16").trim();
+      const seriesStyles = _collectSeriesStyles();
+      const style0 = (seriesStyles.length > 0) ? seriesStyles[0] : { color: "auto", alpha: 0.7, marker: "o", size: 16 };
+      const manhRatio = _readManhRatio();
+      const manhPalette = String(style0.color || "auto");
+      const manhAlpha = String(style0.alpha == null ? 0.7 : style0.alpha);
+      const manhMarker = String(style0.marker || "o");
+      const manhSize = String(style0.size || "16");
       const ldColor = String((_ldColorEl ? _ldColorEl.value : "") || "#4b5563");
       const ldThr = String((_ldThrEl ? _ldThrEl.value : "") || "").trim();
       const annoPath = document.getElementById("anno_sel").value || "";
@@ -2445,8 +3211,10 @@ def _html_page() -> str:
             bimrange: bimranges,
             manh_ratio: manhRatio,
             manh_palette: manhPalette,
+            manh_alpha: manhAlpha,
             manh_marker: manhMarker,
             manh_size: manhSize,
+            series_styles: seriesStyles,
             ld_color: ldColor,
             ld_p_threshold: ldThr,
             render_qq: false,
@@ -2454,7 +3222,7 @@ def _html_page() -> str:
           });
           const meta = out.meta || {};
           document.getElementById("preview_meta").textContent =
-            `merged tasks=${meta.n_tasks || selIds.length}, palette=${meta.palette || "auto"}`;
+            `merged tasks=${meta.n_tasks || selIds.length}, style rows=${seriesStyles.length}`;
           preview.innerHTML = "";
           const canvas = document.createElement("div");
           canvas.className = "preview-canvas";
@@ -2490,6 +3258,7 @@ def _html_page() -> str:
           editable_svg: false,
           manh_ratio: manhRatio,
           manh_palette: manhPalette,
+          manh_alpha: manhAlpha,
           manh_marker: manhMarker,
           manh_size: manhSize,
           ld_color: ldColor,
@@ -2531,6 +3300,7 @@ def _html_page() -> str:
       selectedSigRange = null;
       _markStartInvalidated();
       renderHistoryTable();
+      renderSeriesStyleRows();
       await loadChromOptionsForSelection();
       document.getElementById("img_preview").innerHTML = '<div class="muted">Select task and click Start.</div>';
       renderSigTable([]);
@@ -2620,7 +3390,7 @@ def _html_page() -> str:
       }
       const lines = [];
       if (String(lastSigSummary || "").trim()) lines.push(String(lastSigSummary));
-      lines.push("Chr\tPos\t-log10P\tStart\tEnd\tGene\tnSNP\tMeanR2\tLDclump");
+      lines.push("Chr\tPos\t-log10P\tGene");
       for (const r of rows) {
         let logp = Number.NaN;
         if (Number.isFinite(Number(r.logp))) {
@@ -2629,18 +3399,12 @@ def _html_page() -> str:
           logp = -Math.log10(Number(r.p));
         }
         const ptxt = Number.isFinite(logp) ? logp.toFixed(3) : "";
-        const mtxt = Number.isFinite(Number(r.MeanR2)) ? Number(r.MeanR2).toFixed(2) : String(r.MeanR2 || "");
         lines.push(
           [
             String(r.chrom || ""),
             String(r.pos || ""),
             String(ptxt),
-            String(r.start || ""),
-            String(r.end || ""),
             String(r.Gene || ""),
-            String(r.nsnps || ""),
-            String(mtxt),
-            String(r.LDclump || ""),
           ].join("\t")
         );
       }
@@ -2680,16 +3444,15 @@ def _html_page() -> str:
       }
       const annoPath = document.getElementById("anno_sel").value || "";
       const bimranges = buildBimranges();
-      const _ratioEl = document.getElementById("manh_ratio");
-      const _paletteEl = document.getElementById("manh_palette");
-      const _markerEl = document.getElementById("manh_marker");
-      const _sizeEl = document.getElementById("manh_size");
       const _ldColorEl = document.getElementById("ld_color");
       const _ldThrEl = document.getElementById("ld_thr");
-      const manhRatio = String((_ratioEl ? _ratioEl.value : "") || "2").trim();
-      const manhPalette = String((_paletteEl ? _paletteEl.value : "") || "auto").trim();
-      const manhMarker = String((_markerEl ? _markerEl.value : "") || "o").trim();
-      const manhSize = String((_sizeEl ? _sizeEl.value : "") || "16").trim();
+      const seriesStyles = _collectSeriesStyles();
+      const style0 = (seriesStyles.length > 0) ? seriesStyles[0] : { color: "auto", alpha: 0.7, marker: "o", size: 16 };
+      const manhRatio = _readManhRatio();
+      const manhPalette = String(style0.color || "auto");
+      const manhAlpha = String(style0.alpha == null ? 0.7 : style0.alpha);
+      const manhMarker = String(style0.marker || "o");
+      const manhSize = String(style0.size || "16");
       const ldColor = String((_ldColorEl ? _ldColorEl.value : "") || "#4b5563");
       const ldThr = String((_ldThrEl ? _ldThrEl.value : "") || "").trim();
 
@@ -2711,8 +3474,10 @@ def _html_page() -> str:
             bimrange: bimranges,
             manh_ratio: manhRatio,
             manh_palette: manhPalette,
+            manh_alpha: manhAlpha,
             manh_marker: manhMarker,
             manh_size: manhSize,
+            series_styles: seriesStyles,
             ld_color: ldColor,
             ld_p_threshold: ldThr,
             render_qq: true,
@@ -2727,6 +3492,7 @@ def _html_page() -> str:
             editable_svg: true,
             manh_ratio: manhRatio,
             manh_palette: manhPalette,
+            manh_alpha: manhAlpha,
             manh_marker: manhMarker,
             manh_size: manhSize,
             ld_color: ldColor,
@@ -2777,6 +3543,7 @@ def _html_page() -> str:
     _bindClick("zoom_out_btn", () => _zoomBy(1 / 1.1));
     _bindClick("zoom_reset_btn", () => _resetViewer());
     _bindClick("drag_toggle_btn", () => _setDragEnabled(!viewer.dragEnabled));
+    _bindClick("gwas_upload_btn", () => uploadGwas());
     _bindClick("bim_apply_btn", () => refreshAllByHistory(selectedHistoryId).catch((e) => {
       _setText("bim_msg", String(e));
     }));
@@ -2784,6 +3551,19 @@ def _html_page() -> str:
     _bindInput("anno_sel", "change", () => _markStartInvalidated());
     _bindClick("download_btn", () => downloadCurrentSvg());
     _bindClick("sig_copy_btn", () => copySigTable());
+    _bindInput("manh_ratio", "keydown", (ev) => {
+      if (ev.key === "Enter") {
+        refreshAllByHistory(selectedHistoryId).catch((e) => {
+          _setText("bim_msg", String(e));
+        });
+      }
+    });
+    _bindInput("manh_ratio", "blur", () => {
+      if (!_isStartedForCurrent()) return;
+      refreshAllByHistory(selectedHistoryId).catch((e) => {
+        _setText("bim_msg", String(e));
+      });
+    });
     _bindInput("sig_thr", "keydown", (ev) => {
       if (ev.key === "Enter") {
         loadSigSites(selectedHistoryId).catch((e) => {
@@ -2808,18 +3588,9 @@ def _html_page() -> str:
         }
       });
     }
-    for (const id of ["sig_ld_window_kb", "sig_ld_r2"]) {
-      _bindInput(id, "keydown", (ev) => {
-        if (ev.key === "Enter") {
-          loadSigSites(selectedHistoryId).catch((e) => {
-            _setText("sig_msg", String(e));
-          });
-        }
-      });
-    }
-
     _bindViewerEvents();
     _setDragEnabled(true);
+    renderSeriesStyleRows();
     const _searchEl = document.getElementById("search_box");
     if (_searchEl) _searchEl.value = "";
     loadAnnoFiles().catch((e) => {
@@ -2875,6 +3646,73 @@ def _make_handler(state: WebUIState):
                 return json.loads(raw.decode("utf-8"))
             except Exception:
                 return {}
+
+        def _read_multipart_body(self) -> dict[str, Any]:
+            ctype = str(self.headers.get("Content-Type", "")).strip()
+            if "multipart/form-data" not in ctype.lower():
+                raise ValueError("Content-Type must be multipart/form-data.")
+            m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype, re.IGNORECASE)
+            if m is None:
+                raise ValueError("multipart boundary is missing.")
+            boundary_txt = str(m.group(1) or m.group(2) or "").strip()
+            if boundary_txt == "":
+                raise ValueError("multipart boundary is empty.")
+            try:
+                n = int(str(self.headers.get("Content-Length", "0")).strip())
+            except Exception:
+                n = 0
+            raw = self.rfile.read(max(0, n))
+            if not raw:
+                return {}
+            boundary = ("--" + boundary_txt).encode("utf-8", errors="ignore")
+            parts = raw.split(boundary)
+            out: dict[str, Any] = {}
+
+            def _put(name: str, value: Any) -> None:
+                if name not in out:
+                    out[name] = value
+                    return
+                cur = out.get(name)
+                if isinstance(cur, list):
+                    cur.append(value)
+                    out[name] = cur
+                else:
+                    out[name] = [cur, value]
+
+            for part in parts:
+                chunk = part.strip(b"\r\n")
+                if (not chunk) or chunk == b"--":
+                    continue
+                if chunk.endswith(b"--"):
+                    chunk = chunk[:-2]
+                head_blob, sep, body = chunk.partition(b"\r\n\r\n")
+                if sep == b"":
+                    continue
+                if body.endswith(b"\r\n"):
+                    body = body[:-2]
+                headers: dict[str, str] = {}
+                for line in head_blob.decode("utf-8", errors="replace").split("\r\n"):
+                    if ":" not in line:
+                        continue
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+                disp = str(headers.get("content-disposition", ""))
+                n_m = re.search(r'name="([^"]+)"', disp)
+                if n_m is None:
+                    continue
+                name = str(n_m.group(1) or "").strip()
+                if name == "":
+                    continue
+                f_m = re.search(r'filename="([^"]*)"', disp)
+                if f_m is not None:
+                    _put(name, {
+                        "filename": str(f_m.group(1) or ""),
+                        "content_type": str(headers.get("content-type", "")),
+                        "data": bytes(body),
+                    })
+                else:
+                    _put(name, body.decode("utf-8", errors="replace"))
+            return out
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -2976,14 +3814,123 @@ def _make_handler(state: WebUIState):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == "/api/gwas-upload":
+                try:
+                    form = self._read_multipart_body()
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                def _first_text(v: Any) -> str:
+                    x = v
+                    if isinstance(x, list):
+                        x = x[0] if len(x) > 0 else ""
+                    if isinstance(x, dict):
+                        return ""
+                    return str(x or "").strip()
+
+                raw_items = form.get("file")
+                if isinstance(raw_items, list):
+                    file_items = [x for x in raw_items if isinstance(x, dict)]
+                elif isinstance(raw_items, dict):
+                    file_items = [raw_items]
+                else:
+                    file_items = []
+                if len(file_items) == 0:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing file field"})
+                    return
+
+                phenotype = _first_text(form.get("phenotype", ""))
+                model = _first_text(form.get("model", ""))
+                genofile = _first_text(form.get("genofile", ""))
+                genofile_kind = _first_text(form.get("genofile_kind", "")).lower()
+
+                uploaded: list[dict[str, Any]] = []
+                failed: list[dict[str, Any]] = []
+                for idx, item in enumerate(file_items, start=1):
+                    file_bytes = item.get("data", b"")
+                    if not isinstance(file_bytes, (bytes, bytearray)) or len(file_bytes) == 0:
+                        failed.append(
+                            {
+                                "index": int(idx),
+                                "file_name": str(item.get("filename", "") or ""),
+                                "error": "invalid upload file",
+                            }
+                        )
+                        continue
+                    raw_name = str(item.get("filename", "") or f"uploaded_gwas_{idx}.tsv")
+                    try:
+                        dst = state._upload_storage_path(raw_name, idx)
+                        while dst.exists():
+                            dst = state._upload_storage_path(raw_name, idx)
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        with dst.open("wb") as w:
+                            w.write(bytes(file_bytes))
+                    except Exception as exc:
+                        failed.append(
+                            {
+                                "index": int(idx),
+                                "file_name": raw_name,
+                                "error": f"failed to save upload: {exc}",
+                            }
+                        )
+                        continue
+                    try:
+                        out = state.register_uploaded_gwas(
+                            file_path=dst,
+                            original_name=raw_name,
+                            phenotype=phenotype,
+                            model=model,
+                            genofile=genofile,
+                            genofile_kind=genofile_kind,
+                        )
+                        uploaded.append(dict(out))
+                    except Exception as exc:
+                        try:
+                            if dst.exists():
+                                dst.unlink()
+                        except Exception:
+                            pass
+                        failed.append(
+                            {
+                                "index": int(idx),
+                                "file_name": raw_name,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+
+                if len(uploaded) == 0:
+                    err0 = str(failed[0].get("error", "upload failed")) if len(failed) > 0 else "upload failed"
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": err0,
+                            "uploaded_count": 0,
+                            "failed_count": int(len(failed)),
+                            "failed": failed,
+                        },
+                    )
+                    return
+
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": len(failed) == 0,
+                        "uploaded_count": int(len(uploaded)),
+                        "failed_count": int(len(failed)),
+                        "uploaded": uploaded,
+                        "failed": failed,
+                        "history_id": str(uploaded[0].get("history_id", "")),
+                    },
+                )
+                return
+
             if path.startswith("/api/gwas-history/") and path.endswith("/sigsites"):
                 suffix = unquote(path[len("/api/gwas-history/") :].strip("/"))
                 history_id = suffix[: -len("/sigsites")].strip("/")
                 payload = self._read_json_body()
-                threshold = payload.get("threshold", 1e-6)
+                threshold = payload.get("threshold", "auto")
                 anno_file = str(payload.get("anno", "")).strip()
-                ld_window_kb = payload.get("ld_window_kb", 50)
-                ld_r2 = payload.get("ld_r2", 0.6)
                 search = str(payload.get("search", "")).strip()
                 limit = payload.get("limit", 2000)
                 try:
@@ -2991,8 +3938,6 @@ def _make_handler(state: WebUIState):
                         history_id,
                         threshold=threshold,
                         anno_file=anno_file,
-                        ld_window_kb=ld_window_kb,
-                        ld_r2=ld_r2,
                         search=search,
                         limit=limit,
                     )
@@ -3007,10 +3952,8 @@ def _make_handler(state: WebUIState):
                 history_ids = payload.get("history_ids", [])
                 if not isinstance(history_ids, list):
                     history_ids = []
-                threshold = payload.get("threshold", 1e-6)
+                threshold = payload.get("threshold", "auto")
                 anno_file = str(payload.get("anno", "")).strip()
-                ld_window_kb = payload.get("ld_window_kb", 50)
-                ld_r2 = payload.get("ld_r2", 0.6)
                 search = str(payload.get("search", "")).strip()
                 limit = payload.get("limit", 2000)
                 try:
@@ -3018,8 +3961,6 @@ def _make_handler(state: WebUIState):
                         [str(x).strip() for x in history_ids if str(x).strip() != ""],
                         threshold=threshold,
                         anno_file=anno_file,
-                        ld_window_kb=ld_window_kb,
-                        ld_r2=ld_r2,
                         search=search,
                         limit=limit,
                     )
@@ -3067,8 +4008,10 @@ def _make_handler(state: WebUIState):
                 bimranges = _normalize_bimrange_items(payload.get("bimrange", ""), max_items=4)
                 manh_ratio = payload.get("manh_ratio", 2.0)
                 manh_palette = str(payload.get("manh_palette", "auto"))
+                manh_alpha = payload.get("manh_alpha", 0.7)
                 manh_marker = str(payload.get("manh_marker", "o"))
                 manh_size = payload.get("manh_size", 16.0)
+                series_styles = payload.get("series_styles", None)
                 ld_color = str(payload.get("ld_color", "#4b5563")).strip()
                 ld_p_threshold = payload.get("ld_p_threshold", "auto")
                 render_qq = bool(payload.get("render_qq", True))
@@ -3079,8 +4022,10 @@ def _make_handler(state: WebUIState):
                         bimrange=bimranges,
                         manh_ratio=manh_ratio,
                         manh_palette=manh_palette,
+                        manh_alpha=manh_alpha,
                         manh_marker=manh_marker,
                         manh_size=manh_size,
+                        series_styles=series_styles,
                         ld_color=ld_color,
                         ld_p_threshold=ld_p_threshold,
                         render_qq=render_qq,
@@ -3108,6 +4053,7 @@ def _make_handler(state: WebUIState):
                 full = bool(payload.get("full", False))
                 manh_ratio = payload.get("manh_ratio", 2.0)
                 manh_palette = str(payload.get("manh_palette", "auto"))
+                manh_alpha = payload.get("manh_alpha", 0.7)
                 manh_marker = str(payload.get("manh_marker", "o"))
                 manh_size = payload.get("manh_size", 16.0)
                 ld_color = str(payload.get("ld_color", "#4b5563")).strip()
@@ -3123,6 +4069,7 @@ def _make_handler(state: WebUIState):
                         full=full,
                         manh_ratio=manh_ratio,
                         manh_palette=manh_palette,
+                        manh_alpha=manh_alpha,
                         manh_marker=manh_marker,
                         manh_size=manh_size,
                         ld_color=ld_color,
@@ -3252,6 +4199,12 @@ def main() -> None:
             "WebUI preflight cleanup: removed "
             f"{int(cleanup.get('removed', 0))} invalid GWAS history run(s) "
             "(missing result/genotype files)."
+        )
+    elif int(cleanup.get("pruned_runs", 0)) > 0:
+        print(
+            "WebUI preflight cleanup: pruned "
+            f"{int(cleanup.get('pruned_summary_rows', 0))} invalid history row(s) "
+            f"across {int(cleanup.get('pruned_runs', 0))} run(s)."
         )
     print(f"Serving on: {url}")
     print("Press Ctrl+C to stop.")

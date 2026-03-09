@@ -2049,6 +2049,8 @@ fn ensure_rust_toolchain_for_update_source(
         eprintln!("Checking Rust toolchain for source update...");
     }
     if any_rust_toolchain_ready(runtime_home) {
+        #[cfg(target_os = "windows")]
+        ensure_windows_msvc_linker_ready(runtime_home)?;
         if verbose {
             eprintln!("Rust toolchain is available.");
         }
@@ -2057,7 +2059,10 @@ fn ensure_rust_toolchain_for_update_source(
     if verbose {
         eprintln!("Rust toolchain not detected; installing local Rust toolchain...");
     }
-    ensure_local_rust_toolchain(runtime_home, python, verbose)
+    ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+    #[cfg(target_os = "windows")]
+    ensure_windows_msvc_linker_ready(runtime_home)?;
+    Ok(())
 }
 
 fn rustup_home(runtime_home: &Path) -> PathBuf {
@@ -2148,6 +2153,113 @@ fn system_rust_toolchain_ready() -> bool {
 
 fn any_rust_toolchain_ready(runtime_home: &Path) -> bool {
     local_rust_toolchain_ready(runtime_home) || system_rust_toolchain_ready()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_rustc_host_triple(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("host:") {
+            let host = rest.trim();
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn local_rust_host_triple(runtime_home: &Path) -> Option<String> {
+    let rustc = local_rustc_path(runtime_home);
+    if !rustc.exists() {
+        return None;
+    }
+    let mut cmd = Command::new(&rustc);
+    cmd.arg("-vV")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_local_rust_env(&mut cmd, runtime_home, true);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_rustc_host_triple(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn system_rust_host_triple() -> Option<String> {
+    let out = Command::new("rustc")
+        .arg("-vV")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_rustc_host_triple(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_rust_host_triple(runtime_home: &Path) -> Option<String> {
+    local_rust_host_triple(runtime_home).or_else(system_rust_host_triple)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_rust_requires_msvc_linker(runtime_home: &Path) -> bool {
+    let host = windows_rust_host_triple(runtime_home)
+        .unwrap_or_else(|| "x86_64-pc-windows-msvc".to_string())
+        .to_ascii_lowercase();
+    host.contains("windows-msvc")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_has_link_exe_in_path() -> bool {
+    if let Some(path_var) = env::var_os("PATH") {
+        for d in env::split_paths(&path_var) {
+            if d.join("link.exe").exists() {
+                return true;
+            }
+        }
+    }
+    command_ok("where", &["link.exe"]) || command_ok("where.exe", &["link.exe"])
+}
+
+#[cfg(target_os = "windows")]
+fn windows_msvc_linker_missing_message() -> String {
+    "Rust toolchain is installed, but MSVC linker `link.exe` was not found.\n\
+JanusX source build on Windows currently uses MSVC target and requires Visual C++ Build Tools.\n\n\
+Fix options:\n\
+1) Install Build Tools for Visual Studio 2022 (Desktop development with C++), then reopen terminal.\n\
+2) Or run JanusX commands from \"x64 Native Tools Command Prompt for VS 2022\".\n\n\
+Quick install (PowerShell, admin):\n\
+  winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override \"--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools\"\n\n\
+After install, run:\n\
+  jx -update latest"
+        .to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_msvc_linker_ready(runtime_home: &Path) -> Result<(), String> {
+    if !windows_rust_requires_msvc_linker(runtime_home) {
+        return Ok(());
+    }
+    if windows_has_link_exe_in_path() {
+        return Ok(());
+    }
+    Err(windows_msvc_linker_missing_message())
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_linker_missing_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("linker `link.exe` not found")
+        || (e.contains("program not found") && e.contains("link.exe"))
+        || e.contains("the msvc targets depend on the msvc linker")
+        || (e.contains("visual studio") && e.contains("link.exe"))
 }
 
 fn rustup_target_triple() -> Option<&'static str> {
@@ -3190,18 +3302,26 @@ fn pip_install_update(
     let is_pypi_spec = is_pypi_janusx_spec(spec);
     // For explicit source installs (GitHub/local path), ensure Rust toolchain upfront.
     // For PyPI, keep the preferred order: wheel first, then source+Rust fallback.
-    if spec_requires_rust_build(spec) && !is_pypi_spec && !any_rust_toolchain_ready(runtime_home) {
-        if verbose {
-            eprintln!(
-                "Rust toolchain not detected for source build; installing local Rust toolchain..."
-            );
+    if spec_requires_rust_build(spec) && !is_pypi_spec {
+        if !any_rust_toolchain_ready(runtime_home) {
+            if verbose {
+                eprintln!(
+                    "Rust toolchain not detected for source build; installing local Rust toolchain..."
+                );
+            }
+            ensure_local_rust_toolchain(runtime_home, python, verbose)?;
         }
-        ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+        #[cfg(target_os = "windows")]
+        ensure_windows_msvc_linker_ready(runtime_home)?;
     }
 
     match attempt_install(false, false, None) {
         Ok(d) => return Ok(d),
         Err(e) => {
+            #[cfg(target_os = "windows")]
+            if is_windows_linker_missing_error(&e) {
+                return Err(format!("{}\n\n{}", windows_msvc_linker_missing_message(), e));
+            }
             if spec_requires_rust_build(spec)
                 && !any_rust_toolchain_ready(runtime_home)
                 && should_retry_after_installing_rust(&e)
@@ -3210,6 +3330,8 @@ fn pip_install_update(
                     eprintln!("Rust toolchain is required by this update; installing local Rust and retrying.");
                 }
                 ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                #[cfg(target_os = "windows")]
+                ensure_windows_msvc_linker_ready(runtime_home)?;
                 return attempt_install(false, false, None);
             }
             if is_pypi_spec && should_retry_with_source_build(&e) {
@@ -3224,9 +3346,15 @@ fn pip_install_update(
                     }
                     ensure_local_rust_toolchain(runtime_home, python, verbose)?;
                 }
+                #[cfg(target_os = "windows")]
+                ensure_windows_msvc_linker_ready(runtime_home)?;
                 match attempt_install(true, false, Some("Retrying source build from PyPI ...")) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {
+                        #[cfg(target_os = "windows")]
+                        if is_windows_linker_missing_error(&e2) {
+                            return Err(format!("{}\n\n{}", windows_msvc_linker_missing_message(), e2));
+                        }
                         if !any_rust_toolchain_ready(runtime_home)
                             && should_retry_after_installing_rust(&e2)
                         {
@@ -3236,6 +3364,8 @@ fn pip_install_update(
                                 );
                             }
                             ensure_local_rust_toolchain(runtime_home, python, verbose)?;
+                            #[cfg(target_os = "windows")]
+                            ensure_windows_msvc_linker_ready(runtime_home)?;
                             return attempt_install(
                                 true,
                                 false,

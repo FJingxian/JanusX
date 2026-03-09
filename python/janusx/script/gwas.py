@@ -1044,13 +1044,17 @@ def load_phenotype(
             return ["comma", "tab", "whitespace"]
         return ["whitespace", "tab", "comma"]
 
+    ncol_requested: Union[list[int], None] = None
+    if ncol is not None:
+        ncol_requested = [int(i) for i in ncol]
+
     # If phenotype columns are explicitly requested, read only ID + target cols.
     # ncol indices are relative to phenotype columns (after removing ID/FID).
     usecols: Union[list[int], None] = None
-    if ncol is not None and len(ncol) > 0 and int(id_col) in (0, 1):
+    if ncol_requested is not None and len(ncol_requested) > 0 and int(id_col) in (0, 1):
         offset = 1 if int(id_col) == 0 else 2
         try:
-            wanted = [int(id_col)] + [int(i) + offset for i in ncol]
+            wanted = [int(id_col)] + [int(i) + offset for i in ncol_requested]
             usecols = sorted(set(wanted))
         except Exception:
             usecols = None
@@ -1129,8 +1133,27 @@ def load_phenotype(
 
     if ncol is not None:
         requested_ncol = [int(i) for i in ncol]
-        valid_ncol = [i for i in requested_ncol if 0 <= int(i) < int(pheno.shape[1])]
-        invalid_ncol = [i for i in requested_ncol if i not in valid_ncol]
+        valid_ncol: list[int]
+        invalid_ncol: list[int]
+        ncol_take: list[int]
+
+        # If usecols pre-filtering is enabled, requested_ncol are global phenotype
+        # indices; map them back to local positions in the reduced pheno table.
+        if usecols is not None and ncol_requested is not None and int(id_col) in (0, 1):
+            offset = 1 if int(id_col) == 0 else 2
+            selected_file_cols = [int(c) for c in usecols if int(c) != int(id_col)]
+            if int(id_col) == 1:
+                selected_file_cols = [c for c in selected_file_cols if c != 0]
+            selected_global_ncol = [int(c) - offset for c in selected_file_cols]
+            global_to_local = {g: i for i, g in enumerate(selected_global_ncol)}
+            valid_ncol = [i for i in requested_ncol if i in global_to_local]
+            invalid_ncol = [i for i in requested_ncol if i not in global_to_local]
+            ncol_take = [int(global_to_local[i]) for i in valid_ncol]
+        else:
+            valid_ncol = [i for i in requested_ncol if 0 <= int(i) < int(pheno.shape[1])]
+            invalid_ncol = [i for i in requested_ncol if i not in valid_ncol]
+            ncol_take = [int(i) for i in valid_ncol]
+
         if len(requested_ncol) == 0:
             msg = (
                 "No phenotype column index was provided for -n/--ncol. "
@@ -1138,7 +1161,7 @@ def load_phenotype(
             )
             logger.error(msg)
             raise ValueError(msg)
-        if len(valid_ncol) == 0:
+        if len(ncol_take) == 0:
             max_idx = int(pheno.shape[1]) - 1
             msg = (
                 "Phenotype column index out of range. "
@@ -1153,13 +1176,13 @@ def load_phenotype(
                 f"{invalid_ncol}. valid=[0..{max_idx}]"
             )
         ncol = [int(i) for i in valid_ncol]
-        selected_ncol = [int(i) for i in ncol]
+        selected_ncol = [int(i) for i in valid_ncol]
         _log_info(
             logger,
-            "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol])),
+            "Phenotypes to be analyzed: " + "\t".join(map(str, pheno.columns[ncol_take])),
             use_spinner=use_spinner,
         )
-        pheno = pheno.iloc[:, ncol]
+        pheno = pheno.iloc[:, ncol_take]
     else:
         selected_ncol = list(range(pheno.shape[1]))
 

@@ -472,7 +472,7 @@ if __name__ == "__main__":
     import pandas as pd
     import numpy as np
     from janusx.pyBLUP import kfold
-
+    from janusx.pyBLUP.bayes import BAYES
     def Gmatrix(mat:np.ndarray,):
         SDmat = mat.std(axis=1)
         mat = mat[SDmat>0]
@@ -486,7 +486,7 @@ if __name__ == "__main__":
         gadd = chunk
     ghet = (gadd==1).astype(np.float32)
     
-    for test,train in kfold(ghet.shape[1],5,seed=42):
+    for test,train in kfold(ghet.shape[1],5,seed=101):
         Gadd = Gmatrix(gadd[:,train])
         Ghet = Gmatrix(ghet[:,train])
         model = BLUP(pheno.values[train],G=[Gadd,Ghet],progress=False)
@@ -495,4 +495,7 @@ if __name__ == "__main__":
         model = BLUP(pheno.values[train],G=[Gadd],progress=False)
         yhat = model.predict(G=[Gmatrix(gadd)[test, :][:,train]])
         print('ABLUP:',np.corrcoef(pheno.values[test,0],yhat[:,0])[0,1])
+        model = BAYES(pheno.values[train],M=gadd[:,train])
+        yhat = model.predict(M=gadd[:,test])
+        print('Bayes:',np.corrcoef(pheno.values[test,0],yhat[:,0])[0,1])
         print('---')

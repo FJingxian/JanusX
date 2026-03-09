@@ -5,6 +5,7 @@ JanusX: Genomic Selection Command-Line Interface
 Supported models
 ----------------
   - GBLUP  : Genomic Best Linear Unbiased Prediction (GBLUP, kinship = 1)
+  - adBLUP : Additive + dominance kernel BLUP (pyBLUP/JAX backend)
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
@@ -78,13 +79,21 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
-from joblib import cpu_count as joblib_cpu_count
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
+try:
+    from janusx.pyBLUP.blup import BLUP as KernelBLUP, Gmatrix
+    _HAS_ADBLUP_PY = True
+    _ADBLUP_PY_IMPORT_ERROR: Exception | None = None
+except Exception as _adblup_py_exc:
+    KernelBLUP = None  # type: ignore[assignment]
+    Gmatrix = None  # type: ignore[assignment]
+    _HAS_ADBLUP_PY = False
+    _ADBLUP_PY_IMPORT_ERROR = _adblup_py_exc
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -108,7 +117,6 @@ try:
         TextColumn,
         BarColumn,
         TimeElapsedColumn,
-        TimeRemainingColumn,
     )
     _HAS_RICH_PROGRESS = True
 except Exception:
@@ -117,7 +125,6 @@ except Exception:
     TextColumn = None  # type: ignore[assignment]
     BarColumn = None  # type: ignore[assignment]
     TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
     _HAS_RICH_PROGRESS = False
 
 try:
@@ -136,7 +143,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: np.ndarray,
     Xtest: np.ndarray,
-    method: typing.Literal["GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"],
+    method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"],
     PCAdec: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
@@ -150,7 +157,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi'}
+    method : {'GBLUP', 'adBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -180,6 +187,53 @@ def GSapi(
         vec = val[:dim] * vec[:, :dim]
         Xtrain, Xtest = vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
 
+    # Multi-kernel additive+dominance BLUP (pyBLUP/JAX backend)
+    if method == "adBLUP":
+        if (not _HAS_ADBLUP_PY) or KernelBLUP is None or Gmatrix is None:
+            raise ImportError(
+                "adBLUP (JAX backend) is unavailable. "
+                f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
+            )
+        gadd_train = np.asarray(Xtrain, dtype=np.float32)
+        gadd_test = np.asarray(Xtest, dtype=np.float32)
+        if gadd_train.ndim != 2 or gadd_test.ndim != 2:
+            raise ValueError(
+                f"adBLUP expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
+            )
+        if gadd_train.shape[0] != gadd_test.shape[0]:
+            raise ValueError(
+                f"adBLUP marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
+            )
+
+        ghet_train = (gadd_train == 1.0).astype(np.float32, copy=False)
+        Gadd_train = Gmatrix(gadd_train)
+        Ghet_train = Gmatrix(ghet_train)
+        model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
+
+        yhat_train = model.predict(G=[Gadd_train, Ghet_train])
+        n_train = int(gadd_train.shape[1])
+        if int(gadd_test.shape[1]) > 0:
+            gadd_all = np.concatenate([gadd_train, gadd_test], axis=1)
+            ghet_all = (gadd_all == 1.0).astype(np.float32, copy=False)
+            Gadd_all = Gmatrix(gadd_all)
+            Ghet_all = Gmatrix(ghet_all)
+            Gadd_cross = Gadd_all[n_train:, :n_train]
+            Ghet_cross = Ghet_all[n_train:, :n_train]
+            yhat_test = model.predict(G=[Gadd_cross, Ghet_cross])
+        else:
+            yhat_test = np.zeros((0, 1), dtype=float)
+
+        pve = float("nan")
+        try:
+            var = np.asarray(getattr(model, "var", []), dtype=float).reshape(-1)
+            if var.size >= 2 and np.all(np.isfinite(var)):
+                den = float(np.sum(var))
+                if den > 0:
+                    pve = float(np.sum(var[:-1]) / den)
+        except Exception:
+            pve = float("nan")
+        return np.asarray(yhat_train, dtype=float), np.asarray(yhat_test, dtype=float), pve
+
     # Linear mixed models
     if method in ("GBLUP", "rrBLUP"):
         kinship = 1 if method == "GBLUP" else None
@@ -199,9 +253,12 @@ def _run_method_task(
     train_pheno: np.ndarray,
     train_snp: np.ndarray,
     test_snp: np.ndarray,
+    train_snp_add: np.ndarray | None,
+    test_snp_add: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     progress_queue: typing.Any = None,
+    progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     best_test = None
@@ -211,12 +268,22 @@ def _run_method_task(
     if cv_splits is not None:
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
             t_fold = time.time()
+            if method == "adBLUP":
+                if train_snp_add is None:
+                    raise ValueError(f"{method} requires additive raw genotype matrix.")
+                fold_train = train_snp_add[:, train_idx]
+                fold_test = train_snp_add[:, test_idx]
+                fold_pca = False
+            else:
+                fold_train = train_snp[:, train_idx]
+                fold_test = train_snp[:, test_idx]
+                fold_pca = pca_dec
             yhat_train, yhat_test, pve = GSapi(
                 train_pheno[train_idx],
-                train_snp[:, train_idx],
-                train_snp[:, test_idx],
+                fold_train,
+                fold_test,
                 method=method,
-                PCAdec=pca_dec,
+                PCAdec=fold_pca,
             )
             ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
             ttrain = np.concatenate([train_pheno[train_idx], yhat_train], axis=1)
@@ -233,18 +300,34 @@ def _run_method_task(
                     progress_queue.put((method, 1))
                 except Exception:
                     pass
+            if progress_hook is not None:
+                try:
+                    progress_hook(method, 1)
+                except Exception:
+                    pass
 
             if r2 > best_r2:
                 best_r2 = r2
                 best_test = ttest
                 best_train = ttrain
 
+    if method == "adBLUP":
+        if train_snp_add is None or test_snp_add is None:
+            raise ValueError(f"{method} requires additive raw genotype matrices.")
+        final_train = train_snp_add
+        final_test = test_snp_add
+        final_pca = False
+    else:
+        final_train = train_snp
+        final_test = test_snp
+        final_pca = pca_dec
+
     _, test_pred, pve_final = GSapi(
         train_pheno,
-        train_snp,
-        test_snp,
+        final_train,
+        final_test,
         method=method,
-        PCAdec=pca_dec,
+        PCAdec=final_pca,
     )
     return {
         "method": method,
@@ -261,6 +344,8 @@ def _run_methods_parallel(
     train_pheno: np.ndarray,
     train_snp: np.ndarray,
     test_snp: np.ndarray,
+    train_snp_add: np.ndarray | None,
+    test_snp_add: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
 ) -> list[dict[str, typing.Any]]:
@@ -268,20 +353,120 @@ def _run_methods_parallel(
         return []
 
     show_method_progress = cv_splits is not None
-    n_jobs = int(min(len(methods), max(1, int(joblib_cpu_count()))))
+    # Force serial execution for all GS methods to avoid cross-method contention
+    # and keep runtime behavior consistent.
+    n_jobs = 1
     if n_jobs <= 1:
         out: list[dict[str, typing.Any]] = []
+        fold_total_map = {
+            m: (int(len(cv_splits)) if cv_splits is not None else 1)
+            for m in methods
+        }
+        task_total_map = {
+            m: (fold_total_map[m] + 1) if show_method_progress else fold_total_map[m]
+            for m in methods
+        }
+        if show_method_progress and _HAS_RICH_PROGRESS and sys.stdout.isatty():
+            progress = Progress(
+                SpinnerColumn(
+                    spinner_name=get_rich_spinner_name(),
+                    style="cyan",
+                    finished_text=" ",
+                ),
+                TextColumn("{task.fields[method]}{task.fields[suffix]}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>6.1f}%"),
+                TimeElapsedColumn(),
+                transient=True,
+            )
+            with progress:
+                task_map: dict[str, int] = {}
+                done_map: dict[str, int] = {}
+                for idx, m in enumerate(methods):
+                    total_n = int(max(1, task_total_map.get(m, 1)))
+                    task_map[m] = progress.add_task(
+                        description="",
+                        total=total_n,
+                        method=m,
+                        suffix="" if idx == 0 else " waiting",
+                        start=False,
+                    )
+                    done_map[m] = 0
+
+                for idx, m in enumerate(methods):
+                    total_n = int(max(1, task_total_map.get(m, 1)))
+                    tid = int(task_map[m])
+                    progress.update(tid, suffix="")
+                    try:
+                        progress.start_task(tid)
+                    except Exception:
+                        pass
+                    t0 = time.monotonic()
+                    try:
+                        def _hook(method_name: str, inc: int) -> None:
+                            if str(method_name) != str(m):
+                                return
+                            left = max(0, total_n - int(done_map[m]))
+                            adv = min(left, int(max(0, int(inc))))
+                            if adv > 0:
+                                progress.update(tid, advance=adv)
+                                done_map[m] = int(done_map[m]) + adv
+
+                        res = _run_method_task(
+                            m,
+                            train_pheno,
+                            train_snp,
+                            test_snp,
+                            train_snp_add,
+                            test_snp_add,
+                            pca_dec,
+                            cv_splits,
+                            progress_queue=None,
+                            progress_hook=_hook,
+                        )
+                    except Exception:
+                        try:
+                            progress.remove_task(tid)
+                        except Exception:
+                            pass
+                        elapsed = format_elapsed(time.monotonic() - t0)
+                        progress.console.print(
+                            f"[red]✘ {m} ...Failed [{elapsed}][/red]"
+                        )
+                        raise
+                    left_final = max(0, total_n - int(done_map[m]))
+                    if left_final > 0:
+                        progress.update(tid, advance=left_final)
+                    try:
+                        progress.remove_task(tid)
+                    except Exception:
+                        pass
+                    out.append(res)
+                    elapsed = format_elapsed(time.monotonic() - t0)
+                    progress.console.print(
+                        f"[green]✔︎ {m} ...Finished [{elapsed}][/green]"
+                    )
+            return out
         for m in methods:
             t0 = time.monotonic()
             try:
-                res = _run_method_task(m, train_pheno, train_snp, test_snp, pca_dec, cv_splits)
+                res = _run_method_task(
+                    m,
+                    train_pheno,
+                    train_snp,
+                    test_snp,
+                    train_snp_add,
+                    test_snp_add,
+                    pca_dec,
+                    cv_splits,
+                )
             except Exception:
                 elapsed = format_elapsed(time.monotonic() - t0)
-                print_failure(f"Method: {m} ...Failed [{elapsed}]", force_color=True)
+                print_failure(f"{m} ...Failed [{elapsed}]", force_color=True)
                 raise
             out.append(res)
             elapsed = format_elapsed(time.monotonic() - t0)
-            print_success(f"Method: {m} ...Finished [{elapsed}]", force_color=True)
+            print_success(f"{m} ...Finished [{elapsed}]", force_color=True)
         return out
 
     results_by_method: "OrderedDict[str, dict[str, typing.Any]]" = OrderedDict()
@@ -304,6 +489,8 @@ def _run_methods_parallel(
                     train_pheno,
                     train_snp,
                     test_snp,
+                    train_snp_add,
+                    test_snp_add,
                     pca_dec,
                     cv_splits,
                     None,
@@ -319,7 +506,7 @@ def _run_methods_parallel(
                         time.monotonic() - method_start_ts.get(method, time.monotonic())
                     )
                     print_failure(
-                        f"Method: {method} ...Failed [{elapsed}]",
+                        f"{method} ...Failed [{elapsed}]",
                         force_color=True,
                     )
                     raise
@@ -327,7 +514,7 @@ def _run_methods_parallel(
                     time.monotonic() - method_start_ts.get(method, time.monotonic())
                 )
                 print_success(
-                    f"Method: {method} ...Finished [{elapsed}]",
+                    f"{method} ...Finished [{elapsed}]",
                     force_color=True,
                 )
     elif _HAS_RICH_PROGRESS and sys.stdout.isatty():
@@ -337,22 +524,21 @@ def _run_methods_parallel(
                 style="cyan",
                 finished_text=" ",
             ),
-            TextColumn("Method: {task.fields[method]}"),
+            TextColumn("{task.fields[method]}"),
             BarColumn(),
             TextColumn("{task.percentage:>6.1f}%{task.fields[suffix]}"),
             TimeElapsedColumn(),
-            TimeRemainingColumn(),
             transient=True,
         )
         with progress:
             def _rich_print_success(method_name: str, elapsed_text: str) -> None:
                 progress.console.print(
-                    f"[green]✔︎ Method: {method_name} ...Finished [{elapsed_text}][/green]"
+                    f"[green]✔︎ {method_name} ...Finished [{elapsed_text}][/green]"
                 )
 
             def _rich_print_failure(method_name: str, elapsed_text: str) -> None:
                 progress.console.print(
-                    f"[red]✘ Method: {method_name} ...Failed [{elapsed_text}][/red]"
+                    f"[red]✘ {method_name} ...Failed [{elapsed_text}][/red]"
                 )
 
             task_map: dict[str, int] = {}
@@ -379,6 +565,8 @@ def _run_methods_parallel(
                             train_pheno,
                             train_snp,
                             test_snp,
+                            train_snp_add,
+                            test_snp_add,
                             pca_dec,
                             cv_splits,
                             prog_q,
@@ -447,7 +635,7 @@ def _run_methods_parallel(
             leave=False,
             dynamic_ncols=True,
             bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                       "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                       "[{elapsed}, {rate_fmt}{postfix}]",
         )
         method_start_ts = {m: time.monotonic() for m in methods}
         manager = mp.Manager()
@@ -461,6 +649,8 @@ def _run_methods_parallel(
                         train_pheno,
                         train_snp,
                         test_snp,
+                        train_snp_add,
+                        test_snp_add,
                         pca_dec,
                         cv_splits,
                         prog_q,
@@ -481,7 +671,7 @@ def _run_methods_parallel(
                         pbar.set_postfix(method=method)
                         elapsed = format_elapsed(time.monotonic() - method_start_ts.get(method, time.monotonic()))
                         print_success(
-                            f"Method: {method} ...Finished [{elapsed}]",
+                            f"{method} ...Finished [{elapsed}]",
                             force_color=True,
                         )
         finally:
@@ -499,6 +689,8 @@ def _run_methods_parallel(
                     train_pheno,
                     train_snp,
                     test_snp,
+                    train_snp_add,
+                    test_snp_add,
                     pca_dec,
                     cv_splits,
                     None,
@@ -565,6 +757,7 @@ def main(log: bool = True) -> None:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
+            "jx gs -vcf geno.vcf.gz -p pheno.tsv -adBLUP -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",
         ]),
     )
@@ -602,6 +795,13 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Use GBLUP model for training and prediction "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-adBLUP", "--adBLUP",
+        action="store_true",
+        default=False,
+        help="Use additive+dominance kernel BLUP via pyBLUP/JAX backend "
              "(default: %(default)s).",
     )
     model_group.add_argument(
@@ -755,6 +955,9 @@ def main(log: bool = True) -> None:
         if args.GBLUP:
             model_count += 1
             cfg_rows.append((f"Used model{model_count}", "GBLUP"))
+        if args.adBLUP:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "adBLUP"))
         if args.rrBLUP:
             model_count += 1
             cfg_rows.append((f"Used model{model_count}", "rrBLUP"))
@@ -843,6 +1046,8 @@ def main(log: bool = True) -> None:
     methods: list[str] = []
     if args.GBLUP:
         methods.append("GBLUP")
+    if args.adBLUP:
+        methods.append("adBLUP")
     if args.rrBLUP:
         methods.append("rrBLUP")
     if args.BayesA:
@@ -851,33 +1056,58 @@ def main(log: bool = True) -> None:
         methods.append("BayesB")
     if args.BayesCpi:
         methods.append("BayesCpi")
+    # keep order, drop duplicates
+    if len(methods) > 1:
+        _seen_methods: set[str] = set()
+        _uniq_methods: list[str] = []
+        for _m in methods:
+            if _m in _seen_methods:
+                continue
+            _seen_methods.add(_m)
+            _uniq_methods.append(_m)
+        methods = _uniq_methods
     if len(methods) == 0:
         logger.error(
-            "No model selected. Use --GBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
+            "No model selected. Use --GBLUP/--adBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
         )
         raise SystemExit(1)
+    if args.adBLUP and (not _HAS_ADBLUP_PY):
+        logger.error(
+            "adBLUP (JAX backend) is unavailable. "
+            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
+        )
+        raise SystemExit(1)
+    if args.adBLUP and args.pcd:
+        logger.info("Note: --pcd is ignored for adBLUP.")
 
     # ------------------------------------------------------------------
     # Load genotype
     # ------------------------------------------------------------------
-    sample_ids, geno = _load_genotype_with_rust_gfreader(
-        gfile,
-        maf=args.maf,
-        missing_rate=args.geno,
-    )
-    logger.info(
-        f"* Filter SNPs with MAF < {args.maf} or missing rate > {args.geno}; "
-        "impute with mean."
-    )
-    logger.info("  Tip: Use genotype matrices imputed by BEAGLE/IMPUTE2 whenever possible.")
-    logger.info(f"Completed, cost: {round(time.time() - t_loading, 3)} secs")
-    m, n = geno.shape
-    logger.info(f"Loaded SNP: {m}, individuals: {n}")
+    gsrc = os.path.basename(str(gfile).rstrip("/")) or str(gfile)
+    with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
+        try:
+            sample_ids, geno = _load_genotype_with_rust_gfreader(
+                gfile,
+                maf=args.maf,
+                missing_rate=args.geno,
+            )
+        except Exception:
+            task.fail(f"Loading genotype from {gsrc} ...Failed")
+            raise
+        m, n = geno.shape
+        task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
 
     samples = sample_ids
-    geno = (geno - geno.mean(axis=1, keepdims=True)) / (
-        geno.std(axis=1, keepdims=True) + 1e-6
-    )  # standardization of genotype
+    need_std_geno = bool(args.GBLUP or args.rrBLUP or args.BayesA or args.BayesB or args.BayesCpi)
+    geno_add_raw = (
+        np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+        if args.adBLUP
+        else None
+    )
+    if need_std_geno:
+        geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+            geno.std(axis=1, keepdims=True) + 1e-6
+        )  # standardization for marker-effect models
 
     # ------------------------------------------------------------------
     # Genomic Selection for each phenotype
@@ -905,11 +1135,20 @@ def main(log: bool = True) -> None:
             cv_splits = list(kfold(train_snp.shape[1], k=int(args.cv), seed=None))
 
         test_snp = geno[:, testmask]
+        train_snp_add = None
+        test_snp_add = None
+        if args.adBLUP:
+            if geno_add_raw is None:
+                raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
+            train_snp_add = geno_add_raw[:, trainmask]
+            test_snp_add = geno_add_raw[:, testmask]
         method_results = _run_methods_parallel(
             methods=methods,
             train_pheno=train_pheno,
             train_snp=train_snp,
             test_snp=test_snp,
+            train_snp_add=train_snp_add,
+            test_snp_add=test_snp_add,
             pca_dec=args.pcd,
             cv_splits=cv_splits,
         )
@@ -917,16 +1156,54 @@ def main(log: bool = True) -> None:
 
         if args.cv is not None:
             logger.info("-" * 60)
-            logger.info("Method Fold Pearsonr Spearmanr R² h² time(secs)")
+            row_fmt = (
+                "{fold:>4} "
+                "{method:<10} "
+                "{pear:>8} "
+                "{spear:>9} "
+                "{r2:>6} "
+                "{h2:>6} "
+                "{time:>10}"
+            )
+            logger.info(
+                row_fmt.format(
+                    fold="Fold",
+                    method="Method",
+                    pear="Pearsonr",
+                    spear="Spearmanr",
+                    r2="R²",
+                    h2="h²",
+                    time="time(secs)",
+                )
+            )
+            method_order = {str(m): i for i, m in enumerate(methods)}
+            all_rows: list[tuple[str, int, float, float, float, float, float]] = []
             for method in methods:
                 res = method_result_map.get(method)
                 if res is None:
                     continue
                 for row in res.get("fold_rows", []):
-                    m_name, fold_id, pear, spear, r2, pve, t_fold = row
-                    logger.info(
-                        f"{m_name} {fold_id} {pear:.3f} {spear:.3f} {r2:.3f} {pve:.3f} {t_fold:.3f}"
+                    all_rows.append(row)
+            all_rows.sort(
+                key=lambda r: (
+                    int(r[1]),
+                    int(method_order.get(str(r[0]), 10**6)),
+                    str(r[0]),
+                )
+            )
+            for row in all_rows:
+                m_name, fold_id, pear, spear, r2, pve, t_fold = row
+                logger.info(
+                    row_fmt.format(
+                        fold=int(fold_id),
+                        method=str(m_name),
+                        pear=f"{float(pear):.3f}",
+                        spear=f"{float(spear):.3f}",
+                        r2=f"{float(r2):.3f}",
+                        h2=f"{float(pve):.3f}",
+                        time=f"{float(t_fold):.3f}",
                     )
+                )
 
         if args.plot and args.cv is not None:
             for method in methods:

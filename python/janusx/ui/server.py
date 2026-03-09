@@ -51,7 +51,6 @@ from .render import (
     build_merged_sig_table,
     annotate_sig_rows_with_genes,
     activate_task_cache,
-    detect_gwas_columns,
 )
 
 
@@ -134,6 +133,32 @@ _CHR_COL_CANDIDATES = {
     "scaffold",
     "chromosome_id",
     "chrom_id",
+}
+_POS_COL_CANDIDATES = {
+    "pos",
+    "position",
+    "bp",
+    "ps",
+    "basepair",
+    "basepairposition",
+    "physicalposition",
+    "physicalpos",
+    "coordinate",
+    "coord",
+    "location",
+    "loc",
+}
+_P_COL_CANDIDATES = {
+    "p",
+    "pvalue",
+    "pval",
+    "pwald",
+    "pwaldvalue",
+    "waldp",
+    "waldpvalue",
+    "plrt",
+    "lrtp",
+    "prob",
 }
 
 
@@ -278,6 +303,122 @@ def _extract_chromosomes_from_gwas(path: Path, *, max_lines: int | None = None) 
             return sorted(out, key=_chrom_sort_key)
     except Exception:
         return []
+
+
+def _pick_column_index(cols: list[str], *, kind: str) -> int:
+    best_idx = -1
+    best_score = -1
+    for i, c in enumerate(cols):
+        ck = _col_key(c)
+        score = -1
+        if kind == "chr":
+            if ck in _CHR_COL_CANDIDATES:
+                score = 100
+            elif ck.startswith("chr"):
+                score = 95
+            elif ("chrom" in ck) or ("seq" in ck) or ("contig" in ck) or ("scaffold" in ck):
+                score = 90
+        elif kind == "pos":
+            if ck in _POS_COL_CANDIDATES:
+                score = 100
+            elif ck.startswith("pos") or ck.endswith("bp"):
+                score = 95
+            elif ("position" in ck) or ("coord" in ck) or ("location" in ck):
+                score = 90
+        elif kind == "p":
+            if ck in _P_COL_CANDIDATES:
+                score = 100
+            elif ck.startswith("pvalue") or ck.startswith("pval"):
+                score = 95
+            elif ("pwald" in ck) or ("wald" in ck and ck.startswith("p")):
+                score = 92
+            elif ("lrt" in ck and ck.startswith("p")):
+                score = 90
+        if score > best_score:
+            best_score = score
+            best_idx = int(i)
+    return int(best_idx) if best_score >= 90 else -1
+
+
+def _safe_float(text: object) -> float | None:
+    try:
+        v = float(str(text).strip())
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return float(v)
+
+
+def _detect_gwas_columns_fast(path: Path, *, max_scan_lines: int = 200_000) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"uploaded file not found: {path}")
+    try:
+        if str(path.name).lower().endswith(".gz"):
+            import gzip
+            fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        else:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+    except Exception as exc:
+        raise RuntimeError(f"failed to open file: {exc}") from exc
+
+    with fh as f:
+        header = ""
+        for line in f:
+            t = str(line).strip()
+            if t == "":
+                continue
+            if t.startswith("##"):
+                continue
+            header = str(line)
+            break
+        if header == "":
+            raise RuntimeError("empty GWAS file")
+
+        delim = _guess_delimiter(header)
+        cols = [c.strip() for c in _split_fields(header, delim)]
+        if len(cols) == 0:
+            raise RuntimeError("failed to parse GWAS header")
+
+        i_chr = _pick_column_index(cols, kind="chr")
+        i_pos = _pick_column_index(cols, kind="pos")
+        i_p = _pick_column_index(cols, kind="p")
+        if i_chr < 0 or i_pos < 0 or i_p < 0:
+            raise RuntimeError("Cannot detect required columns (chrom/pos/pvalue).")
+
+        valid = 0
+        chroms: set[str] = set()
+        for n, line in enumerate(f, start=1):
+            if n > int(max_scan_lines):
+                break
+            if not str(line).strip():
+                continue
+            arr = _split_fields(line, delim)
+            if i_chr >= len(arr) or i_pos >= len(arr) or i_p >= len(arr):
+                continue
+            pos_v = _safe_float(arr[i_pos])
+            p_v = _safe_float(arr[i_p])
+            if pos_v is None or p_v is None:
+                continue
+            if p_v <= 0.0 or p_v > 1.0:
+                continue
+            valid += 1
+            c = str(arr[i_chr]).strip()
+            if c != "":
+                chroms.add(c)
+
+    if valid <= 0:
+        raise RuntimeError("No valid SNP rows after filtering (pos/pvalue).")
+
+    out_chroms = sorted(list(chroms), key=_chrom_sort_key)
+    return {
+        "chr": str(cols[i_chr]),
+        "pos": str(cols[i_pos]),
+        "pvalue": str(cols[i_p]),
+        "n_rows": int(valid),
+        "n_chrom": int(len(out_chroms)),
+        "chroms": out_chroms,
+    }
 
 
 def _normalize_bimrange_items(raw: Any, *, max_items: int = 4) -> list[str]:
@@ -801,7 +942,7 @@ class WebUIState:
         if (not p.exists()) or (not p.is_file()):
             raise ValueError(f"uploaded file not found: {p}")
         try:
-            det = detect_gwas_columns(p)
+            det = _detect_gwas_columns_fast(p)
         except Exception as exc:
             raise RuntimeError(f"detect-columns failed for {p.name}: {exc}") from exc
         pheno = str(phenotype or "").strip()
@@ -3134,16 +3275,30 @@ def _html_page() -> str:
       }
       if (msg) msg.textContent = `Uploading ${files.length} GWAS file(s)...`;
       try {
-        const fd = new FormData();
-        for (const f of files) {
-          fd.append("file", f);
+        const BATCH_SIZE = 4;
+        let uploaded = [];
+        let failed = [];
+        for (let i = 0; i < files.length; i += BATCH_SIZE) {
+          const batch = files.slice(i, i + BATCH_SIZE);
+          if (msg) msg.textContent = `Uploading ${Math.min(i + 1, files.length)}-${Math.min(i + batch.length, files.length)}/${files.length} ...`;
+          const fd = new FormData();
+          for (const f of batch) fd.append("file", f);
+          try {
+            const out = await apiForm("/api/gwas-upload", fd, 1200000);
+            const up = Array.isArray(out.uploaded) ? out.uploaded : [];
+            const fl = Array.isArray(out.failed) ? out.failed : [];
+            uploaded = uploaded.concat(up);
+            failed = failed.concat(fl);
+          } catch (eBatch) {
+            const errTxt = String(eBatch || "batch upload failed");
+            for (const f of batch) {
+              failed.push({ file_name: String(f && f.name || ""), error: errTxt });
+            }
+          }
         }
-        const out = await apiForm("/api/gwas-upload", fd, 300000);
-        const uploaded = Array.isArray(out.uploaded) ? out.uploaded : [];
-        const failed = Array.isArray(out.failed) ? out.failed : [];
-        const upN = Number(out.uploaded_count || uploaded.length || 0);
-        const failN = Number(out.failed_count || failed.length || 0);
-        const first = uploaded.length > 0 ? uploaded[0] : null;
+        const upN = uploaded.length;
+        const failN = failed.length;
+        const first = upN > 0 ? uploaded[0] : null;
         const det = first ? (first.detected || {}) : {};
         let text = `Uploaded ${upN}/${files.length} file(s)`;
         if (failN > 0) {
@@ -3154,18 +3309,12 @@ def _html_page() -> str:
         if (first) {
           text += ` | chr=${String(det.chr || "")}, pos=${String(det.pos || "")}, p=${String(det.pvalue || "")}, rows=${Number(first.n_rows || 0)}`;
         }
-        if (msg) {
-          msg.textContent = text;
-        }
-        const hid = String(
-          (first && first.history_id) || out.history_id || ""
-        ).trim();
+        if (msg) msg.textContent = text;
+        const hid = String((first && first.history_id) || "").trim();
         await loadHistory();
         if (hid) {
           const row = gwasRows.find((r) => String(r.history_id || "") === hid);
-          if (row) {
-            await selectHistoryRow(row);
-          }
+          if (row) await selectHistoryRow(row);
         }
         if (fileEl) fileEl.value = "";
       } catch (e) {
@@ -3651,12 +3800,6 @@ def _make_handler(state: WebUIState):
             ctype = str(self.headers.get("Content-Type", "")).strip()
             if "multipart/form-data" not in ctype.lower():
                 raise ValueError("Content-Type must be multipart/form-data.")
-            m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype, re.IGNORECASE)
-            if m is None:
-                raise ValueError("multipart boundary is missing.")
-            boundary_txt = str(m.group(1) or m.group(2) or "").strip()
-            if boundary_txt == "":
-                raise ValueError("multipart boundary is empty.")
             try:
                 n = int(str(self.headers.get("Content-Length", "0")).strip())
             except Exception:
@@ -3664,55 +3807,7 @@ def _make_handler(state: WebUIState):
             raw = self.rfile.read(max(0, n))
             if not raw:
                 return {}
-            boundary = ("--" + boundary_txt).encode("utf-8", errors="ignore")
-            parts = raw.split(boundary)
-            out: dict[str, Any] = {}
-
-            def _put(name: str, value: Any) -> None:
-                if name not in out:
-                    out[name] = value
-                    return
-                cur = out.get(name)
-                if isinstance(cur, list):
-                    cur.append(value)
-                    out[name] = cur
-                else:
-                    out[name] = [cur, value]
-
-            for part in parts:
-                chunk = part.strip(b"\r\n")
-                if (not chunk) or chunk == b"--":
-                    continue
-                if chunk.endswith(b"--"):
-                    chunk = chunk[:-2]
-                head_blob, sep, body = chunk.partition(b"\r\n\r\n")
-                if sep == b"":
-                    continue
-                if body.endswith(b"\r\n"):
-                    body = body[:-2]
-                headers: dict[str, str] = {}
-                for line in head_blob.decode("utf-8", errors="replace").split("\r\n"):
-                    if ":" not in line:
-                        continue
-                    k, v = line.split(":", 1)
-                    headers[k.strip().lower()] = v.strip()
-                disp = str(headers.get("content-disposition", ""))
-                n_m = re.search(r'name="([^"]+)"', disp)
-                if n_m is None:
-                    continue
-                name = str(n_m.group(1) or "").strip()
-                if name == "":
-                    continue
-                f_m = re.search(r'filename="([^"]*)"', disp)
-                if f_m is not None:
-                    _put(name, {
-                        "filename": str(f_m.group(1) or ""),
-                        "content_type": str(headers.get("content-type", "")),
-                        "data": bytes(body),
-                    })
-                else:
-                    _put(name, body.decode("utf-8", errors="replace"))
-            return out
+            return _parse_multipart_form_data(ctype, raw)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)

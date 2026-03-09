@@ -1710,6 +1710,7 @@ def list_gwas_history_rows(limit: int = 500) -> list[dict[str, Any]]:
                     "history_id": history_id,
                     "run_id": run_id,
                     "created_at": created_at,
+                    "source": str(args_data.get("source", "")).strip(),
                     "genotype": genotype,
                     "phenotype": pheno,
                     "model": model,
@@ -1733,12 +1734,15 @@ def list_gwas_history_rows(limit: int = 500) -> list[dict[str, Any]]:
         dedup: list[dict[str, Any]] = []
         seen_keys: set[tuple[str, ...]] = set()
         for row in out:
+            src = str(row.get("source", "")).strip().lower()
             gm = str(row.get("genofile_md5", "")).strip()
             pm = str(row.get("phenofile_md5", "")).strip()
             pheno = str(row.get("phenotype", "")).strip()
             model = str(row.get("model", "")).strip()
             gtype = str(row.get("genotype_type", "")).strip()
-            if gm != "" and pm != "" and pheno != "" and model != "" and gtype != "":
+            if src in {"webui-upload", "jx-load-gwas"}:
+                key = (f"__history__{str(row.get('history_id', ''))}",)
+            elif gm != "" and pm != "" and pheno != "" and model != "" and gtype != "":
                 key = (gm, pm, pheno, model, gtype)
             else:
                 key = (f"__history__{str(row.get('history_id', ''))}",)

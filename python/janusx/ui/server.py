@@ -3278,6 +3278,7 @@ def _html_page() -> str:
         const BATCH_SIZE = 4;
         let uploaded = [];
         let failed = [];
+        let recvTotal = 0;
         for (let i = 0; i < files.length; i += BATCH_SIZE) {
           const batch = files.slice(i, i + BATCH_SIZE);
           if (msg) msg.textContent = `Uploading ${Math.min(i + 1, files.length)}-${Math.min(i + batch.length, files.length)}/${files.length} ...`;
@@ -3287,6 +3288,8 @@ def _html_page() -> str:
             const out = await apiForm("/api/gwas-upload", fd, 1200000);
             const up = Array.isArray(out.uploaded) ? out.uploaded : [];
             const fl = Array.isArray(out.failed) ? out.failed : [];
+            const recvN = Number(out.received_count || batch.length || 0);
+            if (Number.isFinite(recvN) && recvN > 0) recvTotal += recvN;
             uploaded = uploaded.concat(up);
             failed = failed.concat(fl);
           } catch (eBatch) {
@@ -3301,6 +3304,7 @@ def _html_page() -> str:
         const first = upN > 0 ? uploaded[0] : null;
         const det = first ? (first.detected || {}) : {};
         let text = `Uploaded ${upN}/${files.length} file(s)`;
+        if (Number.isFinite(recvTotal) && recvTotal > 0) text += `, received=${recvTotal}`;
         if (failN > 0) {
           const e0 = String((failed[0] && failed[0].error) ? failed[0].error : "").trim();
           text += `, failed ${failN}`;
@@ -3924,13 +3928,20 @@ def _make_handler(state: WebUIState):
                         return ""
                     return str(x or "").strip()
 
-                raw_items = form.get("file")
-                if isinstance(raw_items, list):
-                    file_items = [x for x in raw_items if isinstance(x, dict)]
-                elif isinstance(raw_items, dict):
-                    file_items = [raw_items]
-                else:
-                    file_items = []
+                def _as_file_items(v: Any) -> list[dict[str, Any]]:
+                    if isinstance(v, dict):
+                        return [v]
+                    if isinstance(v, list):
+                        out: list[dict[str, Any]] = []
+                        for x in v:
+                            if isinstance(x, dict):
+                                out.append(x)
+                        return out
+                    return []
+
+                file_items: list[dict[str, Any]] = []
+                for key in ("file", "file[]", "files", "files[]"):
+                    file_items.extend(_as_file_items(form.get(key)))
                 if len(file_items) == 0:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing file field"})
                     return
@@ -4009,11 +4020,12 @@ def _make_handler(state: WebUIState):
 
                 self._send_json(
                     HTTPStatus.OK,
-                    {
-                        "ok": len(failed) == 0,
-                        "uploaded_count": int(len(uploaded)),
-                        "failed_count": int(len(failed)),
-                        "uploaded": uploaded,
+                        {
+                            "ok": len(failed) == 0,
+                            "received_count": int(len(file_items)),
+                            "uploaded_count": int(len(uploaded)),
+                            "failed_count": int(len(failed)),
+                            "uploaded": uploaded,
                         "failed": failed,
                         "history_id": str(uploaded[0].get("history_id", "")),
                     },

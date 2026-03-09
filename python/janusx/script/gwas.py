@@ -512,13 +512,16 @@ def fastplot(
 
         # Align QQ with Manhattan:
         # - QQ ylim follows Manhattan ylim
-        # - QQ xlim keeps QQ auto/adaptive range
+        # - QQ xlim always starts from 0
         manh_ymin, manh_ymax = axes["B"].get_ylim()
         qq_xmin, qq_xmax = axes["C"].get_xlim()
         axes["C"].set_ylim(manh_ymin, manh_ymax)
         if np.isfinite(qq_xmin) and np.isfinite(qq_xmax) and qq_xmax > qq_xmin:
-            x_pad = max(1e-9, 0.02 * float(qq_xmax - qq_xmin))
-            axes["C"].set_xlim(qq_xmin - x_pad, qq_xmax + x_pad)
+            x_right = max(1.0, float(qq_xmax))
+            x_pad = max(1e-9, 0.02 * x_right)
+            axes["C"].set_xlim(0.0, x_right + x_pad)
+        else:
+            axes["C"].set_xlim(0.0, 1.0)
 
         fig.tight_layout()
         fig.savefig(outpdf, transparent=False, facecolor="white")

@@ -1128,11 +1128,31 @@ def load_phenotype(
         raise ValueError(msg)
 
     if ncol is not None:
-        if len(ncol) == 0 or np.min(ncol) >= pheno.shape[1]:
-            msg = "Phenotype column index out of range."
+        requested_ncol = [int(i) for i in ncol]
+        valid_ncol = [i for i in requested_ncol if 0 <= int(i) < int(pheno.shape[1])]
+        invalid_ncol = [i for i in requested_ncol if i not in valid_ncol]
+        if len(requested_ncol) == 0:
+            msg = (
+                "No phenotype column index was provided for -n/--ncol. "
+                "Use zero-based indices, e.g. -n 0 -n 3."
+            )
             logger.error(msg)
             raise ValueError(msg)
-        ncol = [i for i in ncol if i in range(pheno.shape[1])]
+        if len(valid_ncol) == 0:
+            max_idx = int(pheno.shape[1]) - 1
+            msg = (
+                "Phenotype column index out of range. "
+                f"requested={requested_ncol}, valid=[0..{max_idx}]"
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+        if len(invalid_ncol) > 0:
+            max_idx = int(pheno.shape[1]) - 1
+            logger.warning(
+                "Ignoring out-of-range phenotype indices: "
+                f"{invalid_ncol}. valid=[0..{max_idx}]"
+            )
+        ncol = [int(i) for i in valid_ncol]
         selected_ncol = [int(i) for i in ncol]
         _log_info(
             logger,
@@ -3625,7 +3645,7 @@ def parse_args():
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
-        "-n", "--ncol", action="extend", nargs="*",
+        "-n", "--ncol", action="extend", nargs="+",
         default=None, type=int,
         help="Zero-based phenotype column indices to analyze. "
              'E.g., "-n 0 -n 3" to analyze the 1st and 4th traits '

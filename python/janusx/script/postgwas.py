@@ -1374,6 +1374,14 @@ def _clean_anno_token(value: object) -> str:
     if pd.isna(value):
         return "NA"
     text = str(value).strip()
+    # Normalize simple serialized list-like wrappers, e.g. "['geneA']".
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if inner != "" and "," not in inner:
+            text = inner
+    if len(text) >= 2 and ((text[0] == "'" and text[-1] == "'") or (text[0] == '"' and text[-1] == '"')):
+        text = text[1:-1].strip()
+    text = re.sub(r"\s+", " ", text)
     if text == "" or text.lower() == "nan":
         return "NA"
     return text
@@ -1393,10 +1401,10 @@ def _merge_anno_value(base: str, value: str) -> str:
 def _format_gene_annotation_dict(hits: pd.DataFrame) -> str:
     """
     Format annotation hits as:
-      {gene1:[description,additionaldesc], gene2:[description,additionaldesc]}
+      gene1:description/additionaldesc;gene2:description/additionaldesc
     """
     if hits is None or hits.shape[0] == 0:
-        return "{}"
+        return "NA"
     out: dict[str, list[str]] = {}
     for _, row in hits.iterrows():
         gene = _clean_anno_token(row.iloc[3] if hits.shape[1] > 3 else "NA")
@@ -1407,7 +1415,11 @@ def _format_gene_annotation_dict(hits: pd.DataFrame) -> str:
         else:
             out[gene][0] = _merge_anno_value(out[gene][0], desc)
             out[gene][1] = _merge_anno_value(out[gene][1], add_desc)
-    return str(out)
+    if len(out) == 0:
+        return "NA"
+    return ";".join(
+        [f"{gene}:{vals[0]}/{vals[1]}" for gene, vals in out.items()]
+    )
 
 
 def _format_clump_sites(sites: list[tuple[str, int]]) -> str:
@@ -3102,12 +3114,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 anno = readanno(args.anno, args.descItem, gff_data=gff_query_cache.gff)
             else:
                 anno = readanno(args.anno, args.descItem)
-            anno_chr = anno[0].astype(str)
+            anno_chr = anno[0].astype(str).map(_normalize_chr)
 
             # Exact overlap annotation
             desc_exact = [
                 anno.loc[
-                    (anno_chr == str(idx[0]))
+                    (anno_chr == _normalize_chr(idx[0]))
                     & (anno[1] <= idx[1])
                     & (anno[2] >= idx[1])
                 ]
@@ -3123,7 +3135,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 kb = args.annobroaden * 1_000
                 desc_broad = [
                     anno.loc[
-                        (anno_chr == str(idx[0]))
+                        (anno_chr == _normalize_chr(idx[0]))
                         & (anno[1] <= idx[1] + kb)
                         & (anno[2] >= idx[1] - kb)
                     ]

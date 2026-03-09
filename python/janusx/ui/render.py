@@ -2083,7 +2083,7 @@ def render_merged_manhattan_svg(
                     selected_keys = inter
 
         ref_row = series[0]["row"] if len(series) > 0 else rows[0]
-        ld_r2, _ld_keys, ld_msg = _compute_ld_r2(
+        ld_r2, ld_keys, ld_msg = _compute_ld_r2(
             ref_row,
             brs,
             selected_keys=selected_keys,

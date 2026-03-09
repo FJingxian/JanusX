@@ -325,6 +325,54 @@ def _genotype_input_md5(genofile: str, genofile_kind: str) -> str:
     return _file_md5(genofile)
 
 
+def _file_stat_fingerprint(path: str) -> str:
+    """
+    Fast file fingerprint based on metadata only (size + mtime_ns).
+    Avoids full-file MD5 scan for large inputs in GWAS run recording.
+    """
+    p = Path(str(path or "")).expanduser()
+    if (not p.exists()) or (not p.is_file()):
+        return ""
+    try:
+        st = p.stat()
+        mtime_ns = int(getattr(st, "st_mtime_ns", int(float(st.st_mtime) * 1_000_000_000)))
+        return f"stat:size={int(st.st_size)};mtime_ns={mtime_ns}"
+    except Exception:
+        return ""
+
+
+def _genotype_input_stat_fingerprint(genofile: str, genofile_kind: str) -> str:
+    """
+    Fast genotype-input fingerprint:
+      - bfile: combine (bed,bim,fam) basename + size + mtime_ns
+      - others: file size + mtime_ns
+    """
+    kind = _normalize_genofile_kind(genofile_kind, genofile)
+    if kind == "bfile":
+        base = str(genofile or "").strip()
+        files = [
+            Path(f"{base}.bed").expanduser(),
+            Path(f"{base}.bim").expanduser(),
+            Path(f"{base}.fam").expanduser(),
+        ]
+        if not all(p.exists() and p.is_file() for p in files):
+            return ""
+        parts: list[str] = []
+        try:
+            for p in files:
+                st = p.stat()
+                mtime_ns = int(
+                    getattr(st, "st_mtime_ns", int(float(st.st_mtime) * 1_000_000_000))
+                )
+                parts.append(
+                    f"{p.name}:size={int(st.st_size)};mtime_ns={mtime_ns}"
+                )
+            return "bfile-stat:" + "|".join(parts)
+        except Exception:
+            return ""
+    return _file_stat_fingerprint(genofile)
+
+
 def upsert_postgwas_run(
     *,
     history_id: str,
@@ -496,10 +544,12 @@ def record_gwas_run(
 ) -> Path:
     """
     Record one GWAS CLI run into the shared JanusX DB.
+    For speed, run-level input fingerprints use file metadata (size+mtime)
+    instead of full-file MD5 scan.
     """
     kind_norm = _normalize_genofile_kind(genofile_kind, genofile)
-    g_md5 = str(genofile_md5 or "").strip() or _genotype_input_md5(genofile, kind_norm)
-    p_md5 = str(phenofile_md5 or "").strip() or _file_md5(phenofile)
+    g_md5 = str(genofile_md5 or "").strip() or _genotype_input_stat_fingerprint(genofile, kind_norm)
+    p_md5 = str(phenofile_md5 or "").strip() or _file_stat_fingerprint(phenofile)
     db_path = resolve_db_path()
     conn = _connect(db_path)
     try:

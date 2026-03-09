@@ -15,6 +15,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -232,6 +233,160 @@ class WebUIState:
         self._chrom_cache: dict[str, tuple[float, list[str]]] = {}
         self._sig_cache: dict[str, dict[str, Any]] = {}
         self._history_error: str = ""
+        self._startup_cleanup_report: dict[str, Any] = {
+            "scanned": 0,
+            "removed": 0,
+            "removed_missing_genotype": 0,
+            "removed_missing_result": 0,
+            "error": "",
+        }
+        try:
+            self._startup_cleanup_report = self._cleanup_gwas_history_db_startup()
+        except Exception as exc:
+            self._startup_cleanup_report["error"] = str(exc)
+
+    def startup_cleanup_report(self) -> dict[str, Any]:
+        return dict(self._startup_cleanup_report)
+
+    def _run_base_dirs(self, run_row: dict[str, Any]) -> list[Path]:
+        bases: list[Path] = []
+        for p in [Path.cwd(), self.root_dir, self.db_path.parent]:
+            if p not in bases:
+                bases.append(p)
+        for key in ("outprefix", "log_file", "phenofile", "genofile"):
+            v = str(run_row.get(key, "")).strip()
+            if v == "":
+                continue
+            try:
+                parent = Path(v).expanduser().parent.resolve()
+            except Exception:
+                parent = Path(v).expanduser().parent
+            if parent not in bases:
+                bases.append(parent)
+        return bases
+
+    @staticmethod
+    def _resolve_bfile_prefix(prefix: str, base_dirs: list[Path]) -> str:
+        txt = str(prefix or "").strip()
+        if txt == "":
+            return ""
+        base = Path(txt).expanduser()
+        candidates: list[Path] = []
+        if base.is_absolute():
+            candidates.append(base)
+        else:
+            candidates.append(base)
+            for bd in base_dirs:
+                try:
+                    candidates.append((bd / base).expanduser())
+                except Exception:
+                    continue
+        for cand in candidates:
+            bed = Path(f"{cand}.bed")
+            bim = Path(f"{cand}.bim")
+            fam = Path(f"{cand}.fam")
+            if bed.exists() and bim.exists() and fam.exists():
+                try:
+                    return str(cand.resolve())
+                except Exception:
+                    return str(cand)
+        return ""
+
+    def _has_valid_genotype(self, run_row: dict[str, Any], base_dirs: list[Path]) -> bool:
+        gfile = str(run_row.get("genofile", "")).strip()
+        gkind = str(run_row.get("genofile_kind", "")).strip().lower()
+        if gfile == "":
+            return False
+        if gkind == "bfile":
+            return self._resolve_bfile_prefix(gfile, base_dirs) != ""
+        return _resolve_existing_path(gfile, base_dirs) != ""
+
+    def _has_valid_result_file(self, run_row: dict[str, Any], base_dirs: list[Path]) -> bool:
+        summary_rows = run_row.get("summary_rows", [])
+        if isinstance(summary_rows, list):
+            for srow in summary_rows:
+                if not isinstance(srow, dict):
+                    continue
+                rf = str(srow.get("result_file", "")).strip()
+                if rf == "":
+                    continue
+                if _resolve_existing_path(rf, base_dirs) != "":
+                    return True
+        result_files = run_row.get("result_files", [])
+        if isinstance(result_files, list):
+            for rf in result_files:
+                p = str(rf or "").strip()
+                if p == "":
+                    continue
+                if _resolve_existing_path(p, base_dirs) != "":
+                    return True
+        return False
+
+    def _cleanup_gwas_history_db_startup(self) -> dict[str, Any]:
+        report: dict[str, Any] = {
+            "scanned": 0,
+            "removed": 0,
+            "removed_missing_genotype": 0,
+            "removed_missing_result": 0,
+            "error": "",
+        }
+        if not self.db_path.exists():
+            return report
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        try:
+            rows = conn.execute(
+                """
+                SELECT run_id, genofile, genofile_kind, phenofile, outprefix, log_file,
+                       result_files_json, summary_json
+                FROM gwas_runs
+                """
+            ).fetchall()
+            for row in rows:
+                run_id = str(row[0] or "").strip()
+                if run_id == "":
+                    continue
+                run_row: dict[str, Any] = {
+                    "run_id": run_id,
+                    "genofile": str(row[1] or ""),
+                    "genofile_kind": str(row[2] or ""),
+                    "phenofile": str(row[3] or ""),
+                    "outprefix": str(row[4] or ""),
+                    "log_file": str(row[5] or ""),
+                    "result_files": [],
+                    "summary_rows": [],
+                }
+                try:
+                    rf = json.loads(str(row[6] or "[]"))
+                    if isinstance(rf, list):
+                        run_row["result_files"] = rf
+                except Exception:
+                    pass
+                try:
+                    sr = json.loads(str(row[7] or "[]"))
+                    if isinstance(sr, list):
+                        run_row["summary_rows"] = sr
+                except Exception:
+                    pass
+                report["scanned"] = int(report["scanned"]) + 1
+                base_dirs = self._run_base_dirs(run_row)
+                missing_geno = not self._has_valid_genotype(run_row, base_dirs)
+                missing_result = not self._has_valid_result_file(run_row, base_dirs)
+                if not missing_geno and not missing_result:
+                    continue
+                conn.execute("DELETE FROM gwas_runs WHERE run_id = ?", (run_id,))
+                conn.execute(
+                    "DELETE FROM postgwas_runs WHERE run_id = ? OR history_id LIKE ?",
+                    (run_id, f"{run_id}|%"),
+                )
+                report["removed"] = int(report["removed"]) + 1
+                if missing_geno:
+                    report["removed_missing_genotype"] = int(report["removed_missing_genotype"]) + 1
+                if missing_result:
+                    report["removed_missing_result"] = int(report["removed_missing_result"]) + 1
+            conn.commit()
+        finally:
+            conn.close()
+        return report
 
     def list_anno_files(self) -> list[dict[str, Any]]:
         rows = list_annotation_registry(limit=500)
@@ -3080,6 +3235,7 @@ def main() -> None:
     root = Path(args.root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     state = WebUIState(root)
+    cleanup = state.startup_cleanup_report()
 
     handler = _make_handler(state)
     server = ThreadingHTTPServer((args.host, int(args.port)), handler)
@@ -3089,6 +3245,14 @@ def main() -> None:
     url = f"http://{url_host}:{args.port}/"
 
     print(f"JanusX WebUI root: {root}")
+    if str(cleanup.get("error", "")).strip() != "":
+        print(f"WebUI preflight cleanup warning: {cleanup['error']}")
+    elif int(cleanup.get("removed", 0)) > 0:
+        print(
+            "WebUI preflight cleanup: removed "
+            f"{int(cleanup.get('removed', 0))} invalid GWAS history run(s) "
+            "(missing result/genotype files)."
+        )
     print(f"Serving on: {url}")
     print("Press Ctrl+C to stop.")
 

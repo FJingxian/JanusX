@@ -192,6 +192,22 @@ def _log_rust_filter_summary(
         logger.info(f"Filter[{stage}]: kept {kept}, removed {removed}")
 
 
+def _mute_stdout_info_logs(
+    logger: logging.Logger,
+) -> list[tuple[logging.Handler, int]]:
+    muted: list[tuple[logging.Handler, int]] = []
+    for h in logger.handlers:
+        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
+            muted.append((h, h.level))
+            h.setLevel(logging.WARNING)
+    return muted
+
+
+def _restore_handler_levels(muted: list[tuple[logging.Handler, int]]) -> None:
+    for h, level in muted:
+        h.setLevel(level)
+
+
 def configure_export_format(output_format: str) -> None:
     output_format = output_format.lower()
     mpl.rcParams["pdf.fonttype"] = 42
@@ -1680,47 +1696,60 @@ def main() -> None:
 
     raw_df: pd.DataFrame
     smooth_df: pd.DataFrame
+    preprocess_muted_handlers: list[tuple[logging.Handler, int]] = []
+    if use_spinner:
+        preprocess_muted_handlers = _mute_stdout_info_logs(logger)
     if len(input_files) == 1:
-        with CliStatus("Preprocessing BSA table...", enabled=use_spinner) as task:
-            try:
-                raw_df, smooth_df = preprocess_single_table(
-                    table_path=input_files[0],
-                    bulk1=args.bulk1,
-                    bulk2=args.bulk2,
-                    total_dp_threshold=args.total_dp,
-                    min_dp=args.min_dp,
-                    min_gq=args.min_gq,
-                    ref_allele_freq=args.ref_allele_freq,
-                    depth_difference=args.depth_difference,
-                    window_mb=args.window,
-                    step_mb=args.step,
-                    ed_power=args.ed_power,
-                    logger=logger,
-                )
-            except Exception:
-                task.fail("Preprocessing BSA table ...Failed")
-                raise
-            task.complete("Preprocessing BSA table ...Finished")
+        try:
+            with CliStatus("Preprocessing BSA table...", enabled=use_spinner) as task:
+                try:
+                    raw_df, smooth_df = preprocess_single_table(
+                        table_path=input_files[0],
+                        bulk1=args.bulk1,
+                        bulk2=args.bulk2,
+                        total_dp_threshold=args.total_dp,
+                        min_dp=args.min_dp,
+                        min_gq=args.min_gq,
+                        ref_allele_freq=args.ref_allele_freq,
+                        depth_difference=args.depth_difference,
+                        window_mb=args.window,
+                        step_mb=args.step,
+                        ed_power=args.ed_power,
+                        logger=logger,
+                    )
+                except Exception:
+                    task.fail("Preprocessing BSA table ...Failed")
+                    raise
+                task.complete("Preprocessing BSA table ...Finished")
+        finally:
+            _restore_handler_levels(preprocess_muted_handlers)
     else:
-        raw_df, smooth_df = preprocess_tables_parallel(
-            input_files=input_files,
-            worker_count=worker_count,
-            bulk1=args.bulk1,
-            bulk2=args.bulk2,
-            total_dp_threshold=args.total_dp,
-            min_dp=args.min_dp,
-            min_gq=args.min_gq,
-            ref_allele_freq=args.ref_allele_freq,
-            depth_difference=args.depth_difference,
-            window_mb=args.window,
-            step_mb=args.step,
-            ed_power=args.ed_power,
-            logger=logger,
-            use_spinner=use_spinner,
-            bulk1_name=bulk1_name,
-            bulk2_name=bulk2_name,
-            deltaindex_name=deltaindex_name,
-        )
+        try:
+            raw_df, smooth_df = preprocess_tables_parallel(
+                input_files=input_files,
+                worker_count=worker_count,
+                bulk1=args.bulk1,
+                bulk2=args.bulk2,
+                total_dp_threshold=args.total_dp,
+                min_dp=args.min_dp,
+                min_gq=args.min_gq,
+                ref_allele_freq=args.ref_allele_freq,
+                depth_difference=args.depth_difference,
+                window_mb=args.window,
+                step_mb=args.step,
+                ed_power=args.ed_power,
+                logger=logger,
+                use_spinner=use_spinner,
+                bulk1_name=bulk1_name,
+                bulk2_name=bulk2_name,
+                deltaindex_name=deltaindex_name,
+            )
+        finally:
+            _restore_handler_levels(preprocess_muted_handlers)
+
+    logger.info(f"Filter details saved in log: {log_path}")
+    if use_spinner:
+        print_success("Filter details saved in log file.")
 
     raw_df, smooth_df = reoffset_global_chr_positions(raw_df, smooth_df)
     raw_df, smooth_df = filter_low_loci_contigs(raw_df, smooth_df, logger)

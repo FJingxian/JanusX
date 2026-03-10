@@ -8,6 +8,7 @@ mod bsa;
 mod gfcore;
 mod gfreader;
 mod gmerge;
+mod gwasio;
 mod linalg;
 mod lmm;
 mod logreg;
@@ -23,6 +24,7 @@ use gfreader::{
     VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
+use gwasio::load_gwas_triplet_fast;
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use logreg::fit_best_and_not_py;
 // ============================================================
@@ -42,6 +44,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
+    m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;

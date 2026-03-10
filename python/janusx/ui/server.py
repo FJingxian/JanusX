@@ -1167,6 +1167,7 @@ class WebUIState:
         history_ids: list[str],
         *,
         bimrange: Any = "",
+        threshold: Any = "auto",
         manh_ratio: Any = 2.0,
         manh_palette: str = "auto",
         manh_alpha: Any = 0.7,
@@ -1186,6 +1187,7 @@ class WebUIState:
             svg, info = render_merged_manhattan_svg(
                 rows,
                 bimrange_text=bimrange,
+                threshold=threshold,
                 manh_ratio=manh_ratio,
                 manh_palette=str(manh_palette or "auto"),
                 manh_alpha=manh_alpha,
@@ -2042,8 +2044,9 @@ def _html_page() -> str:
     .left-card { display:flex; flex-direction:column; min-height:0; }
     .left-top { flex:1 1 50%; min-height:0; display:flex; flex-direction:column; overflow:auto; }
     .left-bottom { flex:1 1 50%; min-height:0; display:flex; flex-direction:column; margin-top:10px; border-top:1px solid var(--line); padding-top:10px; overflow:hidden; }
-    .right-card { display:grid; grid-template-rows: 3fr 1fr; gap: 10px; min-height:0; }
+    .right-card { display:flex; flex-direction:column; min-height:0; }
     .viz-pane, .ctrl-pane { min-height:0; display:flex; flex-direction:column; }
+    .viz-pane { flex:1 1 auto; }
     h1 { margin:0 0 8px; font-size: 20px; }
     h2 { margin:10px 0 6px; font-size: 14px; }
     .sub { color: var(--muted); margin-bottom: 10px; font-size: 12px; }
@@ -2078,6 +2081,17 @@ def _html_page() -> str:
     .anno-card { margin-top:10px; border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; }
     .anno-card h2 { margin:0 0 6px; font-size:13px; }
     .ctrl-actions { margin-top:auto; justify-content:flex-end; align-items:flex-end; gap:8px; margin-bottom:0; }
+    .params-card {
+      display:flex;
+      flex-direction:column;
+      flex:1 1 auto;
+      min-height:0;
+    }
+    .left-bottom .params-card .style-scroll {
+      flex:1 1 auto;
+      min-height:140px;
+      max-height:none;
+    }
     .style-scroll {
       margin-top:2px;
       border:1px solid var(--line);
@@ -2089,6 +2103,61 @@ def _html_page() -> str:
       overflow-x:hidden;
       background:#fff;
     }
+    .style-grid {
+      display:grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap:6px;
+    }
+    .style-card {
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:6px;
+      background:#f8fafc;
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      gap:5px;
+    }
+    .style-head {
+      color: var(--muted);
+      font-size:12px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      flex:1 1 auto;
+      min-width:0;
+    }
+    .style-head-row {
+      display:flex;
+      align-items:center;
+      gap:6px;
+      min-width:0;
+    }
+    .style-close {
+      flex:0 0 auto;
+      width:20px;
+      height:20px;
+      padding:0;
+      border-radius:50%;
+      border:1px solid #cbd5e1;
+      background:#ffffff;
+      color:#64748b;
+      font-size:14px;
+      line-height:18px;
+      font-weight:700;
+      cursor:pointer;
+    }
+    .style-close:hover {
+      border-color:#94a3b8;
+      color:#334155;
+    }
+    .style-ctrl {
+      display:flex;
+      align-items:center;
+      gap:4px;
+      min-width:0;
+    }
+    .style-ctrl input, .style-ctrl select { height:30px; }
     .action-btn { background:#334155 !important; color:#fff !important; border:0; width:auto; min-width:96px; font-weight:600; font-size:13px; letter-spacing:0; }
     .search-box { position:relative; flex:3 1 50%; width:50%; }
     .search-box .search-icon {
@@ -2103,7 +2172,10 @@ def _html_page() -> str:
     }
     .search-box input { width:100%; padding-left:26px; }
     .composite-svg { width:100%; height:auto; display:block; background:#fff; }
-    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: 1fr; }
+      .style-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -2127,40 +2199,69 @@ def _html_page() -> str:
               <tbody id="history_tbody"></tbody>
             </table>
           </div>
-          <div class="anno-card">
-            <h2>Annotation</h2>
-            <div class="toolbar">
-              <select id="anno_sel" style="flex:1 1 auto;">
-                <option value="">(No annotation)</option>
-              </select>
-              <button id="anno_start_btn" class="action-btn" style="min-width:88px;">Start</button>
-              <span id="anno_msg" class="muted"></span>
-            </div>
-          </div>
           <div id="left_msg" class="muted" style="margin-top:8px;"></div>
         </div>
         <div class="left-bottom">
-          <div class="toolbar" style="margin-bottom:4px; gap:6px;">
-            <input id="sig_thr" value="auto" title="P threshold (auto≈100k)" placeholder="auto" style="flex:1 1 25%; width:25%;"/>
-            <div class="search-box">
-              <span class="search-icon">🔍</span>
-              <input id="sig_search" placeholder="search all sites (chr/pos/gene)"/>
+          <div class="anno-card params-card" style="margin-top:0;">
+            <h2>Realtime Parameters</h2>
+            <select id="anno_sel" style="display:none;">
+              <option value="">(No annotation)</option>
+            </select>
+            <span id="anno_msg" class="muted" style="display:none;"></span>
+            <div class="toolbar" style="margin-top:2px; gap:4px; align-items:center; flex-wrap:wrap;">
+              <span class="muted" style="flex:0 0 auto; margin-right:2px;">aspect ratio</span>
+              <input
+                id="manh_ratio"
+                type="text"
+                value="2"
+                title="Manhattan width/height ratio"
+                placeholder="2"
+                style="flex:0 0 72px; width:72px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"
+              />
+              <span class="muted" style="flex:0 0 auto; margin-right:2px;">thr:</span>
+              <input
+                id="sig_thr"
+                type="text"
+                value="auto"
+                title="Significance threshold for Manhattan line (P)"
+                placeholder="auto"
+                style="flex:0 0 68px; width:68px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"
+              />
+              <input
+                id="ld_color"
+                type="color"
+                value="#4b5563"
+                title="LD/Gene color"
+                style="flex:0 0 34px; width:34px; height:34px; padding:0; border:1px solid #334155; border-radius:6px; background:#0f172a;"
+              />
+            </div>
+            <div class="toolbar" style="gap:4px; align-items:center; flex-wrap:wrap;">
+              <select id="bim_chr1" style="flex:1 1 8%;">
+                <option value="1">1</option>
+              </select>
+              <input id="bim_pos1" style="flex:1 1 16%;" placeholder="pos:pos"/>
+              <select id="bim_chr2" style="flex:1 1 8%;">
+                <option value="1">1</option>
+              </select>
+              <input id="bim_pos2" style="flex:1 1 16%;" placeholder="pos:pos"/>
+              <select id="bim_chr3" style="flex:1 1 8%;">
+                <option value="1">1</option>
+              </select>
+              <input id="bim_pos3" style="flex:1 1 16%;" placeholder="pos:pos"/>
+            </div>
+            <div class="style-scroll">
+              <div id="series_style_rows" class="style-grid"></div>
+            </div>
+            <div id="bim_msg" class="muted"></div>
+            <div class="toolbar ctrl-actions">
+              <button id="bim_apply_btn" class="action-btn">Visualizing</button>
+              <button id="download_btn" class="action-btn">Download</button>
             </div>
           </div>
-          <div class="sig-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Chr</th><th>Pos</th><th>-log10P</th><th>Gene</th>
-                </tr>
-              </thead>
-              <tbody id="sig_tbody"></tbody>
-            </table>
-          </div>
-          <div class="toolbar sig-actions">
-            <span id="sig_msg" class="muted"></span>
-            <button id="sig_copy_btn" class="action-btn" disabled>Copy</button>
-          </div>
+          <input id="sig_search" type="hidden" value=""/>
+          <div id="sig_tbody" style="display:none;"></div>
+          <span id="sig_msg" class="muted" style="display:none;"></span>
+          <button id="sig_copy_btn" class="action-btn" style="display:none;" disabled>Copy</button>
         </div>
       </div>
 
@@ -2177,56 +2278,6 @@ def _html_page() -> str:
             <span id="zoom_text" class="muted">100%</span>
           </div>
           <div id="img_preview" class="composite-wrap"><div class="muted">Waiting for selection...</div></div>
-        </div>
-        <div class="ctrl-pane">
-          <h2 style="margin-top:0;">Realtime Parameters</h2>
-          <div class="toolbar" style="margin-top:2px; gap:2px; align-items:center; flex-wrap:wrap;">
-            <span class="muted" style="flex:0 0 auto; margin-right:2px;">global</span>
-            <span class="muted" style="flex:0 0 auto; margin-right:2px;">ratio</span>
-            <input
-              id="manh_ratio"
-              type="text"
-              value="2"
-              title="Manhattan width/height ratio"
-              placeholder="2"
-              style="flex:0 0 72px; width:72px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"
-            />
-            <select id="bim_chr1" style="flex:1 1 8%;">
-              <option value="1">1</option>
-            </select>
-            <input id="bim_pos1" style="flex:1 1 16%;" placeholder="pos:pos"/>
-            <select id="bim_chr2" style="flex:1 1 8%;">
-              <option value="1">1</option>
-            </select>
-            <input id="bim_pos2" style="flex:1 1 16%;" placeholder="pos:pos"/>
-            <select id="bim_chr3" style="flex:1 1 8%;">
-              <option value="1">1</option>
-            </select>
-            <input id="bim_pos3" style="flex:1 1 16%;" placeholder="pos:pos"/>
-            <input
-              id="ld_thr"
-              type="text"
-              value=""
-              title="LD threshold (p)"
-              placeholder="auto"
-              style="flex:0 0 68px; width:68px; height:34px; padding:4px 6px; border:1px solid #334155; border-radius:6px; background:#0f172a; color:#e2e8f0;"
-            />
-            <input
-              id="ld_color"
-              type="color"
-              value="#4b5563"
-              title="LD/Gene color"
-              style="flex:0 0 34px; width:34px; height:34px; padding:0; border:1px solid #334155; border-radius:6px; background:#0f172a;"
-            />
-          </div>
-          <div class="style-scroll">
-            <div id="series_style_rows" style="display:flex; flex-direction:column; gap:4px;"></div>
-          </div>
-          <div id="bim_msg" class="muted"></div>
-          <div class="toolbar ctrl-actions">
-            <button id="bim_apply_btn" class="action-btn">Visualizing</button>
-            <button id="download_btn" class="action-btn">Download</button>
-          </div>
         </div>
       </div>
     </div>
@@ -2262,61 +2313,18 @@ def _html_page() -> str:
     let selectedHistoryIds = [];
     let selectedRow = null;
     let selectedSigRange = null;
-    let startedHistoryId = "";
-    let startedHistoryIds = [];
-    let startedAnnoPath = "";
     let lastSigRows = [];
     let lastSigSummary = "";
     let pollTimer = null;
     let sigTimer = null;
-    let startBtnSpinTimer = null;
     let styleRefreshTimer = null;
     let seriesStyleMap = {};
     const SPIN_FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
     const STYLE_DEFAULT_COLORS = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"];
     const STYLE_MARKERS = ["o",".","s","^","v","D","x","+","*"];
     const viewer = { scale: 1.0, tx: 0.0, ty: 0.0, dragging: false, dragEnabled: true, x: 0.0, y: 0.0 };
-    function _stopStartBtnSpin() {
-      if (startBtnSpinTimer) {
-        clearInterval(startBtnSpinTimer);
-        startBtnSpinTimer = null;
-      }
-    }
-    function _setStartBtnState(state) {
-      const btn = document.getElementById("anno_start_btn");
-      if (!btn) return;
-      const s = String(state || "start").toLowerCase();
-      if (s === "loading") {
-        _stopStartBtnSpin();
-        btn.disabled = true;
-        let k = 0;
-        btn.textContent = SPIN_FRAMES[k];
-        startBtnSpinTimer = setInterval(() => {
-          if (!btn) return;
-          k = (k + 1) % SPIN_FRAMES.length;
-          btn.textContent = SPIN_FRAMES[k];
-        }, 90);
-        return;
-      }
-      if (s === "loaded") {
-        _stopStartBtnSpin();
-        btn.disabled = false;
-        btn.textContent = "Loaded";
-        return;
-      }
-      _stopStartBtnSpin();
-      btn.disabled = false;
-      btn.textContent = "Start";
-    }
-    function _currentAnnoPath() {
-      const el = document.getElementById("anno_sel");
-      return String((el && el.value) ? el.value : "").trim();
-    }
     function _markStartInvalidated() {
-      startedHistoryId = "";
-      startedHistoryIds = [];
-      startedAnnoPath = "";
-      _setStartBtnState("start");
+      // no-op: start/warmup button was removed
     }
     function _normHistoryIds(ids) {
       const arr = Array.isArray(ids) ? ids : [];
@@ -2324,21 +2332,8 @@ def _html_page() -> str:
       uniq.sort();
       return uniq;
     }
-    function _sameHistorySelection(a, b) {
-      const aa = _normHistoryIds(a);
-      const bb = _normHistoryIds(b);
-      if (aa.length !== bb.length) return false;
-      for (let i = 0; i < aa.length; i++) {
-        if (aa[i] !== bb[i]) return false;
-      }
-      return true;
-    }
     function _isStartedForCurrent() {
-      return (
-        _normHistoryIds(selectedHistoryIds).length > 0
-        && _sameHistorySelection(startedHistoryIds, selectedHistoryIds)
-        && String(startedAnnoPath || "") === _currentAnnoPath()
-      );
+      return _normHistoryIds(selectedHistoryIds).length > 0;
     }
     function _isMergeMode() {
       return Array.isArray(selectedHistoryIds) && selectedHistoryIds.length > 1;
@@ -2389,13 +2384,13 @@ def _html_page() -> str:
       loadChromOptionsForSelection();
       const preview = document.getElementById("img_preview");
       if (_isMergeMode()) {
-        if (preview) preview.innerHTML = '<div class="muted">Select tasks and click Start.</div>';
-        _setText("sig_msg", "Click Start to load merged GWAS/annotation.");
-        _setText("anno_msg", `${selectedHistoryIds.length} GWAS tasks selected. Click Start.`);
+        if (preview) preview.innerHTML = '<div class="muted">Select tasks and click Visualizing.</div>';
+        _setText("sig_msg", "Click Visualizing to load merged GWAS/annotation.");
+        _setText("anno_msg", `${selectedHistoryIds.length} GWAS tasks selected.`);
       } else {
-        if (preview) preview.innerHTML = '<div class="muted">Select task and click Start.</div>';
-        _setText("sig_msg", "Click Start to load selected task.");
-        _setText("anno_msg", "Click Start to load GWAS/annotation.");
+        if (preview) preview.innerHTML = '<div class="muted">Select task and click Visualizing.</div>';
+        _setText("sig_msg", "Click Visualizing to load selected task.");
+        _setText("anno_msg", "Ready.");
       }
       renderSigTable([]);
     }
@@ -2493,23 +2488,46 @@ def _html_page() -> str:
       const ids = _currentStyleHistoryIds();
       box.innerHTML = "";
       if (ids.length === 0) {
-        box.innerHTML = '<div class="muted">Select GWAS task(s) to adjust style.</div>';
+        box.innerHTML = '<div class="muted" style="grid-column:1 / -1;">Select GWAS task(s) to adjust style.</div>';
         return;
       }
       ids.forEach((hid, idx) => {
         const st = _ensureStyleFor(hid, idx);
-        const row = document.createElement("div");
-        row.className = "toolbar";
-        row.style.gap = "6px";
-        row.style.alignItems = "center";
-        row.style.marginTop = "0";
+        const card = document.createElement("div");
+        card.className = "style-card";
+
+        const head = document.createElement("div");
+        head.className = "style-head-row";
 
         const lab = document.createElement("span");
-        lab.className = "muted";
-        lab.style.flex = "0 0 190px";
-        lab.style.width = "190px";
+        lab.className = "style-head";
         lab.textContent = _styleLabelFor(hid, idx);
-        row.appendChild(lab);
+        head.appendChild(lab);
+
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.className = "style-close";
+        closeBtn.title = "Remove this GWAS from current selection";
+        closeBtn.textContent = "×";
+        closeBtn.addEventListener("click", () => {
+          const rowNow = _rowByHistoryId(hid);
+          if (rowNow) {
+            _toggleHistoryRow(rowNow, false);
+            return;
+          }
+          selectedHistoryIds = (Array.isArray(selectedHistoryIds) ? selectedHistoryIds : [])
+            .map((x) => String(x || "").trim())
+            .filter((x) => x !== "" && x !== String(hid || "").trim());
+          _syncPrimarySelection();
+          renderHistoryTable();
+          renderSeriesStyleRows();
+          loadChromOptionsForSelection();
+        });
+        head.appendChild(closeBtn);
+        card.appendChild(head);
+
+        const ctrl = document.createElement("div");
+        ctrl.className = "style-ctrl";
 
         const c = document.createElement("input");
         c.type = "color";
@@ -2528,7 +2546,7 @@ def _html_page() -> str:
           seriesStyleMap[String(hid)] = cur;
           _triggerStyleRefresh();
         });
-        row.appendChild(c);
+        ctrl.appendChild(c);
 
         const a = document.createElement("input");
         a.type = "text";
@@ -2557,11 +2575,11 @@ def _html_page() -> str:
           if (ev.key === "Enter") _commitAlpha();
         });
         a.addEventListener("blur", _commitAlpha);
-        row.appendChild(a);
+        ctrl.appendChild(a);
 
         const mk = document.createElement("select");
         mk.title = "Marker";
-        mk.style.flex = "0 0 66px";
+        mk.style.flex = "0 0 60px";
         STYLE_MARKERS.forEach((m) => {
           const op = document.createElement("option");
           op.value = m;
@@ -2575,15 +2593,15 @@ def _html_page() -> str:
           seriesStyleMap[String(hid)] = cur;
           _triggerStyleRefresh();
         });
-        row.appendChild(mk);
+        ctrl.appendChild(mk);
 
         const sz = document.createElement("input");
         sz.type = "text";
         sz.value = String(st.size || 16);
         sz.placeholder = "size";
         sz.title = "Marker size";
-        sz.style.flex = "0 0 64px";
-        sz.style.width = "64px";
+        sz.style.flex = "0 0 58px";
+        sz.style.width = "58px";
         sz.style.height = "34px";
         sz.style.padding = "4px 6px";
         sz.style.border = "1px solid #334155";
@@ -2602,9 +2620,10 @@ def _html_page() -> str:
           if (ev.key === "Enter") _commitSize();
         });
         sz.addEventListener("blur", _commitSize);
-        row.appendChild(sz);
+        ctrl.appendChild(sz);
 
-        box.appendChild(row);
+        card.appendChild(ctrl);
+        box.appendChild(card);
       });
     }
 
@@ -2664,6 +2683,33 @@ def _html_page() -> str:
       try { j = JSON.parse(t || "{}"); } catch (_e) { j = {error: t}; }
       if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
       return j;
+    }
+
+    async function _withButtonSpinner(buttonId, busyLabel, idleLabel, workFn) {
+      const btn = document.getElementById(String(buttonId || ""));
+      let timer = null;
+      let k = 0;
+      const busy = String(busyLabel || "");
+      const idle = String(idleLabel || "");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = busy ? `${SPIN_FRAMES[0]} ${busy}` : SPIN_FRAMES[0];
+        timer = setInterval(() => {
+          k = (k + 1) % SPIN_FRAMES.length;
+          if (btn) {
+            btn.textContent = busy ? `${SPIN_FRAMES[k]} ${busy}` : SPIN_FRAMES[k];
+          }
+        }, 90);
+      }
+      try {
+        return await workFn();
+      } finally {
+        if (timer) clearInterval(timer);
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = idle;
+        }
+      }
     }
 
     function fuzzyMatch(q, s) {
@@ -3132,14 +3178,6 @@ def _html_page() -> str:
       const q = String((_sigSearchEl ? _sigSearchEl.value : "") || "").trim();
       const annoPath = String((_annoSelEl ? _annoSelEl.value : "") || "").trim();
       if (_isMergeMode()) {
-        if (!_isStartedForCurrent()) {
-          renderSigTable([]);
-          lastSigRows = [];
-          lastSigSummary = "";
-          if (copyBtn) copyBtn.disabled = true;
-          msg.textContent = "Click Start to load selected merge task.";
-          return;
-        }
         msg.textContent = "Loading threshold SNPs...";
         try {
           const out = await api("/api/gwas-history/sigsites-merged", "POST", {
@@ -3169,14 +3207,6 @@ def _html_page() -> str:
         lastSigSummary = "";
         if (copyBtn) copyBtn.disabled = true;
         msg.textContent = "Select one GWAS history row.";
-        return;
-      }
-      if (!_isStartedForCurrent()) {
-        renderSigTable([]);
-        lastSigRows = [];
-        lastSigSummary = "";
-        if (copyBtn) copyBtn.disabled = true;
-        msg.textContent = "Click Start to load selected task.";
         return;
       }
       msg.textContent = "Loading threshold SNPs...";
@@ -3340,7 +3370,7 @@ def _html_page() -> str:
         return;
       }
       const _ldColorEl = document.getElementById("ld_color");
-      const _ldThrEl = document.getElementById("ld_thr");
+      const _sigThrEl = document.getElementById("sig_thr");
       const seriesStyles = _collectSeriesStyles();
       const style0 = (seriesStyles.length > 0) ? seriesStyles[0] : { color: "auto", alpha: 0.7, marker: "o", size: 16 };
       const manhRatio = _readManhRatio();
@@ -3349,14 +3379,11 @@ def _html_page() -> str:
       const manhMarker = String(style0.marker || "o");
       const manhSize = String(style0.size || "16");
       const ldColor = String((_ldColorEl ? _ldColorEl.value : "") || "#4b5563");
-      const ldThr = String((_ldThrEl ? _ldThrEl.value : "") || "").trim();
+      const ldThr = "auto";
+      const sigThr = String((_sigThrEl ? _sigThrEl.value : "") || "auto").trim();
       const annoPath = document.getElementById("anno_sel").value || "";
       const bimranges = buildBimranges();
       if (_isMergeMode()) {
-        if (!_isStartedForCurrent()) {
-          preview.innerHTML = '<div class="muted">Select tasks and click Start.</div>';
-          return;
-        }
         preview.innerHTML = '<div class="muted">Rendering merged Manhattan...</div>';
         try {
           const out = await api("/api/gwas-history/render-merged", "POST", {
@@ -3370,6 +3397,7 @@ def _html_page() -> str:
             series_styles: seriesStyles,
             ld_color: ldColor,
             ld_p_threshold: ldThr,
+            threshold: sigThr || "auto",
             render_qq: false,
             editable_svg: false,
           });
@@ -3396,10 +3424,6 @@ def _html_page() -> str:
       }
       if (!historyId) {
         preview.innerHTML = '<div class="muted">Waiting for selection...</div>';
-        return;
-      }
-      if (!_isStartedForCurrent()) {
-        preview.innerHTML = '<div class="muted">Select task and click Start.</div>';
         return;
       }
       function buildRenderPayload(forceFull) {
@@ -3455,17 +3479,14 @@ def _html_page() -> str:
       renderHistoryTable();
       renderSeriesStyleRows();
       await loadChromOptionsForSelection();
-      document.getElementById("img_preview").innerHTML = '<div class="muted">Select task and click Start.</div>';
+      document.getElementById("img_preview").innerHTML = '<div class="muted">Select task and click Visualizing.</div>';
       renderSigTable([]);
-      _setText("sig_msg", "Click Start to load selected task.");
-      _setText("anno_msg", "Click Start to load GWAS/annotation.");
+      _setText("sig_msg", "Click Visualizing to load selected task.");
+      _setText("anno_msg", "Ready.");
     }
 
     async function refreshAllByHistory(historyId) {
-      await Promise.all([
-        refreshCompositeByHistory(historyId),
-        loadSigSites(historyId),
-      ]);
+      await refreshCompositeByHistory(historyId);
     }
 
     async function runSelected() {
@@ -3481,9 +3502,8 @@ def _html_page() -> str:
       const annoPath = document.getElementById("anno_sel").value || "";
       const bimranges = buildBimranges();
       const _ldColorEl = document.getElementById("ld_color");
-      const _ldThrEl = document.getElementById("ld_thr");
       const ldColor = String((_ldColorEl ? _ldColorEl.value : "") || "#4b5563");
-      const ldThr = String((_ldThrEl ? _ldThrEl.value : "") || "").trim();
+      const ldThr = "auto";
       msg.textContent = "Submitting...";
       await api("/api/jobs/from-gwas", "POST", {
         history_id: selectedHistoryId,
@@ -3497,41 +3517,6 @@ def _html_page() -> str:
       msg.textContent = "Submitted";
       await loadHistory();
       await refreshCompositeByHistory(selectedHistoryId);
-    }
-
-    async function startWarmup() {
-      const msg = document.getElementById("anno_msg");
-      const selIds = _normHistoryIds(selectedHistoryIds);
-      if (selIds.length === 0) {
-        msg.textContent = "Select GWAS history row(s) first";
-        return;
-      }
-      const annoPath = document.getElementById("anno_sel").value || "";
-      _setStartBtnState("loading");
-      msg.textContent = "";
-      try {
-        let out = null;
-        if (_isMergeMode()) {
-          out = await api("/api/gwas-history/start-merged", "POST", {
-            history_ids: selIds,
-            anno: annoPath,
-          });
-        } else {
-          out = await api(`/api/gwas-history/${encodeURIComponent(selectedHistoryId)}/start`, "POST", {
-            anno: annoPath,
-          });
-          await loadChromOptions(selectedHistoryId);
-        }
-        startedHistoryId = String(selectedHistoryId || "");
-        startedHistoryIds = selIds.slice();
-        startedAnnoPath = String(annoPath || "");
-        await refreshAllByHistory(selectedHistoryId);
-        _setStartBtnState("loaded");
-        msg.textContent = String(out.message || "Loaded");
-      } catch (e) {
-        _markStartInvalidated();
-        msg.textContent = String(e);
-      }
     }
 
     async function copySigTable() {
@@ -3585,20 +3570,15 @@ def _html_page() -> str:
 
     async function downloadCurrentSvg() {
       const msg = document.getElementById("bim_msg");
-      const btn = document.getElementById("download_btn");
       const selIds = Array.isArray(selectedHistoryIds) ? selectedHistoryIds.slice() : [];
       if (selIds.length === 0 && !selectedHistoryId) {
         if (msg) msg.textContent = "Select one GWAS history row first.";
         return;
       }
-      if (!_isStartedForCurrent()) {
-        if (msg) msg.textContent = "Click Start before download.";
-        return;
-      }
       const annoPath = document.getElementById("anno_sel").value || "";
       const bimranges = buildBimranges();
       const _ldColorEl = document.getElementById("ld_color");
-      const _ldThrEl = document.getElementById("ld_thr");
+      const _sigThrEl = document.getElementById("sig_thr");
       const seriesStyles = _collectSeriesStyles();
       const style0 = (seriesStyles.length > 0) ? seriesStyles[0] : { color: "auto", alpha: 0.7, marker: "o", size: 16 };
       const manhRatio = _readManhRatio();
@@ -3607,87 +3587,76 @@ def _html_page() -> str:
       const manhMarker = String(style0.marker || "o");
       const manhSize = String(style0.size || "16");
       const ldColor = String((_ldColorEl ? _ldColorEl.value : "") || "#4b5563");
-      const ldThr = String((_ldThrEl ? _ldThrEl.value : "") || "").trim();
+      const ldThr = "auto";
+      const sigThr = String((_sigThrEl ? _sigThrEl.value : "") || "auto").trim();
 
-      let timer = null;
-      let k = 0;
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = SPIN_FRAMES[0];
-        timer = setInterval(() => {
-          k = (k + 1) % SPIN_FRAMES.length;
-          if (btn) btn.textContent = SPIN_FRAMES[k];
-        }, 90);
-      }
       try {
-        let out = null;
-        if (_isMergeMode()) {
-          out = await api("/api/gwas-history/render-merged", "POST", {
-            history_ids: selIds,
-            bimrange: bimranges,
-            manh_ratio: manhRatio,
-            manh_palette: manhPalette,
-            manh_alpha: manhAlpha,
-            manh_marker: manhMarker,
-            manh_size: manhSize,
-            series_styles: seriesStyles,
-            ld_color: ldColor,
-            ld_p_threshold: ldThr,
-            render_qq: true,
-            editable_svg: true,
-          });
-        } else {
-          out = await api(`/api/gwas-history/${encodeURIComponent(selectedHistoryId)}/render`, "POST", {
-            anno: annoPath,
-            bimrange: bimranges,
-            highlight_range: selectedSigRange,
-            full: true,
-            editable_svg: true,
-            manh_ratio: manhRatio,
-            manh_palette: manhPalette,
-            manh_alpha: manhAlpha,
-            manh_marker: manhMarker,
-            manh_size: manhSize,
-            ld_color: ldColor,
-            // Download full figure: include SNPs that were filtered by on-screen LD threshold.
-            ld_p_threshold: 1.0,
-          });
-        }
-        let xml = String(out && out.svg ? out.svg : "");
-        if (xml.trim() === "") {
-          throw new Error("No SVG returned.");
-        }
-        if (!String(xml).startsWith("<?xml")) {
-          xml = '<?xml version="1.0" encoding="UTF-8"?>\\n' + xml;
-        }
-        const blob = new Blob([xml], { type: "image/svg+xml;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        let base = "postgwas";
-        let mode = (Array.isArray(bimranges) && bimranges.length > 0) ? "manhld" : "manhqq";
-        if (_isMergeMode()) {
-          base = `merged_${selIds.length}_tasks`;
-          mode = "manh";
-        } else {
-          const p = _safeNamePart((selectedRow && selectedRow.phenotype) ? selectedRow.phenotype : "postgwas");
-          const m = _safeNamePart((selectedRow && selectedRow.model) ? selectedRow.model : "plot");
-          const t = _safeNamePart((selectedRow && selectedRow.genotype_type) ? selectedRow.genotype_type : "");
-          base = t ? `${p}.${t}.${m}` : `${p}.${m}`;
-        }
-        a.href = url;
-        a.download = `${base}.full.${mode}.svg`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 3000);
+        await _withButtonSpinner("download_btn", "Downloading", "Download", async () => {
+          let out = null;
+          if (_isMergeMode()) {
+            out = await api("/api/gwas-history/render-merged", "POST", {
+              history_ids: selIds,
+              bimrange: bimranges,
+              manh_ratio: manhRatio,
+              manh_palette: manhPalette,
+              manh_alpha: manhAlpha,
+              manh_marker: manhMarker,
+              manh_size: manhSize,
+              series_styles: seriesStyles,
+              ld_color: ldColor,
+              ld_p_threshold: ldThr,
+              // Download full figure: include all Manhattan points.
+              threshold: 1.0,
+              render_qq: true,
+              editable_svg: true,
+            });
+          } else {
+            out = await api(`/api/gwas-history/${encodeURIComponent(selectedHistoryId)}/render`, "POST", {
+              anno: annoPath,
+              bimrange: bimranges,
+              highlight_range: selectedSigRange,
+              full: true,
+              editable_svg: true,
+              manh_ratio: manhRatio,
+              manh_palette: manhPalette,
+              manh_alpha: manhAlpha,
+              manh_marker: manhMarker,
+              manh_size: manhSize,
+              ld_color: ldColor,
+              // Download full figure: include SNPs that were filtered by on-screen LD threshold.
+              ld_p_threshold: 1.0,
+            });
+          }
+          let xml = String(out && out.svg ? out.svg : "");
+          if (xml.trim() === "") {
+            throw new Error("No SVG returned.");
+          }
+          if (!String(xml).startsWith("<?xml")) {
+            xml = '<?xml version="1.0" encoding="UTF-8"?>\\n' + xml;
+          }
+          const blob = new Blob([xml], { type: "image/svg+xml;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          let base = "postgwas";
+          let mode = (Array.isArray(bimranges) && bimranges.length > 0) ? "manhld" : "manhqq";
+          if (_isMergeMode()) {
+            base = `merged_${selIds.length}_tasks`;
+            mode = "manh";
+          } else {
+            const p = _safeNamePart((selectedRow && selectedRow.phenotype) ? selectedRow.phenotype : "postgwas");
+            const m = _safeNamePart((selectedRow && selectedRow.model) ? selectedRow.model : "plot");
+            const t = _safeNamePart((selectedRow && selectedRow.genotype_type) ? selectedRow.genotype_type : "");
+            base = t ? `${p}.${t}.${m}` : `${p}.${m}`;
+          }
+          a.href = url;
+          a.download = `${base}.full.${mode}.svg`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 3000);
+        });
       } catch (e) {
         if (msg) msg.textContent = String(e);
-      } finally {
-        if (timer) clearInterval(timer);
-        if (btn) {
-          btn.disabled = false;
-          btn.textContent = "Download";
-        }
       }
     }
 
@@ -3697,10 +3666,11 @@ def _html_page() -> str:
     _bindClick("zoom_reset_btn", () => _resetViewer());
     _bindClick("drag_toggle_btn", () => _setDragEnabled(!viewer.dragEnabled));
     _bindClick("gwas_upload_btn", () => uploadGwas());
-    _bindClick("bim_apply_btn", () => refreshAllByHistory(selectedHistoryId).catch((e) => {
+    _bindClick("bim_apply_btn", () => _withButtonSpinner("bim_apply_btn", "Visualizing", "Visualizing", async () => {
+      await refreshAllByHistory(selectedHistoryId);
+    }).catch((e) => {
       _setText("bim_msg", String(e));
     }));
-    _bindClick("anno_start_btn", () => startWarmup());
     _bindInput("anno_sel", "change", () => _markStartInvalidated());
     _bindClick("download_btn", () => downloadCurrentSvg());
     _bindClick("sig_copy_btn", () => copySigTable());
@@ -3712,15 +3682,15 @@ def _html_page() -> str:
       }
     });
     _bindInput("manh_ratio", "blur", () => {
-      if (!_isStartedForCurrent()) return;
+      if (_normHistoryIds(selectedHistoryIds).length === 0) return;
       refreshAllByHistory(selectedHistoryId).catch((e) => {
         _setText("bim_msg", String(e));
       });
     });
     _bindInput("sig_thr", "keydown", (ev) => {
       if (ev.key === "Enter") {
-        loadSigSites(selectedHistoryId).catch((e) => {
-          _setText("sig_msg", String(e));
+        refreshCompositeByHistory(selectedHistoryId).catch((e) => {
+          _setText("bim_msg", String(e));
         });
       }
     });
@@ -4121,12 +4091,14 @@ def _make_handler(state: WebUIState):
                 series_styles = payload.get("series_styles", None)
                 ld_color = str(payload.get("ld_color", "#4b5563")).strip()
                 ld_p_threshold = payload.get("ld_p_threshold", "auto")
+                threshold = payload.get("threshold", "auto")
                 render_qq = bool(payload.get("render_qq", True))
                 editable_svg = bool(payload.get("editable_svg", False))
                 try:
                     svg, meta = state.render_merged_history_svg(
                         [str(x).strip() for x in history_ids if str(x).strip() != ""],
                         bimrange=bimranges,
+                        threshold=threshold,
                         manh_ratio=manh_ratio,
                         manh_palette=manh_palette,
                         manh_alpha=manh_alpha,

@@ -14,6 +14,10 @@ from janusx.bioplotkit.LDBlock import LDblock
 from janusx.bioplotkit.manhanden import GWASPLOT
 from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
 from janusx.gtools.reader import readanno
+try:
+    from janusx.janusx import load_gwas_triplet_fast as _load_gwas_triplet_fast
+except Exception:
+    _load_gwas_triplet_fast = None
 
 # Keep WebUI rendering headless/stable on server side.
 mpl.use("Agg")
@@ -80,6 +84,7 @@ _TRACK_ANNO_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _ACTIVE_TASK_CACHE: dict[str, str] = {"gwas": "", "anno": ""}
 _LARGE_MATRIX_ROWS = 1_000_000
 _LARGE_MATRIX_P_THRESH = 1e-3
+_LARGE_MATRIX_LOGP_FLOOR = float(-np.log10(_LARGE_MATRIX_P_THRESH))
 _WEBUI_RASTER_DPI = 180
 _WEBUI_VECTOR_DPI = 150
 _AUTO_SIG_TARGET_POINTS = 100_000
@@ -785,7 +790,52 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
         return pd.read_csv(p, **kwargs)
 
     df: pd.DataFrame | None = None
+    rust_ok = False
     c_chr = c_pos = c_p = None
+    if _load_gwas_triplet_fast is not None:
+        try:
+            chrom_raw_l, pos_raw_l, p_raw_l, c_chr, c_pos, c_p = _load_gwas_triplet_fast(
+                str(path),
+                list(_CHROM_CANDIDATES),
+                list(_POS_CANDIDATES),
+                list(_P_CANDIDATES),
+            )
+            chrom_raw = np.asarray(chrom_raw_l, dtype=object)
+            pos_raw = np.asarray(pos_raw_l, dtype=float)
+            p_raw = np.asarray(p_raw_l, dtype=float)
+            rust_ok = True
+        except Exception:
+            rust_ok = False
+    if rust_ok:
+        mask = np.isfinite(pos_raw) & np.isfinite(p_raw) & (p_raw > 0.0) & (p_raw <= 1.0)
+        if not np.any(mask):
+            raise RuntimeError("No valid SNP rows after filtering (pos/pvalue).")
+        chrom_norm = np.asarray([_normalize_chrom(x) for x in chrom_raw[mask]], dtype=object)
+        pos_f = pos_raw[mask]
+        p_f = p_raw[mask]
+
+        pos_u = np.rint(pos_f).astype(np.int64, copy=False)
+        if pos_u.size > 0 and np.min(pos_u) >= 0 and np.max(pos_u) <= np.iinfo(np.uint32).max:
+            pos_arr = pos_u.astype(np.uint32, copy=False)
+        else:
+            pos_arr = pos_u.astype(np.int64, copy=False)
+
+        p_arr = p_f.astype(np.float32, copy=False)
+        y_arr = (-np.log10(np.clip(p_arr.astype(np.float64, copy=False), np.nextafter(0.0, 1.0), 1.0))).astype(
+            np.float32,
+            copy=False,
+        )
+
+        out = pd.DataFrame(
+            {
+                "chrom_norm": pd.Categorical(chrom_norm),
+                "pos": pos_arr,
+                "p": p_arr,
+                "y": y_arr,
+            }
+        )
+        return out, {"chr": str(c_chr), "pos": str(c_pos), "p": str(c_p)}
+
     try:
         sep_kind = _sniff_sep(path)
         head = _read_fast(path, sep_kind, nrows=0)
@@ -943,16 +993,13 @@ def _compute_x_for_segments(df: pd.DataFrame, segs: list[Segment]) -> tuple[np.n
 def _ld_bridge_x_from_index(idx: int, n_ld: int) -> float:
     """
     Bridge anchor x for LD panel.
-    Avoid top sawtooth tips (0.5-step anchors) and map to the visible
-    center band of LD diamonds.
+    Map each LD row/column index directly to the SNP center along
+    LDblock x-axis: [0.5, 1.5, ..., n-0.5].
+    This keeps transition lines aligned with Manhattan SNP order.
     """
     n = int(max(1, n_ld))
     i = int(max(0, min(int(idx), n - 1)))
-    if n <= 1:
-        return 0.5
-    if n == 2:
-        return 1.0
-    return float(1.0 + (float(i) * float(n - 2) / float(n - 1)))
+    return float(i) + 0.5
 
 
 def _compute_global_x(df: pd.DataFrame) -> tuple[np.ndarray, list[tuple[float, str]], list[float]]:
@@ -1906,6 +1953,7 @@ def render_merged_manhattan_svg(
     rows: list[dict[str, Any]],
     *,
     bimrange_text: Any = "",
+    threshold: Any = "auto",
     manh_ratio: float = 2.0,
     manh_palette: str = "auto",
     manh_alpha: float = 0.7,
@@ -1938,6 +1986,25 @@ def render_merged_manhattan_svg(
     if ld_thr > 1.0:
         ld_thr = 1.0
 
+    # Merged mode threshold:
+    # keep thr adjustable; points below threshold are rendered in light gray.
+    raw_sig_thr = str(threshold).strip().lower() if threshold is not None else ""
+    if raw_sig_thr in {"", "auto", "none", "default", "nan"}:
+        # In bimrange mode, do not enforce the default cutoff.
+        # Keep all points unless user explicitly sets `thr`.
+        sig_p_thr = 1.0 if len(brs) > 0 else float(_LARGE_MATRIX_P_THRESH)
+    else:
+        try:
+            sig_p_thr = float(threshold)
+        except Exception:
+            sig_p_thr = 1.0 if len(brs) > 0 else float(_LARGE_MATRIX_P_THRESH)
+    if (not np.isfinite(sig_p_thr)) or sig_p_thr <= 0.0 or sig_p_thr > 1.0:
+        sig_p_thr = 1.0 if len(brs) > 0 else float(_LARGE_MATRIX_P_THRESH)
+    sig_y_thr = float(-np.log10(max(float(sig_p_thr), np.nextafter(0.0, 1.0))))
+    low_sig_color = "#d1d5db"
+    # Download path uses editable SVG; when threshold is 1.0, keep all points.
+    full_point_mode = bool(editable_svg) and float(sig_p_thr) >= (1.0 - 1e-12)
+
     series: list[dict[str, Any]] = []
     all_chroms: set[str] = set()
     for i, row in enumerate(rows):
@@ -1959,6 +2026,12 @@ def render_merged_manhattan_svg(
         if int(table.shape[0]) == 0:
             continue
         draw_df = _filter_by_bimranges(table, brs) if len(brs) > 0 else table
+        if not full_point_mode:
+            # Preview path: y-axis floor is fixed at default threshold line,
+            # so drop invisible points early.
+            # points early before coordinate mapping and scatter drawing.
+            yv = draw_df["y"].to_numpy(dtype=float, copy=False)
+            draw_df = draw_df.loc[np.isfinite(yv) & (yv >= float(_LARGE_MATRIX_LOGP_FLOOR))].copy()
         if int(draw_df.shape[0]) == 0:
             continue
         lbl = _merged_series_label(row, i)
@@ -1992,8 +2065,10 @@ def render_merged_manhattan_svg(
     alpha_default = float(np.clip(_parse_float(manh_alpha, 0.7, min_value=0.0), 0.0, 1.0))
     marker = _normalize_marker(manh_marker)
     msize = _parse_float(manh_size, 16.0, min_value=0.1)
-    rasterize_main = (not bool(editable_svg))
-    fig_dpi = int(_WEBUI_RASTER_DPI if rasterize_main else _WEBUI_VECTOR_DPI)
+    # Keep scatter-heavy artists rasterized for both preview and download.
+    # Text/axes/labels remain vector in SVG output.
+    rasterize_main = True
+    fig_dpi = int(_WEBUI_RASTER_DPI)
 
     style_by_history: dict[str, dict[str, Any]] = {}
     style_by_index: dict[int, dict[str, Any]] = {}
@@ -2118,11 +2193,12 @@ def render_merged_manhattan_svg(
 
     x_left = np.inf
     x_right = -np.inf
-    y_top = 1.0
+    y_top = -np.inf
     qq_xmax = 1.0
     for i, s in enumerate(series):
         df0 = s["draw"]
         y = df0["y"].to_numpy(dtype=float, copy=False)
+        p = df0["p"].to_numpy(dtype=float, copy=False)
         if len(brs) == 0:
             chrom = df0["chrom_norm"].astype(str).to_numpy(dtype=object)
             pos = df0["pos"].to_numpy(dtype=float, copy=False)
@@ -2142,14 +2218,25 @@ def render_merged_manhattan_svg(
                 continue
             x = x_all[keep_seg]
             y = y[keep_seg]
+            p = p[keep_seg]
         keep = np.isfinite(x) & np.isfinite(y)
         if not np.any(keep):
             continue
         xk = x[keep]
         yk = y[keep]
+        pk = p[keep]
         x_left = min(x_left, float(np.nanmin(xk)))
         x_right = max(x_right, float(np.nanmax(xk)))
         y_top = max(y_top, float(np.nanmax(yk)))
+        if not full_point_mode:
+            # Preview path: y-axis floor is fixed at default threshold line, so points below it are
+            # guaranteed to be outside viewport; skip plotting them early.
+            vis = yk >= float(_LARGE_MATRIX_LOGP_FLOOR)
+            if not np.any(vis):
+                continue
+            xk = xk[vis]
+            yk = yk[vis]
+            pk = pk[vis]
         row_hid = str(s.get("row", {}).get("history_id", "")).strip()
         st = style_by_history.get(row_hid, style_by_index.get(i, {}))
         col = str(st.get("color", color_base[i % len(color_base)]))
@@ -2162,17 +2249,44 @@ def render_merged_manhattan_svg(
         )
         marker_i = str(st.get("marker", marker))
         size_i = float(st.get("size", msize))
-        ax_manh.scatter(
-            xk,
-            yk,
-            s=size_i,
-            c=col,
-            alpha=alpha_i,
-            marker=marker_i,
-            linewidths=0.0,
-            rasterized=rasterize_main,
-            label=str(s["label"]),
-        )
+        high_mask = pk <= float(sig_p_thr)
+        low_mask = ~high_mask
+        if np.any(low_mask):
+            ax_manh.scatter(
+                xk[low_mask],
+                yk[low_mask],
+                s=size_i,
+                c=low_sig_color,
+                alpha=max(0.45, alpha_i * 0.75),
+                marker=marker_i,
+                linewidths=0.0,
+                rasterized=rasterize_main,
+            )
+        if np.any(high_mask):
+            ax_manh.scatter(
+                xk[high_mask],
+                yk[high_mask],
+                s=size_i,
+                c=col,
+                alpha=alpha_i,
+                marker=marker_i,
+                linewidths=0.0,
+                rasterized=rasterize_main,
+                label=str(s["label"]),
+            )
+        else:
+            # Keep series legend entry even if all points are below threshold.
+            ax_manh.scatter(
+                [],
+                [],
+                s=size_i,
+                c=col,
+                alpha=alpha_i,
+                marker=marker_i,
+                linewidths=0.0,
+                rasterized=rasterize_main,
+                label=str(s["label"]),
+            )
 
         # QQ series (same color as manhattan)
         if show_qq and (ax_qq is not None):
@@ -2207,9 +2321,18 @@ def render_merged_manhattan_svg(
 
     ax_manh.set_xlim(float(x_left), float(x_right))
     ax_manh.margins(x=0.0)
-    if not np.isfinite(y_top) or y_top <= 0.0:
-        y_top = 1.0
-    manh_ylim = (0.0, float(y_top) * 1.03)
+    if full_point_mode:
+        y_lo = 0.0
+    else:
+        y_lo = float(_LARGE_MATRIX_LOGP_FLOOR)
+    if not np.isfinite(y_top):
+        y_top = y_lo + 0.2
+    y_top = max(float(y_top), float(sig_y_thr), y_lo + 0.2)
+    y_span = max(0.2, float(y_top) - y_lo)
+    y_hi = float(y_top) + 0.06 * y_span
+    if not np.isfinite(y_hi) or y_hi <= y_lo:
+        y_hi = y_lo + 0.5
+    manh_ylim = (y_lo, y_hi)
     ax_manh.set_ylim(manh_ylim)
     ax_manh.set_ylabel("-log10(P)")
     if len(brs) == 0:
@@ -2232,6 +2355,14 @@ def render_merged_manhattan_svg(
             alpha=0.9,
             zorder=8,
         )
+    ax_manh.axhline(
+        float(sig_y_thr),
+        linestyle="--",
+        color="#9ca3af",
+        linewidth=0.9,
+        alpha=0.95,
+        zorder=9,
+    )
     if show_ld:
         ax_manh.set_aspect("auto")
     else:
@@ -2449,6 +2580,8 @@ def render_merged_manhattan_svg(
         "n_tasks": int(len(series)),
         "palette": str(p_use),
         "manh_alpha": float(alpha_default),
+        "threshold": float(sig_p_thr),
+        "threshold_logp": float(sig_y_thr),
         "n_total": int(sum(int(s["full"].shape[0]) for s in series)),
         "legend": [str(s["label"]) for s in series],
         "mode": mode,
@@ -2546,25 +2679,19 @@ def render_single_svg(
         ld_thr = 1.0
     p_filter_text = "full"
     use_threshold_floor = False
-    if (not bool(full_plot)) and int(df.shape[0]) >= int(_LARGE_MATRIX_ROWS):
+    if not bool(full_plot):
+        # Single preview mode: draw only SNPs above the default threshold line.
+        # Keep full-point rendering for download mode (full_plot=True).
         p_filter_text = f"p<={_LARGE_MATRIX_P_THRESH:g}"
-        df_sig = df.loc[df["p"].values <= float(_LARGE_MATRIX_P_THRESH)].copy()
-        if df_sig.shape[0] > 0:
-            df = df_sig
-            use_threshold_floor = True
-        else:
-            # Keep a minimal informative set when no SNP passes threshold.
-            keep_n = int(min(5000, df.shape[0]))
-            if keep_n > 0:
-                pvals = np.asarray(df["p"].values, dtype=float)
-                idx = np.argpartition(pvals, keep_n - 1)[:keep_n]
-                df = df.iloc[np.sort(idx)].copy()
-            p_filter_text = f"top-{keep_n} by p"
+        df = df.loc[df["p"].values <= float(_LARGE_MATRIX_P_THRESH)].copy()
+        use_threshold_floor = True
     if df.shape[0] == 0:
         raise RuntimeError("No SNPs left after applying bimrange.")
     n_draw = int(df.shape[0])
-    rasterize_main = (not bool(editable_svg))
-    fig_dpi = int(_WEBUI_RASTER_DPI if rasterize_main else _WEBUI_VECTOR_DPI)
+    # Keep scatter-heavy artists rasterized for both preview and download.
+    # Text/axes/labels remain vector in SVG output.
+    rasterize_main = True
+    fig_dpi = int(_WEBUI_RASTER_DPI)
 
     show_track = len(brs) > 0
     show_qq = (len(brs) == 0) and bool(full_plot)

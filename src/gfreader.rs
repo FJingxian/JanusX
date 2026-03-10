@@ -267,16 +267,8 @@ impl BedChunkReader {
             ));
         }
         let it = if let Some(window_mb) = mmap_window_mb {
-            BedSnpIter::new_with_fill_window(
-                &prefix,
-                0.0,
-                1.0,
-                false,
-                false,
-                het,
-                window_mb,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
+            BedSnpIter::new_with_fill_window(&prefix, 0.0, 1.0, false, false, het, window_mb)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         } else {
             BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?

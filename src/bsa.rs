@@ -67,7 +67,52 @@ enum ChromSortValue {
     Text(String),
 }
 
-fn run(config: Config) -> Result<(String, String), String> {
+#[derive(Clone, Debug, Default)]
+struct FilterStats {
+    input_rows: usize,
+    drop_missing_columns: usize,
+    drop_min_dp_bulk1: usize,
+    drop_min_dp_bulk2: usize,
+    drop_min_gq_bulk1: usize,
+    drop_min_gq_bulk2: usize,
+    drop_total_dp_min: usize,
+    drop_total_dp_max: usize,
+    drop_depth_difference: usize,
+    drop_ref_allele_freq: usize,
+    drop_invalid_chr: usize,
+    drop_invalid_pos: usize,
+    kept_rows: usize,
+}
+
+impl FilterStats {
+    fn stage_rows(&self) -> Vec<(String, usize, usize)> {
+        let mut out: Vec<(String, usize, usize)> = Vec::new();
+        let mut kept = self.input_rows;
+        out.push(("input_rows".to_string(), kept, 0));
+
+        let mut push_stage = |name: &str, dropped: usize| {
+            let d = dropped.min(kept);
+            kept = kept.saturating_sub(d);
+            out.push((name.to_string(), kept, d));
+        };
+
+        push_stage("columns_available", self.drop_missing_columns);
+        push_stage("min_dp_bulk1", self.drop_min_dp_bulk1);
+        push_stage("min_dp_bulk2", self.drop_min_dp_bulk2);
+        push_stage("min_gq_bulk1", self.drop_min_gq_bulk1);
+        push_stage("min_gq_bulk2", self.drop_min_gq_bulk2);
+        push_stage("total_dp_min", self.drop_total_dp_min);
+        push_stage("total_dp_max", self.drop_total_dp_max);
+        push_stage("depth_difference", self.drop_depth_difference);
+        push_stage("ref_allele_freq", self.drop_ref_allele_freq);
+        push_stage("valid_chr", self.drop_invalid_chr);
+        push_stage("valid_pos", self.drop_invalid_pos);
+        out.push(("kept_rows".to_string(), self.kept_rows, 0));
+        out
+    }
+}
+
+fn run(config: Config) -> Result<(String, String, FilterStats), String> {
     if config.window_mb <= 0.0 || config.step_mb <= 0.0 {
         return Err("window_mb and step_mb must be positive".to_string());
     }
@@ -89,6 +134,7 @@ fn run(config: Config) -> Result<(String, String), String> {
 
     let mut chrom_lookup: HashMap<String, usize> = HashMap::new();
     let mut chrom_data: Vec<ChromData> = Vec::new();
+    let mut stats = FilterStats::default();
 
     let mut line = String::new();
     while reader
@@ -97,9 +143,14 @@ fn run(config: Config) -> Result<(String, String), String> {
         > 0
     {
         let line_buf = std::mem::take(&mut line);
+        if line_buf.trim().is_empty() {
+            continue;
+        }
+        stats.input_rows += 1;
         let fields = split_tsv_line(&line_buf);
 
         if !columns_available(&fields, &columns) {
+            stats.drop_missing_columns += 1;
             continue;
         }
 
@@ -108,20 +159,36 @@ fn run(config: Config) -> Result<(String, String), String> {
         let bulk1_gq = parse_i64(fields[columns.bulk1_gq]).unwrap_or(0);
         let bulk2_gq = parse_i64(fields[columns.bulk2_gq]).unwrap_or(0);
 
-        if bulk1_dp < config.min_dp || bulk2_dp < config.min_dp {
+        if bulk1_dp < config.min_dp {
+            stats.drop_min_dp_bulk1 += 1;
             continue;
         }
-        if bulk1_gq < config.min_gq || bulk2_gq < config.min_gq {
+        if bulk2_dp < config.min_dp {
+            stats.drop_min_dp_bulk2 += 1;
+            continue;
+        }
+        if bulk1_gq < config.min_gq {
+            stats.drop_min_gq_bulk1 += 1;
+            continue;
+        }
+        if bulk2_gq < config.min_gq {
+            stats.drop_min_gq_bulk2 += 1;
             continue;
         }
 
         let total_dp = bulk1_dp + bulk2_dp;
-        if total_dp < config.total_dp_min || total_dp > config.total_dp_max {
+        if total_dp < config.total_dp_min {
+            stats.drop_total_dp_min += 1;
+            continue;
+        }
+        if total_dp > config.total_dp_max {
+            stats.drop_total_dp_max += 1;
             continue;
         }
 
         let dp_diff = (bulk1_dp - bulk2_dp).abs();
         if dp_diff > config.depth_difference {
+            stats.drop_depth_difference += 1;
             continue;
         }
 
@@ -137,16 +204,23 @@ fn run(config: Config) -> Result<(String, String), String> {
         let high_high =
             bulk1_snp > 1.0 - config.ref_allele_freq && bulk2_snp > 1.0 - config.ref_allele_freq;
         if low_low || high_high {
+            stats.drop_ref_allele_freq += 1;
             continue;
         }
 
         let chrom = match clean_chr_value(fields[columns.chrom]) {
             Some(value) => value,
-            None => continue,
+            None => {
+                stats.drop_invalid_chr += 1;
+                continue;
+            }
         };
         let pos_raw = match parse_f64(fields[columns.pos]) {
             Some(value) if value.is_finite() => value,
-            _ => continue,
+            _ => {
+                stats.drop_invalid_pos += 1;
+                continue;
+            }
         };
 
         let delta = bulk2_snp - bulk1_snp;
@@ -175,6 +249,7 @@ fn run(config: Config) -> Result<(String, String), String> {
             chrom_data.len() - 1
         });
         chrom_data[chr_index].records.push(record);
+        stats.kept_rows += 1;
     }
 
     let mut chrom_order: Vec<usize> = (0..chrom_data.len()).collect();
@@ -290,6 +365,7 @@ fn run(config: Config) -> Result<(String, String), String> {
     Ok((
         raw_path.to_string_lossy().to_string(),
         smooth_path.to_string_lossy().to_string(),
+        stats,
     ))
 }
 
@@ -324,7 +400,7 @@ pub fn preprocess_bsa(
     window_mb: f64,
     step_mb: f64,
     ed_power: i32,
-) -> PyResult<(String, String)> {
+) -> PyResult<(String, String, Vec<(String, usize, usize)>)> {
     let config = Config {
         input: input_path,
         bulk1,
@@ -341,7 +417,9 @@ pub fn preprocess_bsa(
         ed_power,
     };
 
-    py.detach(|| run(config)).map_err(PyRuntimeError::new_err)
+    let (raw_path, smooth_path, stats) =
+        py.detach(|| run(config)).map_err(PyRuntimeError::new_err)?;
+    Ok((raw_path, smooth_path, stats.stage_rows()))
 }
 
 fn build_smooth_output(

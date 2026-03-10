@@ -32,7 +32,7 @@ import tempfile
 import time
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 
 from ._common.log import setup_logging
@@ -157,6 +157,39 @@ def parse_total_dp(value: str) -> tuple[int, int]:
     raise argparse.ArgumentTypeError(
         "total depth range must be like 30:300, 30-300 or 30,300"
     )
+
+
+def _log_filter_stage(
+    logger: logging.Logger,
+    stage: str,
+    before: int,
+    after: int,
+) -> None:
+    removed = max(0, int(before) - int(after))
+    logger.info(
+        f"Filter[{stage}]: kept {int(after)}/{int(before)} (removed {removed})"
+    )
+
+
+def _log_rust_filter_summary(
+    logger: logging.Logger,
+    stage_rows: Any,
+) -> None:
+    if not isinstance(stage_rows, (list, tuple)):
+        return
+    for row in stage_rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        stage = str(row[0])
+        try:
+            kept = int(row[1])
+        except Exception:
+            continue
+        try:
+            removed = int(row[2])
+        except Exception:
+            removed = 0
+        logger.info(f"Filter[{stage}]: kept {kept}, removed {removed}")
 
 
 def configure_export_format(output_format: str) -> None:
@@ -469,7 +502,7 @@ def try_rust_preprocess(
     try:
         with tempfile.TemporaryDirectory(prefix="janusx_postbsa_") as tmpdir:
             tmp_prefix = f"{tmpdir}/postbsa"
-            raw_path, smooth_path = _preprocess_bsa(
+            rust_out = _preprocess_bsa(
                 input_path=table_path,
                 bulk1=bulk1,
                 bulk2=bulk2,
@@ -484,8 +517,26 @@ def try_rust_preprocess(
                 step_mb=step_mb,
                 ed_power=ed_power,
             )
+            stage_rows = None
+            if isinstance(rust_out, (list, tuple)):
+                if len(rust_out) < 2:
+                    raise RuntimeError("Rust preprocess_bsa returned invalid output.")
+                raw_path = rust_out[0]
+                smooth_path = rust_out[1]
+                if len(rust_out) >= 3:
+                    stage_rows = rust_out[2]
+                else:
+                    logger.info(
+                        "Rust backend lacks per-condition filter stats; "
+                        "falling back to Python preprocessing for detailed filter logs."
+                    )
+                    return None
+            else:
+                raise RuntimeError("Rust preprocess_bsa returned non-tuple output.")
             raw_df = pd.read_csv(raw_path, sep="\t")
             smooth_df = pd.read_csv(smooth_path, sep="\t")
+        if stage_rows is not None:
+            _log_rust_filter_summary(logger, stage_rows)
         logger.debug(
             f"Rust preprocessing finished: raw={raw_df.shape}, smooth={smooth_df.shape}"
         )
@@ -591,11 +642,13 @@ def load_bsa_in_python(
 
     initial_rows = len(df)
     df = df.dropna(subset=required_cols)
-    logger.info(f"After dropping NA rows: {df.shape} (removed {initial_rows - len(df)})")
+    _log_filter_stage(logger, "drop_na_required_cols", initial_rows, len(df))
 
     df["CHROM"] = clean_chr(df["CHROM"])
+    before = len(df)
     df["POS"] = pd.to_numeric(df["POS"], errors="coerce")
     df = df.dropna(subset=["CHROM", "POS"]).reset_index(drop=True)
+    _log_filter_stage(logger, "valid_chr_pos", before, len(df))
 
     for bulk in [bulk1, bulk2]:
         ad_col = f"{bulk}.AD"
@@ -611,20 +664,36 @@ def load_bsa_in_python(
             col = f"{bulk}{suffix}"
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    keep = np.ones(len(df), dtype=bool)
-    keep &= df[f"{bulk1}.DP"].to_numpy() >= min_dp
-    keep &= df[f"{bulk2}.DP"].to_numpy() >= min_dp
-    keep &= df[f"{bulk1}.GQ"].to_numpy() >= min_gq
-    keep &= df[f"{bulk2}.GQ"].to_numpy() >= min_gq
+    before = len(df)
+    df = df.loc[df[f"{bulk1}.DP"].to_numpy() >= min_dp].reset_index(drop=True)
+    _log_filter_stage(logger, f"{bulk1}.DP>=minDP({min_dp})", before, len(df))
+
+    before = len(df)
+    df = df.loc[df[f"{bulk2}.DP"].to_numpy() >= min_dp].reset_index(drop=True)
+    _log_filter_stage(logger, f"{bulk2}.DP>=minDP({min_dp})", before, len(df))
+
+    before = len(df)
+    df = df.loc[df[f"{bulk1}.GQ"].to_numpy() >= min_gq].reset_index(drop=True)
+    _log_filter_stage(logger, f"{bulk1}.GQ>=minGQ({min_gq})", before, len(df))
+
+    before = len(df)
+    df = df.loc[df[f"{bulk2}.GQ"].to_numpy() >= min_gq].reset_index(drop=True)
+    _log_filter_stage(logger, f"{bulk2}.GQ>=minGQ({min_gq})", before, len(df))
 
     total_dp = df[f"{bulk1}.DP"].to_numpy() + df[f"{bulk2}.DP"].to_numpy()
-    keep &= total_dp >= total_dp_threshold[0]
-    keep &= total_dp <= total_dp_threshold[1]
+    before = len(df)
+    df = df.loc[total_dp >= total_dp_threshold[0]].reset_index(drop=True)
+    _log_filter_stage(logger, f"totalDP>=min({total_dp_threshold[0]})", before, len(df))
+
+    total_dp = df[f"{bulk1}.DP"].to_numpy() + df[f"{bulk2}.DP"].to_numpy()
+    before = len(df)
+    df = df.loc[total_dp <= total_dp_threshold[1]].reset_index(drop=True)
+    _log_filter_stage(logger, f"totalDP<=max({total_dp_threshold[1]})", before, len(df))
 
     dp_diff = np.abs(df[f"{bulk1}.DP"].to_numpy() - df[f"{bulk2}.DP"].to_numpy())
-    keep &= dp_diff <= depth_difference
-    df = df.loc[keep].reset_index(drop=True)
-    logger.info(f"After depth/GQ filtering: {df.shape}")
+    before = len(df)
+    df = df.loc[dp_diff <= depth_difference].reset_index(drop=True)
+    _log_filter_stage(logger, f"|DPdiff|<=depthDifference({depth_difference})", before, len(df))
 
     if df.empty:
         raise ValueError("No loci remain after DP/GQ filtering.")
@@ -649,8 +718,9 @@ def load_bsa_in_python(
             & (df[bulk2_name] > 1 - ref_allele_freq)
         )
     )
+    before = len(df)
     df = df.loc[freq_keep].reset_index(drop=True)
-    logger.info(f"After allele-frequency filtering: {df.shape}")
+    _log_filter_stage(logger, f"refAlleleFreq({ref_allele_freq})", before, len(df))
 
     if df.empty:
         raise ValueError("No loci remain after allele-frequency filtering.")
@@ -682,6 +752,7 @@ def load_bsa_in_python(
     out, _ = change_chr_loc(out, chr_col="chr", loc_col="pos")
     out = out.sort_values(["chr", "pos_raw"], key=lambda s: s.map(chr_sort_key) if s.name == "chr" else s)
     out = out.reset_index(drop=True)
+    logger.info(f"Filter[kept_rows]: kept {len(out)}")
     return out
 
 

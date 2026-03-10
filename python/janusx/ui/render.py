@@ -1954,6 +1954,7 @@ def render_merged_manhattan_svg(
     *,
     bimrange_text: Any = "",
     threshold: Any = "auto",
+    include_all_points: bool = False,
     manh_ratio: float = 2.0,
     manh_palette: str = "auto",
     manh_alpha: float = 0.7,
@@ -2002,8 +2003,11 @@ def render_merged_manhattan_svg(
         sig_p_thr = 1.0 if len(brs) > 0 else float(_LARGE_MATRIX_P_THRESH)
     sig_y_thr = float(-np.log10(max(float(sig_p_thr), np.nextafter(0.0, 1.0))))
     low_sig_color = "#d1d5db"
-    # Download path uses editable SVG; when threshold is 1.0, keep all points.
-    full_point_mode = bool(editable_svg) and float(sig_p_thr) >= (1.0 - 1e-12)
+    # Full-point mode: keep all points in viewport (download path).
+    # Coloring still follows `sig_p_thr`.
+    full_point_mode = bool(include_all_points) or (
+        bool(editable_svg) and float(sig_p_thr) >= (1.0 - 1e-12)
+    )
 
     series: list[dict[str, Any]] = []
     all_chroms: set[str] = set()
@@ -2582,6 +2586,7 @@ def render_merged_manhattan_svg(
         "manh_alpha": float(alpha_default),
         "threshold": float(sig_p_thr),
         "threshold_logp": float(sig_y_thr),
+        "include_all_points": bool(full_point_mode),
         "n_total": int(sum(int(s["full"].shape[0]) for s in series)),
         "legend": [str(s["label"]) for s in series],
         "mode": mode,

@@ -1168,6 +1168,7 @@ class WebUIState:
         *,
         bimrange: Any = "",
         threshold: Any = "auto",
+        include_all_points: bool = False,
         manh_ratio: Any = 2.0,
         manh_palette: str = "auto",
         manh_alpha: Any = 0.7,
@@ -1188,6 +1189,7 @@ class WebUIState:
                 rows,
                 bimrange_text=bimrange,
                 threshold=threshold,
+                include_all_points=bool(include_all_points),
                 manh_ratio=manh_ratio,
                 manh_palette=str(manh_palette or "auto"),
                 manh_alpha=manh_alpha,
@@ -3605,8 +3607,10 @@ def _html_page() -> str:
               series_styles: seriesStyles,
               ld_color: ldColor,
               ld_p_threshold: ldThr,
-              // Download full figure: include all Manhattan points.
-              threshold: 1.0,
+              // Download full figure: include all Manhattan points, but keep
+              // threshold-based coloring (below-threshold points stay gray).
+              threshold: sigThr || "auto",
+              include_all_points: true,
               render_qq: true,
               editable_svg: true,
             });
@@ -4092,6 +4096,7 @@ def _make_handler(state: WebUIState):
                 ld_color = str(payload.get("ld_color", "#4b5563")).strip()
                 ld_p_threshold = payload.get("ld_p_threshold", "auto")
                 threshold = payload.get("threshold", "auto")
+                include_all_points = bool(payload.get("include_all_points", False))
                 render_qq = bool(payload.get("render_qq", True))
                 editable_svg = bool(payload.get("editable_svg", False))
                 try:
@@ -4099,6 +4104,7 @@ def _make_handler(state: WebUIState):
                         [str(x).strip() for x in history_ids if str(x).strip() != ""],
                         bimrange=bimranges,
                         threshold=threshold,
+                        include_all_points=include_all_points,
                         manh_ratio=manh_ratio,
                         manh_palette=manh_palette,
                         manh_alpha=manh_alpha,

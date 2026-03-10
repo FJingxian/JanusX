@@ -3742,6 +3742,18 @@ def _make_handler(state: WebUIState):
             # Keep console clean.
             return
 
+        def _safe_write_bytes(self, data: bytes) -> bool:
+            try:
+                self.wfile.write(data)
+                return True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return False
+            except OSError as exc:
+                # Common client-disconnect socket errors on different platforms.
+                if getattr(exc, "errno", None) in {32, 54, 104, 10053, 10054}:
+                    return False
+                raise
+
         def _send_json(self, status: int, obj: dict[str, Any]) -> None:
             data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -3749,7 +3761,7 @@ def _make_handler(state: WebUIState):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            self._safe_write_bytes(data)
 
         def _send_text(self, status: int, text: str, content_type: str = "text/plain; charset=utf-8") -> None:
             data = text.encode("utf-8", errors="replace")
@@ -3758,7 +3770,7 @@ def _make_handler(state: WebUIState):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            self._safe_write_bytes(data)
 
         def _read_json_body(self) -> dict[str, Any]:
             clen = self.headers.get("Content-Length", "0").strip()
@@ -3870,7 +3882,7 @@ def _make_handler(state: WebUIState):
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                self._safe_write_bytes(data)
                 return
 
             if path.startswith("/api/jobs/"):

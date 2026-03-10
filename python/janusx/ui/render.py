@@ -14,6 +14,7 @@ from janusx.bioplotkit.LDBlock import LDblock
 from janusx.bioplotkit.manhanden import GWASPLOT
 from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
 from janusx.gtools.reader import readanno
+from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 try:
     from janusx.janusx import load_gwas_triplet_fast as _load_gwas_triplet_fast
 except Exception:
@@ -177,30 +178,31 @@ def _normalize_chrom(v: object) -> str:
     s = str(v).strip()
     if s.lower().startswith("chr"):
         s = s[3:]
-    return s
+    s = s.strip()
+    if s == "" or s.lower() in {"nan", "na", "null", "none", "."}:
+        return ""
+    try:
+        f = float(s)
+        if np.isfinite(f) and float(f).is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    up = s.upper()
+    if up in {"X", "Y", "M", "MT"}:
+        return up
+    return up
+
+
+def _freeze_sort_key(obj: object) -> object:
+    if isinstance(obj, list):
+        return tuple(_freeze_sort_key(x) for x in obj)
+    if isinstance(obj, tuple):
+        return tuple(_freeze_sort_key(x) for x in obj)
+    return obj
 
 
 def _natural_key(text: object) -> tuple[int, object]:
-    s = _normalize_chrom(text)
-    if s.isdigit():
-        return (0, int(s))
-    up = s.upper()
-    if up == "X":
-        return (1, 23)
-    if up == "Y":
-        return (1, 24)
-    if up in {"M", "MT"}:
-        return (1, 25)
-    parts = re.split(r"(\d+)", s)
-    out: list[tuple[int, object]] = []
-    for p in parts:
-        if p == "":
-            continue
-        if p.isdigit():
-            out.append((0, int(p)))
-        else:
-            out.append((1, p.lower()))
-    return (2, tuple(out))
+    return _freeze_sort_key(_chrom_sort_key(_normalize_chrom(text)))  # type: ignore[return-value]
 
 
 def _mix_color(a: tuple[float, float, float], b: tuple[float, float, float], t: float) -> tuple[float, float, float]:
@@ -334,6 +336,29 @@ def _ld_layout_for_webui(
 
     fig_h = (top_h + mid_h + ld_h) / hr
     return float(max(1.0, fig_h)), [float(top_h), float(mid_h), float(ld_h)]
+
+
+def _sync_qq_panel_with_manhattan_height(
+    ax_manh: plt.Axes,
+    ax_qq: plt.Axes,
+    *,
+    qq_box_ratio: float = 1.0,
+) -> None:
+    """
+    Keep QQ panel y-height identical to Manhattan panel and preserve the
+    historical QQ box ratio (default 1:1) inside its slot.
+    """
+    manh_pos = ax_manh.get_position()
+    qq_slot = ax_qq.get_position()
+    fig_w, fig_h = ax_qq.figure.get_size_inches()
+    if not (np.isfinite(fig_w) and np.isfinite(fig_h) and fig_w > 0 and fig_h > 0):
+        ax_qq.set_position([qq_slot.x0, manh_pos.y0, qq_slot.width, manh_pos.height])
+        return
+
+    target_w = float(manh_pos.height) * (float(fig_h) / float(fig_w)) * float(max(0.2, qq_box_ratio))
+    new_w = float(min(float(qq_slot.width), max(1e-6, target_w)))
+    x0 = float(qq_slot.x0) + 0.5 * (float(qq_slot.width) - new_w)
+    ax_qq.set_position([x0, float(manh_pos.y0), new_w, float(manh_pos.height)])
 
 
 def _normalize_marker(raw: Any) -> str:
@@ -813,6 +838,12 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
         chrom_norm = np.asarray([_normalize_chrom(x) for x in chrom_raw[mask]], dtype=object)
         pos_f = pos_raw[mask]
         p_f = p_raw[mask]
+        keep_chr = chrom_norm != ""
+        if not np.any(keep_chr):
+            raise RuntimeError("No valid chromosome labels after normalization.")
+        chrom_norm = chrom_norm[keep_chr]
+        pos_f = pos_f[keep_chr]
+        p_f = p_f[keep_chr]
 
         pos_u = np.rint(pos_f).astype(np.int64, copy=False)
         if pos_u.size > 0 and np.min(pos_u) >= 0 and np.max(pos_u) <= np.iinfo(np.uint32).max:
@@ -881,6 +912,12 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
     chrom_norm = np.asarray([_normalize_chrom(x) for x in chrom_raw[mask]], dtype=object)
     pos_f = pos_raw[mask]
     p_f = p_raw[mask]
+    keep_chr = chrom_norm != ""
+    if not np.any(keep_chr):
+        raise RuntimeError("No valid chromosome labels after normalization.")
+    chrom_norm = chrom_norm[keep_chr]
+    pos_f = pos_f[keep_chr]
+    p_f = p_f[keep_chr]
 
     # Position uses compact integer dtype when possible.
     pos_u = np.rint(pos_f).astype(np.int64, copy=False)
@@ -2380,7 +2417,12 @@ def render_merged_manhattan_svg(
             x_right_qq = x_left_qq + 1.0
         ax_qq.set_xlim(x_left_qq, x_right_qq)
         ax_qq.set_ylim(manh_ylim)
-        ax_qq.set_box_aspect(1.0)
+        # Keep QQ panel height aligned with Manhattan while preserving
+        # QQ box ratio style (historically square).
+        try:
+            _sync_qq_panel_with_manhattan_height(ax_manh, ax_qq, qq_box_ratio=1.0)
+        except Exception:
+            pass
         line_left, line_right = ax_qq.get_xlim()
         ax_qq.plot([line_left, line_right], [line_left, line_right], color="#9ca3af", linewidth=1.0)
         ax_qq.set_xlabel("Expected -log10(P)")
@@ -3108,8 +3150,12 @@ def render_single_svg(
         ax_qq.set_xlim(x_left, x_right)
         ax_qq.margins(x=0.0)
         ax_qq.set_ylim(manh_ylim)
-        # Keep QQ panel physically square (equal width/height on canvas).
-        ax_qq.set_box_aspect(1.0)
+        # Keep QQ panel height aligned with Manhattan while preserving
+        # QQ box ratio style (historically square).
+        try:
+            _sync_qq_panel_with_manhattan_height(ax_manh, ax_qq, qq_box_ratio=1.0)
+        except Exception:
+            pass
         line_left, line_right = ax_qq.get_xlim()
         ax_qq.plot([line_left, line_right], [line_left, line_right], color="#9ca3af", linewidth=1.0)
         ax_qq.set_xlabel("Expected -log10(P)")

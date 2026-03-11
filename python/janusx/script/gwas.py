@@ -561,7 +561,7 @@ def determine_genotype_source(args) -> tuple[str, str]:
     return gfile, prefix
 
 
-def genotype_cache_prefix(genofile: str) -> str:
+def genotype_cache_prefix(genofile: str, *, snps_only: bool = True) -> str:
     """
     Construct a cache prefix within the genotype directory.
     """
@@ -575,7 +575,10 @@ def genotype_cache_prefix(genofile: str) -> str:
                 base = base[: -len(ext)]
                 break
     cache_dir = os.path.dirname(genofile) or "."
-    return os.path.join(cache_dir, base).replace("\\", "/")
+    prefix = os.path.join(cache_dir, base).replace("\\", "/")
+    if low.endswith((".vcf.gz", ".vcf")) and (not bool(snps_only)):
+        prefix = f"{prefix}.all"
+    return prefix
 
 def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     """
@@ -834,6 +837,7 @@ def _load_site_covariates(
     chunk_size: int,
     logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ) -> np.ndarray:
     """
     Load additive genotype values for requested SNP sites as covariates.
@@ -863,6 +867,7 @@ def _load_site_covariates(
         missing_rate=1.0,
         impute=True,
         model="add",
+        snps_only=bool(snps_only),
         snp_sites=unique_sites,
         sample_ids=sample_ids.tolist(),
     ):
@@ -919,6 +924,7 @@ def _load_covariates_for_models(
     logger,
     context: str,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ) -> tuple[Union[np.ndarray, None], Union[np.ndarray, None]]:
     inputs = _normalize_cov_inputs(cov_inputs)
     if len(inputs) == 0:
@@ -963,6 +969,7 @@ def _load_covariates_for_models(
                         chunk_size=chunk_size,
                         logger=logger,
                         use_spinner=use_spinner,
+                        snps_only=bool(snps_only),
                     )
                 except Exception:
                     task.fail(f"Loading covariate from {token} ...Failed")
@@ -1196,7 +1203,7 @@ def load_phenotype(
 # Low-memory LMM/LM: streaming GRM + PCA with caching
 # ======================================================================
 
-def _cache_prefix_tilde(genofile: str) -> str:
+def _cache_prefix_tilde(genofile: str, *, snps_only: bool = True) -> str:
     """
     Cache prefix used by gfreader for VCF/TXT temporary converted files.
     """
@@ -1209,16 +1216,19 @@ def _cache_prefix_tilde(genofile: str) -> str:
         stem = os.path.splitext(base)[0]
     else:
         stem = base
-    return os.path.join(os.path.dirname(p) or ".", f"~{stem}").replace("\\", "/")
+    cprefix = os.path.join(os.path.dirname(p) or ".", f"~{stem}").replace("\\", "/")
+    if (low.endswith(".vcf.gz") or low.endswith(".vcf")) and (not bool(snps_only)):
+        cprefix = f"{cprefix}.all"
+    return cprefix
 
 
-def _detect_cache_need(genofile: str) -> tuple[bool, str, list[str]]:
+def _detect_cache_need(genofile: str, *, snps_only: bool = True) -> tuple[bool, str, list[str]]:
     """
     Detect whether genotype cache build is expected before inspect/load.
     """
     low = str(genofile).lower()
     if low.endswith(".vcf.gz") or low.endswith(".vcf"):
-        cprefix = _cache_prefix_tilde(genofile)
+        cprefix = _cache_prefix_tilde(genofile, snps_only=snps_only)
         targets = [f"{cprefix}.bed", f"{cprefix}.bim", f"{cprefix}.fam"]
         all_exist = all(os.path.isfile(p) for p in targets)
         stale = False
@@ -1229,7 +1239,7 @@ def _detect_cache_need(genofile: str) -> tuple[bool, str, list[str]]:
         return (not all_exist) or stale, "vcf", targets
 
     if low.endswith((".txt", ".tsv", ".csv")):
-        cprefix = _cache_prefix_tilde(genofile)
+        cprefix = _cache_prefix_tilde(genofile, snps_only=True)
         targets = [f"{cprefix}.npy"]
         return (not os.path.isfile(targets[0])), "txt", targets
 
@@ -1282,6 +1292,7 @@ def _load_phenotype_with_status(
 
 def _inspect_genotype_file_with_warnings(
     genofile: str,
+    snps_only: bool = True,
 ) -> tuple[np.ndarray, int, list[str]]:
     """
     Run inspect_genotype_file and capture warning messages.
@@ -1289,7 +1300,7 @@ def _inspect_genotype_file_with_warnings(
     """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        ids0, ns0 = inspect_genotype_file(genofile)
+        ids0, ns0 = inspect_genotype_file(genofile, snps_only=bool(snps_only))
     warn_msgs: list[str] = []
     for w in caught:
         try:
@@ -1306,12 +1317,16 @@ def _inspect_genotype_with_status(
     logger: logging.Logger,
     *,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ) -> tuple[np.ndarray, int]:
     """
     Inspect genotype metadata with optional cache-status spinner.
     """
     src = _basename_only(genofile)
-    need_cache, cache_kind, cache_targets = _detect_cache_need(genofile)
+    need_cache, cache_kind, cache_targets = _detect_cache_need(
+        genofile,
+        snps_only=bool(snps_only),
+    )
     status_enabled = bool(use_spinner)
     plain_progress = (not status_enabled) and (cache_kind in {"vcf", "txt"})
 
@@ -1321,7 +1336,7 @@ def _inspect_genotype_with_status(
     if cache_kind == "":
         with CliStatus(f"Loading genotype from {src}...", enabled=status_enabled) as task:
             try:
-                ids, n_snps = inspect_genotype_file(genofile)
+                ids, n_snps = inspect_genotype_file(genofile, snps_only=bool(snps_only))
             except Exception:
                 task.fail(f"Loading genotype from {src} ...Failed")
                 raise
@@ -1368,7 +1383,11 @@ def _inspect_genotype_with_status(
             try:
                 mp_ctx = mp.get_context("spawn")
                 executor = cf.ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx)
-                fut = executor.submit(_inspect_genotype_file_with_warnings, genofile)
+                fut = executor.submit(
+                    _inspect_genotype_file_with_warnings,
+                    genofile,
+                    bool(snps_only),
+                )
             except Exception:
                 use_subproc = False
 
@@ -1377,7 +1396,10 @@ def _inspect_genotype_with_status(
 
             def _worker() -> None:
                 try:
-                    ids0, ns0, warns0 = _inspect_genotype_file_with_warnings(genofile)
+                    ids0, ns0, warns0 = _inspect_genotype_file_with_warnings(
+                        genofile,
+                        bool(snps_only),
+                    )
                     out["value"] = (np.asarray(ids0, dtype=str), int(ns0))
                     warn_msgs.extend(warns0)
                 except Exception as ex:
@@ -1521,6 +1543,7 @@ def build_grm_streaming(
     threads: int,
     logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ) -> tuple[np.ndarray, int]:
     """
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
@@ -1554,6 +1577,7 @@ def build_grm_streaming(
         maf_threshold,
         max_missing_rate,
         model="add",
+        snps_only=bool(snps_only),
         mmap_window_mb=mmap_window_mb,
     )
 
@@ -1643,6 +1667,7 @@ def load_or_build_grm_with_cache(
     use_spinner: bool = False,
     ids_preloaded: Union[np.ndarray, None] = None,
     n_snps_preloaded: Union[int, None] = None,
+    snps_only: bool = True,
 ) -> tuple[np.ndarray, int, Union[np.ndarray, None]]:
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
@@ -1651,7 +1676,7 @@ def load_or_build_grm_with_cache(
         ids = np.asarray(ids_preloaded, dtype=str)
         n_snps = int(n_snps_preloaded)
     else:
-        ids0, n_snps0 = inspect_genotype_file(genofile)
+        ids0, n_snps0 = inspect_genotype_file(genofile, snps_only=bool(snps_only))
         ids = np.asarray(ids0, dtype=str)
         n_snps = int(n_snps0)
     n_samples = int(len(ids))
@@ -1712,6 +1737,7 @@ def load_or_build_grm_with_cache(
                 threads=threads,
                 logger=logger,
                 use_spinner=use_spinner,
+                snps_only=bool(snps_only),
             )
             np.save(f'{km_path}.npy', grm)
             pd.Series(ids).to_csv(id_path, sep="\t", index=False, header=False)
@@ -1877,6 +1903,7 @@ def _load_covariate_for_streaming(
     chunk_size: int,
     logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ) -> tuple[Union[np.ndarray , None], Union[np.ndarray, None]]:
     """
     Backward-compatible wrapper for streaming covariate loading.
@@ -1889,6 +1916,7 @@ def _load_covariate_for_streaming(
         logger=logger,
         context="streaming",
         use_spinner=use_spinner,
+        snps_only=bool(snps_only),
     )
 
 
@@ -1909,6 +1937,7 @@ def prepare_streaming_context(
     require_kinship: bool,
     logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -1929,6 +1958,7 @@ def prepare_streaming_context(
         genofile,
         logger,
         use_spinner=use_spinner,
+        snps_only=bool(snps_only),
     )
     n_samples = len(ids)
     _log_info(
@@ -1937,7 +1967,7 @@ def prepare_streaming_context(
         use_spinner=use_spinner,
     )
 
-    cache_prefix = genotype_cache_prefix(genofile)
+    cache_prefix = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
     _log_info(
         logger,
         f"Cache prefix (genotype folder): {cache_prefix}",
@@ -1967,6 +1997,7 @@ def prepare_streaming_context(
             use_spinner=use_spinner,
             ids_preloaded=ids,
             n_snps_preloaded=n_snps,
+            snps_only=bool(snps_only),
         )
     else:
         _rich_success(
@@ -1993,6 +2024,7 @@ def prepare_streaming_context(
         chunk_size,
         logger,
         use_spinner=use_spinner,
+        snps_only=bool(snps_only),
     )
 
     # -----------------------------------------
@@ -2143,6 +2175,7 @@ def run_chunked_gwas_lmm_lm(
     threads: int,
     logger:logging.Logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
     eff_snp_by_trait: Union[dict[str, int], None] = None,
     summary_rows: Union[list[dict[str, object]], None] = None,
     saved_paths: Union[list[str], None] = None,
@@ -2416,6 +2449,7 @@ def run_chunked_gwas_lmm_lm(
                 max_missing_rate,
                 model=genetic_model,
                 het=het_threshold,
+                snps_only=bool(snps_only),
                 sample_ids=sample_sub,
                 mmap_window_mb=mmap_window_mb,
             ):
@@ -2612,6 +2646,7 @@ def run_chunked_gwas_streaming_shared(
     threads: int,
     logger: logging.Logger,
     use_spinner: bool = False,
+    snps_only: bool = True,
     eff_snp_by_trait: Union[dict[str, int], None] = None,
     summary_rows: Union[list[dict[str, object]], None] = None,
     saved_paths: Union[list[str], None] = None,
@@ -2899,6 +2934,7 @@ def run_chunked_gwas_streaming_shared(
             max_missing_rate,
             model=genetic_model,
             het=het_threshold,
+            snps_only=bool(snps_only),
             sample_ids=sample_sub,
             mmap_window_mb=mmap_window_mb,
         ):
@@ -3165,6 +3201,7 @@ def build_qmatrix_farmcpu(
     sample_ids: Union[np.ndarray, None] = None,
     use_spinner: bool = False,
     quiet_terminal: bool = False,
+    snps_only: bool = True,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
@@ -3289,6 +3326,7 @@ def build_qmatrix_farmcpu(
             logger=logger,
             context="FarmCPU",
             use_spinner=bool(use_spinner and (not quiet_terminal)),
+            snps_only=bool(snps_only),
         )
         if cov_arr is not None:
             if cov_ids is None:
@@ -3335,6 +3373,7 @@ def run_farmcpu_fullmem(
     outfolder = args.out
     qdim = args.qcov
     cov = args.cov
+    snps_only = bool(getattr(args, "snps_only", False))
 
     if farmcpu_cache is None:
         t_loading = time.time()
@@ -3362,6 +3401,7 @@ def run_farmcpu_fullmem(
                 gfile,
                 logger,
                 use_spinner=use_spinner,
+                snps_only=bool(snps_only),
             )
             famid = np.asarray(famid, dtype=str)
         geno_chunks = []
@@ -3374,6 +3414,7 @@ def run_farmcpu_fullmem(
                 maf=args.maf,
                 missing_rate=args.geno,
                 impute=True,
+                snps_only=bool(snps_only),
                 sample_ids=famid.tolist(),
             ):
                 if chunk.shape[0] == 0:
@@ -3428,7 +3469,7 @@ def run_farmcpu_fullmem(
                     )
                 qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
         else:
-            gfile_prefix = genotype_cache_prefix(gfile)
+            gfile_prefix = genotype_cache_prefix(gfile, snps_only=bool(snps_only))
             qmatrix = build_qmatrix_farmcpu(
                 genofile=gfile,
                 gfile_prefix=gfile_prefix,
@@ -3440,6 +3481,7 @@ def run_farmcpu_fullmem(
                 sample_ids=famid.astype(str),
                 use_spinner=use_spinner,
                 quiet_terminal=bool(context_prepared),
+                snps_only=bool(snps_only),
             )
 
         if bool(context_prepared):
@@ -3695,6 +3737,10 @@ def parse_args():
         ),
     )
     optional_group.add_argument(
+        "-snps-only", "--snps-only", action="store_true", default=False,
+        help="Exclude non-SNP variants.",
+    )
+    optional_group.add_argument(
         "-maf", "--maf", type=float, default=0.02,
         help="Exclude variants with minor allele frequency lower than a threshold "
              "(default: %(default)s).",
@@ -3797,6 +3843,7 @@ def main(log: bool = True):
             ("Mmap limit", args.mmap_limit),
             ("Models", " ".join(model_tokens) if len(model_tokens) > 0 else "None"),
             ("Genetic model", args.model),
+            ("SNPs only", args.snps_only),
             ("GRM option", args.grm),
             ("Q option", args.qcov),
             ("MAF threshold", args.maf),
@@ -3888,6 +3935,7 @@ def main(log: bool = True):
                 require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,
                 use_spinner=use_spinner,
+                snps_only=bool(args.snps_only),
             )
             logger.info("")
         else:
@@ -3952,6 +4000,7 @@ def main(log: bool = True):
                         threads=args.thread,
                         logger=logger,
                         use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
                         eff_snp_by_trait=eff_snp_by_trait,
                         summary_rows=gwas_summary_rows,
                         saved_paths=saved_result_paths,
@@ -3980,6 +4029,7 @@ def main(log: bool = True):
                         threads=args.thread,
                         logger=logger,
                         use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
                         eff_snp_by_trait=eff_snp_by_trait,
                         summary_rows=gwas_summary_rows,
                         saved_paths=saved_result_paths,
@@ -4046,6 +4096,7 @@ def main(log: bool = True):
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),
+                "snps_only": bool(args.snps_only),
                 "maf": float(args.maf),
                 "geno": float(args.geno),
                 "het": float(args.het),

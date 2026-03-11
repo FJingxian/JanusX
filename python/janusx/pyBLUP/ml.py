@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import typing
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import Any, Optional
 
 import numpy as np
+from joblib import parallel_backend
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold, ParameterSampler
@@ -258,9 +259,17 @@ class MLGS:
             self.fit()
 
     def _thread_context(self):
-        if threadpool_limits is None:
+        use_joblib_backend = self.method in {"rf", "et"}
+        use_threadpool_limit = threadpool_limits is not None
+        if (not use_joblib_backend) and (not use_threadpool_limit):
             return nullcontext()
-        return threadpool_limits(limits=self.n_jobs)
+
+        stack = ExitStack()
+        if use_joblib_backend:
+            stack.enter_context(parallel_backend("threading", n_jobs=self.n_jobs))
+        if use_threadpool_limit:
+            stack.enter_context(threadpool_limits(limits=self.n_jobs))
+        return stack
 
     def _default_search_iter(self, stage: typing.Literal["coarse", "fine"]) -> int:
         n = self.sample_count_

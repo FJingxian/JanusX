@@ -380,8 +380,8 @@ def main(log: bool = True):
         prog="jx pca",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
-            "jx pca -vcf geno.vcf.gz -pc 3 -plot",
-            "jx pca -k data.grm -pc 3 -plot",
+            "jx pca -vcf geno.vcf.gz -dim 3 -plot",
+            "jx pca -k data.grm -dim 3 -plot",
         ]),
     )
 

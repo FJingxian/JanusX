@@ -235,8 +235,12 @@ def main() -> None:
     optional_group.add_argument(
         "-pallete", "--pallete", type=str, default=None,
         help=(
-            "Manhattan color palette passed to postgwas. "
-            "Supports cmap name or ';'-separated colors."
+            "Manhattan color palette (QQ keeps black/grey). "
+            "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
+            "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
+            "A single color is also accepted and auto-expanded to light/dark pair "
+            "by grayscale direction for LD/gene (Manhattan keeps single-color). "
+            "If omitted, use default black/grey."
         ),
     )
     optional_group.add_argument(

@@ -872,7 +872,7 @@ def main(log: bool = True) -> None:
         "-cv", "--cv",
         type=int,
         default=None,
-        help="K fold of cross-validazation for models. "
+        help="K fold of cross-validation for models. "
              "(default: %(default)s).",
     )
     optional_group.add_argument(

@@ -33,6 +33,7 @@ except Exception as _xgb_exc:  # pragma: no cover - optional dependency
 ScoreName = typing.Literal["pearson", "r2", "neg_rmse"]
 MethodName = typing.Literal["rf", "et", "gbdt", "xgb", "svm", "enet"]
 FeatureAxisName = typing.Literal["auto", "marker_by_sample", "sample_by_marker"]
+SearchSchemeName = typing.Literal["legacy", "multicenter"]
 
 
 def _safe_pearson(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -212,6 +213,10 @@ class MLGS:
         n_jobs: Optional[int] = None,
         coarse_iter: Optional[int] = None,
         fine_iter: Optional[int] = None,
+        search_scheme: SearchSchemeName = "multicenter",
+        coarse_top_k: int = 3,
+        confirm_top_k: int = 3,
+        confirm_repeats: int = 2,
         fit_on_init: bool = True,
         verbose: bool = False,
     ):
@@ -223,6 +228,15 @@ class MLGS:
         self.n_jobs = max(1, int(os.cpu_count() or 1)) if n_jobs is None else max(1, int(n_jobs))
         self.verbose = bool(verbose)
         self.parallel_mode_ = self._parallel_mode()
+        self.search_scheme = typing.cast(SearchSchemeName, str(search_scheme))
+        default_top_k = 2 if self.method == "svm" else 3
+        self.coarse_top_k = max(1, int(coarse_top_k))
+        self.confirm_top_k = max(1, int(confirm_top_k))
+        if coarse_top_k == 3 and self.method == "svm":
+            self.coarse_top_k = default_top_k
+        if confirm_top_k == 3 and self.method == "svm":
+            self.confirm_top_k = default_top_k
+        self.confirm_repeats = max(1, int(confirm_repeats))
 
         self.y = _as_1d_y(y)
         self.X_marker, self.feature_axis_ = _resolve_marker_matrix(M, self.y.size, feature_axis)
@@ -281,6 +295,49 @@ class MLGS:
         if use_threadpool_limit:
             stack.enter_context(threadpool_limits(limits=self._model_n_jobs()))
         return stack
+
+    @staticmethod
+    def _result_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        return (
+            float(row.get("score", float("-inf"))),
+            float(row.get("pearson", float("-inf"))),
+            float(row.get("r2", float("-inf"))),
+            -float(row.get("rmse", float("inf"))),
+        )
+
+    @staticmethod
+    def _param_signature(params: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        norm: list[tuple[str, Any]] = []
+        for k, v in sorted(params.items()):
+            if isinstance(v, float):
+                norm.append((k, round(v, 10)))
+            else:
+                norm.append((k, v))
+        return tuple(norm)
+
+    def _dedup_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        for params in candidates:
+            sig = self._param_signature(params)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(dict(params))
+        return out
+
+    def _top_result_rows(self, rows: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+        uniq: list[dict[str, Any]] = []
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        for row in sorted(rows, key=self._result_sort_key, reverse=True):
+            sig = self._param_signature(dict(row["params"]))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append(row)
+            if len(uniq) >= max(1, int(k)):
+                break
+        return uniq
 
     def _default_search_iter(self, stage: typing.Literal["coarse", "fine"]) -> int:
         n = self.sample_count_
@@ -734,14 +791,23 @@ class MLGS:
         candidates = list(ParameterSampler(space, n_iter=n_iter, random_state=rng))
         return candidates
 
-    def _cv_splitter(self) -> KFold:
+    def _cv_splitter(self, random_state: int | None = None) -> KFold:
         n_splits = min(self.cv, self.sample_count_)
         if n_splits < 2:
             raise ValueError("At least 2 folds are required for MLGS cross-validation.")
-        return KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
+        return KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=self.seed if random_state is None else int(random_state),
+        )
 
-    def _evaluate_candidate(self, params: dict[str, Any], stage: str) -> dict[str, Any]:
-        splitter = self._cv_splitter()
+    def _evaluate_candidate_once(
+        self,
+        params: dict[str, Any],
+        stage: str,
+        splitter_seed: int | None = None,
+    ) -> dict[str, Any]:
+        splitter = self._cv_splitter(random_state=splitter_seed)
         scores: list[float] = []
         pearsons: list[float] = []
         r2s: list[float] = []
@@ -792,19 +858,49 @@ class MLGS:
             result["n_estimators"] = int(np.median(xgb_iters))
         return result
 
+    def _evaluate_candidate(self, params: dict[str, Any], stage: str) -> dict[str, Any]:
+        return self._evaluate_candidate_once(params, stage=stage, splitter_seed=self.seed)
+
+    def _evaluate_confirm_candidate(self, params: dict[str, Any]) -> dict[str, Any]:
+        rows = [
+            self._evaluate_candidate_once(
+                params,
+                stage="confirm",
+                splitter_seed=self.seed + 1009 + rep * 97,
+            )
+            for rep in range(self.confirm_repeats)
+        ]
+        result = {
+            "stage": "confirm",
+            "params": dict(params),
+            "score": float(np.mean([x["score"] for x in rows])),
+            "pearson": float(np.mean([x["pearson"] for x in rows])),
+            "r2": float(np.mean([x["r2"] for x in rows])),
+            "rmse": float(np.mean([x["rmse"] for x in rows])),
+            "confirm_repeats": int(self.confirm_repeats),
+        }
+        xgb_iters = [int(x["n_estimators"]) for x in rows if "n_estimators" in x]
+        if xgb_iters:
+            result["n_estimators"] = int(np.median(xgb_iters))
+        return result
+
     def _evaluate_candidates(
         self,
         candidates: list[dict[str, Any]],
         stage: str,
+        evaluator: typing.Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         if not candidates:
             return []
+        eval_fn = evaluator
+        if eval_fn is None:
+            eval_fn = lambda params: self._evaluate_candidate(params, stage=stage)
         if self.parallel_mode_ == "search" and self.n_jobs > 1 and len(candidates) > 1:
             return Parallel(n_jobs=self.n_jobs, prefer="threads")(
-                delayed(self._evaluate_candidate)(params, stage=stage)
+                delayed(eval_fn)(params)
                 for params in candidates
             )
-        return [self._evaluate_candidate(params, stage=stage) for params in candidates]
+        return [eval_fn(params) for params in candidates]
 
     def fit(self) -> "MLGS":
         coarse_space = self._coarse_space()
@@ -813,19 +909,41 @@ class MLGS:
             raise RuntimeError("No coarse-search candidate was generated.")
 
         results = self._evaluate_candidates(coarse_candidates, stage="coarse")
-        best_coarse = max(results, key=lambda x: (x["score"], x["pearson"], x["r2"], -x["rmse"]))
-
-        fine_space = self._fine_space(best_coarse["params"])
-        fine_candidates = self._parameter_candidates(fine_space, self.fine_iter, "fine")
-        fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
-        if fine_results:
-            results.extend(fine_results)
-            best_row = max(
-                fine_results + [best_coarse],
-                key=lambda x: (x["score"], x["pearson"], x["r2"], -x["rmse"]),
-            )
+        if self.search_scheme == "legacy":
+            best_coarse = max(results, key=self._result_sort_key)
+            fine_space = self._fine_space(best_coarse["params"])
+            fine_candidates = self._parameter_candidates(fine_space, self.fine_iter, "fine")
+            fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
+            if fine_results:
+                results.extend(fine_results)
+                best_row = max(fine_results + [best_coarse], key=self._result_sort_key)
+            else:
+                best_row = best_coarse
         else:
-            best_row = best_coarse
+            coarse_centers = self._top_result_rows(results, self.coarse_top_k)
+            fine_candidates_all: list[dict[str, Any]] = []
+            for center in coarse_centers:
+                fine_space = self._fine_space(center["params"])
+                fine_candidates_all.extend(
+                    self._parameter_candidates(fine_space, self.fine_iter, "fine")
+                )
+            fine_candidates = self._dedup_candidates(fine_candidates_all)
+            fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
+            if fine_results:
+                results.extend(fine_results)
+            confirm_centers = self._top_result_rows(results, self.confirm_top_k)
+            confirm_results = self._evaluate_candidates(
+                [dict(row["params"]) for row in confirm_centers],
+                stage="confirm",
+                evaluator=self._evaluate_confirm_candidate,
+            )
+            if confirm_results:
+                results.extend(confirm_results)
+                best_row = max(confirm_results, key=self._result_sort_key)
+            elif fine_results:
+                best_row = max(fine_results + coarse_centers, key=self._result_sort_key)
+            else:
+                best_row = max(coarse_centers, key=self._result_sort_key)
 
         self.cv_results_ = results
         self.best_params_ = dict(best_row["params"])

@@ -564,7 +564,21 @@ fn columns_available(fields: &[&str], columns: &ColumnIndex) -> bool {
 }
 
 fn parse_i64(value: &str) -> Option<i64> {
-    value.trim().parse::<i64>().ok()
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = trimmed.parse::<i64>() {
+        return Some(v);
+    }
+    // Be tolerant to decimal/scientific numeric strings (e.g. "28.0"),
+    // matching Python path: to_numeric(...).astype(int) -> truncate toward zero.
+    if let Ok(vf) = trimmed.parse::<f64>() {
+        if vf.is_finite() && vf >= i64::MIN as f64 && vf <= i64::MAX as f64 {
+            return Some(vf as i64);
+        }
+    }
+    None
 }
 
 fn parse_f64(value: &str) -> Option<f64> {

@@ -216,8 +216,8 @@ class MLGS:
         coarse_iter: Optional[int] = None,
         fine_iter: Optional[int] = None,
         search_scheme: SearchSchemeName = "multicenter",
-        coarse_top_k: int = 3,
-        confirm_top_k: int = 3,
+        coarse_top_k: int | None = None,
+        confirm_top_k: int | None = None,
         confirm_repeats: int = 2,
         fit_on_init: bool = True,
         verbose: bool = False,
@@ -231,13 +231,14 @@ class MLGS:
         self.verbose = bool(verbose)
         self.parallel_mode_ = self._parallel_mode()
         self.search_scheme = typing.cast(SearchSchemeName, str(search_scheme))
-        default_top_k = 2 if self.method == "svm" else 3
-        self.coarse_top_k = max(1, int(coarse_top_k))
-        self.confirm_top_k = max(1, int(confirm_top_k))
-        if coarse_top_k == 3 and self.method == "svm":
-            self.coarse_top_k = default_top_k
-        if confirm_top_k == 3 and self.method == "svm":
-            self.confirm_top_k = default_top_k
+        default_coarse_top_k = 2 if self.method == "svm" else 3
+        default_confirm_top_k = 2 if self.method in {"svm", "gbdt"} else 3
+        self.coarse_top_k = (
+            default_coarse_top_k if coarse_top_k is None else max(1, int(coarse_top_k))
+        )
+        self.confirm_top_k = (
+            default_confirm_top_k if confirm_top_k is None else max(1, int(confirm_top_k))
+        )
         self.confirm_repeats = max(1, int(confirm_repeats))
 
         self.y = _as_1d_y(y)
@@ -377,15 +378,15 @@ class MLGS:
         if self.method == "gbdt":
             if stage == "coarse":
                 if large_n or huge_p:
-                    return 8
+                    return 3
                 if medium_n or large_p:
-                    return 10
-                return 12
-            if large_n or huge_p:
-                return 4
-            if medium_n or large_p:
+                    return 4
                 return 6
-            return 8
+            if large_n or huge_p:
+                return 1
+            if medium_n or large_p:
+                return 2
+            return 3
         if self.method == "xgb":
             if stage == "coarse":
                 if large_n or huge_p:

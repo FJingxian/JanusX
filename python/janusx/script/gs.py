@@ -1376,12 +1376,6 @@ def main(log: bool = True) -> None:
             logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
             continue
 
-        if (not args.strict_cv) and any(m in _ML_METHOD_MAP for m in methods):
-            logger.info(
-                "ML tuning mode: tune once per trait and reuse best params across outer CV folds. "
-                "Use -strict-cv for nested tuning."
-            )
-
         # 5-fold cross-validation on training population
         cv_splits = None
         if args.cv is not None:

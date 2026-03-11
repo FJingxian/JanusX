@@ -130,86 +130,79 @@ pub(super) fn cmd_bam2gvcf(
     )
 }
 
-pub(super) fn cmd_cgvcf(
+pub(super) fn cmd_gvcf_to_table_and_gt(
     reference: &Path,
     chrom: &str,
     gvcfs: &[PathBuf],
-    out: &Path,
-    core: usize,
+    merge_dir: &Path,
+    impute_dir: &Path,
+    genotype_core: usize,
+    genotype_mem: usize,
+    min_dp: usize,
+    min_gq: usize,
+    min_ad: usize,
     singularity: &str,
 ) -> String {
     let prefix = cmd_prefix(singularity);
-    let db_dir = out.join(format!("Merge.{chrom}.gendb"));
-    let done = out.join(format!("Merge.{chrom}.gendb.done"));
     let tmp_tag = safe_job_label(chrom);
+    let raw_vcf = merge_dir.join(format!("Merge.{chrom}.raw.vcf.gz"));
+    let raw_tbi = merge_dir.join(format!("Merge.{chrom}.raw.vcf.gz.tbi"));
+    let out_snp_f = merge_dir.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
+    let out_snp_f_tbi = merge_dir.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
+    let out_snp_tsv = merge_dir.join(format!("Merge.{chrom}.SNP.tsv"));
+    let out_gt = impute_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
+    let out_gt_tbi = impute_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz.tbi"));
+    let miss_prefix = impute_dir.join(format!("Merge.{chrom}.SNP.GT"));
+    let out_lmiss = impute_dir.join(format!("Merge.{chrom}.SNP.GT.lmiss"));
+    let out_imiss = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imiss"));
+    let filter_expr = sh_quote(
+        "QUAL>=30 && INFO/FS<=60 && INFO/QD>=2 && INFO/SOR<=3 && INFO/MQ>=40 && INFO/ReadPosRankSum>=-8 && INFO/MQRankSum>=-12.5",
+    );
     let variants = gvcfs
         .iter()
         .map(|p| format!("--variant {}", qpath(p)))
         .collect::<Vec<String>>()
         .join(" ");
+    let expr1 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq} || FMT/AD[:1]<{min_ad}");
+    let expr2 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq} || FMT/AD[1]<{min_ad}");
+    let expr3 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq}");
     let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; GDB_TMP=\"$TMPDIR_BASE/{}.gendb.tmp\"; mkdir -p \"$GDB_TMP\"",
-        qpath(out),
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; GDB_DIR=\"$TMPDIR_BASE/{}.gendb\"; GDB_TMP=\"$TMPDIR_BASE/{}.gendb.tmp\"; cleanup() {{ rm -rf \"$GDB_DIR\" \"$GDB_TMP\" {} {}; }}; trap cleanup EXIT; rm -rf \"$GDB_DIR\" \"$GDB_TMP\"; mkdir -p \"$GDB_TMP\"",
+        qpath(merge_dir),
         tmp_tag,
-    );
-    let cleanup_cmd = format!(
-        "rm -rf {} \"$GDB_TMP\" && mkdir -p \"$GDB_TMP\" && rm -f {}",
-        qpath(&db_dir),
-        qpath(&done)
-    );
-    format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {prefix}gatk GenomicsDBImport -R {} -L {} --genomicsdb-workspace-path {} --tmp-dir \"$GDB_TMP\" --reader-threads {core} {} && touch {} && rm -rf \"$GDB_TMP\"",
-        qpath(reference),
-        sh_quote(chrom),
-        qpath(&db_dir),
-        variants,
-        qpath(&done),
-    )
-}
-
-pub(super) fn cmd_gvcf2snp_table(
-    reference: &Path,
-    chrom: &str,
-    out: &Path,
-    core: usize,
-    mem: usize,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let db_dir = out.join(format!("Merge.{chrom}.gendb"));
-    let raw_vcf = out.join(format!("Merge.{chrom}.raw.vcf.gz"));
-    let raw_tbi = out.join(format!("Merge.{chrom}.raw.vcf.gz.tbi"));
-    let out_snp_f = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-    let out_snp_f_tbi = out.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
-    let out_snp_tsv = out.join(format!("Merge.{chrom}.SNP.tsv"));
-    let filter_expr = sh_quote(
-        "QUAL>=30 && INFO/FS<=60 && INFO/QD>=2 && INFO/SOR<=3 && INFO/MQ>=40 && INFO/ReadPosRankSum>=-8 && INFO/MQRankSum>=-12.5",
-    );
-    let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
-        qpath(out),
-    );
-    let cleanup_cmd = format!(
-        "rm -f {} {} {} {} {}",
+        tmp_tag,
         qpath(&raw_vcf),
         qpath(&raw_tbi),
+    );
+    let cleanup_outputs_cmd = format!(
+        "rm -f {} {} {} {} {} {} {}",
+        qpath(&raw_vcf),
         qpath(&out_snp_f),
         qpath(&out_snp_f_tbi),
         qpath(&out_snp_tsv),
+        qpath(&out_gt),
+        qpath(&out_gt_tbi),
+        qpath(&out_lmiss),
+    );
+    let cleanup_outputs_cmd = format!("{cleanup_outputs_cmd} && rm -f {}", qpath(&out_imiss));
+    let import_cmd = format!(
+        "{prefix}gatk GenomicsDBImport -R {} -L {} --genomicsdb-workspace-path \"$GDB_DIR\" --tmp-dir \"$GDB_TMP\" --reader-threads {genotype_core} {}",
+        qpath(reference),
+        sh_quote(chrom),
+        variants,
     );
     let genotype_cmd = format!(
-        "{prefix}gatk --java-options '-Xmx{mem}G -XX:ParallelGCThreads={core}' GenotypeGVCFs -R {} -V {} -O {}",
+        "{prefix}gatk --java-options '-Xmx{genotype_mem}G -XX:ParallelGCThreads={genotype_core}' GenotypeGVCFs -R {} -V gendb://$GDB_DIR -O {}",
         qpath(reference),
-        sh_quote(&format!("gendb://{}", db_dir.to_string_lossy())),
         qpath(&raw_vcf),
     );
     let filter_cmd = format!(
-        "{prefix}bcftools view --threads {core} -m2 -M2 -v snps {} -Ou | {prefix}bcftools filter --threads {core} -i {} -Oz -o {}",
+        "{prefix}bcftools view --threads {genotype_core} -m2 -M2 -v snps {} -Ou | {prefix}bcftools filter --threads {genotype_core} -i {} -Oz -o {}",
         qpath(&raw_vcf),
         filter_expr,
         qpath(&out_snp_f),
     );
-    let index_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_snp_f));
+    let index_snp_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_snp_f));
     let header_cmd = format!(
         "SAMPLE_COLS=$({prefix}bcftools query -l {} | awk '{{printf \"\\t%s.DP\\t%s.AD\\t%s.GQ\", $1,$1,$1}}'); printf 'CHROM\\tPOS\\tREF\\tALT%s\\n' \"$SAMPLE_COLS\" > {}",
         qpath(&out_snp_f),
@@ -220,62 +213,40 @@ pub(super) fn cmd_gvcf2snp_table(
         qpath(&out_snp_f),
         qpath(&out_snp_tsv),
     );
-    format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {genotype_cmd} && {filter_cmd} && {index_cmd} && {header_cmd} && {table_cmd} && test -s {} && rm -f {} {}",
-        qpath(&out_snp_tsv),
-        qpath(&raw_vcf),
-        qpath(&raw_tbi),
-    )
-}
-
-pub(super) fn cmd_snpvcf_to_gt_and_missing(
-    chrom: &str,
-    merge_dir: &Path,
-    impute_dir: &Path,
-    min_dp: usize,
-    min_gq: usize,
-    min_ad: usize,
-    core: usize,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let in_vcf = merge_dir.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-    let out_gt = impute_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
-    let miss_prefix = impute_dir.join(format!("Merge.{chrom}.SNP.GT"));
-    let out_lmiss = impute_dir.join(format!("Merge.{chrom}.SNP.GT.lmiss"));
-    let out_imiss = impute_dir.join(format!("Merge.{chrom}.SNP.GT.imiss"));
-    let expr1 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq} || FMT/AD[:1]<{min_ad}");
-    let expr2 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq} || FMT/AD[1]<{min_ad}");
-    let expr3 = format!("FMT/DP<{min_dp} || FMT/GQ<{min_gq}");
     let setgt_cmd = format!(
         "( {prefix}bcftools filter -Ou -S . -e {} {} || {prefix}bcftools filter -Ou -S . -e {} {} || {prefix}bcftools filter -Ou -S . -e {} {} )",
         sh_quote(&expr1),
-        qpath(&in_vcf),
+        qpath(&out_snp_f),
         sh_quote(&expr2),
-        qpath(&in_vcf),
+        qpath(&out_snp_f),
         sh_quote(&expr3),
-        qpath(&in_vcf),
+        qpath(&out_snp_f),
     );
     let keep_gt_cmd = format!(
-        "{prefix}bcftools annotate --threads {core} -x FORMAT,^FORMAT/GT -Oz -o {}",
+        "{prefix}bcftools annotate --threads {genotype_core} -x FORMAT,^FORMAT/GT -Oz -o {}",
         qpath(&out_gt),
     );
-    let index_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_gt));
-    let plink_missing_cmd = format!(
-        "{prefix}plink --vcf {} --allow-extra-chr --double-id --set-missing-var-ids @:# --threads {core} --missing --out {}",
-        qpath(&out_gt),
-        qpath(&miss_prefix),
-    );
+    let index_gt_cmd = format!("{prefix}tabix -f -p vcf {}", qpath(&out_gt));
     let write_empty_miss_cmd = format!(
         "printf 'CHR\\tSNP\\tN_MISS\\tN_GENO\\tF_MISS\\n' > {} && printf 'FID\\tIID\\tMISS_PHENO\\tN_MISS\\tN_GENO\\tF_MISS\\n' > {}",
         qpath(&out_lmiss),
         qpath(&out_imiss),
     );
+    let plink_missing_cmd = format!(
+        "{prefix}plink --vcf {} --allow-extra-chr --double-id --set-missing-var-ids @:# --threads {genotype_core} --missing --out {}",
+        qpath(&out_gt),
+        qpath(&miss_prefix),
+    );
     let miss_cmd = format!(
         "NVAR=$({prefix}bcftools index -n {}) && if [ \"${{NVAR:-0}}\" -gt 0 ]; then {plink_missing_cmd}; else {write_empty_miss_cmd}; fi",
         qpath(&out_gt),
     );
-    format!("{setgt_cmd} | {keep_gt_cmd} && {index_cmd} && {miss_cmd}")
+    format!(
+        "{setup_tmp_cmd} && {cleanup_outputs_cmd} && {import_cmd} && {genotype_cmd} && {filter_cmd} && {index_snp_cmd} && {header_cmd} && {table_cmd} && {setgt_cmd} | {keep_gt_cmd} && {index_gt_cmd} && {miss_cmd} && test -s {} && rm -f {} {}",
+        qpath(&out_snp_tsv),
+        qpath(&raw_vcf),
+        qpath(&raw_tbi),
+    )
 }
 
 pub(super) fn cmd_beagle_impute(

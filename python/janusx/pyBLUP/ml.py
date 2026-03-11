@@ -968,6 +968,27 @@ class MLGS:
             self.model.fit(self.X, self.y)
         return self
 
+    def get_final_params(self) -> dict[str, Any]:
+        if self.best_params_ is None:
+            raise RuntimeError("MLGS model is not fitted. Call fit() first.")
+        final_params = dict(self.best_params_)
+        if self.method == "xgb" and self.best_n_estimators_ is not None:
+            final_params["n_estimators"] = int(max(50, self.best_n_estimators_))
+        return final_params
+
+    def fit_with_params(self, params: dict[str, Any]) -> "MLGS":
+        final_params = dict(params)
+        self.best_params_ = dict(final_params)
+        if self.method == "xgb" and "n_estimators" in final_params:
+            try:
+                self.best_n_estimators_ = int(final_params["n_estimators"])
+            except Exception:
+                self.best_n_estimators_ = None
+        self.model = self._build_estimator(final_params)
+        with self._thread_context():
+            self.model.fit(self.X, self.y)
+        return self
+
     def _prepare_predict_marker(self, M: np.ndarray) -> np.ndarray:
         arr = np.asarray(M, dtype=np.float32)
         if arr.ndim != 2:

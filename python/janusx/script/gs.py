@@ -162,6 +162,51 @@ def _mlgs_inner_cv(n_samples: int) -> int:
     return 2
 
 
+def _apply_optional_pca(
+    Xtrain: np.ndarray,
+    Xtest: np.ndarray,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not enabled:
+        return Xtrain, Xtest
+    Xtt = np.concatenate([Xtrain, Xtest], axis=1)
+    Xtt = (Xtt - np.mean(Xtt, axis=1, keepdims=True)) / (
+        np.std(Xtt, axis=1, keepdims=True) + 1e-8
+    )
+    val, vec = np.linalg.eigh(Xtt.T @ Xtt / Xtt.shape[0])
+    idx = np.argsort(val)[::-1]
+    val, vec = val[idx], vec[:, idx]
+    dim = np.sum(np.cumsum(val) / np.sum(val) <= 0.9)
+    vec = val[:dim] * vec[:, :dim]
+    return vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
+
+
+def _tune_ml_method_once(
+    method: str,
+    Y: np.ndarray,
+    Xtrain: np.ndarray,
+    PCAdec: bool,
+    n_jobs: int,
+) -> dict[str, typing.Any]:
+    empty_test = np.zeros((Xtrain.shape[0], 0), dtype=Xtrain.dtype)
+    Xtrain_tuned, _ = _apply_optional_pca(Xtrain, empty_test, enabled=PCAdec)
+    model = MLGS(
+        y=Y.reshape(-1),
+        M=Xtrain_tuned,
+        method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
+        seed=42,
+        cv=_mlgs_inner_cv(int(Y.shape[0])),
+        n_jobs=max(1, int(n_jobs)),
+        fit_on_init=True,
+        verbose=False,
+    )
+    return {
+        "params": model.get_final_params(),
+        "pve": float((model.best_metrics_ or {}).get("r2", np.nan)),
+        "best_metrics": dict(model.best_metrics_ or {}),
+    }
+
+
 def GSapi(
     Y: np.ndarray,
     Xtrain: np.ndarray,
@@ -169,6 +214,7 @@ def GSapi(
     method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
+    ml_fixed_params: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -199,20 +245,7 @@ def GSapi(
         Variance-component PVE/h2 for mixed models and Bayes models,
         or predictive PVE (inner-CV R²) for ML models.
     """
-    # Optional PCA-based dimensionality reduction
-    if PCAdec:
-        Xtt = np.concatenate([Xtrain, Xtest], axis=1)  # (m, n_train + n_test)
-        Xtt = (Xtt - np.mean(Xtt, axis=1, keepdims=True)) / (
-            np.std(Xtt, axis=1, keepdims=True) + 1e-8
-        )
-        # Simple PCA via eigendecomposition of X^T X
-        val, vec = np.linalg.eigh(Xtt.T @ Xtt / Xtt.shape[0])
-        idx = np.argsort(val)[::-1]
-        val, vec = val[idx], vec[:, idx]
-        # Retain components explaining up to 90% variance
-        dim = np.sum(np.cumsum(val) / np.sum(val) <= 0.9)
-        vec = val[:dim] * vec[:, :dim]
-        Xtrain, Xtest = vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
+    Xtrain, Xtest = _apply_optional_pca(Xtrain, Xtest, enabled=PCAdec)
 
     # Multi-kernel additive+dominance BLUP (pyBLUP/JAX backend)
     if method == "adBLUP":
@@ -280,9 +313,11 @@ def GSapi(
             seed=42,
             cv=_mlgs_inner_cv(int(Y.shape[0])),
             n_jobs=max(1, int(n_jobs)),
-            fit_on_init=True,
+            fit_on_init=False if ml_fixed_params is not None else True,
             verbose=False,
         )
+        if ml_fixed_params is not None:
+            model.fit_with_params(ml_fixed_params)
         yhat_train = model.fit_predict()
         if int(Xtest.shape[1]) > 0:
             yhat_test = model.predict(Xtest)
@@ -308,6 +343,7 @@ def _run_method_task(
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
+    strict_cv: bool,
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
@@ -315,6 +351,18 @@ def _run_method_task(
     best_test = None
     best_train = None
     best_r2 = -np.inf
+    ml_tuning_cache: dict[str, typing.Any] | None = None
+
+    if method in _ML_METHOD_MAP and (not strict_cv):
+        if train_snp_ml is None:
+            raise ValueError(f"{method} requires raw genotype matrix.")
+        ml_tuning_cache = _tune_ml_method_once(
+            method=method,
+            Y=train_pheno,
+            Xtrain=train_snp_ml,
+            PCAdec=pca_dec,
+            n_jobs=n_jobs,
+        )
 
     if cv_splits is not None:
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
@@ -342,7 +390,10 @@ def _run_method_task(
                 method=method,
                 PCAdec=fold_pca,
                 n_jobs=n_jobs,
+                ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
             )
+            if ml_tuning_cache is not None:
+                pve = float(ml_tuning_cache.get("pve", np.nan))
             ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
             ttrain = np.concatenate([train_pheno[train_idx], yhat_train], axis=1)
 
@@ -393,7 +444,10 @@ def _run_method_task(
         method=method,
         PCAdec=final_pca,
         n_jobs=n_jobs,
+        ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
     )
+    if ml_tuning_cache is not None:
+        pve_final = float(ml_tuning_cache.get("pve", np.nan))
     return {
         "method": method,
         "fold_rows": fold_rows,
@@ -416,6 +470,7 @@ def _run_methods_parallel(
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
+    strict_cv: bool,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -493,6 +548,7 @@ def _run_methods_parallel(
                             pca_dec,
                             cv_splits,
                             model_n_jobs,
+                            strict_cv,
                             progress_queue=None,
                             progress_hook=_hook,
                         )
@@ -534,6 +590,7 @@ def _run_methods_parallel(
                     pca_dec,
                     cv_splits,
                     model_n_jobs,
+                    strict_cv,
                 )
             except Exception:
                 elapsed = format_elapsed(time.monotonic() - t0)
@@ -571,6 +628,7 @@ def _run_methods_parallel(
                     pca_dec,
                     cv_splits,
                     model_n_jobs,
+                    strict_cv,
                     None,
                 ): m
                 for m in methods
@@ -650,6 +708,7 @@ def _run_methods_parallel(
                             pca_dec,
                             cv_splits,
                             model_n_jobs,
+                            strict_cv,
                             prog_q,
                         ): m
                         for m in methods
@@ -737,6 +796,7 @@ def _run_methods_parallel(
                         pca_dec,
                         cv_splits,
                         model_n_jobs,
+                        strict_cv,
                         prog_q,
                     ): m
                     for m in methods
@@ -780,6 +840,7 @@ def _run_methods_parallel(
                     pca_dec,
                     cv_splits,
                     model_n_jobs,
+                    strict_cv,
                     None,
                 ): m
                 for m in methods
@@ -1013,6 +1074,13 @@ def main(log: bool = True) -> None:
              "(default: all available cores).",
     )
     optional_group.add_argument(
+        "-strict-cv", "--strict-cv",
+        action="store_true",
+        default=False,
+        help="For ML methods, retune hyperparameters inside every outer CV fold. "
+             "By default, ML methods tune once per trait and reuse best params across outer folds.",
+    )
+    optional_group.add_argument(
         "-plot", "--plot",
         action="store_true",
         default=False,
@@ -1131,6 +1199,7 @@ def main(log: bool = True) -> None:
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
                 ("Threads", args.thread),
+                ("Strict CV", args.strict_cv),
             ]
         )
         if args.plot:
@@ -1307,6 +1376,12 @@ def main(log: bool = True) -> None:
             logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
             continue
 
+        if (not args.strict_cv) and any(m in _ML_METHOD_MAP for m in methods):
+            logger.info(
+                "ML tuning mode: tune once per trait and reuse best params across outer CV folds. "
+                "Use -strict-cv for nested tuning."
+            )
+
         # 5-fold cross-validation on training population
         cv_splits = None
         if args.cv is not None:
@@ -1339,6 +1414,7 @@ def main(log: bool = True) -> None:
             pca_dec=args.pcd,
             cv_splits=cv_splits,
             n_jobs=int(max(1, args.thread)),
+            strict_cv=bool(args.strict_cv),
         )
         method_result_map = {str(x["method"]): x for x in method_results}
 

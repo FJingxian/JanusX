@@ -5,8 +5,8 @@ use super::pipeline::{
 mod cmd;
 mod state;
 use cmd::{
-    cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem, cmd_cgvcf, cmd_concat_imputed_vcfs, cmd_fastp,
-    cmd_filter_imputed_by_maf_and_missing, cmd_gvcf2snp_table, cmd_markdup,
+    cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem_then_markdup, cmd_cgvcf, cmd_concat_imputed_vcfs,
+    cmd_fastp, cmd_filter_imputed_by_maf_and_missing, cmd_gvcf2snp_table,
     cmd_snpvcf_to_gt_and_missing, sh_quote,
     wrap_scheduler_cmd,
 };
@@ -24,10 +24,9 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const REQUIRED_DLC_TOOLS: [&str; 9] = [
+const REQUIRED_DLC_TOOLS: [&str; 8] = [
     "fastp",
-    "samtools",
-    "sambamba",
+    "samblaster",
     "gatk",
     "bcftools",
     "tabix",
@@ -36,12 +35,11 @@ const REQUIRED_DLC_TOOLS: [&str; 9] = [
     "beagle",
 ];
 type ToolProbe = (String, bool, bool, String);
-const FASTQ2VCF_TOTAL_STEPS: usize = 9;
+const FASTQ2VCF_TOTAL_STEPS: usize = 8;
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlignerFlavor {
-    Bwa,
     BwaMem2,
 }
 
@@ -178,7 +176,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             ))
         );
     }
-    if from_step >= 5 && !discovered.chroms_hint.is_empty() {
+    if from_step >= 4 && !discovered.chroms_hint.is_empty() {
         println!(
             "{}",
             super::style_green(&format!(
@@ -188,7 +186,6 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             ))
         );
     }
-
     let singularity = jx_cmd.to_string();
     let mut opts = PipelineOptions::default();
     opts.scheduler = if backend == "csub" {
@@ -344,6 +341,9 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         &aligner_cmd,
         &singularity,
         true,
+        if from_step == 2 { Some(&samples) } else { None },
+        from_step,
+        if from_step >= 3 { fastq_dir.as_deref() } else { None },
     )?;
 
     let run_params_json = build_run_params_json(
@@ -454,11 +454,24 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
                 to_step
             ))
         );
+        if to_step >= 5 {
+            print_postbsa_summary(&workdir, &samples, &chroms);
+        }
         return Ok(0);
     }
 
+    print_postbsa_summary(&workdir, &samples, &chroms);
+
+    Ok(0)
+}
+
+fn print_postbsa_summary(
+    workdir: &Path,
+    samples: &BTreeMap<String, (PathBuf, PathBuf)>,
+    chroms: &[String],
+) {
     let bulk_names = infer_bulks(samples.keys().cloned().collect::<Vec<String>>());
-    let latest_tsv = latest_snp_table(&workdir);
+    let latest_tsv = latest_snp_table(workdir);
     let tsv_text = match latest_tsv {
         Some(p) => p.to_string_lossy().to_string(),
         None => {
@@ -500,8 +513,6 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     );
     println!("Next step suggestion:");
     println!("  jx postbsa -file {postbsa_glob} -b1 [bulk1] -b2 [bulk2]");
-
-    Ok(0)
 }
 
 fn print_fastq2vcf_help() {
@@ -555,7 +566,7 @@ fn print_fastq2vcf_help() {
     print_colored_help_entry(
         2,
         Some(("-i", "--fastq-dir", "FASTQ_DIR")),
-        "Directory containing FASTQ files. Required when -from-step is 1 or 2.",
+        "Input directory for current -from-step. Required for step 1/2 (FASTQ). Optional for step 3 (BAM), 4 (gVCF), 5/6 (Merge files), 7 (5.impute files).",
         42,
         width,
     );
@@ -576,7 +587,7 @@ fn print_fastq2vcf_help() {
     println!();
     println!("{}", super::style_orange("Examples:"));
     println!("  jx fastq2vcf -r ref.fa -i fastq_dir -w workdir");
-    println!("  jx fastq2vcf -r ref.fa -w workdir -from-step 5 -to-step 8");
+    println!("  jx fastq2vcf -r ref.fa -w workdir -from-step 4 -to-step 8");
     println!("  jx -update dlc");
     println!();
     println!("{}", super::style_orange("Citation:"));
@@ -962,91 +973,41 @@ fn probe_dlc_toolchain() -> Result<(Vec<ToolProbe>, String, AlignerFlavor), Stri
 }
 
 fn probe_aligner_tool(jx_bin: &Path) -> (String, bool, String, String, AlignerFlavor) {
-    let mem2_ok = probe_dlc_tool_wrapper(jx_bin, "bwa-mem2");
-    let bwa_ok = probe_dlc_tool_wrapper(jx_bin, "bwa");
+    let mem2_ok = probe_bwa_mem2_wrapper(jx_bin);
     if mem2_ok {
-        let mem2_is_alias = !bwa_ok && bwa_mem2_is_bwa_alias(jx_bin);
-        let display = if mem2_is_alias {
-            "bwa".to_string()
-        } else {
-            "bwa-mem2".to_string()
-        };
-        let flavor = if mem2_is_alias {
-            AlignerFlavor::Bwa
-        } else {
-            AlignerFlavor::BwaMem2
-        };
         return (
-            display,
+            "bwa-mem2".to_string(),
             true,
             "jx bwa-mem2".to_string(),
-            "bwa-mem2 or bwa".to_string(),
-            flavor,
-        );
-    }
-    if bwa_ok {
-        return (
-            "bwa".to_string(),
-            true,
-            "jx bwa".to_string(),
-            "bwa-mem2 or bwa".to_string(),
-            AlignerFlavor::Bwa,
+            "bwa-mem2".to_string(),
+            AlignerFlavor::BwaMem2,
         );
     }
     if let Some(mem2_bin) = find_in_path("bwa-mem2") {
+        if !probe_bwa_mem2_path(&mem2_bin) {
+            return (
+                "bwa-mem2".to_string(),
+                false,
+                "jx bwa-mem2".to_string(),
+                "bwa-mem2".to_string(),
+                AlignerFlavor::BwaMem2,
+            );
+        }
         return (
             "bwa-mem2".to_string(),
             true,
             sh_quote(&mem2_bin.to_string_lossy()),
-            "bwa-mem2 or bwa".to_string(),
+            "bwa-mem2".to_string(),
             AlignerFlavor::BwaMem2,
         );
     }
-    if let Some(bwa_bin) = find_in_path("bwa") {
-        return (
-            "bwa".to_string(),
-            true,
-            sh_quote(&bwa_bin.to_string_lossy()),
-            "bwa-mem2 or bwa".to_string(),
-            AlignerFlavor::Bwa,
-        );
-    }
     (
-        "bwa|bwa-mem2".to_string(),
+        "bwa-mem2".to_string(),
         false,
         "jx bwa-mem2".to_string(),
-        "bwa-mem2 or bwa".to_string(),
+        "bwa-mem2".to_string(),
         AlignerFlavor::BwaMem2,
     )
-}
-
-fn bwa_mem2_is_bwa_alias(jx_bin: &Path) -> bool {
-    let out_cmd = Command::new(jx_bin)
-        .arg("bwa-mem2")
-        .arg("mem")
-        .arg("-h")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    let out = match out_cmd {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let mut merged = String::new();
-    merged.push_str(&String::from_utf8_lossy(&out.stdout));
-    merged.push('\n');
-    merged.push_str(&String::from_utf8_lossy(&out.stderr));
-    if wrapper_missing_by_output(&merged) {
-        return false;
-    }
-    let msg = merged.to_ascii_lowercase();
-    if msg.contains("bwa-mem2") {
-        return false;
-    }
-    msg.contains("program: bwa")
-        || msg.contains("usage: bwa ")
-        || msg.contains("burrows-wheeler transformation")
 }
 
 fn probe_dlc_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
@@ -1069,6 +1030,37 @@ fn probe_dlc_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
     merged.push('\n');
     merged.push_str(&String::from_utf8_lossy(&out_cmd.stderr));
     !wrapper_missing_by_output(&merged)
+}
+
+fn probe_bwa_mem2_wrapper(jx_bin: &Path) -> bool {
+    probe_bwa_mem2_exec(Command::new(jx_bin).arg("bwa-mem2").arg("index").output())
+}
+
+fn probe_bwa_mem2_path(bin: &Path) -> bool {
+    probe_bwa_mem2_exec(Command::new(bin).arg("index").output())
+}
+
+fn probe_bwa_mem2_exec(out_cmd: Result<std::process::Output, std::io::Error>) -> bool {
+    let out_cmd = match out_cmd {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut merged = String::new();
+    merged.push_str(&String::from_utf8_lossy(&out_cmd.stdout));
+    merged.push('\n');
+    merged.push_str(&String::from_utf8_lossy(&out_cmd.stderr));
+    let merged_lower = merged.to_ascii_lowercase();
+    if merged_lower.contains("fail to find the right executable")
+        || merged_lower.contains("can not run executable")
+    {
+        return false;
+    }
+    if out_cmd.status.success() {
+        return true;
+    }
+    merged_lower.contains("usage")
+        || merged_lower.contains("index files named")
+        || merged_lower.contains("bwa-mem2")
 }
 
 fn print_toolchain_line(toolchain: &[ToolProbe]) {
@@ -1124,6 +1116,7 @@ fn start_reference_indexing(
     aligner_flavor: AlignerFlavor,
 ) -> Result<Option<ReferenceIndexTask>, String> {
     let reference = absolutize_path(reference)?;
+    ensure_reference_fai(&reference)?;
     fs::create_dir_all(workdir.join("log")).map_err(|e| {
         format!(
             "Failed to create log directory {}: {e}",
@@ -1137,9 +1130,7 @@ fn start_reference_indexing(
     let dict_path = reference_dict_path(&reference);
 
     let idx_cmd = format!(
-        "{} samtools faidx {} && {} index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
-        jx_prefix,
-        sh_quote(&reference.to_string_lossy()),
+        "{} index {} && if [ -f {} ]; then rm -f {}; fi && {} gatk CreateSequenceDictionary -R {} -O {}",
         aligner_cmd,
         sh_quote(&reference.to_string_lossy()),
         sh_quote(&dict_path.to_string_lossy()),
@@ -1150,10 +1141,7 @@ fn start_reference_indexing(
     );
     let safe_job = crate::pipeline::safe_job_label(job_name);
     let ignore_error_logs = collect_existing_step_error_logs(workdir, &safe_job)?;
-    let index_csub_ncpu = match aligner_flavor {
-        AlignerFlavor::BwaMem2 => 8,
-        AlignerFlavor::Bwa => 2,
-    };
+    let index_csub_ncpu = 8usize;
     let wrapped = wrap_reference_submit_cmd(&idx_cmd, &safe_job, backend, index_csub_ncpu);
     run_shell_capture(workdir, &wrapped, "indexing reference submit")?;
     Ok(Some(ReferenceIndexTask {
@@ -1286,10 +1274,15 @@ fn validate_required_aligner_indexes(
     reference: &Path,
     aligner_flavor: AlignerFlavor,
 ) -> Result<(), String> {
-    let (paths, aligner_name): (Vec<PathBuf>, &str) = match aligner_flavor {
-        AlignerFlavor::BwaMem2 => (bwa_mem2_index_paths(reference), "bwa-mem2"),
-        AlignerFlavor::Bwa => (bwa_index_paths(reference), "bwa"),
-    };
+    validate_required_aligner_indexes_exact(reference, aligner_flavor)
+}
+
+fn validate_required_aligner_indexes_exact(
+    reference: &Path,
+    _aligner_flavor: AlignerFlavor,
+) -> Result<(), String> {
+    let paths = bwa_mem2_index_paths(reference);
+    let aligner_name = "bwa-mem2";
     let mut missing: Vec<String> = Vec::new();
     for p in paths {
         if let Err(e) = check_readable_nonempty(&p) {
@@ -1312,13 +1305,6 @@ fn bwa_mem2_index_paths(reference: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn bwa_index_paths(reference: &Path) -> Vec<PathBuf> {
-    [".amb", ".ann", ".bwt", ".pac", ".sa"]
-        .iter()
-        .map(|suffix| reference_sidecar(reference, suffix))
-        .collect()
-}
-
 fn check_readable_nonempty(path: &Path) -> Result<(), String> {
     if !path.exists() || !path.is_file() {
         return Err(format!("index file missing: {}", path.display()));
@@ -1328,6 +1314,121 @@ fn check_readable_nonempty(path: &Path) -> Result<(), String> {
         return Err(format!("index file is empty: {}", path.display()));
     }
     File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_reference_fai(reference: &Path) -> Result<(), String> {
+    let fai = reference_sidecar(reference, ".fai");
+    let need_rebuild = if !fai.exists() {
+        true
+    } else {
+        let ref_m = fs::metadata(reference)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let fai_m = fs::metadata(&fai)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        fai_m < ref_m || parse_fai_file(&fai).is_err()
+    };
+    if !need_rebuild {
+        return Ok(());
+    }
+
+    let file = File::open(reference)
+        .map_err(|e| format!("Failed to open FASTA {}: {e}", reference.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut offset: u64 = 0;
+    let mut rows: Vec<(String, u64, u64, u64, u64)> = Vec::new();
+
+    let mut curr_name: Option<String> = None;
+    let mut curr_len: u64 = 0;
+    let mut curr_offset: u64 = 0;
+    let mut curr_line_bases: u64 = 0;
+    let mut curr_line_width: u64 = 0;
+
+    loop {
+        buf.clear();
+        let read = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| format!("Failed to read FASTA {}: {e}", reference.display()))?;
+        if read == 0 {
+            break;
+        }
+        let line_width = read as u64;
+        let mut trimmed = read;
+        if trimmed > 0 && buf[trimmed - 1] == b'\n' {
+            trimmed -= 1;
+        }
+        if trimmed > 0 && buf[trimmed - 1] == b'\r' {
+            trimmed -= 1;
+        }
+        let line = &buf[..trimmed];
+
+        if line.first() == Some(&b'>') {
+            if let Some(name) = curr_name.take() {
+                rows.push((name, curr_len, curr_offset, curr_line_bases, curr_line_width));
+            }
+            let header = String::from_utf8_lossy(&line[1..]);
+            let name = header
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err(format!(
+                    "Invalid FASTA header with empty contig name in {}",
+                    reference.display()
+                ));
+            }
+            curr_name = Some(name);
+            curr_len = 0;
+            curr_offset = offset + line_width;
+            curr_line_bases = 0;
+            curr_line_width = 0;
+        } else if !line.is_empty() {
+            if curr_name.is_none() {
+                return Err(format!(
+                    "Invalid FASTA content before header in {}",
+                    reference.display()
+                ));
+            }
+            let bases = trimmed as u64;
+            if curr_line_bases == 0 {
+                curr_line_bases = bases;
+                curr_line_width = line_width;
+            }
+            curr_len = curr_len.saturating_add(bases);
+        }
+
+        offset = offset.saturating_add(line_width);
+    }
+
+    if let Some(name) = curr_name.take() {
+        rows.push((name, curr_len, curr_offset, curr_line_bases, curr_line_width));
+    }
+    if rows.is_empty() {
+        return Err(format!("No contigs found in FASTA {}", reference.display()));
+    }
+
+    let mut out = String::new();
+    for (name, len, seq_offset, line_bases, line_width) in rows {
+        out.push_str(&format!(
+            "{name}\t{len}\t{seq_offset}\t{line_bases}\t{line_width}\n"
+        ));
+    }
+
+    let tmp = PathBuf::from(format!("{}.tmp", fai.to_string_lossy()));
+    fs::write(&tmp, out)
+        .map_err(|e| format!("Failed to write FASTA index {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &fai).map_err(|e| {
+        format!(
+            "Failed to move FASTA index {} -> {}: {e}",
+            tmp.display(),
+            fai.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1570,11 +1671,11 @@ struct StepInputDiscovery {
 
 fn discover_inputs_for_from_step(
     from_step: usize,
-    fastq_dir: Option<&Path>,
+    input_dir: Option<&Path>,
     workdir: &Path,
 ) -> Result<StepInputDiscovery, String> {
     if from_step <= 2 {
-        let Some(fq_dir) = fastq_dir else {
+        let Some(fq_dir) = input_dir else {
             return Err("`-i/--fastq-dir` is required when -from-step is 1 or 2.".to_string());
         };
         let fastq_files = collect_fastq_files(fq_dir)?;
@@ -1596,12 +1697,15 @@ fn discover_inputs_for_from_step(
         });
     }
 
-    if from_step == 3 || from_step == 4 {
-        let sample_names = infer_samples_from_mapping_bam(workdir, from_step)?;
+    if from_step == 3 {
+        let mapping_dir = input_dir
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| workdir.join("2.mapping"));
+        let sample_names = infer_samples_from_mapping_bam(&mapping_dir, from_step)?;
         if sample_names.is_empty() {
             return Err(format!(
                 "No BAM-derived samples found under {} for -from-step {}.",
-                workdir.join("2.mapping").display(),
+                mapping_dir.display(),
                 from_step
             ));
         }
@@ -1612,12 +1716,15 @@ fn discover_inputs_for_from_step(
         });
     }
 
-    if from_step == 5 {
-        let (sample_names, chroms) = infer_samples_and_chroms_from_gvcf(workdir)?;
+    if from_step == 4 {
+        let gvcf_dir = input_dir
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| workdir.join("3.gvcf"));
+        let (sample_names, chroms) = infer_samples_and_chroms_from_gvcf(&gvcf_dir)?;
         if sample_names.is_empty() {
             return Err(format!(
-                "No sample/chromosome pairs found under {} for -from-step 5.",
-                workdir.join("3.gvcf").display()
+                "No sample/chromosome pairs found under {} for -from-step 4.",
+                gvcf_dir.display()
             ));
         }
         return Ok(StepInputDiscovery {
@@ -1627,12 +1734,33 @@ fn discover_inputs_for_from_step(
         });
     }
 
+    if from_step == 5 {
+        let merge_dir = input_dir
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| workdir.join("4.merge"));
+        let chroms = infer_chroms_from_merge_gendb(&merge_dir)?;
+        if chroms.is_empty() {
+            return Err(format!(
+                "No chromosomes inferred from {} for -from-step 5.",
+                merge_dir.display()
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples: BTreeMap::new(),
+            fastq_file_count: 0,
+            chroms_hint: chroms,
+        });
+    }
+
     if from_step == 6 {
-        let chroms = infer_chroms_from_merge_gendb(workdir)?;
+        let merge_dir = input_dir
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| workdir.join("4.merge"));
+        let chroms = infer_chroms_from_snp_filtered_vcf(&merge_dir)?;
         if chroms.is_empty() {
             return Err(format!(
                 "No chromosomes inferred from {} for -from-step 6.",
-                workdir.join("4.merge").display()
+                merge_dir.display()
             ));
         }
         return Ok(StepInputDiscovery {
@@ -1643,11 +1771,14 @@ fn discover_inputs_for_from_step(
     }
 
     if from_step == 7 {
-        let chroms = infer_chroms_from_snp_filtered_vcf(workdir)?;
+        let impute_dir = input_dir
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| workdir.join("5.impute"));
+        let chroms = infer_chroms_from_gt_vcf(&impute_dir)?;
         if chroms.is_empty() {
             return Err(format!(
                 "No chromosomes inferred from {} for -from-step 7.",
-                workdir.join("4.merge").display()
+                impute_dir.display()
             ));
         }
         return Ok(StepInputDiscovery {
@@ -1660,14 +1791,12 @@ fn discover_inputs_for_from_step(
     Err(format!("Unsupported -from-step value: {from_step}"))
 }
 
-fn infer_samples_from_mapping_bam(workdir: &Path, from_step: usize) -> Result<Vec<String>, String> {
-    let mapping = workdir.join("2.mapping");
+fn infer_samples_from_mapping_bam(mapping: &Path, _from_step: usize) -> Result<Vec<String>, String> {
     if !mapping.exists() {
         return Ok(Vec::new());
     }
-    let mut sorted: BTreeMap<String, ()> = BTreeMap::new();
     let mut markdup: BTreeMap<String, ()> = BTreeMap::new();
-    for entry in fs::read_dir(&mapping)
+    for entry in fs::read_dir(mapping)
         .map_err(|e| format!("Failed to read directory {}: {e}", mapping.display()))?
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
@@ -1678,12 +1807,6 @@ fn infer_samples_from_mapping_bam(workdir: &Path, from_step: usize) -> Result<Ve
         let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
             continue;
         };
-        if let Some(sample) = name.strip_suffix(".sorted.bam") {
-            if !sample.trim().is_empty() {
-                sorted.insert(sample.to_string(), ());
-            }
-            continue;
-        }
         if let Some(sample) = name.strip_suffix(".Markdup.bam") {
             if !sample.trim().is_empty() {
                 markdup.insert(sample.to_string(), ());
@@ -1691,29 +1814,17 @@ fn infer_samples_from_mapping_bam(workdir: &Path, from_step: usize) -> Result<Ve
             continue;
         }
     }
-    let ordered = if from_step == 3 {
-        if !sorted.is_empty() {
-            sorted
-        } else {
-            markdup
-        }
-    } else if !markdup.is_empty() {
-        markdup
-    } else {
-        sorted
-    };
-    Ok(ordered.keys().cloned().collect())
+    Ok(markdup.keys().cloned().collect())
 }
 
 fn infer_samples_and_chroms_from_gvcf(workdir: &Path) -> Result<(Vec<String>, Vec<String>), String> {
-    let dir = workdir.join("3.gvcf");
-    if !dir.exists() {
+    if !workdir.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
     let mut samples = BTreeMap::<String, ()>::new();
     let mut chroms = BTreeMap::<String, ()>::new();
     for entry in
-        fs::read_dir(&dir).map_err(|e| format!("Failed to read directory {}: {e}", dir.display()))?
+        fs::read_dir(workdir).map_err(|e| format!("Failed to read directory {}: {e}", workdir.display()))?
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let path = entry.path();
@@ -1741,8 +1852,7 @@ fn infer_samples_and_chroms_from_gvcf(workdir: &Path) -> Result<(Vec<String>, Ve
     ))
 }
 
-fn infer_chroms_from_merge_gendb(workdir: &Path) -> Result<Vec<String>, String> {
-    let merge = workdir.join("4.merge");
+fn infer_chroms_from_merge_gendb(merge: &Path) -> Result<Vec<String>, String> {
     if !merge.exists() {
         return Ok(Vec::new());
     }
@@ -1779,8 +1889,7 @@ fn infer_chroms_from_merge_gendb(workdir: &Path) -> Result<Vec<String>, String> 
     Ok(out.keys().cloned().collect())
 }
 
-fn infer_chroms_from_snp_filtered_vcf(workdir: &Path) -> Result<Vec<String>, String> {
-    let merge = workdir.join("4.merge");
+fn infer_chroms_from_snp_filtered_vcf(merge: &Path) -> Result<Vec<String>, String> {
     if !merge.exists() {
         return Ok(Vec::new());
     }
@@ -1799,6 +1908,34 @@ fn infer_chroms_from_snp_filtered_vcf(workdir: &Path) -> Result<Vec<String>, Str
         if let Some(v) = name
             .strip_prefix("Merge.")
             .and_then(|x| x.strip_suffix(".SNP.filtered.vcf.gz"))
+        {
+            if !v.trim().is_empty() {
+                out.insert(v.to_string(), ());
+            }
+        }
+    }
+    Ok(out.keys().cloned().collect())
+}
+
+fn infer_chroms_from_gt_vcf(impute: &Path) -> Result<Vec<String>, String> {
+    if !impute.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = BTreeMap::<String, ()>::new();
+    for entry in fs::read_dir(impute)
+        .map_err(|e| format!("Failed to read directory {}: {e}", impute.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if let Some(v) = name
+            .strip_prefix("Merge.")
+            .and_then(|x| x.strip_suffix(".SNP.GT.vcf.gz"))
         {
             if !v.trim().is_empty() {
                 out.insert(v.to_string(), ());
@@ -1870,7 +2007,7 @@ fn order_chroms_with_reference(chroms: Vec<String>, ref_order: &[String]) -> Vec
 }
 
 fn step_range_needs_reference_index(from_step: usize, to_step: usize) -> bool {
-    let needs_ref_steps = [2usize, 4, 5, 6];
+    let needs_ref_steps = [2usize, 3, 4, 5];
     needs_ref_steps
         .iter()
         .any(|x| *x >= from_step && *x <= to_step)
@@ -1968,6 +2105,9 @@ fn build_sample_key(tokens: &[String], read_idx: usize, stem: &str) -> String {
         if idx != read_idx {
             kept.push(token.to_string());
         }
+    }
+    while matches!(kept.last(), Some(x) if x.eq_ignore_ascii_case("clean")) {
+        kept.pop();
     }
     if let Some(last) = kept.last() {
         if last == "001" || last == "0001" {
@@ -2183,6 +2323,9 @@ fn build_fastq2vcf_steps(
     aligner_cmd: &str,
     singularity: &str,
     include_fastp_step: bool,
+    step2_input_override: Option<&BTreeMap<String, (PathBuf, PathBuf)>>,
+    from_step: usize,
+    step_input_dir_override: Option<&Path>,
 ) -> Result<Vec<PipelineStep>, String> {
     let cleanfolder = workdir.join("1.clean");
     let mappingfolder = workdir.join("2.mapping");
@@ -2203,7 +2346,7 @@ fn build_fastq2vcf_steps(
     }
 
     let sample_names: Vec<String> = samples.keys().cloned().collect();
-    let dynamic_eta = estimate_step5_to_step9_eta_minutes(chroms, chrom_lens, sample_names.len());
+    let dynamic_eta = estimate_step4_to_step8_eta_minutes(chroms, chrom_lens, sample_names.len());
     let mut steps: Vec<PipelineStep> = Vec::new();
 
     if include_fastp_step {
@@ -2214,40 +2357,54 @@ fn build_fastq2vcf_steps(
     let mut step2_inputs = Vec::new();
     let mut step2_outputs = Vec::new();
     let mut step2_items = Vec::new();
+    let step2_markdup_threads = 8usize;
     for sample in &sample_names {
-        let r1 = cleanfolder.join(format!("{sample}.R1.clean.fastq.gz"));
-        let r2 = cleanfolder.join(format!("{sample}.R2.clean.fastq.gz"));
+        let (r1, r2) = if let Some(override_inputs) = step2_input_override {
+            let Some((x1, x2)) = override_inputs.get(sample) else {
+                return Err(format!(
+                    "Step2 input override missing sample `{sample}` for -from-step 2."
+                ));
+            };
+            (x1.clone(), x2.clone())
+        } else {
+            (
+                cleanfolder.join(format!("{sample}.R1.clean.fastq.gz")),
+                cleanfolder.join(format!("{sample}.R2.clean.fastq.gz")),
+            )
+        };
         step2_inputs.push(r1.clone());
         step2_inputs.push(r2.clone());
-        let out_bam = mappingfolder.join(format!("{sample}.sorted.bam"));
-        let out_done = mappingfolder.join(format!("{sample}.sorted.bam.finished"));
-        let raw = cmd_bwamem(
+        let out_md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
+        let out_md_bai = mappingfolder.join(format!("{sample}.Markdup.bam.bai"));
+        let raw = cmd_bwamem_then_markdup(
             reference,
             sample,
             &r1,
             &r2,
             &mappingfolder,
             64,
+            step2_markdup_threads,
+            200,
             aligner_cmd,
             singularity,
         );
         step2_cmds.push(wrap_scheduler_cmd(
             &raw,
-            &format!("bwamem.{sample}"),
+            &format!("bwamem_markdup.{sample}"),
             64,
             backend,
         ));
-        let outs = vec![out_bam, out_done];
+        let outs = vec![out_md_bam, out_md_bai];
         step2_outputs.extend(outs.clone());
         step2_items.push(StepItem {
-            id: format!("bwamem.{sample}"),
+            id: format!("bwamem_markdup.{sample}"),
             outputs: outs,
         });
     }
     steps.push(PipelineStep {
-        id: "step2_bwamem".to_string(),
-        name: "bwamem".to_string(),
-        eta_minutes: Some(255),
+        id: "step2_bwamem_markdup".to_string(),
+        name: "bwamem+markdup".to_string(),
+        eta_minutes: Some(285),
         commands: step2_cmds,
         inputs: dedup_paths(step2_inputs),
         outputs: dedup_paths(step2_outputs),
@@ -2258,44 +2415,17 @@ fn build_fastq2vcf_steps(
     let mut step3_inputs = Vec::new();
     let mut step3_outputs = Vec::new();
     let mut step3_items = Vec::new();
-    let markdup_threads = 8usize;
     for sample in &sample_names {
-        let bam = mappingfolder.join(format!("{sample}.sorted.bam"));
-        step3_inputs.push(bam.clone());
-        let out_md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
-        let out_md_bai = mappingfolder.join(format!("{sample}.Markdup.bam.bai"));
-        let out_md_metrics = mappingfolder.join(format!("{sample}.Markdup.metrics.txt"));
-        let raw = cmd_markdup(sample, &bam, &mappingfolder, markdup_threads, 200, singularity);
-        step3_cmds.push(wrap_scheduler_cmd(
-            &raw,
-            &format!("markdup.{sample}"),
-            markdup_threads,
-            backend,
-        ));
-        let outs = vec![out_md_bam, out_md_bai, out_md_metrics];
-        step3_outputs.extend(outs.clone());
-        step3_items.push(StepItem {
-            id: format!("markdup.{sample}"),
-            outputs: outs,
-        });
-    }
-    steps.push(PipelineStep {
-        id: "step3_markdup".to_string(),
-        name: "markdup".to_string(),
-        eta_minutes: Some(30),
-        commands: step3_cmds,
-        inputs: dedup_paths(step3_inputs),
-        outputs: dedup_paths(step3_outputs),
-        items: step3_items,
-    });
-
-    let mut step4_cmds = Vec::new();
-    let mut step4_inputs = Vec::new();
-    let mut step4_outputs = Vec::new();
-    let mut step4_items = Vec::new();
-    for sample in &sample_names {
-        let md_bam = mappingfolder.join(format!("{sample}.Markdup.bam"));
-        step4_inputs.push(md_bam.clone());
+        let md_bam = if from_step == 3 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("{sample}.Markdup.bam"))
+            } else {
+                mappingfolder.join(format!("{sample}.Markdup.bam"))
+            }
+        } else {
+            mappingfolder.join(format!("{sample}.Markdup.bam"))
+        };
+        step3_inputs.push(md_bam.clone());
         for chrom in chroms {
             let out_g = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"));
             let out_tbi = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz.tbi"));
@@ -2308,24 +2438,69 @@ fn build_fastq2vcf_steps(
                 2,
                 singularity,
             );
-            step4_cmds.push(wrap_scheduler_cmd(
+            step3_cmds.push(wrap_scheduler_cmd(
                 &raw,
                 &format!("bam2gvcf.{sample}.{chrom}"),
                 2,
                 backend,
             ));
             let outs = vec![out_g, out_tbi];
-            step4_outputs.extend(outs.clone());
-            step4_items.push(StepItem {
+            step3_outputs.extend(outs.clone());
+            step3_items.push(StepItem {
                 id: format!("bam2gvcf.{sample}.{chrom}"),
                 outputs: outs,
             });
         }
     }
     steps.push(PipelineStep {
-        id: "step4_bam2gvcf".to_string(),
+        id: "step3_bam2gvcf".to_string(),
         name: "bam2gvcf".to_string(),
         eta_minutes: Some(451),
+        commands: step3_cmds,
+        inputs: dedup_paths(step3_inputs),
+        outputs: dedup_paths(step3_outputs),
+        items: step3_items,
+    });
+
+    let mut step4_cmds = Vec::new();
+    let mut step4_inputs = Vec::new();
+    let mut step4_outputs = Vec::new();
+    let mut step4_items = Vec::new();
+    for chrom in chroms {
+        let mut gvcfs: Vec<PathBuf> = Vec::new();
+        for sample in &sample_names {
+            let p = if from_step == 4 {
+                if let Some(src_dir) = step_input_dir_override {
+                    src_dir.join(format!("{sample}.{chrom}.g.vcf.gz"))
+                } else {
+                    gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"))
+                }
+            } else {
+                gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"))
+            };
+            step4_inputs.push(p.clone());
+            gvcfs.push(p);
+        }
+        let out_gendb = mergefolder.join(format!("Merge.{chrom}.gendb"));
+        let out_gendb_done = mergefolder.join(format!("Merge.{chrom}.gendb.done"));
+        let raw = cmd_cgvcf(reference, chrom, &gvcfs, &mergefolder, 2, singularity);
+        step4_cmds.push(wrap_scheduler_cmd(
+            &raw,
+            &format!("cgvcf.{chrom}"),
+            2,
+            backend,
+        ));
+        let outs = vec![out_gendb, out_gendb_done];
+        step4_outputs.extend(outs.clone());
+        step4_items.push(StepItem {
+            id: format!("cgvcf.{chrom}"),
+            outputs: outs,
+        });
+    }
+    steps.push(PipelineStep {
+        id: "step4_cgvcf".to_string(),
+        name: "cgvcf".to_string(),
+        eta_minutes: Some(dynamic_eta.step4_cgvcf),
         commands: step4_cmds,
         inputs: dedup_paths(step4_inputs),
         outputs: dedup_paths(step4_outputs),
@@ -2337,32 +2512,47 @@ fn build_fastq2vcf_steps(
     let mut step5_outputs = Vec::new();
     let mut step5_items = Vec::new();
     for chrom in chroms {
-        let mut gvcfs: Vec<PathBuf> = Vec::new();
-        for sample in &sample_names {
-            let p = gvcffolder.join(format!("{sample}.{chrom}.g.vcf.gz"));
-            step5_inputs.push(p.clone());
-            gvcfs.push(p);
-        }
-        let out_gendb = mergefolder.join(format!("Merge.{chrom}.gendb"));
-        let out_gendb_done = mergefolder.join(format!("Merge.{chrom}.gendb.done"));
-        let raw = cmd_cgvcf(reference, chrom, &gvcfs, &mergefolder, 2, singularity);
+        let in_gendb = if from_step == 5 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.gendb"))
+            } else {
+                mergefolder.join(format!("Merge.{chrom}.gendb"))
+            }
+        } else {
+            mergefolder.join(format!("Merge.{chrom}.gendb"))
+        };
+        let in_done = if from_step == 5 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.gendb.done"))
+            } else {
+                mergefolder.join(format!("Merge.{chrom}.gendb.done"))
+            }
+        } else {
+            mergefolder.join(format!("Merge.{chrom}.gendb.done"))
+        };
+        step5_inputs.push(in_gendb);
+        step5_inputs.push(in_done);
+        let out_snp_f = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
+        let out_snp_f_tbi = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
+        let out_snp_tsv = mergefolder.join(format!("Merge.{chrom}.SNP.tsv"));
+        let cmd6 = cmd_gvcf2snp_table(reference, chrom, &mergefolder, 2, 50, singularity);
         step5_cmds.push(wrap_scheduler_cmd(
-            &raw,
-            &format!("cgvcf.{chrom}"),
+            &cmd6,
+            &format!("gvcf2vcf.{chrom}"),
             2,
             backend,
         ));
-        let outs = vec![out_gendb, out_gendb_done];
+        let outs = vec![out_snp_f, out_snp_f_tbi, out_snp_tsv];
         step5_outputs.extend(outs.clone());
         step5_items.push(StepItem {
-            id: format!("cgvcf.{chrom}"),
+            id: format!("gvcf2vcf.{chrom}"),
             outputs: outs,
         });
     }
     steps.push(PipelineStep {
-        id: "step5_cgvcf".to_string(),
-        name: "cgvcf".to_string(),
-        eta_minutes: Some(dynamic_eta.step5_cgvcf),
+        id: "step5_gvcf2vcf".to_string(),
+        name: "gvcf2vcf".to_string(),
+        eta_minutes: Some(dynamic_eta.step5_gvcf2vcf),
         commands: step5_cmds,
         inputs: dedup_paths(step5_inputs),
         outputs: dedup_paths(step5_outputs),
@@ -2374,44 +2564,16 @@ fn build_fastq2vcf_steps(
     let mut step6_outputs = Vec::new();
     let mut step6_items = Vec::new();
     for chrom in chroms {
-        let in_gendb = mergefolder.join(format!("Merge.{chrom}.gendb"));
-        let in_done = mergefolder.join(format!("Merge.{chrom}.gendb.done"));
-        step6_inputs.push(in_gendb);
-        step6_inputs.push(in_done);
-        let out_snp_f = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-        let out_snp_f_tbi = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz.tbi"));
-        let out_snp_tsv = mergefolder.join(format!("Merge.{chrom}.SNP.tsv"));
-        let cmd6 = cmd_gvcf2snp_table(reference, chrom, &mergefolder, 2, 50, singularity);
-        step6_cmds.push(wrap_scheduler_cmd(
-            &cmd6,
-            &format!("gvcf2vcf.{chrom}"),
-            2,
-            backend,
-        ));
-        let outs = vec![out_snp_f, out_snp_f_tbi, out_snp_tsv];
-        step6_outputs.extend(outs.clone());
-        step6_items.push(StepItem {
-            id: format!("gvcf2vcf.{chrom}"),
-            outputs: outs,
-        });
-    }
-    steps.push(PipelineStep {
-        id: "step6_gvcf2vcf".to_string(),
-        name: "gvcf2vcf".to_string(),
-        eta_minutes: Some(dynamic_eta.step6_gvcf2vcf),
-        commands: step6_cmds,
-        inputs: dedup_paths(step6_inputs),
-        outputs: dedup_paths(step6_outputs),
-        items: step6_items,
-    });
-
-    let mut step7_cmds = Vec::new();
-    let mut step7_inputs = Vec::new();
-    let mut step7_outputs = Vec::new();
-    let mut step7_items = Vec::new();
-    for chrom in chroms {
-        let in_vcf = mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"));
-        step7_inputs.push(in_vcf);
+        let in_vcf = if from_step == 6 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"))
+            } else {
+                mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"))
+            }
+        } else {
+            mergefolder.join(format!("Merge.{chrom}.SNP.filtered.vcf.gz"))
+        };
+        step6_inputs.push(in_vcf);
         let out_gt = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
         let out_gt_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz.tbi"));
         let out_lmiss = imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss"));
@@ -2426,38 +2588,65 @@ fn build_fastq2vcf_steps(
             2,
             singularity,
         );
-        step7_cmds.push(wrap_scheduler_cmd(
+        step6_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("gtprep.{chrom}"),
             2,
             backend,
         ));
         let outs = vec![out_gt, out_gt_tbi, out_lmiss, out_imiss];
-        step7_outputs.extend(outs.clone());
-        step7_items.push(StepItem {
+        step6_outputs.extend(outs.clone());
+        step6_items.push(StepItem {
             id: format!("gtprep.{chrom}"),
             outputs: outs,
         });
     }
     steps.push(PipelineStep {
-        id: "step7_gtprep".to_string(),
+        id: "step6_gtprep".to_string(),
         name: "gtprep".to_string(),
-        eta_minutes: Some(dynamic_eta.step7_gtprep),
-        commands: step7_cmds,
-        inputs: dedup_paths(step7_inputs),
-        outputs: dedup_paths(step7_outputs),
-        items: step7_items,
+        eta_minutes: Some(dynamic_eta.step6_gtprep),
+        commands: step6_cmds,
+        inputs: dedup_paths(step6_inputs),
+        outputs: dedup_paths(step6_outputs),
+        items: step6_items,
     });
 
-    let mut step8_cmds = Vec::new();
-    let mut step8_inputs = Vec::new();
-    let mut step8_outputs = Vec::new();
-    let mut step8_items = Vec::new();
+    let mut step7_cmds = Vec::new();
+    let mut step7_inputs = Vec::new();
+    let mut step7_outputs = Vec::new();
+    let mut step7_items = Vec::new();
     let impute_threads_max = 32usize;
     for chrom in chroms {
-        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz")));
-        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss")));
-        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss")));
+        let in_gt = if from_step == 7 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"))
+            } else {
+                imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"))
+            }
+        } else {
+            imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"))
+        };
+        let in_lmiss = if from_step == 7 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.SNP.GT.lmiss"))
+            } else {
+                imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss"))
+            }
+        } else {
+            imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss"))
+        };
+        let in_imiss = if from_step == 7 {
+            if let Some(src_dir) = step_input_dir_override {
+                src_dir.join(format!("Merge.{chrom}.SNP.GT.imiss"))
+            } else {
+                imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss"))
+            }
+        } else {
+            imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss"))
+        };
+        step7_inputs.push(in_gt);
+        step7_inputs.push(in_lmiss);
+        step7_inputs.push(in_imiss);
         let out_vcf = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"));
         let out_tbi = imputefolder.join(format!(
             "Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
@@ -2474,51 +2663,51 @@ fn build_fastq2vcf_steps(
             singularity,
         );
         let raw = format!("{raw_impute} && {raw_filter}");
-        step8_cmds.push(wrap_scheduler_cmd(
+        step7_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("impute_filter.{chrom}"),
             chrom_threads,
             backend,
         ));
         let outs = vec![out_vcf, out_tbi];
-        step8_outputs.extend(outs.clone());
-        step8_items.push(StepItem {
+        step7_outputs.extend(outs.clone());
+        step7_items.push(StepItem {
             id: format!("impute_filter.{chrom}"),
             outputs: outs,
         });
     }
     steps.push(PipelineStep {
-        id: "step8_impute_filter".to_string(),
+        id: "step7_impute_filter".to_string(),
         name: "impute_filter".to_string(),
-        eta_minutes: Some(dynamic_eta.step8_impute_filter),
-        commands: step8_cmds,
-        inputs: dedup_paths(step8_inputs),
-        outputs: dedup_paths(step8_outputs),
-        items: step8_items,
+        eta_minutes: Some(dynamic_eta.step7_impute_filter),
+        commands: step7_cmds,
+        inputs: dedup_paths(step7_inputs),
+        outputs: dedup_paths(step7_outputs),
+        items: step7_items,
     });
 
-    let mut step9_inputs = Vec::new();
+    let mut step8_inputs = Vec::new();
     for chrom in chroms {
-        step9_inputs
+        step8_inputs
             .push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz")));
     }
     let out_merge_vcf = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz");
     let out_merge_tbi = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi");
     let raw9 = cmd_concat_imputed_vcfs(chroms, &imputefolder, &genotypefolder, 2, singularity);
-    let step9_cmds = vec![wrap_scheduler_cmd(&raw9, "mergevcf.all", 2, backend)];
-    let step9_outputs = vec![out_merge_vcf, out_merge_tbi];
-    let step9_items = vec![StepItem {
+    let step8_cmds = vec![wrap_scheduler_cmd(&raw9, "mergevcf.all", 2, backend)];
+    let step8_outputs = vec![out_merge_vcf, out_merge_tbi];
+    let step8_items = vec![StepItem {
         id: "mergevcf.all".to_string(),
-        outputs: step9_outputs.clone(),
+        outputs: step8_outputs.clone(),
     }];
     steps.push(PipelineStep {
-        id: "step9_mergevcf".to_string(),
+        id: "step8_mergevcf".to_string(),
         name: "mergevcf".to_string(),
-        eta_minutes: Some(dynamic_eta.step9_mergevcf),
-        commands: step9_cmds,
-        inputs: dedup_paths(step9_inputs),
-        outputs: dedup_paths(step9_outputs),
-        items: step9_items,
+        eta_minutes: Some(dynamic_eta.step8_mergevcf),
+        commands: step8_cmds,
+        inputs: dedup_paths(step8_inputs),
+        outputs: dedup_paths(step8_outputs),
+        items: step8_items,
     });
 
     Ok(steps)
@@ -2539,19 +2728,19 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DynamicEtaStep5To9 {
-    step5_cgvcf: u64,
-    step6_gvcf2vcf: u64,
-    step7_gtprep: u64,
-    step8_impute_filter: u64,
-    step9_mergevcf: u64,
+struct DynamicEtaStep4To8 {
+    step4_cgvcf: u64,
+    step5_gvcf2vcf: u64,
+    step6_gtprep: u64,
+    step7_impute_filter: u64,
+    step8_mergevcf: u64,
 }
 
-fn estimate_step5_to_step9_eta_minutes(
+fn estimate_step4_to_step8_eta_minutes(
     chroms: &[String],
     chrom_lens: &BTreeMap<String, u64>,
     sample_count: usize,
-) -> DynamicEtaStep5To9 {
+) -> DynamicEtaStep4To8 {
     // Use reference locus scale as "site count" proxy before VCF is generated.
     let locus_count: f64 = chroms
         .iter()
@@ -2566,28 +2755,28 @@ fn estimate_step5_to_step9_eta_minutes(
 
     let chrom_factor = ((chroms.len().max(1) as f64) / 10.0).clamp(0.4, 4.0);
 
-    DynamicEtaStep5To9 {
-        step5_cgvcf: scale_eta_minutes(
+    DynamicEtaStep4To8 {
+        step4_cgvcf: scale_eta_minutes(
             36.0 * site_factor_sqrt * pop_factor_sqrt,
             8,
             12 * 60,
         ),
-        step6_gvcf2vcf: scale_eta_minutes(
+        step5_gvcf2vcf: scale_eta_minutes(
             32.0 * site_factor_sqrt * (0.6 + 0.4 * pop_factor_sqrt),
             6,
             10 * 60,
         ),
-        step7_gtprep: scale_eta_minutes(
+        step6_gtprep: scale_eta_minutes(
             40.0 * site_factor_sqrt * (0.5 + 0.5 * pop_factor_sqrt),
             8,
             12 * 60,
         ),
-        step8_impute_filter: scale_eta_minutes(
+        step7_impute_filter: scale_eta_minutes(
             144.0 * site_factor_sqrt * (0.7 + 0.5 * pop_factor_sqrt),
             5,
             24 * 60,
         ),
-        step9_mergevcf: scale_eta_minutes(
+        step8_mergevcf: scale_eta_minutes(
             8.0 * chrom_factor * site_factor_sqrt * (0.8 + 0.2 * pop_factor_sqrt),
             2,
             4 * 60,

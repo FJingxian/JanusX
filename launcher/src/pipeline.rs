@@ -819,6 +819,20 @@ fn wait_step_outputs(
             }
             if done < total {
                 clear_progress_line_if_tty()?;
+                if opts.detect_failed_logs {
+                    let failed =
+                        find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4, ignore_error_logs)?;
+                    if !failed.is_empty() {
+                        return Err(format!(
+                            "{step_text} detected failed subtasks. Example stderr:\n{}",
+                            failed
+                                .iter()
+                                .map(|x| format!("- {x}"))
+                                .collect::<Vec<String>>()
+                                .join("\n")
+                        ));
+                    }
+                }
                 let miss = pending
                     .iter()
                     .take(5)

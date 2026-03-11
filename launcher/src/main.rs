@@ -1731,7 +1731,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
             "-verbose" | "--verbose" => verbose = true,
             "-h" | "--help" | "help" => {
                 println!(
-                    "Update usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
+                    "Update usage:\n  jx -update dlc [-verbose]\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
                 );
                 return Err(String::new());
             }
@@ -1745,7 +1745,7 @@ fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {
                     local_source = Some(other.to_string());
                 } else {
                     return Err(format!(
-                        "Unknown update option: {other}\nUpdate usage:\n  jx -update dlc\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
+                        "Unknown update option: {other}\nUpdate usage:\n  jx -update dlc [-verbose]\n  jx -update [latest|<local_path>] [-e|-editable] [-verbose]\n  Example: jx -update -e ."
                     ));
                 }
             }
@@ -1794,7 +1794,7 @@ fn run_update_internal(
     if matches!(opts.source, UpdateSource::Dlc) {
         let home = runtime_home()?;
         let python = ensure_runtime(false)?;
-        return dlc::run_dlc_update(&home, &python);
+        return dlc::run_dlc_update(&home, &python, opts.verbose);
     }
 
     let home = runtime_home()?;

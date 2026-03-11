@@ -55,78 +55,57 @@ pub(super) fn cmd_fastp(
     )
 }
 
-pub(super) fn cmd_bwamem(
+pub(super) fn cmd_bwamem_then_markdup(
     reference: &Path,
     sample: &str,
     fq1: &Path,
     fq2: &Path,
     out: &Path,
-    core: usize,
+    bwa_core: usize,
+    _markdup_core: usize,
+    _markdup_mem: usize,
     aligner_cmd: &str,
     singularity: &str,
 ) -> String {
+    // Best-path only: bwa-mem2 + samblaster, then GATK sort/index.
+    // This avoids large intermediate sorted BAM artifacts from the old two-stage path.
     let prefix = cmd_prefix(singularity);
-    let out_bam = out.join(format!("{sample}.sorted.bam"));
-    let out_done = out.join(format!("{sample}.sorted.bam.finished"));
-    let out_bai = out.join(format!("{sample}.sorted.bam.bai"));
+    let out_md_bam = out.join(format!("{sample}.Markdup.bam"));
+    let out_md_bai = out.join(format!("{sample}.Markdup.bam.bai"));
+    let out_tmp_sam = out.join(format!("{sample}.Markdup.sam.tmp"));
     let tmp_tag = safe_job_label(sample);
     let rg = sh_quote(&format!(
         "@RG\\tID:{sample}\\tPL:illumina\\tLB:{sample}\\tSM:{sample}"
     ));
     let setup_tmp_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; SORT_TMP=\"$TMPDIR_BASE/{}.sorted.bam.tmp\"",
+        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"; PICARD_TMP=\"$TMPDIR_BASE/{}.sortsam.tmp\"; mkdir -p \"$PICARD_TMP\"",
         qpath(out),
         tmp_tag,
     );
-    let cleanup_cmd = format!("rm -f {} {} {} \"$SORT_TMP\"*", qpath(&out_bam), qpath(&out_bai), qpath(&out_done),);
-    format!(
-        "{setup_tmp_cmd} && {cleanup_cmd} && {aligner_cmd} mem -t {core} -R {rg} {} {} {} | {prefix}samtools sort -@ {core} -T \"$SORT_TMP\" -o {} && touch {}",
+    let cleanup_cmd = format!(
+        "rm -f {} {} {} && rm -rf \"$PICARD_TMP\"",
+        qpath(&out_md_bam),
+        qpath(&out_md_bai),
+        qpath(&out_tmp_sam),
+    );
+    let markdup_cmd = format!(
+        "{aligner_cmd} mem -t {bwa_core} -R {rg} {} {} {} | {prefix}samblaster > {}",
         qpath(reference),
         qpath(fq1),
         qpath(fq2),
-        qpath(&out_bam),
-        qpath(&out_done),
-    )
-}
-
-pub(super) fn cmd_markdup(
-    sample: &str,
-    bam: &Path,
-    out: &Path,
-    core: usize,
-    _mem: usize,
-    singularity: &str,
-) -> String {
-    let prefix = cmd_prefix(singularity);
-    let out_bam = out.join(format!("{sample}.Markdup.bam"));
-    let out_bai = out.join(format!("{sample}.Markdup.bam.bai"));
-    let out_flag = out.join(format!("{sample}.flagstat"));
-    let out_cov = out.join(format!("{sample}.coverage"));
-    let out_metric = out.join(format!("{sample}.Markdup.metrics.txt"));
-    let cleanup_cmd = format!(
-        "rm -f {} {} {} {} {}",
-        qpath(&out_bam),
-        qpath(&out_bai),
-        qpath(&out_flag),
-        qpath(&out_cov),
-        qpath(&out_metric),
+        qpath(&out_tmp_sam),
     );
-    let tmpdir_setup_cmd = format!(
-        "TMPDIR_BASE='/local/tmp'; if [ ! -d \"$TMPDIR_BASE\" ] || [ ! -w \"$TMPDIR_BASE\" ]; then TMPDIR_BASE={}; fi; mkdir -p \"$TMPDIR_BASE\"",
-        qpath(out),
+    let sort_cmd = format!(
+        "{prefix}gatk SortSam -I {} -O {} --SORT_ORDER coordinate --TMP_DIR \"$PICARD_TMP\"",
+        qpath(&out_tmp_sam),
+        qpath(&out_md_bam),
     );
-    let markdup_cmd = format!(
-        "{prefix}sambamba markdup -t {core} --tmpdir \"$TMPDIR_BASE\" {} {}",
-        qpath(bam),
-        qpath(&out_bam),
+    let index_cmd = format!(
+        "{prefix}gatk BuildBamIndex -I {} -O {}",
+        qpath(&out_md_bam),
+        qpath(&out_md_bai),
     );
-    let index_cmd = format!("{prefix}samtools index -@ {core} {}", qpath(&out_bam));
-    let metric_cmd = format!("printf 'tool\\tsambamba markdup\\n' > {}", qpath(&out_metric));
-    let flagstat_cmd = format!("{prefix}samtools flagstat {} > {}", qpath(&out_bam), qpath(&out_flag));
-    let coverage_cmd = format!("{prefix}samtools coverage {} > {}", qpath(&out_bam), qpath(&out_cov));
-    format!(
-        "{cleanup_cmd} && {tmpdir_setup_cmd} && {markdup_cmd} && {index_cmd} && {metric_cmd} && {flagstat_cmd} && {coverage_cmd}",
-    )
+    format!("{setup_tmp_cmd} && {cleanup_cmd} && {markdup_cmd} && {sort_cmd} && {index_cmd} && rm -f {} && rm -rf \"$PICARD_TMP\"", qpath(&out_tmp_sam))
 }
 
 pub(super) fn cmd_bam2gvcf(

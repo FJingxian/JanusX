@@ -16,11 +16,10 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 10] = [
+const REQUIRED_TOOLS: [&str; 9] = [
     "fastp",
     "bwa-mem2",
-    "samtools",
-    "sambamba",
+    "samblaster",
     "gatk",
     "bcftools",
     "tabix",
@@ -28,7 +27,7 @@ const REQUIRED_TOOLS: [&str; 10] = [
     "plink",
     "beagle",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 10] = [
+const DLC_TOOL_ENTRIES: [(&str, &str); 9] = [
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
@@ -36,8 +35,7 @@ const DLC_TOOL_ENTRIES: [(&str, &str); 10] = [
     ("fastp", "FASTQ quality control"),
     ("gatk", "Variant discovery toolkit"),
     ("plink", "Genotype association toolkit"),
-    ("sambamba", "Duplicate marking for BAM"),
-    ("samtools", "Alignment and BAM/CRAM utilities"),
+    ("samblaster", "Duplicate marking during alignment"),
     ("tabix", "BGZF indexing and queries"),
 ];
 const JANUSX_SIF_MIRROR_URL: &str =
@@ -57,73 +55,182 @@ const CONDA_FORGE_MIRROR_URL: &str =
     "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
 const CONDA_BIOCONDA_OFFICIAL: &str = "bioconda";
 const CONDA_FORGE_OFFICIAL: &str = "conda-forge";
-const DOCKER_APT_MIRROR_CN: &str = "mirrors.tuna.tsinghua.edu.cn";
 const DOCKER_APT_MIRROR_DEFAULT: &str = "archive.ubuntu.com";
 const DOCKER_APT_SECURITY_DEFAULT: &str = "security.ubuntu.com";
-const EMBEDDED_DOCKERFILE: &str = r#"FROM ubuntu:22.04
+const EMBEDDED_DOCKERFILE: &str = r#"FROM ubuntu:22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR="archive.ubuntu.com"
 ARG APT_SECURITY_MIRROR="security.ubuntu.com"
 ARG GATK_VER="4.6.2.0"
+ARG BWA_MEM2_VER="2.2.1"
+ARG SAMBLASTER_VER="0.1.26"
 ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
 ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
 
-RUN sed -ri "s@http://(archive.ubuntu.com|ports.ubuntu.com)/ubuntu@http://${APT_MIRROR}/ubuntu@g" /etc/apt/sources.list \
- && sed -ri "s@http://security.ubuntu.com/ubuntu@http://${APT_SECURITY_MIRROR}/ubuntu@g" /etc/apt/sources.list \
- && printf 'deb http://%s/ubuntu jammy universe\n' "${APT_MIRROR}" > /etc/apt/sources.list.d/janusx-universe.list \
- && printf 'deb http://%s/ubuntu jammy-updates universe\n' "${APT_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
- && printf 'deb http://%s/ubuntu jammy-security universe\n' "${APT_SECURITY_MIRROR}" >> /etc/apt/sources.list.d/janusx-universe.list \
+RUN [ ! -f /etc/apt/sources.list ] || sed -i \
+      -e "s|http://archive.ubuntu.com|http://${APT_MIRROR}|g" \
+      -e "s|http://security.ubuntu.com|http://${APT_SECURITY_MIRROR}|g" \
+      -e "s|http://ports.ubuntu.com|http://${APT_MIRROR}|g" \
+      /etc/apt/sources.list \
+ && [ ! -f /etc/apt/sources.list.d/ubuntu.sources ] || sed -i \
+      -e "s|http://archive.ubuntu.com|http://${APT_MIRROR}|g" \
+      -e "s|http://security.ubuntu.com|http://${APT_SECURITY_MIRROR}|g" \
+      -e "s|http://ports.ubuntu.com|http://${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/ubuntu.sources \
  && apt-get update -o Acquire::Retries=3 \
  && apt-get install -y --no-install-recommends \
-    ca-certificates curl wget unzip git \
-    tabix bcftools \
-    bash gawk coreutils sed grep findutils \
-    python3 python3-pip python3-venv \
-    openjdk-17-jre-headless \
-    bwa samtools sambamba fastp \
-    libgomp1 \
- && (apt-get install -y --no-install-recommends bwa-mem2 || true) \
- && if ! command -v bwa-mem2 >/dev/null 2>&1; then \
-      printf '%s\n' '#!/usr/bin/env bash' 'exec bwa "$@"' > /usr/local/bin/bwa-mem2; \
-      chmod +x /usr/local/bin/bwa-mem2; \
-    fi \
- && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    ca-certificates bzip2 curl wget unzip \
+    g++ make zlib1g-dev \
+ && (apt-get install -y --no-install-recommends samblaster || true) \
+ && (command -v samblaster >/dev/null 2>&1 && ln -sf "$(command -v samblaster)" /usr/local/bin/samblaster || true) \
  && rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m pip install --no-cache-dir -U pip setuptools wheel
 
 WORKDIR /opt
 
-RUN mkdir -p /opt/gatk \
-    && wget -O /opt/gatk/gatk-${GATK_VER}.zip \
-        https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip \
-    && unzip /opt/gatk/gatk-${GATK_VER}.zip -d /opt/gatk \
-    && rm -f /opt/gatk/gatk-${GATK_VER}.zip
-
 RUN mkdir -p /opt/beagle \
-    && wget -O /opt/beagle/beagle.jar "${BEAGLE_JAR_URL}" \
+    && curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 10240 \
+       -o /opt/beagle/beagle.jar "${BEAGLE_JAR_URL}" \
     && printf '%s\n' '#!/usr/bin/env bash' \
        'exec java -jar /opt/beagle/beagle.jar "$@"' \
        > /usr/local/bin/beagle \
     && chmod +x /usr/local/bin/beagle
 
+RUN command -v samblaster >/dev/null 2>&1 || ( \
+      mkdir -p /opt/samblaster \
+      && ( (wget -O /opt/samblaster/samblaster.tar.gz \
+            "https://gh-proxy.org/https://github.com/GregoryFaust/samblaster/archive/refs/tags/v${SAMBLASTER_VER}.tar.gz" \
+            && tar -tzf /opt/samblaster/samblaster.tar.gz >/dev/null 2>&1) \
+          || (wget -O /opt/samblaster/samblaster.tar.gz \
+            "https://github.com/GregoryFaust/samblaster/archive/refs/tags/v${SAMBLASTER_VER}.tar.gz" \
+            && tar -tzf /opt/samblaster/samblaster.tar.gz >/dev/null 2>&1) \
+          || (wget -O /opt/samblaster/samblaster.tar.gz \
+            "https://github.com/GregoryFaust/samblaster/archive/refs/tags/${SAMBLASTER_VER}.tar.gz" \
+            && tar -tzf /opt/samblaster/samblaster.tar.gz >/dev/null 2>&1) ) \
+      && tar -xzf /opt/samblaster/samblaster.tar.gz -C /opt/samblaster \
+      && SAMBLASTER_SRC="$(find /opt/samblaster -maxdepth 4 -type f -name samblaster.cpp | head -n 1)" \
+      && [ -n "${SAMBLASTER_SRC}" ] \
+      && g++ -O3 -std=c++11 -o /usr/local/bin/samblaster "${SAMBLASTER_SRC}" \
+      && (strip /usr/local/bin/samblaster || true) \
+      && chmod +x /usr/local/bin/samblaster \
+      && rm -rf /opt/samblaster \
+    )
+
+RUN mkdir -p /opt/bwa-mem2/bin \
+    && ARCH="$(uname -m)" \
+    && if [ "${ARCH}" = "x86_64" ] || [ "${ARCH}" = "amd64" ]; then \
+         (curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+            -o /opt/bwa-mem2/bwa-mem2.tar.bz2 \
+            "https://gh-proxy.org/https://github.com/bwa-mem2/bwa-mem2/releases/download/v${BWA_MEM2_VER}/bwa-mem2-${BWA_MEM2_VER}_x64-linux.tar.bz2" \
+          || curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+            -o /opt/bwa-mem2/bwa-mem2.tar.bz2 \
+            "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${BWA_MEM2_VER}/bwa-mem2-${BWA_MEM2_VER}_x64-linux.tar.bz2"); \
+         tar -xjf /opt/bwa-mem2/bwa-mem2.tar.bz2 -C /opt/bwa-mem2; \
+         BWA_DIR="$(find /opt/bwa-mem2 -maxdepth 2 -type d -name "bwa-mem2-*x64-linux" | head -n 1)"; \
+         [ -n "${BWA_DIR}" ]; \
+         cp -a "${BWA_DIR}"/bwa-mem2* /opt/bwa-mem2/bin/; \
+       else \
+         (curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+            -o /opt/bwa-mem2/source.tar.gz \
+            "https://gh-proxy.org/https://github.com/bwa-mem2/bwa-mem2/releases/download/v${BWA_MEM2_VER}/Source_code_including_submodules.tar.gz" \
+          || curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+            -o /opt/bwa-mem2/source.tar.gz \
+            "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${BWA_MEM2_VER}/Source_code_including_submodules.tar.gz"); \
+         tar -xzf /opt/bwa-mem2/source.tar.gz -C /opt/bwa-mem2; \
+         BWA_SRC_DIR="$(find /opt/bwa-mem2 -maxdepth 2 -type d -name "bwa-mem2-*" | head -n 1)"; \
+         [ -n "${BWA_SRC_DIR}" ]; \
+         make -C "${BWA_SRC_DIR}" -j"$(nproc)"; \
+         cp -a "${BWA_SRC_DIR}"/bwa-mem2* /opt/bwa-mem2/bin/; \
+       fi \
+    && [ -x /opt/bwa-mem2/bin/bwa-mem2 ] \
+    && (strip /opt/bwa-mem2/bin/bwa-mem2* || true) \
+    && ln -sf /opt/bwa-mem2/bin/bwa-mem2 /usr/local/bin/bwa-mem2 \
+    && rm -rf /opt/bwa-mem2/bwa-mem2.tar.bz2 /opt/bwa-mem2/source.tar.gz \
+       /opt/bwa-mem2/bwa-mem2-*x64-linux /opt/bwa-mem2/bwa-mem2-*.tar.gz
+
 RUN mkdir -p /opt/plink \
     && wget -O /opt/plink/plink.zip "${PLINK19_URL}" \
     && unzip /opt/plink/plink.zip -d /opt/plink \
-    && rm -f /opt/plink/plink.zip \
-    && if [ -x /opt/plink/plink ]; then ln -sf /opt/plink/plink /usr/local/bin/plink; fi \
-    && if [ -x /opt/plink/plink1.9 ]; then ln -sf /opt/plink/plink1.9 /usr/local/bin/plink; fi
+    && rm -f /opt/plink/plink.zip
 
-ENV PATH="/opt/gatk/gatk-${GATK_VER}:$PATH" \
-    GATK_LOCAL_JAR="/opt/gatk/gatk-${GATK_VER}/gatk-package-${GATK_VER}-local.jar" \
+RUN mkdir -p /opt/gatk \
+    && (curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+          -o /opt/gatk/gatk-${GATK_VER}.zip \
+          "https://gh-proxy.org/https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip" \
+        || curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 20480 \
+          -o /opt/gatk/gatk-${GATK_VER}.zip \
+          "https://github.com/broadinstitute/gatk/releases/download/${GATK_VER}/gatk-${GATK_VER}.zip") \
+    && mkdir -p /opt/gatk/_tmp \
+    && unzip -q /opt/gatk/gatk-${GATK_VER}.zip -d /opt/gatk/_tmp \
+    && GATK_JAR="$(find /opt/gatk/_tmp -type f -name "gatk-package-${GATK_VER}-local.jar" | head -n 1)" \
+    && [ -n "${GATK_JAR}" ] \
+    && cp "${GATK_JAR}" /opt/gatk/gatk-package-${GATK_VER}-local.jar \
+    && rm -rf /opt/gatk/_tmp /opt/gatk/gatk-${GATK_VER}.zip \
+    && [ -s /opt/gatk/gatk-package-${GATK_VER}-local.jar ] \
+    && printf '%s\n' '#!/usr/bin/env bash' \
+       'JAVA_OPTS=()' \
+       'while [ "$#" -ge 2 ] && [ "$1" = "--java-options" ]; do' \
+       '  JAVA_OPTS+=("$2")' \
+       '  shift 2' \
+       'done' \
+       "exec java \"\${JAVA_OPTS[@]}\" -jar /opt/gatk/gatk-package-${GATK_VER}-local.jar \"\$@\"" \
+       > /usr/local/bin/gatk \
+    && chmod +x /usr/local/bin/gatk
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR="archive.ubuntu.com"
+ARG APT_SECURITY_MIRROR="security.ubuntu.com"
+ARG GATK_VER="4.6.2.0"
+
+RUN [ ! -f /etc/apt/sources.list ] || sed -i \
+      -e "s|http://archive.ubuntu.com|http://${APT_MIRROR}|g" \
+      -e "s|http://security.ubuntu.com|http://${APT_SECURITY_MIRROR}|g" \
+      -e "s|http://ports.ubuntu.com|http://${APT_MIRROR}|g" \
+      /etc/apt/sources.list \
+ && [ ! -f /etc/apt/sources.list.d/ubuntu.sources ] || sed -i \
+      -e "s|http://archive.ubuntu.com|http://${APT_MIRROR}|g" \
+      -e "s|http://security.ubuntu.com|http://${APT_SECURITY_MIRROR}|g" \
+      -e "s|http://ports.ubuntu.com|http://${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/ubuntu.sources \
+ && apt-get update -o Acquire::Retries=3 \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tabix bcftools \
+    fastp \
+    bash gawk coreutils sed grep findutils \
+    openjdk-17-jre-headless \
+    libnuma1 \
+    libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/gatk /opt/gatk
+COPY --from=builder /opt/beagle /opt/beagle
+COPY --from=builder /opt/plink /opt/plink
+COPY --from=builder /opt/bwa-mem2 /opt/bwa-mem2
+COPY --from=builder /usr/local/bin/gatk /usr/local/bin/gatk
+COPY --from=builder /usr/local/bin/beagle /usr/local/bin/beagle
+COPY --from=builder /usr/local/bin/samblaster /usr/local/bin/samblaster
+COPY --from=builder /usr/local/bin/bwa-mem2 /usr/local/bin/bwa-mem2
+
+RUN for f in /opt/bwa-mem2/bin/bwa-mem2*; do \
+      [ -e "$f" ] || continue; \
+      ln -sf "$f" "/usr/local/bin/$(basename "$f")"; \
+    done \
+ && (ln -sf /opt/plink/plink /usr/local/bin/plink \
+        || ln -sf /opt/plink/plink1.9 /usr/local/bin/plink)
+
+ENV PATH="/opt/bwa-mem2/bin:/opt/gatk:$PATH" \
+    GATK_LOCAL_JAR="/opt/gatk/gatk-package-${GATK_VER}-local.jar" \
     MALLOC_ARENA_MAX=2 \
     JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
 
 RUN command -v fastp \
     && command -v bwa-mem2 \
-    && command -v samtools \
-    && command -v sambamba \
+    && BWA_MEM2_PROBE="$(bwa-mem2 index 2>&1 || true)" \
+    && ! printf '%s\n' "$BWA_MEM2_PROBE" | grep -qiE 'fail to find the right executable|can not run executable' \
+    && command -v samblaster \
     && command -v gatk \
     && command -v bcftools \
     && command -v tabix \
@@ -138,6 +245,7 @@ WORKDIR /work
 CMD ["/bin/bash"]
 "#;
 static DLC_INLINE_STEP_LINE_OPEN: AtomicBool = AtomicBool::new(false);
+static DLC_VERBOSE_LOG: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct MethodStatus {
@@ -296,7 +404,8 @@ pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLoca
     Ok(out)
 }
 
-pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, String> {
+pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path, verbose: bool) -> Result<i32, String> {
+    DLC_VERBOSE_LOG.store(verbose, Ordering::Relaxed);
     fs::create_dir_all(runtime_home).map_err(|e| {
         format!(
             "Failed to create runtime home {}: {e}",
@@ -305,10 +414,6 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path) -> Result<i32, 
     })?;
     let db_path = runtime_home.join(super::GWAS_HISTORY_DB_FILE);
 
-    println!(
-        "DLC check/build mode. db={}",
-        db_path.to_string_lossy().to_string()
-    );
     let methods = collect_build_method_status();
     print_build_method_status(&methods);
     let selectable: Vec<i32> = methods
@@ -1882,9 +1987,26 @@ fn build_tool_command(
             }
             cmd.arg("-w")
                 .arg(cwd.to_string_lossy().to_string())
-                .arg(image)
-                .arg(tool)
-                .args(args);
+                .arg(image);
+            if tool == "gatk" {
+                let (java_opts, gatk_args) = split_gatk_java_options(args);
+                let mut shell = String::from(
+                    "exec java"
+                );
+                for opt in &java_opts {
+                    shell.push(' ');
+                    shell.push_str(&shell_quote(opt));
+                }
+                shell.push_str(" -jar ");
+                shell.push_str("\"${GATK_LOCAL_JAR:-/opt/gatk/gatk-package-4.6.2.0-local.jar}\"");
+                for arg in &gatk_args {
+                    shell.push(' ');
+                    shell.push_str(&shell_quote(arg));
+                }
+                cmd.arg("bash").arg("-lc").arg(shell);
+            } else {
+                cmd.arg(tool).args(args);
+            }
             Ok(cmd)
         }
         "singularity" => {
@@ -1996,6 +2118,64 @@ fn beagle_heap_gb_from_args(args: &[String]) -> usize {
     }
     let t = nthreads.unwrap_or(4).max(1);
     t.saturating_mul(4).clamp(16, 256)
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\"'\"'"))
+}
+
+fn split_gatk_java_options(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut java_opts: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--java-options" && i + 1 < args.len() {
+            let parsed = split_shell_words(&args[i + 1]);
+            if parsed.is_empty() {
+                java_opts.push(args[i + 1].clone());
+            } else {
+                java_opts.extend(parsed);
+            }
+            i += 2;
+            continue;
+        }
+        rest.extend_from_slice(&args[i..]);
+        break;
+    }
+    (java_opts, rest)
+}
+
+fn split_shell_words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = text.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !double => {
+                single = !single;
+            }
+            '"' if !single => {
+                double = !double;
+            }
+            '\\' if !single => {
+                if let Some(next) = chars.next() {
+                    buf.push(next);
+                }
+            }
+            c if c.is_whitespace() && !single && !double => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 fn apply_beagle_exec_env(cmd: &mut Command, args: &[String]) {
@@ -2251,11 +2431,8 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
             "bwa-mem2" => {
                 out.insert("bwa-mem2".to_string());
             }
-            "samtools" => {
-                out.insert("samtools".to_string());
-            }
-            "sambamba" => {
-                out.insert("sambamba".to_string());
+            "samblaster" => {
+                out.insert("samblaster".to_string());
             }
             "bcftools" => {
                 out.insert("bcftools".to_string());
@@ -2325,7 +2502,18 @@ fn missing_env_runtime_tools(runtime_home: &Path) -> Vec<String> {
 
 fn missing_tools_in_prefixed_runtime(prefix: &[String]) -> Result<Vec<String>, String> {
     let script = format!(
-        "for t in {}; do command -v \"$t\" >/dev/null 2>&1 || echo \"$t\"; done",
+        "for t in {}; do \
+             if ! command -v \"$t\" >/dev/null 2>&1; then \
+                 echo \"$t\"; \
+                 continue; \
+             fi; \
+             if [ \"$t\" = \"bwa-mem2\" ]; then \
+                 probe_out=\"$($t index 2>&1 || true)\"; \
+                 if printf '%s\\n' \"$probe_out\" | grep -qiE 'fail to find the right executable|can not run executable'; then \
+                     echo \"$t\"; \
+                 fi; \
+             fi; \
+         done",
         REQUIRED_TOOLS.join(" ")
     );
     let mut cmd = Command::new(&prefix[0]);
@@ -2408,6 +2596,9 @@ fn run_cmd_tail(
     required: bool,
     max_lines: usize,
 ) -> Result<(), String> {
+    if DLC_VERBOSE_LOG.load(Ordering::Relaxed) {
+        return run_cmd_stream_all(desc, argv, required);
+    }
     if argv.is_empty() {
         return Err(format!("{desc}: empty command"));
     }
@@ -2434,6 +2625,42 @@ fn run_cmd_tail(
         return Err(format!("{desc} failed with exit={code}.\n{}", msg.trim()));
     }
 
+    eprintln!(
+        "{}",
+        super::style_yellow(&format!("Warning: {desc} failed (optional, exit={code})."))
+    );
+    Ok(())
+}
+
+fn run_cmd_stream_all(desc: &str, argv: &[String], required: bool) -> Result<(), String> {
+    if argv.is_empty() {
+        return Err(format!("{desc}: empty command"));
+    }
+    ensure_dlc_inline_step_newline();
+    println!("{}", super::style_green(&format!("▶ {desc}: {}", argv.join(" "))));
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
+
+    let start = Instant::now();
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to run command: {e}"))?;
+
+    if status.success() {
+        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(start.elapsed())));
+        return Ok(());
+    }
+
+    let code = super::exit_code(status);
+    if required {
+        return Err(format!("{desc} failed with exit={code}."));
+    }
     eprintln!(
         "{}",
         super::style_yellow(&format!("Warning: {desc} failed (optional, exit={code})."))
@@ -4092,13 +4319,7 @@ fn docker_build_apt_mirror_pair() -> (String, String) {
         .ok()
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty())
-        .unwrap_or_else(|| {
-            if prefers_cn_mirror() {
-                DOCKER_APT_MIRROR_CN.to_string()
-            } else {
-                DOCKER_APT_MIRROR_DEFAULT.to_string()
-            }
-        });
+        .unwrap_or_else(|| DOCKER_APT_MIRROR_DEFAULT.to_string());
     let apt_security = env::var("JX_DOCKER_APT_SECURITY_MIRROR")
         .ok()
         .map(|x| x.trim().to_string())
@@ -4111,19 +4332,6 @@ fn docker_build_apt_mirror_pair() -> (String, String) {
             }
         });
     (apt_mirror, apt_security)
-}
-
-fn prefers_cn_mirror() -> bool {
-    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
-        let Ok(v) = env::var(key) else {
-            continue;
-        };
-        let s = v.to_ascii_lowercase();
-        if s.contains("zh_cn") || s.contains("asia/shanghai") {
-            return true;
-        }
-    }
-    false
 }
 
 fn command_in_path(bin: &str) -> bool {

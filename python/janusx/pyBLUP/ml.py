@@ -6,7 +6,7 @@ from contextlib import ExitStack, nullcontext
 from typing import Any, Optional
 
 import numpy as np
-from joblib import parallel_backend
+from joblib import Parallel, delayed, parallel_backend
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold, ParameterSampler
@@ -222,6 +222,7 @@ class MLGS:
         self.feature_axis = feature_axis
         self.n_jobs = max(1, int(os.cpu_count() or 1)) if n_jobs is None else max(1, int(n_jobs))
         self.verbose = bool(verbose)
+        self.parallel_mode_ = self._parallel_mode()
 
         self.y = _as_1d_y(y)
         self.X_marker, self.feature_axis_ = _resolve_marker_matrix(M, self.y.size, feature_axis)
@@ -258,17 +259,27 @@ class MLGS:
         if fit_on_init:
             self.fit()
 
+    def _parallel_mode(self) -> typing.Literal["model", "search"]:
+        if self.method in {"svm", "enet"}:
+            return "search"
+        return "model"
+
+    def _model_n_jobs(self) -> int:
+        if self.parallel_mode_ == "model":
+            return self.n_jobs
+        return 1
+
     def _thread_context(self):
-        use_joblib_backend = self.method in {"rf", "et"}
-        use_threadpool_limit = threadpool_limits is not None
+        use_joblib_backend = self.parallel_mode_ == "model" and self.method in {"rf", "et"}
+        use_threadpool_limit = self.parallel_mode_ == "model" and threadpool_limits is not None
         if (not use_joblib_backend) and (not use_threadpool_limit):
             return nullcontext()
 
         stack = ExitStack()
         if use_joblib_backend:
-            stack.enter_context(parallel_backend("threading", n_jobs=self.n_jobs))
+            stack.enter_context(parallel_backend("threading", n_jobs=self._model_n_jobs()))
         if use_threadpool_limit:
-            stack.enter_context(threadpool_limits(limits=self.n_jobs))
+            stack.enter_context(threadpool_limits(limits=self._model_n_jobs()))
         return stack
 
     def _default_search_iter(self, stage: typing.Literal["coarse", "fine"]) -> int:
@@ -369,7 +380,7 @@ class MLGS:
         if self.method == "rf":
             base = dict(
                 random_state=self.seed,
-                n_jobs=self.n_jobs,
+                n_jobs=self._model_n_jobs(),
                 bootstrap=True,
             )
             base.update(params)
@@ -378,7 +389,7 @@ class MLGS:
         if self.method == "et":
             base = dict(
                 random_state=self.seed,
-                n_jobs=self.n_jobs,
+                n_jobs=self._model_n_jobs(),
                 bootstrap=False,
             )
             base.update(params)
@@ -404,7 +415,7 @@ class MLGS:
                 booster="gbtree",
                 tree_method="hist",
                 random_state=self.seed,
-                n_jobs=self.n_jobs,
+                n_jobs=self._model_n_jobs(),
                 verbosity=0,
                 n_estimators=2000,
             )
@@ -781,22 +792,32 @@ class MLGS:
             result["n_estimators"] = int(np.median(xgb_iters))
         return result
 
+    def _evaluate_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        stage: str,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        if self.parallel_mode_ == "search" and self.n_jobs > 1 and len(candidates) > 1:
+            return Parallel(n_jobs=self.n_jobs, prefer="threads")(
+                delayed(self._evaluate_candidate)(params, stage=stage)
+                for params in candidates
+            )
+        return [self._evaluate_candidate(params, stage=stage) for params in candidates]
+
     def fit(self) -> "MLGS":
         coarse_space = self._coarse_space()
         coarse_candidates = self._parameter_candidates(coarse_space, self.coarse_iter, "coarse")
         if not coarse_candidates:
             raise RuntimeError("No coarse-search candidate was generated.")
 
-        results: list[dict[str, Any]] = []
-        for params in coarse_candidates:
-            results.append(self._evaluate_candidate(params, stage="coarse"))
+        results = self._evaluate_candidates(coarse_candidates, stage="coarse")
         best_coarse = max(results, key=lambda x: (x["score"], x["pearson"], x["r2"], -x["rmse"]))
 
         fine_space = self._fine_space(best_coarse["params"])
         fine_candidates = self._parameter_candidates(fine_space, self.fine_iter, "fine")
-        fine_results: list[dict[str, Any]] = []
-        for params in fine_candidates:
-            fine_results.append(self._evaluate_candidate(params, stage="fine"))
+        fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
         if fine_results:
             results.extend(fine_results)
             best_row = max(

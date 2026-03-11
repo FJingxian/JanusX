@@ -219,6 +219,37 @@ fn normalize_biallelic_snp(ref_a: &str, alt_a: &str) -> Option<(String, String)>
     Some((r, a))
 }
 
+/// Return Some((REF,ALT)) for a biallelic variant.
+/// - snps_only=true : keep only SNP A/C/G/T.
+/// - snps_only=false: keep non-SNP biallelic variants as well (e.g. indels),
+///   while still dropping multiallelic/invalid rows.
+/// - REF==ALT monomorphic rows are retained and can be filtered downstream
+///   by MAF/missingness thresholds.
+#[inline]
+fn normalize_biallelic_variant(
+    ref_a: &str,
+    alt_a: &str,
+    snps_only: bool,
+) -> Option<(String, String)> {
+    if ref_a.contains(',') || alt_a.contains(',') {
+        return None;
+    }
+    let r = ref_a.trim().to_ascii_uppercase();
+    let a = alt_a.trim().to_ascii_uppercase();
+    if r.is_empty() || a.is_empty() || r == "." || a == "." {
+        return None;
+    }
+    if snps_only {
+        if r.len() != 1 || a.len() != 1 {
+            return None;
+        }
+        if !is_acgt(&r) || !is_acgt(&a) {
+            return None;
+        }
+    }
+    Some((r, a))
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AlleleMap {
     Identity,
@@ -1048,7 +1079,7 @@ pub fn merge_genotypes(
 // Single-input conversion (PyO3)
 // ============================================================
 
-#[pyfunction(signature = (input, out, out_fmt=None, progress_callback=None, progress_every=10000, threads=0))]
+#[pyfunction(signature = (input, out, out_fmt=None, progress_callback=None, progress_every=10000, threads=0, snps_only=true))]
 pub fn convert_genotypes(
     py: Python<'_>,
     input: String,
@@ -1057,6 +1088,7 @@ pub fn convert_genotypes(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     threads: usize,
+    snps_only: bool,
 ) -> PyResult<PyConvertStats> {
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -1148,7 +1180,11 @@ pub fn convert_genotypes(
                         .into_par_iter()
                         .map(|idx| {
                             let site = sites[idx].clone();
-                            match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
+                            match normalize_biallelic_variant(
+                                &site.ref_allele,
+                                &site.alt_allele,
+                                snps_only,
+                            ) {
                                 Some((gref, galt)) => {
                                     let offset = idx * bytes_per_snp;
                                     let snp_bytes = &data[offset..offset + bytes_per_snp];
@@ -1245,7 +1281,11 @@ pub fn convert_genotypes(
                 last_report = stats.n_sites_seen;
             }
 
-            let (gref, galt) = match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
+            let (gref, galt) = match normalize_biallelic_variant(
+                &site.ref_allele,
+                &site.alt_allele,
+                snps_only,
+            ) {
                 Some(x) => x,
                 None => {
                     if site.ref_allele.contains(',') || site.alt_allele.contains(',') {

@@ -1,5 +1,6 @@
 from typing import Union
 import os
+import json
 import warnings
 import numpy as np
 from tqdm import tqdm
@@ -13,6 +14,7 @@ from janusx.janusx import (
 )
 
 _WARNED_BED_MODEL_FALLBACK = False
+_PLINK_CACHE_META_VERSION = 2
 
 
 def _cache_prefix(prefix: str) -> str:
@@ -20,6 +22,52 @@ def _cache_prefix(prefix: str) -> str:
     if base.startswith("~"):
         return prefix
     return os.path.join(os.path.dirname(prefix), f"~{base}")
+
+
+def _vcf_cache_prefix(prefix: str, snps_only: bool = True) -> str:
+    """
+    VCF->PLINK cache prefix.
+    - snps_only=True : legacy SNP-only cache (~prefix.*)
+    - snps_only=False: all-biallelic cache (~prefix.all.*)
+    """
+    base = _cache_prefix(prefix)
+    return base if bool(snps_only) else f"{base}.all"
+
+
+def _plink_cache_meta_path(cache_prefix: str) -> str:
+    return f"{cache_prefix}.meta.json"
+
+
+def _expected_plink_cache_meta(*, snps_only: bool) -> dict:
+    return {
+        "kind": "vcf_plink_cache",
+        "version": int(_PLINK_CACHE_META_VERSION),
+        "snps_only": bool(snps_only),
+        # Keep REF==ALT rows in conversion; downstream MAF/missing filters decide.
+        "keep_ref_eq_alt": True,
+    }
+
+
+def _load_plink_cache_meta(cache_prefix: str) -> dict:
+    path = _plink_cache_meta_path(cache_prefix)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+
+def _write_plink_cache_meta(cache_prefix: str, meta: dict) -> None:
+    path = _plink_cache_meta_path(cache_prefix)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=True, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
@@ -82,9 +130,10 @@ def _resolve_input(path_or_prefix: str):
     return "unknown", prefix, None
 
 
-def _ensure_plink_cache(prefix: str, vcf_path: str):
-    cache_prefix = _cache_prefix(prefix)
+def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True):
+    cache_prefix = _vcf_cache_prefix(prefix, snps_only=snps_only)
     cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
+    expect_meta = _expected_plink_cache_meta(snps_only=bool(snps_only))
 
     if any(os.path.exists(p) for p in cache_files):
         src_mtime = os.path.getmtime(vcf_path)
@@ -98,21 +147,32 @@ def _ensure_plink_cache(prefix: str, vcf_path: str):
                 RuntimeWarning,
                 stacklevel=2,
             )
-            for path in cache_files:
-                if os.path.exists(path):
-                    os.remove(path)
+            _remove_plink_cache_files(cache_prefix)
 
     if _is_plink_prefix(cache_prefix):
-        return
-    convert_genotypes(vcf_path, cache_prefix, out_fmt="plink")
+        meta = _load_plink_cache_meta(cache_prefix)
+        if meta == expect_meta:
+            return
+        warnings.warn(
+            (
+                f"Detected outdated VCF cache metadata for '{prefix}'. "
+                "Removing cache files and rebuilding."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _remove_plink_cache_files(cache_prefix)
+
+    convert_genotypes(vcf_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
     if not _is_plink_prefix(cache_prefix):
         raise RuntimeError(
             f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
         )
+    _write_plink_cache_meta(cache_prefix, expect_meta)
 
 
 def _remove_plink_cache_files(cache_prefix: str) -> None:
-    for ext in ("bed", "bim", "fam"):
+    for ext in ("bed", "bim", "fam", "meta.json"):
         path = f"{cache_prefix}.{ext}"
         if os.path.exists(path):
             os.remove(path)
@@ -310,6 +370,7 @@ def load_genotype_chunks(
     model: str = "add",
     het: float = 0.02,
     *,
+    snps_only: bool = True,
     snp_range: Union[tuple[int, int] , None] = None,
     snp_indices: Union[list[int] , None] = None,
     bim_range: Union[tuple[str, int, int] , None] = None,
@@ -384,7 +445,8 @@ def load_genotype_chunks(
     -----
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
-    - VCF/TXT caching does not perform filtering or imputation.
+    - VCF/TXT caching does not perform maf/missing filtering or imputation.
+    - VCF cache can be SNP-only or all-biallelic depending on `snps_only`.
 
     Selection
     ---------
@@ -409,8 +471,8 @@ def load_genotype_chunks(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        _ensure_plink_cache(prefix, src_path)
-        cache_prefix = _cache_prefix(prefix)
+        _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+        cache_prefix = _vcf_cache_prefix(prefix, snps_only=bool(snps_only))
 
         def _iter_cached_bed():
             yield from bed_chunk_reader(
@@ -446,7 +508,7 @@ def load_genotype_chunks(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            _ensure_plink_cache(prefix, src_path)
+            _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
             yield from _iter_cached_bed()
         return
 
@@ -506,6 +568,7 @@ def load_genotype_chunks(
 def inspect_genotype_file(
     path_or_prefix: str,
     *,
+    snps_only: bool = True,
     delimiter: Union[str , None] = None,
 ):
     """
@@ -537,8 +600,8 @@ def inspect_genotype_file(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        _ensure_plink_cache(prefix, src_path)
-        cache_prefix = _cache_prefix(prefix)
+        _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+        cache_prefix = _vcf_cache_prefix(prefix, snps_only=bool(snps_only))
         try:
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
@@ -554,7 +617,7 @@ def inspect_genotype_file(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            _ensure_plink_cache(prefix, src_path)
+            _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
 

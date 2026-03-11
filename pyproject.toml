@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib",
     "scipy",
     "scikit-learn",
+    "xgboost",
     "psutil",
     "tqdm",
     "statsmodels",

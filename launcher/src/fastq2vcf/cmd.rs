@@ -19,8 +19,8 @@ pub(super) fn wrap_scheduler_cmd(cmd: &str, job: &str, threads: usize, backend: 
     if backend == "csub" {
         let quoted_cmd = sh_quote(cmd);
         return format!(
-            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
-            safe_job, safe_job, safe_job, threads, quoted_cmd
+            "mkdir -p ./log && : > ./log/{}.submitted && csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
+            safe_job, safe_job, safe_job, safe_job, threads, quoted_cmd
         );
     }
     let quoted_cmd = sh_quote(cmd);

@@ -319,9 +319,19 @@ pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLoca
 
     let runtime_sig = runtime_signature(&record);
     let (cached_sig, cached_entries) = load_tool_cache_entries(&python, &db_path)?;
-    let use_cache = cached_sig
+    let expected_backend = route_backend_name(record.runtime_mode.as_str()).to_string();
+    let cache_matches_runtime = cached_sig
         .map(|s| s == runtime_sig)
         .unwrap_or(false);
+    let cache_matches_backend = if should_force_container_binding(record.runtime_mode.as_str()) {
+        cached_entries
+            .iter()
+            .filter(|x| x.runtime_sig == runtime_sig)
+            .all(|x| x.backend == expected_backend)
+    } else {
+        true
+    };
+    let use_cache = cache_matches_runtime && cache_matches_backend;
 
     if !use_cache {
         let probed = probe_tool_locators_parallel(&record, runtime_home)?;
@@ -662,6 +672,10 @@ fn route_backend_name(runtime_mode: &str) -> &'static str {
     }
 }
 
+fn should_force_container_binding(runtime_mode: &str) -> bool {
+    matches!(runtime_mode, "docker" | "singularity")
+}
+
 fn runtime_signature(record: &RuntimeRecord) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -745,6 +759,9 @@ fn detect_preferred_binding_for_tool(
     record: &RuntimeRecord,
     runtime_home: &Path,
 ) -> Option<(String, String)> {
+    if should_force_container_binding(record.runtime_mode.as_str()) {
+        return runtime_binding_for_tool(tool, record, runtime_home);
+    }
     if let Some(host_path) = find_bin(tool) {
         let env_bin_dir = env_runtime_bin_dir(runtime_home);
         if host_path.starts_with(&env_bin_dir) {
@@ -871,6 +888,12 @@ fn build_tool_command_from_preferred_binding(
     else {
         return Ok(None);
     };
+    if should_force_container_binding(record.runtime_mode.as_str()) {
+        let expected = route_backend_name(record.runtime_mode.as_str());
+        if entry.backend != expected {
+            return Ok(None);
+        }
+    }
     if !validate_cached_locator(&entry.backend, &entry.locator) {
         return Ok(None);
     }

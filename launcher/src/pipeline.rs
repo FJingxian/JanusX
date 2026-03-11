@@ -129,6 +129,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
             return Err("Interrupted by signal.".to_string());
         }
         if opts.skip_if_outputs_exist && all_outputs_ready(&step.outputs) {
+            clear_ready_item_submission_markers(workdir, step);
             if opts.emit_completion_line {
                 super::print_success_line(&format!("{step_text} ...Skipped"));
             }
@@ -137,6 +138,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         if opts.skip_if_outputs_exist && !step.items.is_empty() {
             let pending_idx = pending_item_indices(step);
             if pending_idx.is_empty() {
+                clear_ready_item_submission_markers(workdir, step);
                 if opts.emit_completion_line {
                     super::print_success_line(&format!("{step_text} ...Skipped"));
                 }
@@ -171,7 +173,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         {
             let pending_idx = pending_item_indices(step);
             if !pending_idx.is_empty() {
-                if let Ok(running_idx) = find_running_csub_items_for_pending(step, &pending_idx) {
+                if let Ok(running_idx) = find_running_csub_items_for_pending(workdir, step, &pending_idx) {
                     if !running_idx.is_empty() {
                         let submit_idx: Vec<usize> = pending_idx
                             .iter()
@@ -218,6 +220,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
             } else if let Err(e) = run_step_script(workdir, &sh, opts) {
                 if interrupt_requested() {
                     return handle_interrupt_for_step(
+                        workdir,
                         &step_text,
                         step,
                         opts,
@@ -251,7 +254,7 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         }
         if interrupt_requested() {
             terminate_step_script(&mut script_child);
-            return handle_interrupt_for_step(&step_text, step, opts, &pending_item_indices(step));
+            return handle_interrupt_for_step(workdir, &step_text, step, opts, &pending_item_indices(step));
         }
         let pre_wait_elapsed = step_exec_start.elapsed();
         wait_step_outputs(
@@ -368,6 +371,29 @@ fn pending_item_indices(step: &PipelineStep) -> Vec<usize> {
     pending
 }
 
+fn submission_marker_path(workdir: &Path, safe_job: &str) -> PathBuf {
+    workdir.join("log").join(format!("{safe_job}.submitted"))
+}
+
+fn item_submission_marker_path(workdir: &Path, item_id: &str) -> PathBuf {
+    submission_marker_path(workdir, &safe_job_label(item_id))
+}
+
+fn clear_item_submission_marker(workdir: &Path, item_id: &str) {
+    let marker = item_submission_marker_path(workdir, item_id);
+    if marker.exists() {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+fn clear_ready_item_submission_markers(workdir: &Path, step: &PipelineStep) {
+    for item in &step.items {
+        if all_outputs_ready(&item.outputs) {
+            clear_item_submission_marker(workdir, &item.id);
+        }
+    }
+}
+
 pub(crate) fn infer_first_incomplete_step(steps: &[PipelineStep]) -> usize {
     for (idx, step) in steps.iter().enumerate() {
         if !is_step_outputs_ready(step) {
@@ -394,6 +420,7 @@ struct CsubJobInfo {
 }
 
 fn find_running_csub_items_for_pending(
+    workdir: &Path,
     step: &PipelineStep,
     pending_idx: &[usize],
 ) -> Result<HashSet<usize>, String> {
@@ -407,11 +434,17 @@ fn find_running_csub_items_for_pending(
         let Some(item) = step.items.get(*idx) else {
             continue;
         };
+        let marker = item_submission_marker_path(workdir, &item.id);
+        if !marker.exists() {
+            continue;
+        }
         if running_jobs
             .iter()
             .any(|job| csub_job_matches_item(&job.job_name, &item.id))
         {
             out.insert(*idx);
+        } else {
+            let _ = fs::remove_file(marker);
         }
     }
     Ok(out)
@@ -484,7 +517,11 @@ fn csub_job_matches_item(job_name: &str, item_id: &str) -> bool {
     !j2.is_empty() && (safe == j2 || safe.ends_with(j2))
 }
 
-fn collect_csub_job_ids_for_pending(step: &PipelineStep, pending_idx: &[usize]) -> Result<Vec<String>, String> {
+fn collect_csub_job_ids_for_pending(
+    workdir: &Path,
+    step: &PipelineStep,
+    pending_idx: &[usize],
+) -> Result<Vec<String>, String> {
     if pending_idx.is_empty() {
         return Ok(Vec::new());
     }
@@ -497,6 +534,9 @@ fn collect_csub_job_ids_for_pending(step: &PipelineStep, pending_idx: &[usize]) 
         let Some(item) = step.items.get(*idx) else {
             continue;
         };
+        if !item_submission_marker_path(workdir, &item.id).exists() {
+            continue;
+        }
         for job in &running_jobs {
             if csub_job_matches_item(&job.job_name, &item.id) {
                 ids.insert(job.job_id.clone());
@@ -547,6 +587,7 @@ fn ckill_job_ids(job_ids: &[String]) -> Result<(), String> {
 }
 
 fn handle_interrupt_for_step(
+    workdir: &Path,
     step_text: &str,
     step: &PipelineStep,
     opts: &PipelineOptions,
@@ -555,7 +596,7 @@ fn handle_interrupt_for_step(
     if !matches!(opts.scheduler, Scheduler::Csub) {
         return Err("Interrupted by signal.".to_string());
     }
-    let job_ids = collect_csub_job_ids_for_pending(step, pending_idx)?;
+    let job_ids = collect_csub_job_ids_for_pending(workdir, step, pending_idx)?;
     if job_ids.is_empty() {
         return Err("Interrupted by signal.".to_string());
     }
@@ -665,7 +706,7 @@ fn wait_step_outputs(
             if interrupt_requested() {
                 clear_progress_line_if_tty()?;
                 terminate_step_script(&mut script_child);
-                return handle_interrupt_for_step(step_text, step, opts, &[]);
+                return handle_interrupt_for_step(workdir, step_text, step, opts, &[]);
             }
             let done = if all_outputs_ready(&step.outputs) {
                 total
@@ -772,6 +813,7 @@ fn wait_step_outputs(
         }
     }
     if done >= total && script_child.is_none() {
+        clear_ready_item_submission_markers(workdir, step);
         if opts.emit_completion_line {
             if opts.skip_if_outputs_exist && !submitted_this_round {
                 super::print_success_line(&format!("{step_text} ...Skipped"));
@@ -792,7 +834,7 @@ fn wait_step_outputs(
         if interrupt_requested() {
             clear_progress_line_if_tty()?;
             terminate_step_script(&mut script_child);
-            return handle_interrupt_for_step(step_text, step, opts, &pending);
+            return handle_interrupt_for_step(workdir, step_text, step, opts, &pending);
         }
         if !pending.is_empty() {
             let mut next_pending: Vec<usize> = Vec::with_capacity(pending.len());
@@ -801,6 +843,7 @@ fn wait_step_outputs(
                 if all_outputs_ready(&item.outputs) {
                     done += 1;
                     last_progress = Instant::now();
+                    clear_item_submission_marker(workdir, &item.id);
                     hook.on_item_completed(step, item)?;
                 } else {
                     next_pending.push(*idx);
@@ -895,6 +938,7 @@ fn wait_step_outputs(
     if opts.emit_progress_line {
         clear_progress_line_if_tty()?;
     }
+    clear_ready_item_submission_markers(workdir, step);
     if opts.emit_completion_line {
         super::print_success_line(&format!(
             "{} ...Finished [{}]",

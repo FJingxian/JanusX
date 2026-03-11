@@ -91,6 +91,7 @@ struct ReferenceIndexTask {
     reference: PathBuf,
     workdir: PathBuf,
     safe_job: String,
+    marker_path: PathBuf,
     ignore_error_logs: HashSet<PathBuf>,
     is_csub: bool,
     aligner_flavor: AlignerFlavor,
@@ -1140,6 +1141,7 @@ fn start_reference_indexing(
         sh_quote(&dict_path.to_string_lossy()),
     );
     let safe_job = crate::pipeline::safe_job_label(job_name);
+    let marker_path = workdir.join("log").join(format!("{safe_job}.submitted"));
     let ignore_error_logs = collect_existing_step_error_logs(workdir, &safe_job)?;
     let index_csub_ncpu = 8usize;
     let wrapped = wrap_reference_submit_cmd(&idx_cmd, &safe_job, backend, index_csub_ncpu);
@@ -1148,6 +1150,7 @@ fn start_reference_indexing(
         reference,
         workdir: workdir.to_path_buf(),
         safe_job,
+        marker_path,
         ignore_error_logs,
         is_csub: backend == "csub",
         aligner_flavor,
@@ -1163,7 +1166,8 @@ fn wrap_reference_submit_cmd(
     let quoted_cmd = sh_quote(cmd);
     if backend == "csub" {
         return format!(
-            "csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
+            "mkdir -p ./log && : > ./log/{}.submitted && csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
+            safe_job,
             safe_job,
             safe_job,
             safe_job,
@@ -2879,7 +2883,7 @@ fn wait_for_reference_index_ready(
             }
         }
         if task.is_csub {
-            match csub_job_is_active(&task.safe_job) {
+                match csub_job_is_active(&task.safe_job, &task.marker_path) {
                 Ok(true) => {
                     csub_last_active = Instant::now();
                     csub_probe_issue = None;
@@ -2959,6 +2963,9 @@ fn wait_for_reference_index_ready(
         io::stdout()
             .flush()
             .map_err(|e| format!("Failed to flush progress output: {e}"))?;
+    }
+    if task.marker_path.exists() {
+        let _ = fs::remove_file(&task.marker_path);
     }
     if emit_ui {
         super::print_success_line(&format!(
@@ -3125,7 +3132,10 @@ fn run_fastp_and_index_parallel(
     Ok((fastp_elapsed, index_elapsed))
 }
 
-fn csub_job_is_active(safe_job: &str) -> Result<bool, String> {
+fn csub_job_is_active(safe_job: &str, marker_path: &Path) -> Result<bool, String> {
+    if !marker_path.exists() {
+        return Ok(false);
+    }
     let out = Command::new("cjobs")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3163,6 +3173,7 @@ fn csub_job_is_active(safe_job: &str) -> Result<bool, String> {
             return Ok(true);
         }
     }
+    let _ = fs::remove_file(marker_path);
     Ok(false)
 }
 

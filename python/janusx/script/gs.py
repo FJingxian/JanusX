@@ -10,6 +10,12 @@ Supported models
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
   - BayesCpi : Bayesian variable selection model with shared variance (via pyBLUP.bayes)
+  - RF     : Random forest regression with GS-oriented inner tuning
+  - ET     : Extra-trees regression with GS-oriented inner tuning
+  - GBDT   : Histogram gradient boosting regression with inner tuning
+  - XGB    : XGBoost regression with compact inner tuning
+  - SVM    : RBF-support vector regression with compact inner tuning
+  - ENET   : ElasticNet regression with compact inner tuning
 
 Genotype input formats
 ----------------------
@@ -85,6 +91,7 @@ from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
+from janusx.pyBLUP.ml import MLGS, _HAS_XGBOOST, _XGBOOST_IMPORT_ERROR
 try:
     from janusx.pyBLUP.blup import BLUP as KernelBLUP, Gmatrix
     _HAS_ADBLUP_PY = True
@@ -139,11 +146,27 @@ except Exception:
 # Core API for single-trait genomic prediction
 # ======================================================================
 
+_ML_METHOD_MAP: dict[str, str] = {
+    "RF": "rf",
+    "ET": "et",
+    "GBDT": "gbdt",
+    "XGB": "xgb",
+    "SVM": "svm",
+    "ENET": "enet",
+}
+
+
+def _mlgs_inner_cv(n_samples: int) -> int:
+    if n_samples >= 120:
+        return 3
+    return 2
+
+
 def GSapi(
     Y: np.ndarray,
     Xtrain: np.ndarray,
     Xtest: np.ndarray,
-    method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"],
+    method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
@@ -157,7 +180,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'adBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi'}
+    method : {'GBLUP', 'adBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -170,7 +193,8 @@ def GSapi(
     yhat_test : np.ndarray
         Predicted phenotypes for test individuals, shape (n_test, 1).
     pve : float
-        Proportion of variance explained (GBLUP/rrBLUP) or posterior mean h2 (Bayes).
+        Variance-component PVE/h2 for mixed models and Bayes models,
+        or predictive PVE (inner-CV R²) for ML models.
     """
     # Optional PCA-based dimensionality reduction
     if PCAdec:
@@ -245,6 +269,26 @@ def GSapi(
         pve = model.pve
         return model.predict(Xtrain), model.predict(Xtest), pve
 
+    if method in _ML_METHOD_MAP:
+        model = MLGS(
+            y=Y.reshape(-1),
+            M=Xtrain,
+            method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
+            seed=42,
+            cv=_mlgs_inner_cv(int(Y.shape[0])),
+            fit_on_init=True,
+            verbose=False,
+        )
+        yhat_train = model.fit_predict()
+        if int(Xtest.shape[1]) > 0:
+            yhat_test = model.predict(Xtest)
+        else:
+            yhat_test = np.zeros((0, 1), dtype=float)
+        pve = float(
+            (model.best_metrics_ or {}).get("r2", np.nan)
+        )
+        return yhat_train, yhat_test, pve
+
     raise ValueError(f"Unsupported GS method: {method}")
 
 
@@ -255,6 +299,8 @@ def _run_method_task(
     test_snp: np.ndarray,
     train_snp_add: np.ndarray | None,
     test_snp_add: np.ndarray | None,
+    train_snp_ml: np.ndarray | None,
+    test_snp_ml: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     progress_queue: typing.Any = None,
@@ -274,6 +320,12 @@ def _run_method_task(
                 fold_train = train_snp_add[:, train_idx]
                 fold_test = train_snp_add[:, test_idx]
                 fold_pca = False
+            elif method in _ML_METHOD_MAP:
+                if train_snp_ml is None:
+                    raise ValueError(f"{method} requires raw genotype matrix.")
+                fold_train = train_snp_ml[:, train_idx]
+                fold_test = train_snp_ml[:, test_idx]
+                fold_pca = pca_dec
             else:
                 fold_train = train_snp[:, train_idx]
                 fold_test = train_snp[:, test_idx]
@@ -317,6 +369,12 @@ def _run_method_task(
         final_train = train_snp_add
         final_test = test_snp_add
         final_pca = False
+    elif method in _ML_METHOD_MAP:
+        if train_snp_ml is None or test_snp_ml is None:
+            raise ValueError(f"{method} requires raw genotype matrices.")
+        final_train = train_snp_ml
+        final_test = test_snp_ml
+        final_pca = pca_dec
     else:
         final_train = train_snp
         final_test = test_snp
@@ -346,6 +404,8 @@ def _run_methods_parallel(
     test_snp: np.ndarray,
     train_snp_add: np.ndarray | None,
     test_snp_add: np.ndarray | None,
+    train_snp_ml: np.ndarray | None,
+    test_snp_ml: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
 ) -> list[dict[str, typing.Any]]:
@@ -419,6 +479,8 @@ def _run_methods_parallel(
                             test_snp,
                             train_snp_add,
                             test_snp_add,
+                            train_snp_ml,
+                            test_snp_ml,
                             pca_dec,
                             cv_splits,
                             progress_queue=None,
@@ -457,6 +519,8 @@ def _run_methods_parallel(
                     test_snp,
                     train_snp_add,
                     test_snp_add,
+                    train_snp_ml,
+                    test_snp_ml,
                     pca_dec,
                     cv_splits,
                 )
@@ -491,6 +555,8 @@ def _run_methods_parallel(
                     test_snp,
                     train_snp_add,
                     test_snp_add,
+                    train_snp_ml,
+                    test_snp_ml,
                     pca_dec,
                     cv_splits,
                     None,
@@ -567,6 +633,8 @@ def _run_methods_parallel(
                             test_snp,
                             train_snp_add,
                             test_snp_add,
+                            train_snp_ml,
+                            test_snp_ml,
                             pca_dec,
                             cv_splits,
                             prog_q,
@@ -651,6 +719,8 @@ def _run_methods_parallel(
                         test_snp,
                         train_snp_add,
                         test_snp_add,
+                        train_snp_ml,
+                        test_snp_ml,
                         pca_dec,
                         cv_splits,
                         prog_q,
@@ -691,6 +761,8 @@ def _run_methods_parallel(
                     test_snp,
                     train_snp_add,
                     test_snp_add,
+                    train_snp_ml,
+                    test_snp_ml,
                     pca_dec,
                     cv_splits,
                     None,
@@ -758,6 +830,7 @@ def main(log: bool = True) -> None:
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -adBLUP -cv 5",
+            "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",
         ]),
     )
@@ -830,6 +903,48 @@ def main(log: bool = True) -> None:
         action="store_true",
         default=False,
         help="Use BayesCpi model for training and prediction "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-RF", "--RF",
+        action="store_true",
+        default=False,
+        help="Use random forest genomic selection with compact inner tuning "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-ET", "--ET",
+        action="store_true",
+        default=False,
+        help="Use extra-trees genomic selection with compact inner tuning "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-GBDT", "--GBDT",
+        action="store_true",
+        default=False,
+        help="Use histogram gradient boosting genomic selection with compact inner tuning "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-XGB", "--XGB",
+        action="store_true",
+        default=False,
+        help="Use XGBoost genomic selection with compact inner tuning "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-SVM", "--SVM",
+        action="store_true",
+        default=False,
+        help="Use RBF-support vector regression genomic selection "
+             "(default: %(default)s).",
+    )
+    model_group.add_argument(
+        "-ENET", "--ENET",
+        action="store_true",
+        default=False,
+        help="Use ElasticNet genomic selection with compact inner tuning "
              "(default: %(default)s).",
     )
     # ------------------------------------------------------------------
@@ -970,6 +1085,24 @@ def main(log: bool = True) -> None:
         if args.BayesCpi:
             model_count += 1
             cfg_rows.append((f"Used model{model_count}", "BayesCpi"))
+        if args.RF:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "RF"))
+        if args.ET:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "ET"))
+        if args.GBDT:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "GBDT"))
+        if args.XGB:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "XGB"))
+        if args.SVM:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "SVM"))
+        if args.ENET:
+            model_count += 1
+            cfg_rows.append((f"Used model{model_count}", "ENET"))
         cfg_rows.extend(
             [
                 ("Use PCA", args.pcd),
@@ -1056,6 +1189,18 @@ def main(log: bool = True) -> None:
         methods.append("BayesB")
     if args.BayesCpi:
         methods.append("BayesCpi")
+    if args.RF:
+        methods.append("RF")
+    if args.ET:
+        methods.append("ET")
+    if args.GBDT:
+        methods.append("GBDT")
+    if args.XGB:
+        methods.append("XGB")
+    if args.SVM:
+        methods.append("SVM")
+    if args.ENET:
+        methods.append("ENET")
     # keep order, drop duplicates
     if len(methods) > 1:
         _seen_methods: set[str] = set()
@@ -1068,13 +1213,20 @@ def main(log: bool = True) -> None:
         methods = _uniq_methods
     if len(methods) == 0:
         logger.error(
-            "No model selected. Use --GBLUP/--adBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi."
+            "No model selected. Use "
+            "--GBLUP/--adBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET."
         )
         raise SystemExit(1)
     if args.adBLUP and (not _HAS_ADBLUP_PY):
         logger.error(
             "adBLUP (JAX backend) is unavailable. "
             f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
+        )
+        raise SystemExit(1)
+    if args.XGB and (not _HAS_XGBOOST):
+        logger.error(
+            "XGB is unavailable because xgboost could not be imported. "
+            f"Original import error: {_XGBOOST_IMPORT_ERROR}"
         )
         raise SystemExit(1)
     if args.adBLUP and args.pcd:
@@ -1099,11 +1251,14 @@ def main(log: bool = True) -> None:
 
     samples = sample_ids
     need_std_geno = bool(args.GBLUP or args.rrBLUP or args.BayesA or args.BayesB or args.BayesCpi)
-    geno_add_raw = (
+    need_raw_geno = bool(args.adBLUP or args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET)
+    geno_raw = (
         np.asarray(geno, dtype=np.float32, copy=need_std_geno)
-        if args.adBLUP
+        if need_raw_geno
         else None
     )
+    geno_add_raw = geno_raw if args.adBLUP else None
+    geno_ml_raw = geno_raw if (args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET) else None
     if need_std_geno:
         geno = (geno - geno.mean(axis=1, keepdims=True)) / (
             geno.std(axis=1, keepdims=True) + 1e-6
@@ -1137,11 +1292,18 @@ def main(log: bool = True) -> None:
         test_snp = geno[:, testmask]
         train_snp_add = None
         test_snp_add = None
+        train_snp_ml = None
+        test_snp_ml = None
         if args.adBLUP:
             if geno_add_raw is None:
                 raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
             train_snp_add = geno_add_raw[:, trainmask]
             test_snp_add = geno_add_raw[:, testmask]
+        if args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET:
+            if geno_ml_raw is None:
+                raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
+            train_snp_ml = geno_ml_raw[:, trainmask]
+            test_snp_ml = geno_ml_raw[:, testmask]
         method_results = _run_methods_parallel(
             methods=methods,
             train_pheno=train_pheno,
@@ -1149,6 +1311,8 @@ def main(log: bool = True) -> None:
             test_snp=test_snp,
             train_snp_add=train_snp_add,
             test_snp_add=test_snp_add,
+            train_snp_ml=train_snp_ml,
+            test_snp_ml=test_snp_ml,
             pca_dec=args.pcd,
             cv_splits=cv_splits,
         )
@@ -1172,7 +1336,7 @@ def main(log: bool = True) -> None:
                     pear="Pearsonr",
                     spear="Spearmanr",
                     r2="R²",
-                    h2="h²",
+                    h2="h²/PVE",
                     time="time(secs)",
                 )
             )

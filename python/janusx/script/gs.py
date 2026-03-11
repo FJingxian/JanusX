@@ -420,11 +420,12 @@ def _run_methods_parallel(
     if len(methods) == 0:
         return []
 
+    model_n_jobs = max(1, int(n_jobs))
     show_method_progress = cv_splits is not None
     # Force serial execution for all GS methods to avoid cross-method contention
     # and keep runtime behavior consistent.
-    n_jobs = 1
-    if n_jobs <= 1:
+    method_parallel_jobs = 1
+    if method_parallel_jobs <= 1:
         out: list[dict[str, typing.Any]] = []
         fold_total_map = {
             m: (int(len(cv_splits)) if cv_splits is not None else 1)
@@ -491,7 +492,7 @@ def _run_methods_parallel(
                             test_snp_ml,
                             pca_dec,
                             cv_splits,
-                            n_jobs,
+                            model_n_jobs,
                             progress_queue=None,
                             progress_hook=_hook,
                         )
@@ -532,7 +533,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
-                    n_jobs,
+                    model_n_jobs,
                 )
             except Exception:
                 elapsed = format_elapsed(time.monotonic() - t0)
@@ -555,7 +556,7 @@ def _run_methods_parallel(
 
     if not show_method_progress:
         method_start_ts = {m: time.monotonic() for m in methods}
-        with cf.ProcessPoolExecutor(max_workers=n_jobs) as ex:
+        with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
             future_map = {
                 ex.submit(
                     _run_method_task,
@@ -569,7 +570,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
-                    n_jobs,
+                    model_n_jobs,
                     None,
                 ): m
                 for m in methods
@@ -634,7 +635,7 @@ def _run_methods_parallel(
             manager = mp.Manager()
             prog_q = manager.Queue() if cv_splits is not None else None
             try:
-                with cf.ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
                     future_map = {
                         ex.submit(
                             _run_method_task,
@@ -648,7 +649,7 @@ def _run_methods_parallel(
                             test_snp_ml,
                             pca_dec,
                             cv_splits,
-                            n_jobs,
+                            model_n_jobs,
                             prog_q,
                         ): m
                         for m in methods
@@ -721,7 +722,7 @@ def _run_methods_parallel(
         manager = mp.Manager()
         prog_q = manager.Queue() if cv_splits is not None else None
         try:
-            with cf.ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
                 future_map = {
                     ex.submit(
                         _run_method_task,
@@ -735,7 +736,7 @@ def _run_methods_parallel(
                         test_snp_ml,
                         pca_dec,
                         cv_splits,
-                        n_jobs,
+                        model_n_jobs,
                         prog_q,
                     ): m
                     for m in methods
@@ -764,7 +765,7 @@ def _run_methods_parallel(
             except Exception:
                 pass
     else:
-        with cf.ProcessPoolExecutor(max_workers=n_jobs) as ex:
+        with cf.ProcessPoolExecutor(max_workers=method_parallel_jobs) as ex:
             future_map = {
                 ex.submit(
                     _run_method_task,
@@ -778,7 +779,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
-                    n_jobs,
+                    model_n_jobs,
                     None,
                 ): m
                 for m in methods

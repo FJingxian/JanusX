@@ -379,6 +379,15 @@ fn item_submission_marker_path(workdir: &Path, item_id: &str) -> PathBuf {
     submission_marker_path(workdir, &safe_job_label(item_id))
 }
 
+fn read_submission_marker_job_id(marker: &Path) -> Option<String> {
+    let raw = fs::read_to_string(marker).ok()?;
+    let job_id = raw.trim();
+    if job_id.is_empty() || !job_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(job_id.to_string())
+}
+
 fn clear_item_submission_marker(workdir: &Path, item_id: &str) {
     let marker = item_submission_marker_path(workdir, item_id);
     if marker.exists() {
@@ -416,7 +425,6 @@ fn is_step_outputs_ready(step: &PipelineStep) -> bool {
 #[derive(Clone, Debug)]
 struct CsubJobInfo {
     job_id: String,
-    job_name: String,
 }
 
 fn find_running_csub_items_for_pending(
@@ -435,13 +443,13 @@ fn find_running_csub_items_for_pending(
             continue;
         };
         let marker = item_submission_marker_path(workdir, &item.id);
-        if !marker.exists() {
+        let Some(job_id) = read_submission_marker_job_id(&marker) else {
+            if marker.exists() {
+                let _ = fs::remove_file(marker);
+            }
             continue;
-        }
-        if running_jobs
-            .iter()
-            .any(|job| csub_job_matches_item(&job.job_name, &item.id))
-        {
+        };
+        if running_jobs.iter().any(|job| job.job_id == job_id) {
             out.insert(*idx);
         } else {
             let _ = fs::remove_file(marker);
@@ -488,33 +496,16 @@ fn query_cjobs_active_jobs() -> Result<Vec<CsubJobInfo>, String> {
             continue;
         }
         let job_id = cols[0].trim().to_string();
-        let job_name = cols[6].trim().to_string();
+        let job_name = cols[6].trim();
         if job_id.is_empty() || job_name.is_empty() {
             continue;
         }
-        let key = (job_id.clone(), job_name.clone());
+        let key = (job_id.clone(), job_name.to_string());
         if seen.insert(key) {
-            jobs.push(CsubJobInfo { job_id, job_name });
+            jobs.push(CsubJobInfo { job_id });
         }
     }
     Ok(jobs)
-}
-
-fn csub_job_matches_item(job_name: &str, item_id: &str) -> bool {
-    let safe = safe_job_label(item_id);
-    let j = job_name.trim();
-    if j.is_empty() {
-        return false;
-    }
-    if safe == j {
-        return true;
-    }
-    let j1 = j.trim_start_matches('*');
-    if !j1.is_empty() && (safe == j1 || safe.ends_with(j1)) {
-        return true;
-    }
-    let j2 = j.trim_matches('*');
-    !j2.is_empty() && (safe == j2 || safe.ends_with(j2))
 }
 
 fn collect_csub_job_ids_for_pending(
@@ -534,13 +525,17 @@ fn collect_csub_job_ids_for_pending(
         let Some(item) = step.items.get(*idx) else {
             continue;
         };
-        if !item_submission_marker_path(workdir, &item.id).exists() {
-            continue;
-        }
-        for job in &running_jobs {
-            if csub_job_matches_item(&job.job_name, &item.id) {
-                ids.insert(job.job_id.clone());
+        let marker = item_submission_marker_path(workdir, &item.id);
+        let Some(job_id) = read_submission_marker_job_id(&marker) else {
+            if marker.exists() {
+                let _ = fs::remove_file(marker);
             }
+            continue;
+        };
+        if running_jobs.iter().any(|job| job.job_id == job_id) {
+            ids.insert(job_id);
+        } else if marker.exists() {
+            let _ = fs::remove_file(marker);
         }
     }
     let mut out: Vec<String> = ids.into_iter().collect();
@@ -1183,7 +1178,7 @@ fn is_likely_fatal_stderr_line(line: &str) -> bool {
         return false;
     }
     if is_csub_failure_marker_line(&s) {
-        return true;
+        return false;
     }
     let keys = [
         "traceback (most recent call last)",

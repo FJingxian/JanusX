@@ -18,9 +18,10 @@ pub(super) fn wrap_scheduler_cmd(cmd: &str, job: &str, threads: usize, backend: 
     let safe_job = safe_job_label(job);
     if backend == "csub" {
         let quoted_cmd = sh_quote(cmd);
+        let marker = sh_quote(&format!("./log/{}.submitted", safe_job));
         return format!(
-            "mkdir -p ./log && : > ./log/{}.submitted && csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
-            safe_job, safe_job, safe_job, safe_job, threads, quoted_cmd
+            "mkdir -p ./log && out=$(csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}); status=$?; printf '%s\\n' \"$out\"; if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; job_id=$(printf '%s\\n' \"$out\" | sed -n 's/.*<\\([0-9][0-9]*\\)>.*/\\1/p' | head -n 1); if [ -z \"$job_id\" ]; then job_id=$(printf '%s\\n' \"$out\" | awk '{{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) {{print $i; exit}}}}'); fi; if [ -n \"$job_id\" ]; then printf '%s\\n' \"$job_id\" > {}; else : > {}; fi",
+            safe_job, safe_job, safe_job, threads, quoted_cmd, marker, marker
         );
     }
     let quoted_cmd = sh_quote(cmd);

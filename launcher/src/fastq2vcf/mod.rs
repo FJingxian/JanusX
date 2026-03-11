@@ -1165,14 +1165,16 @@ fn wrap_reference_submit_cmd(
 ) -> String {
     let quoted_cmd = sh_quote(cmd);
     if backend == "csub" {
+        let marker = sh_quote(&format!("./log/{}.submitted", safe_job));
         return format!(
-            "mkdir -p ./log && : > ./log/{}.submitted && csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}",
-            safe_job,
+            "mkdir -p ./log && out=$(csub -J {} -o ./log/{}.%J.o -e ./log/{}.%J.e -q c01 -n {} {}); status=$?; printf '%s\\n' \"$out\"; if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; job_id=$(printf '%s\\n' \"$out\" | sed -n 's/.*<\\([0-9][0-9]*\\)>.*/\\1/p' | head -n 1); if [ -z \"$job_id\" ]; then job_id=$(printf '%s\\n' \"$out\" | awk '{{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) {{print $i; exit}}}}'); fi; if [ -n \"$job_id\" ]; then printf '%s\\n' \"$job_id\" > {}; else : > {}; fi",
             safe_job,
             safe_job,
             safe_job,
             csub_ncpu.max(1),
-            quoted_cmd
+            quoted_cmd,
+            marker,
+            marker
         );
     }
     format!(
@@ -3132,10 +3134,14 @@ fn run_fastp_and_index_parallel(
     Ok((fastp_elapsed, index_elapsed))
 }
 
-fn csub_job_is_active(safe_job: &str, marker_path: &Path) -> Result<bool, String> {
+fn csub_job_is_active(_safe_job: &str, marker_path: &Path) -> Result<bool, String> {
     if !marker_path.exists() {
         return Ok(false);
     }
+    let Some(marker_job_id) = read_submission_marker_job_id(marker_path) else {
+        let _ = fs::remove_file(marker_path);
+        return Ok(false);
+    };
     let out = Command::new("cjobs")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3169,7 +3175,7 @@ fn csub_job_is_active(safe_job: &str, marker_path: &Path) -> Result<bool, String
         if !active {
             continue;
         }
-        if csub_job_name_matches_safe(cols[6].trim(), safe_job) {
+        if cols[0].trim() == marker_job_id {
             return Ok(true);
         }
     }
@@ -3177,20 +3183,13 @@ fn csub_job_is_active(safe_job: &str, marker_path: &Path) -> Result<bool, String
     Ok(false)
 }
 
-fn csub_job_name_matches_safe(job_name: &str, safe_job: &str) -> bool {
-    let j = job_name.trim();
-    if j.is_empty() {
-        return false;
+fn read_submission_marker_job_id(marker_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(marker_path).ok()?;
+    let job_id = raw.trim();
+    if job_id.is_empty() || !job_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
-    if j == safe_job {
-        return true;
-    }
-    let j1 = j.trim_start_matches('*');
-    if !j1.is_empty() && (j1 == safe_job || safe_job.ends_with(j1)) {
-        return true;
-    }
-    let j2 = j.trim_matches('*');
-    !j2.is_empty() && (j2 == safe_job || safe_job.ends_with(j2))
+    Some(job_id.to_string())
 }
 
 fn collect_existing_step_error_logs(

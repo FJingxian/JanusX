@@ -1,5 +1,6 @@
 use super::pipeline::{
-    all_outputs_ready, run_pipeline_with_hook, PipelineOptions, PipelineStep, Scheduler, StepItem,
+    all_outputs_ready, infer_first_incomplete_step, run_pipeline_with_hook, PipelineOptions,
+    PipelineStep, Scheduler, StepItem,
 };
 mod cmd;
 mod state;
@@ -35,7 +36,7 @@ const REQUIRED_DLC_TOOLS: [&str; 9] = [
     "beagle",
 ];
 type ToolProbe = (String, bool, bool, String);
-const FASTQ2VCF_TOTAL_STEPS: usize = 10;
+const FASTQ2VCF_TOTAL_STEPS: usize = 9;
 const FASTQ_SUFFIXES: [&str; 4] = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,8 +76,10 @@ impl FastqPair {
 #[derive(Clone, Debug)]
 struct ParsedArgs {
     reference: PathBuf,
-    fastq_dir: PathBuf,
+    fastq_dir: Option<PathBuf>,
     workdir: PathBuf,
+    from_step: Option<usize>,
+    to_step: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +111,8 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     }
 
     let parsed = parse_fastq2vcf_args(args)?;
+    let (from_step, to_step, from_step_explicit) =
+        normalize_step_range(parsed.from_step, parsed.to_step)?;
     let (reference, fastq_dir, workdir) = validate_and_resolve_inputs(&parsed)?;
 
     fs::create_dir_all(workdir.join("log")).map_err(|e| {
@@ -132,6 +137,10 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     if !backend_reason.is_empty() {
         println!("{}", backend_reason);
     }
+    println!(
+        "{}",
+        super::style_green(&format!("Pipeline step range: {} -> {}", from_step, to_step))
+    );
 
     let jx_cmd = "jx";
     let (toolchain, aligner_cmd, aligner_flavor) = probe_dlc_toolchain()?;
@@ -148,27 +157,37 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         ));
     }
 
-    let fastq_files = collect_fastq_files(&fastq_dir)?;
-    if fastq_files.is_empty() {
-        return Err(format!("No FASTQ files found in {}", fastq_dir.display()));
+    let discovered = discover_inputs_for_from_step(from_step, fastq_dir.as_deref(), &workdir)?;
+    let samples = discovered.samples.clone();
+    if from_step <= 2 {
+        println!(
+            "{}",
+            super::style_green(&format!(
+                "Detected {} paired samples from {} FASTQ files.",
+                samples.len(),
+                discovered.fastq_file_count
+            ))
+        );
+    } else if !samples.is_empty() {
+        println!(
+            "{}",
+            super::style_green(&format!(
+                "Inferred {} samples from workdir for -from-step {}.",
+                samples.len(),
+                from_step
+            ))
+        );
     }
-    let samples = classify_fastq_pairs(&fastq_files)?;
-    if samples.is_empty() {
-        return Err(format!(
-            "Detected 0 paired samples from {} FASTQ files.\n{}",
-            fastq_files.len(),
-            recognized_fastq_pairing_hint()
-        ));
+    if from_step >= 5 && !discovered.chroms_hint.is_empty() {
+        println!(
+            "{}",
+            super::style_green(&format!(
+                "Inferred {} chromosomes from workdir for -from-step {}.",
+                discovered.chroms_hint.len(),
+                from_step
+            ))
+        );
     }
-
-    println!(
-        "{}",
-        super::style_green(&format!(
-            "Detected {} paired samples from {} FASTQ files.",
-            samples.len(),
-            fastq_files.len()
-        ))
-    );
 
     let singularity = jx_cmd.to_string();
     let mut opts = PipelineOptions::default();
@@ -218,69 +237,98 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         resumed_line_printed = true;
     }
 
-    let index_task = start_reference_indexing(
-        &reference,
-        &workdir,
-        &backend,
-        jx_cmd,
-        "indexREF",
-        &aligner_cmd,
-        aligner_flavor,
-    )?;
+    let index_task = if step_range_needs_reference_index(from_step, to_step) {
+        start_reference_indexing(
+            &reference,
+            &workdir,
+            &backend,
+            jx_cmd,
+            "indexREF",
+            &aligner_cmd,
+            aligner_flavor,
+        )?
+    } else {
+        None
+    };
 
-    let fastp_step = build_fastp_step(&samples, &workdir, &backend, &singularity)?;
-    let fastp_skipped_by_outputs = opts.skip_if_outputs_exist && all_outputs_ready(&fastp_step.outputs);
-    if let Some(task) = index_task.clone() {
-        if fastp_skipped_by_outputs {
-            wait_reference_indexes(&task)?;
-            super::print_success_line("Step 1/10: fastp (~15m) ...Skipped");
+    if from_step <= 1 && to_step >= 1 {
+        let fastp_step = build_fastp_step(&samples, &workdir, &backend, &singularity)?;
+        let fastp_skipped_by_outputs =
+            opts.skip_if_outputs_exist && all_outputs_ready(&fastp_step.outputs);
+        if let Some(task) = index_task.clone() {
+            if fastp_skipped_by_outputs {
+                wait_reference_indexes(&task)?;
+                super::print_success_line(&format!("Step 1/{}: fastp (~15m) ...Skipped", FASTQ2VCF_TOTAL_STEPS));
+            } else {
+                let mut fastp_opts = opts.clone();
+                fastp_opts.step_index_offset = 0;
+                fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
+                fastp_opts.emit_completion_line = false;
+                fastp_opts.emit_progress_line = false;
+                let (fastp_elapsed, index_elapsed) = run_fastp_and_index_parallel(
+                    &workdir,
+                    &fastp_step,
+                    &fastp_opts,
+                    &task,
+                )?;
+                super::print_success_line(&format!(
+                    "Reference index check ...Finished [{}]",
+                    super::format_elapsed_live(index_elapsed)
+                ));
+                super::print_success_line(&format!(
+                    "Step 1/{}: fastp (~15m) ...Finished [{}]",
+                    FASTQ2VCF_TOTAL_STEPS,
+                    super::format_elapsed_live(fastp_elapsed)
+                ));
+            }
         } else {
+            let fastp_start = Instant::now();
             let mut fastp_opts = opts.clone();
             fastp_opts.step_index_offset = 0;
             fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
             fastp_opts.emit_completion_line = false;
-            fastp_opts.emit_progress_line = false;
-            let (fastp_elapsed, index_elapsed) = run_fastp_and_index_parallel(
+            let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
+            run_pipeline_with_hook(
                 &workdir,
-                &fastp_step,
+                std::slice::from_ref(&fastp_step),
                 &fastp_opts,
-                &task,
+                &mut noop_hook,
             )?;
-            super::print_success_line(&format!(
-                "Reference index check ...Finished [{}]",
-                super::format_elapsed_live(index_elapsed)
-            ));
-            super::print_success_line(&format!(
-                "Step 1/10: fastp (~15m) ...Finished [{}]",
-                super::format_elapsed_live(fastp_elapsed)
-            ));
+            let fastp_elapsed = fastp_start.elapsed();
+            if fastp_skipped_by_outputs {
+                super::print_success_line(&format!("Step 1/{}: fastp (~15m) ...Skipped", FASTQ2VCF_TOTAL_STEPS));
+            } else {
+                super::print_success_line(&format!(
+                    "Step 1/{}: fastp (~15m) ...Finished [{}]",
+                    FASTQ2VCF_TOTAL_STEPS,
+                    super::format_elapsed_live(fastp_elapsed)
+                ));
+            }
         }
-    } else {
-        let fastp_start = Instant::now();
-        let mut fastp_opts = opts.clone();
-        fastp_opts.step_index_offset = 0;
-        fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
-        fastp_opts.emit_completion_line = false;
-        let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
-        run_pipeline_with_hook(
-            &workdir,
-            std::slice::from_ref(&fastp_step),
-            &fastp_opts,
-            &mut noop_hook,
-        )?;
-        let fastp_elapsed = fastp_start.elapsed();
-        if fastp_skipped_by_outputs {
-            super::print_success_line("Step 1/10: fastp (~15m) ...Skipped");
-        } else {
-            super::print_success_line(&format!(
-                "Step 1/10: fastp (~15m) ...Finished [{}]",
-                super::format_elapsed_live(fastp_elapsed)
-            ));
-        }
+    } else if let Some(task) = index_task.clone() {
+        wait_reference_indexes(&task)?;
     }
 
-    let fai_data = read_fai_data_from_reference(&reference)?;
-    let chroms = fai_data.order.clone();
+    let fai_data = read_fai_data_from_reference(&reference).ok();
+    let mut reference_order = if let Some(v) = &fai_data {
+        v.order.clone()
+    } else {
+        parse_reference_contigs(&reference)?
+    };
+    if reference_order.is_empty() {
+        reference_order = discovered.chroms_hint.clone();
+    }
+    let chroms = if discovered.chroms_hint.is_empty() {
+        reference_order
+    } else {
+        order_chroms_with_reference(discovered.chroms_hint.clone(), &reference_order)
+    };
+    if chroms.is_empty() {
+        return Err(
+            "Unable to infer chromosome order from reference or workdir artifacts.".to_string(),
+        );
+    }
+    let chrom_lens = fai_data.map(|x| x.lens).unwrap_or_default();
 
     let legacy_metadata_path = workdir.join(".fastq2vcf.metadata.json");
     if legacy_metadata_path.exists() {
@@ -290,7 +338,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         &reference,
         &samples,
         &chroms,
-        &fai_data.lens,
+        &chrom_lens,
         &workdir,
         &backend,
         &aligner_cmd,
@@ -349,18 +397,45 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     let pipeline_result = {
         let mut item_hook =
             |step: &PipelineStep, item: &StepItem| state_tracker.mark_item_done(step, item);
+        let mut main_step_from = from_step.max(2);
+        let main_step_to = to_step.min(FASTQ2VCF_TOTAL_STEPS);
+        if !from_step_explicit && main_step_from <= main_step_to && steps.len() > 1 {
+            let auto_main_from = 1usize + infer_first_incomplete_step(&steps[1..]);
+            if auto_main_from > main_step_from {
+                main_step_from = auto_main_from;
+                if main_step_from <= FASTQ2VCF_TOTAL_STEPS {
+                    println!(
+                        "{}",
+                        super::style_green(&format!(
+                            "Auto-resume detected from workdir outputs: Step {}/{}.",
+                            main_step_from,
+                            FASTQ2VCF_TOTAL_STEPS
+                        ))
+                    );
+                }
+            }
+        }
         let mut main_opts = opts.clone();
-        main_opts.step_index_offset = 1;
+        main_opts.step_index_offset = main_step_from.saturating_sub(1);
         main_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
-        if steps.len() <= 1 {
+        if main_step_from > main_step_to {
+            Ok(())
+        } else if steps.len() <= main_step_from.saturating_sub(1) {
             Ok(())
         } else {
-            run_pipeline_with_hook(&workdir, &steps[1..], &main_opts, &mut item_hook)
+            run_pipeline_with_hook(
+                &workdir,
+                &steps[(main_step_from - 1)..main_step_to],
+                &main_opts,
+                &mut item_hook,
+            )
         }
     };
     match pipeline_result {
         Ok(()) => {
-            state_tracker.mark_completed()?;
+            if to_step >= FASTQ2VCF_TOTAL_STEPS {
+                state_tracker.mark_completed()?;
+            }
         }
         Err(err) => {
             if let Err(mark_err) = state_tracker.mark_failed(&err) {
@@ -370,6 +445,16 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             }
             return Err(err);
         }
+    }
+    if to_step < FASTQ2VCF_TOTAL_STEPS {
+        println!(
+            "{}",
+            super::style_yellow(&format!(
+                "Stopped at step {} by -to-step option.",
+                to_step
+            ))
+        );
+        return Ok(0);
     }
 
     let bulk_names = infer_bulks(samples.keys().cloned().collect::<Vec<String>>());
@@ -430,10 +515,21 @@ fn print_fastq2vcf_help() {
     print!(" ");
     print!("{}", super::style_green("REFERENCE"));
     print!(" ");
+    print!("[");
     print!("{}", super::style_blue("-i"));
     print!(" ");
     print!("{}", super::style_green("FASTQ_DIR"));
+    print!("] ");
+    print!("[");
+    print!("{}", super::style_blue("-from-step"));
     print!(" ");
+    print!("{}", super::style_green("STEP"));
+    print!("] ");
+    print!("[");
+    print!("{}", super::style_blue("-to-step"));
+    print!(" ");
+    print!("{}", super::style_green("STEP"));
+    print!("] ");
     print!("{}", super::style_blue("-w"));
     print!(" ");
     println!("{}", super::style_green("WORKDIR"));
@@ -448,13 +544,6 @@ fn print_fastq2vcf_help() {
     );
     print_colored_help_entry(
         2,
-        Some(("-i", "--fastq-dir", "FASTQ_DIR")),
-        "Directory containing FASTQ files.",
-        42,
-        width,
-    );
-    print_colored_help_entry(
-        2,
         Some(("-w", "--workdir", "WORKDIR")),
         "Working directory for outputs.",
         42,
@@ -463,9 +552,31 @@ fn print_fastq2vcf_help() {
     println!();
     println!("{}", super::style_orange("Optional Arguments:"));
     print_colored_help_entry(2, None, "Show this help message and exit.", 42, width);
+    print_colored_help_entry(
+        2,
+        Some(("-i", "--fastq-dir", "FASTQ_DIR")),
+        "Directory containing FASTQ files. Required when -from-step is 1 or 2.",
+        42,
+        width,
+    );
+    print_colored_help_entry(
+        2,
+        Some(("-from-step", "--from-step", "STEP")),
+        "Start from step number (1-7).",
+        42,
+        width,
+    );
+    print_colored_help_entry(
+        2,
+        Some(("-to-step", "--to-step", "STEP")),
+        "Stop after step number (default: last step).",
+        42,
+        width,
+    );
     println!();
     println!("{}", super::style_orange("Examples:"));
     println!("  jx fastq2vcf -r ref.fa -i fastq_dir -w workdir");
+    println!("  jx fastq2vcf -r ref.fa -w workdir -from-step 5 -to-step 8");
     println!("  jx -update dlc");
     println!();
     println!("{}", super::style_orange("Citation:"));
@@ -543,6 +654,8 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
     let mut reference: Option<String> = None;
     let mut fastq_dir: Option<String> = None;
     let mut workdir: Option<String> = None;
+    let mut from_step: Option<usize> = None;
+    let mut to_step: Option<usize> = None;
     let mut i = 0usize;
 
     while i < args.len() {
@@ -574,6 +687,32 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
             i += 1;
             continue;
         }
+        if token == "-from-step" || token == "--from-step" {
+            i += 1;
+            if i >= args.len() {
+                return Err("Option `-from-step/--from-step` requires a value.".to_string());
+            }
+            let raw = args[i].trim();
+            let v: usize = raw.parse().map_err(|_| {
+                format!("Invalid value for -from-step/--from-step: {raw} (expect integer)")
+            })?;
+            from_step = Some(v);
+            i += 1;
+            continue;
+        }
+        if token == "-to-step" || token == "--to-step" {
+            i += 1;
+            if i >= args.len() {
+                return Err("Option `-to-step/--to-step` requires a value.".to_string());
+            }
+            let raw = args[i].trim();
+            let v: usize = raw.parse().map_err(|_| {
+                format!("Invalid value for -to-step/--to-step: {raw} (expect integer)")
+            })?;
+            to_step = Some(v);
+            i += 1;
+            continue;
+        }
         if let Some(v) = token.strip_prefix("--reference=") {
             reference = Some(v.to_string());
             i += 1;
@@ -589,37 +728,57 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
             i += 1;
             continue;
         }
+        if let Some(v) = token.strip_prefix("--from-step=") {
+            let raw = v.trim();
+            let parsed: usize = raw.parse().map_err(|_| {
+                format!("Invalid value for --from-step: {raw} (expect integer)")
+            })?;
+            from_step = Some(parsed);
+            i += 1;
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("--to-step=") {
+            let raw = v.trim();
+            let parsed: usize = raw.parse().map_err(|_| {
+                format!("Invalid value for --to-step: {raw} (expect integer)")
+            })?;
+            to_step = Some(parsed);
+            i += 1;
+            continue;
+        }
         return Err(format!(
             "Unknown option: {token}\nUse `jx fastq2vcf -h` for help."
         ));
     }
 
-    let (Some(reference), Some(fastq_dir), Some(workdir)) = (reference, fastq_dir, workdir) else {
-        return Err(
-            "`-r/--reference`, `-i/--fastq-dir`, and `-w/--workdir` are required.".to_string(),
-        );
+    let (Some(reference), Some(workdir)) = (reference, workdir) else {
+        return Err("`-r/--reference` and `-w/--workdir` are required.".to_string());
     };
 
     Ok(ParsedArgs {
         reference: PathBuf::from(reference),
-        fastq_dir: PathBuf::from(fastq_dir),
+        fastq_dir: fastq_dir.map(PathBuf::from),
         workdir: PathBuf::from(workdir),
+        from_step,
+        to_step,
     })
 }
 
-fn validate_and_resolve_inputs(args: &ParsedArgs) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+fn validate_and_resolve_inputs(args: &ParsedArgs) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
     let reference = absolutize_path(&args.reference)?;
     if !reference.exists() || !reference.is_file() {
         return Err(format!("Reference file not found: {}", reference.display()));
     }
 
-    let fastq_dir = absolutize_path(&args.fastq_dir)?;
-    if !fastq_dir.exists() || !fastq_dir.is_dir() {
-        return Err(format!(
-            "FASTQ directory not found: {}",
-            fastq_dir.display()
-        ));
-    }
+    let fastq_dir = if let Some(v) = &args.fastq_dir {
+        let p = absolutize_path(v)?;
+        if !p.exists() || !p.is_dir() {
+            return Err(format!("FASTQ directory not found: {}", p.display()));
+        }
+        Some(p)
+    } else {
+        None
+    };
     let workdir = absolutize_path(&args.workdir)?;
 
     Ok((reference, fastq_dir, workdir))
@@ -1402,6 +1561,345 @@ fn recognized_fastq_pairing_hint() -> String {
     )
 }
 
+#[derive(Clone, Debug, Default)]
+struct StepInputDiscovery {
+    samples: BTreeMap<String, (PathBuf, PathBuf)>,
+    fastq_file_count: usize,
+    chroms_hint: Vec<String>,
+}
+
+fn discover_inputs_for_from_step(
+    from_step: usize,
+    fastq_dir: Option<&Path>,
+    workdir: &Path,
+) -> Result<StepInputDiscovery, String> {
+    if from_step <= 2 {
+        let Some(fq_dir) = fastq_dir else {
+            return Err("`-i/--fastq-dir` is required when -from-step is 1 or 2.".to_string());
+        };
+        let fastq_files = collect_fastq_files(fq_dir)?;
+        if fastq_files.is_empty() {
+            return Err(format!("No FASTQ files found in {}", fq_dir.display()));
+        }
+        let samples = classify_fastq_pairs(&fastq_files)?;
+        if samples.is_empty() {
+            return Err(format!(
+                "Detected 0 paired samples from {} FASTQ files.\n{}",
+                fastq_files.len(),
+                recognized_fastq_pairing_hint()
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples,
+            fastq_file_count: fastq_files.len(),
+            chroms_hint: Vec::new(),
+        });
+    }
+
+    if from_step == 3 || from_step == 4 {
+        let sample_names = infer_samples_from_mapping_bam(workdir, from_step)?;
+        if sample_names.is_empty() {
+            return Err(format!(
+                "No BAM-derived samples found under {} for -from-step {}.",
+                workdir.join("2.mapping").display(),
+                from_step
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples: build_inferred_sample_pairs(&sample_names, workdir),
+            fastq_file_count: 0,
+            chroms_hint: Vec::new(),
+        });
+    }
+
+    if from_step == 5 {
+        let (sample_names, chroms) = infer_samples_and_chroms_from_gvcf(workdir)?;
+        if sample_names.is_empty() {
+            return Err(format!(
+                "No sample/chromosome pairs found under {} for -from-step 5.",
+                workdir.join("3.gvcf").display()
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples: build_inferred_sample_pairs(&sample_names, workdir),
+            fastq_file_count: 0,
+            chroms_hint: chroms,
+        });
+    }
+
+    if from_step == 6 {
+        let chroms = infer_chroms_from_merge_gendb(workdir)?;
+        if chroms.is_empty() {
+            return Err(format!(
+                "No chromosomes inferred from {} for -from-step 6.",
+                workdir.join("4.merge").display()
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples: BTreeMap::new(),
+            fastq_file_count: 0,
+            chroms_hint: chroms,
+        });
+    }
+
+    if from_step == 7 {
+        let chroms = infer_chroms_from_snp_filtered_vcf(workdir)?;
+        if chroms.is_empty() {
+            return Err(format!(
+                "No chromosomes inferred from {} for -from-step 7.",
+                workdir.join("4.merge").display()
+            ));
+        }
+        return Ok(StepInputDiscovery {
+            samples: BTreeMap::new(),
+            fastq_file_count: 0,
+            chroms_hint: chroms,
+        });
+    }
+
+    Err(format!("Unsupported -from-step value: {from_step}"))
+}
+
+fn infer_samples_from_mapping_bam(workdir: &Path, from_step: usize) -> Result<Vec<String>, String> {
+    let mapping = workdir.join("2.mapping");
+    if !mapping.exists() {
+        return Ok(Vec::new());
+    }
+    let mut sorted: BTreeMap<String, ()> = BTreeMap::new();
+    let mut markdup: BTreeMap<String, ()> = BTreeMap::new();
+    for entry in fs::read_dir(&mapping)
+        .map_err(|e| format!("Failed to read directory {}: {e}", mapping.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if let Some(sample) = name.strip_suffix(".sorted.bam") {
+            if !sample.trim().is_empty() {
+                sorted.insert(sample.to_string(), ());
+            }
+            continue;
+        }
+        if let Some(sample) = name.strip_suffix(".Markdup.bam") {
+            if !sample.trim().is_empty() {
+                markdup.insert(sample.to_string(), ());
+            }
+            continue;
+        }
+    }
+    let ordered = if from_step == 3 {
+        if !sorted.is_empty() {
+            sorted
+        } else {
+            markdup
+        }
+    } else if !markdup.is_empty() {
+        markdup
+    } else {
+        sorted
+    };
+    Ok(ordered.keys().cloned().collect())
+}
+
+fn infer_samples_and_chroms_from_gvcf(workdir: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    let dir = workdir.join("3.gvcf");
+    if !dir.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut samples = BTreeMap::<String, ()>::new();
+    let mut chroms = BTreeMap::<String, ()>::new();
+    for entry in
+        fs::read_dir(&dir).map_err(|e| format!("Failed to read directory {}: {e}", dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        let Some(prefix) = name.strip_suffix(".g.vcf.gz") else {
+            continue;
+        };
+        let Some((sample, chrom)) = prefix.rsplit_once('.') else {
+            continue;
+        };
+        if sample.trim().is_empty() || chrom.trim().is_empty() {
+            continue;
+        }
+        samples.insert(sample.to_string(), ());
+        chroms.insert(chrom.to_string(), ());
+    }
+    Ok((
+        samples.keys().cloned().collect(),
+        chroms.keys().cloned().collect(),
+    ))
+}
+
+fn infer_chroms_from_merge_gendb(workdir: &Path) -> Result<Vec<String>, String> {
+    let merge = workdir.join("4.merge");
+    if !merge.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = BTreeMap::<String, ()>::new();
+    for entry in fs::read_dir(&merge)
+        .map_err(|e| format!("Failed to read directory {}: {e}", merge.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if let Some(v) = name
+            .strip_prefix("Merge.")
+            .and_then(|x| x.strip_suffix(".gendb.done"))
+        {
+            if !v.trim().is_empty() {
+                out.insert(v.to_string(), ());
+            }
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(v) = name
+            .strip_prefix("Merge.")
+            .and_then(|x| x.strip_suffix(".gendb"))
+        {
+            if !v.trim().is_empty() {
+                out.insert(v.to_string(), ());
+            }
+        }
+    }
+    Ok(out.keys().cloned().collect())
+}
+
+fn infer_chroms_from_snp_filtered_vcf(workdir: &Path) -> Result<Vec<String>, String> {
+    let merge = workdir.join("4.merge");
+    if !merge.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = BTreeMap::<String, ()>::new();
+    for entry in fs::read_dir(&merge)
+        .map_err(|e| format!("Failed to read directory {}: {e}", merge.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if let Some(v) = name
+            .strip_prefix("Merge.")
+            .and_then(|x| x.strip_suffix(".SNP.filtered.vcf.gz"))
+        {
+            if !v.trim().is_empty() {
+                out.insert(v.to_string(), ());
+            }
+        }
+    }
+    Ok(out.keys().cloned().collect())
+}
+
+fn build_inferred_sample_pairs(
+    sample_names: &[String],
+    workdir: &Path,
+) -> BTreeMap<String, (PathBuf, PathBuf)> {
+    let mut out = BTreeMap::new();
+    let base = workdir.join(".inferred_inputs");
+    for sample in sample_names {
+        let safe = sanitize_sample_key(sample);
+        let r1 = base.join(format!("{safe}.R1.fastq.gz"));
+        let r2 = base.join(format!("{safe}.R2.fastq.gz"));
+        out.insert(sample.clone(), (r1, r2));
+    }
+    out
+}
+
+fn parse_reference_contigs(reference: &Path) -> Result<Vec<String>, String> {
+    let file = File::open(reference)
+        .map_err(|e| format!("Failed to open reference {}: {e}", reference.display()))?;
+    let mut out = Vec::<String>::new();
+    let mut seen = BTreeMap::<String, ()>::new();
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read {}: {e}", reference.display()))?;
+        if !line.starts_with('>') {
+            continue;
+        }
+        let id = line[1..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if id.is_empty() || seen.contains_key(id) {
+            continue;
+        }
+        seen.insert(id.to_string(), ());
+        out.push(id.to_string());
+    }
+    Ok(out)
+}
+
+fn order_chroms_with_reference(chroms: Vec<String>, ref_order: &[String]) -> Vec<String> {
+    if chroms.is_empty() {
+        return Vec::new();
+    }
+    let mut need = BTreeMap::<String, ()>::new();
+    for c in chroms {
+        let t = c.trim().to_string();
+        if !t.is_empty() {
+            need.insert(t, ());
+        }
+    }
+    let mut out = Vec::new();
+    for c in ref_order {
+        if need.remove(c).is_some() {
+            out.push(c.clone());
+        }
+    }
+    out.extend(need.into_keys());
+    out
+}
+
+fn step_range_needs_reference_index(from_step: usize, to_step: usize) -> bool {
+    let needs_ref_steps = [2usize, 4, 5, 6];
+    needs_ref_steps
+        .iter()
+        .any(|x| *x >= from_step && *x <= to_step)
+}
+
+fn normalize_step_range(
+    from_step: Option<usize>,
+    to_step: Option<usize>,
+) -> Result<(usize, usize, bool), String> {
+    let from_explicit = from_step.is_some();
+    let from = from_step.unwrap_or(1);
+    let to = to_step.unwrap_or(FASTQ2VCF_TOTAL_STEPS);
+    if from == 0 || from > 7 {
+        return Err("`-from-step/--from-step` must be in [1..7].".to_string());
+    }
+    if to == 0 || to > FASTQ2VCF_TOTAL_STEPS {
+        return Err(format!(
+            "`-to-step/--to-step` must be in [1..{}].",
+            FASTQ2VCF_TOTAL_STEPS
+        ));
+    }
+    if to < from {
+        return Err(format!(
+            "Invalid step range: from-step ({from}) is greater than to-step ({to})."
+        ));
+    }
+    Ok((from, to, from_explicit))
+}
+
 fn strip_fastq_suffix(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     for suffix in FASTQ_SUFFIXES {
@@ -1705,7 +2203,7 @@ fn build_fastq2vcf_steps(
     }
 
     let sample_names: Vec<String> = samples.keys().cloned().collect();
-    let dynamic_eta = estimate_step5_to_step10_eta_minutes(chroms, chrom_lens, sample_names.len());
+    let dynamic_eta = estimate_step5_to_step9_eta_minutes(chroms, chrom_lens, sample_names.len());
     let mut steps: Vec<PipelineStep> = Vec::new();
 
     if include_fastp_step {
@@ -1957,50 +2455,16 @@ fn build_fastq2vcf_steps(
     let mut step8_items = Vec::new();
     let impute_threads_max = 32usize;
     for chrom in chroms {
-        let in_gt = imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz"));
-        step8_inputs.push(in_gt);
-        let out_imp = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz"));
-        let out_imp_tbi = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz.tbi"));
-        let out_imp_ok = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.ok"));
-        let chrom_threads = dynamic_impute_threads(chrom, chrom_lens, impute_threads_max);
-        let raw = cmd_beagle_impute(chrom, &imputefolder, chrom_threads, singularity);
-        step8_cmds.push(wrap_scheduler_cmd(
-            &raw,
-            &format!("beagle.{chrom}"),
-            chrom_threads,
-            backend,
-        ));
-        let outs = vec![out_imp, out_imp_tbi, out_imp_ok];
-        step8_outputs.extend(outs.clone());
-        step8_items.push(StepItem {
-            id: format!("beagle.{chrom}"),
-            outputs: outs,
-        });
-    }
-    steps.push(PipelineStep {
-        id: "step8_impute".to_string(),
-        name: "impute".to_string(),
-        eta_minutes: Some(dynamic_eta.step8_impute),
-        commands: step8_cmds,
-        inputs: dedup_paths(step8_inputs),
-        outputs: dedup_paths(step8_outputs),
-        items: step8_items,
-    });
-
-    let mut step9_cmds = Vec::new();
-    let mut step9_inputs = Vec::new();
-    let mut step9_outputs = Vec::new();
-    let mut step9_items = Vec::new();
-    for chrom in chroms {
-        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.vcf.gz")));
-        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.ok")));
-        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss")));
-        step9_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss")));
+        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.vcf.gz")));
+        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.lmiss")));
+        step8_inputs.push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imiss")));
         let out_vcf = imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz"));
         let out_tbi = imputefolder.join(format!(
             "Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi"
         ));
-        let raw = cmd_filter_imputed_by_maf_and_missing(
+        let chrom_threads = dynamic_impute_threads(chrom, chrom_lens, impute_threads_max);
+        let raw_impute = cmd_beagle_impute(chrom, &imputefolder, chrom_threads, singularity);
+        let raw_filter = cmd_filter_imputed_by_maf_and_missing(
             chrom,
             chroms,
             &imputefolder,
@@ -2009,51 +2473,52 @@ fn build_fastq2vcf_steps(
             2,
             singularity,
         );
-        step9_cmds.push(wrap_scheduler_cmd(
+        let raw = format!("{raw_impute} && {raw_filter}");
+        step8_cmds.push(wrap_scheduler_cmd(
             &raw,
-            &format!("impfilter.{chrom}"),
-            2,
+            &format!("impute_filter.{chrom}"),
+            chrom_threads,
             backend,
         ));
         let outs = vec![out_vcf, out_tbi];
-        step9_outputs.extend(outs.clone());
-        step9_items.push(StepItem {
-            id: format!("impfilter.{chrom}"),
+        step8_outputs.extend(outs.clone());
+        step8_items.push(StepItem {
+            id: format!("impute_filter.{chrom}"),
             outputs: outs,
         });
     }
     steps.push(PipelineStep {
-        id: "step9_impfilter".to_string(),
-        name: "impfilter".to_string(),
-        eta_minutes: Some(dynamic_eta.step9_impfilter),
-        commands: step9_cmds,
-        inputs: dedup_paths(step9_inputs),
-        outputs: dedup_paths(step9_outputs),
-        items: step9_items,
+        id: "step8_impute_filter".to_string(),
+        name: "impute_filter".to_string(),
+        eta_minutes: Some(dynamic_eta.step8_impute_filter),
+        commands: step8_cmds,
+        inputs: dedup_paths(step8_inputs),
+        outputs: dedup_paths(step8_outputs),
+        items: step8_items,
     });
 
-    let mut step10_inputs = Vec::new();
+    let mut step9_inputs = Vec::new();
     for chrom in chroms {
-        step10_inputs
+        step9_inputs
             .push(imputefolder.join(format!("Merge.{chrom}.SNP.GT.imp.maf0.02.miss0.2.vcf.gz")));
     }
     let out_merge_vcf = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz");
     let out_merge_tbi = genotypefolder.join("Merge.SNP.GT.imp.maf0.02.miss0.2.vcf.gz.tbi");
-    let raw10 = cmd_concat_imputed_vcfs(chroms, &imputefolder, &genotypefolder, 2, singularity);
-    let step10_cmds = vec![wrap_scheduler_cmd(&raw10, "mergevcf.all", 2, backend)];
-    let step10_outputs = vec![out_merge_vcf, out_merge_tbi];
-    let step10_items = vec![StepItem {
+    let raw9 = cmd_concat_imputed_vcfs(chroms, &imputefolder, &genotypefolder, 2, singularity);
+    let step9_cmds = vec![wrap_scheduler_cmd(&raw9, "mergevcf.all", 2, backend)];
+    let step9_outputs = vec![out_merge_vcf, out_merge_tbi];
+    let step9_items = vec![StepItem {
         id: "mergevcf.all".to_string(),
-        outputs: step10_outputs.clone(),
+        outputs: step9_outputs.clone(),
     }];
     steps.push(PipelineStep {
-        id: "step10_mergevcf".to_string(),
+        id: "step9_mergevcf".to_string(),
         name: "mergevcf".to_string(),
-        eta_minutes: Some(dynamic_eta.step10_mergevcf),
-        commands: step10_cmds,
-        inputs: dedup_paths(step10_inputs),
-        outputs: dedup_paths(step10_outputs),
-        items: step10_items,
+        eta_minutes: Some(dynamic_eta.step9_mergevcf),
+        commands: step9_cmds,
+        inputs: dedup_paths(step9_inputs),
+        outputs: dedup_paths(step9_outputs),
+        items: step9_items,
     });
 
     Ok(steps)
@@ -2074,20 +2539,19 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DynamicEtaStep5To10 {
+struct DynamicEtaStep5To9 {
     step5_cgvcf: u64,
     step6_gvcf2vcf: u64,
     step7_gtprep: u64,
-    step8_impute: u64,
-    step9_impfilter: u64,
-    step10_mergevcf: u64,
+    step8_impute_filter: u64,
+    step9_mergevcf: u64,
 }
 
-fn estimate_step5_to_step10_eta_minutes(
+fn estimate_step5_to_step9_eta_minutes(
     chroms: &[String],
     chrom_lens: &BTreeMap<String, u64>,
     sample_count: usize,
-) -> DynamicEtaStep5To10 {
+) -> DynamicEtaStep5To9 {
     // Use reference locus scale as "site count" proxy before VCF is generated.
     let locus_count: f64 = chroms
         .iter()
@@ -2102,7 +2566,7 @@ fn estimate_step5_to_step10_eta_minutes(
 
     let chrom_factor = ((chroms.len().max(1) as f64) / 10.0).clamp(0.4, 4.0);
 
-    DynamicEtaStep5To10 {
+    DynamicEtaStep5To9 {
         step5_cgvcf: scale_eta_minutes(
             36.0 * site_factor_sqrt * pop_factor_sqrt,
             8,
@@ -2118,17 +2582,12 @@ fn estimate_step5_to_step10_eta_minutes(
             8,
             12 * 60,
         ),
-        step8_impute: scale_eta_minutes(
-            120.0 * site_factor_sqrt * (0.7 + 0.6 * pop_factor_sqrt),
-            20,
+        step8_impute_filter: scale_eta_minutes(
+            144.0 * site_factor_sqrt * (0.7 + 0.5 * pop_factor_sqrt),
+            5,
             24 * 60,
         ),
-        step9_impfilter: scale_eta_minutes(
-            24.0 * site_factor_sqrt * (0.7 + 0.3 * pop_factor_sqrt),
-            5,
-            6 * 60,
-        ),
-        step10_mergevcf: scale_eta_minutes(
+        step9_mergevcf: scale_eta_minutes(
             8.0 * chrom_factor * site_factor_sqrt * (0.8 + 0.2 * pop_factor_sqrt),
             2,
             4 * 60,
@@ -2429,13 +2888,15 @@ fn run_fastp_and_index_parallel(
             };
             let fp_line = if fastp_done.is_some() {
                 format!(
-                    "✔︎ Step 1/10: fastp (~15m) ...Finished [{}]",
+                    "✔︎ Step 1/{}: fastp (~15m) ...Finished [{}]",
+                    FASTQ2VCF_TOTAL_STEPS,
                     super::format_elapsed_live(fp_elapsed_now)
                 )
             } else {
                 format!(
-                    "{} Step 1/10: fastp (~15m) [{}]",
+                    "{} Step 1/{}: fastp (~15m) [{}]",
                     super::spinner_frame_for_elapsed(fp_elapsed_now),
+                    FASTQ2VCF_TOTAL_STEPS,
                     super::format_elapsed_live(fp_elapsed_now)
                 )
             };

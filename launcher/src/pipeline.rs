@@ -368,6 +368,25 @@ fn pending_item_indices(step: &PipelineStep) -> Vec<usize> {
     pending
 }
 
+pub(crate) fn infer_first_incomplete_step(steps: &[PipelineStep]) -> usize {
+    for (idx, step) in steps.iter().enumerate() {
+        if !is_step_outputs_ready(step) {
+            return idx;
+        }
+    }
+    steps.len()
+}
+
+fn is_step_outputs_ready(step: &PipelineStep) -> bool {
+    if all_outputs_ready(&step.outputs) {
+        return true;
+    }
+    if !step.items.is_empty() {
+        return step.items.iter().all(|item| all_outputs_ready(&item.outputs));
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 struct CsubJobInfo {
     job_id: String,

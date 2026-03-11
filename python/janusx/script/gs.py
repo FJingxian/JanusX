@@ -168,6 +168,7 @@ def GSapi(
     Xtest: np.ndarray,
     method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
+    n_jobs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -185,6 +186,8 @@ def GSapi(
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
         PCA is computed on the concatenated matrix [Xtrain, Xtest].
+    n_jobs : int, optional
+        Thread count for ML models. Non-ML models currently ignore this setting.
 
     Returns
     -------
@@ -276,6 +279,7 @@ def GSapi(
             method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
             seed=42,
             cv=_mlgs_inner_cv(int(Y.shape[0])),
+            n_jobs=max(1, int(n_jobs)),
             fit_on_init=True,
             verbose=False,
         )
@@ -303,6 +307,7 @@ def _run_method_task(
     test_snp_ml: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
+    n_jobs: int,
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
@@ -336,6 +341,7 @@ def _run_method_task(
                 fold_test,
                 method=method,
                 PCAdec=fold_pca,
+                n_jobs=n_jobs,
             )
             ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
             ttrain = np.concatenate([train_pheno[train_idx], yhat_train], axis=1)
@@ -386,6 +392,7 @@ def _run_method_task(
         final_test,
         method=method,
         PCAdec=final_pca,
+        n_jobs=n_jobs,
     )
     return {
         "method": method,
@@ -408,6 +415,7 @@ def _run_methods_parallel(
     test_snp_ml: np.ndarray | None,
     pca_dec: bool,
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
+    n_jobs: int,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -483,6 +491,7 @@ def _run_methods_parallel(
                             test_snp_ml,
                             pca_dec,
                             cv_splits,
+                            n_jobs,
                             progress_queue=None,
                             progress_hook=_hook,
                         )
@@ -523,6 +532,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
+                    n_jobs,
                 )
             except Exception:
                 elapsed = format_elapsed(time.monotonic() - t0)
@@ -559,6 +569,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
+                    n_jobs,
                     None,
                 ): m
                 for m in methods
@@ -637,6 +648,7 @@ def _run_methods_parallel(
                             test_snp_ml,
                             pca_dec,
                             cv_splits,
+                            n_jobs,
                             prog_q,
                         ): m
                         for m in methods
@@ -723,6 +735,7 @@ def _run_methods_parallel(
                         test_snp_ml,
                         pca_dec,
                         cv_splits,
+                        n_jobs,
                         prog_q,
                     ): m
                     for m in methods
@@ -765,6 +778,7 @@ def _run_methods_parallel(
                     test_snp_ml,
                     pca_dec,
                     cv_splits,
+                    n_jobs,
                     None,
                 ): m
                 for m in methods
@@ -991,6 +1005,13 @@ def main(log: bool = True) -> None:
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "-t", "--thread",
+        type=int,
+        default=max(1, int(os.cpu_count() or 1)),
+        help="Threads for ML methods (RF/ET/GBDT/XGB/SVM/ENET). "
+             "(default: all available cores).",
+    )
+    optional_group.add_argument(
         "-plot", "--plot",
         action="store_true",
         default=False,
@@ -1108,6 +1129,7 @@ def main(log: bool = True) -> None:
                 ("Use PCA", args.pcd),
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
+                ("Threads", args.thread),
             ]
         )
         if args.plot:
@@ -1315,6 +1337,7 @@ def main(log: bool = True) -> None:
             test_snp_ml=test_snp_ml,
             pca_dec=args.pcd,
             cv_splits=cv_splits,
+            n_jobs=int(max(1, args.thread)),
         )
         method_result_map = {str(x["method"]): x for x in method_results}
 

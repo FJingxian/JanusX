@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import typing
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import numpy as np
@@ -10,6 +12,11 @@ from sklearn.model_selection import KFold, ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+
+try:
+    from threadpoolctl import threadpool_limits
+except Exception:  # pragma: no cover - optional dependency path
+    threadpool_limits = None  # type: ignore[assignment]
 
 try:
     from xgboost import XGBRegressor
@@ -212,7 +219,7 @@ class MLGS:
         self.cv = max(2, int(cv))
         self.scoring = scoring
         self.feature_axis = feature_axis
-        self.n_jobs = 1 if n_jobs is None else max(1, int(n_jobs))
+        self.n_jobs = max(1, int(os.cpu_count() or 1)) if n_jobs is None else max(1, int(n_jobs))
         self.verbose = bool(verbose)
 
         self.y = _as_1d_y(y)
@@ -249,6 +256,11 @@ class MLGS:
 
         if fit_on_init:
             self.fit()
+
+    def _thread_context(self):
+        if threadpool_limits is None:
+            return nullcontext()
+        return threadpool_limits(limits=self.n_jobs)
 
     def _default_search_iter(self, stage: typing.Literal["coarse", "fine"]) -> int:
         n = self.sample_count_
@@ -723,20 +735,21 @@ class MLGS:
             X_va = self.X[va]
             y_va = self.y[va]
 
-            if self.method == "xgb":
-                est.fit(
-                    X_tr,
-                    y_tr,
-                    eval_set=[(X_va, y_va)],
-                    verbose=False,
-                )
-                best_iter = getattr(est, "best_iteration", None)
-                if best_iter is not None:
-                    xgb_iters.append(int(best_iter) + 1)
-            else:
-                est.fit(X_tr, y_tr)
+            with self._thread_context():
+                if self.method == "xgb":
+                    est.fit(
+                        X_tr,
+                        y_tr,
+                        eval_set=[(X_va, y_va)],
+                        verbose=False,
+                    )
+                    best_iter = getattr(est, "best_iteration", None)
+                    if best_iter is not None:
+                        xgb_iters.append(int(best_iter) + 1)
+                else:
+                    est.fit(X_tr, y_tr)
 
-            pred = np.asarray(est.predict(X_va), dtype=float).reshape(-1)
+                pred = np.asarray(est.predict(X_va), dtype=float).reshape(-1)
             pear = _safe_pearson(y_va, pred)
             r2 = _safe_r2(y_va, pred)
             rmse = _rmse(y_va, pred)
@@ -803,7 +816,8 @@ class MLGS:
             final_params["n_estimators"] = int(max(50, self.best_n_estimators_))
 
         self.model = self._build_estimator(final_params)
-        self.model.fit(self.X, self.y)
+        with self._thread_context():
+            self.model.fit(self.X, self.y)
         return self
 
     def _prepare_predict_marker(self, M: np.ndarray) -> np.ndarray:
@@ -845,7 +859,8 @@ class MLGS:
         X_marker = self._prepare_predict_marker(M)
         X_cov = self._prepare_predict_cov(cov, X_marker.shape[0])
         X = self._merge_features(X_marker, X_cov)
-        pred = np.asarray(self.model.predict(X), dtype=float).reshape(-1, 1)
+        with self._thread_context():
+            pred = np.asarray(self.model.predict(X), dtype=float).reshape(-1, 1)
         return pred
 
     def score(
@@ -873,7 +888,8 @@ class MLGS:
         if self.model is None:
             self.fit()
         if M is None:
-            return np.asarray(self.model.predict(self.X), dtype=float).reshape(-1, 1)
+            with self._thread_context():
+                return np.asarray(self.model.predict(self.X), dtype=float).reshape(-1, 1)
         return self.predict(M, cov=cov)
 
 

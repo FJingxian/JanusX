@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import typing
+import warnings
 from contextlib import ExitStack, nullcontext
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ import numpy as np
 from joblib import Parallel, delayed, parallel_backend
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNet
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import KFold, ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -267,6 +269,7 @@ class MLGS:
         self.best_params_: dict[str, Any] | None = None
         self.best_score_: float | None = None
         self.best_metrics_: dict[str, float] | None = None
+        self.best_boost_rounds_: int | None = None
         self.best_n_estimators_: int | None = None
         self.cv_results_: list[dict[str, Any]] = []
 
@@ -456,7 +459,10 @@ class MLGS:
             base = dict(
                 random_state=self.seed,
                 loss="squared_error",
-                early_stopping=False,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=20,
+                tol=1e-4,
             )
             base.update(params)
             return HistGradientBoostingRegressor(**base)
@@ -474,7 +480,9 @@ class MLGS:
                 random_state=self.seed,
                 n_jobs=self._model_n_jobs(),
                 verbosity=0,
-                n_estimators=2000,
+                eval_metric="rmse",
+                early_stopping_rounds=40,
+                n_estimators=1200,
             )
             base.update(params)
             return XGBRegressor(**base)
@@ -498,8 +506,8 @@ class MLGS:
                         "enet",
                         ElasticNet(
                             random_state=self.seed,
-                            max_iter=5000,
-                            selection="random",
+                            max_iter=10000,
+                            selection="cyclic",
                         ),
                     ),
                 ]
@@ -530,7 +538,7 @@ class MLGS:
             )
             depth_vals = [None, 8, 16, 24]
             return {
-                "n_estimators": [300, 600, 900],
+                "n_estimators": [128, 256, 512],
                 "max_features": max_features,
                 "min_samples_leaf": leaf_vals,
                 "max_depth": depth_vals,
@@ -551,7 +559,7 @@ class MLGS:
                 ]
             )
             return {
-                "n_estimators": [300, 600, 900],
+                "n_estimators": [128, 256, 512],
                 "max_features": max_features,
                 "min_samples_leaf": leaf_vals,
                 "max_depth": [None, 8, 16, 24],
@@ -562,7 +570,7 @@ class MLGS:
             min_leaf = _unique_sorted([5, 10, max(20, n // 50), max(50, n // 20)])
             return {
                 "learning_rate": [0.03, 0.05, 0.10],
-                "max_iter": [200, 400, 800],
+                "max_iter": [100, 200, 400],
                 "max_leaf_nodes": leaf_vals,
                 "min_samples_leaf": min_leaf,
                 "l2_regularization": [0.0, 0.01, 0.1, 1.0],
@@ -600,9 +608,9 @@ class MLGS:
 
         if self.method == "enet":
             return {
-                "enet__alpha": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0],
+                "enet__alpha": [1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, 2.0, 5.0],
                 "enet__l1_ratio": [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95],
-                "enet__tol": [1e-4, 5e-4, 1e-3],
+                "enet__tol": [5e-4, 1e-3, 5e-3, 1e-2],
             }
 
         raise ValueError(f"Unsupported MLGS method: {self.method}")
@@ -635,7 +643,14 @@ class MLGS:
                     [None, max(4, best_depth // 2), best_depth, best_depth * 2]
                 )
             return {
-                "n_estimators": _unique_sorted([max(200, best_n - 200), best_n, best_n + 200, best_n + 400]),
+                "n_estimators": _unique_sorted(
+                    [
+                        max(96, best_n // 2),
+                        best_n,
+                        min(768, best_n + 128),
+                        min(1024, best_n + 256),
+                    ]
+                ),
                 "max_features": feat_vals,
                 "min_samples_leaf": _unique_sorted([1, max(1, best_leaf // 2), best_leaf, best_leaf * 2, max(10, n // 25)]),
                 "max_depth": depth_vals,
@@ -664,7 +679,14 @@ class MLGS:
             else:
                 depth_vals = _unique_sorted([None, max(4, best_depth // 2), best_depth, best_depth * 2])
             return {
-                "n_estimators": _unique_sorted([max(200, best_n - 200), best_n, best_n + 200, best_n + 400]),
+                "n_estimators": _unique_sorted(
+                    [
+                        max(96, best_n // 2),
+                        best_n,
+                        min(768, best_n + 128),
+                        min(1024, best_n + 256),
+                    ]
+                ),
                 "max_features": feat_vals,
                 "min_samples_leaf": _unique_sorted([1, max(1, best_leaf // 2), best_leaf, best_leaf * 2, max(10, n // 25)]),
                 "max_depth": depth_vals,
@@ -682,7 +704,7 @@ class MLGS:
                 depth_vals = _unique_sorted([None, max(2, best_depth - 2), best_depth, best_depth + 2])
             return {
                 "learning_rate": _unique_sorted([0.02, round(best_lr, 4), min(0.2, round(best_lr * 1.5, 4))]),
-                "max_iter": _unique_sorted([max(100, best_iter // 2), best_iter, best_iter + 200]),
+                "max_iter": _unique_sorted([max(80, best_iter // 2), best_iter, min(800, best_iter + 100)]),
                 "max_leaf_nodes": _unique_sorted([max(15, best_leaf_nodes // 2), best_leaf_nodes, best_leaf_nodes * 2]),
                 "min_samples_leaf": _unique_sorted([max(2, best_min_leaf // 2), best_min_leaf, best_min_leaf * 2, max(20, n // 40)]),
                 "l2_regularization": _unique_sorted([0.0, float(best.get("l2_regularization", 0.0)), 0.1, 1.0]),
@@ -752,12 +774,12 @@ class MLGS:
         if self.method == "enet":
             best_alpha = float(best.get("enet__alpha", 0.01))
             best_l1 = float(best.get("enet__l1_ratio", 0.5))
-            best_tol = float(best.get("enet__tol", 1e-4))
+            best_tol = float(best.get("enet__tol", 1e-3))
             return {
                 "enet__alpha": _unique_sorted(
                     [
-                        max(1e-5, round(best_alpha / 5.0, 6)),
-                        max(1e-5, round(best_alpha / 2.0, 6)),
+                        max(1e-4, round(best_alpha / 5.0, 6)),
+                        max(1e-4, round(best_alpha / 2.0, 6)),
                         round(best_alpha, 6),
                         round(best_alpha * 2.0, 6),
                         round(best_alpha * 5.0, 6),
@@ -773,7 +795,7 @@ class MLGS:
                     ]
                 ),
                 "enet__tol": _unique_sorted(
-                    [1e-4, 5e-4, 1e-3, round(best_tol, 6)]
+                    [5e-4, 1e-3, 5e-3, 1e-2, round(best_tol, 6)]
                 ),
             }
 
@@ -812,7 +834,8 @@ class MLGS:
         pearsons: list[float] = []
         r2s: list[float] = []
         rmses: list[float] = []
-        xgb_iters: list[int] = []
+        boost_rounds: list[int] = []
+        convergence_warnings = 0
 
         for fold_id, (tr, va) in enumerate(splitter.split(self.X), start=1):
             est = self._build_estimator(params)
@@ -822,18 +845,28 @@ class MLGS:
             y_va = self.y[va]
 
             with self._thread_context():
-                if self.method == "xgb":
-                    est.fit(
-                        X_tr,
-                        y_tr,
-                        eval_set=[(X_va, y_va)],
-                        verbose=False,
+                with warnings.catch_warnings(record=True) as fit_warnings:
+                    warnings.simplefilter("always", ConvergenceWarning)
+                    if self.method == "xgb":
+                        est.fit(
+                            X_tr,
+                            y_tr,
+                            eval_set=[(X_va, y_va)],
+                            verbose=False,
+                        )
+                        best_iter = getattr(est, "best_iteration", None)
+                        if best_iter is not None:
+                            boost_rounds.append(int(best_iter) + 1)
+                    else:
+                        est.fit(X_tr, y_tr)
+                        if self.method == "gbdt":
+                            best_iter = getattr(est, "n_iter_", None)
+                            if best_iter is not None:
+                                boost_rounds.append(int(best_iter))
+                if self.method == "enet":
+                    convergence_warnings += sum(
+                        1 for w in fit_warnings if issubclass(w.category, ConvergenceWarning)
                     )
-                    best_iter = getattr(est, "best_iteration", None)
-                    if best_iter is not None:
-                        xgb_iters.append(int(best_iter) + 1)
-                else:
-                    est.fit(X_tr, y_tr)
 
                 pred = np.asarray(est.predict(X_va), dtype=float).reshape(-1)
             pear = _safe_pearson(y_va, pred)
@@ -854,8 +887,13 @@ class MLGS:
             "r2": float(np.mean(r2s)) if r2s else float("-inf"),
             "rmse": float(np.mean(rmses)) if rmses else float("inf"),
         }
-        if xgb_iters:
-            result["n_estimators"] = int(np.median(xgb_iters))
+        if boost_rounds:
+            result["boost_rounds"] = int(np.median(boost_rounds))
+            if self.method == "xgb":
+                result["n_estimators"] = int(np.median(boost_rounds))
+        if self.method == "enet" and convergence_warnings > 0:
+            result["convergence_warnings"] = int(convergence_warnings)
+            result["score"] -= 0.01 * float(convergence_warnings)
         return result
 
     def _evaluate_candidate(self, params: dict[str, Any], stage: str) -> dict[str, Any]:
@@ -879,9 +917,11 @@ class MLGS:
             "rmse": float(np.mean([x["rmse"] for x in rows])),
             "confirm_repeats": int(self.confirm_repeats),
         }
-        xgb_iters = [int(x["n_estimators"]) for x in rows if "n_estimators" in x]
-        if xgb_iters:
-            result["n_estimators"] = int(np.median(xgb_iters))
+        boost_rounds = [int(x["boost_rounds"]) for x in rows if "boost_rounds" in x]
+        if boost_rounds:
+            result["boost_rounds"] = int(np.median(boost_rounds))
+            if self.method == "xgb":
+                result["n_estimators"] = int(np.median(boost_rounds))
         return result
 
     def _evaluate_candidates(
@@ -953,6 +993,11 @@ class MLGS:
             "r2": float(best_row["r2"]),
             "rmse": float(best_row["rmse"]),
         }
+        self.best_boost_rounds_ = (
+            int(best_row["boost_rounds"])
+            if "boost_rounds" in best_row and best_row["boost_rounds"] is not None
+            else None
+        )
         self.best_n_estimators_ = (
             int(best_row["n_estimators"])
             if "n_estimators" in best_row and best_row["n_estimators"] is not None
@@ -960,8 +1005,12 @@ class MLGS:
         )
 
         final_params = dict(self.best_params_)
-        if self.method == "xgb" and self.best_n_estimators_ is not None:
-            final_params["n_estimators"] = int(max(50, self.best_n_estimators_))
+        if self.method == "gbdt" and self.best_boost_rounds_ is not None:
+            final_params["max_iter"] = int(max(50, self.best_boost_rounds_))
+            final_params["early_stopping"] = False
+        if self.method == "xgb" and self.best_boost_rounds_ is not None:
+            final_params["n_estimators"] = int(max(50, self.best_boost_rounds_))
+            final_params["early_stopping_rounds"] = None
 
         self.model = self._build_estimator(final_params)
         with self._thread_context():
@@ -972,18 +1021,33 @@ class MLGS:
         if self.best_params_ is None:
             raise RuntimeError("MLGS model is not fitted. Call fit() first.")
         final_params = dict(self.best_params_)
-        if self.method == "xgb" and self.best_n_estimators_ is not None:
-            final_params["n_estimators"] = int(max(50, self.best_n_estimators_))
+        if self.method == "gbdt" and self.best_boost_rounds_ is not None:
+            final_params["max_iter"] = int(max(50, self.best_boost_rounds_))
+            final_params["early_stopping"] = False
+        if self.method == "xgb" and self.best_boost_rounds_ is not None:
+            final_params["n_estimators"] = int(max(50, self.best_boost_rounds_))
+            final_params["early_stopping_rounds"] = None
         return final_params
 
     def fit_with_params(self, params: dict[str, Any]) -> "MLGS":
         final_params = dict(params)
         self.best_params_ = dict(final_params)
+        self.best_boost_rounds_ = None
+        if self.method == "gbdt":
+            if "max_iter" in final_params:
+                try:
+                    self.best_boost_rounds_ = int(final_params["max_iter"])
+                except Exception:
+                    self.best_boost_rounds_ = None
+            final_params.setdefault("early_stopping", False)
         if self.method == "xgb" and "n_estimators" in final_params:
             try:
+                self.best_boost_rounds_ = int(final_params["n_estimators"])
                 self.best_n_estimators_ = int(final_params["n_estimators"])
             except Exception:
+                self.best_boost_rounds_ = None
                 self.best_n_estimators_ = None
+            final_params.setdefault("early_stopping_rounds", None)
         self.model = self._build_estimator(final_params)
         with self._thread_context():
             self.model.fit(self.X, self.y)

@@ -533,11 +533,12 @@ impl InputIter {
         if is_vcf_path(path_or_prefix) {
             Ok(InputIter::Vcf(VcfSnpIterRaw::new(path_or_prefix)?))
         } else {
-            // PLINK prefix must exist
-            let p = Path::new(path_or_prefix);
-            if !(p.with_extension("bed").exists()
-                && p.with_extension("bim").exists()
-                && p.with_extension("fam").exists())
+            // Treat input as a PLINK prefix, not a filename stem extension.
+            // This preserves prefixes containing dots, e.g. "geno/DH.10k".
+            let bed = format!("{path_or_prefix}.bed");
+            let bim = format!("{path_or_prefix}.bim");
+            let fam = format!("{path_or_prefix}.fam");
+            if !(Path::new(&bed).exists() && Path::new(&bim).exists() && Path::new(&fam).exists())
             {
                 return Err(format!(
                     "PLINK prefix not found or missing .bed/.bim/.fam: {path_or_prefix}"

@@ -8,7 +8,7 @@ Examples
 
   jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 -o results -prefix case1
 
-  jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 --window 1 --step 0.25 --format pdf
+  jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 --window 1 --step 0.25 --fmt pdf
 
 Input table
 -----------
@@ -1512,8 +1512,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Subplot width/height ratio, e.g. 3, 3:1, 16/5 (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-format",
-        "--format",
+        "-fmt",
+        "--fmt",
+        dest="format",
         type=str,
         choices=["png", "pdf", "svg", "tif"],
         default=DEFAULT_OUTPUT_FORMAT,

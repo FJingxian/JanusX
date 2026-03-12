@@ -10,10 +10,10 @@ Supported inputs
 
 Supported outputs
 -----------------
-- `-format plink` : PLINK bed/bim/fam
-- `-format vcf`   : bgzipped VCF
-- `-format txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
-- `-format npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
+- `-fmt plink` : PLINK bed/bim/fam
+- `-fmt vcf`   : bgzipped VCF
+- `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
+- `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
 
 Notes
 -----
@@ -211,9 +211,9 @@ def build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx gformat -vcf geno.vcf.gz -format npy",
-                "jx gformat -bfile geno_prefix -format txt -o outdir -prefix panel",
-                "jx gformat -file geno_prefix -format vcf",
+                "jx gformat -vcf geno.vcf.gz -fmt npy",
+                "jx gformat -bfile geno_prefix -fmt txt -o outdir -prefix panel",
+                "jx gformat -file geno_prefix -fmt vcf",
             ]
         ),
     )
@@ -234,8 +234,9 @@ def build_parser() -> CliArgumentParser:
 
     opt = parser.add_argument_group("Optional Arguments")
     opt.add_argument(
-        "-format",
-        "--format",
+        "-fmt",
+        "--fmt",
+        dest="format",
         choices=["plink", "vcf", "txt", "npy"],
         default="npy",
         help="Output genotype format: plink, vcf, txt, npy (default: npy).",

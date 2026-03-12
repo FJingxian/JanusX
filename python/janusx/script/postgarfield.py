@@ -209,7 +209,7 @@ def main() -> None:
         ),
     )
     optional_group.add_argument(
-        "-format", "--format", type=str, default="png",
+        "-fmt", "--fmt", dest="format", type=str, default="png",
         help="Output figure format for postgwas (default: %(default)s).",
     )
     optional_group.add_argument(
@@ -409,7 +409,7 @@ def main() -> None:
             "-file", decode_path,
             "-o", args.out,
             "-prefix", prefix,
-            "-format", args.format,
+            "-fmt", args.format,
             "-t", str(args.thread),
         ]
         if args.threshold is not None:

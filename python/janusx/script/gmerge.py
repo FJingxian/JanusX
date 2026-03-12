@@ -515,9 +515,9 @@ def build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx gmerge -vcf a.vcf.gz b.vcf.gz -format vcf",
-                "jx gmerge -bfile A B -o merged_dir -prefix panel -format plink",
-                "jx gmerge -vcf a.vcf.gz -file matrix_prefix -format txt",
+                "jx gmerge -vcf a.vcf.gz b.vcf.gz -fmt vcf",
+                "jx gmerge -bfile A B -o merged_dir -prefix panel -fmt plink",
+                "jx gmerge -vcf a.vcf.gz -file matrix_prefix -fmt txt",
             ]
         ),
     )
@@ -554,8 +554,8 @@ def build_parser() -> CliArgumentParser:
 
     opt = parser.add_argument_group("Optional Arguments")
     opt.add_argument(
-        "-format",
-        "--format",
+        "-fmt",
+        "--fmt",
         dest="format_name",
         choices=["plink", "vcf", "txt", "npy"],
         default="vcf",

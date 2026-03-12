@@ -758,9 +758,9 @@ def build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx hybrid -vcf parents.vcf.gz -p1 p1.txt -p2 p2.txt -format txt",
-                "jx hybrid -bfile geno/QC -p1 tester.txt -p2 female.txt -o outdir -prefix hybrids -format vcf",
-                "jx hybrid -file geno_prefix -p1 p1.txt -p2 p2.txt -format npy",
+                "jx hybrid -vcf parents.vcf.gz -p1 p1.txt -p2 p2.txt -fmt txt",
+                "jx hybrid -bfile geno/QC -p1 tester.txt -p2 female.txt -o outdir -prefix hybrids -fmt vcf",
+                "jx hybrid -file geno_prefix -p1 p1.txt -p2 p2.txt -fmt npy",
             ]
         ),
     )
@@ -800,8 +800,9 @@ def build_parser() -> CliArgumentParser:
         help="Output prefix. Default: inferred from genotype input.",
     )
     opt.add_argument(
-        "-format",
-        "--format",
+        "-fmt",
+        "--fmt",
+        dest="format",
         default="npy",
         choices=["plink", "vcf", "txt", "npy"],
         help="Output format: plink, vcf, txt, npy (default: npy).",

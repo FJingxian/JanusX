@@ -12,7 +12,7 @@ Examples
 
   # Specify output path and format
   -gwasfile result.assoc.txt -chr "chr" -pos "pos" -pvalue "P_wald" \
-    --out test --format pdf
+    --out test --fmt pdf
   # Results will be saved as:
   #   test/result.assoc.manh.pdf
   #   test/result.assoc.qq.pdf
@@ -4139,7 +4139,7 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-format", "--format", type=str, default="png",
+        "-fmt", "--fmt", dest="format", type=str, default="png",
         help="Output figure format: pdf, png, svg, tif (default: %(default)s).",
     )
     optional_group.add_argument(

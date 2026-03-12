@@ -152,6 +152,7 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         .unwrap_or_else(|| default_threads_for_backend(&backend));
     let resolved_strandness = resolve_effective_strandness(
         &parsed.strandness,
+        &backend,
         need_step3_align,
         step2_in_plan,
         &reference,
@@ -907,6 +908,7 @@ fn recognized_fastq_pairing_hint() -> String {
 
 fn resolve_effective_strandness(
     strandness_arg: &str,
+    backend: &str,
     need_step3_align: bool,
     step2_in_plan: bool,
     reference: &Path,
@@ -956,6 +958,8 @@ fn resolve_effective_strandness(
         &probe_index_dir,
         threads,
         tool_prefix,
+        backend,
+        workdir,
     )?;
     let idx_prefix = probe_index_dir.join("reference");
     let probe_threads = threads.clamp(1, 4);
@@ -1009,6 +1013,8 @@ fn ensure_hisat2_index_for_probe(
     index_dir: &Path,
     threads: usize,
     tool_prefix: &str,
+    backend: &str,
+    workdir: &Path,
 ) -> Result<(), String> {
     if hisat2_index_ready(index_dir) {
         return Ok(());
@@ -1022,6 +1028,46 @@ fn ensure_hisat2_index_for_probe(
         threads.clamp(1, 8),
         tool_prefix,
     );
+    if backend == "csub" {
+        let done = index_dir.join("reference.index.ok");
+        let wrapped = wrap_scheduler_cmd(
+            &raw,
+            "strandness_probe_index",
+            threads.clamp(1, 8),
+            backend,
+        );
+        let step = PipelineStep {
+            id: "probe_hisat2_index".to_string(),
+            name: "strandness-probe-index".to_string(),
+            eta_minutes: Some(8),
+            commands: vec![wrapped],
+            inputs: vec![reference.to_path_buf(), annotation.to_path_buf()],
+            outputs: vec![done.clone()],
+            items: vec![StepItem {
+                id: "probe_hisat2_index".to_string(),
+                outputs: vec![done],
+            }],
+        };
+        let mut opts = PipelineOptions::default();
+        opts.scheduler = Scheduler::Csub;
+        opts.nohup_max_jobs = 1;
+        opts.skip_if_outputs_exist = true;
+        opts.poll_sec = 0.5;
+        opts.detect_failed_logs = true;
+        opts.display_total_steps = Some(1);
+        opts.emit_completion_line = true;
+        opts.emit_progress_line = true;
+        let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
+        run_pipeline_with_hook(workdir, &[step], &opts, &mut noop_hook)
+            .map_err(|e| format!("Auto strandness index build via csub failed: {e}"))?;
+        if !hisat2_index_ready(index_dir) {
+            return Err(
+                "Auto strandness index probe failed: HISAT2 index outputs are incomplete."
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
     let mut cmd = Command::new("bash");
     cmd.arg("-lc")
         .arg(raw)

@@ -369,6 +369,119 @@ def txt_chunk_reader(
         yield geno_np, sites
 
 
+def _process_txt_like_chunk(
+    geno_np: np.ndarray,
+    sites: list,
+    *,
+    maf: float,
+    missing_rate: float,
+    impute: bool,
+    model: str,
+    het: float,
+) -> tuple[np.ndarray, list]:
+    """
+    Apply PLINK/VCF-like SNP filtering/imputation for TXT/NPY inputs.
+
+    This mirrors Rust `process_snp_row` behavior so streaming GWAS/GRM
+    semantics stay consistent across genotype input types.
+    """
+    g = np.asarray(geno_np, dtype=np.float32)
+    if g.ndim != 2 or g.shape[0] == 0:
+        return np.empty((0, g.shape[1] if g.ndim == 2 else 0), dtype=np.float32), []
+
+    model_key = str(model).lower()
+    if model_key not in {"add", "dom", "rec", "het"}:
+        raise ValueError("model must be one of: add, dom, rec, het")
+    if not (0.0 <= float(het) <= 0.5):
+        raise ValueError("het must be within [0, 0.5]")
+
+    n_samples = int(g.shape[1])
+    if n_samples <= 0:
+        return np.empty((0, 0), dtype=np.float32), []
+
+    maf_thr = float(maf)
+    miss_thr = float(missing_rate)
+    fill_missing = bool(impute)
+
+    valid = g >= 0.0
+    non_missing = np.sum(valid, axis=1).astype(np.int64, copy=False)
+    miss_rate = 1.0 - (non_missing.astype(np.float64) / float(n_samples))
+    keep = miss_rate <= miss_thr
+
+    has_obs = non_missing > 0
+    alt_sum = np.sum(np.where(valid, g, 0.0), axis=1, dtype=np.float64)
+    alt_freq = np.zeros(g.shape[0], dtype=np.float64)
+    alt_freq[has_obs] = alt_sum[has_obs] / (
+        2.0 * non_missing[has_obs].astype(np.float64)
+    )
+
+    # Rust parity: keep all-missing rows only when maf==0.
+    if maf_thr > 0.0:
+        keep &= has_obs
+
+    apply_het = model_key != "add"
+    if apply_het:
+        het_count = np.sum(np.isclose(g, 1.0, atol=1e-6) & valid, axis=1).astype(
+            np.int64, copy=False
+        )
+        het_rate = np.zeros(g.shape[0], dtype=np.float64)
+        het_rate[has_obs] = (
+            het_count[has_obs].astype(np.float64)
+            / non_missing[has_obs].astype(np.float64)
+        )
+        low = float(het)
+        keep &= has_obs & (het_rate >= low) & (het_rate <= (1.0 - low))
+
+    # MAF flip for ALT freq > 0.5 and swap REF/ALT labels.
+    flip = has_obs & (alt_freq > 0.5)
+    if np.any(flip):
+        flip_rows = np.where(flip)[0]
+        g_sub = g[flip_rows]
+        v_sub = valid[flip_rows]
+        g_sub[v_sub] = 2.0 - g_sub[v_sub]
+        g[flip_rows] = g_sub
+        alt_sum[flip] = 2.0 * non_missing[flip].astype(np.float64) - alt_sum[flip]
+        alt_freq[flip] = alt_sum[flip] / (
+            2.0 * non_missing[flip].astype(np.float64)
+        )
+
+    maf_val = np.minimum(alt_freq, 1.0 - alt_freq)
+    keep &= maf_val >= maf_thr
+
+    if fill_missing:
+        mean_g = np.zeros(g.shape[0], dtype=np.float32)
+        mean_g[has_obs] = (
+            alt_sum[has_obs] / non_missing[has_obs].astype(np.float64)
+        ).astype(np.float32)
+        miss_rows, miss_cols = np.where(~valid)
+        if miss_rows.size > 0:
+            g[miss_rows, miss_cols] = mean_g[miss_rows]
+        all_missing_keep = (~has_obs) & keep
+        if np.any(all_missing_keep):
+            g[all_missing_keep] = 0.0
+
+    keep_idx = np.where(keep)[0]
+    if keep_idx.size == 0:
+        return np.empty((0, n_samples), dtype=np.float32), []
+
+    g_out = np.ascontiguousarray(g[keep_idx], dtype=np.float32)
+    out_sites = []
+    for idx in keep_idx.tolist():
+        s = sites[idx]
+        if flip[idx]:
+            out_sites.append(
+                SiteInfo(
+                    str(s.chrom),
+                    int(s.pos),
+                    str(s.alt_allele),
+                    str(s.ref_allele),
+                )
+            )
+        else:
+            out_sites.append(s)
+    return g_out, out_sites
+
+
 def load_genotype_chunks(
     path_or_prefix: str,
     chunk_size: int = 50000,
@@ -453,7 +566,8 @@ def load_genotype_chunks(
     -----
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
-    - VCF/TXT caching does not perform maf/missing filtering or imputation.
+    - VCF/TXT caching itself does not perform maf/missing filtering or imputation.
+      Filters are applied during chunk streaming (Rust for PLINK/VCF, Python for TXT/NPY).
     - VCF cache can be SNP-only or all-biallelic depending on `snps_only`.
 
     Selection
@@ -564,7 +678,17 @@ def load_genotype_chunks(
             # geno is already float32 C-contiguous memory managed by Rust
             # Convert to NumPy array (zero-copy)
             geno_np = np.asarray(geno, dtype=np.float32)
-
+            geno_np, sites = _process_txt_like_chunk(
+                geno_np,
+                list(sites),
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+                impute=bool(impute),
+                model=str(model),
+                het=float(het),
+            )
+            if geno_np.shape[0] == 0:
+                continue
             yield geno_np, sites
         return
 

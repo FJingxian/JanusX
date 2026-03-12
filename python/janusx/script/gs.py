@@ -33,7 +33,7 @@ Cross-validation
 ----------------
   - 5-fold cross-validation is performed within the training population for each model.
   - For each method, the fold with the highest R^2 on the validation set is reported
-    and (optionally) visualized.
+    and visualized.
 
 Genomic selection workflow
 --------------------------
@@ -44,7 +44,7 @@ Genomic selection workflow
        - Split individuals into training (non-missing phenotype) and test sets.
        - Run 5-fold CV on the training set for each selected model.
        - Report Pearson, Spearman, and R² per fold.
-       - Use the best fold for diagnostic plotting (if enabled).
+       - Use the best fold for diagnostic plotting.
        - Refit model on full training set and predict the test set.
   4. Write prediction results to {prefix}.{trait}.gs.tsv.
 
@@ -1091,13 +1091,6 @@ def main(log: bool = True) -> None:
              "By default, ML methods tune once per trait and reuse best params across outer folds.",
     )
     optional_group.add_argument(
-        "-plot", "--plot",
-        action="store_true",
-        default=False,
-        help="Enable visualization of 5-fold CV and model performance "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
         "-o", "--out",
         type=str,
         default=".",
@@ -1220,8 +1213,6 @@ def main(log: bool = True) -> None:
                 ("Strict CV", args.strict_cv),
             ]
         )
-        if args.plot:
-            cfg_rows.append(("Plot mode", args.plot))
         emit_cli_configuration(
             logger,
             app_title="JanusX - GS",
@@ -1483,7 +1474,7 @@ def main(log: bool = True) -> None:
                     )
                 )
 
-        if args.plot and args.cv is not None:
+        if args.cv is not None:
             for method in methods:
                 res = method_result_map.get(method)
                 if res is None:
@@ -1495,8 +1486,14 @@ def main(log: bool = True) -> None:
                 fig = plt.figure(figsize=(5, 4), dpi=300)
                 gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
                 out_svg = f"{outprefix}.{trait_name}.gs.{method}.svg"
-                fig.tight_layout()
-                fig.savefig(out_svg, transparent=False, facecolor="white")
+                # Avoid tight_layout warnings on dense decorations.
+                fig.subplots_adjust(left=0.16, right=0.98, bottom=0.14, top=0.98)
+                fig.savefig(
+                    out_svg,
+                    transparent=False,
+                    facecolor="white",
+                    bbox_inches="tight",
+                )
                 plt.close(fig)
 
         missing_methods = [m for m in methods if m not in method_result_map]

@@ -2,6 +2,8 @@ from typing import Union
 import os
 import json
 import warnings
+import shutil
+import sys
 import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
@@ -13,24 +15,118 @@ from janusx.janusx import (
     SiteInfo,
 )
 
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
+
 _WARNED_BED_MODEL_FALLBACK = False
 _PLINK_CACHE_META_VERSION = 2
+_GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
+_WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
 
 
-def _cache_prefix(prefix: str) -> str:
+def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:
+    """
+    Set preferred writable cache directory for VCF/TXT/Numpy temporary caches.
+    Returns normalized absolute path or None.
+    """
+    if cache_dir is None:
+        os.environ.pop(_GENO_CACHE_ENV, None)
+        return None
+    s = str(cache_dir).strip()
+    if s == "":
+        os.environ.pop(_GENO_CACHE_ENV, None)
+        return None
+    path = os.path.abspath(os.path.expanduser(s))
+    os.makedirs(path, mode=0o755, exist_ok=True)
+    os.environ[_GENO_CACHE_ENV] = path
+    return path
+
+
+def _cache_dir_from_env() -> Union[str, None]:
+    raw = os.environ.get(_GENO_CACHE_ENV, "").strip()
+    if raw == "":
+        return None
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def _dir_is_writable(path: str) -> bool:
+    d = os.path.abspath(path or ".")
+    return os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK)
+
+
+def _looks_like_permission_error(exc: Exception) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    msg = str(exc).lower()
+    keys = (
+        "permission denied",
+        "operation not permitted",
+        "read-only file system",
+        "errno 13",
+        "eacces",
+        "access is denied",
+    )
+    return any(k in msg for k in keys)
+
+
+def _warn_cache_once(key: str, msg: str) -> None:
+    if key in _WARNED_CACHE_FALLBACK_KEYS:
+        return
+    _WARNED_CACHE_FALLBACK_KEYS.add(key)
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    if os.path.exists(dst):
+        return
+    os.makedirs(os.path.dirname(dst) or ".", mode=0o755, exist_ok=True)
+    try:
+        os.symlink(src, dst)
+        return
+    except Exception:
+        pass
+    try:
+        os.link(src, dst)
+        return
+    except Exception:
+        pass
+    shutil.copy2(src, dst)
+
+
+def _cache_prefix(prefix: str, cache_dir: Union[str, None] = None) -> str:
     base = os.path.basename(prefix)
+    if base.startswith("~"):
+        bare = base[1:]
+    else:
+        bare = base
+    if cache_dir is not None:
+        return os.path.join(cache_dir, f"~{bare}")
     if base.startswith("~"):
         return prefix
     return os.path.join(os.path.dirname(prefix), f"~{base}")
 
 
-def _vcf_cache_prefix(prefix: str, snps_only: bool = True) -> str:
+def _vcf_cache_prefix(prefix: str, snps_only: bool = True, *, cache_dir: Union[str, None] = None) -> str:
     """
     VCF->PLINK cache prefix.
     - snps_only=True : legacy SNP-only cache (~prefix.*)
     - snps_only=False: all-biallelic cache (~prefix.all.*)
     """
-    base = _cache_prefix(prefix)
+    base = _cache_prefix(prefix, cache_dir=cache_dir)
     return base if bool(snps_only) else f"{base}.all"
 
 
@@ -138,8 +234,7 @@ def _resolve_input(path_or_prefix: str):
     return "unknown", prefix, None
 
 
-def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True):
-    cache_prefix = _vcf_cache_prefix(prefix, snps_only=snps_only)
+def _ensure_plink_cache_at(cache_prefix: str, prefix: str, vcf_path: str, *, snps_only: bool = True) -> None:
     cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
     expect_meta = _expected_plink_cache_meta(snps_only=bool(snps_only))
 
@@ -179,6 +274,45 @@ def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True):
     _write_plink_cache_meta(cache_prefix, expect_meta)
 
 
+def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True) -> str:
+    primary = _vcf_cache_prefix(prefix, snps_only=snps_only)
+    cache_dir = _cache_dir_from_env()
+    fallback = (
+        _vcf_cache_prefix(prefix, snps_only=snps_only, cache_dir=cache_dir)
+        if cache_dir
+        else None
+    )
+
+    # If source-side cache directory is not writable, prefer fallback cache dir.
+    if fallback is not None and not _dir_is_writable(os.path.dirname(primary) or "."):
+        _warn_cache_once(
+            f"vcf:{prefix}:{cache_dir}",
+            (
+                f"No write permission for genotype-side cache directory: "
+                f"{os.path.dirname(primary) or '.'}. "
+                f"Falling back to cache directory from {_GENO_CACHE_ENV}: {cache_dir}"
+            ),
+        )
+        _ensure_plink_cache_at(fallback, prefix, vcf_path, snps_only=bool(snps_only))
+        return fallback
+
+    try:
+        _ensure_plink_cache_at(primary, prefix, vcf_path, snps_only=bool(snps_only))
+        return primary
+    except Exception as ex:
+        if fallback is None or (fallback == primary) or (not _looks_like_permission_error(ex)):
+            raise
+        _warn_cache_once(
+            f"vcf-perm:{prefix}:{cache_dir}",
+            (
+                f"Failed to build/read genotype-side cache at '{primary}' due to permission issue. "
+                f"Falling back to {_GENO_CACHE_ENV}={cache_dir}."
+            ),
+        )
+        _ensure_plink_cache_at(fallback, prefix, vcf_path, snps_only=bool(snps_only))
+        return fallback
+
+
 def _remove_plink_cache_files(cache_prefix: str) -> None:
     for ext in ("bed", "bim", "fam", "meta.json"):
         path = f"{cache_prefix}.{ext}"
@@ -200,6 +334,75 @@ def _is_likely_broken_plink_cache_error(exc: Exception) -> bool:
         "truncated",
     )
     return any(k in msg for k in keys)
+
+
+def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str, None]) -> str:
+    """
+    For txt/npy inputs on read-only genotype directories, stage lightweight links
+    into JANUSX_CACHE_DIR and read from there so Rust-side cache files are writable.
+    """
+    txt_input = src_path if src_path is not None else prefix
+    cache_dir = _cache_dir_from_env()
+    if cache_dir is None:
+        return txt_input
+    primary_cache_prefix = _cache_prefix(prefix)
+    if _dir_is_writable(os.path.dirname(primary_cache_prefix) or "."):
+        return txt_input
+    if src_path is None:
+        return txt_input
+
+    stage_root = os.path.join(cache_dir, "txt_cache_stage")
+    os.makedirs(stage_root, mode=0o755, exist_ok=True)
+    src = os.path.abspath(src_path)
+    staged = os.path.join(stage_root, os.path.basename(src_path))
+    try:
+        _link_or_copy(src, staged)
+    except Exception as e:
+        warnings.warn(
+            (
+                f"Unable to stage read-only input into cache dir ({stage_root}): {e}. "
+                "Proceeding with original input path."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return txt_input
+
+    src_prefix = _strip_known_suffix(src_path)
+    staged_prefix = _strip_known_suffix(staged)
+    sidecar_suffixes = (
+        ".id",
+        ".site",
+        ".site.tsv",
+        ".site.txt",
+        ".site.csv",
+        ".sites.tsv",
+        ".sites.txt",
+        ".sites.csv",
+        ".bim",
+    )
+    # Also mirror possible cache-side sidecars if they already exist in source dir.
+    src_cache_prefix = _cache_prefix(src_prefix)
+    for suf in sidecar_suffixes:
+        src_cands = [f"{src_prefix}{suf}", f"{src_cache_prefix}{suf}"]
+        dst = f"{staged_prefix}{suf}"
+        for cand in src_cands:
+            if os.path.isfile(cand):
+                try:
+                    _link_or_copy(os.path.abspath(cand), dst)
+                except Exception:
+                    pass
+                break
+
+    _warn_cache_once(
+        f"txt:{prefix}:{cache_dir}",
+        (
+            f"No write permission for genotype-side cache directory: "
+            f"{os.path.dirname(primary_cache_prefix) or '.'}. "
+            f"Using staged input under {_GENO_CACHE_ENV}: {stage_root}"
+        ),
+    )
+    return staged
 
 
 def calc_mmap_window_mb(
@@ -593,8 +796,7 @@ def load_genotype_chunks(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
-        cache_prefix = _vcf_cache_prefix(prefix, snps_only=bool(snps_only))
+        cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
 
         def _iter_cached_bed():
             yield from bed_chunk_reader(
@@ -630,7 +832,7 @@ def load_genotype_chunks(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+            cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
             yield from _iter_cached_bed()
         return
 
@@ -656,7 +858,7 @@ def load_genotype_chunks(
     if kind in ("txt", "npy"):
         if mmap_window_mb is not None:
             raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
-        txt_input = src_path if src_path is not None else prefix
+        txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)
         reader = TxtChunkReader(
             txt_input,
             delimiter,
@@ -733,8 +935,7 @@ def inspect_genotype_file(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
-        cache_prefix = _vcf_cache_prefix(prefix, snps_only=bool(snps_only))
+        cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
         try:
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
@@ -750,12 +951,12 @@ def inspect_genotype_file(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+            cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
 
     if kind in ("txt", "npy"):
-        txt_input = src_path if src_path is not None else prefix
+        txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)
         reader = TxtChunkReader(
             txt_input,
             delimiter,
@@ -898,14 +1099,37 @@ def save_genotype_streaming(
     else:
         w = VcfStreamWriter(str(out), sample_ids)
 
-    pbar = tqdm(
-        total=total_snps,
-        unit="SNP",
-        desc=desc,
-        disable=(total_snps is None),
-        bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                   "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-    )
+    use_rich = bool(_HAS_RICH_PROGRESS and getattr(sys.stdout, "isatty", lambda: False)())
+    pbar = None
+    progress = None
+    task_id = None
+    if use_rich:
+        if total_snps is None:
+            progress = Progress(
+                SpinnerColumn(style="green"),
+                TextColumn("[progress.description]{task.description}"),
+                TimeElapsedColumn(),
+            )
+            task_id = progress.add_task(desc, total=None)
+        else:
+            progress = Progress(
+                SpinnerColumn(style="green"),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=40),
+                TextColumn("{task.percentage:>5.1f}%"),
+                TimeElapsedColumn(),
+            )
+            task_id = progress.add_task(desc, total=float(total_snps))
+        progress.start()
+    else:
+        pbar = tqdm(
+            total=total_snps,
+            unit="SNP",
+            desc=desc,
+            disable=(total_snps is None),
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                       "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        )
 
     written = 0
     k = 0
@@ -916,11 +1140,17 @@ def save_genotype_streaming(
 
             n = len(sites)
             written += n
-            pbar.update(n)
+            if progress is not None and task_id is not None:
+                progress.update(task_id, advance=n)
+            elif pbar is not None:
+                pbar.update(n)
 
             k += 1
             if flush_every_chunks > 0 and (k % flush_every_chunks == 0):
                 w.flush()
     finally:
         w.close()
-        pbar.close()
+        if progress is not None:
+            progress.stop()
+        if pbar is not None:
+            pbar.close()

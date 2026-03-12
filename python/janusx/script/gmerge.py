@@ -31,6 +31,7 @@ import pandas as pd
 
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.pathcheck import ensure_all_true, ensure_file_exists, ensure_plink_prefix_exists
 from ._common.status import CliStatus
@@ -615,6 +616,7 @@ def main(log: bool = True) -> None:
     outdir = args.out.replace("\\", "/")
     prefix = (args.prefix or _infer_default_prefix(vcf_inputs, bfile_inputs, file_inputs)).replace("\\", "/")
     os.makedirs(outdir, mode=0o755, exist_ok=True)
+    configure_genotype_cache_from_out(outdir)
 
     log_path = os.path.join(outdir, f"{prefix}.merge.log").replace("\\", "/")
     logger = setup_logging(log_path)

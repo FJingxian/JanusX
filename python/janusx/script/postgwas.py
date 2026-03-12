@@ -39,6 +39,7 @@ from ._common.status import (
     print_failure,
     format_elapsed,
 )
+from ._common.genocache import configure_genotype_cache_from_out
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -4175,6 +4176,7 @@ def main():
     # Create output directory if needed
     if args.out != "":
         os.makedirs(args.out, mode=0o755, exist_ok=True)
+        configure_genotype_cache_from_out(args.out)
     else:
         args.out = "."
 

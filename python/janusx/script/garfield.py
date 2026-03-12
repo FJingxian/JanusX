@@ -24,6 +24,7 @@ from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
+from janusx.script._common.genocache import configure_genotype_cache_from_out
 
 
 def _safe_trait_label(label: object) -> str:
@@ -216,6 +217,7 @@ def main() -> None:
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
     os.makedirs(args.out, mode=0o755, exist_ok=True)
+    configure_genotype_cache_from_out(args.out)
 
     log_path = f"{args.out}/{prefix}.garfield.log".replace("//", "/")
     logger = setup_logging(log_path)

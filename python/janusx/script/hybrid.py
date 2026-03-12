@@ -36,6 +36,7 @@ import pandas as pd
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.status import CliStatus, print_success
 
@@ -848,6 +849,7 @@ def main() -> None:
 
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    configure_genotype_cache_from_out(str(Path(out_prefix).parent))
     log_path = f"{out_prefix}.hybrid.log"
     logger = setup_logging(log_path)
 

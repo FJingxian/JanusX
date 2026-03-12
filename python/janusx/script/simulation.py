@@ -33,6 +33,7 @@ from ._common.pathcheck import (
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.genocache import configure_genotype_cache_from_out
 
 
 # -----------------------------
@@ -356,6 +357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
     os.makedirs(args.out, exist_ok=True, mode=0o755)
+    configure_genotype_cache_from_out(args.out)
 
     log_path = f"{outprefix}.sim.log"
     logger = setup_logging(log_path)

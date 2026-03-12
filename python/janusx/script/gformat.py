@@ -47,6 +47,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.status import CliStatus
+from ._common.genocache import configure_genotype_cache_from_out
 
 
 GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
@@ -541,6 +542,7 @@ def main() -> None:
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
 
     os.makedirs(str(args.out), exist_ok=True, mode=0o755)
+    configure_genotype_cache_from_out(str(args.out))
     log_path = f"{out_prefix}.gformat.log"
     logger = setup_logging(log_path)
 

@@ -76,6 +76,7 @@ from ._common.pathcheck import (
 )
 from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
+from ._common.genocache import configure_genotype_cache_from_out
 
 try:
     from rich.progress import (
@@ -510,6 +511,7 @@ def main(log: bool = True):
 
     # ------------------------- Logging -------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
+    configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.pca.log".replace("//", "/")
     logger = setup_logging(log_path)
 

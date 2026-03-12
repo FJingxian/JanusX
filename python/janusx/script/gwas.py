@@ -102,6 +102,7 @@ from ._common.status import (
     format_elapsed,
 )
 from ._common.gwas_history import record_gwas_run
+from ._common.genocache import configure_genotype_cache_from_out
 
 try:
     from rich.progress import (
@@ -3865,6 +3866,7 @@ def main(log: bool = True):
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     os.makedirs(args.out, 0o755, exist_ok=True)
+    configure_genotype_cache_from_out(args.out)
     outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)

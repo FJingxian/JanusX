@@ -38,7 +38,7 @@ from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunk
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
-from ._common.status import CliStatus, print_success
+from ._common.status import CliStatus, print_success, print_warning
 
 
 GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
@@ -761,7 +761,7 @@ def _validate_parent_ids(
         if logger is not None:
             logger.warning(warn_msg)
         else:
-            print(f"Warning: {warn_msg}")
+            print_warning(warn_msg)
 
     kept_p1 = [sid for sid in p1_ids if sid in available]
     kept_p2 = [sid for sid in p2_ids if sid in available]

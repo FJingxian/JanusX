@@ -1688,10 +1688,7 @@ def _inspect_genotype_with_status(
             warning_collector.extend(warn_msgs)
         else:
             for wmsg in warn_msgs:
-                if use_spinner:
-                    print(f"Warning: {wmsg}", flush=True)
-                else:
-                    logger.warning(wmsg)
+                logger.warning(wmsg)
         task.desc = f"Loading genotype from {src}... SNP={n_snps}"
         task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
         _log_info(logger, f"Cached genotype sites: {n_snps}", use_spinner=use_spinner)

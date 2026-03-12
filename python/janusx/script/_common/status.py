@@ -33,6 +33,7 @@ _SPINNER_FRAMES = [
     "⠞",
 ]
 _GREEN = "\033[32m"
+_YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
@@ -108,6 +109,24 @@ def print_failure(message: str, *, force_color: bool = False) -> None:
         print(f"{_RED}✘ {msg}{_RESET}", flush=True)
     else:
         print(f"✘ {msg}", flush=True)
+
+
+def print_warning(message: str, *, force_color: bool = False) -> None:
+    msg = str(message)
+    line = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if _HAS_RICH and (is_tty or bool(force_color)):
+        try:
+            Console(force_terminal=True, no_color=False).print(
+                f"[yellow]{line}[/yellow]"
+            )
+            return
+        except Exception:
+            pass
+    if is_tty or bool(force_color):
+        print(f"{_YELLOW}{line}{_RESET}", flush=True)
+    else:
+        print(line, flush=True)
 
 
 class CliStatus:

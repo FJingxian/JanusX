@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import warnings
 logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
@@ -101,4 +102,10 @@ def setup_logging(log_file_path):
     # add handler to logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+    # Route Python warnings.warn(...) through logging so WARNING style/color is unified.
+    logging.captureWarnings(True)
+    pywarn_logger = logging.getLogger("py.warnings")
+    pywarn_logger.handlers.clear()
+    pywarn_logger.propagate = True
+    warnings.simplefilter("default")
     return logger

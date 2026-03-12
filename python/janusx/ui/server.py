@@ -1142,7 +1142,7 @@ class WebUIState:
         row = self.get_gwas_history(history_id)
         if row is None:
             raise ValueError(f"GWAS history not found: {history_id}")
-        activate_task_cache(row, anno_file=str(anno or ""))
+        activate_task_cache(row, anno_file=str(anno or ""), preload=False)
         with self._lock:
             svg, info = render_single_svg(
                 row,
@@ -2072,7 +2072,7 @@ def _html_page() -> str:
     .viz-toolbar { display:none; justify-content: space-between; gap:8px; margin: 0 0 8px; }
     .viz-toolbar .tools { display:flex; gap:6px; align-items:center; }
     .viz-toolbar button { height:30px; padding: 5px 10px; }
-    #preview_meta { display:none; }
+    #preview_meta { display:block; }
     .history-wrap { flex:1 1 auto; min-height:140px; overflow-x:auto; overflow-y:auto; margin-top:8px; border:1px solid var(--line); border-radius:8px; }
     .sig-wrap { flex:1 1 auto; min-height:0; overflow-x:auto; overflow-y:auto; margin-top:8px; border:1px solid var(--line); border-radius:8px; }
     .history-wrap table, .sig-wrap table { width:max-content; min-width:100%; table-layout:auto; }
@@ -2269,7 +2269,7 @@ def _html_page() -> str:
 
       <div class="card right-card">
         <div class="viz-pane">
-          <div id="preview_meta" class="muted" style="margin-bottom:8px;">Select one GWAS history row.</div>
+          <div id="preview_meta" class="muted" style="margin-bottom:8px;"></div>
           <div class="toolbar viz-toolbar">
             <div class="tools">
               <button id="zoom_out_btn" style="background:#334155;">-</button>
@@ -3404,8 +3404,17 @@ def _html_page() -> str:
             editable_svg: false,
           });
           const meta = out.meta || {};
+          const loadSec = Number(meta.load_sec || 0);
+          const hitRender = Number(meta.cache_hits_render || 0);
+          const hitSig = Number(meta.cache_hits_sig || 0);
+          const hitDisk = Number(meta.cache_hits_disk || 0);
+          const missDisk = Number(meta.cache_miss_disk || 0);
+          const renderSec = Number(meta.render_sec || 0);
+          const rustTxt = Boolean(meta.rust_loader_available) ? "rust=on" : "rust=off";
+          const loadTxt = Number.isFinite(loadSec) ? `, load=${loadSec.toFixed(2)}s` : "";
+          const drawTxt = Number.isFinite(renderSec) ? `, render=${renderSec.toFixed(2)}s` : "";
           document.getElementById("preview_meta").textContent =
-            `merged tasks=${meta.n_tasks || selIds.length}, style rows=${seriesStyles.length}`;
+            `merged tasks=${meta.n_tasks || selIds.length}, style rows=${seriesStyles.length}${loadTxt}${drawTxt}, cache(render/sig/local/disk)=${hitRender}/${hitSig}/${hitDisk}/${missDisk}, ${rustTxt}`;
           preview.innerHTML = "";
           const canvas = document.createElement("div");
           canvas.className = "preview-canvas";
@@ -3450,8 +3459,15 @@ def _html_page() -> str:
         const meta = out.meta || {};
         const br = String(meta.bimrange || "");
         const pf = String(meta.p_filter || "");
+        const loadSec = Number(meta.load_sec || 0);
+        const renderSec = Number(meta.render_sec || 0);
+        const cacheSrc = String(meta.cache_source || "");
+        const rustTxt = Boolean(meta.rust_loader_available) ? "rust=on" : "rust=off";
+        const loadTxt = Number.isFinite(loadSec) ? `, load=${loadSec.toFixed(2)}s` : "";
+        const drawTxt = Number.isFinite(renderSec) ? `, render=${renderSec.toFixed(2)}s` : "";
+        const srcTxt = cacheSrc ? `, cache=${cacheSrc}` : "";
         document.getElementById("preview_meta").textContent =
-          `nTotal=${meta.n_total || 0}, nDraw=${meta.n_draw || 0}${pf ? `, draw=${pf}` : ""}${br ? `, bimrange=${br}` : ""}`;
+          `nTotal=${meta.n_total || 0}, nDraw=${meta.n_draw || 0}${pf ? `, draw=${pf}` : ""}${br ? `, bimrange=${br}` : ""}${loadTxt}${drawTxt}${srcTxt}, ${rustTxt}`;
         preview.innerHTML = "";
         const canvas = document.createElement("div");
         canvas.className = "preview-canvas";

@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 import re
 import gzip
+import time
+import hashlib
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib as mpl
 import numpy as np
@@ -80,7 +84,7 @@ _P_CANDIDATES = [
 _LD_CACHE: dict[str, tuple[np.ndarray, list[tuple[str, int]]]] = {}
 _META_CACHE: dict[str, int] = {}
 _ANNO_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
-_SIG_GWAS_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_SIG_GWAS_CACHE: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] = {}
 _TRACK_ANNO_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _ACTIVE_TASK_CACHE: dict[str, str] = {"gwas": "", "anno": ""}
 _LARGE_MATRIX_ROWS = 1_000_000
@@ -89,6 +93,8 @@ _LARGE_MATRIX_LOGP_FLOOR = float(-np.log10(_LARGE_MATRIX_P_THRESH))
 _WEBUI_RASTER_DPI = 180
 _WEBUI_VECTOR_DPI = 150
 _AUTO_SIG_TARGET_POINTS = 100_000
+_GWAS_DISK_CACHE_VER = 1
+_GWAS_DISK_CACHE_DIR = Path(tempfile.gettempdir()) / "janusx_webui" / "gwas_cache"
 
 
 @dataclass(frozen=True)
@@ -706,7 +712,7 @@ def _resolve_result_file(row: dict[str, Any]) -> Path:
     raise FileNotFoundError("No valid GWAS result file found in history row.")
 
 
-def activate_task_cache(row: dict[str, Any], *, anno_file: Any = None) -> None:
+def activate_task_cache(row: dict[str, Any], *, anno_file: Any = None, preload: bool = True) -> None:
     """
     Keep GWAS/GFF cache scoped to current selected task.
     On task switch, drop previous task caches to control memory.
@@ -759,6 +765,9 @@ def activate_task_cache(row: dict[str, Any], *, anno_file: Any = None) -> None:
     if anno_change_requested:
         _ACTIVE_TASK_CACHE["anno"] = anno_key
 
+    if not bool(preload):
+        return
+
     # Preload current task data into memory.
     if gwas_key != "":
         try:
@@ -776,7 +785,188 @@ def activate_task_cache(row: dict[str, Any], *, anno_file: Any = None) -> None:
             pass
 
 
+def _path_resolved_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def _path_mtime(path: Path) -> float:
+    try:
+        return float(path.stat().st_mtime)
+    except Exception:
+        return -1.0
+
+
+def _path_stat_token(path: Path) -> tuple[int, int]:
+    try:
+        st = path.stat()
+        return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size)
+    except Exception:
+        return -1, -1
+
+
+def _disk_cache_file(path: Path) -> Path:
+    rp = _path_resolved_key(path)
+    key = hashlib.sha1(rp.encode("utf-8", errors="ignore")).hexdigest()
+    return _GWAS_DISK_CACHE_DIR / f"{key}.npz"
+
+
+def _build_gwas_df(
+    chrom_norm: np.ndarray,
+    pos_arr: np.ndarray,
+    p_arr: np.ndarray,
+    y_arr: np.ndarray,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "chrom_norm": pd.Categorical(np.asarray(chrom_norm, dtype=object)),
+            "pos": pos_arr,
+            "p": p_arr,
+            "y": y_arr,
+        }
+    )
+
+
+def _read_gwas_disk_cache(path: Path) -> tuple[pd.DataFrame, dict[str, str]] | None:
+    cpath = _disk_cache_file(path)
+    if not cpath.exists():
+        return None
+    mtime_ns, fsize = _path_stat_token(path)
+    if mtime_ns < 0 or fsize < 0:
+        return None
+    try:
+        with np.load(cpath, allow_pickle=False) as z:
+            ver = int(np.asarray(z["ver"]).item())
+            if ver != int(_GWAS_DISK_CACHE_VER):
+                return None
+            c_mtime = int(np.asarray(z["mtime_ns"]).item())
+            c_size = int(np.asarray(z["fsize"]).item())
+            if c_mtime != int(mtime_ns) or c_size != int(fsize):
+                return None
+            chrom_norm = np.asarray(z["chrom_norm"], dtype=object)
+            pos_arr = np.asarray(z["pos"])
+            p_arr = np.asarray(z["p"], dtype=np.float32)
+            y_arr = np.asarray(z["y"], dtype=np.float32)
+            if not (chrom_norm.shape[0] == pos_arr.shape[0] == p_arr.shape[0] == y_arr.shape[0]):
+                return None
+            cols = {
+                "chr": str(np.asarray(z["col_chr"]).item()),
+                "pos": str(np.asarray(z["col_pos"]).item()),
+                "p": str(np.asarray(z["col_p"]).item()),
+            }
+            return _build_gwas_df(chrom_norm, pos_arr, p_arr, y_arr), cols
+    except Exception:
+        return None
+
+
+def _write_gwas_disk_cache(
+    path: Path,
+    *,
+    chrom_norm: np.ndarray,
+    pos_arr: np.ndarray,
+    p_arr: np.ndarray,
+    y_arr: np.ndarray,
+    cols: dict[str, str],
+) -> None:
+    mtime_ns, fsize = _path_stat_token(path)
+    if mtime_ns < 0 or fsize < 0:
+        return
+    try:
+        _GWAS_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cpath = _disk_cache_file(path)
+        tmp_base = cpath.with_suffix(".tmp")
+        np.savez_compressed(
+            str(tmp_base),
+            ver=np.asarray([int(_GWAS_DISK_CACHE_VER)], dtype=np.int32),
+            mtime_ns=np.asarray([int(mtime_ns)], dtype=np.int64),
+            fsize=np.asarray([int(fsize)], dtype=np.int64),
+            chrom_norm=np.asarray(chrom_norm, dtype=str),
+            pos=np.asarray(pos_arr),
+            p=np.asarray(p_arr, dtype=np.float32),
+            y=np.asarray(y_arr, dtype=np.float32),
+            col_chr=np.asarray([str(cols.get("chr", ""))], dtype=str),
+            col_pos=np.asarray([str(cols.get("pos", ""))], dtype=str),
+            col_p=np.asarray([str(cols.get("p", ""))], dtype=str),
+        )
+        tmp = Path(str(tmp_base) + ".npz")
+        try:
+            tmp.replace(cpath)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _peek_table_cache(
+    path: Path,
+    *,
+    mtime: float,
+    cache: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] | None = None,
+) -> tuple[pd.DataFrame | None, dict[str, str], str]:
+    key = str(path)
+    if cache is not None and key in cache:
+        c_mtime, c_df, c_cols = cache[key]
+        if float(c_mtime) == float(mtime):
+            return c_df, dict(c_cols), "render_cache"
+    rp = _path_resolved_key(path)
+    cached_sig = _SIG_GWAS_CACHE.get(rp)
+    if cached_sig is not None:
+        s_mtime, s_df, s_cols = cached_sig
+        if float(s_mtime) == float(mtime):
+            if cache is not None:
+                cache[key] = (float(mtime), s_df, dict(s_cols))
+            return s_df, dict(s_cols), "sig_cache"
+    return None, {}, "miss"
+
+
+def _store_table_cache(
+    path: Path,
+    *,
+    mtime: float,
+    table: pd.DataFrame,
+    cols: dict[str, str],
+    cache: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] | None = None,
+) -> None:
+    key = str(path)
+    rp = _path_resolved_key(path)
+    norm_cols = {
+        "chr": str(cols.get("chr", "")),
+        "pos": str(cols.get("pos", "")),
+        "p": str(cols.get("p", "")),
+    }
+    if cache is not None:
+        cache[key] = (float(mtime), table, dict(norm_cols))
+    _SIG_GWAS_CACHE[rp] = (float(mtime), table, dict(norm_cols))
+
+
+def _load_table_cached(
+    path: Path,
+    *,
+    cache: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] | None = None,
+) -> tuple[pd.DataFrame, dict[str, str], str, float]:
+    mtime = _path_mtime(path)
+    table, cols, source = _peek_table_cache(path, mtime=mtime, cache=cache)
+    if table is not None:
+        return table, cols, source, 0.0
+    disk_hit = _read_gwas_disk_cache(path)
+    if disk_hit is not None:
+        table, cols = disk_hit
+        _store_table_cache(path, mtime=mtime, table=table, cols=cols, cache=cache)
+        return table, cols, "disk_cache", 0.0
+    t0 = time.perf_counter()
+    table, cols = _load_table(path)
+    dt = float(time.perf_counter() - t0)
+    _store_table_cache(path, mtime=mtime, table=table, cols=cols, cache=cache)
+    return table, cols, "disk", dt
+
+
 def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
+    cached = _read_gwas_disk_cache(path)
+    if cached is not None:
+        return cached
+
     def _sniff_sep(p: Path) -> str:
         sample = ""
         try:
@@ -857,15 +1047,17 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
             copy=False,
         )
 
-        out = pd.DataFrame(
-            {
-                "chrom_norm": pd.Categorical(chrom_norm),
-                "pos": pos_arr,
-                "p": p_arr,
-                "y": y_arr,
-            }
+        out = _build_gwas_df(chrom_norm, pos_arr, p_arr, y_arr)
+        cols_out = {"chr": str(c_chr), "pos": str(c_pos), "p": str(c_p)}
+        _write_gwas_disk_cache(
+            path,
+            chrom_norm=chrom_norm,
+            pos_arr=pos_arr,
+            p_arr=p_arr,
+            y_arr=y_arr,
+            cols=cols_out,
         )
-        return out, {"chr": str(c_chr), "pos": str(c_pos), "p": str(c_p)}
+        return out, cols_out
 
     try:
         sep_kind = _sniff_sep(path)
@@ -932,15 +1124,17 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
         copy=False,
     )
 
-    out = pd.DataFrame(
-        {
-            "chrom_norm": pd.Categorical(chrom_norm),
-            "pos": pos_arr,
-            "p": p_arr,
-            "y": y_arr,
-        }
+    out = _build_gwas_df(chrom_norm, pos_arr, p_arr, y_arr)
+    cols_out = {"chr": c_chr, "pos": c_pos, "p": c_p}
+    _write_gwas_disk_cache(
+        path,
+        chrom_norm=chrom_norm,
+        pos_arr=pos_arr,
+        p_arr=p_arr,
+        y_arr=y_arr,
+        cols=cols_out,
     )
-    return out, {"chr": c_chr, "pos": c_pos, "p": c_p}
+    return out, cols_out
 
 
 def detect_gwas_columns(path: Path) -> dict[str, Any]:
@@ -964,17 +1158,21 @@ def _load_sig_table_cached(path: Path) -> pd.DataFrame:
     Load GWAS table with in-memory cache for sig-site/LD-clump path.
     This avoids re-reading large files when only threshold/LD params change.
     """
-    try:
-        rp = str(path.resolve())
-        mtime = float(path.stat().st_mtime)
-    except Exception:
-        rp = str(path)
-        mtime = -1.0
+    rp = _path_resolved_key(path)
+    mtime = _path_mtime(path)
     cached = _SIG_GWAS_CACHE.get(rp)
-    if cached is not None and float(cached[0]) == mtime:
+    if cached is not None and float(cached[0]) == float(mtime):
         return cached[1]
-    tbl, _ = _load_table(path)
-    _SIG_GWAS_CACHE[rp] = (mtime, tbl)
+    tbl, cols = _load_table(path)
+    _SIG_GWAS_CACHE[rp] = (
+        float(mtime),
+        tbl,
+        {
+            "chr": str(cols.get("chr", "")),
+            "pos": str(cols.get("pos", "")),
+            "p": str(cols.get("p", "")),
+        },
+    )
     return tbl
 
 
@@ -2004,6 +2202,7 @@ def render_merged_manhattan_svg(
     editable_svg: bool = False,
     cache: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    t_render0 = time.perf_counter()
     if not isinstance(rows, list) or len(rows) == 0:
         raise RuntimeError("No GWAS tasks selected.")
     brs = _parse_bimranges(bimrange_text)
@@ -2046,24 +2245,89 @@ def render_merged_manhattan_svg(
         bool(editable_svg) and float(sig_p_thr) >= (1.0 - 1e-12)
     )
 
+    resolved_rows: list[tuple[int, dict[str, Any], Path]] = []
+    for i, row in enumerate(rows):
+        resolved_rows.append((i, row, _resolve_result_file(row)))
+
+    table_by_key: dict[str, pd.DataFrame] = {}
+    mtime_by_key: dict[str, float] = {}
+    cache_src_by_key: dict[str, str] = {}
+    miss_paths: dict[str, Path] = {}
+    for _, _, gwas_path in resolved_rows:
+        key = str(gwas_path)
+        if key in table_by_key:
+            continue
+        mtime = _path_mtime(gwas_path)
+        mtime_by_key[key] = mtime
+        c_tbl, _c_cols, c_src = _peek_table_cache(gwas_path, mtime=mtime, cache=cache)
+        if c_tbl is not None:
+            table_by_key[key] = c_tbl
+            cache_src_by_key[key] = c_src
+        else:
+            d_tbl = _read_gwas_disk_cache(gwas_path)
+            if d_tbl is not None:
+                tbl0, cols0 = d_tbl
+                _store_table_cache(
+                    gwas_path,
+                    mtime=mtime,
+                    table=tbl0,
+                    cols=cols0,
+                    cache=cache,
+                )
+                table_by_key[key] = tbl0
+                cache_src_by_key[key] = "disk_cache"
+            else:
+                miss_paths[key] = gwas_path
+
+    load_sec_total = 0.0
+    if len(miss_paths) > 0:
+        def _load_table_timed(path_obj: Path) -> tuple[pd.DataFrame, dict[str, str], float]:
+            t0 = time.perf_counter()
+            tbl0, cols0 = _load_table(path_obj)
+            return tbl0, cols0, float(time.perf_counter() - t0)
+
+        items = list(miss_paths.items())
+        if len(items) == 1:
+            key0, path0 = items[0]
+            tbl0, cols0, dt0 = _load_table_timed(path0)
+            load_sec_total += float(dt0)
+            _store_table_cache(
+                path0,
+                mtime=mtime_by_key.get(key0, _path_mtime(path0)),
+                table=tbl0,
+                cols=cols0,
+                cache=cache,
+            )
+            table_by_key[key0] = tbl0
+            cache_src_by_key[key0] = "disk"
+        else:
+            workers = max(1, min(4, len(items)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                fut_map = {pool.submit(_load_table_timed, p0): (k0, p0) for k0, p0 in items}
+                for fut in as_completed(fut_map):
+                    k0, p0 = fut_map[fut]
+                    tbl0, cols0, dt0 = fut.result()
+                    load_sec_total += float(dt0)
+                    _store_table_cache(
+                        p0,
+                        mtime=mtime_by_key.get(k0, _path_mtime(p0)),
+                        table=tbl0,
+                        cols=cols0,
+                        cache=cache,
+                    )
+                    table_by_key[k0] = tbl0
+                    cache_src_by_key[k0] = "disk"
+
     series: list[dict[str, Any]] = []
     all_chroms: set[str] = set()
-    for i, row in enumerate(rows):
-        gwas_path = _resolve_result_file(row)
+    for i, row, gwas_path in resolved_rows:
         key = str(gwas_path)
-        mtime = float(gwas_path.stat().st_mtime)
-        table: pd.DataFrame
-        if cache is not None and key in cache:
-            c_mtime, c_df, _c_cols = cache[key]
-            if float(c_mtime) == mtime:
-                table = c_df
-            else:
-                table, cols = _load_table(gwas_path)
-                cache[key] = (mtime, table, cols)
-        else:
-            table, cols = _load_table(gwas_path)
-            if cache is not None:
-                cache[key] = (mtime, table, cols)
+        table = table_by_key.get(key)
+        if table is None:
+            table, _cols, _src, dt = _load_table_cached(gwas_path, cache=cache)
+            load_sec_total += float(dt)
+            cache_src_by_key[key] = str(_src)
+            table_by_key[key] = table
         if int(table.shape[0]) == 0:
             continue
         draw_df = _filter_by_bimranges(table, brs) if len(brs) > 0 else table
@@ -2636,6 +2900,13 @@ def render_merged_manhattan_svg(
         "ld_p_threshold": float(ld_thr),
         "ld_p_threshold_auto": bool(ld_auto),
         "bimrange": "; ".join([b.label for b in brs]),
+        "load_sec": float(load_sec_total),
+        "cache_hits_render": int(sum(1 for v in cache_src_by_key.values() if v == "render_cache")),
+        "cache_hits_sig": int(sum(1 for v in cache_src_by_key.values() if v == "sig_cache")),
+        "cache_hits_disk": int(sum(1 for v in cache_src_by_key.values() if v == "disk_cache")),
+        "cache_miss_disk": int(sum(1 for v in cache_src_by_key.values() if v == "disk")),
+        "rust_loader_available": bool(_load_gwas_triplet_fast is not None),
+        "render_sec": float(time.perf_counter() - t_render0),
     }
     return svg, info
 
@@ -2657,32 +2928,27 @@ def render_single_svg(
     editable_svg: bool = False,
     cache: dict[str, tuple[float, pd.DataFrame, dict[str, str]]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    t_render0 = time.perf_counter()
     gwas_path = _resolve_result_file(row)
-    key = str(gwas_path)
-    mtime = float(gwas_path.stat().st_mtime)
-    table: pd.DataFrame
-    cols: dict[str, str]
-    if cache is not None and key in cache:
-        c_mtime, c_df, c_cols = cache[key]
-        if float(c_mtime) == mtime:
-            table = c_df
-            cols = c_cols
-        else:
-            table, cols = _load_table(gwas_path)
-            cache[key] = (mtime, table, cols)
-    else:
-        table, cols = _load_table(gwas_path)
-        if cache is not None:
-            cache[key] = (mtime, table, cols)
+    table, cols, cache_source, load_sec = _load_table_cached(gwas_path, cache=cache)
 
     phenotype_name = str(row.get("phenotype", "")).strip() or "Phenotype"
     n_idv = _coerce_pos_int(row.get("nidv", None))
     n_snp = _coerce_pos_int(row.get("eff_snp", None))
+
+    # WebUI rendering path keeps latency low: avoid probing huge genotype files
+    # on first render. Only use already-cached genotype meta when available.
     geno_n_idv, geno_n_snp = (None, None)
+    genofile_txt = str(row.get("genofile", "")).strip()
     if n_idv is None:
         n_idv = _estimate_n_from_phenofile(str(row.get("phenofile", "")).strip())
-    if n_idv is None or n_snp is None:
-        geno_n_idv, geno_n_snp = _inspect_genotype_meta(str(row.get("genofile", "")).strip())
+    if (n_idv is None or n_snp is None) and genofile_txt != "":
+        ck_n = f"geno_n::{genofile_txt}"
+        ck_s = f"geno_snp::{genofile_txt}"
+        n_cached = _META_CACHE.get(ck_n)
+        s_cached = _META_CACHE.get(ck_s)
+        geno_n_idv = int(n_cached) if n_cached is not None and int(n_cached) > 0 else None
+        geno_n_snp = int(s_cached) if s_cached is not None and int(s_cached) > 0 else None
     if n_idv is None:
         n_idv = geno_n_idv
     if n_snp is None:
@@ -3589,5 +3855,9 @@ def render_single_svg(
         "manh_marker": str(marker),
         "manh_size": float(msize),
         "highlight_n": int(highlight_points_n),
+        "load_sec": float(load_sec),
+        "cache_source": str(cache_source),
+        "rust_loader_available": bool(_load_gwas_triplet_fast is not None),
+        "render_sec": float(time.perf_counter() - t_render0),
     }
     return svg, info

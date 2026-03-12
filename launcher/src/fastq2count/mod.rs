@@ -128,7 +128,13 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
 
     let sample_names: Vec<String> = sample_pairs.keys().cloned().collect();
     let metrics_script = ensure_count_metrics_script(&workdir)?;
-    let tool_prefix = if use_jx_wrappers { "jx" } else { "" };
+    let tool_prefix_owned = if use_jx_wrappers {
+        let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
+        cmd::sh_quote(&jx_bin.to_string_lossy())
+    } else {
+        String::new()
+    };
+    let tool_prefix = tool_prefix_owned.as_str();
     let need_step3_align = from_step <= 3 && to_step >= 3;
     let effective_threads = parsed
         .threads
@@ -173,7 +179,7 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         &parsed.feature_type,
         &resolved_gene_attr,
         &metrics_script,
-        use_jx_wrappers,
+        tool_prefix,
     )?;
 
     let mut opts = PipelineOptions::default();
@@ -1214,7 +1220,7 @@ fn build_fastq2count_steps(
     feature_type: &str,
     gene_attr: &str,
     metrics_script: &Path,
-    use_jx_wrappers: bool,
+    tool_prefix: &str,
 ) -> Result<Vec<PipelineStep>, String> {
     let clean_dir = workdir.join("1.clean");
     let clean_qc_dir = clean_dir.join("qc");
@@ -1277,7 +1283,6 @@ fn build_fastq2count_steps(
     let mut step1_inputs = Vec::new();
     let mut step1_outputs = Vec::new();
     let mut step1_items = Vec::new();
-    let tool_prefix = if use_jx_wrappers { "jx" } else { "" };
     for sample in sample_names {
         let Some((fq1, fq2)) = sample_pairs.get(sample) else {
             return Err(format!("Sample missing FASTQ pair: {sample}"));

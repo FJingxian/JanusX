@@ -16,6 +16,7 @@ from janusx.gtools.reader import readanno
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 from janusx.script.gwas import load_phenotype
@@ -129,7 +130,10 @@ def main() -> None:
     )
     geno_group.add_argument(
         "-file", "--file", type=str,
-        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
     required_group.add_argument(
         "-p", "--pheno", type=str, required=False,
@@ -257,6 +261,8 @@ def main() -> None:
     checks: list[bool] = []
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.file:
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))

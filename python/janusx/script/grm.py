@@ -7,7 +7,7 @@ Design overview
 Input:
   - VCF   : genotype in VCF/VCF.GZ format
   - BFILE : genotype in PLINK binary format (.bed/.bim/.fam prefix)
-  - FILE  : genotype text matrix (.txt/.tsv/.csv, header row is sample IDs)
+  - FILE  : genotype numeric matrix (.txt/.tsv/.csv/.npy) with sibling prefix.id
 
 Implementation:
   - Genotypes are streamed via rust2py.gfreader.load_genotype_chunks.
@@ -44,6 +44,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
@@ -311,7 +312,10 @@ def main(log: bool = True):
     )
     geno_group.add_argument(
         "-file", "--file", type=str,
-        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -412,6 +416,8 @@ def main(log: bool = True):
     checks: list[bool] = []
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.file:
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     if not ensure_all_true(checks):

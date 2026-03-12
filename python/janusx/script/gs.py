@@ -107,6 +107,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 from ._common.status import (
@@ -905,6 +906,7 @@ def main(log: bool = True) -> None:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
+            "jx gs -file geno_prefix -p pheno.tsv -GBLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -adBLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",
@@ -927,6 +929,14 @@ def main(log: bool = True) -> None:
         type=str,
         help="Input genotype files in PLINK binary format "
              "(prefix for .bed, .bim, .fam).",
+    )
+    geno_group.add_argument(
+        "-file", "--file",
+        type=str,
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
     required_group.add_argument(
         "-p", "--pheno",
@@ -1102,17 +1112,17 @@ def main(log: bool = True) -> None:
     )
 
     args, extras = parser.parse_known_args()
-    has_genotype = bool(args.vcf or args.bfile)
+    has_genotype = bool(args.vcf or args.bfile or args.file)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -bfile BFILE)"
+            "(-vcf VCF | -file FILE | -bfile BFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
-        parser.error("the following arguments are required: (-vcf VCF | -bfile BFILE)")
+        parser.error("the following arguments are required: (-vcf VCF | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
 
@@ -1127,11 +1137,19 @@ def main(log: bool = True) -> None:
             .replace(".vcf", "")
             if args.prefix is None else args.prefix
         )
+    elif args.file:
+        gfile = args.file
+        base = os.path.basename(gfile)
+        for ext in (".npy", ".txt", ".tsv", ".csv"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+                break
+        args.prefix = base if args.prefix is None else args.prefix
     elif args.bfile:
         gfile = args.bfile
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
     else:
-        raise ValueError("No genotype input detected. Use -vcf or -bfile.")
+        raise ValueError("No genotype input detected. Use -vcf, -file or -bfile.")
 
     gfile = gfile.replace("\\", "/")  # Normalize Windows-style paths
     args.out = os.path.normpath(args.out if args.out is not None else ".")
@@ -1217,6 +1235,8 @@ def main(log: bool = True) -> None:
     checks: list[bool] = []
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.file:
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))

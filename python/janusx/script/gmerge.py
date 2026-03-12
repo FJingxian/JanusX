@@ -2,152 +2,612 @@
 """
 JanusX: Efficient Genotype Merger (gmerge)
 
-This CLI is a thin wrapper around the high-level Python API:
-    janusx.gmerge.merge(inputs, out, out_fmt=..., check_exists=..., return_dict=True)
+Supported inputs
+----------------
+- `-vcf/--vcf`   : one or more VCF / VCF.GZ files
+- `-bfile/--bfile`: one or more PLINK prefixes
+- `-file/--file` : one or more text / npy genotype matrices
 
-Input:
-  - PLINK bfile prefix (BED/BIM/FAM)
-  - VCF / VCF.GZ
-
-Output:
-  - VCF  : out endswith .vcf/.vcf.gz OR --out-fmt vcf
-  - PLINK: otherwise OR --out-fmt plink
-
-The Rust backend enforces:
-  - keep only biallelic SNPs (A/C/G/T)
-  - unify alleles (swap/strand-complement) and global MAF reordering
-  - union of sites, missing filled as ./.
+Notes
+-----
+- `-file` inputs must carry `prefix.id`.
+- `-file` inputs accept site metadata via `prefix.site` or `prefix.bim`.
+- Output can be written as PLINK, VCF.GZ, text matrix, or NPY matrix.
 """
 
-import os
-import time
-import json
-import socket
-import argparse
-import sys
+from __future__ import annotations
 
-from ._common.log import setup_logging
+import os
+import socket
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterator, Sequence
+
+import numpy as np
+import pandas as pd
+
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.pathcheck import (
-    ensure_all_true,
-    ensure_file_exists,
-    ensure_plink_prefix_exists,
-)
+from ._common.log import setup_logging
+from ._common.pathcheck import ensure_all_true, ensure_file_exists, ensure_plink_prefix_exists
 from ._common.status import CliStatus
+from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
 
 
-def _is_vcf_out(out: str) -> bool:
-    x = out.lower()
-    return x.endswith(".vcf") or x.endswith(".vcf.gz")
+GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
+GENOTYPE_SUFFIXES = GENOTYPE_TEXT_SUFFIXES + (".npy",)
 
 
-def _infer_prefix(out: str, out_fmt: str) -> str:
-    """
-    Decide a prefix name for log/json outputs.
-    - If writing VCF: strip .vcf/.vcf.gz
-    - Else: basename(out)
-    """
-    fmt = (out_fmt or "auto").lower()
-    if fmt == "auto":
-        fmt = "vcf" if _is_vcf_out(out) else "plink"
+@dataclass
+class SiteProvider:
+    chrom: np.ndarray
+    pos: np.ndarray
+    ref: np.ndarray
+    alt: np.ndarray
 
-    base = os.path.basename(out)
+    @classmethod
+    def from_table(cls, path: str, n_sites: int) -> "SiteProvider":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Site table not found: {p}")
+
+        if p.suffix.lower() == ".bim":
+            df = pd.read_csv(p, sep=r"\s+", header=None, dtype=str)
+            if df.shape[1] < 6:
+                raise ValueError(f"Invalid BIM file: {p}")
+            chrom = df.iloc[:, 0].astype(str).to_numpy(dtype=object)
+            pos = pd.to_numeric(df.iloc[:, 3], errors="raise").astype(np.int64).to_numpy()
+            ref = df.iloc[:, 4].astype(str).to_numpy(dtype=object)
+            alt = df.iloc[:, 5].astype(str).to_numpy(dtype=object)
+        else:
+            raw = pd.read_csv(p, sep=None, engine="python", header=None, dtype=str)
+            if raw.shape[1] < 4:
+                raise ValueError(f"Invalid site table: {p}")
+            first_row = [str(x).strip().lower() for x in raw.iloc[0].tolist()]
+            has_header = any(
+                token in {"#chrom", "chrom", "chr", "chromosome", "pos", "bp", "position", "ps", "ref", "alt", "a0", "a1"}
+                for token in first_row
+            )
+
+            if not has_header:
+                chrom = raw.iloc[:, 0].astype(str).to_numpy(dtype=object)
+                pos = pd.to_numeric(raw.iloc[:, 1], errors="raise").astype(np.int64).to_numpy()
+                ref = raw.iloc[:, 2].astype(str).to_numpy(dtype=object)
+                alt = raw.iloc[:, 3].astype(str).to_numpy(dtype=object)
+            else:
+                df = pd.read_csv(p, sep=None, engine="python")
+                col_map = {str(c).strip().lower(): c for c in df.columns}
+
+                def pick(cands: Sequence[str], label: str) -> str:
+                    for cand in cands:
+                        hit = col_map.get(str(cand).strip().lower())
+                        if hit is not None:
+                            return str(hit)
+                    raise ValueError(
+                        f"Unable to find {label} column in {p}. Available columns: {list(df.columns)}"
+                    )
+
+                chr_col = pick(
+                    ["#CHROM", "CHROM", "chrom", "CHR", "chr", "chromosome"],
+                    "chromosome",
+                )
+                pos_col = pick(
+                    ["POS", "pos", "BP", "bp", "Position", "position", "PS", "ps"],
+                    "position",
+                )
+                ref_col = pick(
+                    ["REF", "ref", "A0", "a0", "ref_allele", "REF_ALLELE"],
+                    "REF/A0",
+                )
+                alt_col = pick(
+                    ["ALT", "alt", "A1", "a1", "alt_allele", "ALT_ALLELE"],
+                    "ALT/A1",
+                )
+
+                chrom = df[chr_col].astype(str).to_numpy(dtype=object)
+                pos = pd.to_numeric(df[pos_col], errors="raise").astype(np.int64).to_numpy()
+                ref = df[ref_col].astype(str).to_numpy(dtype=object)
+                alt = df[alt_col].astype(str).to_numpy(dtype=object)
+
+        if len(pos) != int(n_sites):
+            raise ValueError(
+                f"Site row count mismatch: {p} has {len(pos)} rows, expected {n_sites}"
+            )
+        return cls(chrom=chrom, pos=pos, ref=ref, alt=alt)
+
+    def is_dummy(self) -> bool:
+        n = len(self.pos)
+        if n == 0:
+            return True
+        chrom_dummy = bool(np.all(self.chrom.astype(str) == "N"))
+        ref_dummy = bool(np.all(self.ref.astype(str) == "N"))
+        alt_dummy = bool(np.all(self.alt.astype(str) == "N"))
+        pos_dummy = bool(
+            np.array_equal(self.pos.astype(np.int64), np.arange(1, n + 1, dtype=np.int64))
+        )
+        return chrom_dummy and ref_dummy and alt_dummy and pos_dummy
+
+    def slice(self, start: int, end: int) -> list[SiteInfo]:
+        return [
+            SiteInfo(str(self.chrom[i]), int(self.pos[i]), str(self.ref[i]), str(self.alt[i]))
+            for i in range(start, end)
+        ]
+
+
+@dataclass
+class PreparedInput:
+    original: str
+    merge_path: str
+    display_kind: str
+
+
+@dataclass
+class FileInputSource:
+    matrix_kind: str
+    matrix_path: str
+    sample_ids: list[str]
+    n_sites: int
+    site_provider: SiteProvider
+    iter_selected_chunks: Callable[[int], Iterator[tuple[np.ndarray, list[SiteInfo]]]]
+
+
+def _strip_known_suffix(path: str) -> str:
+    p = str(path)
+    low = p.lower()
+    for ext in (".vcf.gz", ".vcf", ".bed", ".bim", ".fam", ".txt", ".tsv", ".csv", ".npy"):
+        if low.endswith(ext):
+            return p[: -len(ext)]
+    return p
+
+
+def _basename_no_suffix(path: str) -> str:
+    return os.path.basename(_strip_known_suffix(path.rstrip("/")))
+
+
+def _find_duplicates(items: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    dup: list[str] = []
+    dup_seen: set[str] = set()
+    for item in items:
+        if item in seen and item not in dup_seen:
+            dup.append(item)
+            dup_seen.add(item)
+        seen.add(item)
+    return dup
+
+
+def _read_id_sidecar(path: str) -> list[str]:
+    ids: list[str] = []
+    with open(path, "r", encoding="utf-8") as fr:
+        for lineno, raw in enumerate(fr, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 1:
+                raise ValueError(f"{path}:{lineno}: expected 1 sample ID per line")
+            ids.append(parts[0])
+    if not ids:
+        raise ValueError(f"Empty sample ID sidecar: {path}")
+    dup = _find_duplicates(ids)
+    if dup:
+        raise ValueError(f"Duplicate sample IDs in sidecar: {', '.join(dup[:10])}")
+    return ids
+
+
+def _build_prefix_candidates(file_arg: str) -> tuple[str, list[str]]:
+    raw = Path(file_arg).expanduser()
+
+    if raw.suffix.lower() in GENOTYPE_TEXT_SUFFIXES:
+        raw_prefix = _strip_known_suffix(str(raw))
+        cache_prefix = str(Path(raw_prefix).parent / f"~{Path(raw_prefix).name}")
+        return raw_prefix, [raw_prefix, cache_prefix]
+
+    if raw.suffix.lower() == ".npy":
+        raw_prefix = _strip_known_suffix(str(raw))
+        noncache_prefix = str(Path(raw_prefix).parent / Path(raw_prefix).name.lstrip("~"))
+        return noncache_prefix, [noncache_prefix, raw_prefix]
+
+    raw_prefix = str(raw)
+    cache_prefix = str(raw.parent / f"~{raw.name}")
+    return raw_prefix, [raw_prefix, cache_prefix]
+
+
+def _discover_file_matrix(file_arg: str) -> tuple[str, str, list[str]]:
+    raw_prefix, prefixes = _build_prefix_candidates(file_arg)
+
+    npy_candidates = []
+    raw = Path(file_arg).expanduser()
+    if raw.suffix.lower() == ".npy":
+        npy_candidates.append(str(raw))
+    npy_candidates.extend([f"{p}.npy" for p in prefixes])
+
+    seen: set[str] = set()
+    for cand in npy_candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if Path(cand).exists():
+            return "npy", cand, prefixes
+
+    text_candidates = []
+    if raw.suffix.lower() in GENOTYPE_TEXT_SUFFIXES:
+        text_candidates.append(str(raw))
+    for prefix in prefixes:
+        for ext in GENOTYPE_TEXT_SUFFIXES:
+            text_candidates.append(f"{prefix}{ext}")
+
+    seen.clear()
+    for cand in text_candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if Path(cand).exists():
+            return "text", cand, prefixes
+
+    raise FileNotFoundError(
+        f"Unable to resolve -file input: {file_arg}. "
+        f"Checked prefix candidates: {', '.join(prefixes)}"
+    )
+
+
+def _discover_site_path(prefixes: Sequence[str]) -> str | None:
+    for prefix in prefixes:
+        for cand in (
+            f"{prefix}.site",
+            f"{prefix}.site.tsv",
+            f"{prefix}.site.txt",
+            f"{prefix}.site.csv",
+            f"{prefix}.bim",
+            f"{prefix}.sites.tsv",
+            f"{prefix}.sites.txt",
+            f"{prefix}.sites.csv",
+        ):
+            if Path(cand).exists():
+                return cand
+    return None
+
+
+def _discover_id_path(matrix_path: str, prefixes: Sequence[str]) -> str:
+    candidates = [f"{matrix_path}.id"]
+    for prefix in prefixes:
+        candidates.extend(
+            [
+                f"{prefix}.id",
+            ]
+        )
+
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if not Path(cand).exists():
+            continue
+        return _read_id_sidecar(cand)
+    raise FileNotFoundError(
+        f"Unable to find sample IDs for matrix {matrix_path}. "
+        "Provide a matching prefix.id sidecar."
+    )
+
+
+def _build_file_source(file_arg: str, delimiter: str | None = None) -> FileInputSource:
+    matrix_kind, matrix_path, prefixes = _discover_file_matrix(file_arg)
+    site_path = _discover_site_path(prefixes)
+    if site_path is None:
+        raise ValueError(
+            f"-file input requires real site metadata (.site or .bim): {file_arg}"
+        )
+    sample_ids = _discover_id_path(matrix_path, prefixes)
+
+    if matrix_kind == "npy":
+        matrix = np.load(matrix_path, mmap_mode="r")
+        if matrix.ndim != 2:
+            raise ValueError(
+                f"NumPy genotype matrix must be 2D (n_sites, n_samples); got {matrix.shape}"
+            )
+        if int(matrix.shape[1]) != len(sample_ids):
+            raise ValueError(
+                f"Sample ID count mismatch for {matrix_path}: "
+                f"matrix columns={int(matrix.shape[1])}, sample IDs={len(sample_ids)}"
+            )
+        provider = SiteProvider.from_table(site_path, int(matrix.shape[0]))
+        if provider.is_dummy():
+            raise ValueError(f"Detected dummy site metadata for -file input: {site_path}")
+        sample_index = {sid: i for i, sid in enumerate(sample_ids)}
+
+        def iter_chunks(chunk_size: int):
+            total = int(matrix.shape[0])
+            selected_idx = list(range(len(sample_ids)))
+            for start in range(0, total, int(chunk_size)):
+                end = min(total, start + int(chunk_size))
+                block = np.asarray(matrix[start:end, :][:, selected_idx], dtype=np.float32)
+                yield block, provider.slice(start, end)
+
+        return FileInputSource(
+            matrix_kind="npy",
+            matrix_path=matrix_path,
+            sample_ids=list(sample_ids),
+            n_sites=int(matrix.shape[0]),
+            site_provider=provider,
+            iter_selected_chunks=iter_chunks,
+        )
+
+    sample_ids2, n_sites = inspect_genotype_file(matrix_path, delimiter=delimiter)
+    if list(sample_ids2) != list(sample_ids):
+        raise ValueError(
+            f"Sample ID sidecar mismatch for {matrix_path}: "
+            "prefix.id does not match detected sample order."
+        )
+    provider = SiteProvider.from_table(site_path, int(n_sites))
+    if provider.is_dummy():
+        raise ValueError(f"Detected dummy site metadata for -file input: {site_path}")
+
+    def iter_chunks(chunk_size: int):
+        offset = 0
+        for block, _ in load_genotype_chunks(
+            matrix_path,
+            chunk_size=int(chunk_size),
+            maf=0.0,
+            missing_rate=1.0,
+            impute=False,
+            delimiter=delimiter,
+        ):
+            n_rows = int(block.shape[0])
+            yield np.asarray(block, dtype=np.float32), provider.slice(offset, offset + n_rows)
+            offset += n_rows
+
+    return FileInputSource(
+        matrix_kind="text",
+        matrix_path=matrix_path,
+        sample_ids=list(sample_ids),
+        n_sites=int(n_sites),
+        site_provider=provider,
+        iter_selected_chunks=iter_chunks,
+    )
+
+
+def _check_file_input_resolvable(logger, src: str) -> bool:
+    try:
+        _build_file_source(src)
+        return True
+    except Exception as exc:
+        logger.error(f"Input FILE not found or unresolved: {src}")
+        logger.error(str(exc))
+        return False
+
+
+def _infer_default_prefix(vcf_inputs: Sequence[str], bfile_inputs: Sequence[str], file_inputs: Sequence[str]) -> str:
+    all_inputs = list(vcf_inputs) + list(bfile_inputs) + list(file_inputs)
+    if not all_inputs:
+        return "merged"
+    return f"{_basename_no_suffix(all_inputs[0])}.merge"
+
+
+def _resolve_output(format_name: str, outdir: str, prefix: str) -> tuple[str, str]:
+    fmt = str(format_name).lower()
+    base = os.path.join(outdir, prefix)
+    if fmt == "plink":
+        return fmt, base
     if fmt == "vcf":
-        if base.endswith(".vcf.gz"):
-            return base[:-7]
-        if base.endswith(".vcf"):
-            return base[:-4]
-    return base
+        return fmt, f"{base}.vcf.gz"
+    if fmt == "txt":
+        return fmt, f"{base}.txt"
+    if fmt == "npy":
+        return fmt, f"{base}.npy"
+    raise ValueError(f"Unsupported format: {format_name}")
 
 
-def main(log: bool = True):
-    t_start = time.time()
+def _read_fam_sample_names(prefix: str) -> list[str]:
+    fam = f"{prefix}.fam"
+    out: list[str] = []
+    with open(fam, "r", encoding="utf-8") as fr:
+        for lineno, raw in enumerate(fr, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(f"{fam}:{lineno}: malformed FAM line")
+            fid, iid = parts[0], parts[1]
+            out.append(f"{fid}_{iid}" if fid not in {"", "0"} else iid)
+    return out
 
+
+def _write_bim(handle, sites: Sequence[SiteInfo]) -> None:
+    for site in sites:
+        chrom = str(site.chrom)
+        pos = int(site.pos)
+        sid = f"{chrom}_{pos}"
+        ref = str(site.ref_allele)
+        alt = str(site.alt_allele)
+        handle.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
+
+
+def _write_site(handle, sites: Sequence[SiteInfo]) -> None:
+    for site in sites:
+        chrom = str(site.chrom)
+        pos = int(site.pos)
+        ref = str(site.ref_allele)
+        alt = str(site.alt_allele)
+        handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\n")
+
+
+def _write_text_output(out_path: str, sample_ids: Sequence[str], merge_source: str) -> None:
+    prefix = out_path[: -4] if out_path.lower().endswith(".txt") else _strip_known_suffix(out_path)
+    with open(f"{prefix}.id", "w", encoding="utf-8") as fid:
+        fid.write("\n".join(map(str, sample_ids)) + "\n")
+    with open(out_path, "w", encoding="utf-8") as fw, open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
+        for block, sites in load_genotype_chunks(
+            merge_source,
+            chunk_size=50_000,
+            maf=0.0,
+            missing_rate=1.0,
+            impute=False,
+        ):
+            np.savetxt(fw, np.asarray(block, dtype=np.float32), fmt="%.6g", delimiter="\t")
+            _write_site(fsite, sites)
+
+
+def _write_npy_output(out_path: str, sample_ids: Sequence[str], merge_source: str) -> None:
+    prefix = _strip_known_suffix(out_path)
+    _, n_sites = inspect_genotype_file(merge_source)
+    mm = np.lib.format.open_memmap(
+        out_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(int(n_sites), len(sample_ids)),
+    )
+    offset = 0
+    with open(f"{prefix}.id", "w", encoding="utf-8") as fid, open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
+        fid.write("\n".join(map(str, sample_ids)) + "\n")
+        for block, sites in load_genotype_chunks(
+            merge_source,
+            chunk_size=50_000,
+            maf=0.0,
+            missing_rate=1.0,
+            impute=False,
+        ):
+            n_rows = int(block.shape[0])
+            mm[offset : offset + n_rows, :] = np.asarray(block, dtype=np.float32)
+            _write_site(fsite, sites)
+            offset += n_rows
+    mm.flush()
+
+
+def _prepare_file_inputs(
+    file_inputs: Sequence[str],
+    tmpdir: str,
+    logger,
+) -> list[PreparedInput]:
+    prepared: list[PreparedInput] = []
+    for idx, src in enumerate(file_inputs, start=1):
+        logger.info(f"Preparing -file input {idx}/{len(file_inputs)}: {src}")
+        file_source = _build_file_source(src)
+        temp_prefix = os.path.join(tmpdir, f"file_input_{idx}")
+        desc = f"Converting -file input {idx}/{len(file_inputs)}"
+        save_genotype_streaming(
+            temp_prefix,
+            file_source.sample_ids,
+            file_source.iter_selected_chunks(50_000),
+            fmt="plink",
+            total_snps=int(file_source.n_sites),
+            desc=desc,
+        )
+        logger.info(f"{desc} finished.")
+        prepared.append(
+            PreparedInput(
+                original=src,
+                merge_path=temp_prefix,
+                display_kind=f"file:{file_source.matrix_kind}",
+            )
+        )
+    return prepared
+
+
+def build_parser() -> CliArgumentParser:
     parser = CliArgumentParser(
         prog="jx gmerge",
         formatter_class=cli_help_formatter(),
-        epilog=minimal_help_epilog([
-            "jx gmerge -i a.vcf.gz b.vcf.gz -o merged.vcf.gz",
-            "jx gmerge -i a_prefix b_prefix -o merged --out-fmt plink",
-        ]),
-    )
-
-    # ------------------------------------------------------------------
-    # Required arguments
-    # ------------------------------------------------------------------
-    required_group = parser.add_argument_group("Required Arguments")
-    required_group.add_argument(
-        "-i", "--inputs", nargs="+", required=True, type=str,
-        help=(
-            "Input genotype datasets (>=2).\n"
-            "Each item is either:\n"
-            "  - PLINK prefix (no extension), e.g. geno/QC\n"
-            "  - VCF path (.vcf or .vcf.gz), e.g. geno/QC.vcf.gz"
-        ),
-    )
-    required_group.add_argument(
-        "-o", "--out", required=True, type=str,
-        help=(
-            "Output target.\n"
-            "  - VCF: provide path ending with .vcf or .vcf.gz\n"
-            "  - PLINK: provide prefix (no extension)"
+        epilog=minimal_help_epilog(
+            [
+                "jx gmerge -vcf a.vcf.gz b.vcf.gz -format vcf",
+                "jx gmerge -bfile A B -o merged_dir -prefix panel -format plink",
+                "jx gmerge -vcf a.vcf.gz -file matrix_prefix -format txt",
+            ]
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Optional arguments
-    # ------------------------------------------------------------------
-    optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "--out-fmt", type=str, default="auto", choices=["auto", "vcf", "plink"],
-        help="Output format (default: %(default)s).",
+    req = parser.add_argument_group("Input Arguments")
+    req.add_argument(
+        "-vcf",
+        "--vcf",
+        nargs="+",
+        action="extend",
+        default=None,
+        help="Input VCF / VCF.GZ files (repeatable).",
     )
-    optional_group.add_argument(
-        "--no-check", action="store_true", default=False,
-        help="Skip input existence checks (default: %(default)s).",
+    req.add_argument(
+        "-bfile",
+        "--bfile",
+        nargs="+",
+        action="extend",
+        default=None,
+        help="Input PLINK prefixes (repeatable).",
     )
-    optional_group.add_argument(
-        "--report-json", type=str, default=None,
+    req.add_argument(
+        "-file",
+        "--file",
+        nargs="+",
+        action="extend",
+        default=None,
         help=(
-            "Write merge statistics to JSON file.\n"
-            "Default: <outdir>/<prefix>.merge.json"
+            "Input genotype text/NumPy matrices or prefixes (repeatable). "
+            "If prefix-matched .npy exists, it is preferred. "
+            "Requires prefix.id. Site metadata: prefix.site or prefix.bim."
         ),
     )
-    optional_group.add_argument(
-        "--outdir", type=str, default=None,
-        help=(
-            "Directory to write log/json reports.\n"
-            "Default: parent directory of --out (or current directory if none)."
-        ),
+
+    opt = parser.add_argument_group("Optional Arguments")
+    opt.add_argument(
+        "-format",
+        "--format",
+        dest="format_name",
+        choices=["plink", "vcf", "txt", "npy"],
+        default="vcf",
+        help="Output genotype format: plink, vcf, txt, npy (default: vcf.gz).",
     )
+    opt.add_argument(
+        "-o",
+        "--out",
+        default=".",
+        help="Output directory for merged results (default: %(default)s).",
+    )
+    opt.add_argument(
+        "-prefix",
+        "--prefix",
+        default=None,
+        help="Prefix for merged output files (default: inferred from first input).",
+    )
+    return parser
 
-    args = parser.parse_args()
 
-    inputs = [x.replace("\\", "/") for x in args.inputs]
-    out = args.out.replace("\\", "/")
-    out_fmt = args.out_fmt
+def main(log: bool = True) -> None:
+    t_start = time.time()
+    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    args = build_parser().parse_args()
 
-    if len(inputs) < 2:
-        raise ValueError("--inputs must contain at least 2 datasets")
+    vcf_inputs = [x.replace("\\", "/") for x in (args.vcf or [])]
+    bfile_inputs = [x.replace("\\", "/") for x in (args.bfile or [])]
+    file_inputs = [x.replace("\\", "/") for x in (args.file or [])]
 
-    # ------------------------------------------------------------------
-    # Decide report dir / prefix
-    # ------------------------------------------------------------------
-    if args.outdir is not None:
-        report_dir = args.outdir.replace("\\", "/")
-    else:
-        report_dir = os.path.dirname(out) or "."
+    total_inputs = len(vcf_inputs) + len(bfile_inputs) + len(file_inputs)
+    if total_inputs < 2:
+        raise ValueError(
+            "At least 2 inputs are required across -vcf/-bfile/-file."
+        )
 
-    os.makedirs(report_dir, 0o755, exist_ok=True)
+    outdir = args.out.replace("\\", "/")
+    prefix = (args.prefix or _infer_default_prefix(vcf_inputs, bfile_inputs, file_inputs)).replace("\\", "/")
+    os.makedirs(outdir, mode=0o755, exist_ok=True)
 
-    prefix = _infer_prefix(out, out_fmt)
-    log_path = f"{report_dir}/{prefix}.merge.log".replace("\\", "/").replace("//", "/")
+    log_path = os.path.join(outdir, f"{prefix}.merge.log").replace("\\", "/")
     logger = setup_logging(log_path)
 
+    final_format, final_output = _resolve_output(args.format_name, outdir, prefix)
+
     if log:
-        input_rows = [(f"Input {i + 1}", x) for i, x in enumerate(inputs)]
+        input_rows: list[tuple[str, str]] = []
+        for idx, src in enumerate(vcf_inputs, start=1):
+            input_rows.append((f"VCF {idx}", src))
+        for idx, src in enumerate(bfile_inputs, start=1):
+            input_rows.append((f"BFILE {idx}", src))
+        for idx, src in enumerate(file_inputs, start=1):
+            input_rows.append((f"FILE {idx}", src))
         emit_cli_configuration(
             logger,
             app_title="JanusX - gmerge",
@@ -158,87 +618,148 @@ def main(log: bool = True):
                 (
                     "General",
                     [
-                        ("Output", out),
-                        ("Output format", out_fmt),
-                        ("Check inputs exist", (not args.no_check)),
-                        ("Report dir", report_dir),
+                        ("Format", final_format),
+                        ("Output dir", outdir),
+                        ("Prefix", prefix),
                         ("Log file", log_path),
                     ],
                 ),
             ],
+            footer_rows=[("Output", final_output)],
             line_max_chars=60,
         )
 
-    if args.no_check:
-        logger.warning("--no-check is ignored in CLI mode; input existence is always validated.")
-
     checks: list[bool] = []
-    for src in inputs:
-        low = src.lower()
-        if low.endswith(".vcf") or low.endswith(".vcf.gz"):
-            checks.append(ensure_file_exists(logger, src, "Input VCF file"))
-        else:
-            checks.append(ensure_plink_prefix_exists(logger, src, "Input PLINK prefix"))
+    for src in vcf_inputs:
+        checks.append(ensure_file_exists(logger, src, "Input VCF file"))
+    for src in bfile_inputs:
+        checks.append(ensure_plink_prefix_exists(logger, src, "Input PLINK prefix"))
+    for src in file_inputs:
+        checks.append(_check_file_input_resolvable(logger, src))
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    # ------------------------------------------------------------------
-    # Run merge (call your Python API)
-    # ------------------------------------------------------------------
-    t0 = time.time()
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    with CliStatus("Merging genotype datasets...", enabled=use_spinner) as task:
-        try:
-            stats, d = merge(
-                inputs=inputs,
-                out=out,
-                out_fmt=out_fmt,
-                check_exists=True,
-                return_dict=True,
+    with tempfile.TemporaryDirectory(prefix=f".janusx_gmerge_{prefix}_", dir=outdir) as tmpdir:
+        prepared_inputs: list[PreparedInput] = []
+        prepared_inputs.extend(
+            PreparedInput(original=x, merge_path=x, display_kind="vcf") for x in vcf_inputs
+        )
+        prepared_inputs.extend(
+            PreparedInput(original=x, merge_path=x, display_kind="bfile") for x in bfile_inputs
+        )
+        prepared_inputs.extend(
+            _prepare_file_inputs(
+                file_inputs,
+                tmpdir,
+                logger,
             )
-        except Exception:
-            task.fail("Merging genotype datasets ...Failed")
-            raise
-        task.complete("Merging genotype datasets ...Finished")
-    logger.info(f"Merge completed in {round(time.time() - t0, 3)} seconds")
+        )
 
-    # ------------------------------------------------------------------
-    # Print summary
-    # ------------------------------------------------------------------
-    logger.info("*" * 60)
-    logger.info("GMERGE SUMMARY")
-    logger.info("*" * 60)
-    logger.info(f"Total samples: {d.get('n_samples_total')}")
-    logger.info(f"Sites written: {d.get('n_sites_written')}")
-    logger.info(f"Union sites seen: {d.get('n_sites_union_seen')}")
-    logger.info(f"Dropped multiallelic: {d.get('n_sites_dropped_multiallelic')}")
-    logger.info(f"Dropped non-SNP: {d.get('n_sites_dropped_non_snp')}")
-    logger.info("*" * 60 + "\n")
+        merge_inputs = [item.merge_path for item in prepared_inputs]
 
-    # ------------------------------------------------------------------
-    # Save JSON report
-    # ------------------------------------------------------------------
-    report_json = args.report_json
-    if report_json is None:
-        report_json = f"{report_dir}/{prefix}.merge.json"
-    report_json = report_json.replace("\\", "/")
+        merge_out = final_output
+        merge_fmt = final_format
+        postconvert_source: str | None = None
+        if final_format in {"txt", "npy"}:
+            merge_out = os.path.join(tmpdir, "merged_tmp")
+            merge_fmt = "plink"
+            postconvert_source = merge_out
 
-    with open(report_json, "w", encoding="utf-8") as fw:
-        json.dump(d, fw, ensure_ascii=False, indent=2)
-    logger.info(f"Saved merge report JSON:\n  {report_json}")
+        with CliStatus("Merging genotype datasets...", enabled=use_spinner) as task:
+            try:
+                stats, d = merge(
+                    inputs=merge_inputs,
+                    out=merge_out,
+                    out_fmt=merge_fmt,
+                    check_exists=True,
+                    return_dict=True,
+                )
+            except Exception:
+                task.fail("Merging genotype datasets ...Failed")
+                raise
+            task.complete("Merging genotype datasets ...Finished")
 
-    # ------------------------------------------------------------------
-    # Final logging
-    # ------------------------------------------------------------------
+        if final_format == "txt":
+            sample_ids = _read_fam_sample_names(postconvert_source)
+            with CliStatus("Writing merged text matrix...", enabled=use_spinner) as task:
+                try:
+                    _write_text_output(final_output, sample_ids, postconvert_source)
+                except Exception:
+                    task.fail("Writing merged text matrix ...Failed")
+                    raise
+                task.complete("Writing merged text matrix ...Finished")
+        elif final_format == "npy":
+            sample_ids = _read_fam_sample_names(postconvert_source)
+            with CliStatus("Writing merged npy matrix...", enabled=use_spinner) as task:
+                try:
+                    _write_npy_output(final_output, sample_ids, postconvert_source)
+                except Exception:
+                    task.fail("Writing merged npy matrix ...Failed")
+                    raise
+                task.complete("Writing merged npy matrix ...Finished")
+
+        logger.info("*" * 60)
+        logger.info("GMERGE SUMMARY")
+        logger.info("*" * 60)
+        logger.info(f"Final output: {final_output}")
+        logger.info(f"Final format: {final_format}")
+        logger.info(f"Total inputs: {len(prepared_inputs)}")
+        logger.info(f"Sample counts per input: {d.get('sample_counts')}")
+        logger.info(f"Total samples: {d.get('n_samples_total')}")
+        logger.info(f"Sites written: {d.get('n_sites_written')}")
+        logger.info(f"Union sites seen: {d.get('n_sites_union_seen')}")
+        logger.info(f"Dropped multiallelic: {d.get('n_sites_dropped_multiallelic')}")
+        logger.info(f"Dropped non-SNP: {d.get('n_sites_dropped_non_snp')}")
+        logger.info(f"Per-input present sites: {d.get('per_input_present_sites')}")
+        logger.info(f"Per-input unaligned sites: {d.get('per_input_unaligned_sites')}")
+        logger.info(f"Per-input absent sites: {d.get('per_input_absent_sites')}")
+        logger.info("*" * 60)
+
+        if final_format == "plink":
+            logger.info(
+                "Merged PLINK files saved:\n  %s.bed\n  %s.bim\n  %s.fam",
+                final_output,
+                final_output,
+                final_output,
+            )
+        elif final_format == "vcf":
+            logger.info(f"Merged VCF saved:\n  {final_output}")
+        elif final_format == "txt":
+            logger.info(
+                "Merged text matrix saved:\n  %s\n  %s.id\n  %s.site",
+                final_output,
+                _strip_known_suffix(final_output),
+                _strip_known_suffix(final_output),
+            )
+        elif final_format == "npy":
+            logger.info(
+                "Merged npy matrix saved:\n  %s\n  %s.id\n  %s.site",
+                final_output,
+                _strip_known_suffix(final_output),
+                _strip_known_suffix(final_output),
+            )
+
     lt = time.localtime()
-    endinfo = (
-        f"\nFinished genotype merge. Total wall time: "
-        f"{round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+    logger.info(
+        "\nFinished genotype merge. Total wall time: %.2f seconds\n%d-%d-%d %d:%d:%d",
+        time.time() - t_start,
+        lt.tm_year,
+        lt.tm_mon,
+        lt.tm_mday,
+        lt.tm_hour,
+        lt.tm_min,
+        lt.tm_sec,
     )
-    logger.info(endinfo)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("Error: Interrupted.", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

@@ -2,7 +2,7 @@
 JanusX Simulation CLI
 
 Mode
-- Simulate phenotype from existing genotype: use --vcf or --bfile
+- Simulate phenotype from existing genotype: use --vcf, --file or --bfile
 
 Outputs
 - Phenotypes (always):
@@ -30,6 +30,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 
@@ -235,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx sim -bfile geno_prefix -o out -prefix demo",
+            "jx sim -file geno_prefix -o out -prefix demo",
             "jx simulation -vcf geno.vcf.gz -mode single -o out",
         ]),
         description="JanusX simulation: phenotype from existing genotype",
@@ -252,6 +254,13 @@ def build_parser() -> argparse.ArgumentParser:
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
         help="Input genotype in PLINK binary format (prefix for .bed, .bim, .fam).",
+    )
+    geno_group.add_argument(
+        "-file", "--file", type=str,
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
 
     # Common arguments
@@ -318,11 +327,18 @@ def determine_genotype_source(args: argparse.Namespace) -> tuple[str, str]:
     if args.vcf:
         gfile = args.vcf
         prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "")
+    elif args.file:
+        gfile = args.file
+        prefix = os.path.basename(gfile)
+        for ext in (".npy", ".txt", ".tsv", ".csv"):
+            if prefix.lower().endswith(ext):
+                prefix = prefix[: -len(ext)]
+                break
     elif args.bfile:
         gfile = args.bfile
         prefix = os.path.basename(gfile)
     else:
-        raise ValueError("No genotype input specified. Use -vcf or -bfile.")
+        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
 
     if args.prefix is not None:
         prefix = args.prefix
@@ -373,6 +389,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     checks: list[bool] = []
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.file:
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     if not ensure_all_true(checks):

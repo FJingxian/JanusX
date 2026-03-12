@@ -7,7 +7,7 @@ Design overview
 Input modes:
   - VCF    : genotype in VCF/VCF.GZ format
   - BFILE  : genotype in PLINK binary format (.bed/.bim/.fam prefix)
-  - FILE   : genotype text matrix (.txt/.tsv/.csv, header row is sample IDs)
+  - FILE   : genotype numeric matrix (.txt/.tsv/.csv/.npy) with sibling prefix.id
   - GRM    : precomputed genetic relationship matrix (GRM) plus ID file
   - QCOV : precomputed PCA results (eigenvec/eigenval) for
              visualization only
@@ -71,6 +71,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
@@ -401,7 +402,10 @@ def main(log: bool = True):
     )
     geno_group.add_argument(
         "-file", "--file", type=str,
-        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
     geno_group.add_argument(
         "-k", "--grm", type=str,
@@ -562,7 +566,7 @@ def main(log: bool = True):
     if args.vcf:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     elif args.file:
-        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     elif args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.grm:

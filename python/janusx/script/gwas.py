@@ -91,6 +91,7 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
@@ -585,6 +586,7 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     Return the latest modification time of genotype input files.
 
     - PLINK prefix: max mtime of .bed/.bim/.fam (if all exist)
+    - FILE prefix : max mtime of matrix file, prefix.id, and optional site metadata
     - File input  : mtime of the file path itself
     """
     bed = f"{genofile}.bed"
@@ -592,9 +594,44 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     fam = f"{genofile}.fam"
     if all(os.path.isfile(p) for p in (bed, bim, fam)):
         return max(os.path.getmtime(bed), os.path.getmtime(bim), os.path.getmtime(fam))
+
+    file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
+    if file_prefix and matrix_path:
+        mtimes = [os.path.getmtime(matrix_path)]
+        for cand in _file_input_sidecars(file_prefix):
+            if os.path.isfile(cand):
+                mtimes.append(os.path.getmtime(cand))
+        return max(mtimes)
+
     if os.path.isfile(genofile):
         return os.path.getmtime(genofile)
     return None
+
+
+def _resolve_file_input_matrix(genofile: str) -> tuple[Optional[str], Optional[str]]:
+    path = os.path.expanduser(str(genofile))
+    low = path.lower()
+    if low.endswith(".npy"):
+        return path[: -len(".npy")], path
+    for ext in (".txt", ".tsv", ".csv"):
+        if low.endswith(ext):
+            return path[: -len(ext)], path
+    for ext in (".npy", ".txt", ".tsv", ".csv"):
+        cand = f"{path}{ext}"
+        if os.path.isfile(cand):
+            return path, cand
+    return None, None
+
+
+def _file_input_sidecars(prefix: str) -> list[str]:
+    return [
+        f"{prefix}.id",
+        f"{prefix}.site",
+        f"{prefix}.site.tsv",
+        f"{prefix}.site.txt",
+        f"{prefix}.site.csv",
+        f"{prefix}.bim",
+    ]
 
 
 def _basename_only(path: str) -> str:
@@ -1238,10 +1275,16 @@ def _detect_cache_need(genofile: str, *, snps_only: bool = True) -> tuple[bool, 
             stale = cache_mtime < src_mtime
         return (not all_exist) or stale, "vcf", targets
 
-    if low.endswith((".txt", ".tsv", ".csv")):
+    file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
+    if file_prefix and matrix_path:
+        if matrix_path.lower().endswith(".npy"):
+            return False, "", []
         cprefix = _cache_prefix_tilde(genofile, snps_only=True)
         targets = [f"{cprefix}.npy"]
-        return (not os.path.isfile(targets[0])), "txt", targets
+        stale = False
+        if os.path.isfile(targets[0]) and os.path.isfile(matrix_path):
+            stale = os.path.getmtime(targets[0]) < os.path.getmtime(matrix_path)
+        return (not os.path.isfile(targets[0])) or stale, "txt", targets
 
     return False, "", []
 
@@ -3673,7 +3716,10 @@ def parse_args():
     )
     geno_group.add_argument(
         "-file", "--file", type=str,
-        help="Input genotype text matrix (.txt/.tsv/.csv), header row is sample IDs.",
+        help=(
+            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+        ),
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
@@ -3870,6 +3916,8 @@ def main(log: bool = True):
     checks: list[bool] = []
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
+    elif args.file:
+        checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))

@@ -2,6 +2,7 @@ use super::pipeline::{run_pipeline_with_hook, PipelineOptions, PipelineStep, Sch
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -53,7 +54,7 @@ struct ParsedArgs {
     from_step: Option<usize>,
     to_step: Option<usize>,
     strandness: String,
-    threads: usize,
+    threads: Option<usize>,
     feature_type: String,
     gene_attr: String,
 }
@@ -106,7 +107,7 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         ))
     );
 
-    let (toolchain, use_jx_fastp) = probe_toolchain()?;
+    let (toolchain, use_jx_wrappers) = probe_toolchain()?;
     print_toolchain_line(&toolchain);
     let missing = missing_tools_from_probe(&toolchain);
     if !missing.is_empty() {
@@ -127,6 +128,38 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
 
     let sample_names: Vec<String> = sample_pairs.keys().cloned().collect();
     let metrics_script = ensure_count_metrics_script(&workdir)?;
+    let tool_prefix = if use_jx_wrappers { "jx" } else { "" };
+    let need_step3_align = from_step <= 3 && to_step >= 3;
+    let effective_threads = parsed
+        .threads
+        .unwrap_or_else(|| default_threads_for_backend(&backend));
+    let resolved_strandness = resolve_effective_strandness(
+        &parsed.strandness,
+        need_step3_align,
+        &reference,
+        &annotation,
+        &sample_pairs,
+        &workdir,
+        effective_threads,
+        tool_prefix,
+    )?;
+    if parsed.strandness.trim().eq_ignore_ascii_case("auto") {
+        println!(
+            "{}",
+            super::style_green(&format!("Auto strandness selected: {resolved_strandness}"))
+        );
+    }
+    let resolved_gene_attr =
+        resolve_effective_gene_attr(&annotation, &parsed.feature_type, &parsed.gene_attr);
+    if parsed.gene_attr.trim().eq_ignore_ascii_case("auto") {
+        println!(
+            "{}",
+            super::style_green(&format!(
+                "Auto gene attribute selected: {}",
+                resolved_gene_attr
+            ))
+        );
+    }
 
     let steps = build_fastq2count_steps(
         &reference,
@@ -135,12 +168,12 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         &sample_names,
         &workdir,
         &backend,
-        &parsed.strandness,
-        parsed.threads,
+        &resolved_strandness,
+        effective_threads,
         &parsed.feature_type,
-        &parsed.gene_attr,
+        &resolved_gene_attr,
         &metrics_script,
-        use_jx_fastp,
+        use_jx_wrappers,
     )?;
 
     let mut opts = PipelineOptions::default();
@@ -351,11 +384,21 @@ fn parse_fastq2count_args(args: &[String]) -> Result<ParsedArgs, String> {
         workdir: PathBuf::from(workdir),
         from_step,
         to_step,
-        strandness: strandness.unwrap_or_else(|| "FR".to_string()),
-        threads: threads.unwrap_or(16),
+        strandness: strandness.unwrap_or_else(|| "auto".to_string()),
+        threads,
         feature_type: feature_type.unwrap_or_else(|| "exon".to_string()),
-        gene_attr: gene_attr.unwrap_or_else(|| "gene_id".to_string()),
+        gene_attr: gene_attr.unwrap_or_else(|| "auto".to_string()),
     })
+}
+
+fn default_threads_for_backend(backend: &str) -> usize {
+    if backend == "csub" {
+        return 32;
+    }
+    std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(16)
+        .max(1)
 }
 
 fn normalize_step_range(
@@ -437,34 +480,37 @@ fn detect_backend() -> (String, String) {
 fn probe_toolchain() -> Result<(Vec<ToolProbe>, bool), String> {
     let jx_bin = env::current_exe().map_err(|e| format!("Failed to locate jx binary: {e}"))?;
     let mut out: Vec<ToolProbe> = Vec::new();
-
-    let fastp_via_jx = probe_jx_tool_wrapper(&jx_bin, "fastp");
-    let fastp_ok = fastp_via_jx || find_in_path("fastp").is_some();
-    out.push((
-        "fastp".to_string(),
-        fastp_ok,
-        true,
-        "jx fastp or fastp".to_string(),
-    ));
+    let mut use_jx_wrappers = false;
 
     for tool in [
+        "fastp",
         "hisat2-build",
         "hisat2",
         "samtools",
         "featureCounts",
-        "python3",
     ] {
+        let host_ok = find_in_path(tool).is_some();
+        let jx_ok = probe_jx_tool_wrapper(&jx_bin, tool);
+        if !host_ok && jx_ok {
+            use_jx_wrappers = true;
+        }
         out.push((
             tool.to_string(),
-            find_in_path(tool).is_some(),
+            host_ok || jx_ok,
             true,
-            tool.to_string(),
+            format!("jx {tool} or {tool}"),
         ));
     }
+    out.push((
+        "python3".to_string(),
+        find_in_path("python3").is_some(),
+        true,
+        "python3".to_string(),
+    ));
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok((out, fastp_via_jx))
+    Ok((out, use_jx_wrappers))
 }
 
 fn probe_jx_tool_wrapper(jx_bin: &Path, tool: &str) -> bool {
@@ -816,6 +862,346 @@ fn recognized_fastq_pairing_hint() -> String {
     )
 }
 
+fn resolve_effective_strandness(
+    strandness_arg: &str,
+    need_step3_align: bool,
+    reference: &Path,
+    annotation: &Path,
+    sample_pairs: &BTreeMap<String, (PathBuf, PathBuf)>,
+    workdir: &Path,
+    threads: usize,
+    tool_prefix: &str,
+) -> Result<String, String> {
+    let raw = strandness_arg.trim();
+    if raw.is_empty() {
+        return Ok("none".to_string());
+    }
+    if raw.eq_ignore_ascii_case("none")
+        || raw.eq_ignore_ascii_case("unstranded")
+        || raw.eq_ignore_ascii_case("no")
+    {
+        return Ok("none".to_string());
+    }
+    if raw.eq_ignore_ascii_case("fr") {
+        return Ok("FR".to_string());
+    }
+    if raw.eq_ignore_ascii_case("rf") {
+        return Ok("RF".to_string());
+    }
+    if !raw.eq_ignore_ascii_case("auto") {
+        return Err(format!(
+            "Invalid strandness `{raw}`. Use one of: auto, FR, RF, none."
+        ));
+    }
+    if !need_step3_align {
+        return Ok("none".to_string());
+    }
+    let Some((_, (r1, r2))) = sample_pairs.iter().next() else {
+        return Ok("none".to_string());
+    };
+
+    let index_dir = workdir.join("2.index");
+    ensure_hisat2_index_for_probe(reference, annotation, &index_dir, threads, tool_prefix)?;
+    let idx_prefix = index_dir.join("reference");
+    let probe_threads = threads.clamp(1, 4);
+    let probe_pairs = 200_000usize;
+    let fr = probe_hisat2_strandness_rate(
+        &idx_prefix,
+        r1,
+        r2,
+        "FR",
+        probe_threads,
+        probe_pairs,
+        tool_prefix,
+    )?;
+    let rf = probe_hisat2_strandness_rate(
+        &idx_prefix,
+        r1,
+        r2,
+        "RF",
+        probe_threads,
+        probe_pairs,
+        tool_prefix,
+    )?;
+
+    let chosen = match (fr, rf) {
+        (Some(a), Some(b)) => {
+            let diff = (a - b).abs();
+            if diff < 1.0 {
+                "none".to_string()
+            } else if a > b {
+                "FR".to_string()
+            } else {
+                "RF".to_string()
+            }
+        }
+        (Some(_), None) => "FR".to_string(),
+        (None, Some(_)) => "RF".to_string(),
+        (None, None) => {
+            eprintln!(
+                "{}",
+                super::style_yellow("Warning: auto strandness probe failed. Fallback to `none`.",)
+            );
+            "none".to_string()
+        }
+    };
+    Ok(chosen)
+}
+
+fn ensure_hisat2_index_for_probe(
+    reference: &Path,
+    annotation: &Path,
+    index_dir: &Path,
+    threads: usize,
+    tool_prefix: &str,
+) -> Result<(), String> {
+    if hisat2_index_ready(index_dir) {
+        return Ok(());
+    }
+    fs::create_dir_all(index_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", index_dir.display()))?;
+    let raw = cmd_hisat2_index(
+        reference,
+        annotation,
+        index_dir,
+        threads.clamp(1, 8),
+        tool_prefix,
+    );
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(raw)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (out, elapsed) = super::run_with_spinner(&mut cmd, "Probing strandness: build index ...")?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(&String::from_utf8_lossy(&out.stdout));
+        msg.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Err(format!(
+            "Auto strandness index build failed (exit={}) [{}]: {}",
+            super::exit_code(out.status),
+            super::format_elapsed(elapsed),
+            msg.trim()
+        ));
+    }
+    if !hisat2_index_ready(index_dir) {
+        return Err(
+            "Auto strandness index probe failed: HISAT2 index outputs are incomplete.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn hisat2_index_ready(index_dir: &Path) -> bool {
+    let done = index_dir.join("reference.index.ok");
+    if done.exists() && done.is_file() {
+        return true;
+    }
+    let prefix = index_dir.join("reference");
+    let mut ht2_ok = true;
+    for i in 1..=8 {
+        if !prefix.with_extension(format!("{i}.ht2")).exists() {
+            ht2_ok = false;
+            break;
+        }
+    }
+    if ht2_ok {
+        return true;
+    }
+    let mut ht2l_ok = true;
+    for i in 1..=8 {
+        if !prefix.with_extension(format!("{i}.ht2l")).exists() {
+            ht2l_ok = false;
+            break;
+        }
+    }
+    ht2l_ok
+}
+
+fn probe_hisat2_strandness_rate(
+    index_prefix: &Path,
+    r1: &Path,
+    r2: &Path,
+    strand: &str,
+    threads: usize,
+    probe_pairs: usize,
+    tool_prefix: &str,
+) -> Result<Option<f64>, String> {
+    let strand_opt = if strand.eq_ignore_ascii_case("none") {
+        String::new()
+    } else {
+        format!(" --rna-strandness {}", cmd::sh_quote(strand))
+    };
+    let prefix = if tool_prefix.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{} ", tool_prefix.trim())
+    };
+    let shell = format!(
+        "{prefix}hisat2 -p {} --new-summary{} -x {} -1 {} -2 {} -u {} -S /dev/null",
+        threads.max(1),
+        strand_opt,
+        cmd::sh_quote(&index_prefix.to_string_lossy()),
+        cmd::sh_quote(&r1.to_string_lossy()),
+        cmd::sh_quote(&r2.to_string_lossy()),
+        probe_pairs.max(10_000),
+    );
+    let out = Command::new("bash")
+        .arg("-lc")
+        .arg(shell)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run hisat2 strandness probe ({strand}): {e}"))?;
+    let mut merged = String::new();
+    merged.push_str(&String::from_utf8_lossy(&out.stdout));
+    merged.push('\n');
+    merged.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(parse_hisat2_overall_rate(&merged))
+}
+
+fn parse_hisat2_overall_rate(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("overall alignment rate") {
+            continue;
+        }
+        let Some(pct_idx) = line.find('%') else {
+            continue;
+        };
+        let lhs = &line[..pct_idx];
+        let token = lhs
+            .split_whitespace()
+            .last()
+            .map(str::trim)
+            .unwrap_or_default()
+            .trim_end_matches('%')
+            .trim();
+        if let Ok(v) = token.parse::<f64>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn resolve_effective_gene_attr(
+    annotation: &Path,
+    feature_type: &str,
+    gene_attr_arg: &str,
+) -> String {
+    let raw = gene_attr_arg.trim();
+    if !raw.is_empty() && !raw.eq_ignore_ascii_case("auto") {
+        return raw.to_string();
+    }
+    infer_gene_attr_from_annotation(annotation, feature_type).unwrap_or_else(|| {
+        if looks_like_gff(annotation) {
+            if feature_type.trim().eq_ignore_ascii_case("gene") {
+                "ID".to_string()
+            } else {
+                "Parent".to_string()
+            }
+        } else {
+            "gene_id".to_string()
+        }
+    })
+}
+
+fn looks_like_gff(annotation: &Path) -> bool {
+    let name = annotation
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".gff")
+        || name.ends_with(".gff3")
+        || name.ends_with(".gff.gz")
+        || name.ends_with(".gff3.gz")
+}
+
+fn infer_gene_attr_from_annotation(annotation: &Path, feature_type: &str) -> Option<String> {
+    if annotation
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.eq_ignore_ascii_case("gz"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let file = fs::File::open(annotation).ok()?;
+    let reader = BufReader::new(file);
+    let wanted = feature_type.trim().to_ascii_lowercase();
+    let is_gff = looks_like_gff(annotation);
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen = 0usize;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = s.split('\t').collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        if cols[2].trim().to_ascii_lowercase() != wanted {
+            continue;
+        }
+        for k in extract_attr_keys(cols[8], is_gff) {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+        seen += 1;
+        if seen >= 2000 {
+            break;
+        }
+    }
+    let candidates: &[&str] = if is_gff {
+        &["Parent", "ID", "gene_id", "Name", "gene", "locus_tag"]
+    } else {
+        &["gene_id", "gene", "gene_name", "ID", "Parent"]
+    };
+    let mut best: Option<(String, usize)> = None;
+    for key in candidates {
+        let c = counts.get(*key).copied().unwrap_or(0);
+        if c == 0 {
+            continue;
+        }
+        match &best {
+            Some((_, cur)) if *cur >= c => {}
+            _ => best = Some(((*key).to_string(), c)),
+        }
+    }
+    best.map(|(k, _)| k)
+}
+
+fn extract_attr_keys(attrs: &str, is_gff: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in attrs.split(';') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if is_gff {
+            if let Some((k, _)) = p.split_once('=') {
+                let key = k.trim();
+                if !key.is_empty() {
+                    out.push(key.to_string());
+                }
+            }
+        } else {
+            let mut it = p.split_whitespace();
+            if let Some(k) = it.next() {
+                let key = k.trim();
+                if !key.is_empty() {
+                    out.push(key.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn build_fastq2count_steps(
     reference: &Path,
     annotation: &Path,
@@ -828,7 +1214,7 @@ fn build_fastq2count_steps(
     feature_type: &str,
     gene_attr: &str,
     metrics_script: &Path,
-    use_jx_fastp: bool,
+    use_jx_wrappers: bool,
 ) -> Result<Vec<PipelineStep>, String> {
     let clean_dir = workdir.join("1.clean");
     let clean_qc_dir = clean_dir.join("qc");
@@ -848,12 +1234,50 @@ fn build_fastq2count_steps(
 
     let mut steps: Vec<PipelineStep> = Vec::new();
 
+    let is_csub = backend == "csub";
+    let total_threads = threads.max(1);
+    let fastp_threads = if is_csub {
+        16
+    } else {
+        total_threads.clamp(1, 64)
+    };
+    let fastp_job_cores = if is_csub { 16 } else { fastp_threads };
+
+    let index_threads = if is_csub {
+        16
+    } else {
+        total_threads.clamp(1, 64)
+    };
+    let index_job_cores = if is_csub { 16 } else { index_threads };
+
+    let step3_budget = if is_csub {
+        total_threads.clamp(1, 128)
+    } else {
+        total_threads.clamp(1, 128)
+    };
+    let mut align_threads = (step3_budget * 7) / 10;
+    if align_threads == 0 {
+        align_threads = 1;
+    }
+    if align_threads >= step3_budget {
+        align_threads = step3_budget.saturating_sub(1).max(1);
+    }
+    let sort_threads = step3_budget.saturating_sub(align_threads).max(1);
+    let step3_job_cores = step3_budget;
+
+    let featurecounts_threads = if is_csub {
+        8
+    } else {
+        total_threads.clamp(1, 64)
+    };
+    let featurecounts_job_cores = if is_csub { 8 } else { featurecounts_threads };
+
     // Step 1: fastp
     let mut step1_cmds = Vec::new();
     let mut step1_inputs = Vec::new();
     let mut step1_outputs = Vec::new();
     let mut step1_items = Vec::new();
-    let fastp_prefix = if use_jx_fastp { "jx" } else { "" };
+    let tool_prefix = if use_jx_wrappers { "jx" } else { "" };
     for sample in sample_names {
         let Some((fq1, fq2)) = sample_pairs.get(sample) else {
             return Err(format!("Sample missing FASTQ pair: {sample}"));
@@ -870,13 +1294,13 @@ fn build_fastq2count_steps(
             fq2,
             &clean_dir,
             &clean_qc_dir,
-            threads.min(16),
-            fastp_prefix,
+            fastp_threads,
+            tool_prefix,
         );
         step1_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("fastp.{sample}"),
-            threads.min(16),
+            fastp_job_cores,
             backend,
         ));
         let outs = vec![out_r1, out_r2, out_html, out_json];
@@ -900,11 +1324,17 @@ fn build_fastq2count_steps(
     let index_done = index_dir.join("reference.index.ok");
     let index_ss = index_dir.join("reference.ss");
     let index_exon = index_dir.join("reference.exon");
-    let step2_raw = cmd_hisat2_index(reference, annotation, &index_dir, threads.min(20), "");
+    let step2_raw = cmd_hisat2_index(
+        reference,
+        annotation,
+        &index_dir,
+        index_threads,
+        tool_prefix,
+    );
     let step2_cmds = vec![wrap_scheduler_cmd(
         &step2_raw,
         "hisat2.index",
-        threads.min(20),
+        index_job_cores,
         backend,
     )];
     let step2_outputs = vec![index_done.clone(), index_ss, index_exon];
@@ -927,8 +1357,6 @@ fn build_fastq2count_steps(
     let mut step3_inputs = vec![index_done.clone()];
     let mut step3_outputs = Vec::new();
     let mut step3_items = Vec::new();
-    let align_threads = threads.clamp(1, 32);
-    let sort_threads = ((threads / 2).max(1)).clamp(1, 16);
     for sample in sample_names {
         let in_r1 = clean_dir.join(format!("{sample}.R1.clean.fastq.gz"));
         let in_r2 = clean_dir.join(format!("{sample}.R2.clean.fastq.gz"));
@@ -945,12 +1373,12 @@ fn build_fastq2count_steps(
             align_threads,
             sort_threads,
             Some(strandness),
-            "",
+            tool_prefix,
         );
         step3_cmds.push(wrap_scheduler_cmd(
             &raw,
             &format!("hisat2.{sample}"),
-            align_threads,
+            step3_job_cores,
             backend,
         ));
         let outs = vec![out_bam, out_bai, out_log];
@@ -986,13 +1414,13 @@ fn build_fastq2count_steps(
         &mapping_dir,
         &count_dir,
         metrics_script,
-        threads.clamp(1, 32),
-        "",
+        featurecounts_threads,
+        tool_prefix,
     );
     let step4_cmds = vec![wrap_scheduler_cmd(
         &step4_raw,
         "featurecounts.all",
-        threads.clamp(1, 32),
+        featurecounts_job_cores,
         backend,
     )];
     let step4_outputs = vec![out_counts, out_fpkm, out_tpm];
@@ -1208,14 +1636,14 @@ fn print_fastq2count_help() {
     print_colored_help_entry(
         2,
         Some(("-strandness", "--strandness", "STRAND")),
-        "RNA strandness passed to hisat2 `--rna-strandness` (default: FR). Use `none` to disable.",
+        "RNA strandness passed to hisat2 `--rna-strandness` (default: auto). `auto` probes FR/RF from data; use `none` to disable.",
         42,
         width,
     );
     print_colored_help_entry(
         2,
         Some(("-t", "--threads", "THREADS")),
-        "Worker threads for fastp/hisat2/samtools/featureCounts (default: 16).",
+        "Worker threads for pipeline steps. Default: csub uses 32 for step3 (fastp=16, featureCounts=8), nohup uses all available cores.",
         42,
         width,
     );
@@ -1229,7 +1657,7 @@ fn print_fastq2count_help() {
     print_colored_help_entry(
         2,
         Some(("-gene-attr", "--gene-attr", "ATTR")),
-        "featureCounts -g value (default: gene_id).",
+        "featureCounts -g value (default: auto). For GTF defaults to gene_id; for GFF defaults to Parent/ID by detected feature attributes.",
         42,
         width,
     );

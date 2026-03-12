@@ -29,6 +29,8 @@ from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_hel
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    ensure_file_input_exists,
+    ensure_file_input_site_metadata_exists,
     ensure_plink_prefix_exists,
 )
 from ._common.status import (
@@ -4091,7 +4093,11 @@ def main():
     )
     geno_group.add_argument(
         "-file", "--file", dest="geno", type=str, default=None,
-        help="Optional genotype TXT file for --ldblock/--ldblock-all.",
+        help=(
+            "Optional genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix for "
+            "--ldblock/--ldblock-all. Requires sibling prefix.id. "
+            "For LD/LDclump, also requires real prefix.site or prefix.bim."
+        ),
     )
     optional_group.add_argument(
         "-qq", "--qq", type=str, nargs="?", const="on", default=None,
@@ -4535,7 +4541,15 @@ def main():
     if args.vcf:
         checks.append(ensure_file_exists(logger, args.vcf, "Genotype VCF file"))
     if args.geno:
-        checks.append(ensure_file_exists(logger, args.geno, "Genotype TXT file"))
+        checks.append(ensure_file_input_exists(logger, args.geno, "Genotype FILE input"))
+        if args.ldblock_ratio is not None or args.ldclump_window_bp is not None:
+            checks.append(
+                ensure_file_input_site_metadata_exists(
+                    logger,
+                    args.geno,
+                    "Genotype FILE site metadata for LD/LDclump",
+                )
+            )
     if args.bfile:
         checks.append(ensure_plink_prefix_exists(logger, args.bfile, "Genotype PLINK prefix"))
     if not ensure_all_true(checks):

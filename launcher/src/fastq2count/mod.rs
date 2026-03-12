@@ -82,17 +82,39 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         )
     })?;
 
-    println!("Reference path: {}", reference.display());
-    println!("Annotation path: {}", annotation.display());
+    println!(
+        "{}",
+        super::style_green(&format!("Reference path: {}", reference.display()))
+    );
+    println!(
+        "{}",
+        super::style_green(&format!("Annotation path: {}", annotation.display()))
+    );
 
     let (backend, backend_reason) = detect_backend();
-    println!("Selected backend: {backend}");
+    println!(
+        "{}",
+        super::style_green(&format!("Selected backend: {backend}"))
+    );
     if !backend_reason.is_empty() {
         println!("{}", backend_reason);
     }
+    // Externally we present fastq2count as 3 logical steps:
+    // 1) fastp+hisat2-index, 2) hisat2-align, 3) featurecounts.
+    let display_step = |s: usize| -> usize {
+        if s <= 2 {
+            1
+        } else {
+            s - 1
+        }
+    };
     println!(
-        "Pipeline step range: {} -> {} (inclusive)",
-        from_step, to_step
+        "{}",
+        super::style_green(&format!(
+            "Pipeline step range: {} -> {} (inclusive)",
+            display_step(from_step),
+            display_step(to_step)
+        ))
     );
 
     let (toolchain, use_jx_wrappers) = probe_toolchain()?;
@@ -109,7 +131,10 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
             recognized_fastq_pairing_hint()
         ));
     }
-    println!("Detected {} paired samples.", sample_pairs.len());
+    println!(
+        "{}",
+        super::style_green(&format!("Detected {} paired samples.", sample_pairs.len()))
+    );
 
     let sample_names: Vec<String> = sample_pairs.keys().cloned().collect();
     let metrics_script = ensure_count_metrics_script(&workdir)?;
@@ -137,12 +162,21 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         tool_prefix,
     )?;
     if parsed.strandness.trim().eq_ignore_ascii_case("auto") {
-        println!("Auto strandness selected: {resolved_strandness}");
+        println!(
+            "{}",
+            super::style_green(&format!("Auto strandness selected: {resolved_strandness}"))
+        );
     }
     let resolved_gene_attr =
         resolve_effective_gene_attr(&annotation, &parsed.feature_type, &parsed.gene_attr);
     if parsed.gene_attr.trim().eq_ignore_ascii_case("auto") {
-        println!("Auto gene attribute selected: {}", resolved_gene_attr);
+        println!(
+            "{}",
+            super::style_green(&format!(
+                "Auto gene attribute selected: {}",
+                resolved_gene_attr
+            ))
+        );
     }
 
     let steps = build_fastq2count_steps(
@@ -174,9 +208,14 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
 
     let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
     if from_step == 1 && to_step >= 2 {
-        println!("Parallel preprocessing enabled: fastp + hisat2-index");
+        println!(
+            "{}",
+            super::style_green("Parallel preprocessing enabled: fastp + hisat2-index")
+        );
+        let merged_total_steps = 1 + to_step.saturating_sub(2);
         let mut pre_opts = base_opts.clone();
         pre_opts.step_index_offset = 0;
+        pre_opts.display_total_steps = Some(merged_total_steps);
         if matches!(pre_opts.scheduler, Scheduler::Nohup) {
             // Allow fastp and index jobs to overlap, while keeping later stages serial.
             pre_opts.nohup_max_jobs = 2;
@@ -186,7 +225,8 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
 
         if to_step > 2 {
             let mut tail_opts = base_opts.clone();
-            tail_opts.step_index_offset = 2;
+            tail_opts.step_index_offset = 1;
+            tail_opts.display_total_steps = Some(merged_total_steps);
             run_pipeline_with_hook(&workdir, &steps[2..to_step], &tail_opts, &mut noop_hook)?;
         }
     } else {
@@ -211,10 +251,19 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
     let out_counts = workdir.join("4.count").join("gene_counts.txt");
     let out_fpkm = workdir.join("4.count").join("gene_counts.fpkm.tsv");
     let out_tpm = workdir.join("4.count").join("gene_counts.tpm.tsv");
-    println!("FASTQ2COUNT completed.");
-    println!("Count table: {}", out_counts.display());
-    println!("FPKM table: {}", out_fpkm.display());
-    println!("TPM table: {}", out_tpm.display());
+    println!("{}", super::style_green("FASTQ2COUNT completed."));
+    println!(
+        "{}",
+        super::style_green(&format!("Count table: {}", out_counts.display()))
+    );
+    println!(
+        "{}",
+        super::style_green(&format!("FPKM table: {}", out_fpkm.display()))
+    );
+    println!(
+        "{}",
+        super::style_green(&format!("TPM table: {}", out_tpm.display()))
+    );
 
     Ok(0)
 }
@@ -543,9 +592,13 @@ fn wrapper_missing_by_output(text: &str) -> bool {
 }
 
 fn print_toolchain_line(toolchain: &[ToolProbe]) {
-    let mut segs: Vec<String> = Vec::with_capacity(toolchain.len());
-    for (tool, _, _, _) in toolchain {
-        segs.push(tool.to_string());
+    let mut segs = Vec::with_capacity(toolchain.len());
+    for (tool, ok, _, _) in toolchain {
+        if *ok {
+            segs.push(super::style_green(tool));
+        } else {
+            segs.push(super::style_yellow(tool));
+        }
     }
     println!("{}", segs.join(" "));
 }

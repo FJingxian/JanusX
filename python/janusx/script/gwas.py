@@ -586,12 +586,53 @@ def _warn_gwas_cache_fallback_once(
         warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
 
+def _normalize_cache_warning_message(msg: str) -> str:
+    s = str(msg).strip()
+    prefix = "No write permission for genotype-side cache directory:"
+    marker = ". Falling back to cache directory from JANUSX_CACHE_DIR:"
+    if s.startswith(prefix) and marker in s:
+        try:
+            left, right = s.split(marker, 1)
+            src = left[len(prefix):].strip()
+            dst = right.strip()
+            src_abs = os.path.abspath(os.path.expanduser(src))
+            dst_abs = os.path.abspath(os.path.expanduser(dst))
+            return f"{prefix} {src_abs}{marker} {dst_abs}"
+        except Exception:
+            return s
+    return s
+
+
+def _dedupe_cache_warning_messages(msgs: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in msgs:
+        s = _normalize_cache_warning_message(str(m))
+        if s == "" or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _is_cache_warning_message(msg: str) -> bool:
+    s = str(msg).lower()
+    if s == "":
+        return False
+    return (
+        "cache" in s
+        or "no write permission for genotype-side cache directory" in s
+        or "janusx_cache_dir" in s
+    )
+
+
 def _resolve_gwas_cache_dir(
     genofile: str,
     *,
     cache_dir: Union[str, None] = None,
     logger: Union[logging.Logger, None] = None,
     emit_warning: bool = True,
+    warning_collector: Union[list[str], None] = None,
 ) -> str:
     geno_dir = os.path.abspath(os.path.dirname(str(genofile)) or ".")
     if _is_writable_dir(geno_dir):
@@ -608,15 +649,19 @@ def _resolve_gwas_cache_dir(
             pass
         if _is_writable_dir(fallback_dir):
             if bool(emit_warning):
-                _warn_gwas_cache_fallback_once(
-                    f"{geno_dir}->{fallback_dir}",
-                    (
-                        "No write permission for genotype-side cache directory: "
-                        f"{geno_dir}. Falling back to cache directory from "
-                        f"JANUSX_CACHE_DIR: {fallback_dir}"
-                    ),
-                    logger=logger,
+                msg = (
+                    "No write permission for genotype-side cache directory: "
+                    f"{geno_dir}. Falling back to cache directory from "
+                    f"JANUSX_CACHE_DIR: {fallback_dir}"
                 )
+                if warning_collector is not None:
+                    warning_collector.append(msg)
+                else:
+                    _warn_gwas_cache_fallback_once(
+                        f"{geno_dir}->{fallback_dir}",
+                        msg,
+                        logger=logger,
+                    )
             return fallback_dir
 
     return geno_dir
@@ -628,6 +673,7 @@ def genotype_cache_prefix(
     snps_only: bool = True,
     cache_dir: Union[str, None] = None,
     logger: Union[logging.Logger, None] = None,
+    warning_collector: Union[list[str], None] = None,
 ) -> str:
     """
     Construct a cache prefix for GWAS GRM/Q caches.
@@ -646,6 +692,7 @@ def genotype_cache_prefix(
         genofile,
         cache_dir=cache_dir,
         logger=logger,
+        warning_collector=warning_collector,
     )
     prefix = os.path.join(cache_root, base).replace("\\", "/")
     if low.endswith((".vcf.gz", ".vcf")) and (not bool(snps_only)):
@@ -1433,6 +1480,7 @@ def _inspect_genotype_with_status(
     *,
     use_spinner: bool = False,
     snps_only: bool = True,
+    warning_collector: Union[list[str], None] = None,
 ) -> tuple[np.ndarray, int]:
     """
     Inspect genotype metadata with optional cache-status spinner.
@@ -1636,11 +1684,14 @@ def _inspect_genotype_with_status(
             raise err["value"]
 
         ids, n_snps = out["value"]
-        for wmsg in warn_msgs:
-            if use_spinner:
-                print(f"Warning: {wmsg}", flush=True)
-            else:
-                logger.warning(wmsg)
+        if warning_collector is not None:
+            warning_collector.extend(warn_msgs)
+        else:
+            for wmsg in warn_msgs:
+                if use_spinner:
+                    print(f"Warning: {wmsg}", flush=True)
+                else:
+                    logger.warning(wmsg)
         task.desc = f"Loading genotype from {src}... SNP={n_snps}"
         task.complete(f"Loading genotype from {src} (n={len(ids)}, nSNP={n_snps})")
         _log_info(logger, f"Cached genotype sites: {n_snps}", use_spinner=use_spinner)
@@ -2069,12 +2120,23 @@ def prepare_streaming_context(
         use_spinner=use_spinner,
     )
 
-    ids, n_snps = _inspect_genotype_with_status(
-        genofile,
-        logger,
-        use_spinner=use_spinner,
-        snps_only=bool(snps_only),
-    )
+    deferred_cache_warnings: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ids, n_snps = _inspect_genotype_with_status(
+            genofile,
+            logger,
+            use_spinner=use_spinner,
+            snps_only=bool(snps_only),
+            warning_collector=deferred_cache_warnings,
+        )
+        for w in caught:
+            try:
+                msg = str(w.message).strip()
+            except Exception:
+                msg = ""
+            if _is_cache_warning_message(msg):
+                deferred_cache_warnings.append(msg)
     n_samples = len(ids)
     _log_info(
         logger,
@@ -2086,6 +2148,7 @@ def prepare_streaming_context(
         genofile,
         snps_only=bool(snps_only),
         logger=logger,
+        warning_collector=deferred_cache_warnings,
     )
     _log_info(
         logger,
@@ -2101,50 +2164,59 @@ def prepare_streaming_context(
     grm: Union[np.ndarray, None] = None
     eff_m = n_snps
     grm_ids = None
-    if need_grm:
-        # GRM stream...
-        grm, eff_m, grm_ids = load_or_build_grm_with_cache(
-            genofile=genofile,
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if need_grm:
+            # GRM stream...
+            grm, eff_m, grm_ids = load_or_build_grm_with_cache(
+                genofile=genofile,
+                cache_prefix=cache_prefix,
+                mgrm=mgrm,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                chunk_size=chunk_size,
+                threads=threads,
+                mmap_limit=mmap_limit,
+                logger=logger,
+                use_spinner=use_spinner,
+                ids_preloaded=ids,
+                n_snps_preloaded=n_snps,
+                snps_only=bool(snps_only),
+            )
+        else:
+            _rich_success(
+                logger,
+                "Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.",
+                use_spinner=use_spinner,
+            )
+
+        # PCA stream...
+        qmatrix, q_ids = load_or_build_q_with_cache(
+            grm=grm,
+            n_samples=n_samples,
             cache_prefix=cache_prefix,
-            mgrm=mgrm,
-            maf_threshold=maf_threshold,
-            max_missing_rate=max_missing_rate,
-            chunk_size=chunk_size,
-            threads=threads,
-            mmap_limit=mmap_limit,
+            pcdim=pcdim,
+            ids=ids,
             logger=logger,
             use_spinner=use_spinner,
-            ids_preloaded=ids,
-            n_snps_preloaded=n_snps,
+        )
+
+        cov_all, cov_ids = _load_covariate_for_streaming(
+            cov_inputs,
+            genofile,
+            ids,
+            chunk_size,
+            logger,
+            use_spinner=use_spinner,
             snps_only=bool(snps_only),
         )
-    else:
-        _rich_success(
-            logger,
-            "Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.",
-            use_spinner=use_spinner,
-        )
-
-    # PCA stream...
-    qmatrix, q_ids = load_or_build_q_with_cache(
-        grm=grm,
-        n_samples=n_samples,
-        cache_prefix=cache_prefix,
-        pcdim=pcdim,
-        ids=ids,
-        logger=logger,
-        use_spinner=use_spinner,
-    )
-
-    cov_all, cov_ids = _load_covariate_for_streaming(
-        cov_inputs,
-        genofile,
-        ids,
-        chunk_size,
-        logger,
-        use_spinner=use_spinner,
-        snps_only=bool(snps_only),
-    )
+        for w in caught:
+            try:
+                msg = str(w.message).strip()
+            except Exception:
+                msg = ""
+            if _is_cache_warning_message(msg):
+                deferred_cache_warnings.append(msg)
 
     # -----------------------------------------
     # Align all data sources to shared IDs
@@ -2239,6 +2311,8 @@ def prepare_streaming_context(
         f"q={'NA' if q_ids is None else len(q_ids)}, "
         f"cov={'NA' if cov_ids is None else len(cov_ids)} -> {len(common_ids)}"
     )
+    for wmsg in _dedupe_cache_warning_messages(deferred_cache_warnings):
+        logger.warning(wmsg)
 
     # index maps
     geno_index = {sid: i for i, sid in enumerate(geno_ids)}

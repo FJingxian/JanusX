@@ -1327,8 +1327,6 @@ fn build_fastq2count_steps(
 
     // Step 2: hisat2-build
     let index_done = index_dir.join("reference.index.ok");
-    let index_ss = index_dir.join("reference.ss");
-    let index_exon = index_dir.join("reference.exon");
     let step2_raw = cmd_hisat2_index(
         reference,
         annotation,
@@ -1342,7 +1340,7 @@ fn build_fastq2count_steps(
         index_job_cores,
         backend,
     )];
-    let step2_outputs = vec![index_done.clone(), index_ss, index_exon];
+    let step2_outputs = vec![index_done.clone()];
     let step2_items = vec![StepItem {
         id: "hisat2.index".to_string(),
         outputs: step2_outputs.clone(),

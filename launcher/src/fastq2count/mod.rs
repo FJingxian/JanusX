@@ -160,26 +160,45 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         tool_prefix,
     )?;
 
-    let mut opts = PipelineOptions::default();
-    opts.scheduler = if backend == "csub" {
+    let mut base_opts = PipelineOptions::default();
+    base_opts.scheduler = if backend == "csub" {
         Scheduler::Csub
     } else {
         Scheduler::Nohup
     };
-    opts.nohup_max_jobs = 1;
-    opts.skip_if_outputs_exist = true;
-    opts.poll_sec = 0.5;
-    opts.detect_failed_logs = true;
-    opts.step_index_offset = from_step.saturating_sub(1);
-    opts.display_total_steps = Some(FASTQ2COUNT_TOTAL_STEPS);
+    base_opts.nohup_max_jobs = 1;
+    base_opts.skip_if_outputs_exist = true;
+    base_opts.poll_sec = 0.5;
+    base_opts.detect_failed_logs = true;
+    base_opts.display_total_steps = Some(FASTQ2COUNT_TOTAL_STEPS);
 
     let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());
-    run_pipeline_with_hook(
-        &workdir,
-        &steps[(from_step - 1)..to_step],
-        &opts,
-        &mut noop_hook,
-    )?;
+    if from_step == 1 && to_step >= 2 {
+        println!("Parallel preprocessing enabled: fastp + hisat2-index");
+        let mut pre_opts = base_opts.clone();
+        pre_opts.step_index_offset = 0;
+        if matches!(pre_opts.scheduler, Scheduler::Nohup) {
+            // Allow fastp and index jobs to overlap, while keeping later stages serial.
+            pre_opts.nohup_max_jobs = 2;
+        }
+        let pre_step = merge_preprocess_steps(&steps[0], &steps[1]);
+        run_pipeline_with_hook(&workdir, &[pre_step], &pre_opts, &mut noop_hook)?;
+
+        if to_step > 2 {
+            let mut tail_opts = base_opts.clone();
+            tail_opts.step_index_offset = 2;
+            run_pipeline_with_hook(&workdir, &steps[2..to_step], &tail_opts, &mut noop_hook)?;
+        }
+    } else {
+        let mut opts = base_opts.clone();
+        opts.step_index_offset = from_step.saturating_sub(1);
+        run_pipeline_with_hook(
+            &workdir,
+            &steps[(from_step - 1)..to_step],
+            &opts,
+            &mut noop_hook,
+        )?;
+    }
 
     if to_step < FASTQ2COUNT_TOTAL_STEPS {
         println!(
@@ -1433,6 +1452,37 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         out.push(p);
     }
     out
+}
+
+fn merge_preprocess_steps(step1: &PipelineStep, step2: &PipelineStep) -> PipelineStep {
+    let mut commands = step1.commands.clone();
+    commands.extend(step2.commands.iter().cloned());
+
+    let mut inputs = step1.inputs.clone();
+    inputs.extend(step2.inputs.iter().cloned());
+
+    let mut outputs = step1.outputs.clone();
+    outputs.extend(step2.outputs.iter().cloned());
+
+    let mut items = step1.items.clone();
+    items.extend(step2.items.iter().cloned());
+
+    let eta = match (step1.eta_minutes, step2.eta_minutes) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    PipelineStep {
+        id: "step1_step2_preprocess".to_string(),
+        name: "fastp+hisat2-index".to_string(),
+        eta_minutes: eta,
+        commands,
+        inputs: dedup_paths(inputs),
+        outputs: dedup_paths(outputs),
+        items,
+    }
 }
 
 fn ensure_count_metrics_script(workdir: &Path) -> Result<PathBuf, String> {

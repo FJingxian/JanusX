@@ -1054,7 +1054,8 @@ fn ensure_hisat2_index_for_probe(
         opts.skip_if_outputs_exist = true;
         opts.poll_sec = 0.5;
         opts.detect_failed_logs = true;
-        opts.display_total_steps = Some(1);
+        // Keep progress display consistent with user-facing fastq2count 3-step flow.
+        opts.display_total_steps = Some(3);
         opts.emit_completion_line = true;
         opts.emit_progress_line = true;
         let mut noop_hook = |_step: &PipelineStep, _item: &StepItem| Ok(());

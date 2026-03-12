@@ -16,10 +16,14 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 9] = [
+const REQUIRED_TOOLS: [&str; 13] = [
     "fastp",
     "bwa-mem2",
     "samblaster",
+    "samtools",
+    "hisat2",
+    "hisat2-build",
+    "featureCounts",
     "gatk",
     "bcftools",
     "tabix",
@@ -27,15 +31,19 @@ const REQUIRED_TOOLS: [&str; 9] = [
     "plink",
     "beagle",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 9] = [
+const DLC_TOOL_ENTRIES: [(&str, &str); 13] = [
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
     ("bwa-mem2", "Short-read alignment"),
+    ("featureCounts", "Read counting"),
     ("fastp", "FASTQ quality control"),
     ("gatk", "Variant discovery toolkit"),
+    ("hisat2", "Splice-aware alignment"),
+    ("hisat2-build", "HISAT2 index builder"),
     ("plink", "Genotype association toolkit"),
     ("samblaster", "Duplicate marking during alignment"),
+    ("samtools", "BAM/CRAM processing"),
     ("tabix", "BGZF indexing and queries"),
 ];
 const JANUSX_SIF_MIRROR_URL: &str =
@@ -198,6 +206,7 @@ RUN [ ! -f /etc/apt/sources.list ] || sed -i \
  && apt-get install -y --no-install-recommends \
     ca-certificates \
     tabix bcftools \
+    samtools hisat2 subread \
     fastp \
     bash gawk coreutils sed grep findutils \
     openjdk-17-jre-headless \
@@ -231,6 +240,10 @@ RUN command -v fastp \
     && BWA_MEM2_PROBE="$(bwa-mem2 index 2>&1 || true)" \
     && ! printf '%s\n' "$BWA_MEM2_PROBE" | grep -qiE 'fail to find the right executable|can not run executable' \
     && command -v samblaster \
+    && command -v samtools \
+    && command -v hisat2 \
+    && command -v hisat2-build \
+    && command -v featureCounts \
     && command -v gatk \
     && command -v bcftools \
     && command -v tabix \
@@ -2476,6 +2489,15 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
             }
             "samblaster" => {
                 out.insert("samblaster".to_string());
+            }
+            "samtools" => {
+                out.insert("samtools".to_string());
+            }
+            "hisat2" | "hisat2-build" => {
+                out.insert("hisat2".to_string());
+            }
+            "featureCounts" => {
+                out.insert("subread".to_string());
             }
             "bcftools" => {
                 out.insert("bcftools".to_string());

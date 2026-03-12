@@ -36,6 +36,7 @@ import pandas as pd
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.log import setup_logging
 from ._common.status import CliStatus, print_success
 
 
@@ -739,17 +740,35 @@ def _write_npy_output(
         raise RuntimeError(f"Written site count mismatch for npy output: {offset} vs {total_sites}")
 
 
-def _validate_parent_ids(source: HybridInputSource, p1_ids: Sequence[str], p2_ids: Sequence[str]) -> None:
+def _validate_parent_ids(
+    source: HybridInputSource,
+    p1_ids: Sequence[str],
+    p2_ids: Sequence[str],
+    *,
+    logger=None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
     available = set(source.sample_ids)
     missing_p1 = [sid for sid in p1_ids if sid not in available]
     missing_p2 = [sid for sid in p2_ids if sid not in available]
     if missing_p1 or missing_p2:
-        msg = []
+        msg_parts: list[str] = []
         if missing_p1:
-            msg.append(f"P1 missing={', '.join(missing_p1[:10])}")
+            msg_parts.append(f"P1 missing={', '.join(missing_p1[:10])}")
         if missing_p2:
-            msg.append(f"P2 missing={', '.join(missing_p2[:10])}")
-        raise ValueError("Parent IDs not found in genotype source. " + " | ".join(msg))
+            msg_parts.append(f"P2 missing={', '.join(missing_p2[:10])}")
+        warn_msg = "Parent IDs not found in genotype source; they will be skipped. " + " | ".join(msg_parts)
+        if logger is not None:
+            logger.warning(warn_msg)
+        else:
+            print(f"Warning: {warn_msg}")
+
+    kept_p1 = [sid for sid in p1_ids if sid in available]
+    kept_p2 = [sid for sid in p2_ids if sid in available]
+    if not kept_p1:
+        raise ValueError("No valid P1 parent IDs remain after filtering by genotype samples.")
+    if not kept_p2:
+        raise ValueError("No valid P2 parent IDs remain after filtering by genotype samples.")
+    return kept_p1, kept_p2, missing_p1, missing_p2
 
 
 def build_parser() -> CliArgumentParser:
@@ -827,6 +846,11 @@ def main() -> None:
     if int(args.chunksize) <= 0:
         raise ValueError("--chunksize must be > 0")
 
+    out_fmt, out_prefix, out_path = _resolve_output_target(args)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    log_path = f"{out_prefix}.hybrid.log"
+    logger = setup_logging(log_path)
+
     with CliStatus("Inspecting genotype input...", enabled=bool(getattr(os.sys.stdout, "isatty", lambda: False)())) as task:
         try:
             if args.vcf:
@@ -842,9 +866,9 @@ def main() -> None:
 
     p1_ids, p1_dup = _load_parent_ids(args.p1)
     p2_ids, p2_dup = _load_parent_ids(args.p2)
-    _validate_parent_ids(source, p1_ids, p2_ids)
-
-    out_fmt, out_prefix, out_path = _resolve_output_target(args)
+    p1_ids, p2_ids, missing_p1, missing_p2 = _validate_parent_ids(
+        source, p1_ids, p2_ids, logger=logger
+    )
     hybrid_ids = _make_hybrid_sample_ids(p1_ids, p2_ids)
     require_real_sites = out_fmt in {"vcf", "plink"}
     if require_real_sites and (not source.has_real_sites):
@@ -859,6 +883,10 @@ def main() -> None:
         print(f"P1 duplicates removed: {', '.join(p1_dup[:10])}")
     if p2_dup:
         print(f"P2 duplicates removed: {', '.join(p2_dup[:10])}")
+    if missing_p1:
+        print(f"P1 missing skipped: {', '.join(missing_p1[:10])}")
+    if missing_p2:
+        print(f"P2 missing skipped: {', '.join(missing_p2[:10])}")
     overlap = sorted(set(p1_ids) & set(p2_ids))
     if overlap:
         shown = ", ".join(overlap[:10])

@@ -82,29 +82,17 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         )
     })?;
 
-    println!(
-        "{}",
-        super::style_green(&format!("Reference path: {}", reference.display()))
-    );
-    println!(
-        "{}",
-        super::style_green(&format!("Annotation path: {}", annotation.display()))
-    );
+    println!("Reference path: {}", reference.display());
+    println!("Annotation path: {}", annotation.display());
 
     let (backend, backend_reason) = detect_backend();
-    println!(
-        "{}",
-        super::style_green(&format!("Selected backend: {backend}"))
-    );
+    println!("Selected backend: {backend}");
     if !backend_reason.is_empty() {
         println!("{}", backend_reason);
     }
     println!(
-        "{}",
-        super::style_green(&format!(
-            "Pipeline step range: {} -> {} (inclusive)",
-            from_step, to_step
-        ))
+        "Pipeline step range: {} -> {} (inclusive)",
+        from_step, to_step
     );
 
     let (toolchain, use_jx_wrappers) = probe_toolchain()?;
@@ -121,10 +109,7 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
             recognized_fastq_pairing_hint()
         ));
     }
-    println!(
-        "{}",
-        super::style_green(&format!("Detected {} paired samples.", sample_pairs.len(),))
-    );
+    println!("Detected {} paired samples.", sample_pairs.len());
 
     let sample_names: Vec<String> = sample_pairs.keys().cloned().collect();
     let metrics_script = ensure_count_metrics_script(&workdir)?;
@@ -136,12 +121,14 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
     };
     let tool_prefix = tool_prefix_owned.as_str();
     let need_step3_align = from_step <= 3 && to_step >= 3;
+    let step2_in_plan = from_step <= 2 && to_step >= 2;
     let effective_threads = parsed
         .threads
         .unwrap_or_else(|| default_threads_for_backend(&backend));
     let resolved_strandness = resolve_effective_strandness(
         &parsed.strandness,
         need_step3_align,
+        step2_in_plan,
         &reference,
         &annotation,
         &sample_pairs,
@@ -150,21 +137,12 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
         tool_prefix,
     )?;
     if parsed.strandness.trim().eq_ignore_ascii_case("auto") {
-        println!(
-            "{}",
-            super::style_green(&format!("Auto strandness selected: {resolved_strandness}"))
-        );
+        println!("Auto strandness selected: {resolved_strandness}");
     }
     let resolved_gene_attr =
         resolve_effective_gene_attr(&annotation, &parsed.feature_type, &parsed.gene_attr);
     if parsed.gene_attr.trim().eq_ignore_ascii_case("auto") {
-        println!(
-            "{}",
-            super::style_green(&format!(
-                "Auto gene attribute selected: {}",
-                resolved_gene_attr
-            ))
-        );
+        println!("Auto gene attribute selected: {}", resolved_gene_attr);
     }
 
     let steps = build_fastq2count_steps(
@@ -214,19 +192,10 @@ pub(crate) fn run_fastq2count_module(args: &[String]) -> Result<i32, String> {
     let out_counts = workdir.join("4.count").join("gene_counts.txt");
     let out_fpkm = workdir.join("4.count").join("gene_counts.fpkm.tsv");
     let out_tpm = workdir.join("4.count").join("gene_counts.tpm.tsv");
-    println!("{}", super::style_green("FASTQ2COUNT completed."));
-    println!(
-        "{}",
-        super::style_green(&format!("Count table: {}", out_counts.display()))
-    );
-    println!(
-        "{}",
-        super::style_green(&format!("FPKM table: {}", out_fpkm.display()))
-    );
-    println!(
-        "{}",
-        super::style_green(&format!("TPM table: {}", out_tpm.display()))
-    );
+    println!("FASTQ2COUNT completed.");
+    println!("Count table: {}", out_counts.display());
+    println!("FPKM table: {}", out_fpkm.display());
+    println!("TPM table: {}", out_tpm.display());
 
     Ok(0)
 }
@@ -555,13 +524,9 @@ fn wrapper_missing_by_output(text: &str) -> bool {
 }
 
 fn print_toolchain_line(toolchain: &[ToolProbe]) {
-    let mut segs = Vec::with_capacity(toolchain.len());
-    for (tool, ok, _, _) in toolchain {
-        if *ok {
-            segs.push(super::style_green(tool));
-        } else {
-            segs.push(super::style_yellow(tool));
-        }
+    let mut segs: Vec<String> = Vec::with_capacity(toolchain.len());
+    for (tool, _, _, _) in toolchain {
+        segs.push(tool.to_string());
     }
     println!("{}", segs.join(" "));
 }
@@ -871,6 +836,7 @@ fn recognized_fastq_pairing_hint() -> String {
 fn resolve_effective_strandness(
     strandness_arg: &str,
     need_step3_align: bool,
+    step2_in_plan: bool,
     reference: &Path,
     annotation: &Path,
     sample_pairs: &BTreeMap<String, (PathBuf, PathBuf)>,
@@ -906,9 +872,20 @@ fn resolve_effective_strandness(
         return Ok("none".to_string());
     };
 
-    let index_dir = workdir.join("2.index");
-    ensure_hisat2_index_for_probe(reference, annotation, &index_dir, threads, tool_prefix)?;
-    let idx_prefix = index_dir.join("reference");
+    let main_index_dir = workdir.join("2.index");
+    let probe_index_dir = if hisat2_index_ready(&main_index_dir) || !step2_in_plan {
+        main_index_dir
+    } else {
+        workdir.join("tmp").join("strandness_probe_index")
+    };
+    ensure_hisat2_index_for_probe(
+        reference,
+        annotation,
+        &probe_index_dir,
+        threads,
+        tool_prefix,
+    )?;
+    let idx_prefix = probe_index_dir.join("reference");
     let probe_threads = threads.clamp(1, 4);
     let probe_pairs = 200_000usize;
     let fr = probe_hisat2_strandness_rate(
@@ -1463,6 +1440,7 @@ fn ensure_count_metrics_script(workdir: &Path) -> Result<PathBuf, String> {
     let script = r###"#!/usr/bin/env python3
 import csv
 import math
+import os
 import sys
 from typing import List
 
@@ -1501,6 +1479,33 @@ def main() -> int:
 
     m = len(header)
     sample_idx = list(range(6, m))
+    def _norm_sample_name(v: str) -> str:
+        x = (v or "").strip()
+        if not x:
+            return x
+        x = x.replace("\\\\", "/")
+        x = os.path.basename(x)
+        lx = x.lower()
+        for suf in (".bam", ".cram", ".sam"):
+            if lx.endswith(suf):
+                x = x[: -len(suf)]
+                lx = x.lower()
+                break
+        if lx.endswith(".sorted"):
+            x = x[: -len(".sorted")]
+        return x or (v or "").strip()
+
+    sample_names: List[str] = []
+    _seen = {}
+    for idx in sample_idx:
+        base = _norm_sample_name(header[idx])
+        k = _seen.get(base, 0) + 1
+        _seen[base] = k
+        if k > 1:
+            base = f"{base}_{k}"
+        sample_names.append(base)
+    out_header = header[:6] + sample_names
+
     lib = [0.0 for _ in sample_idx]
     lengths: List[float] = []
     counts: List[List[float]] = []
@@ -1527,14 +1532,19 @@ def main() -> int:
         for j in range(len(sample_idx)):
             rpk_sum[j] += counts[i][j] / (ln / 1000.0)
 
-    with open(out_fpkm, "w", encoding="utf-8", newline="") as f_fpkm, open(out_tpm, "w", encoding="utf-8", newline="") as f_tpm:
+    with open(in_path, "w", encoding="utf-8", newline="") as f_counts, \
+         open(out_fpkm, "w", encoding="utf-8", newline="") as f_fpkm, \
+         open(out_tpm, "w", encoding="utf-8", newline="") as f_tpm:
+        w_counts = csv.writer(f_counts, delimiter="\t", lineterminator="\n")
         w_fpkm = csv.writer(f_fpkm, delimiter="\t", lineterminator="\n")
         w_tpm = csv.writer(f_tpm, delimiter="\t", lineterminator="\n")
-        w_fpkm.writerow(header)
-        w_tpm.writerow(header)
+        w_counts.writerow(out_header)
+        w_fpkm.writerow(out_header)
+        w_tpm.writerow(out_header)
 
         for i, r in enumerate(rows):
             meta = r[:6]
+            raw_count_row = [r[idx] if idx < len(r) else "0" for idx in sample_idx]
             ln = lengths[i]
             fpkm_row = []
             tpm_row = []
@@ -1549,6 +1559,7 @@ def main() -> int:
                     tpm = (c / (ln / 1000.0)) * 1e6 / denom
                 fpkm_row.append(f"{fpkm:.6f}")
                 tpm_row.append(f"{tpm:.6f}")
+            w_counts.writerow(meta + raw_count_row)
             w_fpkm.writerow(meta + fpkm_row)
             w_tpm.writerow(meta + tpm_row)
 

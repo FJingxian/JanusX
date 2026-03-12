@@ -30,14 +30,14 @@ def ensure_file_input_exists(logger, path: str, label: str = "Genotype file inpu
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
         matrix_candidates = [p]
-        id_candidates = [prefix.with_suffix(".id")]
+        id_candidates = [Path(f"{prefix}.id")]
     elif low.endswith((".txt", ".tsv", ".csv")):
         for ext in (".txt", ".tsv", ".csv"):
             if low.endswith(ext):
                 prefix = Path(str(p)[: -len(ext)])
                 break
         matrix_candidates = [p]
-        id_candidates = [prefix.with_suffix(".id")]
+        id_candidates = [Path(f"{prefix}.id")]
     else:
         prefix = p
         matrix_candidates = [Path(f"{prefix}{ext}") for ext in (".npy", ".txt", ".tsv", ".csv")]

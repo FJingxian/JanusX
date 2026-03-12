@@ -62,6 +62,9 @@ def merge(
     out: PathLike,
     *,
     out_fmt: str = "auto",
+    sample_prefix: bool = False,
+    maf: float = 0.0,
+    geno: float = 1.0,
     check_exists: bool = True,
     return_dict: bool = True,
 ) -> Tuple[object, Dict[str, Any]] | object:
@@ -100,6 +103,15 @@ def merge(
         - VCF  : file path, e.g. "out/merged.vcf.gz"
     out_fmt : {"auto","vcf","plink"}
         Output format selection.
+    sample_prefix : bool
+        If True, prepend dataset prefix in merged sample IDs (e.g. D1_, D2_).
+        Default False.
+    maf : float
+        Drop merged sites with minor allele frequency lower than this threshold.
+        Valid range: [0, 0.5]. Default 0.0.
+    geno : float
+        Drop merged sites with missing rate greater than this threshold.
+        Valid range: [0, 1]. Default 1.0.
     check_exists : bool
         If True, validate inputs exist before calling Rust.
     return_dict : bool
@@ -132,7 +144,7 @@ def merge(
     _ensure_outdir(out_s)
 
     # Call Rust
-    stats = merge_genotypes(xs, out_s, out_fmt)
+    stats = merge_genotypes(xs, out_s, out_fmt, sample_prefix, float(maf), float(geno))
 
     if not return_dict:
         return stats

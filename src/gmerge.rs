@@ -31,6 +31,18 @@ fn is_vcf_path(s: &str) -> bool {
     x.ends_with(".vcf") || x.ends_with(".vcf.gz")
 }
 
+fn has_dataset_prefix(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.len() < 3 || b[0] != b'D' {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 1 && i < b.len() && b[i] == b'_'
+}
+
 fn infer_out_fmt(out: &str, out_fmt: &str) -> Result<OutFmt, String> {
     let f = out_fmt.to_ascii_lowercase();
     if f == "auto" {
@@ -59,11 +71,9 @@ struct SampleKey {
 }
 
 impl SampleKey {
-    /// For VCF header; avoid ':' to reduce tool-compat issues.
+    /// VCF sample name.
     fn vcf_name(&self) -> String {
-        // If you really want "D1:YZW119", change to:
-        // format!("{}:{}", self.fid, self.iid)
-        format!("{}_{}", self.fid, self.iid)
+        self.iid.clone()
     }
 }
 
@@ -95,6 +105,10 @@ pub struct PyMergeStats {
     pub n_sites_dropped_multiallelic: u64,
     #[pyo3(get)]
     pub n_sites_dropped_non_snp: u64,
+    #[pyo3(get)]
+    pub n_sites_dropped_maf: u64,
+    #[pyo3(get)]
+    pub n_sites_dropped_geno: u64,
 
     #[pyo3(get)]
     pub per_input_present_sites: Vec<u64>,
@@ -120,6 +134,8 @@ impl PyMergeStats {
             self.n_sites_dropped_multiallelic,
         )?;
         d.set_item("n_sites_dropped_non_snp", self.n_sites_dropped_non_snp)?;
+        d.set_item("n_sites_dropped_maf", self.n_sites_dropped_maf)?;
+        d.set_item("n_sites_dropped_geno", self.n_sites_dropped_geno)?;
         d.set_item(
             "per_input_present_sites",
             self.per_input_present_sites.clone(),
@@ -800,11 +816,14 @@ impl PlinkBfileWriter {
 // Main merge API (PyO3)
 // ============================================================
 
-#[pyfunction(signature = (inputs, out, out_fmt=None))]
+#[pyfunction(signature = (inputs, out, out_fmt=None, sample_prefix=false, maf=0.0, geno=1.0))]
 pub fn merge_genotypes(
     inputs: Vec<String>,
     out: String,
     out_fmt: Option<String>,
+    sample_prefix: bool,
+    maf: f64,
+    geno: f64,
 ) -> PyResult<PyMergeStats> {
     if inputs.len() < 2 {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -815,6 +834,17 @@ pub fn merge_genotypes(
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
+    if !(0.0..=0.5).contains(&maf) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maf must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&geno) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "geno must be within [0, 1]",
+        ));
+    }
+
     // open inputs
     let mut iters: Vec<InputIter> = Vec::with_capacity(inputs.len());
     for p in inputs.iter() {
@@ -822,22 +852,40 @@ pub fn merge_genotypes(
         iters.push(it);
     }
 
-    // merged samples (FID=D#, IID=raw)
+    // merged samples
     let mut merged_samples: Vec<SampleKey> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_output_names: HashSet<String> = HashSet::new();
     let mut sample_counts: Vec<usize> = Vec::with_capacity(iters.len());
 
     for (i, it) in iters.iter().enumerate() {
-        let fid = format!("D{}", i + 1);
+        let fid = "0".to_string();
         sample_counts.push(it.n_samples());
         for sid in it.sample_ids().iter() {
-            let key = format!("{fid}\t{sid}");
-            if seen.insert(key) {
-                merged_samples.push(SampleKey {
-                    fid: fid.clone(),
-                    iid: sid.clone(),
-                });
+            let base_name = if sample_prefix {
+                if has_dataset_prefix(sid) {
+                    sid.clone()
+                } else {
+                    format!("D{}_{}", i + 1, sid)
+                }
+            } else {
+                sid.clone()
+            };
+            let mut out_name = base_name.clone();
+            if !seen_output_names.insert(out_name.clone()) {
+                let mut k: usize = 2;
+                loop {
+                    let cand = format!("{}__dup{}", base_name, k);
+                    if seen_output_names.insert(cand.clone()) {
+                        out_name = cand;
+                        break;
+                    }
+                    k += 1;
+                }
             }
+            merged_samples.push(SampleKey {
+                fid: fid.clone(),
+                iid: out_name,
+            });
         }
     }
 
@@ -857,10 +905,17 @@ pub fn merge_genotypes(
         n_sites_union_seen: 0,
         n_sites_dropped_multiallelic: 0,
         n_sites_dropped_non_snp: 0,
+        n_sites_dropped_maf: 0,
+        n_sites_dropped_geno: 0,
         per_input_present_sites: vec![0; iters.len()],
         per_input_unaligned_sites: vec![0; iters.len()],
         per_input_absent_sites: vec![0; iters.len()],
     };
+
+    // Keep output unique by genomic coordinate during merge.
+    // Only mark a site as seen after a successful write, so a later valid
+    // record at the same coordinate can still be written if earlier one was dropped.
+    let mut written_site_keys: HashSet<(String, i32)> = HashSet::new();
 
     // writers
     let mut vcf_w: Option<VcfWriter> = None;
@@ -1029,7 +1084,66 @@ pub fn merge_genotypes(
             }
         }
 
+        // QC on merged row (missingness and MAF)
+        let mut called: usize = 0;
+        let mut alt_dosage_sum: usize = 0;
+        for &g in merged_row.iter() {
+            match g {
+                0 => {
+                    called += 1;
+                }
+                1 => {
+                    called += 1;
+                    alt_dosage_sum += 1;
+                }
+                2 => {
+                    called += 1;
+                    alt_dosage_sum += 2;
+                }
+                _ => {}
+            }
+        }
+        let missing_rate = if merged_row.is_empty() {
+            1.0
+        } else {
+            1.0 - (called as f64 / merged_row.len() as f64)
+        };
+        if missing_rate > geno {
+            stats.n_sites_dropped_geno += 1;
+            for &i in idxs.iter() {
+                cur[i] = iters[i].next_snp();
+            }
+            continue;
+        }
+        if maf > 0.0 {
+            let maf_obs = if called == 0 {
+                0.0
+            } else {
+                let af = alt_dosage_sum as f64 / (2.0 * called as f64);
+                if af <= 0.5 {
+                    af
+                } else {
+                    1.0 - af
+                }
+            };
+            if maf_obs < maf {
+                stats.n_sites_dropped_maf += 1;
+                for &i in idxs.iter() {
+                    cur[i] = iters[i].next_snp();
+                }
+                continue;
+            }
+        }
+
         // write
+        let site_key = (min_site.chrom.clone(), min_site.pos);
+        if written_site_keys.contains(&site_key) {
+            // duplicated coordinate, skip writing this record
+            for &i in idxs.iter() {
+                cur[i] = iters[i].next_snp();
+            }
+            continue;
+        }
         match fmt {
             OutFmt::Vcf => {
                 vcf_w
@@ -1046,6 +1160,7 @@ pub fn merge_genotypes(
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             }
         }
+        written_site_keys.insert(site_key);
 
         stats.n_sites_written += 1;
 

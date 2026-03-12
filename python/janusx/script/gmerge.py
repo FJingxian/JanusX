@@ -573,6 +573,27 @@ def build_parser() -> CliArgumentParser:
         default=None,
         help="Prefix for merged output files (default: inferred from first input).",
     )
+    opt.add_argument(
+        "-sample-prefix",
+        "--sample-prefix",
+        action="store_true",
+        default=False,
+        help="Prefix sample IDs by dataset index (D1_, D2_, ...). Default: off.",
+    )
+    opt.add_argument(
+        "-maf",
+        "--maf",
+        type=float,
+        default=0.0,
+        help="Drop merged sites with MAF below this threshold (range: 0-0.5; default: %(default)s).",
+    )
+    opt.add_argument(
+        "-geno",
+        "--geno",
+        type=float,
+        default=1.0,
+        help="Drop merged sites with missing rate above this threshold (range: 0-1; default: %(default)s).",
+    )
     return parser
 
 
@@ -621,6 +642,9 @@ def main(log: bool = True) -> None:
                         ("Format", final_format),
                         ("Output dir", outdir),
                         ("Prefix", prefix),
+                        ("Sample prefix", bool(args.sample_prefix)),
+                        ("MAF", args.maf),
+                        ("GENO", args.geno),
                         ("Log file", log_path),
                     ],
                 ),
@@ -671,6 +695,9 @@ def main(log: bool = True) -> None:
                     inputs=merge_inputs,
                     out=merge_out,
                     out_fmt=merge_fmt,
+                    sample_prefix=bool(args.sample_prefix),
+                    maf=float(args.maf),
+                    geno=float(args.geno),
                     check_exists=True,
                     return_dict=True,
                 )
@@ -710,6 +737,8 @@ def main(log: bool = True) -> None:
         logger.info(f"Union sites seen: {d.get('n_sites_union_seen')}")
         logger.info(f"Dropped multiallelic: {d.get('n_sites_dropped_multiallelic')}")
         logger.info(f"Dropped non-SNP: {d.get('n_sites_dropped_non_snp')}")
+        logger.info(f"Dropped by MAF: {d.get('n_sites_dropped_maf')}")
+        logger.info(f"Dropped by GENO: {d.get('n_sites_dropped_geno')}")
         logger.info(f"Per-input present sites: {d.get('per_input_present_sites')}")
         logger.info(f"Per-input unaligned sites: {d.get('per_input_unaligned_sites')}")
         logger.info(f"Per-input absent sites: {d.get('per_input_absent_sites')}")

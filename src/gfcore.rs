@@ -1,4 +1,5 @@
 // src/gfcore.rs
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -234,16 +235,22 @@ fn strip_cache_prefix(prefix: &Path) -> Option<PathBuf> {
     Some(original)
 }
 
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os: OsString = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
 fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
-    let txt = prefix.with_extension("txt");
+    let txt = append_suffix(prefix, ".txt");
     if txt.exists() {
         return Some(txt);
     }
-    let tsv = prefix.with_extension("tsv");
+    let tsv = append_suffix(prefix, ".tsv");
     if tsv.exists() {
         return Some(tsv);
     }
-    let csv = prefix.with_extension("csv");
+    let csv = append_suffix(prefix, ".csv");
     if csv.exists() {
         return Some(csv);
     }
@@ -251,7 +258,7 @@ fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
 }
 
 fn find_id_with_prefix(prefix: &Path) -> Option<PathBuf> {
-    let id = prefix.with_extension("id");
+    let id = append_suffix(prefix, ".id");
     if id.exists() {
         return Some(id);
     }
@@ -260,13 +267,13 @@ fn find_id_with_prefix(prefix: &Path) -> Option<PathBuf> {
 
 fn find_site_with_prefix(prefix: &Path) -> Option<PathBuf> {
     let candidates = [
-        prefix.with_extension("site"),
-        prefix.with_extension("site.tsv"),
-        prefix.with_extension("site.txt"),
-        prefix.with_extension("site.csv"),
-        prefix.with_extension("sites.tsv"),
-        prefix.with_extension("sites.txt"),
-        prefix.with_extension("sites.csv"),
+        append_suffix(prefix, ".site"),
+        append_suffix(prefix, ".site.tsv"),
+        append_suffix(prefix, ".site.txt"),
+        append_suffix(prefix, ".site.csv"),
+        append_suffix(prefix, ".sites.tsv"),
+        append_suffix(prefix, ".sites.txt"),
+        append_suffix(prefix, ".sites.csv"),
     ];
     for cand in candidates {
         if cand.exists() {
@@ -277,7 +284,7 @@ fn find_site_with_prefix(prefix: &Path) -> Option<PathBuf> {
 }
 
 fn find_bim_with_prefix(prefix: &Path) -> Option<PathBuf> {
-    let bim = prefix.with_extension("bim");
+    let bim = append_suffix(prefix, ".bim");
     if bim.exists() {
         return Some(bim);
     }
@@ -301,13 +308,13 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
                 prefix = p;
             }
             let cache_prefix = cache_prefix_path(&prefix);
-            let npy_path = cache_prefix.with_extension("npy");
+            let npy_path = append_suffix(&cache_prefix, ".npy");
             let id_path = find_id_with_prefix(&prefix)
                 .or_else(|| find_id_with_prefix(&cache_prefix))
-                .unwrap_or_else(|| prefix.with_extension("id"));
+                .unwrap_or_else(|| append_suffix(&prefix, ".id"));
             let src_site_path = find_site_with_prefix(&prefix);
             let src_bim_path = find_bim_with_prefix(&prefix);
-            let cache_bim_path = cache_prefix.with_extension("bim");
+            let cache_bim_path = append_suffix(&cache_prefix, ".bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path: Some(input.to_path_buf()),
@@ -328,11 +335,11 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
                 find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&cache_prefix));
             let id_path = find_id_with_prefix(&prefix)
                 .or_else(|| find_id_with_prefix(&cache_prefix))
-                .unwrap_or_else(|| prefix.with_extension("id"));
+                .unwrap_or_else(|| append_suffix(&prefix, ".id"));
             let src_site_path = find_site_with_prefix(&prefix)
                 .or_else(|| find_site_with_prefix(&cache_prefix));
             let src_bim_path = find_bim_with_prefix(&prefix);
-            let cache_bim_path = cache_prefix_path(&prefix).with_extension("bim");
+            let cache_bim_path = append_suffix(&cache_prefix_path(&prefix), ".bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path,
@@ -349,14 +356,14 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
         // Unknown extension: treat as text matrix path, cache to "<path>.npy".
         let prefix = strip_cache_prefix(input).unwrap_or_else(|| input.to_path_buf());
         let cache_prefix = cache_prefix_path(&prefix);
-        let npy_path = cache_prefix.with_extension("npy");
+        let npy_path = append_suffix(&cache_prefix, ".npy");
         let id_path = find_id_with_prefix(&prefix)
             .or_else(|| find_id_with_prefix(&cache_prefix))
-            .unwrap_or_else(|| prefix.with_extension("id"));
+            .unwrap_or_else(|| append_suffix(&prefix, ".id"));
         let src_site_path = find_site_with_prefix(&prefix)
             .or_else(|| find_site_with_prefix(&cache_prefix));
         let src_bim_path = find_bim_with_prefix(&prefix);
-        let cache_bim_path = cache_prefix.with_extension("bim");
+        let cache_bim_path = append_suffix(&cache_prefix, ".bim");
         return Ok(TxtPaths {
             prefix,
             txt_path: Some(input.to_path_buf()),
@@ -372,16 +379,16 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
     let prefix = strip_cache_prefix(&raw_prefix).unwrap_or(raw_prefix.clone());
     let txt_path = find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&raw_prefix));
     let cache_prefix = cache_prefix_path(&prefix);
-    let npy_path = cache_prefix.with_extension("npy");
+    let npy_path = append_suffix(&cache_prefix, ".npy");
     let id_path = find_id_with_prefix(&prefix)
         .or_else(|| find_id_with_prefix(&raw_prefix))
         .or_else(|| find_id_with_prefix(&cache_prefix))
-        .unwrap_or_else(|| prefix.with_extension("id"));
+        .unwrap_or_else(|| append_suffix(&prefix, ".id"));
     let src_site_path = find_site_with_prefix(&prefix)
         .or_else(|| find_site_with_prefix(&raw_prefix))
         .or_else(|| find_site_with_prefix(&cache_prefix));
     let src_bim_path = find_bim_with_prefix(&prefix);
-    let cache_bim_path = cache_prefix.with_extension("bim");
+    let cache_bim_path = append_suffix(&cache_prefix, ".bim");
     if !npy_path.exists() && txt_path.is_none() {
         return Err(format!("text matrix not found: {path_or_prefix}"));
     }

@@ -18,10 +18,10 @@ Execution mode (automatic)
 
 Caching
 -------
-  - GRM (kinship) and PCA (Q matrix) are cached in the genotype directory
-    for streaming LMM/LM runs:
-      * GRM: {geno_prefix}.k.{method}.npy
-      * Q   : {geno_prefix}.q.{pcdim}.txt
+  - Genotype/GRM/PCA caches use `~prefix` naming with JSON parameter metadata.
+  - GRM and PCA caches for streaming LMM/LM runs:
+      * GRM: ~{geno_prefix}.npy (+ ~{geno_prefix}.npy.id / .json)
+      * PCA: ~{geno_prefix}.eigvec / ~{geno_prefix}.eigval (+ .json)
   - If genotype directory is not writable, cache falls back to
     JANUSX_CACHE_DIR (configured from -o).
 
@@ -44,6 +44,7 @@ import socket
 import argparse
 import logging
 import sys
+import json
 import threading
 import warnings
 import multiprocessing as mp
@@ -694,10 +695,7 @@ def genotype_cache_prefix(
         logger=logger,
         warning_collector=warning_collector,
     )
-    prefix = os.path.join(cache_root, base).replace("\\", "/")
-    if low.endswith((".vcf.gz", ".vcf")) and (not bool(snps_only)):
-        prefix = f"{prefix}.all"
-    return prefix
+    return os.path.join(cache_root, f"~{base}").replace("\\", "/")
 
 def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     """
@@ -750,6 +748,59 @@ def _file_input_sidecars(prefix: str) -> list[str]:
         f"{prefix}.site.csv",
         f"{prefix}.bim",
     ]
+
+
+def _cache_meta_load(path: str) -> dict:
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+
+def _cache_meta_write(path: str, meta: dict) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=True, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _cache_meta_matches(meta: dict, *, kind: str, params: dict) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    if str(meta.get("kind", "")) != str(kind):
+        return False
+    mp = meta.get("params", {})
+    if not isinstance(mp, dict):
+        return False
+    for k, v in params.items():
+        if k not in mp:
+            return False
+        mv = mp.get(k)
+        if isinstance(v, float):
+            try:
+                if abs(float(mv) - float(v)) > 1e-12:
+                    return False
+            except Exception:
+                return False
+        else:
+            if mv != v:
+                return False
+    return True
+
+
+def _build_cache_meta(kind: str, params: dict) -> dict:
+    return {
+        "kind": str(kind),
+        "version": 1,
+        "params": dict(params),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def _basename_only(path: str) -> str:
@@ -1362,20 +1413,7 @@ def _cache_prefix_tilde(genofile: str, *, snps_only: bool = True) -> str:
     """
     Cache prefix used by gfreader for VCF/TXT temporary converted files.
     """
-    p = str(genofile).replace("\\", "/")
-    base = os.path.basename(p)
-    low = base.lower()
-    if low.endswith(".vcf.gz"):
-        stem = base[: -len(".vcf.gz")]
-    elif low.endswith((".vcf", ".txt", ".tsv", ".csv", ".npy")):
-        stem = os.path.splitext(base)[0]
-    else:
-        stem = base
-    cache_root = _resolve_gwas_cache_dir(genofile, emit_warning=False)
-    cprefix = os.path.join(cache_root, f"~{stem}").replace("\\", "/")
-    if (low.endswith(".vcf.gz") or low.endswith(".vcf")) and (not bool(snps_only)):
-        cprefix = f"{cprefix}.all"
-    return cprefix
+    return genotype_cache_prefix(genofile, snps_only=bool(snps_only))
 
 
 def _detect_cache_need(genofile: str, *, snps_only: bool = True) -> tuple[bool, str, list[str]]:
@@ -1823,6 +1861,7 @@ def load_or_build_grm_with_cache(
     mgrm: str,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
     chunk_size: int,
     threads: int,
     mmap_limit: bool,
@@ -1847,24 +1886,52 @@ def load_or_build_grm_with_cache(
 
     grm_ids = None
     if method_is_builtin:
-        # GRM is always additive and shared by add/dom/rec/het scans.
-        km_path = f"{cache_prefix}.k.{mgrm}"
-        id_path = f"{km_path}.npy.id"
-        cache_npy = f"{km_path}.npy"
+        grm_path = f"{cache_prefix}.npy"
+        id_path = f"{grm_path}.id"
+        meta_path = f"{grm_path}.json"
+        expected_meta = _build_cache_meta(
+            "gwas_grm_cache",
+            {
+                "maf": float(maf_threshold),
+                "geno": float(max_missing_rate),
+                "snps_only": bool(snps_only),
+                "het": float(het_threshold),
+                "k": int(mgrm),
+            },
+        )
+
         cache_is_stale = False
-        if os.path.exists(cache_npy):
+        if os.path.exists(grm_path):
             g_mtime = latest_genotype_mtime(genofile)
-            k_mtime = os.path.getmtime(cache_npy)
+            k_mtime = os.path.getmtime(grm_path)
             if g_mtime is not None and g_mtime > k_mtime:
                 cache_is_stale = True
                 logger.warning(
-                    "Warning: Genotype input is newer than cached GRM; rebuilding GRM cache."
+                    "Genotype input is newer than cached GRM; rebuilding GRM cache."
                 )
-        if os.path.exists(cache_npy) and (not cache_is_stale):
-            src = _basename_only(cache_npy)
+            elif not os.path.isfile(meta_path):
+                cache_is_stale = True
+                logger.info("Missing GRM cache metadata; rebuilding cache.")
+            elif not _cache_meta_matches(
+                _cache_meta_load(meta_path),
+                kind="gwas_grm_cache",
+                params=expected_meta["params"],
+            ):
+                cache_is_stale = True
+                logger.info("Detected GRM cache parameter mismatch; rebuilding cache.")
+        if cache_is_stale:
+            for p in (grm_path, id_path, meta_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+        if os.path.exists(grm_path) and (not cache_is_stale):
+            src = _basename_only(grm_path)
             with CliStatus(f"Loading GRM from {src}...", enabled=bool(use_spinner)) as task:
                 try:
-                    grm = np.load(f'{km_path}.npy',mmap_mode='r')
+                    grm = np.load(grm_path, mmap_mode='r')
                     grm = grm.reshape(n_samples, n_samples)
                     grm_ids = _read_id_file(
                         id_path,
@@ -1902,13 +1969,14 @@ def load_or_build_grm_with_cache(
                 use_spinner=use_spinner,
                 snps_only=bool(snps_only),
             )
-            np.save(f'{km_path}.npy', grm)
+            np.save(grm_path, grm)
             pd.Series(ids).to_csv(id_path, sep="\t", index=False, header=False)
+            _cache_meta_write(meta_path, expected_meta)
             grm_ids = ids
-            grm = np.load(f'{km_path}.npy',mmap_mode='r')
+            grm = np.load(grm_path, mmap_mode='r')
             if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
                 raise ValueError(f"GRM must be square; got shape={grm.shape}")
-            _log_file_only(logger, logging.INFO, f"Cached GRM written to {km_path}.npy")
+            _log_file_only(logger, logging.INFO, f"Cached GRM written to {grm_path}")
     else:
         if not os.path.isfile(mgrm):
             msg = f"GRM file not found: {mgrm}"
@@ -1992,7 +2060,12 @@ def load_or_build_q_with_cache(
     n_samples: int,
     cache_prefix: str,
     pcdim: str,
+    mgrm: str,
     ids: np.ndarray,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
     logger,
     use_spinner: bool = False,
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
@@ -2006,17 +2079,48 @@ def load_or_build_q_with_cache(
     q_ids = None
     if pcdim in np.arange(1, n).astype(str):
         dim = int(pcdim)
-        q_path = f"{cache_prefix}.q.{pcdim}.txt"
-        if os.path.exists(q_path):
-            src = _basename_only(q_path)
+        eigvec_path = f"{cache_prefix}.eigvec"
+        eigval_path = f"{cache_prefix}.eigval"
+        q_meta_path = f"{cache_prefix}.eigvec.json"
+        expected_meta = _build_cache_meta(
+            "gwas_pca_cache",
+            {
+                "maf": float(maf_threshold),
+                "geno": float(max_missing_rate),
+                "snps_only": bool(snps_only),
+                "het": float(het_threshold),
+                "k": int(mgrm) if str(mgrm) in {"1", "2"} else str(mgrm),
+                "q": int(dim),
+            },
+        )
+        cache_ready = os.path.exists(eigvec_path) and os.path.exists(eigval_path)
+        if cache_ready:
+            if not os.path.isfile(q_meta_path):
+                cache_ready = False
+                logger.info("Missing PCA cache metadata; rebuilding cache.")
+            elif not _cache_meta_matches(
+                _cache_meta_load(q_meta_path),
+                kind="gwas_pca_cache",
+                params=expected_meta["params"],
+            ):
+                cache_ready = False
+                logger.info("Detected PCA cache parameter mismatch; rebuilding cache.")
+        if cache_ready:
+            src = _basename_only(eigvec_path)
             with CliStatus(f"Loading Q matrix from {src}...", enabled=bool(use_spinner)) as task:
                 try:
-                    try:
-                        q_ids, qmatrix = _read_matrix_with_ids(q_path, logger, "Q")
-                    except Exception:
-                        qmatrix = np.genfromtxt(q_path, dtype="float32")
-                        q_ids = None
-                        logger.warning("Q cache has no IDs; assuming genotype order.")
+                    with open(eigvec_path, "rb") as f:
+                        eigvec = np.load(f)
+                    if eigvec.ndim != 2 or eigvec.shape[0] != n:
+                        raise ValueError(
+                            f"PCA eigvec cache shape mismatch: expected (*,{n}), got {eigvec.shape}"
+                        )
+                    if dim > eigvec.shape[1]:
+                        raise ValueError(
+                            f"PCA cache has only {eigvec.shape[1]} components, requested q={dim}"
+                        )
+                    qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+                    q_ids = ids
                 except Exception:
                     task.fail(f"Loading Q matrix from {src} ...Failed")
                     raise
@@ -2028,11 +2132,32 @@ def load_or_build_q_with_cache(
                 raise ValueError(
                     "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
                 )
-            qmatrix = build_pcs_from_grm(grm, dim, logger, use_spinner=use_spinner)
-            df = pd.DataFrame(np.column_stack([ids.astype(str), qmatrix]))
-            df.to_csv(q_path, sep="\t", header=False, index=False)
+            if use_spinner:
+                with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
+                    try:
+                        eigval, eigvec = np.linalg.eigh(grm)
+                    except Exception:
+                        task.fail(f"Computing top {dim} PCs from GRM ...Failed")
+                        raise
+                    task.complete(
+                        f"Computing top {dim} PCs from GRM (n={eigvec.shape[0]}, nPC={dim})"
+                    )
+            else:
+                logger.info(f"Computing top {dim} PCs from GRM...")
+                eigval, eigvec = np.linalg.eigh(grm)
+                logger.info("PC computation finished.")
+            qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+            with open(eigvec_path, "wb") as f:
+                np.save(f, np.asarray(eigvec, dtype="float32"))
+            with open(eigval_path, "wb") as f:
+                np.save(f, np.asarray(eigval, dtype="float32"))
+            _cache_meta_write(q_meta_path, expected_meta)
             q_ids = ids
-            _log_file_only(logger, logging.INFO, f"Cached Q matrix written to {q_path}")
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Cached PCA written to {eigvec_path} / {eigval_path}",
+            )
     elif pcdim == "0":
         _rich_success(
             logger,
@@ -2152,10 +2277,34 @@ def prepare_streaming_context(
         f"Cache prefix: {cache_prefix}",
         use_spinner=use_spinner,
     )
-    need_generate_q = (
-        pcdim in np.arange(1, n_samples).astype(str)
-        and not os.path.exists(f"{cache_prefix}.q.{pcdim}.txt")
-    )
+    need_generate_q = False
+    if pcdim in np.arange(1, n_samples).astype(str):
+        qdim = int(pcdim)
+        eigvec_path = f"{cache_prefix}.eigvec"
+        eigval_path = f"{cache_prefix}.eigval"
+        q_meta_path = f"{cache_prefix}.eigvec.json"
+        expected_q_meta = _build_cache_meta(
+            "gwas_pca_cache",
+            {
+                "maf": float(maf_threshold),
+                "geno": float(max_missing_rate),
+                "snps_only": bool(snps_only),
+                "het": float(het_threshold),
+                "k": int(mgrm) if str(mgrm) in {"1", "2"} else str(mgrm),
+                "q": int(qdim),
+            },
+        )
+        has_cache = os.path.exists(eigvec_path) and os.path.exists(eigval_path)
+        if (not has_cache):
+            need_generate_q = True
+        elif (not os.path.isfile(q_meta_path)):
+            need_generate_q = True
+        elif (not _cache_meta_matches(
+            _cache_meta_load(q_meta_path),
+            kind="gwas_pca_cache",
+            params=expected_q_meta["params"],
+        )):
+            need_generate_q = True
     need_grm = bool(require_kinship or need_generate_q)
 
     grm: Union[np.ndarray, None] = None
@@ -2171,6 +2320,7 @@ def prepare_streaming_context(
                 mgrm=mgrm,
                 maf_threshold=maf_threshold,
                 max_missing_rate=max_missing_rate,
+                het_threshold=het_threshold,
                 chunk_size=chunk_size,
                 threads=threads,
                 mmap_limit=mmap_limit,
@@ -2193,7 +2343,12 @@ def prepare_streaming_context(
             n_samples=n_samples,
             cache_prefix=cache_prefix,
             pcdim=pcdim,
+            mgrm=mgrm,
             ids=ids,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            het_threshold=het_threshold,
+            snps_only=bool(snps_only),
             logger=logger,
             use_spinner=use_spinner,
         )
@@ -3385,6 +3540,9 @@ def build_qmatrix_farmcpu(
     gfile_prefix: str,
     geno: np.ndarray,
     qdim: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
     cov_inputs: Union[str, list[str], None],
     chunk_size: int,
     logger,
@@ -3403,11 +3561,34 @@ def build_qmatrix_farmcpu(
             logger.info(str(msg))
 
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
-        grm_path = f"{gfile_prefix}.k.1.npy"
+        grm_path = f"{gfile_prefix}.npy"
         id_path = f"{grm_path}.id"
+        meta_path = f"{grm_path}.json"
+        expected_meta = _build_cache_meta(
+            "gwas_grm_cache",
+            {
+                "maf": float(maf_threshold),
+                "geno": float(max_missing_rate),
+                "snps_only": bool(snps_only),
+                "het": float(het_threshold),
+                "k": 1,
+            },
+        )
         n = geno.shape[1]
 
-        if os.path.exists(grm_path):
+        cache_ready = os.path.exists(grm_path)
+        if cache_ready:
+            if not os.path.isfile(meta_path):
+                cache_ready = False
+                _farm_log("Missing GRM cache metadata; rebuilding GRM cache.")
+            elif not _cache_meta_matches(
+                _cache_meta_load(meta_path),
+                kind="gwas_grm_cache",
+                params=expected_meta["params"],
+            ):
+                cache_ready = False
+                _farm_log("Detected GRM cache parameter mismatch; rebuilding GRM cache.")
+        if cache_ready:
             _farm_log(f"* Loading GRM cache for FarmCPU PCA from {grm_path}...")
             grm = np.load(grm_path, mmap_mode="r")
             if grm.size != n * n:
@@ -3439,6 +3620,12 @@ def build_qmatrix_farmcpu(
                     if sample_ids is not None and not os.path.exists(id_path):
                         _farm_log("GRM cache ID file not found; assuming genotype sample order.")
                     return np.asarray(grm, dtype="float32")
+        for p in (grm_path, id_path, meta_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
         _farm_log("* Building GRM cache for FarmCPU PCA...")
         grm = GRM(geno).astype("float32")
@@ -3447,6 +3634,7 @@ def build_qmatrix_farmcpu(
             pd.Series(sample_ids.astype(str)).to_csv(
                 id_path, sep="\t", index=False, header=False
             )
+        _cache_meta_write(meta_path, expected_meta)
         _farm_log(f"Cached GRM written to {grm_path}")
         return grm
 
@@ -3474,28 +3662,71 @@ def build_qmatrix_farmcpu(
         return q
 
     if qdim in np.arange(0, 30).astype(str):
-        q_path = f"{gfile_prefix}.q.{qdim}.txt"
-        if os.path.exists(q_path):
-            q_src = _basename_only(q_path)
-            with CliStatus(
-                f"Loading Q matrix from {q_src}...",
-                enabled=bool(use_spinner and (not quiet_terminal)),
-            ) as task:
-                qmatrix = _maybe_load_with_ids(q_path, geno.shape[1])
-                task.complete(f"Loading Q matrix from {q_src}")
-        elif qdim == "0":
+        eigvec_path = f"{gfile_prefix}.eigvec"
+        eigval_path = f"{gfile_prefix}.eigval"
+        q_meta_path = f"{gfile_prefix}.eigvec.json"
+        if qdim == "0":
             qmatrix = np.array([]).reshape(geno.shape[1], 0)
         else:
-            _farm_log(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
-            grm = _load_or_build_grm_cache_for_pca()
-            _eigval, eigvec = np.linalg.eigh(grm)
-            qmatrix = eigvec[:, -int(qdim):]
-            if sample_ids is not None:
-                df = pd.DataFrame(np.column_stack([sample_ids.astype(str), qmatrix]))
-                df.to_csv(q_path, sep="\t", header=False, index=False)
+            q_int = int(qdim)
+            expected_q_meta = _build_cache_meta(
+                "gwas_pca_cache",
+                {
+                    "maf": float(maf_threshold),
+                    "geno": float(max_missing_rate),
+                    "snps_only": bool(snps_only),
+                    "het": float(het_threshold),
+                    "k": 1,
+                    "q": int(q_int),
+                },
+            )
+            cache_ready = os.path.exists(eigvec_path) and os.path.exists(eigval_path)
+            if cache_ready:
+                if not os.path.isfile(q_meta_path):
+                    cache_ready = False
+                    _farm_log("Missing PCA cache metadata; rebuilding PCA cache.")
+                elif not _cache_meta_matches(
+                    _cache_meta_load(q_meta_path),
+                    kind="gwas_pca_cache",
+                    params=expected_q_meta["params"],
+                ):
+                    cache_ready = False
+                    _farm_log("Detected PCA cache parameter mismatch; rebuilding PCA cache.")
+            if cache_ready:
+                q_src = _basename_only(eigvec_path)
+                with CliStatus(
+                    f"Loading Q matrix from {q_src}...",
+                    enabled=bool(use_spinner and (not quiet_terminal)),
+                ) as task:
+                    with open(eigvec_path, "rb") as f:
+                        eigvec = np.load(f)
+                    if eigvec.ndim != 2 or eigvec.shape[0] != geno.shape[1]:
+                        raise ValueError(
+                            f"PCA eigvec cache shape mismatch: expected ({geno.shape[1]}, *), got {eigvec.shape}"
+                        )
+                    if q_int > eigvec.shape[1]:
+                        raise ValueError(
+                            f"PCA cache has only {eigvec.shape[1]} components, requested q={q_int}"
+                        )
+                    qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
+                    task.complete(f"Loading Q matrix from {q_src}")
             else:
-                np.savetxt(q_path, qmatrix, fmt="%.6f")
-            _farm_log(f"Cached Q matrix written to {q_path}")
+                _farm_log(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
+                for p in (eigvec_path, eigval_path, q_meta_path):
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                grm = _load_or_build_grm_cache_for_pca()
+                eigval, eigvec = np.linalg.eigh(grm)
+                qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
+                with open(eigvec_path, "wb") as f:
+                    np.save(f, np.asarray(eigvec, dtype="float32"))
+                with open(eigval_path, "wb") as f:
+                    np.save(f, np.asarray(eigval, dtype="float32"))
+                _cache_meta_write(q_meta_path, expected_q_meta)
+                _farm_log(f"Cached PCA written to {eigvec_path} / {eigval_path}")
     else:
         q_src = _basename_only(qdim)
         with CliStatus(
@@ -3669,6 +3900,9 @@ def run_farmcpu_fullmem(
                 gfile_prefix=gfile_prefix,
                 geno=geno,
                 qdim=qdim,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+                het_threshold=float(args.het),
                 cov_inputs=cov,
                 chunk_size=args.chunksize,
                 logger=logger,

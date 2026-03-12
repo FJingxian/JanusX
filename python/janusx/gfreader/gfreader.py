@@ -123,25 +123,55 @@ def _cache_prefix(prefix: str, cache_dir: Union[str, None] = None) -> str:
 def _vcf_cache_prefix(prefix: str, snps_only: bool = True, *, cache_dir: Union[str, None] = None) -> str:
     """
     VCF->PLINK cache prefix.
-    - snps_only=True : legacy SNP-only cache (~prefix.*)
-    - snps_only=False: all-biallelic cache (~prefix.all.*)
+    Cache naming no longer encodes snps_only in filename; parameters are tracked in JSON metadata.
     """
-    base = _cache_prefix(prefix, cache_dir=cache_dir)
-    return base if bool(snps_only) else f"{base}.all"
+    return _cache_prefix(prefix, cache_dir=cache_dir)
 
 
 def _plink_cache_meta_path(cache_prefix: str) -> str:
-    return f"{cache_prefix}.meta.json"
+    return f"{cache_prefix}.json"
 
 
-def _expected_plink_cache_meta(*, snps_only: bool) -> dict:
-    return {
+def _expected_plink_cache_meta(
+    *,
+    snps_only: bool,
+    maf: Union[float, None] = None,
+    missing_rate: Union[float, None] = None,
+    het: Union[float, None] = None,
+) -> dict:
+    meta = {
         "kind": "vcf_plink_cache",
         "version": int(_PLINK_CACHE_META_VERSION),
         "snps_only": bool(snps_only),
         # Keep REF==ALT rows in conversion; downstream MAF/missing filters decide.
         "keep_ref_eq_alt": True,
     }
+    if maf is not None:
+        meta["maf"] = float(maf)
+    if missing_rate is not None:
+        meta["geno"] = float(missing_rate)
+    if het is not None:
+        meta["het"] = float(het)
+    return meta
+
+
+def _plink_cache_meta_matches(meta: dict, expected: dict) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    for k, v in expected.items():
+        if k not in meta:
+            return False
+        mv = meta.get(k)
+        if isinstance(v, float):
+            try:
+                if abs(float(mv) - float(v)) > 1e-12:
+                    return False
+            except Exception:
+                return False
+        else:
+            if mv != v:
+                return False
+    return True
 
 
 def _load_plink_cache_meta(cache_prefix: str) -> dict:
@@ -234,47 +264,76 @@ def _resolve_input(path_or_prefix: str):
     return "unknown", prefix, None
 
 
-def _ensure_plink_cache_at(cache_prefix: str, prefix: str, vcf_path: str, *, snps_only: bool = True) -> None:
+def _ensure_plink_cache_at(
+    cache_prefix: str,
+    prefix: str,
+    vcf_path: str,
+    *,
+    snps_only: bool = True,
+    maf: Union[float, None] = None,
+    missing_rate: Union[float, None] = None,
+    het: Union[float, None] = None,
+) -> None:
     cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
-    expect_meta = _expected_plink_cache_meta(snps_only=bool(snps_only))
-
-    if any(os.path.exists(p) for p in cache_files):
-        src_mtime = os.path.getmtime(vcf_path)
-        cache_mtime = min(os.path.getmtime(p) for p in cache_files if os.path.exists(p))
-        if cache_mtime < src_mtime:
-            warnings.warn(
-                (
+    meta_path = _plink_cache_meta_path(cache_prefix)
+    expect_meta = _expected_plink_cache_meta(
+        snps_only=bool(snps_only),
+        maf=maf,
+        missing_rate=missing_rate,
+        het=het,
+    )
+    cache_present = any(os.path.exists(p) for p in cache_files)
+    if cache_present:
+        rebuild_reason = None
+        if not os.path.isfile(meta_path):
+            rebuild_reason = (
+                f"Missing VCF cache metadata for '{prefix}' ({meta_path}). "
+                "Removing cache files and rebuilding."
+            )
+        elif not _is_plink_prefix(cache_prefix):
+            rebuild_reason = (
+                f"Incomplete VCF cache detected for '{prefix}' at '{cache_prefix}'. "
+                "Removing cache files and rebuilding."
+            )
+        else:
+            src_mtime = os.path.getmtime(vcf_path)
+            cache_mtime = min(os.path.getmtime(p) for p in cache_files)
+            if cache_mtime < src_mtime:
+                rebuild_reason = (
                     f"Detected stale VCF cache for '{prefix}': cache files are older than "
                     f"source VCF '{vcf_path}'. Removing and rebuilding."
-                ),
-                RuntimeWarning,
-                stacklevel=2,
-            )
+                )
+            else:
+                meta = _load_plink_cache_meta(cache_prefix)
+                if _plink_cache_meta_matches(meta, expect_meta):
+                    return
+                rebuild_reason = (
+                    f"Detected outdated VCF cache metadata for '{prefix}'. "
+                    "Removing cache files and rebuilding."
+                )
+        if rebuild_reason is not None:
+            warnings.warn(rebuild_reason, RuntimeWarning, stacklevel=2)
             _remove_plink_cache_files(cache_prefix)
-
-    if _is_plink_prefix(cache_prefix):
-        meta = _load_plink_cache_meta(cache_prefix)
-        if meta == expect_meta:
-            return
-        warnings.warn(
-            (
-                f"Detected outdated VCF cache metadata for '{prefix}'. "
-                "Removing cache files and rebuilding."
-            ),
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _remove_plink_cache_files(cache_prefix)
 
     convert_genotypes(vcf_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
     if not _is_plink_prefix(cache_prefix):
         raise RuntimeError(
             f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
         )
-    _write_plink_cache_meta(cache_prefix, expect_meta)
+    meta_to_write = dict(expect_meta)
+    meta_to_write["time"] = int(os.path.getmtime(vcf_path))
+    _write_plink_cache_meta(cache_prefix, meta_to_write)
 
 
-def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True) -> str:
+def _ensure_plink_cache(
+    prefix: str,
+    vcf_path: str,
+    *,
+    snps_only: bool = True,
+    maf: Union[float, None] = None,
+    missing_rate: Union[float, None] = None,
+    het: Union[float, None] = None,
+) -> str:
     primary = _vcf_cache_prefix(prefix, snps_only=snps_only)
     cache_dir = _cache_dir_from_env()
     fallback = (
@@ -293,11 +352,27 @@ def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True) -
                 f"Falling back to cache directory from {_GENO_CACHE_ENV}: {cache_dir}"
             ),
         )
-        _ensure_plink_cache_at(fallback, prefix, vcf_path, snps_only=bool(snps_only))
+        _ensure_plink_cache_at(
+            fallback,
+            prefix,
+            vcf_path,
+            snps_only=bool(snps_only),
+            maf=maf,
+            missing_rate=missing_rate,
+            het=het,
+        )
         return fallback
 
     try:
-        _ensure_plink_cache_at(primary, prefix, vcf_path, snps_only=bool(snps_only))
+        _ensure_plink_cache_at(
+            primary,
+            prefix,
+            vcf_path,
+            snps_only=bool(snps_only),
+            maf=maf,
+            missing_rate=missing_rate,
+            het=het,
+        )
         return primary
     except Exception as ex:
         if fallback is None or (fallback == primary) or (not _looks_like_permission_error(ex)):
@@ -309,12 +384,20 @@ def _ensure_plink_cache(prefix: str, vcf_path: str, *, snps_only: bool = True) -
                 f"Falling back to {_GENO_CACHE_ENV}={cache_dir}."
             ),
         )
-        _ensure_plink_cache_at(fallback, prefix, vcf_path, snps_only=bool(snps_only))
+        _ensure_plink_cache_at(
+            fallback,
+            prefix,
+            vcf_path,
+            snps_only=bool(snps_only),
+            maf=maf,
+            missing_rate=missing_rate,
+            het=het,
+        )
         return fallback
 
 
 def _remove_plink_cache_files(cache_prefix: str) -> None:
-    for ext in ("bed", "bim", "fam", "meta.json"):
+    for ext in ("bed", "bim", "fam", "json", "meta.json"):
         path = f"{cache_prefix}.{ext}"
         if os.path.exists(path):
             os.remove(path)
@@ -771,7 +854,8 @@ def load_genotype_chunks(
     - SNP order (rows) follows the original file order after filtering.
     - VCF/TXT caching itself does not perform maf/missing filtering or imputation.
       Filters are applied during chunk streaming (Rust for PLINK/VCF, Python for TXT/NPY).
-    - VCF cache can be SNP-only or all-biallelic depending on `snps_only`.
+    - VCF cache uses a single `~prefix.*` filename set; `snps_only`/maf/geno/het
+      mode is tracked in `~prefix.json`. Mismatch triggers cache rebuild.
 
     Selection
     ---------
@@ -796,7 +880,14 @@ def load_genotype_chunks(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+        cache_prefix = _ensure_plink_cache(
+            prefix,
+            src_path,
+            snps_only=bool(snps_only),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het=float(het),
+        )
 
         def _iter_cached_bed():
             yield from bed_chunk_reader(
@@ -832,7 +923,14 @@ def load_genotype_chunks(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+            cache_prefix = _ensure_plink_cache(
+                prefix,
+                src_path,
+                snps_only=bool(snps_only),
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+                het=float(het),
+            )
             yield from _iter_cached_bed()
         return
 
@@ -935,7 +1033,11 @@ def inspect_genotype_file(
     if kind == "vcf":
         if src_path is None:
             raise ValueError("VCF source path not found.")
-        cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+        cache_prefix = _ensure_plink_cache(
+            prefix,
+            src_path,
+            snps_only=bool(snps_only),
+        )
         try:
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
@@ -951,7 +1053,11 @@ def inspect_genotype_file(
                 stacklevel=2,
             )
             _remove_plink_cache_files(cache_prefix)
-            cache_prefix = _ensure_plink_cache(prefix, src_path, snps_only=bool(snps_only))
+            cache_prefix = _ensure_plink_cache(
+                prefix,
+                src_path,
+                snps_only=bool(snps_only),
+            )
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
 

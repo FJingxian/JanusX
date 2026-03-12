@@ -106,7 +106,12 @@ def _resolve_input(path_or_prefix: str):
         return "txt", _strip_known_suffix(p), p
 
     if low.endswith(".npy"):
-        return "npy", _strip_known_suffix(p), p
+        prefix = _strip_known_suffix(p)
+        # keep non-cache logical prefix for downstream cache bookkeeping
+        base = os.path.basename(prefix)
+        if base.startswith("~"):
+            prefix = os.path.join(os.path.dirname(prefix), base[1:])
+        return "npy", prefix, p
 
     prefix = p
     if _is_plink_prefix(prefix):
@@ -121,6 +126,9 @@ def _resolve_input(path_or_prefix: str):
         return "txt", prefix, f"{prefix}.tsv"
     if os.path.exists(f"{prefix}.csv"):
         return "txt", prefix, f"{prefix}.csv"
+    # New FILE layout: prefix.npy + prefix.id (+ optional prefix.site)
+    if os.path.exists(f"{prefix}.npy"):
+        return "npy", prefix, f"{prefix}.npy"
     cache_prefix = _cache_prefix(prefix)
     if os.path.exists(f"{cache_prefix}.npy"):
         return "npy", prefix, f"{cache_prefix}.npy"
@@ -562,7 +570,8 @@ def load_genotype_chunks(
 
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
-        "a PLINK prefix (.bed/.bim/.fam), or a TXT matrix path (with header sample IDs)."
+        "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
+        "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
     )
 
 def inspect_genotype_file(
@@ -641,7 +650,8 @@ def inspect_genotype_file(
 
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
-        "a PLINK prefix (.bed/.bim/.fam), or a TXT matrix path (with header sample IDs)."
+        "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
+        "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
     )
 
 

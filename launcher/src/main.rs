@@ -33,7 +33,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 14] = [
+const KNOWN_MODULES: [&str; 16] = [
     "grm",
     "pca",
     "gwas",
@@ -43,13 +43,15 @@ const KNOWN_MODULES: [&str; 14] = [
     "postgarfield",
     "postbsa",
     "fastq2vcf",
+    "hybrid",
+    "gformat",
     "gmerge",
     "webui",
     "sim",
     "simulation",
     "loadanno",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 14] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 16] = [
     ("grm", "Build genomic relationship matrix"),
     ("pca", "Principal component analysis for population structure"),
     ("gwas", "Run genome-wide association analysis"),
@@ -59,6 +61,8 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 14] = [
     ("postgarfield", "Summarize and visualize GARFIELD outputs"),
     ("postbsa", "Post-process and visualize BSA results"),
     ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
+    ("hybrid", "Build pairwise hybrid genotype matrix from parent lists"),
+    ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
     ("gmerge", "Merge genotype/variant tables"),
     ("webui", "Start JanusX web UI (postgwas first)"),
     ("sim", "Quick simulation workflow"),
@@ -4400,6 +4404,20 @@ fn print_cli_help() {
         4,
         "fastq2vcf",
         "Variant-calling pipeline from FASTQ to VCF",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "hybrid",
+        "Build pairwise hybrid genotype matrix from parent lists",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "gformat",
+        "Convert genotype files across plink/vcf/txt/npy",
         12,
         width,
     );

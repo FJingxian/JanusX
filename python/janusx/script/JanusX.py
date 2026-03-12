@@ -30,6 +30,8 @@ Modules:
 
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF
+    hybrid        Build pairwise hybrid genotype matrix from parent lists
+    gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
     webui         Start JanusX web UI (postgwas first)
 
@@ -93,7 +95,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs",
-    "sim", "simulation", "gmerge", "fastq2vcf", "webui", "loadanno",
+    "sim", "simulation", "gformat", "gmerge", "fastq2vcf", "hybrid", "webui", "loadanno",
 ]
 
 

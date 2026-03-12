@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dlc;
+mod fastq2count;
 mod fastq2vcf;
 mod pipeline;
 
@@ -33,7 +34,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 16] = [
+const KNOWN_MODULES: [&str; 17] = [
     "grm",
     "pca",
     "gwas",
@@ -42,6 +43,7 @@ const KNOWN_MODULES: [&str; 16] = [
     "garfield",
     "postgarfield",
     "postbsa",
+    "fastq2count",
     "fastq2vcf",
     "hybrid",
     "gformat",
@@ -51,22 +53,35 @@ const KNOWN_MODULES: [&str; 16] = [
     "simulation",
     "loadanno",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 16] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 17] = [
     ("grm", "Build genomic relationship matrix"),
-    ("pca", "Principal component analysis for population structure"),
+    (
+        "pca",
+        "Principal component analysis for population structure",
+    ),
     ("gwas", "Run genome-wide association analysis"),
     ("postgwas", "Post-process GWAS results and downstream plots"),
     ("gs", "Genomic prediction and model-based selection"),
     ("garfield", "Random-forest based marker-trait association"),
     ("postgarfield", "Summarize and visualize GARFIELD outputs"),
     ("postbsa", "Post-process and visualize BSA results"),
+    (
+        "fastq2count",
+        "RNA-seq pipeline from FASTQ to gene count/FPKM/TPM",
+    ),
     ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
-    ("hybrid", "Build pairwise hybrid genotype matrix from parent lists"),
+    (
+        "hybrid",
+        "Build pairwise hybrid genotype matrix from parent lists",
+    ),
     ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
     ("gmerge", "Merge genotype/variant tables"),
     ("webui", "Start JanusX web UI (postgwas first)"),
     ("sim", "Quick simulation workflow"),
-    ("simulation", "Extended simulation and benchmarking workflow"),
+    (
+        "simulation",
+        "Extended simulation and benchmarking workflow",
+    ),
     ("loadanno", "Load annotation resources"),
 ];
 const MIN_PYTHON_MAJOR: u32 = 3;
@@ -205,6 +220,9 @@ fn run() -> Result<i32, String> {
     if dlc::is_dlc_tool(head) {
         let home = runtime_home()?;
         return dlc::run_dlc_tool(head, &args[1..], &home);
+    }
+    if head == "fastq2count" {
+        return fastq2count::run_fastq2count_module(&args[1..]);
     }
     if head == "fastq2vcf" {
         return fastq2vcf::run_fastq2vcf_module(&args[1..]);
@@ -1656,10 +1674,18 @@ fn replace_current_launcher_binary(
     let install_dir = current
         .parent()
         .ok_or_else(|| "Failed to resolve current jx install directory.".to_string())?;
-    let staged = install_dir.join(if cfg!(windows) { "jx.new.exe" } else { "jx.new" });
+    let staged = install_dir.join(if cfg!(windows) {
+        "jx.new.exe"
+    } else {
+        "jx.new"
+    });
     if staged.exists() {
-        std::fs::remove_file(&staged)
-            .map_err(|e| format!("Failed to remove stale staged launcher {}: {e}", staged.display()))?;
+        std::fs::remove_file(&staged).map_err(|e| {
+            format!(
+                "Failed to remove stale staged launcher {}: {e}",
+                staged.display()
+            )
+        })?;
     }
     std::fs::copy(built_binary, &staged).map_err(|e| {
         format!(
@@ -3324,7 +3350,11 @@ fn pip_install_update(
         Err(e) => {
             #[cfg(target_os = "windows")]
             if is_windows_linker_missing_error(&e) {
-                return Err(format!("{}\n\n{}", windows_msvc_linker_missing_message(), e));
+                return Err(format!(
+                    "{}\n\n{}",
+                    windows_msvc_linker_missing_message(),
+                    e
+                ));
             }
             if spec_requires_rust_build(spec)
                 && !any_rust_toolchain_ready(runtime_home)
@@ -3357,7 +3387,11 @@ fn pip_install_update(
                     Err(e2) => {
                         #[cfg(target_os = "windows")]
                         if is_windows_linker_missing_error(&e2) {
-                            return Err(format!("{}\n\n{}", windows_msvc_linker_missing_message(), e2));
+                            return Err(format!(
+                                "{}\n\n{}",
+                                windows_msvc_linker_missing_message(),
+                                e2
+                            ));
                         }
                         if !any_rust_toolchain_ready(runtime_home)
                             && should_retry_after_installing_rust(&e2)
@@ -3821,7 +3855,8 @@ fn ready_core_python(runtime_home: &Path) -> Option<PathBuf> {
 fn print_version(core_python: Option<&Path>, runtime_home: &Path) {
     let launcher_version = normalize_version_token(LAUNCHER_CARGO_VERSION)
         .unwrap_or_else(|| LAUNCHER_CARGO_VERSION.to_string());
-    let launcher_time = launcher_build_time(core_python, runtime_home).unwrap_or_else(|| "unknown".to_string());
+    let launcher_time =
+        launcher_build_time(core_python, runtime_home).unwrap_or_else(|| "unknown".to_string());
     let core_version = core_python.and_then(installed_version);
     let core_time = core_python.and_then(|py| python_core_update_time(py, runtime_home));
 
@@ -3878,8 +3913,7 @@ fn version_mismatch_hint(launcher_version: &str, core_version: &str) -> Option<S
     match compare_version_tokens(launcher_version, core_version) {
         std::cmp::Ordering::Equal => None,
         std::cmp::Ordering::Less => Some(
-            "launcher version is lower than core packages. Please run `jx -upgrade`."
-                .to_string(),
+            "launcher version is lower than core packages. Please run `jx -upgrade`.".to_string(),
         ),
         std::cmp::Ordering::Greater => Some(
             "core packages version is lower than launcher. Please run `jx -update latest`."
@@ -4400,6 +4434,13 @@ fn print_cli_help() {
     );
     println!();
     println!("  {}", style_blue("Pipeline and utility:"));
+    print_help_entry(
+        4,
+        "fastq2count",
+        "RNA-seq pipeline from FASTQ to gene count/FPKM/TPM",
+        12,
+        width,
+    );
     print_help_entry(
         4,
         "fastq2vcf",
@@ -5021,10 +5062,7 @@ fn pip_install_tail(
                     render_streaming_title_only(desc, elapsed, streamed_lines_before_tail)?;
                     last_render = Instant::now();
                 }
-                if is_tty
-                    && tail_mode_started
-                    && last_render.elapsed() >= refresh_every
-                {
+                if is_tty && tail_mode_started && last_render.elapsed() >= refresh_every {
                     render_tail_title_only(desc, elapsed, max_lines)?;
                     rendered = true;
                     last_render = Instant::now();
@@ -5080,7 +5118,10 @@ fn pip_install_tail(
                 } else {
                     let width = terminal_line_width();
                     let title = truncate_plain_line(
-                        &format!("{final_symbol} {desc}[{}]", format_elapsed_live(start.elapsed())),
+                        &format!(
+                            "{final_symbol} {desc}[{}]",
+                            format_elapsed_live(start.elapsed())
+                        ),
                         width,
                     );
                     if status.success() {
@@ -5196,7 +5237,10 @@ fn render_streaming_failure_compact(
     lines_below: usize,
 ) -> Result<(), String> {
     let width = terminal_line_width();
-    let title = truncate_plain_line(&format!("✘ {desc}[{}]", format_elapsed_live(elapsed)), width);
+    let title = truncate_plain_line(
+        &format!("✘ {desc}[{}]", format_elapsed_live(elapsed)),
+        width,
+    );
     // Move to title row, rewrite as failure, then delete streamed log rows entirely.
     let up = lines_below.saturating_add(1);
     print!("\x1b[{}A", up);
@@ -5216,7 +5260,10 @@ fn render_tail_success_compact(
     max_lines: usize,
 ) -> Result<(), String> {
     let width = terminal_line_width();
-    let title = truncate_plain_line(&format!("✔︎ {desc}[{}]", format_elapsed_live(elapsed)), width);
+    let title = truncate_plain_line(
+        &format!("✔︎ {desc}[{}]", format_elapsed_live(elapsed)),
+        width,
+    );
     // Cursor is currently below the fixed block.
     // Move to title row, print success title, then delete tail log rows entirely.
     print!("\x1b[{}A", max_lines.saturating_add(1));

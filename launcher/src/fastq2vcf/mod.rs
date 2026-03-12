@@ -72,7 +72,7 @@ impl FastqPair {
 #[derive(Clone, Debug)]
 struct ParsedArgs {
     reference: PathBuf,
-    fastq_dir: Option<PathBuf>,
+    input_dir: PathBuf,
     workdir: PathBuf,
     from_step: Option<usize>,
     to_step: Option<usize>,
@@ -110,7 +110,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     let parsed = parse_fastq2vcf_args(args)?;
     let (from_step, to_step, from_step_explicit) =
         normalize_step_range(parsed.from_step, parsed.to_step)?;
-    let (reference, fastq_dir, workdir) = validate_and_resolve_inputs(&parsed)?;
+    let (reference, input_dir, workdir) = validate_and_resolve_inputs(&parsed)?;
 
     fs::create_dir_all(workdir.join("log")).map_err(|e| {
         format!(
@@ -157,7 +157,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         ));
     }
 
-    let discovered = discover_inputs_for_from_step(from_step, fastq_dir.as_deref(), &workdir)?;
+    let discovered = discover_inputs_for_from_step(from_step, &input_dir, &workdir)?;
     let samples = discovered.samples.clone();
     if from_step <= 2 {
         println!(
@@ -348,7 +348,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         if from_step == 2 { Some(&samples) } else { None },
         from_step,
         if from_step >= 3 {
-            fastq_dir.as_deref()
+            Some(input_dir.as_path())
         } else {
             None
         },
@@ -530,11 +530,10 @@ fn print_fastq2vcf_help() {
     print!(" ");
     print!("{}", super::style_green("REFERENCE"));
     print!(" ");
-    print!("[");
     print!("{}", super::style_blue("-i"));
     print!(" ");
-    print!("{}", super::style_green("FASTQ_DIR"));
-    print!("] ");
+    print!("{}", super::style_green("INPUT_DIR"));
+    print!(" ");
     print!("[");
     print!("{}", super::style_blue("-from-step"));
     print!(" ");
@@ -559,6 +558,13 @@ fn print_fastq2vcf_help() {
     );
     print_colored_help_entry(
         2,
+        Some(("-i", "--in", "INPUT_DIR")),
+        "Input directory for current -from-step. This parameter is required.",
+        42,
+        width,
+    );
+    print_colored_help_entry(
+        2,
         Some(("-w", "--workdir", "WORKDIR")),
         "Working directory for outputs.",
         42,
@@ -567,13 +573,6 @@ fn print_fastq2vcf_help() {
     println!();
     println!("{}", super::style_orange("Optional Arguments:"));
     print_colored_help_entry(2, None, "Show this help message and exit.", 42, width);
-    print_colored_help_entry(
-        2,
-        Some(("-i", "--fastq-dir", "FASTQ_DIR")),
-        "Input directory for current -from-step. Required for step 1/2 (FASTQ). Optional for step 3 (Markdup BAM), step 4 (gVCF), and step 5 (GT VCF/lmiss/imiss).",
-        42,
-        width,
-    );
     print_colored_help_entry(
         2,
         Some(("-from-step", "--from-step", "STEP")),
@@ -622,8 +621,8 @@ fn print_fastq2vcf_help() {
     );
     println!();
     println!("{}", super::style_orange("Examples:"));
-    println!("  jx fastq2vcf -r ref.fa -i fastq_dir -w workdir");
-    println!("  jx fastq2vcf -r ref.fa -w workdir -from-step 4 -to-step 6");
+    println!("  jx fastq2vcf -r ref.fa -i raw_fastq_dir -w workdir");
+    println!("  jx fastq2vcf -r ref.fa -i 3.gvcf -w workdir -from-step 4 -to-step 6");
     println!("  jx -update dlc");
     println!();
     println!("{}", super::style_orange("Citation:"));
@@ -731,7 +730,7 @@ fn print_fastq2vcf_step_entry(step: &str, desc: &str, total_width: usize) {
 
 fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
     let mut reference: Option<String> = None;
-    let mut fastq_dir: Option<String> = None;
+    let mut input_dir: Option<String> = None;
     let mut workdir: Option<String> = None;
     let mut from_step: Option<usize> = None;
     let mut to_step: Option<usize> = None;
@@ -748,12 +747,12 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
             i += 1;
             continue;
         }
-        if token == "-i" || token == "--fastq-dir" {
+        if token == "-i" || token == "--in" || token == "--fastq-dir" {
             i += 1;
             if i >= args.len() {
-                return Err("Option `-i/--fastq-dir` requires a value.".to_string());
+                return Err("Option `-i/--in` requires a value.".to_string());
             }
-            fastq_dir = Some(args[i].clone());
+            input_dir = Some(args[i].clone());
             i += 1;
             continue;
         }
@@ -797,8 +796,13 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
             i += 1;
             continue;
         }
+        if let Some(v) = token.strip_prefix("--in=") {
+            input_dir = Some(v.to_string());
+            i += 1;
+            continue;
+        }
         if let Some(v) = token.strip_prefix("--fastq-dir=") {
-            fastq_dir = Some(v.to_string());
+            input_dir = Some(v.to_string());
             i += 1;
             continue;
         }
@@ -830,39 +834,35 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
         ));
     }
 
-    let (Some(reference), Some(workdir)) = (reference, workdir) else {
-        return Err("`-r/--reference` and `-w/--workdir` are required.".to_string());
+    let (Some(reference), Some(input_dir), Some(workdir)) = (reference, input_dir, workdir) else {
+        return Err("`-r/--reference`, `-i/--in`, and `-w/--workdir` are required.".to_string());
     };
 
     Ok(ParsedArgs {
         reference: PathBuf::from(reference),
-        fastq_dir: fastq_dir.map(PathBuf::from),
+        input_dir: PathBuf::from(input_dir),
         workdir: PathBuf::from(workdir),
         from_step,
         to_step,
     })
 }
 
-fn validate_and_resolve_inputs(
-    args: &ParsedArgs,
-) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
+fn validate_and_resolve_inputs(args: &ParsedArgs) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let reference = absolutize_path(&args.reference)?;
     if !reference.exists() || !reference.is_file() {
         return Err(format!("Reference file not found: {}", reference.display()));
     }
 
-    let fastq_dir = if let Some(v) = &args.fastq_dir {
-        let p = absolutize_path(v)?;
-        if !p.exists() || !p.is_dir() {
-            return Err(format!("FASTQ directory not found: {}", p.display()));
-        }
-        Some(p)
-    } else {
-        None
-    };
+    let input_dir = absolutize_path(&args.input_dir)?;
+    if !input_dir.exists() || !input_dir.is_dir() {
+        return Err(format!(
+            "Input directory not found: {}",
+            input_dir.display()
+        ));
+    }
     let workdir = absolutize_path(&args.workdir)?;
 
-    Ok((reference, fastq_dir, workdir))
+    Ok((reference, input_dir, workdir))
 }
 
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
@@ -1748,16 +1748,13 @@ struct StepInputDiscovery {
 
 fn discover_inputs_for_from_step(
     from_step: usize,
-    input_dir: Option<&Path>,
+    input_dir: &Path,
     workdir: &Path,
 ) -> Result<StepInputDiscovery, String> {
     if from_step <= 2 {
-        let Some(fq_dir) = input_dir else {
-            return Err("`-i/--fastq-dir` is required when -from-step is 1 or 2.".to_string());
-        };
-        let fastq_files = collect_fastq_files(fq_dir)?;
+        let fastq_files = collect_fastq_files(input_dir)?;
         if fastq_files.is_empty() {
-            return Err(format!("No FASTQ files found in {}", fq_dir.display()));
+            return Err(format!("No FASTQ files found in {}", input_dir.display()));
         }
         let samples = classify_fastq_pairs(&fastq_files)?;
         if samples.is_empty() {
@@ -1775,9 +1772,7 @@ fn discover_inputs_for_from_step(
     }
 
     if from_step == 3 {
-        let mapping_dir = input_dir
-            .map(|x| x.to_path_buf())
-            .unwrap_or_else(|| workdir.join("2.mapping"));
+        let mapping_dir = input_dir.to_path_buf();
         let sample_names = infer_samples_from_mapping_bam(&mapping_dir, from_step)?;
         if sample_names.is_empty() {
             return Err(format!(
@@ -1794,9 +1789,7 @@ fn discover_inputs_for_from_step(
     }
 
     if from_step == 4 {
-        let gvcf_dir = input_dir
-            .map(|x| x.to_path_buf())
-            .unwrap_or_else(|| workdir.join("3.gvcf"));
+        let gvcf_dir = input_dir.to_path_buf();
         let (sample_names, chroms) = infer_and_validate_gvcf_inputs(&gvcf_dir)?;
         if sample_names.is_empty() {
             return Err(format!(
@@ -1812,9 +1805,7 @@ fn discover_inputs_for_from_step(
     }
 
     if from_step == 5 {
-        let impute_dir = input_dir
-            .map(|x| x.to_path_buf())
-            .unwrap_or_else(|| workdir.join("5.impute"));
+        let impute_dir = input_dir.to_path_buf();
         let chroms = infer_chroms_from_gt_vcf(&impute_dir)?;
         if chroms.is_empty() {
             return Err(format!(

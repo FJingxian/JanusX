@@ -5,9 +5,8 @@ use super::pipeline::{
 mod cmd;
 mod state;
 use cmd::{
-    cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem_then_markdup, cmd_concat_imputed_vcfs,
-    cmd_fastp, cmd_filter_imputed_by_maf_and_missing, cmd_gvcf_to_table_and_gt, sh_quote,
-    wrap_scheduler_cmd,
+    cmd_bam2gvcf, cmd_beagle_impute, cmd_bwamem_then_markdup, cmd_concat_imputed_vcfs, cmd_fastp,
+    cmd_filter_imputed_by_maf_and_missing, cmd_gvcf_to_table_and_gt, sh_quote, wrap_scheduler_cmd,
 };
 use state::{
     inspect_work_state_basic_params, inspect_work_state_params, WorkStateParamStatus,
@@ -258,19 +257,18 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         if let Some(task) = index_task.clone() {
             if fastp_skipped_by_outputs {
                 wait_reference_indexes(&task)?;
-                super::print_success_line(&format!("Step 1/{}: fastp (~15m) ...Skipped", FASTQ2VCF_TOTAL_STEPS));
+                super::print_success_line(&format!(
+                    "Step 1/{}: fastp (~15m) ...Skipped",
+                    FASTQ2VCF_TOTAL_STEPS
+                ));
             } else {
                 let mut fastp_opts = opts.clone();
                 fastp_opts.step_index_offset = 0;
                 fastp_opts.display_total_steps = Some(FASTQ2VCF_TOTAL_STEPS);
                 fastp_opts.emit_completion_line = false;
                 fastp_opts.emit_progress_line = false;
-                let (fastp_elapsed, index_elapsed) = run_fastp_and_index_parallel(
-                    &workdir,
-                    &fastp_step,
-                    &fastp_opts,
-                    &task,
-                )?;
+                let (fastp_elapsed, index_elapsed) =
+                    run_fastp_and_index_parallel(&workdir, &fastp_step, &fastp_opts, &task)?;
                 super::print_success_line(&format!(
                     "Reference index check ...Finished [{}]",
                     super::format_elapsed_live(index_elapsed)
@@ -296,7 +294,10 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
             )?;
             let fastp_elapsed = fastp_start.elapsed();
             if fastp_skipped_by_outputs {
-                super::print_success_line(&format!("Step 1/{}: fastp (~15m) ...Skipped", FASTQ2VCF_TOTAL_STEPS));
+                super::print_success_line(&format!(
+                    "Step 1/{}: fastp (~15m) ...Skipped",
+                    FASTQ2VCF_TOTAL_STEPS
+                ));
             } else {
                 super::print_success_line(&format!(
                     "Step 1/{}: fastp (~15m) ...Finished [{}]",
@@ -346,7 +347,11 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
         true,
         if from_step == 2 { Some(&samples) } else { None },
         from_step,
-        if from_step >= 3 { fastq_dir.as_deref() } else { None },
+        if from_step >= 3 {
+            fastq_dir.as_deref()
+        } else {
+            None
+        },
     )?;
 
     let run_params_json = build_run_params_json(
@@ -411,8 +416,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
                         "{}",
                         super::style_green(&format!(
                             "Auto-resume detected from workdir outputs: Step {}/{}.",
-                            main_step_from,
-                            FASTQ2VCF_TOTAL_STEPS
+                            main_step_from, FASTQ2VCF_TOTAL_STEPS
                         ))
                     );
                 }
@@ -452,10 +456,7 @@ pub(crate) fn run_fastq2vcf_module(args: &[String]) -> Result<i32, String> {
     if to_step < FASTQ2VCF_TOTAL_STEPS {
         println!(
             "{}",
-            super::style_yellow(&format!(
-                "Stopped at step {} by -to-step option.",
-                to_step
-            ))
+            super::style_yellow(&format!("Stopped at step {} by -to-step option.", to_step))
         );
         if to_step >= 4 {
             print_postbsa_summary(&workdir, &samples, &chroms);
@@ -808,18 +809,18 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
         }
         if let Some(v) = token.strip_prefix("--from-step=") {
             let raw = v.trim();
-            let parsed: usize = raw.parse().map_err(|_| {
-                format!("Invalid value for --from-step: {raw} (expect integer)")
-            })?;
+            let parsed: usize = raw
+                .parse()
+                .map_err(|_| format!("Invalid value for --from-step: {raw} (expect integer)"))?;
             from_step = Some(parsed);
             i += 1;
             continue;
         }
         if let Some(v) = token.strip_prefix("--to-step=") {
             let raw = v.trim();
-            let parsed: usize = raw.parse().map_err(|_| {
-                format!("Invalid value for --to-step: {raw} (expect integer)")
-            })?;
+            let parsed: usize = raw
+                .parse()
+                .map_err(|_| format!("Invalid value for --to-step: {raw} (expect integer)"))?;
             to_step = Some(parsed);
             i += 1;
             continue;
@@ -842,7 +843,9 @@ fn parse_fastq2vcf_args(args: &[String]) -> Result<ParsedArgs, String> {
     })
 }
 
-fn validate_and_resolve_inputs(args: &ParsedArgs) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
+fn validate_and_resolve_inputs(
+    args: &ParsedArgs,
+) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
     let reference = absolutize_path(&args.reference)?;
     if !reference.exists() || !reference.is_file() {
         return Err(format!("Reference file not found: {}", reference.display()));
@@ -939,10 +942,7 @@ fn prepare_reference_for_pipeline(reference: &Path, workdir: &Path) -> Result<Pa
     check_readable_nonempty(&out_path)?;
     println!(
         "{}",
-        super::style_yellow(&format!(
-            "Unzipped reference path: {}",
-            out_path.display()
-        ))
+        super::style_yellow(&format!("Unzipped reference path: {}", out_path.display()))
     );
     Ok(out_path)
 }
@@ -972,8 +972,8 @@ fn reference_decompress_needed(src_gz: &Path, dst_plain: &Path) -> Result<bool, 
     if !dst_plain.exists() {
         return Ok(true);
     }
-    let dst_md =
-        fs::metadata(dst_plain).map_err(|e| format!("Failed to stat {}: {e}", dst_plain.display()))?;
+    let dst_md = fs::metadata(dst_plain)
+        .map_err(|e| format!("Failed to stat {}: {e}", dst_plain.display()))?;
     if !dst_md.is_file() || dst_md.len() == 0 {
         return Ok(true);
     }
@@ -1145,15 +1145,13 @@ fn print_toolchain_line(toolchain: &[ToolProbe]) {
 fn missing_tools_from_probe(toolchain: &[ToolProbe]) -> Vec<String> {
     let mut missing = toolchain
         .iter()
-        .filter_map(
-            |(_, ok, required, missing_hint)| {
-                if *required && !*ok {
-                    Some(missing_hint.clone())
-                } else {
-                    None
-                }
-            },
-        )
+        .filter_map(|(_, ok, required, missing_hint)| {
+            if *required && !*ok {
+                Some(missing_hint.clone())
+            } else {
+                None
+            }
+        })
         .collect::<Vec<String>>();
     missing.sort();
     missing.dedup();
@@ -1223,12 +1221,7 @@ fn start_reference_indexing(
     }))
 }
 
-fn wrap_reference_submit_cmd(
-    cmd: &str,
-    safe_job: &str,
-    backend: &str,
-    csub_ncpu: usize,
-) -> String {
+fn wrap_reference_submit_cmd(cmd: &str, safe_job: &str, backend: &str, csub_ncpu: usize) -> String {
     let quoted_cmd = sh_quote(cmd);
     if backend == "csub" {
         let marker = sh_quote(&format!("./log/{}.submitted", safe_job));
@@ -1439,7 +1432,13 @@ fn ensure_reference_fai(reference: &Path) -> Result<(), String> {
 
         if line.first() == Some(&b'>') {
             if let Some(name) = curr_name.take() {
-                rows.push((name, curr_len, curr_offset, curr_line_bases, curr_line_width));
+                rows.push((
+                    name,
+                    curr_len,
+                    curr_offset,
+                    curr_line_bases,
+                    curr_line_width,
+                ));
             }
             let header = String::from_utf8_lossy(&line[1..]);
             let name = header
@@ -1478,7 +1477,13 @@ fn ensure_reference_fai(reference: &Path) -> Result<(), String> {
     }
 
     if let Some(name) = curr_name.take() {
-        rows.push((name, curr_len, curr_offset, curr_line_bases, curr_line_width));
+        rows.push((
+            name,
+            curr_len,
+            curr_offset,
+            curr_line_bases,
+            curr_line_width,
+        ));
     }
     if rows.is_empty() {
         return Err(format!("No contigs found in FASTA {}", reference.display()));
@@ -1827,7 +1832,10 @@ fn discover_inputs_for_from_step(
     Err(format!("Unsupported -from-step value: {from_step}"))
 }
 
-fn infer_samples_from_mapping_bam(mapping: &Path, _from_step: usize) -> Result<Vec<String>, String> {
+fn infer_samples_from_mapping_bam(
+    mapping: &Path,
+    _from_step: usize,
+) -> Result<Vec<String>, String> {
     if !mapping.exists() {
         return Ok(Vec::new());
     }
@@ -1853,14 +1861,16 @@ fn infer_samples_from_mapping_bam(mapping: &Path, _from_step: usize) -> Result<V
     Ok(markdup.keys().cloned().collect())
 }
 
-fn infer_samples_and_chroms_from_gvcf(workdir: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+fn infer_samples_and_chroms_from_gvcf(
+    workdir: &Path,
+) -> Result<(Vec<String>, Vec<String>), String> {
     if !workdir.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
     let mut samples = BTreeMap::<String, ()>::new();
     let mut chroms = BTreeMap::<String, ()>::new();
-    for entry in
-        fs::read_dir(workdir).map_err(|e| format!("Failed to read directory {}: {e}", workdir.display()))?
+    for entry in fs::read_dir(workdir)
+        .map_err(|e| format!("Failed to read directory {}: {e}", workdir.display()))?
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let path = entry.path();
@@ -2717,11 +2727,19 @@ fn estimate_tail_eta_minutes(
 }
 
 fn scale_eta_minutes(value: f64, min_minutes: u64, max_minutes: u64) -> u64 {
-    let raw = if value.is_finite() { value.round() } else { min_minutes as f64 };
+    let raw = if value.is_finite() {
+        value.round()
+    } else {
+        min_minutes as f64
+    };
     raw.max(min_minutes as f64).min(max_minutes as f64) as u64
 }
 
-fn dynamic_impute_threads(chrom: &str, chrom_lens: &BTreeMap<String, u64>, max_threads: usize) -> usize {
+fn dynamic_impute_threads(
+    chrom: &str,
+    chrom_lens: &BTreeMap<String, u64>,
+    max_threads: usize,
+) -> usize {
     let max_threads = max_threads.max(1);
     if max_threads <= 4 {
         return max_threads;
@@ -2811,7 +2829,7 @@ fn wait_for_reference_index_ready(
             }
         }
         if task.is_csub {
-                match csub_job_is_active(&task.safe_job, &task.marker_path) {
+            match csub_job_is_active(&task.safe_job, &task.marker_path) {
                 Ok(true) => {
                     csub_last_active = Instant::now();
                     csub_probe_issue = None;
@@ -2976,7 +2994,9 @@ fn run_fastp_and_index_parallel(
                 }
                 Err(TryRecvError::Disconnected) => {
                     index_elapsed = index_start.elapsed();
-                    index_done = Some(Err("reference index worker disconnected unexpectedly".to_string()));
+                    index_done = Some(Err(
+                        "reference index worker disconnected unexpectedly".to_string()
+                    ));
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -3094,10 +3114,7 @@ fn csub_job_is_active(_safe_job: &str, marker_path: &Path) -> Result<bool, Strin
             continue;
         }
         let stat = cols[2].trim().to_ascii_uppercase();
-        let active = matches!(
-            stat.as_str(),
-            "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP"
-        );
+        let active = matches!(stat.as_str(), "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP");
         if !active {
             continue;
         }

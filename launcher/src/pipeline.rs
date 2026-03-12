@@ -173,7 +173,9 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         {
             let pending_idx = pending_item_indices(step);
             if !pending_idx.is_empty() {
-                if let Ok(running_idx) = find_running_csub_items_for_pending(workdir, step, &pending_idx) {
+                if let Ok(running_idx) =
+                    find_running_csub_items_for_pending(workdir, step, &pending_idx)
+                {
                     if !running_idx.is_empty() {
                         let submit_idx: Vec<usize> = pending_idx
                             .iter()
@@ -254,7 +256,13 @@ pub(crate) fn run_pipeline_with_hook<H: PipelineHook>(
         }
         if interrupt_requested() {
             terminate_step_script(&mut script_child);
-            return handle_interrupt_for_step(workdir, &step_text, step, opts, &pending_item_indices(step));
+            return handle_interrupt_for_step(
+                workdir,
+                &step_text,
+                step,
+                opts,
+                &pending_item_indices(step),
+            );
         }
         let pre_wait_elapsed = step_exec_start.elapsed();
         wait_step_outputs(
@@ -417,7 +425,10 @@ fn is_step_outputs_ready(step: &PipelineStep) -> bool {
         return true;
     }
     if !step.items.is_empty() {
-        return step.items.iter().all(|item| all_outputs_ready(&item.outputs));
+        return step
+            .items
+            .iter()
+            .all(|item| all_outputs_ready(&item.outputs));
     }
     false
 }
@@ -488,10 +499,7 @@ fn query_cjobs_active_jobs() -> Result<Vec<CsubJobInfo>, String> {
             continue;
         }
         let stat = cols[2].to_ascii_uppercase();
-        let active = matches!(
-            stat.as_str(),
-            "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP"
-        );
+        let active = matches!(stat.as_str(), "RUN" | "PEND" | "PSUSP" | "USUSP" | "SSUSP");
         if !active {
             continue;
         }
@@ -731,17 +739,17 @@ fn wait_step_outputs(
                     ));
                 }
             }
-                if done >= total {
-                    if script_child.is_some() {
-                        if opts.emit_progress_line {
-                            render_step_progress(
-                                step_text,
-                                done,
-                                total,
-                                pre_wait_elapsed + start.elapsed(),
-                                0,
-                            )?;
-                        }
+            if done >= total {
+                if script_child.is_some() {
+                    if opts.emit_progress_line {
+                        render_step_progress(
+                            step_text,
+                            done,
+                            total,
+                            pre_wait_elapsed + start.elapsed(),
+                            0,
+                        )?;
+                    }
                     thread::sleep(super::spinner_refresh_interval(
                         pre_wait_elapsed + start.elapsed(),
                     ));
@@ -858,8 +866,14 @@ fn wait_step_outputs(
             if done < total {
                 clear_progress_line_if_tty()?;
                 if opts.detect_failed_logs {
-                    let failed =
-                        find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4, ignore_error_logs)?;
+                    let failed = find_failed_item_logs_for_pending(
+                        workdir,
+                        step,
+                        &pending,
+                        3,
+                        4,
+                        ignore_error_logs,
+                    )?;
                     if !failed.is_empty() {
                         return Err(format!(
                             "{step_text} detected failed subtasks. Example stderr:\n{}",
@@ -892,8 +906,14 @@ fn wait_step_outputs(
             let scan_interval = Duration::from_secs_f64((opts.poll_sec * 3.0).max(2.0));
             if last_error_scan.elapsed() >= scan_interval {
                 last_error_scan = Instant::now();
-                let failed =
-                    find_failed_item_logs_for_pending(workdir, step, &pending, 3, 4, ignore_error_logs)?;
+                let failed = find_failed_item_logs_for_pending(
+                    workdir,
+                    step,
+                    &pending,
+                    3,
+                    4,
+                    ignore_error_logs,
+                )?;
                 if !failed.is_empty() {
                     clear_progress_line_if_tty()?;
                     return Err(format!(
@@ -1210,8 +1230,7 @@ fn is_csub_failure_marker_line(s: &str) -> bool {
     // csub frequently emits this line when a task stderr is produced.
     // For pending items this is a strong failure signal even when detailed
     // stderr lines are missing or delayed.
-    s.starts_with("job ")
-        && s.contains(" stderr output")
+    s.starts_with("job ") && s.contains(" stderr output")
 }
 
 fn is_benign_stderr_line(line: &str) -> bool {

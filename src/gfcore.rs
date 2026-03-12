@@ -208,6 +208,8 @@ struct TxtPaths {
     prefix: PathBuf,
     txt_path: Option<PathBuf>,
     npy_path: PathBuf,
+    id_path: PathBuf,
+    src_site_path: Option<PathBuf>,
     src_bim_path: Option<PathBuf>,
     cache_bim_path: PathBuf,
 }
@@ -248,6 +250,32 @@ fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
+fn find_id_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let id = prefix.with_extension("id");
+    if id.exists() {
+        return Some(id);
+    }
+    None
+}
+
+fn find_site_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let candidates = [
+        prefix.with_extension("site"),
+        prefix.with_extension("site.tsv"),
+        prefix.with_extension("site.txt"),
+        prefix.with_extension("site.csv"),
+        prefix.with_extension("sites.tsv"),
+        prefix.with_extension("sites.txt"),
+        prefix.with_extension("sites.csv"),
+    ];
+    for cand in candidates {
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn find_bim_with_prefix(prefix: &Path) -> Option<PathBuf> {
     let bim = prefix.with_extension("bim");
     if bim.exists() {
@@ -274,12 +302,18 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             }
             let cache_prefix = cache_prefix_path(&prefix);
             let npy_path = cache_prefix.with_extension("npy");
+            let id_path = find_id_with_prefix(&prefix)
+                .or_else(|| find_id_with_prefix(&cache_prefix))
+                .unwrap_or_else(|| prefix.with_extension("id"));
+            let src_site_path = find_site_with_prefix(&prefix);
             let src_bim_path = find_bim_with_prefix(&prefix);
             let cache_bim_path = cache_prefix.with_extension("bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path: Some(input.to_path_buf()),
                 npy_path,
+                id_path,
+                src_site_path,
                 src_bim_path,
                 cache_bim_path,
             });
@@ -292,12 +326,19 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             let prefix = strip_cache_prefix(&cache_prefix).unwrap_or_else(|| cache_prefix.clone());
             let txt_path =
                 find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&cache_prefix));
+            let id_path = find_id_with_prefix(&prefix)
+                .or_else(|| find_id_with_prefix(&cache_prefix))
+                .unwrap_or_else(|| prefix.with_extension("id"));
+            let src_site_path = find_site_with_prefix(&prefix)
+                .or_else(|| find_site_with_prefix(&cache_prefix));
             let src_bim_path = find_bim_with_prefix(&prefix);
             let cache_bim_path = cache_prefix_path(&prefix).with_extension("bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path,
                 npy_path: input.to_path_buf(),
+                id_path,
+                src_site_path,
                 src_bim_path,
                 cache_bim_path,
             });
@@ -309,12 +350,19 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
         let prefix = strip_cache_prefix(input).unwrap_or_else(|| input.to_path_buf());
         let cache_prefix = cache_prefix_path(&prefix);
         let npy_path = cache_prefix.with_extension("npy");
+        let id_path = find_id_with_prefix(&prefix)
+            .or_else(|| find_id_with_prefix(&cache_prefix))
+            .unwrap_or_else(|| prefix.with_extension("id"));
+        let src_site_path = find_site_with_prefix(&prefix)
+            .or_else(|| find_site_with_prefix(&cache_prefix));
         let src_bim_path = find_bim_with_prefix(&prefix);
         let cache_bim_path = cache_prefix.with_extension("bim");
         return Ok(TxtPaths {
             prefix,
             txt_path: Some(input.to_path_buf()),
             npy_path,
+            id_path,
+            src_site_path,
             src_bim_path,
             cache_bim_path,
         });
@@ -325,6 +373,13 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
     let txt_path = find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&raw_prefix));
     let cache_prefix = cache_prefix_path(&prefix);
     let npy_path = cache_prefix.with_extension("npy");
+    let id_path = find_id_with_prefix(&prefix)
+        .or_else(|| find_id_with_prefix(&raw_prefix))
+        .or_else(|| find_id_with_prefix(&cache_prefix))
+        .unwrap_or_else(|| prefix.with_extension("id"));
+    let src_site_path = find_site_with_prefix(&prefix)
+        .or_else(|| find_site_with_prefix(&raw_prefix))
+        .or_else(|| find_site_with_prefix(&cache_prefix));
     let src_bim_path = find_bim_with_prefix(&prefix);
     let cache_bim_path = cache_prefix.with_extension("bim");
     if !npy_path.exists() && txt_path.is_none() {
@@ -334,14 +389,18 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
         prefix,
         txt_path,
         npy_path,
+        id_path,
+        src_site_path,
         src_bim_path,
         cache_bim_path,
     })
 }
 
-fn read_txt_header_samples(path: &Path, delimiter: Option<char>) -> Result<Vec<String>, String> {
+fn read_id_file(path: &Path) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
+    let mut samples = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
@@ -349,16 +408,107 @@ fn read_txt_header_samples(path: &Path, delimiter: Option<char>) -> Result<Vec<S
         if trimmed.is_empty() {
             continue;
         }
+        let toks = split_line_tokens(trimmed, None);
+        if toks.len() != 1 {
+            return Err(format!(
+                "{}:{}: expected 1 sample ID per line",
+                path.display(),
+                line_no + 1
+            ));
+        }
+        let sid = toks[0].to_string();
+        if !seen.insert(sid.clone()) {
+            return Err(format!("duplicate sample ID in {}: {sid}", path.display()));
+        }
+        samples.push(sid);
+    }
+    if samples.is_empty() {
+        return Err(format!("no sample IDs found in {}", path.display()));
+    }
+    Ok(samples)
+}
+
+fn infer_text_delimiter(line: &str) -> Option<char> {
+    if line.contains(',') && !line.contains('\t') {
+        Some(',')
+    } else if line.contains('\t') {
+        Some('\t')
+    } else {
+        None
+    }
+}
+
+fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+
+    let mut sites = Vec::new();
+    let mut delimiter: Option<char> = None;
+    let mut header_ready = false;
+    let mut idx_chr = 0usize;
+    let mut idx_pos = 1usize;
+    let mut idx_ref = 2usize;
+    let mut idx_alt = 3usize;
+
+    for (line_no, line) in reader.lines().enumerate() {
+        let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
+        let trimmed = l.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if delimiter.is_none() {
+            delimiter = infer_text_delimiter(trimmed);
+        }
         let toks = split_line_tokens(trimmed, delimiter);
         if toks.is_empty() {
             continue;
         }
-        return Ok(toks.iter().map(|s| s.to_string()).collect());
+        if !header_ready {
+            header_ready = true;
+            let low: Vec<String> = toks.iter().map(|x| x.trim().to_ascii_lowercase()).collect();
+            let pick = |cands: &[&str]| -> Option<usize> {
+                low.iter().position(|v| cands.iter().any(|cand| v == cand))
+            };
+            if let (Some(chr_i), Some(pos_i), Some(ref_i), Some(alt_i)) = (
+                pick(&["#chrom", "chrom", "chr", "chromosome"]),
+                pick(&["pos", "bp", "position", "ps"]),
+                pick(&["ref", "a0", "ref_allele"]),
+                pick(&["alt", "a1", "alt_allele"]),
+            ) {
+                idx_chr = chr_i;
+                idx_pos = pos_i;
+                idx_ref = ref_i;
+                idx_alt = alt_i;
+                continue;
+            }
+        }
+        if toks.len() <= idx_alt {
+            return Err(format!(
+                "Malformed site line at {}:{}: {trimmed}",
+                path.display(),
+                line_no + 1
+            ));
+        }
+        let chrom = toks[idx_chr].to_string();
+        let pos: i32 = toks[idx_pos].parse().map_err(|_| {
+            format!(
+                "invalid position at {}:{} -> {}",
+                path.display(),
+                line_no + 1,
+                toks[idx_pos]
+            )
+        })?;
+        sites.push(SiteInfo {
+            chrom,
+            pos,
+            ref_allele: toks[idx_ref].to_string(),
+            alt_allele: toks[idx_alt].to_string(),
+        });
     }
-    Err(format!(
-        "no header row (sample IDs) found in {}",
-        path.display()
-    ))
+    if sites.is_empty() {
+        return Err(format!("no site rows found in {}", path.display()));
+    }
+    Ok(sites)
 }
 
 fn default_sites(n_rows: usize) -> Vec<SiteInfo> {
@@ -408,8 +558,8 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
 fn write_bim_file(path: &Path, sites: &[SiteInfo]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| e.to_string())?;
     let mut writer = BufWriter::new(file);
-    for (i, s) in sites.iter().enumerate() {
-        let sid = format!("SNP{}", i + 1);
+    for s in sites.iter() {
+        let sid = format!("{}_{}", s.chrom, s.pos);
         writeln!(
             writer,
             "{}\t{}\t0\t{}\t{}\t{}",
@@ -421,6 +571,20 @@ fn write_bim_file(path: &Path, sites: &[SiteInfo]) -> Result<(), String> {
 }
 
 fn resolve_txt_sites(paths: &TxtPaths, n_snps: usize) -> Result<Vec<SiteInfo>, String> {
+    if let Some(src_site) = paths.src_site_path.as_ref() {
+        let sites = read_site_file(src_site)?;
+        if sites.len() != n_snps {
+            return Err(format!(
+                "site row count mismatch: {} has {} rows, expected {}",
+                src_site.display(),
+                sites.len(),
+                n_snps
+            ));
+        }
+        write_bim_file(&paths.cache_bim_path, &sites)?;
+        return Ok(sites);
+    }
+
     if let Some(src_bim) = paths.src_bim_path.as_ref() {
         let sites = read_bim_file(src_bim)?;
         if sites.len() != n_snps {
@@ -459,9 +623,13 @@ fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut source_files: Vec<&Path> = Vec::with_capacity(2);
+    let mut source_files: Vec<&Path> = Vec::with_capacity(4);
     if let Some(txt_path) = paths.txt_path.as_ref() {
         source_files.push(txt_path.as_path());
+    }
+    source_files.push(paths.id_path.as_path());
+    if let Some(src_site_path) = paths.src_site_path.as_ref() {
+        source_files.push(src_site_path.as_path());
     }
     if let Some(src_bim_path) = paths.src_bim_path.as_ref() {
         source_files.push(src_bim_path.as_path());
@@ -635,7 +803,6 @@ fn convert_text_matrix_to_npy(
     let mut raw_writer = BufWriter::new(raw_tmp);
 
     let mut n_rows: usize = 0;
-    let mut seen_header = false;
 
     for (line_no, line) in reader.lines().enumerate() {
         let l = line.map_err(|e| format!("{}:{}: {}", txt_path.display(), line_no + 1, e))?;
@@ -645,20 +812,6 @@ fn convert_text_matrix_to_npy(
         }
         let toks = split_line_tokens(trimmed, delimiter);
         if toks.is_empty() {
-            continue;
-        }
-
-        if !seen_header {
-            seen_header = true;
-            if toks.len() != expected_cols {
-                return Err(format!(
-                    "header column count mismatch at {}:{}: expected {}, got {}",
-                    txt_path.display(),
-                    line_no + 1,
-                    expected_cols,
-                    toks.len()
-                ));
-            }
             continue;
         }
 
@@ -689,17 +842,10 @@ fn convert_text_matrix_to_npy(
     }
     raw_writer.flush().map_err(|e| e.to_string())?;
 
-    if !seen_header {
-        let _ = fs::remove_file(&raw_tmp_path);
-        return Err(format!(
-            "no header row (sample IDs) found in {}",
-            txt_path.display()
-        ));
-    }
     if n_rows == 0 {
         let _ = fs::remove_file(&raw_tmp_path);
         return Err(format!(
-            "no numeric matrix rows found after header in {}",
+            "no numeric matrix rows found in {}",
             txt_path.display()
         ));
     }
@@ -1239,33 +1385,25 @@ impl TxtSnpIter {
         let paths = resolve_txt_paths(path)?;
 
         let delimiter = parse_delimiter_char(delimiter)?;
-        let txt_path = paths.txt_path.as_ref().ok_or_else(|| {
-            format!(
-                "text matrix header not found for prefix: {}",
-                paths.prefix.display()
-            )
-        })?;
-        let samples = read_txt_header_samples(txt_path, delimiter)?;
+        let samples = read_id_file(&paths.id_path)?;
         let n_samples = samples.len();
         if n_samples == 0 {
-            return Err("header sample IDs are empty".into());
-        }
-        {
-            let mut seen = std::collections::HashSet::with_capacity(n_samples);
-            for sid in samples.iter() {
-                if !seen.insert(sid.as_str()) {
-                    return Err(format!("duplicate sample ID in header: {sid}"));
-                }
-            }
+            return Err("sample IDs are empty".into());
         }
 
         purge_stale_txt_cache(&paths)?;
 
-        let (n_snps, n_cols) =
-            ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?;
+        let (n_snps, n_cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
+            ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?
+        } else {
+            let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+            let (rows, cols, _) = parse_npy_f32_header(&mmap[..])?;
+            (rows, cols)
+        };
         if n_cols != n_samples {
             return Err(format!(
-                "header sample count mismatch: header={}, matrix columns={}",
+                "sample ID count mismatch: ids={}, matrix columns={}",
                 n_samples, n_cols
             ));
         }

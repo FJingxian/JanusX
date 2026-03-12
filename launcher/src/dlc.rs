@@ -287,7 +287,9 @@ pub(crate) fn is_dlc_tool(name: &str) -> bool {
     DLC_TOOL_ENTRIES.iter().any(|(tool, _)| *tool == name)
 }
 
-pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLocatorStatus>, String> {
+pub(crate) fn list_dlc_tool_locators(
+    runtime_home: &Path,
+) -> Result<Vec<ToolLocatorStatus>, String> {
     let mut tools = REQUIRED_TOOLS
         .iter()
         .map(|x| (*x).to_string())
@@ -320,9 +322,7 @@ pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLoca
     let runtime_sig = runtime_signature(&record);
     let (cached_sig, cached_entries) = load_tool_cache_entries(&python, &db_path)?;
     let expected_backend = route_backend_name(record.runtime_mode.as_str()).to_string();
-    let cache_matches_runtime = cached_sig
-        .map(|s| s == runtime_sig)
-        .unwrap_or(false);
+    let cache_matches_runtime = cached_sig.map(|s| s == runtime_sig).unwrap_or(false);
     let cache_matches_backend = if should_force_container_binding(record.runtime_mode.as_str()) {
         cached_entries
             .iter()
@@ -414,7 +414,11 @@ pub(crate) fn list_dlc_tool_locators(runtime_home: &Path) -> Result<Vec<ToolLoca
     Ok(out)
 }
 
-pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path, verbose: bool) -> Result<i32, String> {
+pub(crate) fn run_dlc_update(
+    runtime_home: &Path,
+    python: &Path,
+    verbose: bool,
+) -> Result<i32, String> {
     DLC_VERBOSE_LOG.store(verbose, Ordering::Relaxed);
     fs::create_dir_all(runtime_home).map_err(|e| {
         format!(
@@ -513,7 +517,8 @@ pub(crate) fn run_dlc_update(runtime_home: &Path, python: &Path, verbose: bool) 
                             missing_after.join(", ")
                         ));
                     }
-                    repaired.installed_tools = REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect();
+                    repaired.installed_tools =
+                        REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect();
                     repaired.status = "ok".to_string();
                     repaired.updated_at = now_utc_epoch();
                     save_runtime_record(python, &db_path, &repaired)?;
@@ -646,9 +651,14 @@ pub(crate) fn run_dlc_tool(
         ));
     }
 
-    let mut cmd = if let Some(bound) =
-        build_tool_command_from_preferred_binding(tool, args, &record, runtime_home, &python, &db_path)?
-    {
+    let mut cmd = if let Some(bound) = build_tool_command_from_preferred_binding(
+        tool,
+        args,
+        &record,
+        runtime_home,
+        &python,
+        &db_path,
+    )? {
         bound
     } else {
         build_tool_command(tool, args, &record, runtime_home)?
@@ -742,7 +752,9 @@ fn build_preferred_tool_bindings(
 ) -> Vec<ToolCacheEntry> {
     let mut out: Vec<ToolCacheEntry> = Vec::new();
     for tool in REQUIRED_TOOLS {
-        if let Some((backend, locator)) = detect_preferred_binding_for_tool(tool, record, runtime_home) {
+        if let Some((backend, locator)) =
+            detect_preferred_binding_for_tool(tool, record, runtime_home)
+        {
             out.push(ToolCacheEntry {
                 tool: tool.to_string(),
                 backend,
@@ -765,18 +777,15 @@ fn detect_preferred_binding_for_tool(
     if let Some(host_path) = find_bin(tool) {
         let env_bin_dir = env_runtime_bin_dir(runtime_home);
         if host_path.starts_with(&env_bin_dir) {
-            return Some((
-                "env".to_string(),
-                host_path.to_string_lossy().to_string(),
-            ));
+            return Some(("env".to_string(), host_path.to_string_lossy().to_string()));
         }
         if let Some((env_name, conda_path)) = detect_active_conda_binding(tool, &host_path) {
-            return Some(("conda".to_string(), build_conda_locator(&env_name, &conda_path)));
+            return Some((
+                "conda".to_string(),
+                build_conda_locator(&env_name, &conda_path),
+            ));
         }
-        return Some((
-            "host".to_string(),
-            host_path.to_string_lossy().to_string(),
-        ));
+        return Some(("host".to_string(), host_path.to_string_lossy().to_string()));
     }
     runtime_binding_for_tool(tool, record, runtime_home)
 }
@@ -804,8 +813,14 @@ fn path_looks_like_conda(path: &Path) -> bool {
             return true;
         }
     }
-    let s = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-    s.contains("/envs/") || s.contains("miniconda") || s.contains("anaconda") || s.contains("mambaforge")
+    let s = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    s.contains("/envs/")
+        || s.contains("miniconda")
+        || s.contains("anaconda")
+        || s.contains("mambaforge")
 }
 
 fn infer_conda_env_name_from_path(path: &Path) -> Option<String> {
@@ -1007,49 +1022,45 @@ fn probe_tool_locators_parallel(
         let backend_c = backend.clone();
         handles.push((
             tool_name.clone(),
-            thread::spawn(move || {
-                match mode_c.as_str() {
-                    "env" | "local" => {
-                        let p = env_dir_c.join(&tool_name);
-                        let loc = p.to_string_lossy().to_string();
-                        let ready = p.exists();
-                        ToolLocatorStatus {
-                            tool: tool_name,
-                            route: format!("{backend_c}:{loc}"),
-                            ready,
-                        }
-                    }
-                    "conda" => {
-                        let loc = resolve_conda_tool_path(&conda_env_c, &tool_name)
-                            .unwrap_or_else(|| "-".to_string());
-                        let ready = Path::new(&loc).exists();
-                        ToolLocatorStatus {
-                            tool: tool_name,
-                            route: format!("{backend_c}:{loc}"),
-                            ready,
-                        }
-                    }
-                    "docker" => {
-                        ToolLocatorStatus {
-                            tool: tool_name,
-                            route: format!("{backend_c}:{docker_image_c}"),
-                            ready: docker_ready_c,
-                        }
-                    }
-                    "singularity" => {
-                        let ready = !sif_path_c.is_empty() && Path::new(&sif_path_c).exists();
-                        ToolLocatorStatus {
-                            tool: tool_name,
-                            route: format!("{backend_c}:{sif_path_c}"),
-                            ready,
-                        }
-                    }
-                    _ => ToolLocatorStatus {
+            thread::spawn(move || match mode_c.as_str() {
+                "env" | "local" => {
+                    let p = env_dir_c.join(&tool_name);
+                    let loc = p.to_string_lossy().to_string();
+                    let ready = p.exists();
+                    ToolLocatorStatus {
                         tool: tool_name,
-                        route: "none:-".to_string(),
-                        ready: false,
-                    },
+                        route: format!("{backend_c}:{loc}"),
+                        ready,
+                    }
                 }
+                "conda" => {
+                    let loc = resolve_conda_tool_path(&conda_env_c, &tool_name)
+                        .unwrap_or_else(|| "-".to_string());
+                    let ready = Path::new(&loc).exists();
+                    ToolLocatorStatus {
+                        tool: tool_name,
+                        route: format!("{backend_c}:{loc}"),
+                        ready,
+                    }
+                }
+                "docker" => ToolLocatorStatus {
+                    tool: tool_name,
+                    route: format!("{backend_c}:{docker_image_c}"),
+                    ready: docker_ready_c,
+                },
+                "singularity" => {
+                    let ready = !sif_path_c.is_empty() && Path::new(&sif_path_c).exists();
+                    ToolLocatorStatus {
+                        tool: tool_name,
+                        route: format!("{backend_c}:{sif_path_c}"),
+                        ready,
+                    }
+                }
+                _ => ToolLocatorStatus {
+                    tool: tool_name,
+                    route: "none:-".to_string(),
+                    ready: false,
+                },
             }),
         ));
     }
@@ -1332,7 +1343,11 @@ fn repair_env_runtime_missing_tools(
 
     let mut dl_desc: Option<String> = None;
     if need_mm_setup {
-        dl_desc = Some(format!("[{}/{}] Download micromamba", step_idx, total_steps.max(1)));
+        dl_desc = Some(format!(
+            "[{}/{}] Download micromamba",
+            step_idx,
+            total_steps.max(1)
+        ));
         step_idx += 1;
     }
     let micromamba_bin = if need_mm_setup || need_env_create || !ordered_missing.is_empty() {
@@ -1342,7 +1357,11 @@ fn repair_env_runtime_missing_tools(
     };
 
     if need_env_create {
-        let desc = format!("[{}/{}] Create local env via env", step_idx, total_steps.max(step_idx));
+        let desc = format!(
+            "[{}/{}] Create local env via env",
+            step_idx,
+            total_steps.max(step_idx)
+        );
         run_cmd_tail_with_conda_channel_fallback(
             &desc,
             &[
@@ -1600,7 +1619,10 @@ fn build_env_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
 
     let mut dl_desc: Option<String> = None;
     if need_mm_setup {
-        dl_desc = Some(format!("[{}/{}] Download micromamba", step_idx, total_steps));
+        dl_desc = Some(format!(
+            "[{}/{}] Download micromamba",
+            step_idx, total_steps
+        ));
         step_idx += 1;
     }
     let micromamba_bin = ensure_micromamba(runtime_home, dl_desc.as_deref(), None)?;
@@ -2013,9 +2035,7 @@ fn build_tool_command(
                 .arg(image);
             if tool == "gatk" {
                 let (java_opts, gatk_args) = split_gatk_java_options(args);
-                let mut shell = String::from(
-                    "exec java"
-                );
+                let mut shell = String::from("exec java");
                 for opt in &java_opts {
                     shell.push(' ');
                     shell.push_str(&shell_quote(opt));
@@ -2248,11 +2268,11 @@ fn missing_tools_for_record(
             };
             Ok(ordered_required_tools(
                 &missing_tools_in_prefixed_runtime(&[
-                conda_bin.to_string_lossy().to_string(),
-                "run".to_string(),
-                "--no-capture-output".to_string(),
-                "-n".to_string(),
-                env_name.to_string(),
+                    conda_bin.to_string_lossy().to_string(),
+                    "run".to_string(),
+                    "--no-capture-output".to_string(),
+                    "-n".to_string(),
+                    env_name.to_string(),
                 ])?
                 .into_iter()
                 .filter(|x| conda_required_set.contains(x))
@@ -2660,7 +2680,10 @@ fn run_cmd_stream_all(desc: &str, argv: &[String], required: bool) -> Result<(),
         return Err(format!("{desc}: empty command"));
     }
     ensure_dlc_inline_step_newline();
-    println!("{}", super::style_green(&format!("▶ {desc}: {}", argv.join(" "))));
+    println!(
+        "{}",
+        super::style_green(&format!("▶ {desc}: {}", argv.join(" ")))
+    );
     io::stdout()
         .flush()
         .map_err(|e| format!("Failed to flush DLC progress output: {e}"))?;
@@ -2676,7 +2699,10 @@ fn run_cmd_stream_all(desc: &str, argv: &[String], required: bool) -> Result<(),
         .map_err(|e| format!("Failed to run command: {e}"))?;
 
     if status.success() {
-        super::print_success_line(&format!("{desc}[{}]", super::format_elapsed(start.elapsed())));
+        super::print_success_line(&format!(
+            "{desc}[{}]",
+            super::format_elapsed(start.elapsed())
+        ));
         return Ok(());
     }
 
@@ -2883,11 +2909,7 @@ fn run_with_live_tail(
                     && streaming_title_started
                     && last_render.elapsed() >= refresh_every
                 {
-                    render_streaming_title_only_dlc(
-                        desc,
-                        elapsed,
-                        streamed_lines_before_tail,
-                    )?;
+                    render_streaming_title_only_dlc(desc, elapsed, streamed_lines_before_tail)?;
                     last_render = Instant::now();
                 }
                 if tail_mode_started && last_render.elapsed() >= refresh_every {
@@ -3218,8 +3240,12 @@ fn ensure_embedded_dockerfile(runtime_home: &Path) -> Result<PathBuf, String> {
         Err(_) => true,
     };
     if need_write {
-        fs::write(&dockerfile, EMBEDDED_DOCKERFILE)
-            .map_err(|e| format!("Failed to write embedded Dockerfile {}: {e}", dockerfile.display()))?;
+        fs::write(&dockerfile, EMBEDDED_DOCKERFILE).map_err(|e| {
+            format!(
+                "Failed to write embedded Dockerfile {}: {e}",
+                dockerfile.display()
+            )
+        })?;
     }
     Ok(dockerfile)
 }
@@ -3242,8 +3268,8 @@ fn download_with_fallback(desc: &str, urls: &[&str], dst: &Path) -> Result<(), S
         }
         let mut ok = false;
         if command_in_path("aria2c") {
-            let total_bytes = probe_content_length_with_curl(url)
-                .or_else(|| probe_content_length_with_wget(url));
+            let total_bytes =
+                probe_content_length_with_curl(url).or_else(|| probe_content_length_with_wget(url));
             let tmp_dir = tmp
                 .parent()
                 .ok_or_else(|| format!("Invalid temporary download path: {}", tmp.display()))?
@@ -3514,8 +3540,7 @@ fn run_download_with_progress(
                 }
                 if status.is_none() {
                     let downloaded = fs::metadata(target_path).map(|m| m.len()).unwrap_or(0);
-                    last_progress_desc =
-                        download_desc_with_progress(desc, downloaded, total_bytes);
+                    last_progress_desc = download_desc_with_progress(desc, downloaded, total_bytes);
                 }
                 let elapsed = start.elapsed();
                 let refresh_every = super::spinner_refresh_interval(elapsed);
@@ -3576,10 +3601,21 @@ fn run_download_with_progress(
             render_tail_success_compact_dlc(desc, elapsed, max_lines)?;
             return Ok(());
         }
-        render_tail_block_dlc(&last_progress_desc, "✘", elapsed, &tail, max_lines, rendered)?;
+        render_tail_block_dlc(
+            &last_progress_desc,
+            "✘",
+            elapsed,
+            &tail,
+            max_lines,
+            rendered,
+        )?;
     } else if !status.success() && streaming_title_started {
         DLC_INLINE_STEP_LINE_OPEN.store(false, Ordering::Relaxed);
-        render_streaming_failure_compact_dlc(&last_progress_desc, elapsed, streamed_lines_before_tail)?;
+        render_streaming_failure_compact_dlc(
+            &last_progress_desc,
+            elapsed,
+            streamed_lines_before_tail,
+        )?;
     } else {
         let width = dlc_terminal_line_width();
         let title = dlc_truncate_plain_line(
@@ -3637,7 +3673,11 @@ fn human_bytes(bytes: u64) -> String {
 
 fn download_desc_with_progress(base: &str, downloaded: u64, total_bytes: Option<u64>) -> String {
     match total_bytes {
-        Some(total) if total > 0 => format!("{base} [{}/{}]", human_bytes(downloaded), human_bytes(total)),
+        Some(total) if total > 0 => format!(
+            "{base} [{}/{}]",
+            human_bytes(downloaded),
+            human_bytes(total)
+        ),
         _ => format!("{base} [{}]", human_bytes(downloaded)),
     }
 }
@@ -3872,9 +3912,7 @@ for row in rows:
 }
 
 fn sanitize_db_field(raw: &str) -> String {
-    raw.replace('\t', " ")
-        .replace('\n', " ")
-        .replace('\r', " ")
+    raw.replace('\t', " ").replace('\n', " ").replace('\r', " ")
 }
 
 fn save_runtime_record(

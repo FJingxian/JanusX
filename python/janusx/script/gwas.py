@@ -22,6 +22,8 @@ Caching
     for streaming LMM/LM runs:
       * GRM: {geno_prefix}.k.{method}.npy
       * Q   : {geno_prefix}.q.{pcdim}.txt
+  - If genotype directory is not writable, cache falls back to
+    JANUSX_CACHE_DIR (configured from -o).
 
 Covariates
 ----------
@@ -129,6 +131,8 @@ try:
 except Exception:
     tqdm = None  # type: ignore[assignment]
     _HAS_TQDM = False
+
+_WARNED_GWAS_CACHE_FALLBACK_KEYS: set[str] = set()
 
 
 # ======================================================================
@@ -563,9 +567,71 @@ def determine_genotype_source(args) -> tuple[str, str]:
     return gfile, prefix
 
 
-def genotype_cache_prefix(genofile: str, *, snps_only: bool = True) -> str:
+def _is_writable_dir(path: str) -> bool:
+    d = os.path.abspath(path or ".")
+    return os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK)
+
+
+def _warn_gwas_cache_fallback_once(
+    key: str,
+    msg: str,
+    logger: Union[logging.Logger, None] = None,
+) -> None:
+    if key in _WARNED_GWAS_CACHE_FALLBACK_KEYS:
+        return
+    _WARNED_GWAS_CACHE_FALLBACK_KEYS.add(key)
+    if logger is not None:
+        logger.warning(msg)
+    else:
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _resolve_gwas_cache_dir(
+    genofile: str,
+    *,
+    cache_dir: Union[str, None] = None,
+    logger: Union[logging.Logger, None] = None,
+    emit_warning: bool = True,
+) -> str:
+    geno_dir = os.path.abspath(os.path.dirname(str(genofile)) or ".")
+    if _is_writable_dir(geno_dir):
+        return geno_dir
+
+    preferred = (str(cache_dir).strip() if cache_dir is not None else "")
+    if preferred == "":
+        preferred = os.environ.get("JANUSX_CACHE_DIR", "").strip()
+    if preferred:
+        fallback_dir = os.path.abspath(os.path.expanduser(preferred))
+        try:
+            os.makedirs(fallback_dir, mode=0o755, exist_ok=True)
+        except Exception:
+            pass
+        if _is_writable_dir(fallback_dir):
+            if bool(emit_warning):
+                _warn_gwas_cache_fallback_once(
+                    f"{geno_dir}->{fallback_dir}",
+                    (
+                        "No write permission for genotype-side cache directory: "
+                        f"{geno_dir}. Falling back to cache directory from "
+                        f"JANUSX_CACHE_DIR: {fallback_dir}"
+                    ),
+                    logger=logger,
+                )
+            return fallback_dir
+
+    return geno_dir
+
+
+def genotype_cache_prefix(
+    genofile: str,
+    *,
+    snps_only: bool = True,
+    cache_dir: Union[str, None] = None,
+    logger: Union[logging.Logger, None] = None,
+) -> str:
     """
-    Construct a cache prefix within the genotype directory.
+    Construct a cache prefix for GWAS GRM/Q caches.
+    Prefer genotype directory; if not writable, fallback to JANUSX_CACHE_DIR.
     """
     base = os.path.basename(genofile)
     low = base.lower()
@@ -576,8 +642,12 @@ def genotype_cache_prefix(genofile: str, *, snps_only: bool = True) -> str:
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
-    cache_dir = os.path.dirname(genofile) or "."
-    prefix = os.path.join(cache_dir, base).replace("\\", "/")
+    cache_root = _resolve_gwas_cache_dir(
+        genofile,
+        cache_dir=cache_dir,
+        logger=logger,
+    )
+    prefix = os.path.join(cache_root, base).replace("\\", "/")
     if low.endswith((".vcf.gz", ".vcf")) and (not bool(snps_only)):
         prefix = f"{prefix}.all"
     return prefix
@@ -1254,7 +1324,8 @@ def _cache_prefix_tilde(genofile: str, *, snps_only: bool = True) -> str:
         stem = os.path.splitext(base)[0]
     else:
         stem = base
-    cprefix = os.path.join(os.path.dirname(p) or ".", f"~{stem}").replace("\\", "/")
+    cache_root = _resolve_gwas_cache_dir(genofile, emit_warning=False)
+    cprefix = os.path.join(cache_root, f"~{stem}").replace("\\", "/")
     if (low.endswith(".vcf.gz") or low.endswith(".vcf")) and (not bool(snps_only)):
         cprefix = f"{cprefix}.all"
     return cprefix
@@ -2011,10 +2082,14 @@ def prepare_streaming_context(
         use_spinner=use_spinner,
     )
 
-    cache_prefix = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
+    cache_prefix = genotype_cache_prefix(
+        genofile,
+        snps_only=bool(snps_only),
+        logger=logger,
+    )
     _log_info(
         logger,
-        f"Cache prefix (genotype folder): {cache_prefix}",
+        f"Cache prefix: {cache_prefix}",
         use_spinner=use_spinner,
     )
     need_generate_q = (
@@ -3513,7 +3588,11 @@ def run_farmcpu_fullmem(
                     )
                 qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
         else:
-            gfile_prefix = genotype_cache_prefix(gfile, snps_only=bool(snps_only))
+            gfile_prefix = genotype_cache_prefix(
+                gfile,
+                snps_only=bool(snps_only),
+                logger=logger,
+            )
             qmatrix = build_qmatrix_farmcpu(
                 genofile=gfile,
                 gfile_prefix=gfile_prefix,

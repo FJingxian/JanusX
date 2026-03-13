@@ -7,6 +7,8 @@ from matplotlib.gridspec import GridSpec
 from scipy.stats import beta
 from janusx.gtools.cleaner import chrom_sort_key
 
+_PVALUE_EPS = float(np.nextafter(0.0, 1.0))
+
 
 def ppoints(n: int) -> np.ndarray:
     """
@@ -16,6 +18,23 @@ def ppoints(n: int) -> np.ndarray:
         q_i = i / (n + 1), i = 1..n
     """
     return np.arange(1, n + 1) / (n + 1)
+
+
+def _sanitize_pvalues(values) -> np.ndarray:
+    """
+    Convert p-values to finite float64 and clamp to (_PVALUE_EPS, 1.0].
+    This prevents -log10 warnings from zeros/NaN/inf/out-of-range values.
+    """
+    p = pd.to_numeric(values, errors="coerce")
+    if isinstance(p, pd.Series):
+        arr = p.to_numpy(dtype=np.float64, copy=False)
+    else:
+        arr = np.asarray(p, dtype=np.float64)
+    arr = np.array(arr, dtype=np.float64, copy=True)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    arr[~np.isfinite(arr)] = 1.0
+    return np.clip(arr, _PVALUE_EPS, 1.0)
 
 
 class GWASPLOT:
@@ -65,6 +84,9 @@ class GWASPLOT:
         self.t_start = time.time()
         # Ensure positional indices are contiguous for downstream iloc usage.
         df = df.reset_index(drop=True)
+        # Global p-value sanitization: avoid log10 warnings in all plotting paths.
+        if pvalue in df.columns:
+            df[pvalue] = _sanitize_pvalues(df[pvalue])
 
         # ---- (1) Optional down-sampling for plotting ----
         # minidx is first computed on the original row order (after reset_index).
@@ -79,7 +101,7 @@ class GWASPLOT:
                 chunk_size = n_snp // 100_000 if n_snp >= 100_000 else 1
 
                 # Use numpy arrays to avoid expensive pandas sort/copy chains.
-                pvals = pd.to_numeric(df[pvalue], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+                pvals = _sanitize_pvalues(df[pvalue])
 
                 # p-value threshold: small p => highly significant
                 # we keep all SNPs with p <= p_thresh without compression
@@ -237,7 +259,7 @@ class GWASPLOT:
 
         # subset to plotting SNPs
         df = self.df.iloc[self.minidx, -3:].copy()
-        df["y"] = -np.log10(df["y"])
+        df["y"] = -np.log10(_sanitize_pvalues(df["y"]))
         if min_logp is not None:
             df = df[df["y"] >= float(min_logp)]
         if max_logp is not None:

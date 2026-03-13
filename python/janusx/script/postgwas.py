@@ -2018,7 +2018,7 @@ def _overlay_manhattan_threshold_points(
     if not bool(keep.any()):
         return
     dfp = dfp.loc[keep].copy()
-    dfp["ylog"] = -np.log10(pd.to_numeric(dfp["y"], errors="coerce"))
+    dfp["ylog"] = _safe_neglog10_p(dfp["y"])
     dfp = dfp[dfp["ylog"] >= float(min_logp)]
     if max_logp is not None:
         dfp = dfp[dfp["ylog"] <= float(max_logp)]
@@ -2051,6 +2051,26 @@ def _overlay_manhattan_threshold_points(
         color="grey",
         linewidth=1.0,
     )
+
+
+def _safe_neglog10_p(values: object) -> np.ndarray:
+    """
+    Safe -log10 transform for p-values:
+    - coerce non-numeric to NaN
+    - replace non-finite with 1.0
+    - clamp to (0, 1]
+    """
+    p = pd.to_numeric(values, errors="coerce")
+    if isinstance(p, pd.Series):
+        arr = p.to_numpy(dtype=float, copy=False)
+    else:
+        arr = np.asarray(p, dtype=float)
+    arr = np.array(arr, dtype=float, copy=True)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    arr[~np.isfinite(arr)] = 1.0
+    arr = np.clip(arr, np.nextafter(0.0, 1.0), 1.0)
+    return -np.log10(arr)
 
 
 def _qq_select_points_with_threshold(
@@ -2325,12 +2345,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         max_logp=manh_max_logp,
                     )
                 else:
-                    y_hl = -np.log10(
-                        pd.to_numeric(
-                            plotmodel.df.loc[df_hl_idx, "y"],
-                            errors="coerce",
-                        ).to_numpy(dtype=float)
-                    )
+                    y_hl = _safe_neglog10_p(plotmodel.df.loc[df_hl_idx, "y"])
                     keep_hl = np.isfinite(y_hl) & (y_hl >= float(manh_min_logp))
                     if manh_max_logp is not None:
                         keep_hl = keep_hl & (y_hl <= float(manh_max_logp))
@@ -2351,7 +2366,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         text = _sanitize_plot_text(df_hl.loc[idx, 3])
                         ax.text(
                             plotmodel.df.loc[idx, "x"],
-                            -np.log10(plotmodel.df.loc[idx, "y"]),
+                            float(_safe_neglog10_p(plotmodel.df.loc[idx, "y"])[0]),
                             s=text,
                             ha="center",
                             zorder=11,
@@ -3376,8 +3391,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
     if plot_df.shape[0] > 0:
         pvals_draw = np.asarray(plot_df[p_col], dtype=float)
-        pvals_draw = np.clip(pvals_draw, np.nextafter(0.0, 1.0), np.inf)
-        plot_df["_ylog"] = -np.log10(pvals_draw)
+        plot_df["_ylog"] = _safe_neglog10_p(pvals_draw)
     else:
         plot_df["_ylog"] = np.asarray([], dtype=float)
 

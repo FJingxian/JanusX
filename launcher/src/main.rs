@@ -1416,9 +1416,9 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
         #[cfg(windows)]
         LauncherReplaceResult::ReplacedAfterExit => {
             print_success_line(
-                "Launcher upgrade compiled and staged. `jx` will be replaced after this process exits.",
+                "Launcher upgrade compiled and staged. `jx` will be replaced after this command exits.",
             );
-            println!("Re-run `jx -h` to verify the upgraded launcher.");
+            println!("Keep this command running until update steps finish, then run `jx -h` to verify.");
         }
     }
     let (core_update, core_update_hint) = match &opts.source {
@@ -1693,7 +1693,7 @@ fn build_launcher_binary_from_source(
 
 fn replace_current_launcher_binary(
     built_binary: &Path,
-    _verbose: bool,
+    verbose: bool,
 ) -> Result<LauncherReplaceResult, String> {
     let current = env::current_exe().map_err(|e| format!("Failed to locate current jx: {e}"))?;
     let install_dir = current
@@ -1732,17 +1732,37 @@ fn replace_current_launcher_binary(
 
     #[cfg(windows)]
     {
+        let helper = install_dir.join("jx_replace_launcher.cmd");
         let esc_stage = staged.to_string_lossy().replace('"', "\"\"");
         let esc_current = current.to_string_lossy().replace('"', "\"\"");
-        let cmdline = format!(
-            "ping 127.0.0.1 -n 2 >NUL & move /Y \"{esc_stage}\" \"{esc_current}\" >NUL 2>NUL"
+        let helper_script = format!(
+            "@echo off\r\n\
+setlocal enableextensions\r\n\
+set \"SRC={esc_stage}\"\r\n\
+set \"DST={esc_current}\"\r\n\
+for /L %%i in (1,1,900) do (\r\n\
+  move /Y \"%SRC%\" \"%DST%\" >NUL 2>NUL && goto :done\r\n\
+  >NUL 2>NUL ping 127.0.0.1 -n 2\r\n\
+)\r\n\
+:done\r\n\
+del /F /Q \"%~f0\" >NUL 2>NUL\r\n\
+endlocal\r\n"
         );
-        if _verbose {
-            println!("Applying launcher replacement after exit: {cmdline}");
+        std::fs::write(&helper, helper_script).map_err(|e| {
+            format!(
+                "Failed to create launcher replacement helper {}: {e}",
+                helper.display()
+            )
+        })?;
+        if verbose {
+            println!(
+                "Applying launcher replacement after exit via helper: {}",
+                helper.display()
+            );
         }
         Command::new("cmd")
             .arg("/C")
-            .arg(cmdline)
+            .arg(&helper)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

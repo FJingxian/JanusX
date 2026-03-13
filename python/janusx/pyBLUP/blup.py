@@ -17,6 +17,8 @@ except Exception:
     _rust_ai_reml_null_f64 = None  # type: ignore[assignment]
     _HAS_RUST_AIREML = False
 
+_OBJ_PENALTY = 1e30
+
 def REML(
     theta: np.ndarray,
     y: np.ndarray,
@@ -61,16 +63,19 @@ def REML(
 
     rTV_invr = float((r.T @ Vinvr)[0, 0])
     if not np.isfinite(rTV_invr) or rTV_invr <= 0.0:
-        return np.inf
+        return _OBJ_PENALTY
     log_detV = float(2.0 * np.sum(np.log(np.diag(L))))
     sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
     if sign <= 0 or (not np.isfinite(log_detXTV_invX)):
-        return np.inf
+        return _OBJ_PENALTY
     total_log = (n - p) * np.log(rTV_invr) + log_detV + float(log_detXTV_invX)
 
     # Constant term (matches your original expression)
     c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2.0
-    return float(total_log / 2.0 - c)
+    out = float(total_log / 2.0 - c)
+    if not np.isfinite(out):
+        return _OBJ_PENALTY
+    return out
 
 def _testX(X:typing.Union[np.ndarray,None],n:int,) -> np.ndarray:
     if X is None:
@@ -305,9 +310,9 @@ def _sparse_z_reml_objective(
 ) -> float:
     theta = np.asarray(theta, dtype=float).reshape(-1)
     if theta.size != (len(z_cols) + 1):
-        return np.inf
+        return _OBJ_PENALTY
     if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
-        return np.inf
+        return _OBJ_PENALTY
 
     n, p = int(X.shape[0]), int(X.shape[1])
     theta_z = theta[:-1]
@@ -332,11 +337,11 @@ def _sparse_z_reml_objective(
         vinvr = vinvy - vinvx @ beta
         r_t_vinvr = float((r.T @ vinvr)[0, 0])
         if (not np.isfinite(r_t_vinvr)) or r_t_vinvr <= 0.0:
-            return np.inf
+            return _OBJ_PENALTY
 
         udiag = np.asarray(lu.U.diagonal(), dtype=float).reshape(-1)
         if np.any(udiag == 0.0):
-            return np.inf
+            return _OBJ_PENALTY
         log_det_m = float(np.sum(np.log(np.abs(udiag))))
         log_det_v = (
             n * np.log(lbd)
@@ -345,12 +350,15 @@ def _sparse_z_reml_objective(
         )
         sign, log_det_xt_vinv_x = np.linalg.slogdet(xt_vinv_x)
         if sign <= 0 or (not np.isfinite(log_det_xt_vinv_x)):
-            return np.inf
+            return _OBJ_PENALTY
         total_log = (n - p) * np.log(r_t_vinvr) + log_det_v + float(log_det_xt_vinv_x)
         c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2.0
-        return float(total_log / 2.0 - c)
+        out = float(total_log / 2.0 - c)
+        if not np.isfinite(out):
+            return _OBJ_PENALTY
+        return out
     except Exception:
-        return np.inf
+        return _OBJ_PENALTY
 
 
 def _sparse_z_fit_state(

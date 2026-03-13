@@ -69,9 +69,14 @@ def _resolve_columns(tokens: list[str], data_cols: list[str], label: str) -> lis
         t = str(tk).strip()
         if t == "":
             continue
-        # Support numeric slice syntax like "1:3" (inclusive, 1-based).
+        # Support numeric range syntax like "1:3" / "1-3" (inclusive, 1-based).
+        range_sep = None
         if ":" in t:
-            left, right = t.split(":", 1)
+            range_sep = ":"
+        elif t.count("-") == 1 and not t.startswith("-"):
+            range_sep = "-"
+        if range_sep is not None:
+            left, right = t.split(range_sep, 1)
             if left.lstrip("+-").isdigit() and right.lstrip("+-").isdigit():
                 start, end = int(left), int(right)
                 step = 1 if end >= start else -1
@@ -326,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COL",
         help=(
             "Phenotype column(s), 1-based index (excluding sample ID), name, "
-            "comma list (e.g. 1,3), or numeric range (e.g. 1:3). "
+            "comma list (e.g. 1,3), or numeric range (e.g. 1:3 or 1-3). "
             "Repeat this flag for multiple traits."
         ),
     )

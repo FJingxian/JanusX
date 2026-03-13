@@ -4,21 +4,17 @@ version = "1.0.13"
 description = "A Suite of Genotyping Tools for Genome-Wide Association Study and Genomic Selection"
 requires-python = ">=3.9"
 dependencies = [
-    "numpy",
+    "numpy", "scipy",
+    "scikit-learn","xgboost",
     "pandas<3.0",
     "matplotlib",
-    "scipy",
-    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-    "scikit-learn",
-    "xgboost",
     "psutil",
-    "tqdm",
     "statsmodels",
-    "rich",
-    "rich-argparse",
+    "rich", "tqdm", "rich-argparse",
     "dynamicTreeCut",
     "joblib>=1.5",
+    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
 ]
 authors = [
   {name = "Jingxian FU", email = "827888724@qq.com"},

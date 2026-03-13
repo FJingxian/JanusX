@@ -20,12 +20,14 @@ import os
 import socket
 import sys
 import time
+import typing
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from scipy.linalg import cho_solve
 from scipy.stats import t as student_t
 
@@ -35,7 +37,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists
 from ._common.genoio import strip_default_prefix_suffix
-from ._common.status import CliStatus, print_success, print_failure, format_elapsed
+from ._common.status import print_success, print_failure, format_elapsed
 
 
 @dataclass
@@ -134,34 +136,124 @@ def _encode_term_matrix(
     term: _TermSpec,
     *,
     for_random: bool,
-) -> tuple[np.ndarray, list[str]]:
+    sparse_onehot: bool = False,
+) -> tuple[typing.Union[np.ndarray, sparse.csr_matrix], list[str]]:
     s = df_sub[term.name]
     if (not term.force_onehot) and _is_numeric_series(s):
         arr = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
         return arr, [term.name]
 
     # Default rule: string/categorical columns are one-hot encoded.
-    ss = s.astype("string").fillna("NA").astype(str)
-    dummies = pd.get_dummies(
-        ss,
+    return _onehot_encode_series(
+        s,
         prefix=term.name,
-        prefix_sep="=",
         drop_first=(not for_random),
-        dtype=float,
+        sparse_output=bool(sparse_onehot),
     )
-    if dummies.shape[1] == 0:
-        return np.zeros((len(df_sub), 0), dtype=float), []
-    return dummies.to_numpy(dtype=float), [str(c) for c in dummies.columns]
+
+
+def _onehot_encode_series(
+    series: pd.Series,
+    *,
+    prefix: str,
+    drop_first: bool,
+    sparse_output: bool,
+) -> tuple[typing.Union[np.ndarray, sparse.csr_matrix], list[str]]:
+    ss = series.astype("string").fillna("NA").astype(str)
+    n = int(ss.shape[0])
+    if n == 0:
+        empty = sparse.csr_matrix((0, 0), dtype=float)
+        return (empty if sparse_output else np.zeros((0, 0), dtype=float)), []
+
+    codes, levels = pd.factorize(ss, sort=True)
+    n_levels = int(levels.shape[0])
+    if n_levels == 0:
+        empty = sparse.csr_matrix((n, 0), dtype=float)
+        return (empty if sparse_output else np.zeros((n, 0), dtype=float)), []
+
+    if drop_first:
+        kept_levels = [str(x) for x in levels[1:]]
+        mask = codes > 0
+        cols = (codes[mask] - 1).astype(np.int64, copy=False)
+        n_cols = max(0, n_levels - 1)
+    else:
+        kept_levels = [str(x) for x in levels]
+        mask = codes >= 0
+        cols = codes[mask].astype(np.int64, copy=False)
+        n_cols = n_levels
+    if n_cols == 0:
+        empty = sparse.csr_matrix((n, 0), dtype=float)
+        return (empty if sparse_output else np.zeros((n, 0), dtype=float)), []
+
+    rows = np.nonzero(mask)[0].astype(np.int64, copy=False)
+    data = np.ones(rows.shape[0], dtype=float)
+    mat = sparse.csr_matrix((data, (rows, cols)), shape=(n, n_cols), dtype=float)
+    names = [f"{prefix}-{lv}" for lv in kept_levels]
+    return (mat if sparse_output else mat.toarray()), names
+
+
+def _is_repeat_like(name: str) -> bool:
+    s = str(name).strip().lower()
+    keys = ("rep", "repeat", "block", "plot")
+    return any(k in s for k in keys)
+
+
+def _is_env_like(name: str) -> bool:
+    s = str(name).strip().lower()
+    keys = ("env", "environment", "site", "location", "loc", "year", "season", "place")
+    return any(k in s for k in keys)
+
+
+def _combine_key(df_sub: pd.DataFrame, cols: list[str], default_label: str) -> pd.Series:
+    if len(cols) == 0:
+        return pd.Series([default_label] * len(df_sub), index=df_sub.index, dtype="string")
+    z = df_sub[cols].astype("string").fillna("NA")
+    if len(cols) == 1:
+        return z.iloc[:, 0].astype("string")
+    return z.agg("|".join, axis=1).astype("string")
+
+
+def _infer_env_rep_columns(random_terms: list[_TermSpec]) -> tuple[list[str], list[str]]:
+    all_terms = [str(t.name) for t in random_terms]
+    rep_cols = [c for c in all_terms if _is_repeat_like(c)]
+    env_cols = [c for c in all_terms if _is_env_like(c) and c not in rep_cols]
+    return env_cols, rep_cols
+
+
+def _effective_env_rep_counts(
+    sample_ids_sub: pd.Series,
+    sub: pd.DataFrame,
+    env_cols: list[str],
+    rep_cols: list[str],
+) -> tuple[float, float]:
+    sid = sample_ids_sub.astype("string").fillna("NA").astype(str)
+    env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
+    ge = pd.DataFrame({"sid": sid, "env": env_key})
+    e_per_sid = ge.drop_duplicates().groupby("sid", sort=False)["env"].nunique()
+    e_eff = float(e_per_sid.mean()) if len(e_per_sid) > 0 else 1.0
+    e_eff = max(1.0, e_eff)
+
+    if len(rep_cols) > 0:
+        rep_key = _combine_key(sub, rep_cols, "__REP__").astype(str)
+        ger = pd.DataFrame({"sid": sid, "env": env_key, "rep": rep_key})
+        r_per_ge = ger.drop_duplicates().groupby(["sid", "env"], sort=False)["rep"].nunique()
+    else:
+        r_per_ge = ge.groupby(["sid", "env"], sort=False).size()
+    r_eff = float(r_per_ge.mean()) if len(r_per_ge) > 0 else 1.0
+    r_eff = max(1.0, r_eff)
+    return e_eff, r_eff
 
 
 def _gls_fixed_stats_from_blup(
     model: BLUP,
-    z_list: list[np.ndarray],
+    z_list: list[typing.Union[np.ndarray, sparse.spmatrix]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     beta = np.asarray(model.beta, dtype=float).reshape(-1)
     n, p = int(model.X.shape[0]), int(model.X.shape[1])
-
-    if model.theta is None or len(z_list) == 0:
+    cov_beta_cached = getattr(model, "_cov_beta", None)
+    if cov_beta_cached is not None:
+        cov_beta = np.asarray(cov_beta_cached, dtype=float)
+    elif model.theta is None or len(z_list) == 0:
         resid = np.asarray(model.residuals, dtype=float).reshape(-1, 1)
         sigma2 = float((resid.T @ resid)[0, 0]) / max(1, n - p)
         xtx = np.asarray(model.X.T @ model.X, dtype=float)
@@ -172,15 +264,20 @@ def _gls_fixed_stats_from_blup(
             raise ValueError("BLUP theta size is inconsistent with random effects.")
 
         # Reconstruct the same K-list definition used in BLUP._fit()
+        z_standardized = bool(getattr(model, "_z_standardized", True))
         k_list: list[np.ndarray] = []
         for i, z in enumerate(z_list):
-            q, mean_vec, std_vec = model.onehot_info[i]
-            z_std = (
-                (np.asarray(z, dtype=float) - np.asarray(mean_vec, dtype=float))
-                / np.asarray(std_vec, dtype=float)
-                / np.sqrt(float(q))
-            )
-            k_list.append(np.asarray(z_std @ z_std.T, dtype=float))
+            z_arr = np.asarray(z.toarray(), dtype=float) if sparse.issparse(z) else np.asarray(z, dtype=float)
+            if z_standardized:
+                q, mean_vec, std_vec = model.onehot_info[i]
+                z_fit = (
+                    (z_arr - np.asarray(mean_vec, dtype=float))
+                    / np.asarray(std_vec, dtype=float)
+                    / np.sqrt(float(q))
+                )
+            else:
+                z_fit = z_arr
+            k_list.append(np.asarray(z_fit @ z_fit.T, dtype=float))
 
         v = np.eye(n, dtype=float) * float(theta[-1])
         for i, k in enumerate(k_list):
@@ -304,26 +401,20 @@ def main() -> None:
     if not ensure_file_exists(logger, str(args.file), "Input file"):
         return
 
-    with CliStatus("Loading input table...", enabled=bool(sys.stdout.isatty())) as st:
-        try:
-            df = pd.read_csv(str(args.file), sep=None, engine="python")
-        except Exception:
-            st.fail("Loading input table ...Failed")
-            raise
-        st.complete("Loading input table ...Finished")
+    load_t0 = time.time()
+    try:
+        df = pd.read_csv(str(args.file), sep=None, engine="python")
+    except Exception:
+        raise
+    load_elapsed = format_elapsed(time.time() - load_t0)
 
     if df.shape[1] < 2:
         raise ValueError("Input file must contain at least 2 columns: sample_id + data columns.")
 
     sample_col = str(df.columns[0])
     sample_ids = df.iloc[:, 0].astype(str).str.strip()
-    if sample_ids.duplicated().any():
-        dup = sample_ids[sample_ids.duplicated()].unique().tolist()[:8]
-        msg = (
-            "Duplicated sample IDs detected in first column; keep all rows as independent records. "
-            f"Examples: {', '.join(map(str, dup))}"
-        )
-        logger.warning(msg)
+    n_samples_total = int(sample_ids.shape[0])
+    n_samples_unique = int(sample_ids.nunique(dropna=False))
     df = df.copy()
     df[sample_col] = sample_ids
     dfx = df.iloc[:, 1:].copy()
@@ -348,6 +439,7 @@ def main() -> None:
     for c in r_cols:
         random_map[c] = bool(random_map.get(c, False))
     random_terms = [_TermSpec(name=k, force_onehot=v) for k, v in random_map.items()]
+    env_cols_auto, rep_cols_auto = _infer_env_rep_columns(random_terms)
 
     emit_cli_configuration(
         logger,
@@ -359,14 +451,19 @@ def main() -> None:
                 "Input",
                 [
                     ("File", str(args.file)),
+                    ("Load table", f"Finished [{load_elapsed}]"),
                     ("Sample column", sample_col),
-                    ("Samples", int(df.shape[0])),
+                    ("Samples(total)", n_samples_total),
+                    ("Samples(unique)", n_samples_unique),
                 ],
             ),
             (
                 "Columns",
                 [
                     ("Phenotypes", ", ".join(n_cols)),
+                    ("ID random effect", f"{sample_col} (auto one-hot)"),
+                    ("Auto env columns", ", ".join(env_cols_auto) if env_cols_auto else "None"),
+                    ("Auto rep columns", ", ".join(rep_cols_auto) if rep_cols_auto else "None"),
                     ("Fixed onehot", ", ".join(fh_cols) if fh_cols else "None"),
                     ("Fixed", ", ".join(f_cols) if f_cols else "None"),
                     ("Random onehot", ", ".join(rh_cols) if rh_cols else "None"),
@@ -385,7 +482,8 @@ def main() -> None:
         ],
     )
 
-    blup_out = pd.DataFrame({sample_col: sample_ids.to_numpy(dtype=object)})
+    unique_sample_ids = sample_ids.drop_duplicates().reset_index(drop=True)
+    blup_out = pd.DataFrame({sample_col: unique_sample_ids.to_numpy(dtype=object)})
 
     for trait in n_cols:
         step_t0 = time.time()
@@ -406,18 +504,53 @@ def main() -> None:
         x_blocks: list[np.ndarray] = []
         x_names: list[str] = []
         for term in fixed_terms:
-            arr, names = _encode_term_matrix(sub, term, for_random=False)
+            arr, names = _encode_term_matrix(sub, term, for_random=False, sparse_onehot=False)
             if arr.shape[1] == 0:
                 logger.warning(f"Trait {trait}: fixed term `{term.name}` expanded to 0 columns; skipped.")
                 continue
-            x_blocks.append(arr)
+            x_blocks.append(np.asarray(arr, dtype=float))
             x_names.extend(names)
         x_mat = np.concatenate(x_blocks, axis=1) if len(x_blocks) > 0 else None
 
-        z_list: list[np.ndarray] = []
+        z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
         z_names: list[str] = []
+        sample_ids_sub = df.loc[mask, sample_col].astype("string").fillna("NA").astype(str)
+        # Always include sample-ID random effect from the first column.
+        id_series = sample_ids_sub
+        id_dummies, id_col_names = _onehot_encode_series(
+            id_series,
+            prefix=str(sample_col),
+            drop_first=False,
+            sparse_output=True,
+        )
+        if id_dummies.shape[1] > 0:
+            z_list.append(id_dummies)
+            z_names.append(sample_col)
+        else:
+            logger.warning(
+                f"Trait {trait}: sample-ID random effect expanded to 0 columns; H2 will be unavailable."
+            )
+
+        gxe_name = f"{sample_col}xenv"
+        if len(env_cols_auto) > 0:
+            env_key = _combine_key(sub, [c for c in env_cols_auto if c in sub.columns], "__ENV__").astype(str)
+            gxe_key = (sample_ids_sub + "@@" + env_key).astype("string")
+            gxe_dummies, _ = _onehot_encode_series(
+                gxe_key,
+                prefix=gxe_name,
+                drop_first=False,
+                sparse_output=True,
+            )
+            if gxe_dummies.shape[1] > 0:
+                z_list.append(gxe_dummies)
+                z_names.append(gxe_name)
+            else:
+                logger.warning(
+                    f"Trait {trait}: sample×env random effect expanded to 0 columns; use fallback H2."
+                )
+
         for term in random_terms:
-            arr, _ = _encode_term_matrix(sub, term, for_random=True)
+            arr, _ = _encode_term_matrix(sub, term, for_random=True, sparse_onehot=True)
             if arr.shape[1] == 0:
                 logger.warning(f"Trait {trait}: random term `{term.name}` expanded to 0 columns; skipped.")
                 continue
@@ -431,21 +564,31 @@ def main() -> None:
             maxiter=int(args.maxiter),
             progress=False,
         )
-        y_hat = (
-            model.predict(
-                X=x_mat,
-                Z=z_list if len(z_list) > 0 else None,
+        # Export sample-level BLUP (ID random effect), one row per unique sample.
+        id_u = np.full(blup_out.shape[0], np.nan, dtype=float)
+        if getattr(model, "u_by_Z", None) is not None and len(model.u_by_Z) > 0:
+            u_id = np.asarray(model.u_by_Z[0], dtype=float).reshape(-1)
+            id_cols = [str(c) for c in id_col_names]
+            id_prefix = f"{sample_col}-"
+            id_levels = [
+                c[len(id_prefix):] if c.startswith(id_prefix) else c
+                for c in id_cols
+            ]
+            id_map = {str(k): float(v) for k, v in zip(id_levels, u_id)}
+            id_u = (
+                blup_out[sample_col]
+                .astype(str)
+                .map(id_map)
+                .to_numpy(dtype=float)
             )
-            .reshape(-1)
-            .astype(float)
-        )
-
-        pred_col = np.full(df.shape[0], np.nan, dtype=float)
-        pred_col[np.asarray(mask, dtype=bool)] = y_hat
-        blup_out[trait] = pred_col
+        blup_out[trait] = id_u
 
         # Variance decomposition and heritability
-        h2 = 0.0
+        h2 = np.nan
+        ve = np.nan
+        pve_e = np.nan
+        e_eff = 1.0
+        r_eff = 1.0
         random_rows: list[tuple[str, float, float]] = []
         if getattr(model, "var", None) is not None and len(z_names) > 0:
             var_all = np.asarray(model.var, dtype=float).reshape(-1)
@@ -455,7 +598,25 @@ def main() -> None:
                 total = float(np.sum(rand_var) + ve)
                 if total > 0.0:
                     pve = rand_var / total
-                    h2 = float(np.sum(pve))
+                    # Broad-sense heritability on mean scale:
+                    # H2 = Vg / (Vg + Vge/e + Ve/(e*r))
+                    id_idx = z_names.index(sample_col) if sample_col in z_names else -1
+                    gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
+                    vg = float(rand_var[id_idx]) if id_idx >= 0 else np.nan
+                    vge = float(rand_var[gxe_idx]) if gxe_idx >= 0 else 0.0
+                    e_eff, r_eff = _effective_env_rep_counts(
+                        sample_ids_sub,
+                        sub,
+                        [c for c in env_cols_auto if c in sub.columns],
+                        [c for c in rep_cols_auto if c in sub.columns],
+                    )
+                    denom = vg + (vge / e_eff) + (ve / (e_eff * r_eff))
+                    if np.isfinite(denom) and denom > 0.0 and np.isfinite(vg):
+                        h2 = float(vg / denom)
+                    else:
+                        # fallback to observation-scale id-PVE when mean-scale denominator is unstable
+                        h2 = float(pve[id_idx]) if id_idx >= 0 else np.nan
+                    pve_e = float(ve / total)
                     random_rows = [
                         (z_names[i], float(rand_var[i]), float(pve[i])) for i in range(len(z_names))
                     ]
@@ -466,19 +627,24 @@ def main() -> None:
 
         logger.info("-" * 60)
         logger.info(
-            f"Trait: {trait} | used={n_used}/{df.shape[0]} | H2={h2:.6f} | elapsed={format_elapsed(time.time()-step_t0)}"
+            f"Trait: {trait} | used={n_used}/{df.shape[0]} | e={e_eff:.2f} | r={r_eff:.2f} | elapsed={format_elapsed(time.time()-step_t0)}"
         )
-        logger.info("Fixed effects (beta, se, pvalue):")
+        logger.info("Fixed effects:")
         for i, nm in enumerate(fx_names):
             logger.info(
-                f"  {nm}\tbeta={beta[i]:.6g}\tse={se[i]:.6g}\tp={pval[i]:.6g}"
+                f"  {nm:<12} beta={beta[i]:<12.6g} se={se[i]:<12.6g} p={pval[i]:<12.6g}"
             )
         if len(random_rows) > 0:
-            logger.info("Random effects (var, PVE):")
+            logger.info("Random effects:")
             for nm, vv, pp in random_rows:
-                logger.info(f"  {nm}\tvar={vv:.6g}\tPVE={pp:.6g}")
+                logger.info(
+                    f"  {nm:<12} var={vv:<12.6g} PVE={pp:<12.6g}"
+                )
+            logger.info(
+                f"  {'Residual':<12} var={ve:<12.6g} PVE={pve_e:<12.6g}"
+            )
         else:
-            logger.info("Random effects (var, PVE): None")
+            logger.info("Random effects: None")
 
     out_blup = f"{outprefix}.blup.txt"
     blup_out.to_csv(out_blup, sep="\t", index=False)

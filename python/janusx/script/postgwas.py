@@ -2543,6 +2543,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             if (np.isfinite(threshold) and float(threshold) > 0.0)
                             else None
                         ),
+                        axis_min=(
+                            float(manh_ylim[0])
+                            if (manh_ylim is not None and len(manh_ylim) >= 1)
+                            else None
+                        ),
                     )
                     qq_xmax = float(np.log10(plotmodel_qq.df.shape[0] + 1))
                     if np.isfinite(qq_xmax) and qq_xmax > 0:
@@ -2553,10 +2558,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     x_right = max(1.0, x_right)
                     if manh_ylim is not None:
                         ax2.set_ylim(manh_ylim)
-                    # Keep QQ x-range adaptive to QQ data; only align y-range to Manhattan.
-                    # Left bound is always 0 for QQ axis.
-                    x_pad = max(1e-9, 0.02 * float(x_right))
-                    ax2.set_xlim(0.0, x_right + x_pad)
+                    qq_left = float(manh_ylim[0]) if manh_ylim is not None else 0.0
+                    x_right = max(x_right, qq_left + 1e-9)
+                    x_pad = max(1e-9, 0.02 * float(max(1e-9, x_right - qq_left)))
+                    x_upper = x_right + x_pad
+                    if x_upper <= qq_left:
+                        x_upper = qq_left + 1.0
+                    ax2.set_xlim(qq_left, x_upper)
                     if manh_yticks is not None and manh_ylim is not None:
                         y0, y1 = ax2.get_ylim()
                         lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
@@ -3589,7 +3597,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             eps = max(1e-9, abs(exp_xmin) * 1e-9)
             x_pad = max(1e-9, 0.02 * float(eps))
             x_right = exp_xmax + eps + x_pad
-        ax.set_xlim(0.0, max(1.0, float(x_right)))
+        qq_left = float(manh_ylim_pair[0]) if manh_ylim_pair is not None else 0.0
+        x_right = max(float(x_right), qq_left + 1e-9)
+        x_upper = max(float(x_right), qq_left + 1.0)
+        ax.set_xlim(qq_left, x_upper)
         ax.margins(x=0.0)
         line_left, line_right = ax.get_xlim()
         ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")

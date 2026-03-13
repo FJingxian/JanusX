@@ -347,6 +347,7 @@ class GWASPLOT:
         qq_fast_max_points: int = 120_000,
         qq_band_max_points: Union[int, None] = 20_000,
         sig_p_threshold: Union[float, None] = None,
+        axis_min: Union[float, None] = None,
     ) -> plt.Axes:
         """
         Draw a QQ plot of observed vs expected -log10(p) with a beta-based
@@ -385,6 +386,8 @@ class GWASPLOT:
         sig_p_threshold : float or None, default None
             Significance threshold to always preserve in QQ scatter.
             If None, Bonferroni-like threshold 1/n is used.
+        axis_min : float or None, default None
+            If provided, force both QQ axis lower bounds (x/y) to this value.
 
         Returns
         -------
@@ -517,6 +520,19 @@ class GWASPLOT:
             edgecolors="none",
             linewidths=0.0,
         )
+
+        # Keep QQ axis lower bounds consistent between X/Y.
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        if np.isfinite([x0, x1, y0, y1]).all():
+            if axis_min is not None and np.isfinite(float(axis_min)):
+                lo = float(axis_min)
+            else:
+                lo = float(min(x0, y0))
+            x_hi = float(x1) if float(x1) > lo else (lo + 1.0)
+            y_hi = float(y1) if float(y1) > lo else (lo + 1.0)
+            ax.set_xlim(lo, x_hi)
+            ax.set_ylim(lo, y_hi)
 
         ax.set_xlabel("Expected -log10(p-value)")
         ax.set_ylabel("Observed -log10(p-value)")

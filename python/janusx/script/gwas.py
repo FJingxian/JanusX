@@ -516,20 +516,29 @@ def fastplot(
         axes["B"].set_xlabel(f"Chromosome (SNP={snp_text}{snp_suffix})")
 
         # C: QQ plot
-        gwasplot.qq(ax=axes["C"], scatter_size=scatter_size)
+        manh_ymin, manh_ymax = axes["B"].get_ylim()
+        gwasplot.qq(
+            ax=axes["C"],
+            scatter_size=scatter_size,
+            axis_min=float(manh_ymin),
+        )
 
         # Align QQ with Manhattan:
         # - QQ ylim follows Manhattan ylim
-        # - QQ xlim always starts from 0
-        manh_ymin, manh_ymax = axes["B"].get_ylim()
+        # - QQ xlim minimum equals Manhattan ylim minimum
         qq_xmin, qq_xmax = axes["C"].get_xlim()
         axes["C"].set_ylim(manh_ymin, manh_ymax)
+        qq_left = float(manh_ymin)
         if np.isfinite(qq_xmin) and np.isfinite(qq_xmax) and qq_xmax > qq_xmin:
-            x_right = max(1.0, float(qq_xmax))
-            x_pad = max(1e-9, 0.02 * x_right)
-            axes["C"].set_xlim(0.0, x_right + x_pad)
+            x_right = max(float(qq_xmax), qq_left + 1e-9)
+            x_span = max(1e-9, x_right - qq_left)
+            x_pad = max(1e-9, 0.02 * x_span)
+            x_upper = x_right + x_pad
+            if x_upper <= qq_left:
+                x_upper = qq_left + 1.0
+            axes["C"].set_xlim(qq_left, x_upper)
         else:
-            axes["C"].set_xlim(0.0, 1.0)
+            axes["C"].set_xlim(qq_left, qq_left + 1.0)
 
         fig.tight_layout()
         fig.savefig(outpdf, transparent=False, facecolor="white")

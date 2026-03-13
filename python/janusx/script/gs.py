@@ -87,6 +87,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
+from sklearn.model_selection import KFold
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
@@ -256,6 +257,37 @@ def detect_effective_threads() -> int:
         detected = min(detected, min(caps))
 
     return max(1, int(detected))
+
+
+def build_cv_splits(
+    n_samples: int,
+    n_splits: int,
+    seed: int | None = 42,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Build CV splits with sklearn KFold and keep legacy output order:
+    each item is (test_idx, train_idx).
+    """
+    n_samples = int(n_samples)
+    n_splits = int(n_splits)
+    if n_samples < 2:
+        raise ValueError(f"CV requires at least 2 samples, got {n_samples}.")
+    if n_splits < 2:
+        raise ValueError(f"CV folds must be >=2, got {n_splits}.")
+    if n_splits > n_samples:
+        raise ValueError(f"CV folds ({n_splits}) cannot exceed sample size ({n_samples}).")
+
+    try:
+        splitter = KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=seed,
+        )
+        row = np.arange(n_samples, dtype=int)
+        return [(test_idx, train_idx) for train_idx, test_idx in splitter.split(row)]
+    except Exception:
+        # Fallback keeps historical behavior if sklearn splitter is unavailable.
+        return list(kfold(n_samples, k=n_splits, seed=seed))
 
 
 def _mlgs_inner_cv(n_samples: int) -> int:
@@ -1505,7 +1537,11 @@ def main(log: bool = True) -> None:
         # 5-fold cross-validation on training population
         cv_splits = None
         if args.cv is not None:
-            cv_splits = list(kfold(train_snp.shape[1], k=int(args.cv), seed=None))
+            cv_splits = build_cv_splits(
+                n_samples=train_snp.shape[1],
+                n_splits=int(args.cv),
+                seed=42,
+            )
 
         test_snp = geno[:, testmask]
         train_snp_add = None

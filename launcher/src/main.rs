@@ -1584,8 +1584,28 @@ fn git_clone_source_repo(
         .arg(repo_url)
         .arg(dst)
         .stdin(Stdio::null());
-    run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-        .map_err(|e| format!("Failed to clone source repo: {e}"))
+    match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if should_retry_without_proxy_env(&err) {
+                let mut retry = Command::new("git");
+                retry
+                    .arg("clone")
+                    .arg("--depth")
+                    .arg("1")
+                    .arg(repo_url)
+                    .arg(dst)
+                    .stdin(Stdio::null());
+                apply_temporary_no_proxy(&mut retry);
+                let retry_desc = format!("{desc} (retry without proxy) ...");
+                run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(|e| {
+                    format!("Failed to clone source repo: {err}\nRetry without proxy failed: {e}")
+                })
+            } else {
+                Err(format!("Failed to clone source repo: {err}"))
+            }
+        }
+    }
 }
 
 fn find_repo_root_with_launcher(root: &Path) -> Option<PathBuf> {
@@ -2818,8 +2838,27 @@ fn download_file_with_fallback(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-            .map_err(|e| format!("wget download failed: {e}"))?;
+        match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+            Ok(_) => {}
+            Err(err) => {
+                if should_retry_without_proxy_env(&err) {
+                    let mut retry = Command::new("wget");
+                    retry
+                        .arg("-c")
+                        .arg("-O")
+                        .arg(output)
+                        .arg(url)
+                        .stdin(Stdio::null());
+                    apply_temporary_no_proxy(&mut retry);
+                    let retry_desc = format!("{desc} (retry without proxy) ...");
+                    run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(
+                        |e| format!("wget download failed: {err}\nRetry without proxy failed: {e}"),
+                    )?;
+                } else {
+                    return Err(format!("wget download failed: {err}"));
+                }
+            }
+        }
         return Ok(());
     }
     if command_ok("curl", &["--version"]) {
@@ -2832,8 +2871,30 @@ fn download_file_with_fallback(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-            .map_err(|e| format!("curl download failed: {e}"))?;
+        match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+            Ok(_) => {}
+            Err(err) => {
+                if should_retry_without_proxy_env(&err) {
+                    let mut retry = Command::new("curl");
+                    retry
+                        .arg("-L")
+                        .arg("--fail")
+                        .arg("--continue-at")
+                        .arg("-")
+                        .arg("-o")
+                        .arg(output)
+                        .arg(url)
+                        .stdin(Stdio::null());
+                    apply_temporary_no_proxy(&mut retry);
+                    let retry_desc = format!("{desc} (retry without proxy) ...");
+                    run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(
+                        |e| format!("curl download failed: {err}\nRetry without proxy failed: {e}"),
+                    )?;
+                } else {
+                    return Err(format!("curl download failed: {err}"));
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -2849,8 +2910,27 @@ urllib.request.urlretrieve(url, out)
         .arg(url)
         .arg(output)
         .stdin(Stdio::null());
-    run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-        .map_err(|e| format!("Python download failed: {e}"))?;
+    match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+        Ok(_) => {}
+        Err(err) => {
+            if should_retry_without_proxy_env(&err) {
+                let mut retry = Command::new(python);
+                retry
+                    .arg("-c")
+                    .arg(script)
+                    .arg(url)
+                    .arg(output)
+                    .stdin(Stdio::null());
+                apply_temporary_no_proxy(&mut retry);
+                let retry_desc = format!("{desc} (retry without proxy) ...");
+                run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(|e| {
+                    format!("Python download failed: {err}\nRetry without proxy failed: {e}")
+                })?;
+            } else {
+                return Err(format!("Python download failed: {err}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2871,8 +2951,27 @@ fn download_file_with_http_tools(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-            .map_err(|e| format!("wget download failed: {e}"))?;
+        match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+            Ok(_) => {}
+            Err(err) => {
+                if should_retry_without_proxy_env(&err) {
+                    let mut retry = Command::new("wget");
+                    retry
+                        .arg("-c")
+                        .arg("-O")
+                        .arg(output)
+                        .arg(url)
+                        .stdin(Stdio::null());
+                    apply_temporary_no_proxy(&mut retry);
+                    let retry_desc = format!("{desc} (retry without proxy) ...");
+                    run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(
+                        |e| format!("wget download failed: {err}\nRetry without proxy failed: {e}"),
+                    )?;
+                } else {
+                    return Err(format!("wget download failed: {err}"));
+                }
+            }
+        }
         return Ok(());
     }
     if command_ok("curl", &["--version"]) {
@@ -2885,8 +2984,30 @@ fn download_file_with_http_tools(
             .arg(output)
             .arg(url)
             .stdin(Stdio::null());
-        run_cmd_with_optional_spinner(&mut cmd, desc, verbose)
-            .map_err(|e| format!("curl download failed: {e}"))?;
+        match run_cmd_with_optional_spinner(&mut cmd, desc, verbose) {
+            Ok(_) => {}
+            Err(err) => {
+                if should_retry_without_proxy_env(&err) {
+                    let mut retry = Command::new("curl");
+                    retry
+                        .arg("-L")
+                        .arg("--fail")
+                        .arg("--continue-at")
+                        .arg("-")
+                        .arg("-o")
+                        .arg(output)
+                        .arg(url)
+                        .stdin(Stdio::null());
+                    apply_temporary_no_proxy(&mut retry);
+                    let retry_desc = format!("{desc} (retry without proxy) ...");
+                    run_cmd_with_optional_spinner(&mut retry, &retry_desc, verbose).map_err(
+                        |e| format!("curl download failed: {err}\nRetry without proxy failed: {e}"),
+                    )?;
+                } else {
+                    return Err(format!("curl download failed: {err}"));
+                }
+            }
+        }
         return Ok(());
     }
     Err("Neither wget nor curl is available.".to_string())
@@ -3291,6 +3412,46 @@ fn runtime_path_name_eq(a: &str, b: &str) -> bool {
     a == b
 }
 
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+fn has_proxy_env() -> bool {
+    PROXY_ENV_KEYS
+        .iter()
+        .any(|k| env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false))
+}
+
+fn apply_temporary_no_proxy(cmd: &mut Command) {
+    for key in PROXY_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    cmd.env_remove("PIP_PROXY");
+    cmd.env_remove("GIT_PROXY_COMMAND");
+}
+
+fn proxy_error_like(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("proxy")
+        || e.contains("proxyconnect")
+        || e.contains("could not connect to server")
+        || e.contains("failed to connect to")
+        || e.contains("connection refused")
+        || e.contains("127.0.0.1 port")
+        || e.contains("localhost port")
+}
+
+fn should_retry_without_proxy_env(err: &str) -> bool {
+    has_proxy_env() && proxy_error_like(err)
+}
+
 fn pip_install_update(
     python: &Path,
     runtime_home: &Path,
@@ -3303,7 +3464,8 @@ fn pip_install_update(
 ) -> Result<Duration, String> {
     let attempt_install = |force_source_build: bool,
                            suppress_failure_status_line: bool,
-                           desc_override: Option<&str>|
+                           desc_override: Option<&str>,
+                           disable_proxy: bool|
      -> Result<Duration, String> {
         let effective_desc = desc_override.unwrap_or(desc);
         if verbose {
@@ -3317,6 +3479,7 @@ fn pip_install_update(
                 effective_desc,
                 use_cn_rust_mirror,
                 force_source_build,
+                disable_proxy,
             )
         } else {
             pip_install_tail(
@@ -3330,7 +3493,42 @@ fn pip_install_update(
                 use_cn_rust_mirror,
                 force_source_build,
                 suppress_failure_status_line,
+                disable_proxy,
             )
+        }
+    };
+
+    let attempt_install_with_proxy_retry = |force_source_build: bool,
+                                            suppress_failure_status_line: bool,
+                                            desc_override: Option<&str>|
+     -> Result<Duration, String> {
+        match attempt_install(
+            force_source_build,
+            suppress_failure_status_line,
+            desc_override,
+            false,
+        ) {
+            Ok(d) => Ok(d),
+            Err(err) => {
+                if should_retry_without_proxy_env(&err) {
+                    if verbose {
+                        eprintln!(
+                            "Detected proxy connectivity issue; retrying once with temporary no-proxy environment."
+                        );
+                    }
+                    attempt_install(
+                        force_source_build,
+                        suppress_failure_status_line,
+                        desc_override,
+                        true,
+                    )
+                    .map_err(|retry_err| {
+                        format!("{err}\nRetry without proxy failed: {retry_err}")
+                    })
+                } else {
+                    Err(err)
+                }
+            }
         }
     };
 
@@ -3350,7 +3548,7 @@ fn pip_install_update(
         ensure_windows_msvc_linker_ready(runtime_home)?;
     }
 
-    match attempt_install(false, false, None) {
+    match attempt_install_with_proxy_retry(false, false, None) {
         Ok(d) => return Ok(d),
         Err(e) => {
             #[cfg(target_os = "windows")]
@@ -3371,7 +3569,7 @@ fn pip_install_update(
                 ensure_local_rust_toolchain(runtime_home, python, verbose)?;
                 #[cfg(target_os = "windows")]
                 ensure_windows_msvc_linker_ready(runtime_home)?;
-                return attempt_install(false, false, None);
+                return attempt_install_with_proxy_retry(false, false, None);
             }
             if is_pypi_spec && should_retry_with_source_build(&e) {
                 if verbose {
@@ -3387,7 +3585,11 @@ fn pip_install_update(
                 }
                 #[cfg(target_os = "windows")]
                 ensure_windows_msvc_linker_ready(runtime_home)?;
-                match attempt_install(true, false, Some("Retrying source build from PyPI ...")) {
+                match attempt_install_with_proxy_retry(
+                    true,
+                    false,
+                    Some("Retrying source build from PyPI ..."),
+                ) {
                     Ok(d) => return Ok(d),
                     Err(e2) => {
                         #[cfg(target_os = "windows")]
@@ -3409,7 +3611,7 @@ fn pip_install_update(
                             ensure_local_rust_toolchain(runtime_home, python, verbose)?;
                             #[cfg(target_os = "windows")]
                             ensure_windows_msvc_linker_ready(runtime_home)?;
-                            return attempt_install(
+                            return attempt_install_with_proxy_retry(
                                 true,
                                 false,
                                 Some("Retrying source build from PyPI ..."),
@@ -4785,6 +4987,7 @@ fn pip_install(
     desc: &str,
     use_cn_rust_mirror: bool,
     force_source_build: bool,
+    disable_proxy: bool,
 ) -> Result<Duration, String> {
     let mut cmd = build_pip_install_cmd(
         python,
@@ -4795,6 +4998,9 @@ fn pip_install(
         use_cn_rust_mirror,
         force_source_build,
     );
+    if disable_proxy {
+        apply_temporary_no_proxy(&mut cmd);
+    }
 
     if verbose {
         let start = Instant::now();
@@ -4902,6 +5108,7 @@ fn pip_install_tail(
     use_cn_rust_mirror: bool,
     force_source_build: bool,
     suppress_failure_status_line: bool,
+    disable_proxy: bool,
 ) -> Result<Duration, String> {
     let is_tty = io::stdout().is_terminal();
     let mut cmd = build_pip_install_cmd(
@@ -4913,6 +5120,9 @@ fn pip_install_tail(
         use_cn_rust_mirror,
         force_source_build,
     );
+    if disable_proxy {
+        apply_temporary_no_proxy(&mut cmd);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

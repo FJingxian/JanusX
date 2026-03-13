@@ -26,6 +26,7 @@ from janusx.script._common.status import CliStatus
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
+from janusx.script._common.colspec import parse_zero_based_index_specs
 
 
 def _safe_trait_label(label: object) -> str:
@@ -128,8 +129,16 @@ def main() -> None:
         help="Optional GFF3 file for gene coordinates.",
     )
     optional_group.add_argument(
-        "-n", "--ncol", action="extend", nargs="*", default=None, type=int,
-        help="Zero-based phenotype column indices to analyze (same as gwas.py).",
+        "-n", "--n", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
+        help=(
+            "Phenotype column(s), zero-based index (excluding sample ID), "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
+            "Repeat this flag for multiple traits."
+        ),
+    )
+    optional_group.add_argument(
+        "--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-forceset", "--forceset", action="store_true", default=False,
@@ -190,6 +199,10 @@ def main() -> None:
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    try:
+        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+    except ValueError as e:
+        parser.error(str(e))
 
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")

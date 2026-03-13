@@ -121,6 +121,7 @@ from ._common.status import (
     format_elapsed,
 )
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.colspec import parse_zero_based_index_specs
 
 try:
     from rich.progress import (
@@ -1198,15 +1199,28 @@ def main(log: bool = True) -> None:
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-n", "--ncol",
+        "-n", "--n",
         action="extend",
         nargs="+",
-        type=int,
+        metavar="COL",
+        type=str,
         default=None,
-        help="Zero-based phenotype column indices to analyze. "
-             "Supports repeated inputs, e.g. -n 0 -n 3 or -n 0 3. "
-             "If not set, all phenotype columns will be processed "
-             "(default: %(default)s).",
+        dest="ncol",
+        help=(
+            "Phenotype column(s), zero-based index (excluding sample ID), "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
+            "Repeat this flag for multiple traits."
+        ),
+    )
+    optional_group.add_argument(
+        "--ncol",
+        action="extend",
+        nargs="+",
+        metavar="COL",
+        type=str,
+        default=None,
+        dest="ncol",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-cv", "--cv",
@@ -1257,6 +1271,10 @@ def main(log: bool = True) -> None:
         parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    try:
+        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+    except ValueError as e:
+        parser.error(str(e))
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix

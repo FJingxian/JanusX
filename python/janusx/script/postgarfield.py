@@ -40,6 +40,7 @@ from janusx.script._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from janusx.script._common.status import CliStatus
+from janusx.script._common.colspec import parse_zero_based_index_specs
 
 
 def _determine_genotype(args) -> tuple[str, str]:
@@ -162,8 +163,16 @@ def main() -> None:
         help="Optional covariate file (first column is sample ID).",
     )
     optional_group.add_argument(
-        "-n", "--ncol", action="extend", nargs="*", default=None, type=int,
-        help="Zero-based phenotype column indices to analyze.",
+        "-n", "--n", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
+        help=(
+            "Phenotype column(s), zero-based index (excluding sample ID), "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
+            "Repeat this flag for multiple traits."
+        ),
+    )
+    optional_group.add_argument(
+        "--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
@@ -268,6 +277,10 @@ def main() -> None:
         parser.error("the following arguments are required: " + ", ".join(missing_items))
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    try:
+        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+    except ValueError as e:
+        parser.error(str(e))
     if args.only_set is not None and args.only_set < 0:
         raise ValueError("--only-set must be >= 0.")
 

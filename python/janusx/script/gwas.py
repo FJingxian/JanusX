@@ -113,6 +113,7 @@ from ._common.genoio import (
     read_id_file as _read_id_file,
     read_matrix_with_ids as _read_matrix_with_ids,
 )
+from ._common.colspec import parse_zero_based_index_specs
 
 try:
     from rich.progress import (
@@ -1317,7 +1318,7 @@ def load_phenotype(
 
         if len(requested_ncol) == 0:
             msg = (
-                "No phenotype column index was provided for -n/--ncol. "
+                "No phenotype column index was provided for -n/--n. "
                 "Use zero-based indices, e.g. -n 0 -n 3."
             )
             logger.error(msg)
@@ -4023,11 +4024,17 @@ def parse_args():
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
-        "-n", "--ncol", action="extend", nargs="+",
-        default=None, type=int,
-        help="Zero-based phenotype column indices to analyze. "
-             'E.g., "-n 0 -n 3" to analyze the 1st and 4th traits '
-             "(default: %(default)s).",
+        "-n", "--n", action="extend", nargs="+", metavar="COL",
+        default=None, type=str, dest="ncol",
+        help=(
+            "Phenotype column(s), zero-based index (excluding sample ID), "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
+            "Repeat this flag for multiple traits."
+        ),
+    )
+    optional_group.add_argument(
+        "--ncol", action="extend", nargs="+", metavar="COL",
+        default=None, type=str, dest="ncol", help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-k", "--grm", type=str, default="1",
@@ -4107,6 +4114,10 @@ def parse_args():
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    try:
+        args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+    except ValueError as e:
+        parser.error(str(e))
     return args
 
 

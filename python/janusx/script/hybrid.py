@@ -35,14 +35,19 @@ import pandas as pd
 
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
+from ._common.genoio import (
+    GENOTYPE_SUFFIXES,
+    GENOTYPE_TEXT_SUFFIXES,
+    determine_genotype_source_from_args as determine_genotype_source,
+    find_duplicates,
+    output_prefix_from_path,
+    write_npy_output,
+    write_text_output,
+)
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
 from ._common.status import CliStatus, print_success, print_warning
-
-
-GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
-GENOTYPE_SUFFIXES = GENOTYPE_TEXT_SUFFIXES + (".npy",)
 
 
 @dataclass
@@ -169,18 +174,6 @@ def _strip_known_matrix_suffix(path: str) -> str:
     return p
 
 
-def _find_duplicates(items: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    dup: list[str] = []
-    dup_seen: set[str] = set()
-    for item in items:
-        if item in seen and item not in dup_seen:
-            dup.append(item)
-            dup_seen.add(item)
-        seen.add(item)
-    return dup
-
-
 def _read_sidecar_ids(path: str) -> list[str]:
     lines: list[str] = []
     with open(path, "r", encoding="utf-8") as fr:
@@ -207,7 +200,7 @@ def _read_sidecar_ids(path: str) -> list[str]:
             if len(parts) != 1:
                 raise ValueError(f"{path}:{idx}: expected 1 sample ID per line")
             ids.append(parts[0])
-    dup = _find_duplicates(ids)
+    dup = find_duplicates(ids)
     if dup:
         raise ValueError(f"Duplicate sample IDs in sidecar: {', '.join(dup[:10])}")
     return ids
@@ -354,7 +347,7 @@ def _load_parent_ids(path: str) -> tuple[list[str], list[str]]:
 
 
 def _ensure_unique_source_ids(sample_ids: Sequence[str]) -> None:
-    dup = _find_duplicates(list(sample_ids))
+    dup = find_duplicates(list(sample_ids))
     if dup:
         raise ValueError(
             f"Duplicate sample IDs in genotype source: {', '.join(dup[:10])}"
@@ -614,51 +607,6 @@ def _make_hybrid_chunk_iterator(
         yield hybrid, sites
 
 
-def _output_prefix_from_path(path: str) -> str:
-    p = str(path)
-    low = p.lower()
-    if low.endswith(".vcf.gz"):
-        return p[:-7]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return p[: -len(ext)]
-    return p
-
-
-def _strip_default_prefix_suffix(name: str) -> str:
-    base = os.path.basename(str(name))
-    low = base.lower()
-    if low.endswith(".vcf.gz"):
-        base = base[: -len(".vcf.gz")]
-    else:
-        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-            if low.endswith(ext):
-                base = base[: -len(ext)]
-                break
-    if base.startswith("~"):
-        base = base[1:]
-    return base
-
-
-def determine_genotype_source(args) -> tuple[str, str]:
-    if args.vcf:
-        gfile = args.vcf
-        prefix = _strip_default_prefix_suffix(gfile)
-    elif args.file:
-        gfile = args.file
-        prefix = _strip_default_prefix_suffix(gfile)
-    elif args.bfile:
-        gfile = args.bfile
-        prefix = os.path.basename(gfile.rstrip("/\\"))
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
-
-    if args.prefix is not None:
-        prefix = str(args.prefix)
-
-    return gfile.replace("\\", "/"), prefix
-
-
 def _resolve_output_target(args) -> tuple[str, str, str]:
     _, prefix = determine_genotype_source(args)
     outdir = str(args.out or ".").replace("\\", "/")
@@ -674,71 +622,6 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     if fmt == "plink":
         return fmt, base, base
     raise ValueError("Unsupported output format. Use one of: plink, vcf, txt, npy.")
-
-
-def _write_site_file(handle, sites: Sequence[SiteInfo]) -> None:
-    for site in sites:
-        chrom = str(site.chrom)
-        pos = int(site.pos)
-        ref = str(site.ref_allele)
-        alt = str(site.alt_allele)
-        handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\n")
-
-
-def _write_id_file(path: str, sample_ids: Sequence[str]) -> None:
-    with open(path, "w", encoding="utf-8") as fid:
-        fid.write("\n".join(map(str, sample_ids)) + "\n")
-
-
-def _write_text_output(
-    out_path: str,
-    sample_ids: Sequence[str],
-    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
-    *,
-    total_sites: int,
-) -> None:
-    prefix = _output_prefix_from_path(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    _write_id_file(f"{prefix}.id", sample_ids)
-    with open(out_path, "w", encoding="utf-8") as fw, open(
-        f"{prefix}.site", "w", encoding="utf-8"
-    ) as fsite:
-        written = 0
-        for block, sites in chunks:
-            np.savetxt(fw, np.asarray(block, dtype=np.float32), fmt="%.6g", delimiter="\t")
-            _write_site_file(fsite, sites)
-            written += int(block.shape[0])
-    if written != int(total_sites):
-        raise RuntimeError(f"Written site count mismatch for text output: {written} vs {total_sites}")
-
-
-def _write_npy_output(
-    out_path: str,
-    sample_ids: Sequence[str],
-    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
-    *,
-    total_sites: int,
-) -> None:
-    prefix = _output_prefix_from_path(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    n_samples = len(sample_ids)
-    out_mm = np.lib.format.open_memmap(
-        out_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(int(total_sites), int(n_samples)),
-    )
-    offset = 0
-    _write_id_file(f"{prefix}.id", sample_ids)
-    with open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        for block, sites in chunks:
-            n_rows = int(block.shape[0])
-            out_mm[offset : offset + n_rows, :] = np.asarray(block, dtype=np.float32)
-            _write_site_file(fsite, sites)
-            offset += n_rows
-    out_mm.flush()
-    if offset != int(total_sites):
-        raise RuntimeError(f"Written site count mismatch for npy output: {offset} vs {total_sites}")
 
 
 def _validate_parent_ids(
@@ -929,14 +812,14 @@ def main() -> None:
                     desc="Writing hybrid PLINK",
                 )
             elif out_fmt == "txt":
-                _write_text_output(
+                write_text_output(
                     out_path,
                     hybrid_ids,
                     chunks,
                     total_sites=int(source.n_sites),
                 )
             else:
-                _write_npy_output(
+                write_npy_output(
                     out_path,
                     hybrid_ids,
                     chunks,

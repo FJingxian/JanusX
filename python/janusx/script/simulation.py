@@ -34,6 +34,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 
 
 # -----------------------------
@@ -319,33 +320,6 @@ def build_parser() -> argparse.ArgumentParser:
     optional_group.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     return parser
-
-
-def determine_genotype_source(args: argparse.Namespace) -> tuple[str, str]:
-    """
-    Resolve genotype input and output prefix from CLI arguments.
-    """
-    if args.vcf:
-        gfile = args.vcf
-        prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "")
-    elif args.file:
-        gfile = args.file
-        prefix = os.path.basename(gfile)
-        for ext in (".npy", ".txt", ".tsv", ".csv"):
-            if prefix.lower().endswith(ext):
-                prefix = prefix[: -len(ext)]
-                break
-    elif args.bfile:
-        gfile = args.bfile
-        prefix = os.path.basename(gfile)
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
-
-    if args.prefix is not None:
-        prefix = args.prefix
-
-    gfile = gfile.replace("\\", "/")
-    return gfile, prefix
 
 
 def main(argv: Optional[List[str]] = None) -> int:

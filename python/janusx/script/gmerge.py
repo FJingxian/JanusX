@@ -30,6 +30,16 @@ import numpy as np
 import pandas as pd
 
 from ._common.config_render import emit_cli_configuration
+from ._common.genoio import (
+    GENOTYPE_TEXT_SUFFIXES,
+    build_prefix_candidates,
+    discover_id_sidecar_path,
+    discover_site_path,
+    find_duplicates,
+    strip_known_suffix,
+    write_npy_output,
+    write_text_output,
+)
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
@@ -37,10 +47,6 @@ from ._common.pathcheck import ensure_all_true, ensure_file_exists, ensure_plink
 from ._common.status import CliStatus
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
-
-
-GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
-GENOTYPE_SUFFIXES = GENOTYPE_TEXT_SUFFIXES + (".npy",)
 
 
 @dataclass
@@ -156,29 +162,8 @@ class FileInputSource:
     iter_selected_chunks: Callable[[int], Iterator[tuple[np.ndarray, list[SiteInfo]]]]
 
 
-def _strip_known_suffix(path: str) -> str:
-    p = str(path)
-    low = p.lower()
-    for ext in (".vcf.gz", ".vcf", ".bed", ".bim", ".fam", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return p[: -len(ext)]
-    return p
-
-
 def _basename_no_suffix(path: str) -> str:
-    return os.path.basename(_strip_known_suffix(path.rstrip("/")))
-
-
-def _find_duplicates(items: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    dup: list[str] = []
-    dup_seen: set[str] = set()
-    for item in items:
-        if item in seen and item not in dup_seen:
-            dup.append(item)
-            dup_seen.add(item)
-        seen.add(item)
-    return dup
+    return os.path.basename(strip_known_suffix(path.rstrip("/")))
 
 
 def _read_id_sidecar(path: str) -> list[str]:
@@ -194,32 +179,14 @@ def _read_id_sidecar(path: str) -> list[str]:
             ids.append(parts[0])
     if not ids:
         raise ValueError(f"Empty sample ID sidecar: {path}")
-    dup = _find_duplicates(ids)
+    dup = find_duplicates(ids)
     if dup:
         raise ValueError(f"Duplicate sample IDs in sidecar: {', '.join(dup[:10])}")
     return ids
 
 
-def _build_prefix_candidates(file_arg: str) -> tuple[str, list[str]]:
-    raw = Path(file_arg).expanduser()
-
-    if raw.suffix.lower() in GENOTYPE_TEXT_SUFFIXES:
-        raw_prefix = _strip_known_suffix(str(raw))
-        cache_prefix = str(Path(raw_prefix).parent / f"~{Path(raw_prefix).name}")
-        return raw_prefix, [raw_prefix, cache_prefix]
-
-    if raw.suffix.lower() == ".npy":
-        raw_prefix = _strip_known_suffix(str(raw))
-        noncache_prefix = str(Path(raw_prefix).parent / Path(raw_prefix).name.lstrip("~"))
-        return noncache_prefix, [noncache_prefix, raw_prefix]
-
-    raw_prefix = str(raw)
-    cache_prefix = str(raw.parent / f"~{raw.name}")
-    return raw_prefix, [raw_prefix, cache_prefix]
-
-
 def _discover_file_matrix(file_arg: str) -> tuple[str, str, list[str]]:
-    raw_prefix, prefixes = _build_prefix_candidates(file_arg)
+    raw_prefix, prefixes = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
 
     npy_candidates = []
     raw = Path(file_arg).expanduser()
@@ -256,40 +223,10 @@ def _discover_file_matrix(file_arg: str) -> tuple[str, str, list[str]]:
     )
 
 
-def _discover_site_path(prefixes: Sequence[str]) -> str | None:
-    for prefix in prefixes:
-        for cand in (
-            f"{prefix}.site",
-            f"{prefix}.site.tsv",
-            f"{prefix}.site.txt",
-            f"{prefix}.site.csv",
-            f"{prefix}.bim",
-            f"{prefix}.sites.tsv",
-            f"{prefix}.sites.txt",
-            f"{prefix}.sites.csv",
-        ):
-            if Path(cand).exists():
-                return cand
-    return None
-
-
-def _discover_id_path(matrix_path: str, prefixes: Sequence[str]) -> str:
-    candidates = [f"{matrix_path}.id"]
-    for prefix in prefixes:
-        candidates.extend(
-            [
-                f"{prefix}.id",
-            ]
-        )
-
-    seen: set[str] = set()
-    for cand in candidates:
-        if cand in seen:
-            continue
-        seen.add(cand)
-        if not Path(cand).exists():
-            continue
-        return _read_id_sidecar(cand)
+def _discover_id_path(matrix_path: str, prefixes: Sequence[str]) -> list[str]:
+    id_path = discover_id_sidecar_path(matrix_path, prefixes)
+    if id_path is not None:
+        return _read_id_sidecar(id_path)
     raise FileNotFoundError(
         f"Unable to find sample IDs for matrix {matrix_path}. "
         "Provide a matching prefix.id sidecar."
@@ -298,7 +235,7 @@ def _discover_id_path(matrix_path: str, prefixes: Sequence[str]) -> str:
 
 def _build_file_source(file_arg: str, delimiter: str | None = None) -> FileInputSource:
     matrix_kind, matrix_path, prefixes = _discover_file_matrix(file_arg)
-    site_path = _discover_site_path(prefixes)
+    site_path = discover_site_path(prefixes)
     if site_path is None:
         raise ValueError(
             f"-file input requires real site metadata (.site or .bim): {file_arg}"
@@ -417,67 +354,6 @@ def _read_fam_sample_names(prefix: str) -> list[str]:
             fid, iid = parts[0], parts[1]
             out.append(f"{fid}_{iid}" if fid not in {"", "0"} else iid)
     return out
-
-
-def _write_bim(handle, sites: Sequence[SiteInfo]) -> None:
-    for site in sites:
-        chrom = str(site.chrom)
-        pos = int(site.pos)
-        sid = f"{chrom}_{pos}"
-        ref = str(site.ref_allele)
-        alt = str(site.alt_allele)
-        handle.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
-
-
-def _write_site(handle, sites: Sequence[SiteInfo]) -> None:
-    for site in sites:
-        chrom = str(site.chrom)
-        pos = int(site.pos)
-        ref = str(site.ref_allele)
-        alt = str(site.alt_allele)
-        handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\n")
-
-
-def _write_text_output(out_path: str, sample_ids: Sequence[str], merge_source: str) -> None:
-    prefix = out_path[: -4] if out_path.lower().endswith(".txt") else _strip_known_suffix(out_path)
-    with open(f"{prefix}.id", "w", encoding="utf-8") as fid:
-        fid.write("\n".join(map(str, sample_ids)) + "\n")
-    with open(out_path, "w", encoding="utf-8") as fw, open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        for block, sites in load_genotype_chunks(
-            merge_source,
-            chunk_size=50_000,
-            maf=0.0,
-            missing_rate=1.0,
-            impute=False,
-        ):
-            np.savetxt(fw, np.asarray(block, dtype=np.float32), fmt="%.6g", delimiter="\t")
-            _write_site(fsite, sites)
-
-
-def _write_npy_output(out_path: str, sample_ids: Sequence[str], merge_source: str) -> None:
-    prefix = _strip_known_suffix(out_path)
-    _, n_sites = inspect_genotype_file(merge_source)
-    mm = np.lib.format.open_memmap(
-        out_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(int(n_sites), len(sample_ids)),
-    )
-    offset = 0
-    with open(f"{prefix}.id", "w", encoding="utf-8") as fid, open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        fid.write("\n".join(map(str, sample_ids)) + "\n")
-        for block, sites in load_genotype_chunks(
-            merge_source,
-            chunk_size=50_000,
-            maf=0.0,
-            missing_rate=1.0,
-            impute=False,
-        ):
-            n_rows = int(block.shape[0])
-            mm[offset : offset + n_rows, :] = np.asarray(block, dtype=np.float32)
-            _write_site(fsite, sites)
-            offset += n_rows
-    mm.flush()
 
 
 def _prepare_file_inputs(
@@ -712,7 +588,20 @@ def main(log: bool = True) -> None:
             sample_ids = _read_fam_sample_names(postconvert_source)
             with CliStatus("Writing merged text matrix...", enabled=use_spinner) as task:
                 try:
-                    _write_text_output(final_output, sample_ids, postconvert_source)
+                    _, n_sites = inspect_genotype_file(postconvert_source)
+                    chunks = load_genotype_chunks(
+                        postconvert_source,
+                        chunk_size=50_000,
+                        maf=0.0,
+                        missing_rate=1.0,
+                        impute=False,
+                    )
+                    write_text_output(
+                        final_output,
+                        sample_ids,
+                        chunks,
+                        total_sites=int(n_sites),
+                    )
                 except Exception:
                     task.fail("Writing merged text matrix ...Failed")
                     raise
@@ -721,7 +610,20 @@ def main(log: bool = True) -> None:
             sample_ids = _read_fam_sample_names(postconvert_source)
             with CliStatus("Writing merged npy matrix...", enabled=use_spinner) as task:
                 try:
-                    _write_npy_output(final_output, sample_ids, postconvert_source)
+                    _, n_sites = inspect_genotype_file(postconvert_source)
+                    chunks = load_genotype_chunks(
+                        postconvert_source,
+                        chunk_size=50_000,
+                        maf=0.0,
+                        missing_rate=1.0,
+                        impute=False,
+                    )
+                    write_npy_output(
+                        final_output,
+                        sample_ids,
+                        chunks,
+                        total_sites=int(n_sites),
+                    )
                 except Exception:
                     task.fail("Writing merged npy matrix ...Failed")
                     raise
@@ -759,15 +661,15 @@ def main(log: bool = True) -> None:
             logger.info(
                 "Merged text matrix saved:\n  %s\n  %s.id\n  %s.site",
                 final_output,
-                _strip_known_suffix(final_output),
-                _strip_known_suffix(final_output),
+                strip_known_suffix(final_output),
+                strip_known_suffix(final_output),
             )
         elif final_format == "npy":
             logger.info(
                 "Merged npy matrix saved:\n  %s\n  %s.id\n  %s.site",
                 final_output,
-                _strip_known_suffix(final_output),
-                _strip_known_suffix(final_output),
+                strip_known_suffix(final_output),
+                strip_known_suffix(final_output),
             )
 
     lt = time.localtime()

@@ -1030,12 +1030,8 @@ fn ensure_hisat2_index_for_probe(
     );
     if backend == "csub" {
         let done = index_dir.join("reference.index.ok");
-        let wrapped = wrap_scheduler_cmd(
-            &raw,
-            "strandness_probe_index",
-            threads.clamp(1, 8),
-            backend,
-        );
+        let wrapped =
+            wrap_scheduler_cmd(&raw, "strandness_probe_index", threads.clamp(1, 8), backend);
         let step = PipelineStep {
             id: "probe_hisat2_index".to_string(),
             name: "strandness-probe-index".to_string(),

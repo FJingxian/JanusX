@@ -38,6 +38,14 @@ import numpy as np
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming, SiteInfo
 
 from ._common.config_render import emit_cli_configuration
+from ._common.genoio import (
+    GENOTYPE_TEXT_SUFFIXES,
+    build_prefix_candidates,
+    determine_genotype_source_from_args as determine_genotype_source,
+    discover_site_path,
+    write_npy_output,
+    write_text_output,
+)
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
@@ -48,10 +56,6 @@ from ._common.pathcheck import (
 )
 from ._common.status import CliStatus
 from ._common.genocache import configure_genotype_cache_from_out
-
-
-GENOTYPE_TEXT_SUFFIXES = (".txt", ".tsv", ".csv")
-GENOTYPE_SUFFIXES = GENOTYPE_TEXT_SUFFIXES + (".npy",)
 
 
 def _normalize_chr_key(chrom: str) -> str:
@@ -255,79 +259,9 @@ def _filter_chunk_by_site(
     return np.asarray(geno[keep_idx, :], dtype=np.float32), keep_sites
 
 
-def _strip_known_suffix(path: str) -> str:
-    p = str(path)
-    low = p.lower()
-    for ext in (".vcf.gz", ".vcf", ".bed", ".bim", ".fam", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return p[: -len(ext)]
-    return p
-
-
-def _strip_default_prefix_suffix(name: str) -> str:
-    base = os.path.basename(str(name).rstrip("/\\"))
-    low = base.lower()
-    if low.endswith(".vcf.gz"):
-        return base[: -len(".vcf.gz")]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return base[: -len(ext)]
-    return base
-
-
-def _build_prefix_candidates(file_arg: str) -> tuple[str, list[str]]:
-    raw = Path(file_arg).expanduser()
-
-    if raw.suffix.lower() in GENOTYPE_TEXT_SUFFIXES:
-        raw_prefix = _strip_known_suffix(str(raw))
-        cache_prefix = str(Path(raw_prefix).parent / f"~{Path(raw_prefix).name}")
-        return raw_prefix, [raw_prefix, cache_prefix]
-
-    if raw.suffix.lower() == ".npy":
-        raw_prefix = _strip_known_suffix(str(raw))
-        noncache_prefix = str(Path(raw_prefix).parent / Path(raw_prefix).name.lstrip("~"))
-        return noncache_prefix, [noncache_prefix, raw_prefix]
-
-    raw_prefix = str(raw)
-    cache_prefix = str(raw.parent / f"~{raw.name}")
-    return raw_prefix, [raw_prefix, cache_prefix]
-
-
 def _has_real_file_sites(file_arg: str) -> bool:
-    _, prefixes = _build_prefix_candidates(file_arg)
-    for prefix in prefixes:
-        for cand in (
-            f"{prefix}.site",
-            f"{prefix}.site.tsv",
-            f"{prefix}.site.txt",
-            f"{prefix}.site.csv",
-            f"{prefix}.sites.tsv",
-            f"{prefix}.sites.txt",
-            f"{prefix}.sites.csv",
-            f"{prefix}.bim",
-        ):
-            if os.path.isfile(cand):
-                return True
-    return False
-
-
-def determine_genotype_source(args) -> tuple[str, str]:
-    if args.vcf:
-        gfile = args.vcf
-        prefix = _strip_default_prefix_suffix(gfile)
-    elif args.file:
-        gfile = args.file
-        prefix = _strip_default_prefix_suffix(gfile)
-    elif args.bfile:
-        gfile = args.bfile
-        prefix = os.path.basename(gfile.rstrip("/\\"))
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
-
-    if args.prefix is not None:
-        prefix = str(args.prefix)
-
-    return gfile.replace("\\", "/"), prefix
+    _, prefixes = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
+    return discover_site_path(prefixes) is not None
 
 
 def _resolve_output_target(args) -> tuple[str, str, str]:
@@ -345,68 +279,6 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     if fmt == "plink":
         return fmt, base, base
     raise ValueError("Unsupported output format. Use one of: plink, vcf, txt, npy.")
-
-
-def _write_site_file(handle, sites: Sequence[SiteInfo]) -> None:
-    for site in sites:
-        chrom = str(site.chrom)
-        pos = int(site.pos)
-        ref = str(site.ref_allele)
-        alt = str(site.alt_allele)
-        handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\n")
-
-
-def _write_id_file(path: str, sample_ids: Sequence[str]) -> None:
-    with open(path, "w", encoding="utf-8") as fid:
-        fid.write("\n".join(map(str, sample_ids)) + "\n")
-
-
-def _write_text_output(
-    out_path: str,
-    sample_ids: Sequence[str],
-    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
-    *,
-    total_sites: int,
-) -> None:
-    prefix = _strip_known_suffix(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    _write_id_file(f"{prefix}.id", sample_ids)
-    written = 0
-    with open(out_path, "w", encoding="utf-8") as fw, open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        for block, sites in chunks:
-            np.savetxt(fw, np.asarray(block, dtype=np.float32), fmt="%.6g", delimiter="\t")
-            _write_site_file(fsite, sites)
-            written += int(block.shape[0])
-    if written != int(total_sites):
-        raise RuntimeError(f"Written site count mismatch for text output: {written} vs {total_sites}")
-
-
-def _write_npy_output(
-    out_path: str,
-    sample_ids: Sequence[str],
-    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
-    *,
-    total_sites: int,
-) -> None:
-    prefix = _strip_known_suffix(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    out_mm = np.lib.format.open_memmap(
-        out_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(int(total_sites), len(sample_ids)),
-    )
-    offset = 0
-    _write_id_file(f"{prefix}.id", sample_ids)
-    with open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        for block, sites in chunks:
-            n_rows = int(block.shape[0])
-            out_mm[offset : offset + n_rows, :] = np.asarray(block, dtype=np.float32)
-            _write_site_file(fsite, sites)
-            offset += n_rows
-    out_mm.flush()
-    if offset != int(total_sites):
-        raise RuntimeError(f"Written site count mismatch for npy output: {offset} vs {total_sites}")
 
 
 def _iter_filtered_chunks(
@@ -708,9 +580,9 @@ def main() -> None:
                     desc="Writing PLINK",
                 )
             elif out_fmt == "txt":
-                _write_text_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
+                write_text_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
             else:
-                _write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
+                write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
         except Exception:
             task.fail("Converting genotype format ...Failed")
             raise

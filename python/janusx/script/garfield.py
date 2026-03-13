@@ -25,6 +25,7 @@ from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 
 
 def _safe_trait_label(label: object) -> str:
@@ -81,34 +82,6 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
             if genes:
                 genesets.append(genes)
     return genesets
-
-
-def determine_genotype_source(args) -> tuple[str, str]:
-    def _strip_geno_suffix(name: str) -> str:
-        low = name.lower()
-        if low.endswith(".vcf.gz"):
-            return name[: -len(".vcf.gz")]
-        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-            if low.endswith(ext):
-                return name[: -len(ext)]
-        return name
-
-    if args.vcf:
-        gfile = args.vcf
-        prefix = _strip_geno_suffix(os.path.basename(gfile))
-    elif args.file:
-        gfile = args.file
-        prefix = _strip_geno_suffix(os.path.basename(gfile))
-    elif args.bfile:
-        gfile = args.bfile
-        prefix = os.path.basename(gfile)
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
-
-    if args.prefix is not None:
-        prefix = args.prefix
-
-    return gfile.replace("\\", "/"), prefix
 
 
 def main() -> None:

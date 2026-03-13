@@ -50,6 +50,7 @@ from ._common.pathcheck import (
 from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.genoio import determine_genotype_source as _determine_genotype_source
 
 try:
     from rich.progress import (
@@ -275,16 +276,6 @@ def build_grm_streaming(
     return grm, eff_m
 
 
-def _strip_geno_suffix(name: str) -> str:
-    low = name.lower()
-    if low.endswith(".vcf.gz"):
-        return name[: -len(".vcf.gz")]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return name[: -len(ext)]
-    return name
-
-
 def main(log: bool = True):
     t_start = time.time()
 
@@ -367,19 +358,14 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
     # ------------------------------------------------------------------
-    if args.vcf:
-        gfile = args.vcf
-        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
-    elif args.bfile:
-        gfile = args.bfile
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
-    elif args.file:
-        gfile = args.file
-        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
-    else:
-        raise ValueError("One of --vcf, --file or --bfile must be provided.")
+    gfile, auto_prefix = _determine_genotype_source(
+        vcf=getattr(args, "vcf", None),
+        file=getattr(args, "file", None),
+        bfile=getattr(args, "bfile", None),
+        prefix=None,
+    )
+    args.prefix = auto_prefix if args.prefix is None else args.prefix
 
-    gfile = gfile.replace("\\", "/")
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
 

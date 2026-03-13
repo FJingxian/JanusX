@@ -10,11 +10,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use flate2::write::GzEncoder;
-use flate2::Compression;
-
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
 #[pyclass]
@@ -910,44 +908,6 @@ fn vcf_gt_from_g_i8(g: i8) -> &'static str {
     }
 }
 
-/// Internal writer wrapper: either plain text or gzip-compressed text.
-enum VcfOut {
-    Plain(BufWriter<File>),
-    Gzip(BufWriter<GzEncoder<File>>),
-}
-
-impl VcfOut {
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        match self {
-            VcfOut::Plain(w) => w.write_all(buf),
-            VcfOut::Gzip(w) => w.write_all(buf),
-        }
-    }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            VcfOut::Plain(w) => w.flush(),
-            VcfOut::Gzip(w) => w.flush(),
-        }
-    }
-
-    /// Finish the writer. For gzip, this is critical to write the gzip trailer (CRC/footer).
-    #[inline]
-    fn finish(mut self) -> std::io::Result<()> {
-        self.flush()?;
-        match self {
-            VcfOut::Plain(_w) => Ok(()),
-            VcfOut::Gzip(w) => {
-                let enc = w.into_inner()?; // BufWriter -> GzEncoder
-                let _file = enc.finish()?; // finalize gzip stream and return File
-                Ok(())
-            }
-        }
-    }
-}
-
 #[pyclass]
 pub struct VcfStreamWriter {
     n_samples: usize,
@@ -970,13 +930,8 @@ impl VcfStreamWriter {
             return Err(PyValueError::new_err("sample_ids is empty"));
         }
 
-        let file = File::create(&path).map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
-        let mut out = if path.ends_with(".gz") {
-            let enc = GzEncoder::new(file, Compression::default());
-            VcfOut::Gzip(BufWriter::new(enc))
-        } else {
-            VcfOut::Plain(BufWriter::new(file))
-        };
+        let mut out =
+            VcfOut::from_path(&path).map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
 
         // Write VCF headers once
         out.write_all(b"##fileformat=VCFv4.2\n")

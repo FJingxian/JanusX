@@ -8,13 +8,12 @@ use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use crate::gfcore::{open_text_maybe_gz, read_bim, read_fam, SiteInfo};
+use crate::vcfout::VcfOut;
 
 // ============================================================
 // Output format
@@ -589,42 +588,6 @@ impl InputIter {
 // Output writers
 // ============================================================
 
-enum VcfOut {
-    Plain(BufWriter<File>),
-    Gzip(BufWriter<GzEncoder<File>>),
-}
-
-impl VcfOut {
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        match self {
-            VcfOut::Plain(w) => w.write_all(buf),
-            VcfOut::Gzip(w) => w.write_all(buf),
-        }
-    }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            VcfOut::Plain(w) => w.flush(),
-            VcfOut::Gzip(w) => w.flush(),
-        }
-    }
-
-    #[inline]
-    fn finish(mut self) -> std::io::Result<()> {
-        self.flush()?;
-        match self {
-            VcfOut::Plain(_) => Ok(()),
-            VcfOut::Gzip(w) => {
-                let enc = w.into_inner()?;
-                let _file = enc.finish()?;
-                Ok(())
-            }
-        }
-    }
-}
-
 struct VcfWriter {
     out: VcfOut,
     n_samples_total: usize,
@@ -632,13 +595,7 @@ struct VcfWriter {
 
 impl VcfWriter {
     fn new(out: &str, sample_ids: &[String]) -> Result<Self, String> {
-        let f = File::create(out).map_err(|e| e.to_string())?;
-        let mut out = if out.ends_with(".gz") {
-            let enc = GzEncoder::new(f, Compression::default());
-            VcfOut::Gzip(BufWriter::new(enc))
-        } else {
-            VcfOut::Plain(BufWriter::new(f))
-        };
+        let mut out = VcfOut::from_path(out).map_err(|e| e.to_string())?;
 
         out.write_all(b"##fileformat=VCFv4.2\n")
             .map_err(|e| e.to_string())?;

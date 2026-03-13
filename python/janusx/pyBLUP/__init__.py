@@ -1,7 +1,53 @@
-from .mlm import *
-from .ml import *
-from .kfold import *
-from .assoc import *
-from .QK2 import *
-from .assoc import *
-from .stream_grm import *
+"""
+pyBLUP public API.
+
+Keep this surface explicit to avoid wildcard pollution and accidental
+shadowing by duplicated helper names across modules.
+"""
+
+from .QK2 import QK, GRM
+from .assoc import (
+    FEM,
+    lmm_reml,
+    lmm_reml_null,
+    fastlmm_reml_null,
+    fastlmm_reml,
+    fastlmm_assoc_chunk,
+    ml_loglike_null,
+    lmm_assoc_fixed,
+    LMM,
+    FastLMM,
+    LM,
+    farmcpu,
+)
+from .stream_grm import (
+    StreamingGrmStats,
+    auto_stream_grm_chunk_size,
+    build_streaming_grm_from_chunks,
+)
+from .kfold import kfold
+from .mlm import BLUP as BLUP
+from .ml import MLGS
+
+__all__ = [
+    "QK",
+    "GRM",
+    "FEM",
+    "lmm_reml",
+    "lmm_reml_null",
+    "fastlmm_reml_null",
+    "fastlmm_reml",
+    "fastlmm_assoc_chunk",
+    "ml_loglike_null",
+    "lmm_assoc_fixed",
+    "LMM",
+    "FastLMM",
+    "LM",
+    "farmcpu",
+    "StreamingGrmStats",
+    "auto_stream_grm_chunk_size",
+    "build_streaming_grm_from_chunks",
+    "kfold",
+    "BLUP",
+    "MLGS",
+]

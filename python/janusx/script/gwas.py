@@ -75,20 +75,19 @@ mpl.rcParams['svg.fonttype'] = 'none'
 mpl.rcParams['svg.hashsalt'] = 'hello'
 
 import matplotlib.pyplot as plt
-from matplotlib import font_manager as mpl_font_manager
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
 from joblib import cpu_count
 import psutil
 from janusx.bioplotkit import GWASPLOT
-from janusx.pyBLUP import QK
 from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
 )
-from janusx.pyBLUP import LMM, LM, FastLMM, farmcpu
+from janusx.pyBLUP.QK2 import QK
+from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -107,6 +106,13 @@ from ._common.status import (
 )
 from ._common.gwas_history import record_gwas_run
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
+from ._common.genoio import (
+    basename_only as _basename_only,
+    determine_genotype_source_from_args as determine_genotype_source,
+    read_id_file as _read_id_file,
+    read_matrix_with_ids as _read_matrix_with_ids,
+)
 
 try:
     from rich.progress import (
@@ -546,38 +552,6 @@ def fastplot(
         plt.close(fig)
 
 
-def determine_genotype_source(args) -> tuple[str, str]:
-    """
-    Resolve genotype input and output prefix from CLI arguments.
-    """
-    def _strip_geno_suffix(name: str) -> str:
-        low = name.lower()
-        if low.endswith(".vcf.gz"):
-            return name[: -len(".vcf.gz")]
-        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-            if low.endswith(ext):
-                return name[: -len(ext)]
-        return name
-
-    if args.vcf:
-        gfile = args.vcf
-        prefix = _strip_geno_suffix(os.path.basename(gfile))
-    elif args.file:
-        gfile = args.file
-        prefix = _strip_geno_suffix(os.path.basename(gfile))
-    elif args.bfile:
-        gfile = args.bfile
-        prefix = os.path.basename(gfile)
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
-
-    if args.prefix is not None:
-        prefix = args.prefix
-
-    gfile = gfile.replace("\\", "/")
-    return gfile, prefix
-
-
 def _is_writable_dir(path: str) -> bool:
     d = os.path.abspath(path or ".")
     return os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK)
@@ -854,85 +828,6 @@ def _file_input_sidecars(prefix: str) -> list[str]:
         f"{prefix}.site.csv",
         f"{prefix}.bim",
     ]
-
-
-def _basename_only(path: str) -> str:
-    p = str(path).replace("\\", "/").rstrip("/")
-    b = os.path.basename(p)
-    return b if b else p
-
-
-def _read_id_file(
-    path: str,
-    logger,
-    label: str,
-    *,
-    use_spinner: bool = False,
-    show_status: bool = True,
-) -> Union[np.ndarray, None]:
-    if not os.path.isfile(path):
-        logger.warning(f"{label} ID file not found: {path}")
-        return None
-    src = _basename_only(path)
-
-    def _load_ids() -> Union[np.ndarray, None]:
-        try:
-            df = pd.read_csv(
-                path, sep=r"\s+", header=None, usecols=[0],
-                dtype=str, keep_default_na=False
-            )
-        except Exception:
-            df = pd.read_csv(
-                path, sep=None, engine="python", header=None, usecols=[0],
-                dtype=str, keep_default_na=False
-            )
-        if not df.empty and df.iloc[0, 0] == "":
-            # sep=None can mis-parse single-column ID files; fallback to whitespace
-            df = pd.read_csv(
-                path, sep=r"\s+", header=None, usecols=[0],
-                dtype=str, keep_default_na=False
-            )
-        if df.empty:
-            logger.warning(f"{label} ID file is empty: {path}")
-            return None
-        ids0 = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-        if ids0.size == 0:
-            logger.warning(f"{label} ID file has no usable IDs: {path}")
-            return None
-        return ids0
-
-    if not show_status:
-        return _load_ids()
-
-    with CliStatus(f"Loading {label} ID from {src}...", enabled=bool(use_spinner)) as task:
-        try:
-            ids = _load_ids()
-        except Exception:
-            task.fail(f"Loading {label} ID from {src} ...Failed")
-            raise
-        if ids is None:
-            task.complete(f"Loading {label} ID from {src} shape=(0,)")
-            return None
-        task.complete(f"Loading {label} ID from {src} shape=({ids.size},)")
-    return ids
-
-
-def _read_matrix_with_ids(path: str, logger, label: str) -> tuple[Union[np.ndarray, None], np.ndarray]:
-    try:
-        df = pd.read_csv(
-            path, sep=None, engine="python", header=None,
-            dtype={0: str}, keep_default_na=False
-        )
-    except Exception:
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None,
-            dtype={0: str}, keep_default_na=False
-        )
-    if df.shape[1] < 2:
-        raise ValueError(f"{label} file must have IDs in column 1 and data in columns 2+.")
-    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-    data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-    return ids, data
 
 
 def _normalize_cov_inputs(cov_arg: Union[str, list[str], None]) -> list[str]:
@@ -1909,56 +1804,6 @@ def build_grm_streaming(
 
     _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
     return grm, int(grm_stats.eff_m)
-
-_CJK_FONT_READY: Optional[bool] = None
-
-
-def _contains_cjk(text: str) -> bool:
-    for ch in str(text):
-        code = ord(ch)
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3000 <= code <= 0x303F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
-            return True
-    return False
-
-
-def _ensure_cjk_font() -> bool:
-    """
-    Ensure matplotlib has at least one CJK-capable sans font configured.
-    Returns True when a candidate font is found, otherwise False.
-    """
-    global _CJK_FONT_READY
-    if _CJK_FONT_READY is not None:
-        return _CJK_FONT_READY
-
-    candidates = [
-        "Microsoft YaHei",
-        "SimHei",
-        "Noto Sans CJK SC",
-        "Source Han Sans CN",
-        "PingFang SC",
-        "Heiti SC",
-        "WenQuanYi Zen Hei",
-        "Arial Unicode MS",
-    ]
-    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
-    selected = next((name for name in candidates if name in installed), None)
-    if selected is None:
-        _CJK_FONT_READY = False
-        return False
-
-    current = mpl.rcParams.get("font.sans-serif", [])
-    if not isinstance(current, list):
-        current = [str(current)]
-    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
-    mpl.rcParams["axes.unicode_minus"] = False
-    _CJK_FONT_READY = True
-    return True
-
 
 def load_or_build_grm_with_cache(
     genofile: str,

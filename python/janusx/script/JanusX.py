@@ -20,6 +20,7 @@ Modules:
 
     Genomic Selection (GS):
     gs            Genomic prediction and model-based selection
+    reml          Estimate heritability/effect components by REML-BLUP
 
     GARFIELD:
     garfield      Random-forest based marker-trait association
@@ -29,7 +30,7 @@ Modules:
     postbsa       Post-process and visualize BSA results
 
     Pipeline and utility:
-    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
+    fastq2vcf     Variant-calling pipeline from FASTQ to VCF (launcher-only)
     hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
@@ -94,8 +95,8 @@ __version__ = (
 
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
-    "garfield", "grm", "pca", "gs",
-    "sim", "simulation", "gformat", "gmerge", "fastq2vcf", "hybrid", "webui", "loadanno",
+    "garfield", "grm", "pca", "gs", "reml",
+    "sim", "simulation", "gformat", "gmerge", "hybrid", "webui", "loadanno",
 ]
 
 
@@ -174,6 +175,10 @@ def main():
             _load_script_module("loadanno").main()
         else:
             module_name = sys.argv[1]
+            if module_name == "fastq2vcf":
+                print("Error: Python fastq2vcf has been retired.")
+                print("Please run launcher command: `jx fastq2vcf ...`")
+                return
             if module_name in _MODULE_NAMES:
                 # Keep argparse usage as "jx <module> ..."
                 sys.argv[0] = f"jx {module_name}"

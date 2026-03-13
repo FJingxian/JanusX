@@ -590,7 +590,7 @@ pub(crate) fn run_dlc_update(
         cleanup_previous_runtime(&existing, runtime_home)?;
     }
 
-    let mut record = match build_runtime(selected_entry.builder_id, python, runtime_home) {
+    let mut record = match build_runtime(selected_entry.builder_id, runtime_home) {
         Ok(r) => r,
         Err(e) => {
             ensure_dlc_inline_step_newline();
@@ -1291,16 +1291,12 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
     }
 }
 
-fn build_runtime(
-    method_id: i32,
-    python: &Path,
-    runtime_home: &Path,
-) -> Result<RuntimeRecord, String> {
+fn build_runtime(method_id: i32, runtime_home: &Path) -> Result<RuntimeRecord, String> {
     match method_id {
         1 => build_env_runtime(runtime_home),
         2 => build_conda_runtime(runtime_home),
         3 => build_docker_runtime(runtime_home),
-        4 => build_singularity_runtime(python),
+        4 => build_singularity_runtime(runtime_home),
         _ => Err("Unknown build method.".to_string()),
     }
 }
@@ -1872,7 +1868,7 @@ fn build_docker_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     })
 }
 
-fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
+fn build_singularity_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     if !cfg!(target_os = "linux") {
         return Err("singularity method is Linux only.".to_string());
     }
@@ -1883,11 +1879,10 @@ fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
     if !ready {
         return Err(format!("Singularity runtime is not usable: {detail}"));
     }
-    let pipeline_dir = pipeline_dir_from_python(python)?;
-    let bin_dir = pipeline_dir.join("bin");
-    fs::create_dir_all(&bin_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
-    let sif_path = bin_dir.join("janusxext.sif");
+    let sif_dir = runtime_home.join("dlc").join("singularity");
+    fs::create_dir_all(&sif_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", sif_dir.display()))?;
+    let sif_path = sif_dir.join("janusxext.sif");
     if !sif_path.exists() {
         print!("Download JanusX Singularity Image (~800MB)? [y/N/path.sif]: ");
         io::stdout()
@@ -1901,7 +1896,7 @@ fn build_singularity_runtime(python: &Path) -> Result<RuntimeRecord, String> {
         if input.is_empty() || input.eq_ignore_ascii_case("n") {
             return Err("No SIF provided.".to_string());
         }
-        let tmp_path = bin_dir.join("janusxext.tmp.sif");
+        let tmp_path = sif_dir.join("janusxext.tmp.sif");
         if input.eq_ignore_ascii_case("y") {
             download_with_fallback("download SIF", &JANUSX_SIF_URLS, &tmp_path)?;
         } else {
@@ -3220,32 +3215,6 @@ fn ensure_dlc_inline_step_newline() {
     }
     println!();
     let _ = io::stdout().flush();
-}
-
-fn pipeline_dir_from_python(python: &Path) -> Result<PathBuf, String> {
-    let out = Command::new(python)
-        .arg("-c")
-        .arg("import janusx.pipeline, pathlib; print(pathlib.Path(janusx.pipeline.__file__).resolve().parent)")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to resolve janusx.pipeline path: {e}"))?;
-    if !out.status.success() {
-        let mut msg = String::new();
-        msg.push_str(&String::from_utf8_lossy(&out.stdout));
-        msg.push_str(&String::from_utf8_lossy(&out.stderr));
-        return Err(format!(
-            "Failed to locate janusx.pipeline path (exit={}): {}",
-            super::exit_code(out.status),
-            msg.trim()
-        ));
-    }
-    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if p.is_empty() {
-        return Err("janusx.pipeline path is empty.".to_string());
-    }
-    Ok(PathBuf::from(p))
 }
 
 fn ensure_embedded_dockerfile(runtime_home: &Path) -> Result<PathBuf, String> {

@@ -53,7 +53,6 @@ from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks
 
 import matplotlib.pyplot as plt
-from matplotlib import font_manager as mpl_font_manager
 from matplotlib import colors as mcolors
 from matplotlib.patches import ConnectionPatch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -71,13 +70,13 @@ from typing import Any, Optional, Tuple
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
 import warnings
+from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
 
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "maf", "beta", "se"]
 _QQ_FIXED_RATIO = 5.0 / 4.0
 _QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
-_CJK_FONT_READY: Optional[bool] = None
 
 try:
     from rich.progress import (
@@ -120,50 +119,6 @@ except Exception:
     Text = None  # type: ignore[assignment]
     box = None  # type: ignore[assignment]
     _HAS_RICH_CONSOLE = False
-
-
-def _contains_cjk(text: object) -> bool:
-    s = str(text)
-    for ch in s:
-        code = ord(ch)
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3000 <= code <= 0x303F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
-            return True
-    return False
-
-
-def _ensure_cjk_font() -> bool:
-    global _CJK_FONT_READY
-    if _CJK_FONT_READY is not None:
-        return _CJK_FONT_READY
-
-    candidates = [
-        "Microsoft YaHei",
-        "SimHei",
-        "Noto Sans CJK SC",
-        "Source Han Sans CN",
-        "PingFang SC",
-        "Heiti SC",
-        "WenQuanYi Zen Hei",
-        "Arial Unicode MS",
-    ]
-    installed = {f.name for f in mpl_font_manager.fontManager.ttflist}
-    selected = next((name for name in candidates if name in installed), None)
-    if selected is None:
-        _CJK_FONT_READY = False
-        return False
-
-    current = mpl.rcParams.get("font.sans-serif", [])
-    if not isinstance(current, list):
-        current = [str(current)]
-    mpl.rcParams["font.sans-serif"] = [selected] + [x for x in current if x != selected]
-    mpl.rcParams["axes.unicode_minus"] = False
-    _CJK_FONT_READY = True
-    return True
 
 
 def _sanitize_plot_text(text: object) -> str:

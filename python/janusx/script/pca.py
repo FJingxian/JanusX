@@ -77,6 +77,12 @@ from ._common.pathcheck import (
 from ._common.prefetch import prefetch_iter
 from ._common.status import get_rich_spinner_name, print_success, format_elapsed
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.genoio import (
+    determine_genotype_source as _determine_genotype_source,
+    read_id_file as _read_id_file,
+    read_matrix_with_ids as _read_matrix_with_ids,
+    strip_default_prefix_suffix,
+)
 
 try:
     from rich.progress import (
@@ -108,52 +114,6 @@ except Exception:
 # ======================================================================
 # Helpers: GRM-based PCA (aligned with GWAS module)
 # ======================================================================
-
-def _read_id_file(path: str, logger, label: str) -> Union[np.ndarray, None]:
-    if not os.path.isfile(path):
-        logger.warning(f"{label} ID file not found: {path}")
-        return None
-    try:
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    except Exception:
-        df = pd.read_csv(
-            path, sep=None, engine="python", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    if not df.empty and df.iloc[0, 0] == "":
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None, usecols=[0],
-            dtype=str, keep_default_na=False
-        )
-    if df.empty:
-        logger.warning(f"{label} ID file is empty: {path}")
-        return None
-    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-    if ids.size == 0:
-        logger.warning(f"{label} ID file has no usable IDs: {path}")
-        return None
-    return ids
-
-
-def _read_matrix_with_ids(path: str, logger, label: str) -> tuple[Union[np.ndarray, None], np.ndarray]:
-    try:
-        df = pd.read_csv(
-            path, sep=None, engine="python", header=None,
-            dtype={0: str}, keep_default_na=False
-        )
-    except Exception:
-        df = pd.read_csv(
-            path, sep=r"\s+", header=None,
-            dtype={0: str}, keep_default_na=False
-        )
-    if df.shape[1] < 2:
-        raise ValueError(f"{label} file must have IDs in column 1 and data in columns 2+.")
-    ids = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-    data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-    return ids, data
 
 def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], Union[str , None]]:
     group_df = pd.read_csv(group_path, sep="\t", header=None, index_col=0)
@@ -361,16 +321,6 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     return eigvec, eigval
 
 
-def _strip_geno_suffix(name: str) -> str:
-    low = name.lower()
-    if low.endswith(".vcf.gz"):
-        return name[: -len(".vcf.gz")]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
-        if low.endswith(ext):
-            return name[: -len(ext)]
-    return name
-
-
 # ======================================================================
 # Main CLI
 # ======================================================================
@@ -483,22 +433,35 @@ def main(log: bool = True):
 
     # ------------------------- Resolve input file & output prefix -------------------------
     if args.vcf:
-        gfile = args.vcf
-        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) \
-            if args.prefix is None else args.prefix
+        gfile, auto_prefix = _determine_genotype_source(
+            vcf=args.vcf,
+            file=None,
+            bfile=None,
+            prefix=None,
+        )
+        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.file:
-        gfile = args.file
-        args.prefix = _strip_geno_suffix(os.path.basename(gfile)) \
-            if args.prefix is None else args.prefix
+        gfile, auto_prefix = _determine_genotype_source(
+            vcf=None,
+            file=args.file,
+            bfile=None,
+            prefix=None,
+        )
+        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.bfile:
-        gfile = args.bfile
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+        gfile, auto_prefix = _determine_genotype_source(
+            vcf=None,
+            file=None,
+            bfile=args.bfile,
+            prefix=None,
+        )
+        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.grm:
         gfile = args.grm
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+        args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
     elif args.qcov:
         gfile = args.qcov
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+        args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
     else:
         raise ValueError("No valid input found; one of --vcf/--bfile/--grm/--qcov must be provided.")
 
@@ -671,7 +634,7 @@ def main(log: bool = True):
             grm = np.genfromtxt(grm_file)
 
         id_path = f"{grm_file}.id"
-        samples = _read_id_file(id_path, logger, "GRM")
+        samples = _read_id_file(id_path, logger, "GRM", show_status=False)
         if samples is None:
             raise ValueError(f"GRM ID file not found: {id_path}")
         logger.info(f"Loaded GRM sample IDs from {id_path}")

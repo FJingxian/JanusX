@@ -1,17 +1,35 @@
 use pyo3::prelude::*;
 use pyo3::Bound;
 
+// stats
+#[path = "stats/assoc.rs"]
 mod assoc;
+#[path = "stats/bayes.rs"]
 mod bayes;
-mod brent;
+#[path = "stats/bsa.rs"]
 mod bsa;
-mod gfcore;
-mod gfreader;
-mod gmerge;
-mod gwasio;
-mod linalg;
+#[path = "stats/lmm.rs"]
 mod lmm;
+#[path = "stats/logreg.rs"]
 mod logreg;
+
+// io
+#[path = "io/gfcore.rs"]
+mod gfcore;
+#[path = "io/gfreader.rs"]
+mod gfreader;
+#[path = "io/gmerge.rs"]
+mod gmerge;
+#[path = "io/gwasio.rs"]
+mod gwasio;
+#[path = "io/vcfout.rs"]
+mod vcfout;
+
+// math
+#[path = "math/brent.rs"]
+mod brent;
+#[path = "math/linalg.rs"]
+mod linalg;
 
 use assoc::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, glmf32, glmf32_full,

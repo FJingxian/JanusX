@@ -34,12 +34,13 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 17] = [
+const KNOWN_MODULES: [&str; 18] = [
     "grm",
     "pca",
     "gwas",
     "postgwas",
     "gs",
+    "reml",
     "garfield",
     "postgarfield",
     "postbsa",
@@ -53,7 +54,7 @@ const KNOWN_MODULES: [&str; 17] = [
     "simulation",
     "loadanno",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 17] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 18] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -62,6 +63,10 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 17] = [
     ("gwas", "Run genome-wide association analysis"),
     ("postgwas", "Post-process GWAS results and downstream plots"),
     ("gs", "Genomic prediction and model-based selection"),
+    (
+        "reml",
+        "Estimate heritability/effect components by REML-BLUP",
+    ),
     ("garfield", "Random-forest based marker-trait association"),
     ("postgarfield", "Summarize and visualize GARFIELD outputs"),
     ("postbsa", "Post-process and visualize BSA results"),
@@ -4404,6 +4409,13 @@ fn print_cli_help() {
         4,
         "gs",
         "Genomic prediction and model-based selection",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "reml",
+        "Estimate heritability/effect components by REML-BLUP",
         12,
         width,
     );

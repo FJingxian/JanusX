@@ -8,6 +8,8 @@ dependencies = [
     "pandas<3.0",
     "matplotlib",
     "scipy",
+    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
     "scikit-learn",
     "xgboost",
     "psutil",

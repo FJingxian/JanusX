@@ -1,4 +1,5 @@
 import typing
+import platform
 import numpy as np
 from types import SimpleNamespace
 
@@ -7,6 +8,13 @@ from scipy.optimize import minimize
 from scipy import sparse
 from scipy.sparse.linalg import splu
 from tqdm import tqdm
+
+try:
+    import pypardiso as _pypardiso  # type: ignore[import-not-found]
+    _HAS_PYPARDISO = True
+except Exception:
+    _pypardiso = None  # type: ignore[assignment]
+    _HAS_PYPARDISO = False
 
 try:
     from janusx.janusx import ai_reml_multi_f64 as _rust_ai_reml_multi_f64
@@ -18,6 +26,29 @@ except Exception:
     _HAS_RUST_AIREML = False
 
 _OBJ_PENALTY = 1e30
+_PLAT_MACHINE = platform.machine().lower()
+_PREFER_PYPARDISO = bool(
+    _HAS_PYPARDISO
+    and (_PLAT_MACHINE in {"x86_64", "amd64"})
+    and (platform.system() != "Darwin")
+)
+
+
+def _pardiso_spsolve(m: sparse.csc_matrix, b: np.ndarray) -> np.ndarray:
+    if _pypardiso is None:
+        raise RuntimeError("pypardiso not available")
+    b_arr = np.asarray(b, dtype=float)
+    try:
+        x = _pypardiso.spsolve(m, b_arr)
+        return np.asarray(x, dtype=float)
+    except Exception:
+        if b_arr.ndim != 2:
+            raise
+        cols = [
+            np.asarray(_pypardiso.spsolve(m, b_arr[:, i]), dtype=float).reshape(-1, 1)
+            for i in range(b_arr.shape[1])
+        ]
+        return np.hstack(cols)
 
 def REML(
     theta: np.ndarray,
@@ -376,12 +407,20 @@ def _sparse_z_fit_state(
     d = _expand_z_theta(theta_z, z_cols)
 
     m = sparse.diags(1.0 / d, format="csc") + (ztz_csc * inv_lbd)
-    lu = splu(m)
 
     zty = np.asarray(z_csc.T @ y, dtype=float).reshape(-1)
     ztx = np.asarray(z_csc.T @ X, dtype=float)
-    tmp_y = lu.solve(zty).reshape(-1, 1)
-    tmp_x = lu.solve(ztx)
+    use_pardiso = _PREFER_PYPARDISO
+    if use_pardiso:
+        try:
+            tmp_y = _pardiso_spsolve(m, zty).reshape(-1, 1)
+            tmp_x = _pardiso_spsolve(m, ztx)
+        except Exception:
+            use_pardiso = False
+    if not use_pardiso:
+        lu = splu(m)
+        tmp_y = lu.solve(zty).reshape(-1, 1)
+        tmp_x = lu.solve(ztx)
 
     vinvy = y * inv_lbd - (z_csc @ tmp_y) * (inv_lbd * inv_lbd)
     vinvx = X * inv_lbd - (z_csc @ tmp_x) * (inv_lbd * inv_lbd)
@@ -393,7 +432,10 @@ def _sparse_z_fit_state(
     vinvr = vinvy - vinvx @ beta
 
     rhs_r = np.asarray(z_csc.T @ r, dtype=float).reshape(-1)
-    u_hat = lu.solve(rhs_r * inv_lbd).reshape(-1, 1)
+    if use_pardiso:
+        u_hat = _pardiso_spsolve(m, rhs_r * inv_lbd).reshape(-1, 1)
+    else:
+        u_hat = lu.solve(rhs_r * inv_lbd).reshape(-1, 1)
     z_fitted = np.asarray(z_csc @ u_hat, dtype=float)
     fitted = X @ beta + z_fitted
     residuals = y - fitted

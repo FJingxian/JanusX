@@ -476,6 +476,7 @@ def main() -> None:
                     ("Out dir", outdir),
                     ("Prefix", prefix),
                     ("BLUP file", f"{outprefix}.blup.txt"),
+                    ("Summary file", f"{outprefix}.reml.summary.tsv"),
                     ("Log file", log_path),
                 ],
             ),
@@ -484,6 +485,7 @@ def main() -> None:
 
     unique_sample_ids = sample_ids.drop_duplicates().reset_index(drop=True)
     blup_out = pd.DataFrame({sample_col: unique_sample_ids.to_numpy(dtype=object)})
+    summary_rows: list[dict[str, typing.Any]] = []
 
     for trait in n_cols:
         step_t0 = time.time()
@@ -496,6 +498,20 @@ def main() -> None:
         if n_used <= 2:
             logger.warning(f"Trait {trait}: too few valid samples after filtering ({n_used}); skip.")
             blup_out[trait] = np.nan
+            summary_rows.append(
+                {
+                    "trait": trait,
+                    "used": n_used,
+                    "total": int(df.shape[0]),
+                    "e": np.nan,
+                    "r": np.nan,
+                    "hsqr": np.nan,
+                    "ve": np.nan,
+                    "pve_e": np.nan,
+                    "elapsed_sec": float(time.time() - step_t0),
+                    "status": "skipped_too_few_samples",
+                }
+            )
             continue
 
         sub = dfx.loc[mask, :].copy()
@@ -629,6 +645,7 @@ def main() -> None:
         logger.info(
             f"Trait: {trait} | used={n_used}/{df.shape[0]} | e={e_eff:.2f} | r={r_eff:.2f} | elapsed={format_elapsed(time.time()-step_t0)}"
         )
+        logger.info(f"hsqr={h2:.6g}" if np.isfinite(h2) else "hsqr=NA")
         logger.info("Fixed effects:")
         for i, nm in enumerate(fx_names):
             logger.info(
@@ -645,11 +662,28 @@ def main() -> None:
             )
         else:
             logger.info("Random effects: None")
+        summary_rows.append(
+            {
+                "trait": trait,
+                "used": n_used,
+                "total": int(df.shape[0]),
+                "e": float(e_eff),
+                "r": float(r_eff),
+                "hsqr": float(h2) if np.isfinite(h2) else np.nan,
+                "ve": float(ve) if np.isfinite(ve) else np.nan,
+                "pve_e": float(pve_e) if np.isfinite(pve_e) else np.nan,
+                "elapsed_sec": float(time.time() - step_t0),
+                "status": "ok",
+            }
+        )
 
     out_blup = f"{outprefix}.blup.txt"
+    out_summary = f"{outprefix}.reml.summary.tsv"
     blup_out.to_csv(out_blup, sep="\t", index=False)
+    pd.DataFrame(summary_rows).to_csv(out_summary, sep="\t", index=False)
     logger.info("=" * 60)
     logger.info(f"BLUP table saved: {out_blup}")
+    logger.info(f"Summary table saved: {out_summary}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
     print_success(f"REML ...Finished [{format_elapsed(time.time() - t0)}]")
 

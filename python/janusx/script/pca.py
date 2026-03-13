@@ -333,6 +333,7 @@ def main(log: bool = True):
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx pca -vcf geno.vcf.gz -dim 3 -plot",
+            "jx pca -hmp geno.hmp.gz -dim 3 -plot",
             "jx pca -k data.grm -dim 3 -plot",
         ]),
     )
@@ -343,6 +344,10 @@ def main(log: bool = True):
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp", type=str,
+        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
@@ -435,6 +440,16 @@ def main(log: bool = True):
     if args.vcf:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=args.vcf,
+            hmp=None,
+            file=None,
+            bfile=None,
+            prefix=None,
+        )
+        args.prefix = auto_prefix if args.prefix is None else args.prefix
+    elif args.hmp:
+        gfile, auto_prefix = _determine_genotype_source(
+            vcf=None,
+            hmp=args.hmp,
             file=None,
             bfile=None,
             prefix=None,
@@ -443,6 +458,7 @@ def main(log: bool = True):
     elif args.file:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
+            hmp=None,
             file=args.file,
             bfile=None,
             prefix=None,
@@ -451,6 +467,7 @@ def main(log: bool = True):
     elif args.bfile:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
+            hmp=None,
             file=None,
             bfile=args.bfile,
             prefix=None,
@@ -463,7 +480,7 @@ def main(log: bool = True):
         gfile = args.qcov
         args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
     else:
-        raise ValueError("No valid input found; one of --vcf/--bfile/--grm/--qcov must be provided.")
+        raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--qcov must be provided.")
 
     gfile = gfile.replace("\\", "/")
     args.out = os.path.normpath(args.out if args.out is not None else ".")
@@ -488,7 +505,7 @@ def main(log: bool = True):
 
     if log:
         cfg_rows: list[tuple[str, object]] = []
-        if args.vcf or args.file or args.bfile:
+        if args.vcf or args.hmp or args.file or args.bfile:
             cfg_rows.extend(
                 [
                     ("Genotype file", gfile),
@@ -528,7 +545,7 @@ def main(log: bool = True):
         )
 
     checks: list[bool] = []
-    if args.vcf:
+    if args.vcf or args.hmp:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -568,8 +585,8 @@ def main(log: bool = True):
     samples = None
 
     # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
-    if args.vcf or args.file or args.bfile:
-        logger.info("* PCA from genotype (VCF/BFILE/TXT) using streaming GRM.")
+    if args.vcf or args.hmp or args.file or args.bfile:
+        logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming GRM.")
         logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
 
         # Build GRM in streaming mode

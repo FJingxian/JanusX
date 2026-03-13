@@ -239,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=minimal_help_epilog([
             "jx sim -bfile geno_prefix -o out -prefix demo",
             "jx sim -file geno_prefix -o out -prefix demo",
+            "jx sim -hmp geno.hmp.gz -o out -prefix demo",
             "jx simulation -vcf geno.vcf.gz -mode single -o out",
         ]),
         description="JanusX simulation: phenotype from existing genotype",
@@ -252,6 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp", type=str,
+        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,

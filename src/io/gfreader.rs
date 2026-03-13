@@ -11,7 +11,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::gfcore as core;
-use crate::gfcore::{BedSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 use crate::vcfout::VcfOut;
 
 // -------- Py-exposed SiteInfo (wrapper) --------
@@ -528,6 +528,136 @@ impl VcfChunkReader {
     }
 }
 
+// -------- HmpChunkReader --------
+#[pyclass]
+pub struct HmpChunkReader {
+    it: HmpSnpIter,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+}
+
+#[pymethods]
+impl HmpChunkReader {
+    #[new]
+    #[pyo3(signature = (
+        path,
+        maf_threshold=None,
+        max_missing_rate=None,
+        fill_missing=None,
+        sample_ids=None,
+        sample_indices=None,
+        model=None,
+        het_threshold=None,
+    ))]
+    fn new(
+        path: String,
+        maf_threshold: Option<f32>,
+        max_missing_rate: Option<f32>,
+        fill_missing: Option<bool>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
+        model: Option<String>,
+        het_threshold: Option<f32>,
+    ) -> PyResult<Self> {
+        let maf = maf_threshold.unwrap_or(0.0);
+        let miss = max_missing_rate.unwrap_or(1.0);
+        let fill = fill_missing.unwrap_or(true);
+        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
+        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "model must be one of: add, dom, rec, het",
+            ));
+        }
+        let het = het_threshold.unwrap_or(0.02);
+        if !(0.0..=0.5).contains(&het) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "het_threshold must be within [0, 0.5]",
+            ));
+        }
+        let apply_het_filter = model_key != "add";
+        let it = HmpSnpIter::new_with_fill(&path, 0.0, 1.0, false, false, het)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let (sample_indices, sample_ids) =
+            build_sample_selection(&it.samples, sample_ids, sample_indices)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        Ok(Self {
+            it,
+            sample_indices,
+            sample_ids,
+            maf,
+            miss,
+            fill_missing: fill,
+            apply_het_filter,
+            het_threshold: het,
+        })
+    }
+
+    #[getter]
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
+
+    fn next_chunk<'py>(
+        &mut self,
+        py: Python<'py>,
+        chunk_size: usize,
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
+        }
+
+        let n = self.sample_indices.len();
+        let full_samples = n == self.it.n_samples();
+        let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut m: usize = 0;
+
+        while m < chunk_size {
+            match self.it.next_snp_raw() {
+                Some((row, mut site)) => {
+                    let mut row_sub = if full_samples {
+                        row
+                    } else {
+                        self.sample_indices.iter().map(|&i| row[i]).collect()
+                    };
+                    let keep = core::process_snp_row(
+                        &mut row_sub,
+                        &mut site.ref_allele,
+                        &mut site.alt_allele,
+                        self.maf,
+                        self.miss,
+                        self.fill_missing,
+                        self.apply_het_filter,
+                        self.het_threshold,
+                    );
+                    if keep {
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site.into());
+                        m += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+        if m == 0 {
+            return Ok(None);
+        }
+
+        let mat = Array2::from_shape_vec((m, n), data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
+        Ok(Some((py_mat, sites)))
+    }
+}
+
 // -------- TxtChunkReader --------
 #[pyclass]
 pub struct TxtChunkReader {
@@ -683,6 +813,40 @@ pub fn count_vcf_snps(path: String) -> PyResult<usize> {
             continue;
         }
         n += 1;
+    }
+    Ok(n)
+}
+
+#[pyfunction]
+pub fn count_hmp_snps(path: String) -> PyResult<usize> {
+    let p = Path::new(&path);
+    let mut reader =
+        core::open_text_maybe_gz(p).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let mut n: usize = 0;
+    let mut line = String::new();
+    let mut header_seen = false;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        if bytes == 0 {
+            break;
+        }
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            continue;
+        }
+        n += 1;
+    }
+    if !header_seen {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "No HapMap header found in file",
+        ));
     }
     Ok(n)
 }
@@ -1047,6 +1211,170 @@ impl VcfStreamWriter {
     }
 
     /// Close writer. For gzip output, this finalizes the gzip stream (writes trailer).
+    fn close(&mut self) -> PyResult<()> {
+        if let Some(out) = self.out.take() {
+            out.finish()
+                .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    #[getter]
+    fn written_snps(&self) -> usize {
+        self.written_snps
+    }
+}
+
+#[inline]
+fn hmp_base_byte(s: &str) -> u8 {
+    let c = s
+        .chars()
+        .next()
+        .unwrap_or('N')
+        .to_ascii_uppercase();
+    match c {
+        'A' | 'C' | 'G' | 'T' => c as u8,
+        _ => b'N',
+    }
+}
+
+#[inline]
+fn hmp_gt_bytes_from_g_i8(g: i8, ref_b: u8, alt_b: u8) -> [u8; 2] {
+    match g {
+        0 => [ref_b, ref_b],
+        1 => [ref_b, alt_b],
+        2 => [alt_b, alt_b],
+        _ => [b'N', b'N'],
+    }
+}
+
+// ============================================================
+// Streaming HMP writer: plain .hmp OR gzip .hmp.gz (auto)
+// ============================================================
+
+#[pyclass]
+pub struct HmpStreamWriter {
+    n_samples: usize,
+    out: Option<VcfOut>,
+    written_snps: usize,
+}
+
+#[pymethods]
+impl HmpStreamWriter {
+    #[new]
+    fn new(path: String, sample_ids: Vec<String>) -> PyResult<Self> {
+        if sample_ids.is_empty() {
+            return Err(PyValueError::new_err("sample_ids is empty"));
+        }
+        let mut out =
+            VcfOut::from_path(&path).map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+
+        out.write_all(
+            b"rs#\talleles\tchrom\tpos\tstrand\tassembly#\tcenter\tprotLSID\tassayLSID\tpanelLSID\tQCcode",
+        )
+        .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        for sid in sample_ids.iter() {
+            out.write_all(b"\t")
+                .and_then(|_| out.write_all(sid.as_bytes()))
+                .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        }
+        out.write_all(b"\n")
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+
+        Ok(Self {
+            n_samples: sample_ids.len(),
+            out: Some(out),
+            written_snps: 0,
+        })
+    }
+
+    fn write_chunk(
+        &mut self,
+        geno_chunk: PyReadonlyArray2<i8>,
+        sites: Vec<SiteInfo>,
+    ) -> PyResult<()> {
+        let out = self
+            .out
+            .as_mut()
+            .ok_or_else(|| PyErr::new::<PyRuntimeError, _>("writer is closed"))?;
+
+        let arr = geno_chunk.as_array();
+        let shape = arr.shape();
+        if shape.len() != 2 {
+            return Err(PyValueError::new_err(
+                "geno_chunk must be 2D (m_chunk, n_samples)",
+            ));
+        }
+        let m_chunk = shape[0];
+        let n_samples = shape[1];
+        if n_samples != self.n_samples {
+            return Err(PyValueError::new_err(format!(
+                "n_samples mismatch: writer expects {}, got {}",
+                self.n_samples, n_samples
+            )));
+        }
+        if sites.len() != m_chunk {
+            return Err(PyValueError::new_err(format!(
+                "sites length mismatch: sites={}, m_chunk={}",
+                sites.len(),
+                m_chunk
+            )));
+        }
+
+        let strides = arr.strides();
+        let s0 = strides[0] as isize;
+        let s1 = strides[1] as isize;
+        let base = arr.as_ptr();
+
+        unsafe {
+            for snp in 0..m_chunk {
+                let s = &sites[snp];
+                let snp_id = format!("{}_{}", s.chrom, s.pos);
+                let ref_b = hmp_base_byte(&s.ref_allele);
+                let mut alt_b = hmp_base_byte(&s.alt_allele);
+                if alt_b == ref_b {
+                    alt_b = if ref_b == b'A' { b'C' } else { b'A' };
+                }
+                let alleles = format!("{}/{}", ref_b as char, alt_b as char);
+                let prefix = format!(
+                    "{}\t{}\t{}\t{}\t+\t.\t.\t.\t.\t.\t.",
+                    snp_id, alleles, s.chrom, s.pos
+                );
+                out.write_all(prefix.as_bytes())
+                    .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+
+                let snp_off = (snp as isize) * s0;
+                for i in 0..self.n_samples {
+                    let off = snp_off + (i as isize) * s1;
+                    let g = *base.offset(off);
+                    let gt = hmp_gt_bytes_from_g_i8(g, ref_b, alt_b);
+                    out.write_all(b"\t")
+                        .and_then(|_| out.write_all(&gt))
+                        .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+                }
+                out.write_all(b"\n")
+                    .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+                self.written_snps += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        let out = self
+            .out
+            .as_mut()
+            .ok_or_else(|| PyErr::new::<PyRuntimeError, _>("writer is closed"))?;
+        out.flush()
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+        Ok(())
+    }
+
     fn close(&mut self) -> PyResult<()> {
         if let Some(out) = self.out.take() {
             out.finish()

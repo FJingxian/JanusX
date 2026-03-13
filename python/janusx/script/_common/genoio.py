@@ -32,7 +32,9 @@ def strip_known_suffix(path: str, exts: Sequence[str] | None = None) -> str:
     low = p.lower()
     known = tuple(exts) if exts is not None else (
         ".vcf.gz",
+        ".hmp.gz",
         ".vcf",
+        ".hmp",
         ".bed",
         ".bim",
         ".fam",
@@ -52,8 +54,10 @@ def strip_default_prefix_suffix(name: str) -> str:
     low = base.lower()
     if low.endswith(".vcf.gz"):
         base = base[: -len(".vcf.gz")]
+    elif low.endswith(".hmp.gz"):
+        base = base[: -len(".hmp.gz")]
     else:
-        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
@@ -65,12 +69,16 @@ def strip_default_prefix_suffix(name: str) -> str:
 def determine_genotype_source(
     *,
     vcf: str | None,
+    hmp: str | None,
     file: str | None,
     bfile: str | None,
     prefix: str | None = None,
 ) -> tuple[str, str]:
     if vcf:
         gfile = str(vcf)
+        auto_prefix = strip_default_prefix_suffix(gfile)
+    elif hmp:
+        gfile = str(hmp)
         auto_prefix = strip_default_prefix_suffix(gfile)
     elif file:
         gfile = str(file)
@@ -79,7 +87,7 @@ def determine_genotype_source(
         gfile = str(bfile)
         auto_prefix = os.path.basename(gfile.rstrip("/\\"))
     else:
-        raise ValueError("No genotype input specified. Use -vcf, -file or -bfile.")
+        raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
 
     resolved_prefix = str(prefix) if prefix is not None else auto_prefix
     return gfile.replace("\\", "/"), resolved_prefix
@@ -88,6 +96,7 @@ def determine_genotype_source(
 def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
     return determine_genotype_source(
         vcf=getattr(args, "vcf", None),
+        hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
         prefix=getattr(args, "prefix", None),
@@ -154,7 +163,9 @@ def output_prefix_from_path(path: str) -> str:
     low = p.lower()
     if low.endswith(".vcf.gz"):
         return p[:-7]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+    if low.endswith(".hmp.gz"):
+        return p[:-7]
+    for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
         if low.endswith(ext):
             return p[: -len(ext)]
     return p

@@ -9,9 +9,12 @@ import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
     BedChunkReader,
+    HmpChunkReader,
     TxtChunkReader,
     convert_genotypes,
+    count_hmp_snps,
     PlinkStreamWriter,
+    HmpStreamWriter,
     VcfStreamWriter,
     SiteInfo,
 )
@@ -195,9 +198,11 @@ def _is_plink_prefix(path_or_prefix: str) -> bool:
 def _strip_known_suffix(path_or_prefix: str) -> str:
     p = str(path_or_prefix)
     low = p.lower()
+    if low.endswith(".hmp.gz"):
+        return p[: -len(".hmp.gz")]
     if low.endswith(".vcf.gz"):
         return p[: -len(".vcf.gz")]
-    for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+    for ext in (".hmp", ".vcf", ".txt", ".tsv", ".csv", ".npy"):
         if low.endswith(ext):
             return p[: -len(ext)]
     return p
@@ -207,7 +212,7 @@ def _resolve_input(path_or_prefix: str):
     """
     Resolve input kind and prefix.
     Returns (kind, prefix, src_path_or_none).
-    kind: "plink" | "vcf" | "txt" | "npy" | "unknown"
+    kind: "plink" | "vcf" | "hmp" | "txt" | "npy" | "unknown"
     """
     p = str(path_or_prefix)
     low = p.lower()
@@ -217,6 +222,9 @@ def _resolve_input(path_or_prefix: str):
 
     if low.endswith(".vcf.gz") or low.endswith(".vcf"):
         return "vcf", _strip_known_suffix(p), p
+
+    if low.endswith(".hmp.gz") or low.endswith(".hmp"):
+        return "hmp", _strip_known_suffix(p), p
 
     if low.endswith((".txt", ".tsv", ".csv")):
         return "txt", _strip_known_suffix(p), p
@@ -236,6 +244,10 @@ def _resolve_input(path_or_prefix: str):
         return "vcf", prefix, f"{prefix}.vcf.gz"
     if os.path.exists(f"{prefix}.vcf"):
         return "vcf", prefix, f"{prefix}.vcf"
+    if os.path.exists(f"{prefix}.hmp.gz"):
+        return "hmp", prefix, f"{prefix}.hmp.gz"
+    if os.path.exists(f"{prefix}.hmp"):
+        return "hmp", prefix, f"{prefix}.hmp"
     if os.path.exists(f"{prefix}.txt"):
         return "txt", prefix, f"{prefix}.txt"
     if os.path.exists(f"{prefix}.tsv"):
@@ -777,6 +789,7 @@ def load_genotype_chunks(
     It works for:
       - PLINK BED/BIM/FAM (SNP-major, on-disk)
       - VCF / VCF.GZ (converted once to cached PLINK BED/BIM/FAM: ~prefix.*)
+      - HMP / HMP.GZ (streamed directly from HapMap text)
       - Numeric TXT matrix (converted once to cached NPY: ~prefix.npy)
 
     Parameters
@@ -785,6 +798,7 @@ def load_genotype_chunks(
         Genotype source.
         - PLINK: prefix without extension, e.g. "data/QC"
         - VCF  : full path, e.g. "data/QC.vcf.gz" (cached as "data/~QC.*")
+        - HMP  : full path, e.g. "data/QC.hmp.gz"
         - TXT  : matrix path, e.g. "data/matrix.txt" (cached as "data/~matrix.npy")
 
     chunk_size : int
@@ -934,6 +948,94 @@ def load_genotype_chunks(
         )
         return
 
+    if kind == "hmp":
+        if src_path is None:
+            raise ValueError("HMP source path not found.")
+        mode_flags = int(snp_range is not None) + int(snp_indices is not None) + int(bim_range is not None) + int(snp_sites is not None)
+        if mode_flags > 1:
+            raise ValueError(
+                "Provide only one of snp_range, snp_indices, bim_range, or snp_sites."
+            )
+
+        if snp_range is not None:
+            if len(snp_range) != 2:
+                raise ValueError("snp_range must be (start, end).")
+            _start = int(snp_range[0])
+            _end = int(snp_range[1])
+            if _start < 0 or _end <= _start:
+                raise ValueError("invalid snp_range: start must be >=0 and end>start.")
+        else:
+            _start = 0
+            _end = 0
+
+        index_set = None
+        if snp_indices is not None:
+            index_set = set(int(i) for i in snp_indices)
+            if len(index_set) == 0:
+                raise ValueError("snp_indices is empty.")
+
+        site_set = None
+        if snp_sites is not None:
+            site_set = set((str(c), int(p)) for c, p in snp_sites)
+            if len(site_set) == 0:
+                raise ValueError("snp_sites is empty.")
+
+        range_chrom = None
+        range_start = None
+        range_end = None
+        if bim_range is not None:
+            if len(bim_range) != 3:
+                raise ValueError("bim_range must be (chrom, start_pos, end_pos).")
+            range_chrom = str(bim_range[0])
+            range_start = int(bim_range[1])
+            range_end = int(bim_range[2])
+            if range_start > range_end:
+                raise ValueError("bim_range start > end.")
+
+        reader = HmpChunkReader(
+            src_path,
+            float(maf),
+            float(missing_rate),
+            bool(impute),
+            sample_ids,
+            sample_indices,
+            str(model),
+            float(het),
+        )
+        row0 = 0
+        while True:
+            out = reader.next_chunk(chunk_size)
+            if out is None:
+                break
+            geno, sites = out
+            geno_np = np.asarray(geno, dtype=np.float32)
+            sites_list = list(sites)
+            n_rows = int(geno_np.shape[0])
+            if mode_flags > 0:
+                keep_idx: list[int] = []
+                for i, s in enumerate(sites_list):
+                    ridx = row0 + i
+                    keep = True
+                    if snp_range is not None:
+                        keep = (_start <= ridx < _end)
+                    elif index_set is not None:
+                        keep = (ridx in index_set)
+                    elif (range_chrom is not None) and (range_start is not None) and (range_end is not None):
+                        keep = (str(s.chrom) == range_chrom) and (int(s.pos) >= range_start) and (int(s.pos) <= range_end)
+                    elif site_set is not None:
+                        keep = ((str(s.chrom), int(s.pos)) in site_set)
+                    if keep:
+                        keep_idx.append(i)
+                row0 += n_rows
+                if len(keep_idx) == 0:
+                    continue
+                geno_np = np.asarray(geno_np[keep_idx, :], dtype=np.float32)
+                sites_list = [sites_list[i] for i in keep_idx]
+            else:
+                row0 += n_rows
+            yield geno_np, sites_list
+        return
+
     if kind in ("txt", "npy"):
         if mmap_window_mb is not None:
             raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
@@ -975,6 +1077,7 @@ def load_genotype_chunks(
 
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
+        "an HMP path (.hmp/.hmp.gz), "
         "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
         "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
     )
@@ -1051,6 +1154,21 @@ def inspect_genotype_file(
             reader = BedChunkReader(cache_prefix, 0.0, 1.0)
             return reader.sample_ids, reader.n_snps
 
+    if kind == "hmp":
+        if src_path is None:
+            raise ValueError("HMP source path not found.")
+        reader = HmpChunkReader(
+            src_path,
+            0.0,
+            1.0,
+            False,
+            None,
+            None,
+            "add",
+            float(het),
+        )
+        return reader.sample_ids, int(count_hmp_snps(src_path))
+
     if kind in ("txt", "npy"):
         txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)
         reader = TxtChunkReader(
@@ -1071,6 +1189,7 @@ def inspect_genotype_file(
 
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
+        "an HMP path (.hmp/.hmp.gz), "
         "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
         "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
     )
@@ -1124,11 +1243,14 @@ def _infer_format_from_out(out: str) -> str:
     Returns
     -------
     "vcf"   : VCF or VCF.GZ
+    "hmp"   : HMP or HMP.GZ
     "plink" : PLINK prefix (BED/BIM/FAM)
     """
     out = str(out).lower()
     if out.endswith(".vcf") or out.endswith(".vcf.gz"):
         return "vcf"
+    if out.endswith(".hmp") or out.endswith(".hmp.gz"):
+        return "hmp"
     return "plink"
 
 def save_genotype_streaming(
@@ -1145,7 +1267,8 @@ def save_genotype_streaming(
     Unified streaming writer for genotype data.
 
     - If fmt="auto":
-        * out endswith .vcf or .vcf.gz  -> write VCF (optionally gz if your Rust writer supports it)
+        * out endswith .vcf or .vcf.gz  -> write VCF
+        * out endswith .hmp or .hmp.gz  -> write HMP
         * otherwise                     -> write PLINK BED/BIM/FAM using `out` as prefix
 
     This function NEVER materializes the full genotype matrix in memory.
@@ -1165,7 +1288,7 @@ def save_genotype_streaming(
             geno_chunk : np.ndarray (m_chunk, n_samples) (float32/float64/int8 all ok)
             sites      : list[SiteInfo] of length m_chunk
 
-    fmt : {"auto", "vcf", "plink"}
+    fmt : {"auto", "vcf", "hmp", "plink"}
         Force output format. "auto" infers from `out`.
 
     flush_every_chunks : int
@@ -1178,8 +1301,8 @@ def save_genotype_streaming(
     - Missing values should be < 0; writer will encode as ./.
     - For PLINK, phenotype is NOT written; Rust side should write -9 in FAM.
     """
-    if fmt not in ("auto", "vcf", "plink"):
-        raise ValueError("fmt must be one of: auto, vcf, plink")
+    if fmt not in ("auto", "vcf", "hmp", "plink"):
+        raise ValueError("fmt must be one of: auto, vcf, hmp, plink")
 
     if not sample_ids:
         raise ValueError("sample_ids is empty")
@@ -1192,6 +1315,8 @@ def save_genotype_streaming(
     # pick writer
     if fmt == "plink":
         w = PlinkStreamWriter(str(out), sample_ids, None)
+    elif fmt == "hmp":
+        w = HmpStreamWriter(str(out), sample_ids)
     else:
         w = VcfStreamWriter(str(out), sample_ids)
 

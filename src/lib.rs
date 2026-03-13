@@ -38,8 +38,8 @@ use assoc::{
 use bayes::{bayesa, bayesb, bayescpi};
 use bsa::preprocess_bsa;
 use gfreader::{
-    count_vcf_snps, BedChunkReader, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
-    VcfStreamWriter,
+    count_hmp_snps, count_vcf_snps, BedChunkReader, HmpChunkReader, HmpStreamWriter,
+    PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
@@ -53,15 +53,18 @@ use logreg::fit_best_and_not_py;
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<BedChunkReader>()?;
     m.add_class::<VcfChunkReader>()?;
+    m.add_class::<HmpChunkReader>()?;
     m.add_class::<TxtChunkReader>()?;
     m.add_class::<PlinkStreamWriter>()?;
     m.add_class::<VcfStreamWriter>()?;
+    m.add_class::<HmpStreamWriter>()?;
     m.add_class::<SiteInfo>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
+    m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;

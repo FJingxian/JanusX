@@ -284,6 +284,7 @@ def main(log: bool = True):
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx grm -vcf geno.vcf.gz -o outdir -prefix demo",
+            "jx grm -hmp geno.hmp.gz -o outdir -prefix demo",
             "jx grm -bfile geno_prefix -m 1 --npy",
         ]),
     )
@@ -296,6 +297,10 @@ def main(log: bool = True):
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp", type=str,
+        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile", type=str,
@@ -360,6 +365,7 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     gfile, auto_prefix = _determine_genotype_source(
         vcf=getattr(args, "vcf", None),
+        hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
         prefix=None,

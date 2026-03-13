@@ -1367,6 +1367,309 @@ impl VcfSnpIter {
 }
 
 // ======================================================================
+// HMP SNP iterator (single SNP each time)
+// Supports HapMap text files (.hmp / .hmp.gz).
+// ======================================================================
+
+#[inline]
+fn is_dna_base(c: char) -> bool {
+    matches!(c, 'A' | 'C' | 'G' | 'T')
+}
+
+#[inline]
+fn default_alt_for_ref(r: char) -> char {
+    match r {
+        'A' => 'C',
+        'C' => 'A',
+        'G' => 'A',
+        'T' => 'A',
+        _ => 'A',
+    }
+}
+
+#[inline]
+fn iupac_to_pair(c: char) -> Option<(char, char)> {
+    match c {
+        'R' => Some(('A', 'G')),
+        'Y' => Some(('C', 'T')),
+        'S' => Some(('G', 'C')),
+        'W' => Some(('A', 'T')),
+        'K' => Some(('G', 'T')),
+        'M' => Some(('A', 'C')),
+        _ => None,
+    }
+}
+
+fn split_hmp_fields(line: &str) -> Vec<&str> {
+    let tab_cols: Vec<&str> = line.trim_end().split('\t').collect();
+    if tab_cols.len() >= 12 {
+        return tab_cols;
+    }
+    line.split_whitespace().collect()
+}
+
+fn parse_hmp_alleles_field(field: &str) -> Option<(char, char)> {
+    let up = field.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        return None;
+    }
+    let mut bases: Vec<char> = Vec::new();
+    for part in up.split(|c: char| c == '/' || c == '|' || c == ',' || c == ';') {
+        if part.is_empty() {
+            continue;
+        }
+        let b = part.chars().find(|c| is_dna_base(*c));
+        if let Some(x) = b {
+            if !bases.contains(&x) {
+                bases.push(x);
+            }
+        }
+    }
+    if bases.len() >= 2 {
+        return Some((bases[0], bases[1]));
+    }
+    let letters: Vec<char> = up.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.len() == 2 && is_dna_base(letters[0]) && is_dna_base(letters[1]) {
+        if letters[0] != letters[1] {
+            return Some((letters[0], letters[1]));
+        }
+        return Some((letters[0], default_alt_for_ref(letters[0])));
+    }
+    if letters.len() == 1 && is_dna_base(letters[0]) {
+        return Some((letters[0], default_alt_for_ref(letters[0])));
+    }
+    None
+}
+
+fn parse_hmp_gt_token(token: &str) -> Option<(char, char)> {
+    let up = token.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        return None;
+    }
+    if matches!(up.as_str(), "." | "./." | ".|." | "-" | "--" | "N" | "NN" | "NA") {
+        return None;
+    }
+
+    if up.contains('/') || up.contains('|') {
+        let mut alleles: Vec<char> = Vec::with_capacity(2);
+        for part in up.split(|c: char| c == '/' || c == '|') {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(c) = part.chars().find(|x| is_dna_base(*x)) {
+                alleles.push(c);
+                if alleles.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        if alleles.len() >= 2 {
+            return Some((alleles[0], alleles[1]));
+        }
+        return None;
+    }
+
+    let letters: Vec<char> = up.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.len() == 1 {
+        let c = letters[0];
+        if is_dna_base(c) {
+            return Some((c, c));
+        }
+        if let Some((a, b)) = iupac_to_pair(c) {
+            return Some((a, b));
+        }
+        return None;
+    }
+    if letters.len() >= 2 && is_dna_base(letters[0]) && is_dna_base(letters[1]) {
+        return Some((letters[0], letters[1]));
+    }
+    None
+}
+
+fn infer_hmp_ref_alt_from_samples(sample_fields: &[&str]) -> (char, char) {
+    let mut seen: Vec<char> = Vec::new();
+    for tok in sample_fields.iter() {
+        if let Some((a, b)) = parse_hmp_gt_token(tok) {
+            for x in [a, b] {
+                if is_dna_base(x) && !seen.contains(&x) {
+                    seen.push(x);
+                    if seen.len() >= 2 {
+                        return (seen[0], seen[1]);
+                    }
+                }
+            }
+        }
+    }
+    if seen.len() == 1 {
+        return (seen[0], default_alt_for_ref(seen[0]));
+    }
+    ('A', 'C')
+}
+
+pub struct HmpSnpIter {
+    pub samples: Vec<String>,
+    reader: Box<dyn BufRead + Send + Sync + 'static>,
+    #[allow(dead_code)]
+    maf: f32,
+    #[allow(dead_code)]
+    miss: f32,
+    #[allow(dead_code)]
+    fill_missing: bool,
+    #[allow(dead_code)]
+    apply_het_filter: bool,
+    #[allow(dead_code)]
+    het_threshold: f32,
+    finished: bool,
+}
+
+impl HmpSnpIter {
+    pub fn new_with_fill(
+        path: &str,
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
+    ) -> Result<Self, String> {
+        let p = Path::new(path);
+        let mut reader = open_text_maybe_gz(p)?;
+        let mut header_line = String::new();
+        let samples: Vec<String>;
+
+        loop {
+            header_line.clear();
+            let n = reader
+                .read_line(&mut header_line)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("No HapMap header found".into());
+            }
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts = split_hmp_fields(trimmed);
+            if parts.len() < 12 {
+                return Err("Malformed HapMap header: expected >=12 columns".into());
+            }
+            samples = parts[11..].iter().map(|s| s.to_string()).collect();
+            break;
+        }
+
+        Ok(Self {
+            samples,
+            reader,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+            finished: false,
+        })
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+        if self.finished {
+            return None;
+        }
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).ok()?;
+            if n == 0 {
+                self.finished = true;
+                return None;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts = split_hmp_fields(trimmed);
+            if parts.len() < 11 {
+                continue;
+            }
+
+            let chrom = parts[2].to_string();
+            let pos: i32 = parts[3].parse().unwrap_or(0);
+            let sample_fields = if parts.len() > 11 { &parts[11..] } else { &[][..] };
+
+            let (ref_c, alt_c) = if let Some((r, a)) = parse_hmp_alleles_field(parts[1]) {
+                if r != a {
+                    (r, a)
+                } else {
+                    let (rr, aa) = infer_hmp_ref_alt_from_samples(sample_fields);
+                    (rr, aa)
+                }
+            } else {
+                infer_hmp_ref_alt_from_samples(sample_fields)
+            };
+
+            let ref_a = ref_c.to_string();
+            let alt_a = alt_c.to_string();
+
+            let mut row: Vec<f32> = Vec::with_capacity(self.samples.len());
+            for i in 0..self.samples.len() {
+                let tok = if i < sample_fields.len() {
+                    sample_fields[i]
+                } else {
+                    "N"
+                };
+                let g = if let Some((a1, a2)) = parse_hmp_gt_token(tok) {
+                    if (a1 == ref_c || a1 == alt_c) && (a2 == ref_c || a2 == alt_c) {
+                        let mut d = 0.0f32;
+                        if a1 == alt_c {
+                            d += 1.0;
+                        }
+                        if a2 == alt_c {
+                            d += 1.0;
+                        }
+                        d
+                    } else {
+                        -9.0
+                    }
+                } else {
+                    -9.0
+                };
+                row.push(g);
+            }
+
+            let site = SiteInfo {
+                chrom,
+                pos,
+                ref_allele: ref_a,
+                alt_allele: alt_a,
+            };
+            return Some((row, site));
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+        loop {
+            let (mut row, mut site) = self.next_snp_raw()?;
+            let keep = process_snp_row(
+                &mut row,
+                &mut site.ref_allele,
+                &mut site.alt_allele,
+                self.maf,
+                self.miss,
+                self.fill_missing,
+                self.apply_het_filter,
+                self.het_threshold,
+            );
+            if keep {
+                return Some((row, site));
+            }
+        }
+    }
+}
+
+// ======================================================================
 // TXT float32 matrix iterator:
 // - read numeric text matrix in chunks
 // - convert/cache as .npy (float32, C-order)

@@ -3965,6 +3965,7 @@ def parse_args():
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
+            "jx gwas -hmp example.hmp.gz -p pheno.tsv -lmm",
             "jx gwas -bfile example_prefix -p pheno.tsv -lm",
         ]),
     )
@@ -3975,6 +3976,10 @@ def parse_args():
     geno_group.add_argument(
         "-vcf", "--vcf", type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp", type=str,
+        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
     )
     geno_group.add_argument(
         "-file", "--file", type=str,
@@ -4086,19 +4091,19 @@ def parse_args():
     )
 
     args, extras = parser.parse_known_args()
-    has_genotype = bool(args.vcf or args.file or args.bfile)
+    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
-            "(-vcf VCF | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
@@ -4398,7 +4403,11 @@ def main(log: bool = True):
 
     if run_status == "done":
         try:
-            genofile_kind = "bfile" if bool(args.bfile) else ("vcf" if bool(args.vcf) else "tsv")
+            genofile_kind = (
+                "bfile" if bool(args.bfile)
+                else ("vcf" if bool(args.vcf)
+                      else ("hmp" if bool(args.hmp) else "tsv"))
+            )
             args_data = {
                 "models": {
                     "lmm": bool(args.lmm),

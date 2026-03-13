@@ -103,6 +103,10 @@ def main() -> None:
         help="Input genotype in VCF format (.vcf or .vcf.gz).",
     )
     geno_group.add_argument(
+        "-hmp", "--hmp", type=str,
+        help="Input genotype in HMP format (.hmp or .hmp.gz).",
+    )
+    geno_group.add_argument(
         "-file", "--file", type=str,
         help=(
             "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
@@ -170,19 +174,19 @@ def main() -> None:
     )
 
     args, extras = parser.parse_known_args()
-    has_genotype = bool(args.vcf or args.file or args.bfile)
+    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
-            "(-vcf VCF | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))

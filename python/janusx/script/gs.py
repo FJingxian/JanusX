@@ -1039,6 +1039,7 @@ def main(log: bool = True) -> None:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
+            "jx gs -hmp geno.hmp.gz -p pheno.tsv -GBLUP -cv 5",
             "jx gs -file geno_prefix -p pheno.tsv -GBLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -adBLUP -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
@@ -1056,6 +1057,11 @@ def main(log: bool = True) -> None:
         "-vcf", "--vcf",
         type=str,
         help="Input genotype file in VCF format (.vcf or .vcf.gz).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp",
+        type=str,
+        help="Input genotype file in HMP format (.hmp or .hmp.gz).",
     )
     geno_group.add_argument(
         "-bfile", "--bfile",
@@ -1238,17 +1244,17 @@ def main(log: bool = True) -> None:
     )
 
     args, extras = parser.parse_known_args()
-    has_genotype = bool(args.vcf or args.bfile or args.file)
+    has_genotype = bool(args.vcf or args.hmp or args.bfile or args.file)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
-        parser.error("the following arguments are required: (-vcf VCF | -file FILE | -bfile BFILE)")
+        parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
 
@@ -1263,6 +1269,14 @@ def main(log: bool = True) -> None:
             .replace(".vcf", "")
             if args.prefix is None else args.prefix
         )
+    elif args.hmp:
+        gfile = args.hmp
+        args.prefix = (
+            os.path.basename(gfile)
+            .replace(".gz", "")
+            .replace(".hmp", "")
+            if args.prefix is None else args.prefix
+        )
     elif args.file:
         gfile = args.file
         base = os.path.basename(gfile)
@@ -1275,7 +1289,7 @@ def main(log: bool = True) -> None:
         gfile = args.bfile
         args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
     else:
-        raise ValueError("No genotype input detected. Use -vcf, -file or -bfile.")
+        raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
 
     gfile = gfile.replace("\\", "/")  # Normalize Windows-style paths
     args.out = os.path.normpath(args.out if args.out is not None else ".")

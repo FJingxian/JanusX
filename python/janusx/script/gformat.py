@@ -5,6 +5,7 @@ JanusX: Genotype format converter (gformat)
 Supported inputs
 ----------------
 - `-vcf/--vcf`    : VCF / VCF.GZ genotype file
+- `-hmp/--hmp`    : HMP / HMP.GZ genotype file
 - `-bfile/--bfile`: PLINK prefix (.bed/.bim/.fam)
 - `-file/--file`  : text / npy genotype matrix or prefix
 
@@ -12,13 +13,14 @@ Supported outputs
 -----------------
 - `-fmt plink` : PLINK bed/bim/fam
 - `-fmt vcf`   : bgzipped VCF
+- `-fmt hmp`   : HapMap text (.hmp)
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
 - `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
 
 Notes
 -----
 - `-file` inputs must carry sibling `prefix.id`.
-- `-file -> vcf/plink` requires real site metadata via `prefix.site` or `prefix.bim`.
+- `-file -> vcf/hmp/plink` requires real site metadata via `prefix.site` or `prefix.bim`.
 - `txt/npy` outputs always write headerless `prefix.site` as four columns:
   `CHR POS REF ALT`.
 """
@@ -272,13 +274,15 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     base = f"{outdir}/{prefix}".replace("//", "/")
     if fmt == "vcf":
         return fmt, base, f"{base}.vcf.gz"
+    if fmt == "hmp":
+        return fmt, base, f"{base}.hmp"
     if fmt == "txt":
         return fmt, base, f"{base}.txt"
     if fmt == "npy":
         return fmt, base, f"{base}.npy"
     if fmt == "plink":
         return fmt, base, base
-    raise ValueError("Unsupported output format. Use one of: plink, vcf, txt, npy.")
+    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy.")
 
 
 def _iter_filtered_chunks(
@@ -325,6 +329,7 @@ def build_parser() -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx gformat -vcf geno.vcf.gz -fmt npy",
+                "jx gformat -hmp geno.hmp.gz -fmt plink",
                 "jx gformat -bfile geno_prefix -fmt txt -o outdir -prefix panel",
                 "jx gformat -file geno_prefix -fmt vcf",
             ]
@@ -334,6 +339,7 @@ def build_parser() -> CliArgumentParser:
     req = parser.add_argument_group("Input Arguments")
     src = req.add_mutually_exclusive_group(required=True)
     src.add_argument("-vcf", "--vcf", type=str, help="Input genotype file in VCF format (.vcf or .vcf.gz).")
+    src.add_argument("-hmp", "--hmp", type=str, help="Input genotype file in HMP format (.hmp or .hmp.gz).")
     src.add_argument("-bfile", "--bfile", type=str, help="Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).")
     src.add_argument(
         "-file",
@@ -350,9 +356,9 @@ def build_parser() -> CliArgumentParser:
         "-fmt",
         "--fmt",
         dest="format",
-        choices=["plink", "vcf", "txt", "npy"],
+        choices=["plink", "vcf", "hmp", "txt", "npy"],
         default="npy",
-        help="Output genotype format: plink, vcf, txt, npy (default: npy).",
+        help="Output genotype format: plink, vcf, hmp, txt, npy (default: npy).",
     )
     opt.add_argument(
         "-o",
@@ -464,7 +470,7 @@ def main() -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if args.file and out_fmt in {"vcf", "plink"} and (not _has_real_file_sites(gfile)):
+    if args.file and out_fmt in {"vcf", "hmp", "plink"} and (not _has_real_file_sites(gfile)):
         raise ValueError(
             f"{out_fmt.upper()} output from -file input requires real site metadata. "
             "Please provide a matching prefix.site or prefix.bim sidecar."
@@ -568,6 +574,16 @@ def main() -> None:
                     fmt="vcf",
                     total_snps=int(selected_n_sites),
                     desc="Writing VCF",
+                )
+            elif out_fmt == "hmp":
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                save_genotype_streaming(
+                    out_path,
+                    out_sample_ids,
+                    _make_chunks(),
+                    fmt="hmp",
+                    total_snps=int(selected_n_sites),
+                    desc="Writing HMP",
                 )
             elif out_fmt == "plink":
                 Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)

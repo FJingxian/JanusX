@@ -2313,6 +2313,8 @@ Fix options:\n\
 Quick install (PowerShell, admin):\n\
   winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override \"--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools\"\n\n\
 After install, run:\n\
+  jx -upgrade\n\
+or\n\
   jx -update latest"
         .to_string()
 }

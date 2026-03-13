@@ -7,6 +7,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2304,9 +2306,193 @@ fn windows_has_link_exe_in_path() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_parse_first_existing_path(output: &[u8]) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(output);
+    for line in text.lines() {
+        let p = PathBuf::from(line.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_vswhere_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for key in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(base) = env::var_os(key) {
+            paths.push(
+                PathBuf::from(base)
+                    .join("Microsoft Visual Studio")
+                    .join("Installer")
+                    .join("vswhere.exe"),
+            );
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn windows_find_vswhere() -> Option<PathBuf> {
+    for p in windows_vswhere_candidates() {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if command_ok("vswhere", &["-help"]) {
+        return Some(PathBuf::from("vswhere"));
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_find_vsdevcmd_with_vswhere(vswhere: &Path) -> Option<PathBuf> {
+    let out = Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-find",
+            "**\\Common7\\Tools\\VsDevCmd.bat",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    windows_parse_first_existing_path(&out.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_default_vsdevcmd_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let years = ["2022", "2019", "2017"];
+    let editions = ["BuildTools", "Community", "Professional", "Enterprise"];
+    for base_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = env::var_os(base_key) else {
+            continue;
+        };
+        let base = PathBuf::from(base).join("Microsoft Visual Studio");
+        for year in years {
+            for edition in editions {
+                out.push(
+                    base.join(year)
+                        .join(edition)
+                        .join("Common7")
+                        .join("Tools")
+                        .join("VsDevCmd.bat"),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn windows_find_vsdevcmd() -> Option<PathBuf> {
+    if let Some(vswhere) = windows_find_vswhere() {
+        if let Some(vsdevcmd) = windows_find_vsdevcmd_with_vswhere(&vswhere) {
+            return Some(vsdevcmd);
+        }
+    }
+    windows_default_vsdevcmd_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_capture_vsdevcmd_env(vsdevcmd: &Path) -> Result<Vec<(String, String)>, String> {
+    let cmdline = format!(
+        "\"\"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL && set\"",
+        vsdevcmd.display()
+    );
+    let out = Command::new("cmd")
+        .arg("/d")
+        .arg("/s")
+        .arg("/c")
+        .arg(cmdline)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run VsDevCmd.bat: {e}"))?;
+    if !out.status.success() {
+        let mut msg = String::new();
+        msg.push_str(String::from_utf8_lossy(&out.stdout).trim());
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(String::from_utf8_lossy(&out.stderr).trim());
+        return Err(format!(
+            "VsDevCmd.bat exited with code {}: {}",
+            exit_code(out.status),
+            msg.trim()
+        ));
+    }
+
+    let mut kvs = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.is_empty() || k.starts_with('=') {
+            continue;
+        }
+        kvs.push((k.to_string(), v.to_string()));
+    }
+    if kvs.is_empty() {
+        return Err("VsDevCmd.bat returned empty environment snapshot.".to_string());
+    }
+    Ok(kvs)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_try_apply_msvc_env() -> Result<(), String> {
+    let vsdevcmd = windows_find_vsdevcmd()
+        .ok_or_else(|| "Unable to locate VsDevCmd.bat in default Visual Studio paths.".to_string())?;
+    let kvs = windows_capture_vsdevcmd_env(&vsdevcmd)?;
+    const KEYS: &[&str] = &[
+        "PATH",
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "VCToolsInstallDir",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
+        "WindowsSdkDir",
+        "WindowsSdkVersion",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
+    ];
+    for (k, v) in kvs {
+        if KEYS.contains(&k.as_str()) && !v.trim().is_empty() {
+            env::set_var(k, v);
+        }
+    }
+    if windows_has_link_exe_in_path() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Loaded VsDevCmd from {}, but `link.exe` is still not discoverable in PATH.",
+            vsdevcmd.display()
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+static WINDOWS_MSVC_ENV_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
 fn windows_msvc_linker_missing_message() -> String {
     "Rust toolchain is installed, but MSVC linker `link.exe` was not found.\n\
 JanusX source build on Windows currently uses MSVC target and requires Visual C++ Build Tools.\n\n\
+JanusX cannot download/distribute `link.exe` into `.janusx`; it must come from Visual Studio Build Tools.\n\n\
 Fix options:\n\
 1) Install Build Tools for Visual Studio 2022 (Desktop development with C++), then reopen terminal.\n\
 2) Or run JanusX commands from \"x64 Native Tools Command Prompt for VS 2022\".\n\n\
@@ -2327,7 +2513,16 @@ fn ensure_windows_msvc_linker_ready(runtime_home: &Path) -> Result<(), String> {
     if windows_has_link_exe_in_path() {
         return Ok(());
     }
-    Err(windows_msvc_linker_missing_message())
+    let auto = WINDOWS_MSVC_ENV_INIT.get_or_init(windows_try_apply_msvc_env);
+    match auto {
+        Ok(()) if windows_has_link_exe_in_path() => Ok(()),
+        Ok(()) => Err(windows_msvc_linker_missing_message()),
+        Err(e) => Err(format!(
+            "{}\n\nAuto-detect attempt failed: {}",
+            windows_msvc_linker_missing_message(),
+            e
+        )),
+    }
 }
 
 #[cfg(target_os = "windows")]

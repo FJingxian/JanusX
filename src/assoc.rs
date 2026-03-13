@@ -1,8 +1,14 @@
+use nalgebra::{DMatrix, DVector};
+use numpy::PyArray1;
+use numpy::PyReadonlyArray3;
+use numpy::PyUntypedArrayMethods;
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -986,6 +992,762 @@ pub fn ml_loglike_null_f32<'py>(
     };
     let ml = ml_loglike(log10_lbd, s, &xcov_flat, y, None, n, p_cov);
     Ok(ml)
+}
+
+#[inline]
+fn apply_p_diag_vec(
+    xcov: &[f64],
+    n: usize,
+    p: usize,
+    w: &[f64],
+    c_inv: &[f64],
+    v: &[f64],
+    out: &mut [f64],
+    tmp: &mut [f64],
+    xtmp: &mut [f64],
+    cxtmp: &mut [f64],
+) {
+    debug_assert_eq!(w.len(), n);
+    debug_assert_eq!(v.len(), n);
+    debug_assert_eq!(out.len(), n);
+    debug_assert_eq!(tmp.len(), n);
+    debug_assert_eq!(xtmp.len(), p);
+    debug_assert_eq!(cxtmp.len(), p);
+
+    for i in 0..n {
+        tmp[i] = w[i] * v[i];
+    }
+    for r in 0..p {
+        let mut acc = 0.0_f64;
+        for i in 0..n {
+            acc += xcov[i * p + r] * tmp[i];
+        }
+        xtmp[r] = acc;
+    }
+    for r in 0..p {
+        let mut acc = 0.0_f64;
+        for c in 0..p {
+            acc += c_inv[r * p + c] * xtmp[c];
+        }
+        cxtmp[r] = acc;
+    }
+    for i in 0..n {
+        let mut xcu = 0.0_f64;
+        for r in 0..p {
+            xcu += xcov[i * p + r] * cxtmp[r];
+        }
+        out[i] = tmp[i] - w[i] * xcu;
+    }
+}
+
+#[inline]
+fn trace_p_d(
+    s: &[f64],
+    xcov: &[f64],
+    n: usize,
+    p: usize,
+    w: &[f64],
+    c_inv: &[f64],
+    use_s_as_d: bool,
+) -> f64 {
+    let mut tr_wd = 0.0_f64;
+    for i in 0..n {
+        let d = if use_s_as_d { s[i] } else { 1.0 };
+        tr_wd += w[i] * d;
+    }
+
+    // M = X^T diag(w^2 * d) X
+    let mut m = vec![0.0_f64; p * p];
+    for i in 0..n {
+        let d = if use_s_as_d { s[i] } else { 1.0 };
+        let wi2d = w[i] * w[i] * d;
+        let base = i * p;
+        for r in 0..p {
+            let xir = xcov[base + r];
+            for c in 0..=r {
+                let xic = xcov[base + c];
+                m[r * p + c] += wi2d * xir * xic;
+            }
+        }
+    }
+    for r in 0..p {
+        for c in 0..r {
+            m[c * p + r] = m[r * p + c];
+        }
+    }
+
+    // tr(C^{-1} M) is not right; we already pass C = (X^T W X)^{-1}.
+    // Need tr(C * M).
+    let mut tr_cm = 0.0_f64;
+    for r in 0..p {
+        for c in 0..p {
+            tr_cm += c_inv[r * p + c] * m[c * p + r];
+        }
+    }
+    tr_wd - tr_cm
+}
+
+fn ai_reml_eval(
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    sigma_g2: f64,
+    sigma_e2: f64,
+) -> Option<(f64, f64, f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    if !sigma_g2.is_finite() || !sigma_e2.is_finite() || sigma_g2 <= 0.0 || sigma_e2 <= 0.0 {
+        return None;
+    }
+    if n <= p {
+        return None;
+    }
+
+    let mut w = vec![0.0_f64; n];
+    let mut log_det_v = 0.0_f64;
+    for i in 0..n {
+        let vi = sigma_g2 * s[i] + sigma_e2;
+        if !vi.is_finite() || vi <= 0.0 {
+            return None;
+        }
+        w[i] = 1.0 / vi;
+        log_det_v += vi.ln();
+    }
+
+    // A = X^T W X, b = X^T W y
+    let mut a = vec![0.0_f64; p * p];
+    let mut b = vec![0.0_f64; p];
+    for i in 0..n {
+        let wi = w[i];
+        let yi = y[i];
+        let base = i * p;
+        for r in 0..p {
+            let xir = xcov[base + r];
+            b[r] += wi * xir * yi;
+            for c in 0..=r {
+                let xic = xcov[base + c];
+                a[r * p + c] += wi * xir * xic;
+            }
+        }
+    }
+    for r in 0..p {
+        a[r * p + r] += 1e-8;
+        for c in 0..r {
+            a[c * p + r] = a[r * p + c];
+        }
+    }
+
+    let mut l = a.clone();
+    cholesky_inplace(&mut l, p)?;
+    let log_det_xtv_inv_x = cholesky_logdet(&l, p);
+
+    let beta = cholesky_solve(&l, p, &b);
+
+    // z = V^{-1} r
+    let mut z = vec![0.0_f64; n];
+    let mut rtv_invr = 0.0_f64;
+    for i in 0..n {
+        let base = i * p;
+        let mut xb = 0.0_f64;
+        for r in 0..p {
+            xb += xcov[base + r] * beta[r];
+        }
+        let ri = y[i] - xb;
+        z[i] = w[i] * ri;
+        rtv_invr += ri * z[i];
+    }
+    if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+        return None;
+    }
+
+    // C = (X^T W X)^{-1}
+    let mut c_inv = vec![0.0_f64; p * p];
+    let mut e = vec![0.0_f64; p];
+    let mut x = vec![0.0_f64; p];
+    for col in 0..p {
+        e.fill(0.0);
+        e[col] = 1.0;
+        x.fill(0.0);
+        cholesky_solve_into(&l, p, &e, &mut x);
+        for row in 0..p {
+            c_inv[row * p + col] = x[row];
+        }
+    }
+
+    let n_f = n as f64;
+    let p_f = p as f64;
+    let reml_total = (n_f - p_f) * rtv_invr.ln() + log_det_v + log_det_xtv_inv_x;
+    let reml_c = (n_f - p_f) * ((n_f - p_f).ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let reml = reml_c - 0.5 * reml_total;
+
+    let ml_total = n_f * rtv_invr.ln() + log_det_v;
+    let ml_c = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let ml = ml_c - 0.5 * ml_total;
+
+    Some((reml, ml, rtv_invr, w, z, c_inv, beta))
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, max_iter=100, tol=1e-6, min_var=1e-12))]
+pub fn ai_reml_null_f64<'py>(
+    _py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    max_iter: usize,
+    tol: f64,
+    min_var: f64,
+) -> PyResult<(f64, f64, f64, f64, f64, usize, bool)> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if n <= p_cov {
+        return Err(PyRuntimeError::new_err("n must be > p_cov"));
+    }
+    let min_var = if min_var.is_finite() && min_var > 0.0 {
+        min_var
+    } else {
+        1e-12
+    };
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-6
+    };
+
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(v) => Cow::Borrowed(v),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+
+    let mean_y = y.iter().copied().sum::<f64>() / (n as f64);
+    let mut var_y = 0.0_f64;
+    for &yi in y {
+        let d = yi - mean_y;
+        var_y += d * d;
+    }
+    var_y /= (n.max(2) - 1) as f64;
+    if !var_y.is_finite() || var_y <= 0.0 {
+        var_y = 1.0;
+    }
+    let mut sigma_g2 = (0.5 * var_y).max(min_var);
+    let mut sigma_e2 = (0.5 * var_y).max(min_var);
+
+    let mut converged = false;
+    let mut used_iter = 0usize;
+
+    let mut state = ai_reml_eval(s, &xcov_flat, y, n, p_cov, sigma_g2, sigma_e2)
+        .ok_or_else(|| PyRuntimeError::new_err("AIREML init failed"))?;
+
+    for it in 0..max_iter {
+        used_iter = it + 1;
+        let (reml_curr, _ml_curr, _q_curr, w, z, c_inv, _beta) = &state;
+
+        let tr_g = trace_p_d(s, &xcov_flat, n, p_cov, w, c_inv, true);
+        let tr_e = trace_p_d(s, &xcov_flat, n, p_cov, w, c_inv, false);
+
+        let mut q_g = 0.0_f64;
+        let mut q_e = 0.0_f64;
+        for i in 0..n {
+            q_g += s[i] * z[i] * z[i];
+            q_e += z[i] * z[i];
+        }
+        let score_g = -0.5 * (tr_g - q_g);
+        let score_e = -0.5 * (tr_e - q_e);
+
+        let mut dz_g = vec![0.0_f64; n];
+        let mut dz_e = vec![0.0_f64; n];
+        for i in 0..n {
+            dz_g[i] = s[i] * z[i];
+            dz_e[i] = z[i];
+        }
+
+        let mut p_dz_g = vec![0.0_f64; n];
+        let mut p_dz_e = vec![0.0_f64; n];
+        let mut tmp = vec![0.0_f64; n];
+        let mut xtmp = vec![0.0_f64; p_cov];
+        let mut cxtmp = vec![0.0_f64; p_cov];
+
+        apply_p_diag_vec(
+            &xcov_flat,
+            n,
+            p_cov,
+            w,
+            c_inv,
+            &dz_g,
+            &mut p_dz_g,
+            &mut tmp,
+            &mut xtmp,
+            &mut cxtmp,
+        );
+        apply_p_diag_vec(
+            &xcov_flat,
+            n,
+            p_cov,
+            w,
+            c_inv,
+            &dz_e,
+            &mut p_dz_e,
+            &mut tmp,
+            &mut xtmp,
+            &mut cxtmp,
+        );
+
+        let mut ai_gg = 0.0_f64;
+        let mut ai_ge = 0.0_f64;
+        let mut ai_ee = 0.0_f64;
+        for i in 0..n {
+            ai_gg += dz_g[i] * p_dz_g[i];
+            ai_ge += dz_g[i] * p_dz_e[i];
+            ai_ee += dz_e[i] * p_dz_e[i];
+        }
+        ai_gg *= 0.5;
+        ai_ge *= 0.5;
+        ai_ee *= 0.5;
+
+        let ridge = 1e-10;
+        ai_gg += ridge;
+        ai_ee += ridge;
+        let det = ai_gg * ai_ee - ai_ge * ai_ge;
+        if !det.is_finite() || det.abs() < 1e-18 {
+            break;
+        }
+        let delta_g = (score_g * ai_ee - score_e * ai_ge) / det;
+        let delta_e = (ai_gg * score_e - ai_ge * score_g) / det;
+        if !delta_g.is_finite() || !delta_e.is_finite() {
+            break;
+        }
+
+        let mut accepted = false;
+        let mut step = 1.0_f64;
+        let mut next_state = None;
+        let mut next_sg = sigma_g2;
+        let mut next_se = sigma_e2;
+
+        for _ in 0..24 {
+            let cand_sg = (sigma_g2 + step * delta_g).max(min_var);
+            let cand_se = (sigma_e2 + step * delta_e).max(min_var);
+            if let Some(st) = ai_reml_eval(s, &xcov_flat, y, n, p_cov, cand_sg, cand_se) {
+                if st.0.is_finite() && st.0 >= *reml_curr - 1e-12 {
+                    accepted = true;
+                    next_state = Some(st);
+                    next_sg = cand_sg;
+                    next_se = cand_se;
+                    break;
+                }
+            }
+            step *= 0.5;
+            if step < 1e-8 {
+                break;
+            }
+        }
+
+        if !accepted {
+            break;
+        }
+        let rel_g = (next_sg - sigma_g2).abs() / sigma_g2.max(min_var);
+        let rel_e = (next_se - sigma_e2).abs() / sigma_e2.max(min_var);
+        sigma_g2 = next_sg;
+        sigma_e2 = next_se;
+        if let Some(st) = next_state {
+            state = st;
+        } else {
+            break;
+        }
+        if rel_g.max(rel_e) < tol {
+            converged = true;
+            break;
+        }
+    }
+
+    let (_reml, _ml, q, _w, _z, _c_inv, _beta) = &state;
+    let n_f = n as f64;
+    let p_f = p_cov as f64;
+    let sigma_g2_out = (q / (n_f - p_f)).max(min_var);
+    let sigma_e2_out = (sigma_e2 / sigma_g2).max(min_var) * sigma_g2_out;
+    let lbd = (sigma_e2_out / sigma_g2_out).max(min_var);
+    let reml = state.0;
+    let ml = state.1;
+
+    Ok((
+        lbd,
+        ml,
+        reml,
+        sigma_g2_out,
+        sigma_e2_out,
+        used_iter,
+        converged,
+    ))
+}
+
+#[inline]
+fn trace_ab(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+    let (nr, nc) = a.shape();
+    debug_assert_eq!(b.shape(), (nr, nc));
+    let mut s = 0.0_f64;
+    for r in 0..nr {
+        for c in 0..nc {
+            s += a[(r, c)] * b[(c, r)];
+        }
+    }
+    s
+}
+
+#[pyfunction]
+#[pyo3(signature = (k_stack, xcov, y, max_iter=100, tol=1e-6, min_var=1e-12, trace_probes=8, trace_seed=42))]
+pub fn ai_reml_multi_f64<'py>(
+    py: Python<'py>,
+    k_stack: PyReadonlyArray3<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    max_iter: usize,
+    tol: f64,
+    min_var: f64,
+    trace_probes: usize,
+    trace_seed: u64,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, f64, f64, usize, bool)> {
+    let kshape = k_stack.shape();
+    if kshape.len() != 3 {
+        return Err(PyRuntimeError::new_err("k_stack must be 3D (q, n, n)"));
+    }
+    let q = kshape[0];
+    let n = kshape[1];
+    if kshape[2] != n {
+        return Err(PyRuntimeError::new_err("k_stack must be (q, n, n)"));
+    }
+    if q == 0 {
+        return Err(PyRuntimeError::new_err(
+            "k_stack requires at least one kernel",
+        ));
+    }
+
+    let y_slice = y.as_slice()?;
+    if y_slice.len() != n {
+        return Err(PyRuntimeError::new_err("len(y) must equal n in k_stack"));
+    }
+
+    let x_arr = xcov.as_array();
+    let (xn, p) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err(
+            "xcov.n_rows must equal n in k_stack",
+        ));
+    }
+    if p == 0 {
+        return Err(PyRuntimeError::new_err(
+            "xcov must have at least one column",
+        ));
+    }
+    if n <= p {
+        return Err(PyRuntimeError::new_err("n must be > p in xcov"));
+    }
+
+    let min_var = if min_var.is_finite() && min_var > 0.0 {
+        min_var
+    } else {
+        1e-12
+    };
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-6
+    };
+
+    let x_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(v) => Cow::Borrowed(v),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let x_mat = DMatrix::<f64>::from_row_slice(n, p, &x_flat);
+    let x_t = x_mat.transpose();
+    let y_vec = DVector::<f64>::from_row_slice(y_slice);
+
+    let mut kmats: Vec<DMatrix<f64>> = Vec::with_capacity(q);
+    if let Ok(ks) = k_stack.as_slice() {
+        for qi in 0..q {
+            let off = qi * n * n;
+            let mut km = DMatrix::<f64>::from_row_slice(n, n, &ks[off..off + n * n]);
+            km = (&km + km.transpose()) * 0.5;
+            kmats.push(km);
+        }
+    } else {
+        let k_arr = k_stack.as_array();
+        for qi in 0..q {
+            let mut buf = vec![0.0_f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    buf[r * n + c] = k_arr[(qi, r, c)];
+                }
+            }
+            let mut km = DMatrix::<f64>::from_row_slice(n, n, &buf);
+            km = (&km + km.transpose()) * 0.5;
+            kmats.push(km);
+        }
+    }
+    let eye = DMatrix::<f64>::identity(n, n);
+    let use_exact_trace = trace_probes == 0 || n <= 768;
+    let probes_n = trace_probes.max(1);
+    let mut trace_probes_vec: Vec<DVector<f64>> = Vec::new();
+    if !use_exact_trace {
+        let mut rng = StdRng::seed_from_u64(trace_seed);
+        trace_probes_vec.reserve(probes_n);
+        for _ in 0..probes_n {
+            let mut z = DVector::<f64>::zeros(n);
+            for i in 0..n {
+                z[i] = if rng.random::<f64>() < 0.5 { -1.0 } else { 1.0 };
+            }
+            trace_probes_vec.push(z);
+        }
+    }
+
+    let mut var_y = {
+        let mean = y_slice.iter().copied().sum::<f64>() / (n as f64);
+        let mut s2 = 0.0_f64;
+        for &yi in y_slice {
+            let d = yi - mean;
+            s2 += d * d;
+        }
+        s2 / ((n.max(2) - 1) as f64)
+    };
+    if !var_y.is_finite() || var_y <= 0.0 {
+        var_y = 1.0;
+    }
+
+    let m = q + 1; // q kernels + residual
+    let mut theta = DVector::<f64>::from_element(m, (var_y / (m as f64)).max(min_var));
+    let mut converged = false;
+    let mut used_iter = 0usize;
+
+    let mut last_ml = f64::NAN;
+    let mut last_reml = f64::NAN;
+
+    for it in 0..max_iter {
+        used_iter = it + 1;
+
+        // Build V = sum_j theta_j K_j + theta_e I
+        let mut v = eye.clone() * theta[m - 1];
+        for j in 0..q {
+            v += &kmats[j] * theta[j];
+        }
+        let Some(chol_v) = v.clone().cholesky() else {
+            break;
+        };
+
+        let vinv_x = chol_v.solve(&x_mat);
+        let xt_vinv_x = &x_t * &vinv_x;
+        let Some(chol_x) = xt_vinv_x.clone().cholesky() else {
+            break;
+        };
+        let c_inv = chol_x.inverse();
+
+        let vinv_y = chol_v.solve(&y_vec);
+        let xt_vinv_y = &x_t * &vinv_y;
+        let beta = chol_x.solve(&xt_vinv_y);
+
+        let r_vec = &y_vec - &x_mat * beta;
+        let vinv_r = chol_v.solve(&r_vec);
+        let proj = &vinv_x * (&c_inv * (&x_t * &vinv_r));
+        let alpha = &vinv_r - proj; // alpha = P y
+        let qval = r_vec.dot(&vinv_r);
+        if !qval.is_finite() || qval <= 0.0 {
+            break;
+        }
+
+        let lv = chol_v.l();
+        let mut log_det_v = 0.0_f64;
+        for i in 0..n {
+            log_det_v += 2.0 * lv[(i, i)].ln();
+        }
+        let lx = chol_x.l();
+        let mut log_det_xt = 0.0_f64;
+        for i in 0..p {
+            log_det_xt += 2.0 * lx[(i, i)].ln();
+        }
+        let n_f = n as f64;
+        let p_f = p as f64;
+        let reml_total = (n_f - p_f) * qval.ln() + log_det_v + log_det_xt;
+        let reml_c = (n_f - p_f) * ((n_f - p_f).ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+        let reml_curr = reml_c - 0.5 * reml_total;
+        let ml_total = n_f * qval.ln() + log_det_v;
+        let ml_c = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+        let ml_curr = ml_c - 0.5 * ml_total;
+        if !reml_curr.is_finite() || !ml_curr.is_finite() {
+            break;
+        }
+        last_reml = reml_curr;
+        last_ml = ml_curr;
+
+        let mut score = DVector::<f64>::zeros(m);
+        let mut ka_list: Vec<DVector<f64>> = Vec::with_capacity(m);
+        let mut pka_list: Vec<DVector<f64>> = Vec::with_capacity(m);
+        let b_t = vinv_x.transpose();
+        let vinv_exact = if use_exact_trace {
+            Some(chol_v.inverse())
+        } else {
+            None
+        };
+        let mut vinv_probe_vec: Vec<DVector<f64>> = Vec::new();
+        if !use_exact_trace {
+            vinv_probe_vec.reserve(probes_n);
+            for z in &trace_probes_vec {
+                vinv_probe_vec.push(chol_v.solve(z));
+            }
+        }
+
+        for j in 0..m {
+            let kj = if j < q { &kmats[j] } else { &eye };
+
+            let ka = kj * &alpha;
+            let quad = alpha.dot(&ka);
+            ka_list.push(ka.clone());
+
+            let tr1 = if let Some(vinv) = &vinv_exact {
+                trace_ab(vinv, kj)
+            } else {
+                // Hutchinson trace estimate for tr(V^{-1} K_j) using cached V^{-1}z.
+                let mut s = 0.0_f64;
+                for (z, vinv_z) in trace_probes_vec.iter().zip(vinv_probe_vec.iter()) {
+                    let kz = kj * z;
+                    s += vinv_z.dot(&kz);
+                }
+                s / probes_n as f64
+            };
+
+            // Exact correction tr((X'V^{-1}X)^{-1} X'V^{-1}K_jV^{-1}X)
+            // = tr(C^{-1} B'K_jB), where B = V^{-1}X.
+            let kb = kj * &vinv_x;
+            let bt_kb = &b_t * &kb;
+            let tr2 = trace_ab(&c_inv, &bt_kb);
+            let tr_pk = tr1 - tr2;
+            score[j] = -0.5 * (tr_pk - quad);
+
+            let vinv_ka = chol_v.solve(&ka);
+            let pka = &vinv_ka - &vinv_x * (&c_inv * (&b_t * &ka));
+            pka_list.push(pka);
+        }
+
+        let mut ai = DMatrix::<f64>::zeros(m, m);
+        for a in 0..m {
+            for b in 0..=a {
+                let v_ab = 0.5 * ka_list[a].dot(&pka_list[b]);
+                ai[(a, b)] = v_ab;
+                ai[(b, a)] = v_ab;
+            }
+        }
+        for d in 0..m {
+            ai[(d, d)] += 1e-10;
+        }
+
+        let Some(delta) = ai.lu().solve(&score) else {
+            break;
+        };
+        if !delta.iter().all(|v| v.is_finite()) {
+            break;
+        }
+
+        let mut accepted = false;
+        let mut step = 1.0_f64;
+        let mut theta_next = theta.clone();
+        let mut reml_next = reml_curr;
+        let mut ml_next = ml_curr;
+
+        for _ in 0..24 {
+            let mut cand = theta.clone();
+            for j in 0..m {
+                cand[j] = (theta[j] + step * delta[j]).max(min_var);
+            }
+
+            let mut v_c = eye.clone() * cand[m - 1];
+            for j in 0..q {
+                v_c += &kmats[j] * cand[j];
+            }
+            let Some(chol_vc) = v_c.clone().cholesky() else {
+                step *= 0.5;
+                if step < 1e-8 {
+                    break;
+                }
+                continue;
+            };
+            let vinv_xc = chol_vc.solve(&x_mat);
+            let xt_vinv_xc = &x_t * &vinv_xc;
+            let Some(chol_xc) = xt_vinv_xc.clone().cholesky() else {
+                step *= 0.5;
+                if step < 1e-8 {
+                    break;
+                }
+                continue;
+            };
+            let vinv_yc = chol_vc.solve(&y_vec);
+            let xt_vinv_yc = &x_t * &vinv_yc;
+            let beta_c = chol_xc.solve(&xt_vinv_yc);
+            let r_c = &y_vec - &x_mat * beta_c;
+            let vinv_rc = chol_vc.solve(&r_c);
+            let q_c = r_c.dot(&vinv_rc);
+            if !q_c.is_finite() || q_c <= 0.0 {
+                step *= 0.5;
+                if step < 1e-8 {
+                    break;
+                }
+                continue;
+            }
+            let lv_c = chol_vc.l();
+            let mut log_det_vc = 0.0_f64;
+            for i in 0..n {
+                log_det_vc += 2.0 * lv_c[(i, i)].ln();
+            }
+            let lx_c = chol_xc.l();
+            let mut log_det_xc = 0.0_f64;
+            for i in 0..p {
+                log_det_xc += 2.0 * lx_c[(i, i)].ln();
+            }
+            let reml_total_c = (n_f - p_f) * q_c.ln() + log_det_vc + log_det_xc;
+            let reml_cand = reml_c - 0.5 * reml_total_c;
+            let ml_total_c = n_f * q_c.ln() + log_det_vc;
+            let ml_cand = ml_c - 0.5 * ml_total_c;
+            if reml_cand.is_finite() && reml_cand >= reml_curr - 1e-12 {
+                accepted = true;
+                theta_next = cand;
+                reml_next = reml_cand;
+                ml_next = ml_cand;
+                break;
+            }
+            step *= 0.5;
+            if step < 1e-8 {
+                break;
+            }
+        }
+
+        if !accepted {
+            break;
+        }
+
+        let mut rel_max = 0.0_f64;
+        for j in 0..m {
+            let rel = (theta_next[j] - theta[j]).abs() / theta[j].max(min_var);
+            if rel > rel_max {
+                rel_max = rel;
+            }
+        }
+        theta = theta_next;
+        last_reml = reml_next;
+        last_ml = ml_next;
+
+        if rel_max < tol {
+            converged = true;
+            break;
+        }
+    }
+
+    let theta_arr = PyArray1::<f64>::from_vec(py, theta.iter().copied().collect()).into_bound();
+    Ok((theta_arr, last_ml, last_reml, used_iter, converged))
 }
 
 #[pyfunction]

@@ -554,8 +554,7 @@ impl InputIter {
             let bed = format!("{path_or_prefix}.bed");
             let bim = format!("{path_or_prefix}.bim");
             let fam = format!("{path_or_prefix}.fam");
-            if !(Path::new(&bed).exists() && Path::new(&bim).exists() && Path::new(&fam).exists())
-            {
+            if !(Path::new(&bed).exists() && Path::new(&bim).exists() && Path::new(&fam).exists()) {
                 return Err(format!(
                     "PLINK prefix not found or missing .bed/.bim/.fam: {path_or_prefix}"
                 ));
@@ -1397,21 +1396,18 @@ pub fn convert_genotypes(
                 last_report = stats.n_sites_seen;
             }
 
-            let (gref, galt) = match normalize_biallelic_variant(
-                &site.ref_allele,
-                &site.alt_allele,
-                snps_only,
-            ) {
-                Some(x) => x,
-                None => {
-                    if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
-                        stats.n_sites_dropped_multiallelic += 1;
-                    } else {
-                        stats.n_sites_dropped_non_snp += 1;
+            let (gref, galt) =
+                match normalize_biallelic_variant(&site.ref_allele, &site.alt_allele, snps_only) {
+                    Some(x) => x,
+                    None => {
+                        if site.ref_allele.contains(',') || site.alt_allele.contains(',') {
+                            stats.n_sites_dropped_multiallelic += 1;
+                        } else {
+                            stats.n_sites_dropped_non_snp += 1;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             if row.len() != n_samples {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(

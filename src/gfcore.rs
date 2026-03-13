@@ -336,8 +336,8 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             let id_path = find_id_with_prefix(&prefix)
                 .or_else(|| find_id_with_prefix(&cache_prefix))
                 .unwrap_or_else(|| append_suffix(&prefix, ".id"));
-            let src_site_path = find_site_with_prefix(&prefix)
-                .or_else(|| find_site_with_prefix(&cache_prefix));
+            let src_site_path =
+                find_site_with_prefix(&prefix).or_else(|| find_site_with_prefix(&cache_prefix));
             let src_bim_path = find_bim_with_prefix(&prefix);
             let cache_bim_path = append_suffix(&cache_prefix_path(&prefix), ".bim");
             return Ok(TxtPaths {
@@ -360,8 +360,8 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
         let id_path = find_id_with_prefix(&prefix)
             .or_else(|| find_id_with_prefix(&cache_prefix))
             .unwrap_or_else(|| append_suffix(&prefix, ".id"));
-        let src_site_path = find_site_with_prefix(&prefix)
-            .or_else(|| find_site_with_prefix(&cache_prefix));
+        let src_site_path =
+            find_site_with_prefix(&prefix).or_else(|| find_site_with_prefix(&cache_prefix));
         let src_bim_path = find_bim_with_prefix(&prefix);
         let cache_bim_path = append_suffix(&cache_prefix, ".bim");
         return Ok(TxtPaths {

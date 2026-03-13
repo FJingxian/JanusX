@@ -2407,56 +2407,137 @@ fn windows_find_vsdevcmd() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_capture_vsdevcmd_env(vsdevcmd: &Path) -> Result<Vec<(String, String)>, String> {
-    let cmdline = format!(
-        "\"\"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL && set\"",
-        vsdevcmd.display()
-    );
-    let out = Command::new("cmd")
-        .arg("/d")
-        .arg("/s")
-        .arg("/c")
-        .arg(cmdline)
+fn windows_find_vcvars64_with_vswhere(vswhere: &Path) -> Option<PathBuf> {
+    let out = Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-find",
+            "**\\VC\\Auxiliary\\Build\\vcvars64.bat",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
-        .map_err(|e| format!("Failed to run VsDevCmd.bat: {e}"))?;
+        .ok()?;
     if !out.status.success() {
-        let mut msg = String::new();
-        msg.push_str(String::from_utf8_lossy(&out.stdout).trim());
-        if !msg.is_empty() {
-            msg.push('\n');
-        }
-        msg.push_str(String::from_utf8_lossy(&out.stderr).trim());
-        return Err(format!(
-            "VsDevCmd.bat exited with code {}: {}",
-            exit_code(out.status),
-            msg.trim()
-        ));
+        return None;
     }
+    windows_parse_first_existing_path(&out.stdout)
+}
 
-    let mut kvs = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let Some((k, v)) = line.split_once('=') else {
+#[cfg(target_os = "windows")]
+fn windows_default_vcvars64_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let years = ["2022", "2019", "2017"];
+    let editions = ["BuildTools", "Community", "Professional", "Enterprise"];
+    for base_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = env::var_os(base_key) else {
             continue;
         };
-        if k.is_empty() || k.starts_with('=') {
+        let base = PathBuf::from(base).join("Microsoft Visual Studio");
+        for year in years {
+            for edition in editions {
+                out.push(
+                    base.join(year)
+                        .join(edition)
+                        .join("VC")
+                        .join("Auxiliary")
+                        .join("Build")
+                        .join("vcvars64.bat"),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn windows_find_vcvars64() -> Option<PathBuf> {
+    if let Some(vswhere) = windows_find_vswhere() {
+        if let Some(vcvars) = windows_find_vcvars64_with_vswhere(&vswhere) {
+            return Some(vcvars);
+        }
+    }
+    windows_default_vcvars64_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_capture_batch_env(script_candidates: &[String]) -> Result<Vec<(String, String)>, String> {
+    fn parse_env_pairs(stdout: &[u8]) -> Vec<(String, String)> {
+        let mut kvs = Vec::new();
+        for line in String::from_utf8_lossy(stdout).lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            if k.is_empty() || k.starts_with('=') {
+                continue;
+            }
+            kvs.push((k.to_string(), v.to_string()));
+        }
+        kvs
+    }
+
+    let mut last_exit = 1i32;
+    for script in script_candidates {
+        let out = Command::new("cmd")
+            .arg("/d")
+            .arg("/c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("Failed to run MSVC setup script: {e}"))?;
+        last_exit = exit_code(out.status);
+        if !out.status.success() {
             continue;
         }
-        kvs.push((k.to_string(), v.to_string()));
+        let kvs = parse_env_pairs(&out.stdout);
+        if !kvs.is_empty() {
+            return Ok(kvs);
+        }
     }
-    if kvs.is_empty() {
-        return Err("VsDevCmd.bat returned empty environment snapshot.".to_string());
-    }
-    Ok(kvs)
+
+    Err(format!(
+        "MSVC setup script exited with code {} while probing environment.",
+        last_exit
+    ))
 }
 
 #[cfg(target_os = "windows")]
 fn windows_try_apply_msvc_env() -> Result<(), String> {
-    let vsdevcmd = windows_find_vsdevcmd()
-        .ok_or_else(|| "Unable to locate VsDevCmd.bat in default Visual Studio paths.".to_string())?;
-    let kvs = windows_capture_vsdevcmd_env(&vsdevcmd)?;
+    let mut probe_scripts: Vec<String> = Vec::new();
+    if let Some(vsdevcmd) = windows_find_vsdevcmd() {
+        let path = vsdevcmd.display();
+        probe_scripts.push(format!(
+            "call \"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL 2>&1 && set",
+            path
+        ));
+        probe_scripts.push(format!(
+            "call \"{}\" -no_logo -arch=x64 >NUL 2>&1 && set",
+            path
+        ));
+        probe_scripts.push(format!("call \"{}\" >NUL 2>&1 && set", path));
+    }
+    if let Some(vcvars64) = windows_find_vcvars64() {
+        let path = vcvars64.display();
+        probe_scripts.push(format!("call \"{}\" amd64 >NUL 2>&1 && set", path));
+        probe_scripts.push(format!("call \"{}\" >NUL 2>&1 && set", path));
+    }
+    if probe_scripts.is_empty() {
+        return Err(
+            "Unable to locate VsDevCmd.bat or vcvars64.bat in default Visual Studio paths."
+                .to_string(),
+        );
+    }
+
+    let kvs = windows_capture_batch_env(&probe_scripts)?;
     const KEYS: &[&str] = &[
         "PATH",
         "INCLUDE",
@@ -2478,10 +2559,7 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
     if windows_has_link_exe_in_path() {
         Ok(())
     } else {
-        Err(format!(
-            "Loaded VsDevCmd from {}, but `link.exe` is still not discoverable in PATH.",
-            vsdevcmd.display()
-        ))
+        Err("MSVC environment loaded, but `link.exe` is still not discoverable in PATH.".to_string())
     }
 }
 
@@ -2492,7 +2570,6 @@ static WINDOWS_MSVC_ENV_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 fn windows_msvc_linker_missing_message() -> String {
     "Rust toolchain is installed, but MSVC linker `link.exe` was not found.\n\
 JanusX source build on Windows currently uses MSVC target and requires Visual C++ Build Tools.\n\n\
-JanusX cannot download/distribute `link.exe` into `.janusx`; it must come from Visual Studio Build Tools.\n\n\
 Fix options:\n\
 1) Install Build Tools for Visual Studio 2022 (Desktop development with C++), then reopen terminal.\n\
 2) Or run JanusX commands from \"x64 Native Tools Command Prompt for VS 2022\".\n\n\

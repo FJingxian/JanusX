@@ -14,8 +14,6 @@ dependencies = [
     "tqdm",
     "statsmodels",
     "rich",
-    "jax",
-    "jaxlib",
     "rich-argparse",
     "dynamicTreeCut",
     "joblib>=1.5",

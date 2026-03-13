@@ -1,22 +1,24 @@
 import typing
-import os
 import numpy as np
+from types import SimpleNamespace
 
-# Default to CPU backend to avoid noisy TPU probe warnings (libtpu.so).
-# Users can still override by setting JAX_PLATFORMS explicitly.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
-import jax.numpy as jnp
-from jax.scipy.linalg import cho_solve
-# from jax.scipy.optimize import minimize
-from jax import grad
+from scipy.linalg import cho_solve
 from scipy.optimize import minimize
 from tqdm import tqdm
 
+try:
+    from janusx.janusx import ai_reml_multi_f64 as _rust_ai_reml_multi_f64
+    from janusx.janusx import ai_reml_null_f64 as _rust_ai_reml_null_f64
+    _HAS_RUST_AIREML = True
+except Exception:
+    _rust_ai_reml_multi_f64 = None  # type: ignore[assignment]
+    _rust_ai_reml_null_f64 = None  # type: ignore[assignment]
+    _HAS_RUST_AIREML = False
+
 def REML(
-    theta: jnp.ndarray,
-    y: jnp.ndarray,
-    X: jnp.ndarray,
+    theta: np.ndarray,
+    y: np.ndarray,
+    X: np.ndarray,
     Klist: typing.List[np.ndarray],
 ) -> float:
     """
@@ -38,31 +40,35 @@ def REML(
     float
         REML objective value (lower is better for minimize).
     """
-    theta = jnp.asarray(theta)
-    X = jnp.asarray(X)
-    y = jnp.asarray(y)
+    theta = np.asarray(theta, dtype=float).reshape(-1)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
     n, p = X.shape
-    V = theta[-1]*jnp.eye(n)
+    V = theta[-1] * np.eye(n, dtype=float)
     for num, K in enumerate(Klist):
-        V += theta[num] * jnp.asarray(K)
-    L = jnp.linalg.cholesky(V)
-    VinvX = cho_solve((L,True),X)
-    Vinvy = cho_solve((L,True),y)
+        V += theta[num] * np.asarray(K, dtype=float)
+    L = np.linalg.cholesky(V)
+    VinvX = cho_solve((L, True), X)
+    Vinvy = cho_solve((L, True), y)
     XTV_invX = X.T @ VinvX
     XTV_invy = X.T @ Vinvy
 
-    beta = jnp.linalg.solve(XTV_invX, XTV_invy)
+    beta = np.linalg.solve(XTV_invX, XTV_invy)
     r = y - X @ beta
-    Vinvr = cho_solve((L,True),r)
+    Vinvr = cho_solve((L, True), r)
 
-    rTV_invr = (r.T @ Vinvr)[0, 0]
-    log_detV = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
-    sign, log_detXTV_invX = jnp.linalg.slogdet(XTV_invX)
-    total_log = (n - p) * jnp.log(rTV_invr) + log_detV + log_detXTV_invX
+    rTV_invr = float((r.T @ Vinvr)[0, 0])
+    if not np.isfinite(rTV_invr) or rTV_invr <= 0.0:
+        return np.inf
+    log_detV = float(2.0 * np.sum(np.log(np.diag(L))))
+    sign, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
+    if sign <= 0 or (not np.isfinite(log_detXTV_invX)):
+        return np.inf
+    total_log = (n - p) * np.log(rTV_invr) + log_detV + float(log_detXTV_invX)
 
     # Constant term (matches your original expression)
-    c = (n - p) * (jnp.log(n - p) - 1 - jnp.log(2 * jnp.pi)) / 2.0
-    return total_log / 2.0 - c
+    c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2.0
+    return float(total_log / 2.0 - c)
 
 def _testX(X:typing.Union[np.ndarray,None],n:int,) -> np.ndarray:
     if X is None:
@@ -179,11 +185,67 @@ def _split_u(u: np.ndarray, Z_list: list[np.ndarray]) -> list[np.ndarray]:
         start = end
     return u_by_Z
 
-def dynamicEigh(Zlist:typing.List[np.ndarray]):
-    qdim = [z.shape[1] for z in Zlist]
-    idx2eigh = np.argmax(qdim)
-    
-    return
+
+def _fit_multi_kernel_ai_reml_rust(
+    y: np.ndarray,
+    X: np.ndarray,
+    Klist: typing.Sequence[np.ndarray],
+    maxiter: int,
+) -> tuple[np.ndarray, typing.Any] | None:
+    """
+    Fast-path: multi-kernel REML solved by Rust AIREML.
+    Returns (theta, result_like) or None when unavailable/fallback.
+    """
+    if (
+        (not _HAS_RUST_AIREML)
+        or (_rust_ai_reml_multi_f64 is None)
+        or (len(Klist) == 0)
+    ):
+        return None
+    try:
+        n = int(X.shape[0])
+        k_stack = np.stack(
+            [((np.asarray(k, dtype=float) + np.asarray(k, dtype=float).T) / 2.0) for k in Klist],
+            axis=0,
+        )
+        if k_stack.ndim != 3 or k_stack.shape[1] != n or k_stack.shape[2] != n:
+            return None
+        # Use exact trace for mid/small n to stabilize theta;
+        # switch to Hutchinson probes for large n.
+        if n <= 768:
+            trace_probes = 0
+        elif n <= 2048:
+            trace_probes = 16
+        else:
+            trace_probes = 12
+        theta, ml, reml, nit, converged = _rust_ai_reml_multi_f64(
+            np.asarray(k_stack, dtype=np.float64),
+            np.asarray(X, dtype=np.float64),
+            np.asarray(y, dtype=np.float64).reshape(-1),
+            max_iter=int(maxiter),
+            tol=1e-6,
+            min_var=1e-12,
+            trace_probes=int(trace_probes),
+            trace_seed=42,
+        )
+        theta = np.asarray(theta, dtype=float).reshape(-1)
+        if theta.size != (len(Klist) + 1):
+            return None
+        if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
+            return None
+        result = SimpleNamespace(
+            x=theta.copy(),
+            success=bool(converged),
+            nit=int(nit),
+            message="rust_ai_reml",
+            fun=float(-reml),
+            ml=float(ml),
+            reml=float(reml),
+            lbd=float(theta[-1] / max(1e-12, theta[0])),
+        )
+        return theta, result
+    except Exception:
+        return None
 
 class BLUP:
     def __init__(
@@ -278,7 +340,7 @@ class BLUP:
             pass
         else:
             Zstlist = [
-                jnp.array(
+                np.asarray(
                     (z - self.onehot_info[num][1])
                     / self.onehot_info[num][2]
                     / np.sqrt(self.onehot_info[num][0])
@@ -288,33 +350,41 @@ class BLUP:
             Gnorm_list, g_scales = _normalize_G(self.G_list)
             Klist = [np.asarray(z @ z.T, dtype=float) for z in Zstlist] + Gnorm_list
 
-            theta0 = jnp.ones(len(Klist)+1)
-            gradfn = grad(REML)
-
-            pbar = None
-            callback = None
-            if self.progress:
-                pbar = tqdm(total=self.maxiter, desc="REML", ncols=100)
-
-                def callback(theta):
-                    pbar.update(1)
-                    pbar.set_postfix({"theta": np.round(theta, 4)})
-
-            def jac(theta, y, X, Klist):
-                return jnp.asarray(gradfn(theta, y, X, Klist))
-
-            result = minimize(
-                REML,
-                theta0,
-                args=(self.y, self.X, Klist),
-                jac=jac,
-                method="L-BFGS-B",
-                callback=callback,
-                options={"maxiter": self.maxiter},
+            result = None
+            theta: np.ndarray | None = None
+            rust_fit = _fit_multi_kernel_ai_reml_rust(
+                self.y,
+                self.X,
+                Klist,
+                self.maxiter,
             )
-            theta = np.asarray(result.x, dtype=float)
-            if pbar is not None:
-                pbar.close()
+            if rust_fit is not None:
+                theta, result = rust_fit
+            else:
+                theta0 = np.ones(len(Klist) + 1, dtype=float)
+
+                pbar = None
+                callback = None
+                if self.progress:
+                    pbar = tqdm(total=self.maxiter, desc="REML", ncols=100)
+
+                    def callback(theta):
+                        pbar.update(1)
+                        pbar.set_postfix({"theta": np.round(theta, 4)})
+
+                result = minimize(
+                    REML,
+                    theta0,
+                    args=(self.y, self.X, Klist),
+                    method="L-BFGS-B",
+                    callback=callback,
+                    options={"maxiter": self.maxiter},
+                )
+                theta = np.asarray(result.x, dtype=float)
+                if pbar is not None:
+                    pbar.close()
+            if theta is None:
+                raise RuntimeError("REML optimization failed to produce theta.")
             
             V = theta[-1]*np.eye(self.n)
             for num, K in enumerate(Klist):

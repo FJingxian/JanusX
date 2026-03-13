@@ -132,22 +132,3 @@ def GRM(M:np.ndarray,log=False,chunksize=50_000):
                 memory_usage = process.memory_info().rss / 1024**3
                 pbar.set_postfix(memory=f'{memory_usage:.2f} GB')
     return (grm+grm.T)/2
-
-def Eigendec(grm:np.ndarray):
-    eigval,eigvec = np.linalg.eigh(grm)
-    idx = np.argsort(eigval)[::-1]
-    eigval = eigval[idx]
-    eigvec = eigvec[:, idx]
-    return eigvec,eigval
-
-if __name__ == '__main__':
-    from janusx.gfreader import breader
-    geno = breader(r"C:\Users\82788\Desktop\Pyscript\装饰器\geno.45k")
-    M = geno.iloc[:,2:].values.T
-    qkmodel = QK(M,log=True)
-    grm = qkmodel.GRM()
-    U,_ = qkmodel.PCA()
-    print(grm[:4,:4])
-    print(U[:4,:4])
-    pass
-    

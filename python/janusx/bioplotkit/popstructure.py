@@ -1,10 +1,12 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-thr = 0.3
+thr = 0.7
+palette = "tab10"
 qmatrix = np.genfromtxt("test/mouse_hs1940.3.Q")
 K = qmatrix.shape[1]
-colors = {0:'red',1:'green',2:'blue'}
+colors = plt.get_cmap(palette).colors
+colors = {i: colors[i % len(colors)] for i in range(K)}
 pop = qmatrix.argmax(axis=1)
 pop[qmatrix.max(axis=1)<thr] = -1
 

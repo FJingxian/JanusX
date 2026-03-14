@@ -1,7 +1,7 @@
 # JanusX
 
 [CLI Doc](./doc/JanusXcli.md) | [Core API Doc](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
-![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 
 Joint Association and Novel Utility for Selection (JanusX) is a high-performance toolkit for quantitative genetics. It combines Rust-accelerated kernels (PyO3) with Python CLI workflows for GWAS, genomic selection (GS), post-analysis visualization, and variant-processing pipelines.
 
@@ -179,4 +179,6 @@ jx <module> -h
 
 ## License
 
-MIT License. See [LICENSE](./LICENSE).
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-or-later).
+
+See the [LICENSE](./LICENSE) file for details.

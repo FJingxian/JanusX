@@ -36,7 +36,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 18] = [
+const KNOWN_MODULES: [&str; 17] = [
     "grm",
     "pca",
     "gwas",
@@ -54,9 +54,8 @@ const KNOWN_MODULES: [&str; 18] = [
     "webui",
     "sim",
     "simulation",
-    "loadanno",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 18] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 17] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -89,7 +88,6 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 18] = [
         "simulation",
         "Extended simulation and benchmarking workflow",
     ),
-    ("loadanno", "Load annotation resources"),
 ];
 const MIN_PYTHON_MAJOR: u32 = 3;
 const MIN_PYTHON_MINOR: u32 = 9;

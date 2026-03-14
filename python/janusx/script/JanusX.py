@@ -8,7 +8,6 @@ Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
     -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
-    -load, --load          List/load files: `jx --load` or `jx --load <type> <name> <file>`
     -clean, --clean        Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record
 
 Modules:
@@ -96,7 +95,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
-    "sim", "simulation", "gformat", "gmerge", "hybrid", "webui", "loadanno",
+    "sim", "simulation", "gformat", "gmerge", "hybrid", "webui",
 ]
 
 
@@ -168,11 +167,6 @@ def main():
                 _clean_loaded_by_id(clean_args[0])
             else:
                 print("Usage: jx --clean [<load_id>]")
-        elif sys.argv[1] == '-load' or sys.argv[1] == '--load':
-            print(__logo__)
-            sys.argv[0] = "jx --load"
-            del sys.argv[1]
-            _load_script_module("loadanno").main()
         else:
             module_name = sys.argv[1]
             if module_name == "fastq2vcf":

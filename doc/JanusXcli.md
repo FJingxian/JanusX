@@ -235,6 +235,20 @@ Key options:
 - Filters: `-snps-only`, `-maf`, `-geno`, `-het`.
 - Performance: `-chunksize`, `-mmap-limit`, `-t`.
 
+Model details (association engines):
+
+- `-lmm`: full mixed-model scan with per-marker effect test; robust for population structure and relatedness.
+- `-fastlmm`: mixed-model scan with null-model lambda fixed once; usually faster than full LMM with very similar ranking in many datasets.
+- `-lm`: ordinary linear model scan; fastest baseline, but does not account for kinship unless controlled by covariates.
+- `-farmcpu`: iterative fixed/random marker selection strategy; can improve power for complex architectures, but uses full genotype in memory.
+
+Genetic coding details (`-model`) for LM/LMM/FastLMM:
+
+- `add`: additive dosage coding (0/1/2), standard GWAS default.
+- `dom`: dominance-oriented coding to emphasize heterozygote effects.
+- `rec`: recessive coding to emphasize homozygous-alternative effects.
+- `het`: heterozygosity-focused coding (with `-het` site filter).
+
 Outputs:
 
 ```text
@@ -292,6 +306,21 @@ Key options:
 - CV and tuning: `-cv`, `-strict-cv`.
 - Filters and preprocessing: `-maf`, `-geno`, `-pcd`.
 - Parallelism: `-t` (ML methods thread count).
+
+Model details (prediction engines):
+
+- `-GBLUP`: genomic BLUP with additive relationship matrix; strong default for many breeding datasets.
+- `-adBLUP`: additive + dominance BLUP (pyBLUP/JAX backend) to capture non-additive signal.
+- `-rrBLUP`: marker-effect ridge regression BLUP; typically similar behavior to GBLUP with marker-effect parameterization.
+- `-BayesA`: Bayesian marker model with marker-specific shrinkage variance; flexible but slower.
+- `-BayesB`: Bayesian sparse marker model (subset of markers with larger effects); useful when few major loci are expected.
+- `-BayesCpi`: Bayesian mixture model with estimated zero-effect proportion (`pi`); balances sparsity and polygenic background.
+- `-RF`: Random Forest regressor; non-linear and interaction-capable, usually robust baseline ML model.
+- `-ET`: Extra Trees regressor; similar to RF with higher randomization, often faster and less variance in tuning.
+- `-GBDT`: Gradient boosting trees (hist-based); strong non-linear learner but can be the slowest tree model to tune.
+- `-XGB`: XGBoost regressor; efficient boosted trees with strong performance on medium/large marker sets.
+- `-SVM`: RBF-SVR; can perform well on moderate sample sizes but tuning cost increases quickly with dataset size.
+- `-ENET`: ElasticNet linear model; good high-dimensional baseline with joint L1/L2 shrinkage and good interpretability.
 
 Outputs:
 
@@ -628,25 +657,6 @@ Outputs:
 
 - Simulated phenotype files and optional causal site files.
 - Log: `<prefix>.sim.log`.
-
-### 4.18 `loadanno` (registry helper)
-
-Function:
-
-- Registry helper for listing/registering/removing loaded files in JanusX runtime DB.
-
-Usage:
-
-```bash
-jx loadanno
-jx loadanno gwas traitA result.tsv
-jx loadanno --clean-id <record_id>
-```
-
-Notes:
-
-- This is a low-level registry utility.
-- Main workflows normally use module commands directly (for example `gwas/postgwas/webui`).
 
 ## 5. Pipeline-Oriented Examples
 

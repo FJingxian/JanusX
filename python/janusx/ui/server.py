@@ -4208,8 +4208,7 @@ def _make_handler(state: WebUIState):
                     HTTPStatus.BAD_REQUEST,
                     {
                         "error": (
-                            "Annotation upload is disabled in WebUI. "
-                            "Use `jx --load <name> <file.gff|file.gff3|file.bed>`."
+                            "Annotation upload is disabled in WebUI."
                         )
                     },
                 )

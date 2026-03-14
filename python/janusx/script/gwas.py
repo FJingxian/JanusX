@@ -29,10 +29,8 @@ Caching
 Covariates
 ----------
   - The --cov option is shared by LMM, LM, and FarmCPU.
-  - For LMM/LM, the covariate file must match the genotype sample order
-    (inspect_genotype_file IDs).
-  - For FarmCPU, the covariate file must match the genotype sample order
-    (famid from the genotype matrix).
+  - Covariate files must include sample IDs in the first column.
+  - Rows are aligned by sample ID intersection with genotype IDs.
 
 Citation
 --------
@@ -963,9 +961,13 @@ def _read_cov_file_flexible(
     label: str = "Covariate",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Read covariate file with flexible format:
-      1) ID + cov columns
-      2) numeric-only matrix (sample order must match genotype)
+    Read covariate file.
+
+    Supported format:
+      - first column: sample ID
+      - remaining columns: numeric covariates
+
+    Numeric-only covariate matrices are not supported.
     """
     try:
         df = pd.read_csv(
@@ -981,26 +983,40 @@ def _read_cov_file_flexible(
     if df.empty:
         raise ValueError(f"{label} file is empty: {path}")
 
-    sid = None if sample_ids is None else np.asarray(sample_ids, dtype=str)
-    if sid is not None and df.shape[1] > 1:
-        col0 = df.iloc[:, 0].astype(str).str.strip().to_numpy()
-        overlap = len(set(col0) & set(sid))
-        if overlap >= max(1, int(0.9 * len(sid))):
-            data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-            if data.ndim == 1:
-                data = data.reshape(-1, 1)
-            return col0, data
+    if df.shape[1] < 2:
+        raise ValueError(
+            f"{label} file must contain at least 2 columns: sample_id + covariate(s): {path}"
+        )
 
-    data = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    sid = None if sample_ids is None else np.asarray(sample_ids, dtype=str)
+    col0 = df.iloc[:, 0].astype(str).str.strip().to_numpy()
+    df_use = df
+    ids = col0
+
+    if sid is not None:
+        sid_set = set(sid)
+        need = max(1, int(0.9 * len(sid)))
+        overlap = len(set(col0) & sid_set)
+        if overlap < need and df.shape[0] > 1:
+            # Header-tolerant fallback for small tables:
+            # if dropping the first row makes ID overlap sufficient, treat first row as header.
+            col0_tail = df.iloc[1:, 0].astype(str).str.strip().to_numpy()
+            overlap_tail = len(set(col0_tail) & sid_set)
+            if overlap_tail >= need:
+                df_use = df.iloc[1:, :].reset_index(drop=True)
+                ids = df_use.iloc[:, 0].astype(str).str.strip().to_numpy()
+                overlap = overlap_tail
+
+        if overlap < need:
+            raise ValueError(
+                f"{label} file must include sample IDs in the first column "
+                f"(numeric-only matrix is not supported): {path}"
+            )
+
+    data = df_use.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
     if data.ndim == 1:
         data = data.reshape(-1, 1)
-    if sid is not None:
-        if data.shape[0] != len(sid):
-            raise ValueError(
-                f"{label} rows ({data.shape[0]}) do not match genotype sample count ({len(sid)}): {path}"
-            )
-        return sid.copy(), data
-    return np.arange(data.shape[0]).astype(str), data
+    return np.asarray(ids, dtype=str), data
 
 
 def _load_site_covariates(
@@ -4044,6 +4060,7 @@ def parse_args():
         help=(
             "Additional covariate input (repeatable). Each -c accepts either: "
             "(1) covariate file path, or "
+            "    covariate file format: first column sample ID, remaining columns numeric covariates; or "
             "(2) single-site token chr:pos / chr:start:end (start must equal end, "
             "supports full-width colon). "
             "Examples: -c cov.tsv -c 1:1000 -c 1:1000:1000."

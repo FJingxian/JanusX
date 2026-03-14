@@ -345,6 +345,27 @@ fn warm_up_jx(jx_bin: &Path, runtime_home: &Path) -> Result<(), String> {
         ));
     }
 
+    // Force-load Python core path via a real module entry.
+    let module_help_status = Command::new(jx_bin)
+        .arg("gwas")
+        .arg("-h")
+        .env("JX_HOME", runtime_home)
+        .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+        .env(SKIP_WARMUP_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run `{}` gwas -h: {e}", jx_bin.display()))?;
+    if !module_help_status.success() {
+        stop_warm_progress(warm_done, warm_progress);
+        return Err(format!(
+            "Warm-up command failed: {} gwas -h (exit={})",
+            jx_bin.display(),
+            exit_code(module_help_status)
+        ));
+    }
+
     let py = venv_python(&runtime_home.join("venv"));
     if py.exists() {
         let py_status = Command::new(&py)
@@ -4072,12 +4093,47 @@ fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<()
         }
     }
 
+    let mut errs: Vec<String> = Vec::new();
     for cand in candidates {
-        if cand.exists() && cand.is_file() {
-            return warm_up_jx(&cand, runtime_home);
+        if !(cand.exists() && cand.is_file()) {
+            continue;
+        }
+        match warm_up_jx(&cand, runtime_home) {
+            Ok(()) => return Ok(()),
+            Err(e) => errs.push(e),
         }
     }
-    Ok(())
+
+    // Fallback: warm core directly with runtime python even if no runnable jx binary is found.
+    let py = venv_python(&runtime_home.join("venv"));
+    if py.exists() {
+        let py_status = Command::new(&py)
+            .arg("-m")
+            .arg("janusx.script.gwas")
+            .arg("-h")
+            .env("JX_HOME", runtime_home)
+            .env(SKIP_RUNTIME_REBUILD_ENV, "1")
+            .env(SKIP_WARMUP_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to run `{}` -m janusx.script.gwas -h: {e}", py.display()))?;
+        if py_status.success() {
+            write_warmup_marker(runtime_home);
+            return Ok(());
+        }
+        errs.push(format!(
+            "Warm-up command failed: {} -m janusx.script.gwas -h (exit={})",
+            py.display(),
+            exit_code(py_status)
+        ));
+    }
+
+    if errs.is_empty() {
+        return Err("Warm-up skipped: no runnable `jx` binary and no runtime python found.".to_string());
+    }
+    Err(format!("Warm-up failed after update:\n{}", errs.join("\n")))
 }
 
 fn strip_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {

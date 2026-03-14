@@ -794,6 +794,69 @@ impl TxtChunkReader {
 
 // -------- count_vcf_snps (Py function) --------
 #[pyfunction]
+#[pyo3(signature = (prefix, maf_threshold=None, max_missing_rate=None, fill_missing=None))]
+pub fn load_bed_u8_matrix<'py>(
+    py: Python<'py>,
+    prefix: String,
+    maf_threshold: Option<f32>,
+    max_missing_rate: Option<f32>,
+    fill_missing: Option<bool>,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    let mut bed_prefix = prefix;
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let maf = maf_threshold.unwrap_or(0.0);
+    let miss = max_missing_rate.unwrap_or(1.0);
+    let fill = fill_missing.unwrap_or(false);
+
+    let mut it = BedSnpIter::new_with_fill(&bed_prefix, 0.0, 1.0, false, false, 0.02)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let n = it.n_samples();
+    if n == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "no samples found in PLINK input",
+        ));
+    }
+
+    let hint = it.sites.len().max(1);
+    let mut data: Vec<u8> = Vec::with_capacity(hint.saturating_mul(n));
+    let mut kept = 0usize;
+    while let Some((mut row, mut site)) = it.next_snp_raw() {
+        let keep = core::process_snp_row(
+            &mut row,
+            &mut site.ref_allele,
+            &mut site.alt_allele,
+            maf,
+            miss,
+            fill,
+            false,
+            0.02,
+        );
+        if !keep {
+            continue;
+        }
+        for &g in row.iter() {
+            let v = if !g.is_finite() || g < 0.0 {
+                3_u8
+            } else {
+                g.round().clamp(0.0, 2.0) as u8
+            };
+            data.push(v);
+        }
+        kept += 1;
+    }
+
+    let mat = Array2::from_shape_vec((kept, n), data)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    #[allow(deprecated)]
+    Ok(PyArray2::from_owned_array(py, mat).into_bound())
+}
+
+// -------- count_vcf_snps (Py function) --------
+#[pyfunction]
 pub fn count_vcf_snps(path: String) -> PyResult<usize> {
     let p = Path::new(&path);
     let mut reader =

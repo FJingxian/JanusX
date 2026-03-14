@@ -38,15 +38,17 @@ use assoc::{
     lmm_assoc_chunk_f32, lmm_reml_chunk_f32, lmm_reml_null_f32, ml_loglike_null_f32,
 };
 use admixture::{
-    admx_adam_update_p, admx_adam_update_p_inplace, admx_adam_update_q, admx_adam_update_q_inplace,
-    admx_allele_frequency, admx_em_step, admx_em_step_inplace,
-    admx_kl_divergence, admx_loglikelihood, admx_map_p_f32, admx_map_q_f32, admx_multiply_a_omega,
-    admx_multiply_at_omega, admx_rmse_f32, admx_rmse_f64, admx_set_threads,
+    admx_adam_update_p, admx_adam_update_p_inplace, admx_adam_update_p_inplace_f32,
+    admx_adam_update_q, admx_adam_update_q_inplace, admx_adam_update_q_inplace_f32,
+    admx_adam_optimize_f32,
+    admx_allele_frequency, admx_em_step, admx_em_step_inplace, admx_em_step_inplace_f32,
+    admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_f32, admx_map_p_f32, admx_map_q_f32,
+    admx_multiply_a_omega, admx_multiply_at_omega, admx_rmse_f32, admx_rmse_f64, admx_set_threads,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use bsa::preprocess_bsa;
 use gfreader::{
-    count_hmp_snps, count_vcf_snps, BedChunkReader, HmpChunkReader, HmpStreamWriter,
+    count_hmp_snps, count_vcf_snps, load_bed_u8_matrix, BedChunkReader, HmpChunkReader, HmpStreamWriter,
     PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
@@ -73,6 +75,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
+    m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;
@@ -92,6 +95,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_allele_frequency, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_loglikelihood_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rmse_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rmse_f64, m)?)?;
     m.add_function(wrap_pyfunction!(admx_kl_divergence, m)?)?;
@@ -99,10 +103,14 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_map_p_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_em_step, m)?)?;
     m.add_function(wrap_pyfunction!(admx_em_step_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_em_step_inplace_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_update_p, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_update_q, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_update_p_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_adam_update_q_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_adam_update_p_inplace_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_adam_update_q_inplace_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_adam_optimize_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;

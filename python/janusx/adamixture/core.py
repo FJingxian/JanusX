@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
@@ -55,7 +56,9 @@ class ADAMixtureConfig:
 
 
 def _set_thread_env(threads: int) -> None:
-    th = str(max(1, int(threads)))
+    # Rust kernels are parallelized by Rayon; keep BLAS thread count low to avoid oversubscription
+    # and unnecessary memory overhead from multi-threaded BLAS workspaces.
+    th = str(max(1, int(os.environ.get("JANUSX_ADMX_BLAS_THREADS", "1"))))
     os.environ["MKL_NUM_THREADS"] = th
     os.environ["MKL_MAX_THREADS"] = th
     os.environ["OMP_NUM_THREADS"] = th
@@ -76,6 +79,55 @@ def _to_u8_missing3(block: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(out)
 
 
+def _iter_genotype_chunks(
+    genotype_path: str,
+    *,
+    chunk_size: int,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+):
+    yield from load_genotype_chunks(
+        genotype_path,
+        chunk_size=int(chunk_size),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        impute=False,
+        model="add",
+        snps_only=bool(snps_only),
+    )
+
+
+def _adaptive_chunk_size(requested: int, n_samples: int) -> int:
+    req = max(1000, int(requested))
+    ns = max(1, int(n_samples))
+    # raw loader chunk is float32; cap raw chunk buffer around this budget.
+    budget_mb = int(os.environ.get("JANUSX_ADMX_LOAD_MB", "32"))
+    budget_bytes = max(8, budget_mb) * 1024 * 1024
+    rows_by_budget = max(1000, int(budget_bytes // (ns * 4)))
+    return int(max(1000, min(req, rows_by_budget)))
+
+
+def _plink_prefix_path(genotype_path: str) -> Optional[Path]:
+    p = Path(genotype_path)
+    if p.suffix.lower() in {".bed", ".bim", ".fam"}:
+        p = p.with_suffix("")
+    if p.with_suffix(".bed").exists() and p.with_suffix(".bim").exists():
+        return p
+    return None
+
+
+def _count_bim_rows(prefix: Path) -> Optional[int]:
+    bim = prefix.with_suffix(".bim")
+    if not bim.exists():
+        return None
+    try:
+        with bim.open("rb") as fh:
+            return int(sum(1 for _ in fh))
+    except Exception:
+        return None
+
+
 def load_genotype_u8_matrix(
     genotype_path: str,
     *,
@@ -84,32 +136,120 @@ def load_genotype_u8_matrix(
     maf: float,
     missing_rate: float,
 ) -> np.ndarray:
-    chunks: list[np.ndarray] = []
-    n_samples = None
-    for geno, _sites in load_genotype_chunks(
+    prefix = _plink_prefix_path(genotype_path)
+    if prefix is not None:
+        g = np.ascontiguousarray(
+            jxrs.load_bed_u8_matrix(
+                str(prefix),
+                float(maf),
+                float(missing_rate),
+                False,
+            ),
+            dtype=np.uint8,
+        )
+        if g.ndim != 2 or g.shape[0] <= 0 or g.shape[1] <= 0:
+            raise ValueError("No SNPs were loaded from PLINK input.")
+        return g
+
+    req_chunk = max(1000, int(chunk_size))
+    n_samples: Optional[int] = None
+
+    # Probe first chunk to infer sample size, then adapt chunk size to lower peak RSS.
+    probe_iter = _iter_genotype_chunks(
         genotype_path,
-        chunk_size=int(chunk_size),
-        maf=float(maf),
-        missing_rate=float(missing_rate),
-        impute=False,
-        model="add",
-        snps_only=bool(snps_only),
+        chunk_size=req_chunk,
+        snps_only=snps_only,
+        maf=maf,
+        missing_rate=missing_rate,
+    )
+    try:
+        first_probe, _ = next(probe_iter)
+    except StopIteration as exc:
+        raise ValueError("No SNPs were loaded from genotype input.") from exc
+    if first_probe.ndim != 2:
+        raise ValueError(f"Invalid genotype chunk shape: {first_probe.shape}")
+    n_samples = int(first_probe.shape[1])
+    use_chunk = _adaptive_chunk_size(req_chunk, n_samples)
+
+    # Fast low-memory path for PLINK: use .bim row count as allocation hint (single parse).
+    total_rows_hint = _count_bim_rows(prefix) if prefix is not None else None
+    if total_rows_hint is not None and total_rows_hint > 0:
+        out = np.empty((int(total_rows_hint), int(n_samples)), dtype=np.uint8)
+        offset = 0
+        for geno, _sites in _iter_genotype_chunks(
+            genotype_path,
+            chunk_size=use_chunk,
+            snps_only=snps_only,
+            maf=maf,
+            missing_rate=missing_rate,
+        ):
+            if geno.ndim != 2 or int(geno.shape[1]) != int(n_samples):
+                raise ValueError(
+                    f"Inconsistent genotype chunk shape: got {geno.shape}, expected (?, {n_samples})"
+                )
+            g = _to_u8_missing3(geno)
+            rows = int(g.shape[0])
+            need = offset + rows
+            if need > out.shape[0]:
+                # If upstream loader yields more rows than bim hint, grow safely.
+                grow = max(need, int(out.shape[0] * 1.5))
+                buf = np.empty((int(grow), int(n_samples)), dtype=np.uint8)
+                if offset > 0:
+                    buf[:offset, :] = out[:offset, :]
+                out = buf
+            out[offset:need, :] = g
+            offset = need
+        if offset <= 0:
+            raise ValueError("No SNPs were loaded from genotype input.")
+        return np.ascontiguousarray(out[:offset, :], dtype=np.uint8)
+
+    # Generic fallback: two-pass low-memory allocation.
+    total_rows = 0
+    if use_chunk == req_chunk:
+        total_rows += int(first_probe.shape[0])
+        for geno, _sites in probe_iter:
+            if geno.ndim != 2:
+                raise ValueError(f"Invalid genotype chunk shape: {geno.shape}")
+            if int(geno.shape[1]) != int(n_samples):
+                raise ValueError(
+                    f"Inconsistent sample count across chunks: expected {n_samples}, got {geno.shape[1]}"
+                )
+            total_rows += int(geno.shape[0])
+    else:
+        for geno, _sites in _iter_genotype_chunks(
+            genotype_path,
+            chunk_size=use_chunk,
+            snps_only=snps_only,
+            maf=maf,
+            missing_rate=missing_rate,
+        ):
+            if geno.ndim != 2:
+                raise ValueError(f"Invalid genotype chunk shape: {geno.shape}")
+            if int(geno.shape[1]) != int(n_samples):
+                raise ValueError(
+                    f"Inconsistent sample count across chunks: expected {n_samples}, got {geno.shape[1]}"
+                )
+            total_rows += int(geno.shape[0])
+
+    if total_rows <= 0:
+        raise ValueError("No SNPs were loaded from genotype input.")
+
+    out = np.empty((int(total_rows), int(n_samples)), dtype=np.uint8)
+    offset = 0
+    for geno, _sites in _iter_genotype_chunks(
+        genotype_path,
+        chunk_size=use_chunk,
+        snps_only=snps_only,
+        maf=maf,
+        missing_rate=missing_rate,
     ):
         g = _to_u8_missing3(geno)
-        if g.ndim != 2:
-            raise ValueError(f"Invalid genotype chunk shape: {g.shape}")
-        if n_samples is None:
-            n_samples = int(g.shape[1])
-        elif int(g.shape[1]) != int(n_samples):
-            raise ValueError(
-                f"Inconsistent sample count across chunks: expected {n_samples}, got {g.shape[1]}"
-            )
-        chunks.append(g)
-    if len(chunks) == 0:
-        raise ValueError("No SNPs were loaded from genotype input.")
-    if len(chunks) == 1:
-        return np.ascontiguousarray(chunks[0], dtype=np.uint8)
-    return np.ascontiguousarray(np.vstack(chunks), dtype=np.uint8)
+        rows = int(g.shape[0])
+        out[offset : offset + rows, :] = g
+        offset += rows
+    if offset != total_rows:
+        out = out[:offset, :]
+    return np.ascontiguousarray(out, dtype=np.uint8)
 
 
 def _eig_svd(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -279,9 +419,9 @@ def _als_init(
 
     elapsed = time.time() - t0
     logger.info(f"{'ALS finished':<22}: {elapsed:.2f}s")
-    p64 = np.ascontiguousarray(p, dtype=np.float64)
-    q64 = np.ascontiguousarray(q, dtype=np.float64)
-    ll0 = float(jxrs.admx_loglikelihood(g, p64, q64))
+    p = np.ascontiguousarray(p, dtype=np.float32)
+    q = np.ascontiguousarray(q, dtype=np.float32)
+    ll0 = float(jxrs.admx_loglikelihood_f32(g, p, q))
     logger.info(f"{'Initial log-likelihood':<22}: {ll0:.3f}")
     _emit_progress(
         callback,
@@ -291,7 +431,7 @@ def _als_init(
         converged_iter=converged_iter,
         max_iter=int(max_iter),
     )
-    return p64, q64
+    return p, q
 
 
 def _adam_em_optimize(
@@ -310,116 +450,41 @@ def _adam_em_optimize(
     logger: logging.Logger,
     callback: ProgressCallback = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    p = np.ascontiguousarray(p, dtype=np.float64)
-    q = np.ascontiguousarray(q, dtype=np.float64)
+    p = np.ascontiguousarray(p, dtype=np.float32)
+    q = np.ascontiguousarray(q, dtype=np.float32)
     t0 = time.time()
-    m_p = np.zeros_like(p, dtype=np.float64)
-    v_p = np.zeros_like(p, dtype=np.float64)
-    m_q = np.zeros_like(q, dtype=np.float64)
-    v_q = np.zeros_like(q, dtype=np.float64)
-    p_em = np.empty_like(p, dtype=np.float64)
-    q_em = np.empty_like(q, dtype=np.float64)
-
-    p_best = np.array(p, copy=True)
-    q_best = np.array(q, copy=True)
-    ll_best = -np.inf
-    no_improve = 0
-    lr_cur = float(lr)
-    step = 0
     check_every = max(1, int(check))
+    # 0 means auto (full-width fast path); set JANUSX_ADMX_TILE to a positive value
+    # to force tiled Q-accumulation when you want lower scratch memory.
+    tile_cfg = int(os.environ.get("JANUSX_ADMX_TILE", "0"))
+    tile_cols = int(g.shape[1]) if tile_cfg <= 0 else max(1, tile_cfg)
     _emit_progress(
         callback,
         "adam_start",
         max_iter=int(max_iter),
         check_every=int(check_every),
     )
-
-    for it in range(int(max_iter)):
-        step += 1
-        jxrs.admx_em_step_inplace(g, p, q, p_em, q_em)
-        jxrs.admx_adam_update_p_inplace(
-            p,
-            p_em,
-            m_p,
-            v_p,
-            float(lr_cur),
-            float(beta1),
-            float(beta2),
-            float(reg_adam),
-            int(step),
-        )
-        jxrs.admx_adam_update_q_inplace(
-            q,
-            q_em,
-            m_q,
-            v_q,
-            float(lr_cur),
-            float(beta1),
-            float(beta2),
-            float(reg_adam),
-            int(step),
-        )
-
-        if (it + 1) % check_every != 0:
-            continue
-
-        ll_cur = float(jxrs.admx_loglikelihood(g, p, q))
-        logger.info(
-            f"{'ADAM iteration':<22}: {it + 1:>4}/{int(max_iter):<4} "
-            f"ll={ll_cur:>14.3f} lr={lr_cur:>9.3e}"
-        )
-        _emit_progress(
-            callback,
-            "adam_iter",
-            iteration=int(it + 1),
-            max_iter=int(max_iter),
-            ll=float(ll_cur),
-            lr=float(lr_cur),
-        )
-        if abs(ll_cur - ll_best) < 0.1:
-            _emit_progress(
-                callback,
-                "adam_stop",
-                reason="ll_delta_small",
-                iteration=int(it + 1),
-            )
-            break
-
-        if ll_cur > ll_best:
-            ll_best = ll_cur
-            p_best = np.array(p, copy=True)
-            q_best = np.array(q, copy=True)
-            no_improve = 0
-        else:
-            no_improve += 1
-            old_lr = lr_cur
-            lr_cur = max(lr_cur * float(lr_decay), float(min_lr))
-            logger.info(
-                f"{'No improvement':<22}: count={int(no_improve)} "
-                f"lr {old_lr:>9.3e} -> {lr_cur:>9.3e}"
-            )
-            _emit_progress(
-                callback,
-                "adam_lr_decay",
-                iteration=int(it + 1),
-                no_improve=int(no_improve),
-                old_lr=float(old_lr),
-                new_lr=float(lr_cur),
-            )
-            if no_improve >= 2:
-                logger.info(f"{'Early stopping':<22}: triggered")
-                _emit_progress(
-                    callback,
-                    "adam_stop",
-                    reason="no_improve",
-                    iteration=int(it + 1),
-                )
-                break
-
-    ll_final = float(jxrs.admx_loglikelihood(g, p_best, q_best))
+    p_best, q_best, ll_final, n_iter = jxrs.admx_adam_optimize_f32(
+        g,
+        p,
+        q,
+        float(lr),
+        float(beta1),
+        float(beta2),
+        float(reg_adam),
+        int(max_iter),
+        int(check_every),
+        float(lr_decay),
+        float(min_lr),
+        int(tile_cols),
+    )
+    logger.info(
+        f"{'ADAM optimize':<22}: iter={int(n_iter):>4}/{int(max_iter):<4} "
+        f"ll={float(ll_final):>14.3f} tile={int(tile_cols)}"
+    )
     elapsed = time.time() - t0
     logger.info(
-        f"{'Final log-likelihood':<22}: {ll_final:.3f} (elapsed {elapsed:.2f}s)"
+        f"{'Final log-likelihood':<22}: {float(ll_final):.3f} (elapsed {elapsed:.2f}s)"
     )
     _emit_progress(
         callback,
@@ -427,7 +492,11 @@ def _adam_em_optimize(
         elapsed=float(elapsed),
         final_ll=float(ll_final),
     )
-    return p_best, q_best
+    # Keep external API/output compatibility with previous float64 behavior.
+    return (
+        np.ascontiguousarray(p_best, dtype=np.float64),
+        np.ascontiguousarray(q_best, dtype=np.float64),
+    )
 
 
 def train_adamixture(

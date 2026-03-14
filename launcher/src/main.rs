@@ -2468,7 +2468,48 @@ fn windows_find_vcvars64() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_find_link_exe_with_vswhere(vswhere: &Path) -> Option<PathBuf> {
+    let patterns = [
+        "**\\VC\\Tools\\MSVC\\**\\bin\\Hostx64\\x64\\link.exe",
+        "**\\VC\\Tools\\MSVC\\**\\bin\\Hostx64\\x86\\link.exe",
+        "**\\VC\\Tools\\MSVC\\**\\bin\\Hostx86\\x64\\link.exe",
+        "**\\VC\\Tools\\MSVC\\**\\bin\\Hostx86\\x86\\link.exe",
+        "**\\VC\\Tools\\MSVC\\**\\bin\\HostArm64\\arm64\\link.exe",
+        "**\\VC\\Tools\\MSVC\\**\\bin\\HostArm64\\x64\\link.exe",
+    ];
+    for pattern in patterns {
+        let out = Command::new(vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-find",
+                pattern,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        if let Some(p) = windows_parse_first_existing_path(&out.stdout) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn windows_find_link_exe_direct() -> Option<PathBuf> {
+    if let Some(vswhere) = windows_find_vswhere() {
+        if let Some(link) = windows_find_link_exe_with_vswhere(&vswhere) {
+            return Some(link);
+        }
+    }
     let years = ["2022", "2019", "2017"];
     let editions = ["BuildTools", "Community", "Professional", "Enterprise"];
     for base_key in ["ProgramFiles", "ProgramFiles(x86)"] {
@@ -2587,29 +2628,35 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
         probe_scripts.push(format!("call \"{}\" >NUL 2>&1", path));
     }
     if probe_scripts.is_empty() {
-        return Err(
-            "Unable to locate VsDevCmd.bat or vcvars64.bat in default Visual Studio paths."
-                .to_string(),
-        );
+        // No setup scripts found; still allow direct link.exe path probing below.
     }
 
-    let kvs = windows_capture_batch_env(&probe_scripts)?;
-    const KEYS: &[&str] = &[
-        "PATH",
-        "INCLUDE",
-        "LIB",
-        "LIBPATH",
-        "VCToolsInstallDir",
-        "VCINSTALLDIR",
-        "VSINSTALLDIR",
-        "WindowsSdkDir",
-        "WindowsSdkVersion",
-        "UniversalCRTSdkDir",
-        "UCRTVersion",
-    ];
-    for (k, v) in kvs {
-        if KEYS.contains(&k.as_str()) && !v.trim().is_empty() {
-            env::set_var(k, v);
+    let mut probe_err: Option<String> = None;
+    if !probe_scripts.is_empty() {
+        match windows_capture_batch_env(&probe_scripts) {
+            Ok(kvs) => {
+                const KEYS: &[&str] = &[
+                    "PATH",
+                    "INCLUDE",
+                    "LIB",
+                    "LIBPATH",
+                    "VCToolsInstallDir",
+                    "VCINSTALLDIR",
+                    "VSINSTALLDIR",
+                    "WindowsSdkDir",
+                    "WindowsSdkVersion",
+                    "UniversalCRTSdkDir",
+                    "UCRTVersion",
+                ];
+                for (k, v) in kvs {
+                    if KEYS.contains(&k.as_str()) && !v.trim().is_empty() {
+                        env::set_var(k, v);
+                    }
+                }
+            }
+            Err(e) => {
+                probe_err = Some(e);
+            }
         }
     }
     if windows_has_link_exe_in_path() {
@@ -2628,6 +2675,11 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
                 }
             }
         }
+    }
+    if let Some(e) = probe_err {
+        return Err(format!(
+            "{e} (fallback direct scan also failed to locate usable link.exe)"
+        ));
     }
     Err("MSVC environment loaded, but `link.exe` is still not discoverable in PATH.".to_string())
 }

@@ -4,12 +4,25 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
 from janusx import janusx as jxrs
 from janusx.gfreader import load_genotype_chunks
+
+
+ProgressCallback = Optional[Callable[[str, dict[str, Any]], None]]
+
+
+def _emit_progress(callback: ProgressCallback, event: str, **payload: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(str(event), payload)
+    except Exception:
+        # Progress callback should never break numerical training.
+        pass
 
 
 @dataclass
@@ -22,6 +35,8 @@ class ADAMixtureConfig:
     threads: int = 1
     chunk_size: int = 50000
     snps_only: bool = True
+    maf: float = 0.02
+    geno: float = 0.05
 
     lr: float = 0.005
     beta1: float = 0.80
@@ -66,14 +81,16 @@ def load_genotype_u8_matrix(
     *,
     chunk_size: int,
     snps_only: bool,
+    maf: float,
+    missing_rate: float,
 ) -> np.ndarray:
     chunks: list[np.ndarray] = []
     n_samples = None
     for geno, _sites in load_genotype_chunks(
         genotype_path,
         chunk_size=int(chunk_size),
-        maf=0.0,
-        missing_rate=1.0,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
         impute=False,
         model="add",
         snps_only=bool(snps_only),
@@ -116,6 +133,7 @@ def _rsvd(
     power: int,
     tol: float,
     logger: logging.Logger,
+    callback: ProgressCallback = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     m, n = g.shape  # SNP x sample
     t0 = time.time()
@@ -123,7 +141,8 @@ def _rsvd(
     k_prime = max(int(k) + 10, 20)
     alpha = 0.0
 
-    logger.info("    Running RSVD...")
+    _emit_progress(callback, "rsvd_start", power=int(power))
+    logger.info(f"{'RSVD':<22}: start")
     omega = np.ascontiguousarray(
         rng.standard_normal(size=(m, k_prime), dtype=np.float32),
         dtype=np.float32,
@@ -133,6 +152,7 @@ def _rsvd(
 
     sk = np.zeros(k_prime, dtype=np.float32)
     s_idx = 0
+    converged_iter: Optional[int] = None
     for i in range(int(power)):
         g_small = np.ascontiguousarray(jxrs.admx_multiply_a_omega(g, q, f), dtype=np.float32)
         y = np.ascontiguousarray(jxrs.admx_multiply_at_omega(g, g_small, f), dtype=np.float32)
@@ -145,7 +165,10 @@ def _rsvd(
             pve_all = np.abs(sk_now - sk[: len(sk_now)]) / denom
             ei = float(np.max(pve_all[s_idx : int(k) + s_idx])) if len(pve_all) > 0 else 0.0
             if ei < float(tol):
-                logger.info(f"    RSVD converged at power iteration {i + 1}.")
+                converged_iter = int(i + 1)
+                logger.info(
+                    f"{'RSVD converged':<22}: iter {i + 1}/{int(power)}"
+                )
                 break
             sk[: len(sk_now)] = sk_now
         else:
@@ -159,7 +182,15 @@ def _rsvd(
     s = np.ascontiguousarray(s_all[: int(k)], dtype=np.float32)
     u = np.ascontiguousarray(u_small[:, : int(k)], dtype=np.float32)
     v = np.ascontiguousarray(q @ v_small[:, : int(k)], dtype=np.float32)
-    logger.info(f"    RSVD finished in {time.time() - t0:.2f}s.")
+    elapsed = time.time() - t0
+    logger.info(f"{'RSVD finished':<22}: {elapsed:.2f}s")
+    _emit_progress(
+        callback,
+        "rsvd_done",
+        elapsed=float(elapsed),
+        converged_iter=converged_iter,
+        max_power=int(power),
+    )
     return u, s, v
 
 
@@ -176,6 +207,7 @@ def _als_init(
     tol: float,
     reg: float,
     logger: logging.Logger,
+    callback: ProgressCallback = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     t0 = time.time()
     m, n = g.shape
@@ -196,7 +228,9 @@ def _als_init(
     high_corr = False
     p_best = np.array(p, copy=True)
     q_best = np.array(q, copy=True)
+    _emit_progress(callback, "als_start", max_iter=int(max_iter))
 
+    converged_iter: Optional[int] = None
     for it in range(int(max_iter)):
         i_mat = np.ascontiguousarray(q @ np.linalg.pinv(q.T @ q + reg_eye), dtype=np.float32)
         p = 0.5 * (z @ (v.T @ i_mat)) + np.outer(f, i_mat.sum(axis=0))
@@ -227,21 +261,36 @@ def _als_init(
             else:
                 stall_counter += 1
             if stall_counter >= 20:
-                logger.info(f"    ALS stall limit reached at iter {it + 1}, rollback best state.")
+                converged_iter = int(it + 1)
+                logger.info(
+                    f"{'ALS stall limit':<22}: iter {it + 1}/{int(max_iter)}, rollback best state"
+                )
                 p = p_best
                 q = q_best
                 break
 
         if rmse_err < float(tol):
-            logger.info(f"    ALS converged at iteration {it + 1}.")
+            converged_iter = int(it + 1)
+            logger.info(
+                f"{'ALS converged':<22}: iter {it + 1}/{int(max_iter)}"
+            )
             break
         q_prev[...] = q
 
-    logger.info(f"    ALS finished in {time.time() - t0:.2f}s.")
+    elapsed = time.time() - t0
+    logger.info(f"{'ALS finished':<22}: {elapsed:.2f}s")
     p64 = np.ascontiguousarray(p, dtype=np.float64)
     q64 = np.ascontiguousarray(q, dtype=np.float64)
     ll0 = float(jxrs.admx_loglikelihood(g, p64, q64))
-    logger.info(f"    Initial log-likelihood: {ll0:.3f}")
+    logger.info(f"{'Initial log-likelihood':<22}: {ll0:.3f}")
+    _emit_progress(
+        callback,
+        "als_done",
+        elapsed=float(elapsed),
+        initial_ll=float(ll0),
+        converged_iter=converged_iter,
+        max_iter=int(max_iter),
+    )
     return p64, q64
 
 
@@ -259,12 +308,17 @@ def _adam_em_optimize(
     lr_decay: float,
     min_lr: float,
     logger: logging.Logger,
+    callback: ProgressCallback = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    p = np.ascontiguousarray(p, dtype=np.float64)
+    q = np.ascontiguousarray(q, dtype=np.float64)
     t0 = time.time()
     m_p = np.zeros_like(p, dtype=np.float64)
     v_p = np.zeros_like(p, dtype=np.float64)
     m_q = np.zeros_like(q, dtype=np.float64)
     v_q = np.zeros_like(q, dtype=np.float64)
+    p_em = np.empty_like(p, dtype=np.float64)
+    q_em = np.empty_like(q, dtype=np.float64)
 
     p_best = np.array(p, copy=True)
     q_best = np.array(q, copy=True)
@@ -273,13 +327,19 @@ def _adam_em_optimize(
     lr_cur = float(lr)
     step = 0
     check_every = max(1, int(check))
+    _emit_progress(
+        callback,
+        "adam_start",
+        max_iter=int(max_iter),
+        check_every=int(check_every),
+    )
 
     for it in range(int(max_iter)):
         step += 1
-        p_em, q_em = jxrs.admx_em_step(g, p, q)
-        p, m_p, v_p = jxrs.admx_adam_update_p(
+        jxrs.admx_em_step_inplace(g, p, q, p_em, q_em)
+        jxrs.admx_adam_update_p_inplace(
             p,
-            np.ascontiguousarray(p_em, dtype=np.float64),
+            p_em,
             m_p,
             v_p,
             float(lr_cur),
@@ -288,9 +348,9 @@ def _adam_em_optimize(
             float(reg_adam),
             int(step),
         )
-        q, m_q, v_q = jxrs.admx_adam_update_q(
+        jxrs.admx_adam_update_q_inplace(
             q,
-            np.ascontiguousarray(q_em, dtype=np.float64),
+            q_em,
             m_q,
             v_q,
             float(lr_cur),
@@ -304,8 +364,25 @@ def _adam_em_optimize(
             continue
 
         ll_cur = float(jxrs.admx_loglikelihood(g, p, q))
-        logger.info(f"    Iteration {it + 1}: log-likelihood={ll_cur:.3f}, lr={lr_cur:.3e}")
+        logger.info(
+            f"{'ADAM iteration':<22}: {it + 1:>4}/{int(max_iter):<4} "
+            f"ll={ll_cur:>14.3f} lr={lr_cur:>9.3e}"
+        )
+        _emit_progress(
+            callback,
+            "adam_iter",
+            iteration=int(it + 1),
+            max_iter=int(max_iter),
+            ll=float(ll_cur),
+            lr=float(lr_cur),
+        )
         if abs(ll_cur - ll_best) < 0.1:
+            _emit_progress(
+                callback,
+                "adam_stop",
+                reason="ll_delta_small",
+                iteration=int(it + 1),
+            )
             break
 
         if ll_cur > ll_best:
@@ -317,27 +394,65 @@ def _adam_em_optimize(
             no_improve += 1
             old_lr = lr_cur
             lr_cur = max(lr_cur * float(lr_decay), float(min_lr))
-            logger.info(f"    No improvement ({no_improve}), lr: {old_lr:.3e} -> {lr_cur:.3e}")
+            logger.info(
+                f"{'No improvement':<22}: count={int(no_improve)} "
+                f"lr {old_lr:>9.3e} -> {lr_cur:>9.3e}"
+            )
+            _emit_progress(
+                callback,
+                "adam_lr_decay",
+                iteration=int(it + 1),
+                no_improve=int(no_improve),
+                old_lr=float(old_lr),
+                new_lr=float(lr_cur),
+            )
             if no_improve >= 2:
-                logger.info("    Early stopping triggered.")
+                logger.info(f"{'Early stopping':<22}: triggered")
+                _emit_progress(
+                    callback,
+                    "adam_stop",
+                    reason="no_improve",
+                    iteration=int(it + 1),
+                )
                 break
 
     ll_final = float(jxrs.admx_loglikelihood(g, p_best, q_best))
-    logger.info(f"    Final log-likelihood={ll_final:.3f}, elapsed={time.time() - t0:.2f}s")
+    elapsed = time.time() - t0
+    logger.info(
+        f"{'Final log-likelihood':<22}: {ll_final:.3f} (elapsed {elapsed:.2f}s)"
+    )
+    _emit_progress(
+        callback,
+        "adam_done",
+        elapsed=float(elapsed),
+        final_ll=float(ll_final),
+    )
     return p_best, q_best
 
 
-def train_adamixture(cfg: ADAMixtureConfig, logger: logging.Logger) -> tuple[np.ndarray, np.ndarray, int, int]:
+def train_adamixture(
+    cfg: ADAMixtureConfig,
+    logger: logging.Logger,
+    callback: ProgressCallback = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     _set_thread_env(cfg.threads)
+    try:
+        jxrs.admx_set_threads(int(max(1, int(cfg.threads))))
+    except Exception:
+        # Backward-compatible fallback when Rust extension doesn't expose thread setter.
+        pass
     np.random.seed(int(cfg.seed))
 
     g = load_genotype_u8_matrix(
         cfg.genotype_path,
         chunk_size=int(cfg.chunk_size),
         snps_only=bool(cfg.snps_only),
+        maf=float(cfg.maf),
+        missing_rate=float(cfg.geno),
     )
     m, n = g.shape
-    logger.info(f"    Data loaded: SNPs={m}, samples={n}")
+    logger.info(f"{'Data loaded':<22}: SNPs={m}, samples={n}")
+    _emit_progress(callback, "data_loaded", m=int(m), n=int(n))
 
     f = np.ascontiguousarray(jxrs.admx_allele_frequency(g), dtype=np.float32)
     u, s, v = _rsvd(
@@ -348,6 +463,7 @@ def train_adamixture(cfg: ADAMixtureConfig, logger: logging.Logger) -> tuple[np.
         power=int(cfg.power),
         tol=float(cfg.tole_svd),
         logger=logger,
+        callback=callback,
     )
     p0, q0 = _als_init(
         g,
@@ -361,6 +477,7 @@ def train_adamixture(cfg: ADAMixtureConfig, logger: logging.Logger) -> tuple[np.
         tol=float(cfg.tole_als),
         reg=float(cfg.reg_als),
         logger=logger,
+        callback=callback,
     )
     p, q = _adam_em_optimize(
         g,
@@ -375,5 +492,6 @@ def train_adamixture(cfg: ADAMixtureConfig, logger: logging.Logger) -> tuple[np.
         lr_decay=float(cfg.lr_decay),
         min_lr=float(cfg.min_lr),
         logger=logger,
+        callback=callback,
     )
     return p, q, m, n

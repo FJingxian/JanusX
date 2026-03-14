@@ -330,6 +330,234 @@ pub fn admx_multiply_at_omega<'py>(
     Ok(out)
 }
 
+fn multiply_a_omega_inplace_impl(
+    g: &ArrayView2<'_, u8>,
+    omega: &[f32],
+    f: &[f32],
+    out: &mut [f32],
+    kp: usize,
+) -> Result<(), String> {
+    let (m, n) = g.dim();
+    if f.len() != m {
+        return Err(format!(
+            "shape mismatch: f length={} expected {}",
+            f.len(),
+            m
+        ));
+    }
+    if omega.len() != n * kp {
+        return Err(format!(
+            "shape mismatch: omega length={} expected {}",
+            omega.len(),
+            n * kp
+        ));
+    }
+    if out.len() != m * kp {
+        return Err(format!(
+            "shape mismatch: out length={} expected {}",
+            out.len(),
+            m * kp
+        ));
+    }
+    out.par_chunks_mut(kp).enumerate().for_each(|(i, row)| {
+        let f2 = 2.0_f32 * f[i];
+        for j in 0..kp {
+            let mut acc = 0.0_f32;
+            for l in 0..n {
+                let gv = g[(i, l)];
+                if gv == 3 {
+                    continue;
+                }
+                acc += (gv as f32 - f2) * omega[l * kp + j];
+            }
+            row[j] = acc;
+        }
+    });
+    Ok(())
+}
+
+fn multiply_at_omega_inplace_impl(
+    g: &ArrayView2<'_, u8>,
+    omega: &[f32],
+    f: &[f32],
+    out: &mut [f32],
+    kp: usize,
+    tile_cols: usize,
+) -> Result<(), String> {
+    let (m, n) = g.dim();
+    if f.len() != m {
+        return Err(format!(
+            "shape mismatch: f length={} expected {}",
+            f.len(),
+            m
+        ));
+    }
+    if omega.len() != m * kp {
+        return Err(format!(
+            "shape mismatch: omega length={} expected {}",
+            omega.len(),
+            m * kp
+        ));
+    }
+    if out.len() != n * kp {
+        return Err(format!(
+            "shape mismatch: out length={} expected {}",
+            out.len(),
+            n * kp
+        ));
+    }
+    out.fill(0.0);
+    let tile = tile_cols.max(1).min(n);
+    for block_start in (0..n).step_by(tile) {
+        let block_len = (n - block_start).min(tile);
+        let blk = (0..m)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f32; block_len * kp],
+                |mut local, i| {
+                    let f2 = 2.0_f32 * f[i];
+                    let omega_row = &omega[i * kp..(i + 1) * kp];
+                    for off in 0..block_len {
+                        let col = block_start + off;
+                        let gv = g[(i, col)];
+                        if gv == 3 {
+                            continue;
+                        }
+                        let centered = gv as f32 - f2;
+                        let dst = &mut local[off * kp..(off + 1) * kp];
+                        for j in 0..kp {
+                            dst[j] += centered * omega_row[j];
+                        }
+                    }
+                    local
+                },
+            )
+            .reduce(
+                || vec![0.0_f32; block_len * kp],
+                |mut a, b| {
+                    for idx in 0..(block_len * kp) {
+                        a[idx] += b[idx];
+                    }
+                    a
+                },
+            );
+        out[block_start * kp..(block_start + block_len) * kp].copy_from_slice(&blk);
+    }
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (g, omega, f, out, tile_cols=None))]
+pub fn admx_multiply_at_omega_inplace(
+    g: PyReadonlyArray2<'_, u8>,
+    omega: PyReadonlyArray2<'_, f32>,
+    f: PyReadonlyArray1<'_, f32>,
+    out: &Bound<'_, PyArray2<f32>>,
+    tile_cols: Option<usize>,
+) -> PyResult<()> {
+    let g = g.as_array();
+    let omega = omega.as_array();
+    let f = f.as_array();
+    let (m, _) = g.dim();
+    let (m2, kp) = omega.dim();
+    if m != m2 {
+        return Err(PyRuntimeError::new_err(format!(
+            "shape mismatch: G rows={}, omega rows={}",
+            m, m2
+        )));
+    }
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    multiply_at_omega_inplace_impl(
+        &g,
+        omega
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("omega not contiguous"))?,
+        f.as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("f not contiguous"))?,
+        out_slice,
+        kp,
+        tile_cols.unwrap_or(1024),
+    )
+    .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
+pub fn admx_multiply_a_omega_inplace(
+    g: PyReadonlyArray2<'_, u8>,
+    omega: PyReadonlyArray2<'_, f32>,
+    f: PyReadonlyArray1<'_, f32>,
+    out: &Bound<'_, PyArray2<f32>>,
+) -> PyResult<()> {
+    let g = g.as_array();
+    let omega = omega.as_array();
+    let f = f.as_array();
+    let (_, kp) = omega.dim();
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    multiply_a_omega_inplace_impl(
+        &g,
+        omega
+            .as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("omega not contiguous"))?,
+        f.as_slice()
+            .ok_or_else(|| PyRuntimeError::new_err("f not contiguous"))?,
+        out_slice,
+        kp,
+    )
+    .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (g, omega, f, y_out, g_small_out, tile_cols=None))]
+pub fn admx_rsvd_power_step_inplace(
+    g: PyReadonlyArray2<'_, u8>,
+    omega: PyReadonlyArray2<'_, f32>,
+    f: PyReadonlyArray1<'_, f32>,
+    y_out: &Bound<'_, PyArray2<f32>>,
+    g_small_out: &Bound<'_, PyArray2<f32>>,
+    tile_cols: Option<usize>,
+) -> PyResult<()> {
+    let g = g.as_array();
+    let omega = omega.as_array();
+    let f = f.as_array();
+    let (_, kp) = omega.dim();
+
+    let g_small_slice = unsafe {
+        g_small_out
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("g_small_out not contiguous"))?
+    };
+    let y_slice = unsafe {
+        y_out
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("y_out not contiguous"))?
+    };
+
+    let omega_slice = omega
+        .as_slice()
+        .ok_or_else(|| PyRuntimeError::new_err("omega not contiguous"))?;
+    let f_slice = f
+        .as_slice()
+        .ok_or_else(|| PyRuntimeError::new_err("f not contiguous"))?;
+
+    multiply_a_omega_inplace_impl(&g, omega_slice, f_slice, g_small_slice, kp)
+        .map_err(PyRuntimeError::new_err)?;
+    multiply_at_omega_inplace_impl(
+        &g,
+        g_small_slice,
+        f_slice,
+        y_slice,
+        kp,
+        tile_cols.unwrap_or(1024),
+    )
+    .map_err(PyRuntimeError::new_err)
+}
+
 #[pyfunction]
 pub fn admx_multiply_a_omega<'py>(
     py: Python<'py>,

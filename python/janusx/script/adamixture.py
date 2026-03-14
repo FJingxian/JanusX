@@ -22,6 +22,7 @@ from typing import Any, Optional
 import numpy as np
 
 from janusx.adamixture import ADAMixtureConfig, train_adamixture
+from janusx.gfreader import inspect_genotype_file
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -154,6 +155,57 @@ def _resolve_input(args, logger) -> tuple[str, str, str]:
 
     prefix = args.prefix or strip_default_prefix_suffix(auto_prefix)
     return gfile.replace("\\", "/"), source_label, prefix
+
+
+def _safe_sample_ids(
+    genotype_path: str,
+    *,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    expected_n: int,
+    logger: logging.Logger,
+) -> list[str]:
+    sample_ids: list[str] = []
+    try:
+        sample_ids_raw, _ = inspect_genotype_file(
+            genotype_path,
+            snps_only=bool(snps_only),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+        )
+        sample_ids = [str(x) for x in sample_ids_raw]
+    except Exception as ex:
+        logger.warning(f"Failed to inspect sample IDs for Q output: {ex}")
+        sample_ids = []
+
+    if len(sample_ids) != int(expected_n):
+        if len(sample_ids) > 0:
+            logger.warning(
+                "Sample ID count mismatch for Q output "
+                f"(ids={len(sample_ids)}, expected={int(expected_n)}). "
+                "Fallback to generated sample IDs."
+            )
+        sample_ids = [f"S{i+1}" for i in range(int(expected_n))]
+    return sample_ids
+
+
+def _write_matrix_with_row_ids(
+    out_path: str,
+    row_ids: list[str],
+    mat: np.ndarray,
+) -> None:
+    arr = np.asarray(mat, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(f"Matrix must be 2D, got shape={arr.shape}")
+    if len(row_ids) != int(arr.shape[0]):
+        raise ValueError(
+            f"Row ID length mismatch: ids={len(row_ids)}, rows={int(arr.shape[0])}"
+        )
+    with open(out_path, "w", encoding="utf-8") as fw:
+        for rid, row in zip(row_ids, arr):
+            vals = "\t".join(f"{float(v):.8f}" for v in row)
+            fw.write(f"{rid}\t{vals}\n")
 
 
 def main() -> None:
@@ -363,8 +415,18 @@ def main() -> None:
             if progress_ui is not None:
                 progress_ui.close()
             _restore_handler_levels(muted)
-        np.savetxt(q_out, np.asarray(q_mat, dtype=np.float64), fmt="%.8f", delimiter=" ")
-        np.savetxt(p_out, np.asarray(p_mat, dtype=np.float64), fmt="%.8f", delimiter=" ")
+        q_ids = _safe_sample_ids(
+            genotype_path,
+            snps_only=bool(args.snps_only),
+            maf=float(args.maf),
+            missing_rate=float(args.geno),
+            expected_n=int(n),
+            logger=logger,
+        )
+        # P matrix is SNP x K (not sample x K), so prepend per-site row IDs.
+        p_ids = [f"SNP{i+1}" for i in range(int(m))]
+        _write_matrix_with_row_ids(q_out, q_ids, np.asarray(q_mat, dtype=np.float64))
+        _write_matrix_with_row_ids(p_out, p_ids, np.asarray(p_mat, dtype=np.float64))
     except Exception as e:
         if progress_ui is not None:
             try:

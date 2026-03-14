@@ -280,6 +280,7 @@ def _rsvd(
     rng = np.random.default_rng(int(seed))
     k_prime = max(int(k) + 10, 20)
     alpha = 0.0
+    rsvd_tile = max(1, int(os.environ.get("JANUSX_ADMX_RSVD_TILE", "1024")))
 
     _emit_progress(callback, "rsvd_start", power=int(power))
     logger.info(f"{'RSVD':<22}: start")
@@ -287,15 +288,16 @@ def _rsvd(
         rng.standard_normal(size=(m, k_prime), dtype=np.float32),
         dtype=np.float32,
     )
-    y = np.ascontiguousarray(jxrs.admx_multiply_at_omega(g, omega, f), dtype=np.float32)
+    y = np.empty((n, k_prime), dtype=np.float32)
+    g_small = np.empty((m, k_prime), dtype=np.float32)
+    jxrs.admx_multiply_at_omega_inplace(g, omega, f, y, rsvd_tile)
     q, _, _ = _eig_svd(y)
 
     sk = np.zeros(k_prime, dtype=np.float32)
     s_idx = 0
     converged_iter: Optional[int] = None
     for i in range(int(power)):
-        g_small = np.ascontiguousarray(jxrs.admx_multiply_a_omega(g, q, f), dtype=np.float32)
-        y = np.ascontiguousarray(jxrs.admx_multiply_at_omega(g, g_small, f), dtype=np.float32)
+        jxrs.admx_rsvd_power_step_inplace(g, q, f, y, g_small, rsvd_tile)
         y -= alpha * q
         q, s_y, _ = _eig_svd(y)
 
@@ -317,7 +319,7 @@ def _rsvd(
         if float(alpha) < float(s_y[-1]):
             alpha = float(alpha + s_y[-1]) / 2.0
 
-    g_small = np.ascontiguousarray(jxrs.admx_multiply_a_omega(g, q, f), dtype=np.float32)
+    jxrs.admx_multiply_a_omega_inplace(g, q, f, g_small)
     u_small, s_all, v_small = _eig_svd(g_small)
     s = np.ascontiguousarray(s_all[: int(k)], dtype=np.float32)
     u = np.ascontiguousarray(u_small[:, : int(k)], dtype=np.float32)

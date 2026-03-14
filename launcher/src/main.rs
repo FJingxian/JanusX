@@ -36,7 +36,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 18] = [
+const KNOWN_MODULES: [&str; 19] = [
     "grm",
     "pca",
     "gwas",
@@ -49,6 +49,7 @@ const KNOWN_MODULES: [&str; 18] = [
     "fastq2count",
     "fastq2vcf",
     "adamixture",
+    "tree",
     "hybrid",
     "gformat",
     "gmerge",
@@ -56,7 +57,7 @@ const KNOWN_MODULES: [&str; 18] = [
     "sim",
     "simulation",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 18] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 19] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -78,6 +79,10 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 18] = [
     ),
     ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
     ("adamixture", "ADAMIXTURE ancestry inference"),
+    (
+        "tree",
+        "Build sample distance matrix for phylogenetic analysis",
+    ),
     (
         "hybrid",
         "Build pairwise hybrid genotype matrix from parent lists",
@@ -5101,6 +5106,13 @@ fn print_cli_help() {
         width,
     );
     print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width);
+    print_help_entry(
+        4,
+        "tree",
+        "Build sample distance matrix for phylogenetic analysis",
+        12,
+        width,
+    );
     print_help_entry(
         4,
         "hybrid",

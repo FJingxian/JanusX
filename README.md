@@ -1,53 +1,123 @@
 # JanusX
 
-[简体中文](./doc/README_zh.md) | [English](./README.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
+[CLI Doc](./doc/JanusXcli.md) | [Core API Doc](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
+![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 JanusX is a high-performance toolkit for quantitative genetics. It combines Rust-accelerated kernels (PyO3) with Python CLI workflows for GWAS, genomic selection (GS), post-analysis visualization, and variant-processing pipelines.
 
 ## Overview
+
+```text
+       _                      __   __
+      | |                     \ \ / /
+      | | __ _ _ __  _   _ ___ \ V / 
+  _   | |/ _` | '_ \| | | / __| > <  
+ | |__| | (_| | | | | |_| \__ \/ . \ 
+  \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
+  ---------------------------------------------------------
+```
 
 - Unified CLI entry: `jx`
 - Core GWAS models: `LM`, `LMM`, `FarmCPU`
 - Core GS models: `GBLUP`, `rrBLUP`, `BayesA`, `BayesB`, `BayesCpi`
 - Streaming genotype reader for VCF/PLINK/TXT with low-memory workflows
 - Integrated post-analysis tools: `postgwas`, `postbsa`, `postgarfield`
-- Additional utilities: `grm`, `pca`, `gmerge`, `fastq2vcf`, `sim`, `simulation`
+- Additional utilities: `grm`, `pca`, `gmerge`, `fastq2vcf`, `fastq2count`, `sim`, `simulation`
+
+****
 
 ## Installation
 
 Requirements:
 
-- Python `>=3.9`
-- Rust toolchain (only needed when local wheel is unavailable and build from source is required)
+- Supported OS: Linux / macOS / Windows
+- Internet access for first-time runtime setup and updates
+- Python/Rust are **not** required for normal end-user installation via launcher installer
 
-### PyPI (recommended)
+### Release Launcher Install (required)
 
-```bash
-pip install -U janusx
-jx -h
-```
+Download the installer asset from GitHub Releases:
+<https://github.com/FJingxian/JanusX/releases>
 
-### Latest GitHub version
-
-```bash
-pip install --upgrade --force-reinstall --no-cache-dir git+https://github.com/FJingxian/JanusX.git
-jx -h
-```
-
-### Docker (source image build)
+Unzip, and then run installer:
 
 ```bash
-git clone https://github.com/FJingxian/JanusX.git
-cd JanusX
-docker build -t janusx:latest .
-docker run --rm janusx:latest -h
+# Linux
+./JanusX-vX.Y.Z-linux-x86_64.run
+
+# macOS
+./JanusX-vX.Y.Z-darwin-universal.command
 ```
 
-### In-place update for an installed JanusX
+On Windows, run the `.exe` installer directly.
+
+### Upgrade after a new release
 
 ```bash
-jx --update
+jx -upgrade
 ```
+
+****
+
+## Quick Start
+
+### GWAS
+
+```bash
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
+```
+
+<p align="center">
+  <img src="./doc/mouse_hs1940.test0.add.lmm.svg" alt="overview" />
+</p>
+
+### Post-GWAS
+
+```bash
+jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -threshold 1e-6 -o testpost
+```
+
+<p align="center">
+  <img src="./doc/ldblock.png" alt="ldblock" />
+</p>
+
+### Genomic Selection
+
+```bash
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -o testgs
+```
+
+<p align="center">
+  <img src="./doc/mouse_hs1940.test0.gs.XGB.svg" alt="gsoverview" />
+</p>
+
+```text
+* Genomic Selection for trait: test0
+Train size: 1410, Test size: 530, EffSNPs: 8960
+✔︎ GBLUP ...Finished [3.5s]
+✔︎ adBLUP ...Finished [10.1s]
+✔︎ BayesA ...Finished [32.6s]
+✔︎ BayesB ...Finished [34.2s]
+✔︎ BayesCpi ...Finished [32.0s]
+✔︎ RF ...Finished [1m46s]
+✔︎ XGB ...Finished [9m27s]
+✔︎ SVM ...Finished [2m05s]
+✔︎ ENET ...Finished [9.7s]
+Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
+   1 GBLUP         0.704     0.671  0.493  0.610      0.531
+   1 adBLUP        0.717     0.679  0.512  0.694      2.341
+   1 BayesA        0.721     0.695  0.514  0.714      5.307
+   1 BayesB        0.722     0.693  0.517  0.667      5.522
+   1 BayesCpi      0.699     0.671  0.476  0.672      4.971
+   1 RF            0.709     0.702  0.471  0.468      3.055
+   1 XGB           0.754     0.733  0.564  0.563      5.231
+   1 SVM           0.703     0.664  0.490  0.485      9.027
+   1 ENET          0.720     0.704  0.514  0.517      0.274
+```
+
+More usage in [CLI doc](./doc/JanusXcli.md).
+
+****
 
 ## CLI Modules
 
@@ -73,8 +143,12 @@ jx --update
 
 ### Pipeline and Utility
 
+- `fastq2count`: RNA-seq pipeline from FASTQ to gene count/FPKM/TPM
 - `fastq2vcf`: variant-calling pipeline from FASTQ to VCF
+- `hybrid`: build pairwise hybrid genotype matrix from parent lists
+- `gformat`: convert genotype files across plink/vcf/hmp/txt/npy
 - `gmerge`: merge genotype/variant datasets
+- `webui`: start JanusX web UI
 
 ### Benchmark
 
@@ -87,124 +161,7 @@ For full options, run:
 jx <module> -h
 ```
 
-## Quick Start
-
-### 1) GWAS
-
-```bash
-jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -plot -o test
-```
-
-### 2) Post-GWAS (single result)
-
-```bash
-jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -threshold 1e-6 -o testpost
-```
-
-### 3) Post-GWAS merge plot (multiple GWAS files in one figure)
-
-```bash
-jx postgwas \
-  -gwasfile testb/mouse_hs1940.test0.add.lmm.tsv \
-  -merge testb/mouse_hs1940.test0.dom.lmm.tsv \
-  -merge testb/mouse_hs1940.test0.het.lmm.tsv \
-  -merge testb/mouse_hs1940.test0.rec.lmm.tsv \
-  -manh -qq -o testpost
-```
-
-### 4) Genomic Selection
-
-```bash
-jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -plot -o testgs
-```
-
-### 5) Post-BSA
-
-```bash
-jx postbsa -file QBproject/5.table/all.tsv -b1 JS -b2 JR -window 1 -format pdf -o QBproject/5.table
-```
-
-### 6) FASTQ to VCF pipeline
-
-```bash
-jx fastq2vcf -r /path/ref.fa -i /path/fastq_dir -w /path/workdir -b nohup -m 2
-```
-
-## Input File Formats
-
-### Phenotype file
-
-Tab-delimited. First column is sample ID, remaining columns are traits.
-
-```text
-sample	trait1	trait2
-id1	10.5	0.85
-id2	12.3	1.00
-id3	8.6	0.92
-```
-
-### Genotype files
-
-- VCF: `.vcf` or `.vcf.gz` (`-vcf`)
-- PLINK: `.bed/.bim/.fam` prefix (`-bfile`)
-- Text genotype matrix (`-file`, selected modules):
-  - header row is sample IDs
-  - subsequent rows are SNP-major numeric genotype values
-
-Example (text matrix):
-
-```text
-id1	id2	id3	id4
-0	1	2	0
-2	2	1	0
-0	0	1	1
-```
-
-### GWAS optional matrices
-
-- GRM (`-k/--grm` in `gwas`): numeric matrix aligned to genotype sample order
-- Q/PC covariate (`-q/--qcov` in `gwas`): PC count or covariate matrix file
-- Covariate (`-c/--cov` in `gwas`): numeric matrix aligned to genotype sample order
-
-All matrix files should be numeric-only, space/tab-delimited, without row/column headers.
-
-### GRM/PCA file conventions (updated)
-
-- `jx grm` accepts genotype input only: `-vcf` or `-bfile`
-- `jx grm` outputs:
-  - default text mode: `{prefix}.grm.txt` and `{prefix}.grm.txt.id`
-  - with `--npy`: `{prefix}.grm.npy` and `{prefix}.grm.npy.id`
-- `jx pca` inputs (mutually exclusive):
-  - genotype: `-vcf` or `-bfile` (compute PCA from genotype)
-  - GRM prefix: `-k/--grm <prefix>` (expects `{prefix}.grm.id` and `{prefix}.grm.txt` or `{prefix}.grm.npy`)
-  - existing PCA prefix: `-q/--qcov <prefix>` (expects `{prefix}.eigenval` and `{prefix}.eigenvec`, visualization-only mode)
-
-## Common Output Naming
-
-- `gwas`: `{prefix}.{trait}.{model}.tsv` and optional `{prefix}.{trait}.{genetic_model}.{model}.svg`
-- `postgwas`: `{prefix}.manh.{format}`, `{prefix}.qq.{format}`, `{prefix}.{thr}.anno.tsv`
-- `postgwas` merge mode: `{prefix}.merge.manh.{format}`, `{prefix}.merge.qq.{format}`
-- `postbsa`:
-  - `{prefix}.{bulk1}vs{bulk2}.snpidx.{format}`
-  - `{prefix}.{bulk1}vs{bulk2}.bsa.{format}`
-  - `{prefix}.{bulk1}vs{bulk2}.smooth.tsv`
-  - `{prefix}.{bulk1}vs{bulk2}.thr.tsv`
-- `gs`: `{prefix}.{trait}.gs.tsv`
-
-## Python API (selected)
-
-```python
-from janusx.gfreader import load_genotype_chunks
-
-for geno, sites in load_genotype_chunks("example/mouse_hs1940.vcf.gz", chunk_size=50000):
-    # geno: (m, n) float32 genotype chunk
-    # sites: variant metadata list
-    pass
-```
-
-```python
-from janusx.gtools.wgcna import cor, adj, tom, cluster
-```
+****
 
 ## Citation
 

@@ -16,7 +16,7 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 13] = [
+const REQUIRED_TOOLS: [&str; 15] = [
     "fastp",
     "bwa-mem2",
     "samblaster",
@@ -30,8 +30,11 @@ const REQUIRED_TOOLS: [&str; 13] = [
     "bgzip",
     "plink",
     "beagle",
+    "iqtree",
+    "admixture",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 13] = [
+const DLC_TOOL_ENTRIES: [(&str, &str); 15] = [
+    ("admixture", "Ancestry estimation"),
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
@@ -41,6 +44,7 @@ const DLC_TOOL_ENTRIES: [(&str, &str); 13] = [
     ("gatk", "Variant discovery toolkit"),
     ("hisat2", "Splice-aware alignment"),
     ("hisat2-build", "HISAT2 index builder"),
+    ("iqtree", "Phylogenetic inference"),
     ("plink", "Genotype association toolkit"),
     ("samblaster", "Duplicate marking during alignment"),
     ("samtools", "BAM/CRAM processing"),
@@ -208,6 +212,7 @@ RUN [ ! -f /etc/apt/sources.list ] || sed -i \
     tabix bcftools \
     samtools hisat2 subread \
     fastp \
+    iqtree admixture \
     bash gawk coreutils sed grep findutils \
     openjdk-17-jre-headless \
     libnuma1 \
@@ -250,6 +255,8 @@ RUN command -v fastp \
     && command -v bgzip \
     && command -v plink \
     && command -v beagle \
+    && (command -v iqtree || command -v iqtree2) \
+    && command -v admixture \
     && command -v awk \
     && command -v sort
 
@@ -747,6 +754,33 @@ fn build_conda_locator(env_name: &str, path: &str) -> String {
     format!("{}|{}", env_name.trim(), path.trim())
 }
 
+fn tool_command_candidates(tool: &str) -> Vec<String> {
+    let mut out = vec![tool.to_string()];
+    if tool == "iqtree" {
+        out.push("iqtree2".to_string());
+    }
+    out
+}
+
+fn find_tool_in_path(tool: &str) -> Option<PathBuf> {
+    for cand in tool_command_candidates(tool) {
+        if let Some(path) = find_bin(&cand) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_tool_in_prefix_bin(prefix_bin: &Path, tool: &str) -> Option<PathBuf> {
+    for cand in tool_command_candidates(tool) {
+        let p = prefix_bin.join(&cand);
+        if p.exists() && p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn refresh_preferred_tool_bindings(
     python: &Path,
     db_path: &Path,
@@ -787,7 +821,7 @@ fn detect_preferred_binding_for_tool(
     if should_force_container_binding(record.runtime_mode.as_str()) {
         return runtime_binding_for_tool(tool, record, runtime_home);
     }
-    if let Some(host_path) = find_bin(tool) {
+    if let Some(host_path) = find_tool_in_path(tool) {
         let env_bin_dir = env_runtime_bin_dir(runtime_home);
         if host_path.starts_with(&env_bin_dir) {
             return Some(("env".to_string(), host_path.to_string_lossy().to_string()));
@@ -954,12 +988,14 @@ fn build_tool_command_from_preferred_binding(
                 let Some(conda_bin) = find_bin("conda") else {
                     return Ok(None);
                 };
+                let conda_tool =
+                    resolve_conda_tool_path(env_name, tool).unwrap_or_else(|| tool.to_string());
                 let mut cmd = Command::new(conda_bin);
                 cmd.arg("run")
                     .arg("--no-capture-output")
                     .arg("-n")
                     .arg(env_name)
-                    .arg(tool)
+                    .arg(conda_tool)
                     .args(args);
                 if tool == "beagle" {
                     apply_beagle_exec_env(&mut cmd, args);
@@ -1094,6 +1130,13 @@ fn probe_tool_locators_parallel(
 }
 
 fn resolve_conda_tool_path(env_name: &str, tool: &str) -> Option<String> {
+    let mut script = String::new();
+    for cand in tool_command_candidates(tool) {
+        script.push_str(&format!(
+            "p=$(command -v {} 2>/dev/null || true); if [ -n \"$p\" ]; then echo \"$p\"; break; fi; ",
+            shell_quote(&cand)
+        ));
+    }
     let conda_bin = find_bin("conda")?;
     let out = Command::new(conda_bin)
         .arg("run")
@@ -1102,7 +1145,7 @@ fn resolve_conda_tool_path(env_name: &str, tool: &str) -> Option<String> {
         .arg(env_name)
         .arg("sh")
         .arg("-lc")
-        .arg(format!("command -v {tool} || true"))
+        .arg(script)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -1970,7 +2013,7 @@ fn build_tool_command(
         }
         "conda" => {
             if !should_force_conda_run(tool) {
-                if let Some(host_tool) = find_bin(tool) {
+                if let Some(host_tool) = find_tool_in_path(tool) {
                     let mut cmd = Command::new(host_tool);
                     cmd.args(args);
                     if tool == "beagle" {
@@ -1988,11 +2031,13 @@ fn build_tool_command(
                 record.conda_env.as_str()
             };
             let mut cmd = Command::new(conda_bin);
+            let conda_tool =
+                resolve_conda_tool_path(env_name, tool).unwrap_or_else(|| tool.to_string());
             cmd.arg("run")
                 .arg("--no-capture-output")
                 .arg("-n")
                 .arg(env_name)
-                .arg(tool)
+                .arg(conda_tool)
                 .args(args);
             if tool == "beagle" {
                 apply_beagle_exec_env(&mut cmd, args);
@@ -2365,7 +2410,7 @@ fn env_runtime_tool_path(runtime_home: &Path, tool: &str) -> PathBuf {
 fn missing_host_tools() -> Vec<String> {
     REQUIRED_TOOLS
         .iter()
-        .filter(|x| !command_in_path(x))
+        .filter(|x| find_tool_in_path(x).is_none())
         .map(|x| (*x).to_string())
         .collect()
 }
@@ -2454,11 +2499,10 @@ fn sync_env_runtime_bin_mixed(runtime_home: &Path, env_prefix: &Path) -> Result<
     prepare_env_runtime_bin(runtime_home)?;
     let bin_dir = env_runtime_bin_dir(runtime_home);
     for tool in REQUIRED_TOOLS {
-        let local_src = env_prefix.join("bin").join(tool);
-        let src = if local_src.exists() {
+        let src = if let Some(local_src) = find_tool_in_prefix_bin(&env_prefix.join("bin"), tool) {
             local_src
         } else {
-            let Some(host_src) = find_bin(tool) else {
+            let Some(host_src) = find_tool_in_path(tool) else {
                 return Err(format!(
                     "Tool `{tool}` not found in either host PATH or DLC env prefix {}",
                     env_prefix.display()
@@ -2476,6 +2520,9 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     for t in tools {
         match t.as_str() {
+            "admixture" => {
+                out.insert("admixture".to_string());
+            }
             "fastp" => {
                 out.insert("fastp".to_string());
             }
@@ -2490,6 +2537,9 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
             }
             "hisat2" | "hisat2-build" => {
                 out.insert("hisat2".to_string());
+            }
+            "iqtree" => {
+                out.insert("iqtree".to_string());
             }
             "featureCounts" => {
                 out.insert("subread".to_string());
@@ -2563,7 +2613,16 @@ fn missing_env_runtime_tools(runtime_home: &Path) -> Vec<String> {
 fn missing_tools_in_prefixed_runtime(prefix: &[String]) -> Result<Vec<String>, String> {
     let script = format!(
         "for t in {}; do \
-             if ! command -v \"$t\" >/dev/null 2>&1; then \
+             found=0; \
+             if [ \"$t\" = \"iqtree\" ]; then \
+                 command -v iqtree >/dev/null 2>&1 && found=1; \
+                 if [ \"$found\" -eq 0 ]; then \
+                     command -v iqtree2 >/dev/null 2>&1 && found=1; \
+                 fi; \
+             else \
+                 command -v \"$t\" >/dev/null 2>&1 && found=1; \
+             fi; \
+             if [ \"$found\" -eq 0 ]; then \
                  echo \"$t\"; \
                  continue; \
              fi; \

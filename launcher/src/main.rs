@@ -2468,7 +2468,65 @@ fn windows_find_vcvars64() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_find_link_exe_direct() -> Option<PathBuf> {
+    let years = ["2022", "2019", "2017"];
+    let editions = ["BuildTools", "Community", "Professional", "Enterprise"];
+    for base_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = env::var_os(base_key) else {
+            continue;
+        };
+        let base = PathBuf::from(base).join("Microsoft Visual Studio");
+        for year in years {
+            for edition in editions {
+                let msvc_root = base
+                    .join(year)
+                    .join(edition)
+                    .join("VC")
+                    .join("Tools")
+                    .join("MSVC");
+                if !msvc_root.is_dir() {
+                    continue;
+                }
+                let Ok(vers) = std::fs::read_dir(&msvc_root) else {
+                    continue;
+                };
+                for v in vers.flatten() {
+                    let link = v
+                        .path()
+                        .join("bin")
+                        .join("Hostx64")
+                        .join("x64")
+                        .join("link.exe");
+                    if link.is_file() {
+                        return Some(link);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn windows_capture_batch_env(script_candidates: &[String]) -> Result<Vec<(String, String)>, String> {
+    fn path_has_link(path_value: &str) -> bool {
+        for d in env::split_paths(path_value) {
+            if d.join("link.exe").is_file() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn kvs_has_link(kvs: &[(String, String)]) -> bool {
+        for (k, v) in kvs {
+            if k.eq_ignore_ascii_case("PATH") && path_has_link(v) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn parse_env_pairs(stdout: &[u8]) -> Vec<(String, String)> {
         let mut kvs = Vec::new();
         for line in String::from_utf8_lossy(stdout).lines() {
@@ -2485,27 +2543,25 @@ fn windows_capture_batch_env(script_candidates: &[String]) -> Result<Vec<(String
 
     let mut last_exit = 1i32;
     for script in script_candidates {
+        let cmdline = format!("{script} & set");
         let out = Command::new("cmd")
             .arg("/d")
             .arg("/c")
-            .arg(script)
+            .arg(cmdline)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
             .map_err(|e| format!("Failed to run MSVC setup script: {e}"))?;
         last_exit = exit_code(out.status);
-        if !out.status.success() {
-            continue;
-        }
         let kvs = parse_env_pairs(&out.stdout);
-        if !kvs.is_empty() {
+        if !kvs.is_empty() && kvs_has_link(&kvs) {
             return Ok(kvs);
         }
     }
 
     Err(format!(
-        "MSVC setup script exited with code {} while probing environment.",
+        "MSVC setup script exited with code {} while probing environment (no PATH containing link.exe found).",
         last_exit
     ))
 }
@@ -2516,19 +2572,19 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
     if let Some(vsdevcmd) = windows_find_vsdevcmd() {
         let path = vsdevcmd.display();
         probe_scripts.push(format!(
-            "call \"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL 2>&1 && set",
+            "call \"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL 2>&1",
             path
         ));
         probe_scripts.push(format!(
-            "call \"{}\" -no_logo -arch=x64 >NUL 2>&1 && set",
+            "call \"{}\" -no_logo -arch=x64 >NUL 2>&1",
             path
         ));
-        probe_scripts.push(format!("call \"{}\" >NUL 2>&1 && set", path));
+        probe_scripts.push(format!("call \"{}\" >NUL 2>&1", path));
     }
     if let Some(vcvars64) = windows_find_vcvars64() {
         let path = vcvars64.display();
-        probe_scripts.push(format!("call \"{}\" amd64 >NUL 2>&1 && set", path));
-        probe_scripts.push(format!("call \"{}\" >NUL 2>&1 && set", path));
+        probe_scripts.push(format!("call \"{}\" amd64 >NUL 2>&1", path));
+        probe_scripts.push(format!("call \"{}\" >NUL 2>&1", path));
     }
     if probe_scripts.is_empty() {
         return Err(
@@ -2557,10 +2613,23 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
         }
     }
     if windows_has_link_exe_in_path() {
-        Ok(())
-    } else {
-        Err("MSVC environment loaded, but `link.exe` is still not discoverable in PATH.".to_string())
+        return Ok(());
     }
+    if let Some(link) = windows_find_link_exe_direct() {
+        if let Some(dir) = link.parent() {
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(current) = env::var_os("PATH") {
+                paths.extend(env::split_paths(&current));
+            }
+            if let Ok(joined) = env::join_paths(paths) {
+                env::set_var("PATH", joined);
+                if windows_has_link_exe_in_path() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err("MSVC environment loaded, but `link.exe` is still not discoverable in PATH.".to_string())
 }
 
 #[cfg(target_os = "windows")]

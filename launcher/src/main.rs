@@ -215,9 +215,6 @@ fn run() -> Result<i32, String> {
         };
         return run_upgrade(opts);
     }
-    if matches!(head, "-load" | "--load") {
-        return run_load(&args[1..]);
-    }
     if matches!(head, "-clean" | "--clean") {
         return run_clean(&args[1..]);
     }
@@ -3585,11 +3582,11 @@ fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), Strin
 
 fn run_clean(args: &[String]) -> Result<i32, String> {
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("Clean usage:\n  jx -clean\n  jx -clean <load_id>");
+        println!("Clean usage:\n  jx -clean\n  jx -clean <history_id>");
         return Ok(0);
     }
     if args.len() > 1 {
-        return Err("Clean usage:\n  jx -clean\n  jx -clean <load_id>".to_string());
+        return Err("Clean usage:\n  jx -clean\n  jx -clean <history_id>".to_string());
     }
     if args.len() == 1 {
         let python = ensure_runtime(false)?;
@@ -3643,29 +3640,6 @@ fn run_clean(args: &[String]) -> Result<i32, String> {
     }
     println!("A new history DB will be created automatically on next `jx gwas`.");
     Ok(0)
-}
-
-fn run_load(args: &[String]) -> Result<i32, String> {
-    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help" | "help") {
-        println!("Load usage:\n  jx -load\n  jx -load <type> <name> <file>");
-        return Ok(0);
-    }
-    if !args.is_empty() && args.len() != 3 {
-        return Err("Load usage:\n  jx -load\n  jx -load <type> <name> <file>".to_string());
-    }
-    let python = ensure_runtime(false)?;
-    let mut cmd = Command::new(&python);
-    cmd.arg("-m").arg("janusx.script.loadanno");
-    for a in args {
-        cmd.arg(a);
-    }
-    let status = cmd
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("Failed to run annotation loader: {e}"))?;
-    Ok(exit_code(status))
 }
 
 fn run_uninstall(args: &[String]) -> Result<i32, String> {
@@ -5034,15 +5008,8 @@ fn print_cli_help() {
     );
     print_help_entry(
         2,
-        "-load",
-        "List/load files: `jx -load` or `jx -load <type> <name> <file>`",
-        flag_key_width,
-        width,
-    );
-    print_help_entry(
-        2,
         "-clean",
-        "Clear GWAS history DB, or `jx -clean <load_id>` to remove one loaded file record",
+        "Clear GWAS history DB, or `jx -clean <history_id>` to remove one history record",
         flag_key_width,
         width,
     );

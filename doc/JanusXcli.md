@@ -191,12 +191,12 @@ Usage:
 ```bash
 jx pca -vcf geno.vcf.gz -dim 3 -plot -o out
 jx pca -k out/panel -dim 5
-jx pca -q out/panel -plot -plot3D
+jx pca -c out/panel -plot -plot3D
 ```
 
 Key options:
 
-- Input mode: `-vcf/-hmp/-bfile/-file` or `-k` (GRM prefix) or `-q` (existing PCA prefix).
+- Input mode: `-vcf/-hmp/-bfile/-file` or `-k` (GRM prefix) or `-c/--cov` (existing PCA prefix).
 - `-dim`: number of PCs.
 - `-plot/-plot3D`: 2D PDF and 3D GIF plotting.
 - `-group`: optional sample group file for colored PCA.
@@ -277,8 +277,32 @@ Key options:
 - Thresholding/range: `-threshold`, `-bimrange`, `-ylim`.
 - Plot controls: `-manh`, `-qq`, `-fmt`, `-scatter-size`, `-pallete`, `-full`.
 - LD block: `-ldblock` or `-ldblock-all` plus genotype input (`-bfile/-vcf/-file`).
-- Annotation: `-a`, `-ab`, `-descItem`, `-hl`.
+- Annotation: `-a`, `-ab`, optional `-LDclump`.
 - Merge mode: `-merge`.
+
+LD block plotting details:
+
+- `--bimrange` is required for `-ldblock/-ldblock-all`; format is `chr:start-end` in Mb.
+- `-ldblock` uses threshold-passing SNPs; `-ldblock-all` uses all SNPs in the selected range.
+- You must provide genotype input (`-bfile` or `-vcf` or `-file`) to compute LD.
+- Ratio and x-span:
+  - `-ldblock 2` means LD triangle ratio = 2 and full x-span.
+  - `-ldblock 0.2:0.8` means x-span from 20% to 80% of Manhattan width.
+  - You can combine custom x-span and ratio according to `jx postgwas -h` examples.
+- Typical outputs in one run may include:
+  - Manhattan (`*.manh.<fmt>`)
+  - LD block (`*.ldblock.<fmt>`)
+  - Combined Manhattan+LD (`*.manhld.<fmt>`)
+  - Gene structure panel when annotation + bimrange are available.
+
+Annotation details:
+
+- `-a` accepts `.gff/.gff3/.bed`.
+- Exact annotation: SNP position overlaps gene interval.
+- Broadened annotation: use `-ab` (Kb) to report nearby genes within ±window.
+- `-LDclump` only affects annotation output (lead-SNP style annotation table); it is ignored if `-a` is not provided.
+- Annotation output table is written as:
+  - `<prefix>.<threshold>.anno.tsv`
 
 Outputs:
 
@@ -404,7 +428,7 @@ Key options:
 - Inputs: `-bfile` or `-vcf`, plus `-p`, `-k`.
 - Optional covariates: `-q`, `-cov`.
 - GWAS filters: `-maf`, `-geno`, `-chunksize`, `-t`.
-- Postgwas controls: `-threshold`, `-bimrange`, `-fmt`, `-hl`, `-a`, `-ab`, `-pallete`, `-noplot`.
+- Postgwas controls: `-threshold`, `-bimrange`, `-fmt`, `-a`, `-ab`, `-pallete`, `-noplot`.
 
 Outputs:
 

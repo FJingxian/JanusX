@@ -335,6 +335,7 @@ def main(log: bool = True):
             "jx pca -vcf geno.vcf.gz -dim 3 -plot",
             "jx pca -hmp geno.hmp.gz -dim 3 -plot",
             "jx pca -k data.grm -dim 3 -plot",
+            "jx pca -c data_prefix -plot -plot3D",
         ]),
     )
 
@@ -371,11 +372,14 @@ def main(log: bool = True):
         ),
     )
     geno_group.add_argument(
-        "-q", "--qcov", type=str,
+        "-c", "--cov", dest="qcov", type=str,
         help=(
             "Prefix of existing PCA result files for visualization only "
             "({prefix}.eigenval, {prefix}.eigenvec)."
         ),
+    )
+    geno_group.add_argument(
+        "--qcov", dest="qcov", type=str, help=argparse.SUPPRESS
     )
 
     # ------------------------- Optional arguments -------------------------
@@ -480,7 +484,7 @@ def main(log: bool = True):
         gfile = args.qcov
         args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
     else:
-        raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--qcov must be provided.")
+        raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--cov must be provided.")
 
     gfile = gfile.replace("\\", "/")
     args.out = os.path.normpath(args.out if args.out is not None else ".")

@@ -77,6 +77,7 @@ _QQ_FIXED_RATIO = 5.0 / 4.0
 _QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
+_ANNO_DESC_KEY = "description"
 
 try:
     from rich.progress import (
@@ -3092,9 +3093,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             #   anno[3] = gene ID
             #   anno[4], anno[5] = description fields
             if anno_suffix in {"gff", "gff3"} and gff_query_cache is not None:
-                anno = readanno(args.anno, args.descItem, gff_data=gff_query_cache.gff)
+                anno = readanno(args.anno, _ANNO_DESC_KEY, gff_data=gff_query_cache.gff)
             else:
-                anno = readanno(args.anno, args.descItem)
+                anno = readanno(args.anno, _ANNO_DESC_KEY)
             anno_chr = anno[0].astype(str).map(_normalize_chr)
 
             # Exact overlap annotation
@@ -4113,13 +4114,6 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-hl", "--highlight", type=str, default=None,
-        help=(
-            "BED-like file of SNPs to highlight, e.g.:\n"
-            "  chr\\tpos\\tpos\\tgene\\tfunction"
-        ),
-    )
-    optional_group.add_argument(
         "-fmt", "--fmt", dest="format", type=str, default="png",
         help="Output figure format: pdf, png, svg, tif (default: %(default)s).",
     )
@@ -4130,10 +4124,6 @@ def main():
     optional_group.add_argument(
         "-ab", "--annobroaden", type=float, default=None,
         help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-descItem", "--descItem", type=str, default="description",
-        help="Attribute key used as description in the GFF file (default: %(default)s).",
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
@@ -4149,6 +4139,9 @@ def main():
     )
 
     args = parser.parse_args()
+    # `--highlight` was removed from CLI; keep a disabled attribute for
+    # internal legacy branches that still check it.
+    args.highlight = None
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     args.prefix = "JanusX" if args.prefix is None else args.prefix
@@ -4308,9 +4301,6 @@ def main():
                 logger.warning("Warning: --LDclump is ignored in --merge mode.")
                 args.ldclump_window_bp = None
                 args.ldclump_r2 = None
-            if args.highlight is not None:
-                logger.warning("Warning: --highlight is ignored in --merge mode.")
-                args.highlight = None
     else:
         args.merge_files = []
 
@@ -4393,7 +4383,7 @@ def main():
         vis_rows = [
             ("Manhattan", manh_text),
             ("QQ", qq_text),
-            ("Scatter", f"size={args.scatter_size}, highlight={args.highlight}"),
+            ("Scatter", f"size={args.scatter_size}"),
             ("Format", str(args.format)),
         ]
         if args.ldblock_ratio is None:
@@ -4516,8 +4506,6 @@ def main():
     checks: list[bool] = [
         ensure_file_exists(logger, f, "GWAS result file") for f in check_gwas_files
     ]
-    if args.highlight:
-        checks.append(ensure_file_exists(logger, args.highlight, "Highlight file"))
     if args.anno:
         checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
     if args.vcf:

@@ -226,20 +226,12 @@ def main() -> None:
         help="Disable Manhattan/QQ plotting in postgwas.",
     )
     optional_group.add_argument(
-        "-hl", "--highlight", type=str, default=None,
-        help="BED-like file for highlighting SNPs in postgwas.",
-    )
-    optional_group.add_argument(
         "-a", "--anno", type=str, default=None,
         help="Annotation file for postgwas (GFF/BED).",
     )
     optional_group.add_argument(
         "-ab", "--annobroaden", type=float, default=None,
         help="Annotation window around SNPs in Kb (postgwas).",
-    )
-    optional_group.add_argument(
-        "-descItem", "--descItem", type=str, default="description",
-        help="GFF attribute key used for description (postgwas).",
     )
     optional_group.add_argument(
         "-pallete", "--pallete", type=str, default=None,
@@ -333,8 +325,6 @@ def main() -> None:
         checks.append(ensure_file_exists(logger, args.cov, "Covariate file"))
     pseudo_path = args.pseudo or f"{gfile}.pseudo"
     checks.append(ensure_file_exists(logger, pseudo_path, "Pseudo mapping file"))
-    if args.highlight:
-        checks.append(ensure_file_exists(logger, args.highlight, "Highlight file"))
     if args.anno:
         checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
     if not ensure_all_true(checks):
@@ -432,14 +422,10 @@ def main() -> None:
                 cmd.extend(["-bimrange", br])
         if not args.noplot:
             cmd.extend(["--manh", "--qq"])
-        if args.highlight:
-            cmd.extend(["-hl", args.highlight])
         if args.anno:
             cmd.extend(["-a", args.anno])
         if args.annobroaden is not None:
             cmd.extend(["-ab", str(args.annobroaden)])
-        if args.descItem:
-            cmd.extend(["-descItem", args.descItem])
         if args.pallete is not None:
             cmd.extend(["-pallete", args.pallete])
 

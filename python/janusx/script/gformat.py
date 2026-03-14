@@ -373,12 +373,14 @@ def build_parser() -> CliArgumentParser:
         help="Output prefix (default: input basename).",
     )
     opt.add_argument(
+        "-keep",
         "--keep",
         type=str,
         default=None,
         help="Keep only samples listed in file (one sample ID per line, no header).",
     )
     opt.add_argument(
+        "-extract",
         "--extract",
         nargs="+",
         default=None,
@@ -390,6 +392,7 @@ def build_parser() -> CliArgumentParser:
         ),
     )
     opt.add_argument(
+        "-chr",
         "--chr",
         dest="chr_filter",
         nargs="+",
@@ -403,8 +406,8 @@ def build_parser() -> CliArgumentParser:
         "Physical position range filter. Must be used with a single chromosome in --chr. "
         "Both --from-bp and --to-bp are inclusive."
     )
-    opt.add_argument("--from-bp", type=int, default=None, help=bp_help)
-    opt.add_argument("--to-bp", type=int, default=None, help=bp_help)
+    opt.add_argument("-from-bp", "--from-bp", type=int, default=None, help=bp_help)
+    opt.add_argument("-to-bp", "--to-bp", type=int, default=None, help=bp_help)
     return parser
 
 

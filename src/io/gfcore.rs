@@ -189,6 +189,20 @@ fn parse_delimiter_char(delimiter: Option<&str>) -> Result<Option<char>, String>
     }
 }
 
+fn parse_txt_numeric_token(tok: &str) -> Result<f32, String> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return Err("empty token".to_string());
+    }
+    let up = t.to_ascii_uppercase();
+    // Treat common textual missing-value markers as internal missing code.
+    if matches!(up.as_str(), "NA" | "NAN" | "NULL" | "." | "-") {
+        return Ok(-9.0);
+    }
+    t.parse::<f32>()
+        .map_err(|_| format!("invalid float token: {tok}"))
+}
+
 fn split_line_tokens<'a>(line: &'a str, delimiter: Option<char>) -> Vec<&'a str> {
     if let Some(delim) = delimiter {
         if delim.is_ascii_whitespace() {
@@ -833,7 +847,7 @@ fn convert_text_matrix_to_npy(
         }
 
         for tok in toks {
-            let v: f32 = tok.parse().map_err(|_| {
+            let v: f32 = parse_txt_numeric_token(tok).map_err(|_| {
                 format!(
                     "invalid float at {}:{} -> {}",
                     txt_path.display(),

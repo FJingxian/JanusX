@@ -111,7 +111,6 @@ from ._common.genoio import (
     basename_only as _basename_only,
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
-    read_matrix_with_ids as _read_matrix_with_ids,
 )
 from ._common.colspec import parse_zero_based_index_specs
 
@@ -909,9 +908,28 @@ def _format_qcov_display(qcov_opt: object) -> str:
     s = str(qcov_opt if qcov_opt is not None else "").strip()
     if s == "":
         return ""
-    if s in set(np.arange(0, 30).astype(str)):
+    try:
+        return str(_parse_qcov_dim(qcov_opt))
+    except Exception:
         return s
-    return _basename_only(s)
+
+
+def _parse_qcov_dim(qcov_opt: object) -> int:
+    s = str(qcov_opt if qcov_opt is not None else "").strip()
+    if s == "":
+        raise ValueError(
+            "Invalid -q/--qcov: empty value. Use an integer PC dimension (>=0)."
+        )
+    try:
+        q = int(s)
+    except Exception:
+        raise ValueError(
+            "External Q matrix via -q/--qcov is no longer supported. "
+            "Use -q <int> for PCA dimension, and pass external covariate files via -c."
+        ) from None
+    if q < 0:
+        raise ValueError(f"Invalid -q/--qcov: {q}. Q/PC dimension must be >= 0.")
+    return int(q)
 
 
 def _format_cov_display(cov_inputs: Union[list[str], None]) -> str:
@@ -2010,14 +2028,19 @@ def load_or_build_q_with_cache(
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
     """
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
-    When loading from file, the first column is treated as sample IDs and
-    the remaining columns are PCs.
+    Note: external Q file via -q is no longer supported; pass external
+    covariate matrices via -c.
     """
     n = int(n_samples)
+    qdim = _parse_qcov_dim(pcdim)
+    if qdim >= n and qdim != 0:
+        raise ValueError(
+            f"Q/PC dimension out of range: {qdim}. valid=[0..{max(0, n-1)}]"
+        )
 
     q_ids = None
-    if pcdim in np.arange(1, n).astype(str):
-        dim = int(pcdim)
+    if qdim > 0:
+        dim = int(qdim)
         q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
         with _cache_lock(q_path):
             cache_ready = os.path.isfile(q_path)
@@ -2074,7 +2097,7 @@ def load_or_build_q_with_cache(
                     logging.INFO,
                     f"Cached PCA written to {q_path}",
                 )
-    elif pcdim == "0":
+    elif qdim == 0:
         _rich_success(
             logger,
             "PC dimension set to 0; using empty Q matrix.",
@@ -2082,19 +2105,11 @@ def load_or_build_q_with_cache(
         )
         qmatrix = np.zeros((n, 0), dtype="float32")
         q_ids = ids
-    elif os.path.isfile(pcdim):
-        src = _basename_only(pcdim)
-        with CliStatus(f"Loading Q matrix from {src}...", enabled=bool(use_spinner)) as task:
-            try:
-                q_ids, qmatrix = _read_matrix_with_ids(pcdim, logger, "Q")
-            except Exception:
-                task.fail(f"Loading Q matrix from {src} ...Failed")
-                raise
-            task.complete(
-                f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
-            )
     else:
-        raise ValueError(f"Unknown Q/PC option: {pcdim}")
+        raise ValueError(
+            "External Q matrix via -q/--qcov is no longer supported. "
+            "Use -q <int> and provide external covariates via -c."
+        )
 
     _log_info(logger, f"Q matrix shape: {qmatrix.shape}", use_spinner=use_spinner)
     return qmatrix, q_ids
@@ -3467,6 +3482,8 @@ def build_qmatrix_farmcpu(
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
+    Note: external Q file via -q is no longer supported; pass external
+    covariate matrices via -c.
     """
     def _farm_log(msg: str) -> None:
         if bool(quiet_terminal):
@@ -3541,73 +3558,47 @@ def build_qmatrix_farmcpu(
                 _farm_log(f"Cached GRM written to {grm_path}")
                 return grm
 
-    def _maybe_load_with_ids(path: str, expect_rows: int):
-        df = pd.read_csv(
-            path, sep=None, engine="python", header=None,
-            dtype=str, keep_default_na=False
+    q_int = _parse_qcov_dim(qdim)
+    if q_int >= geno.shape[1] and q_int != 0:
+        raise ValueError(
+            f"Q/PC dimension out of range for FarmCPU: {q_int}. "
+            f"valid=[0..{max(0, geno.shape[1]-1)}]"
         )
-        if df.shape[0] != expect_rows:
-            raise ValueError(
-                f"Q matrix rows ({df.shape[0]}) do not match sample count ({expect_rows})."
-            )
-        if sample_ids is not None:
-            col0 = df.iloc[:, 0].astype(str).str.strip()
-            overlap = len(set(col0) & set(sample_ids))
-            if overlap >= int(0.9 * len(sample_ids)) and df.shape[1] > 1:
-                data = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-                index = {sid: i for i, sid in enumerate(col0)}
-                missing = [sid for sid in sample_ids if sid not in index]
-                if missing:
-                    raise ValueError(f"Q matrix missing {len(missing)} sample IDs (e.g. {missing[:5]}).")
-                return data[[index[sid] for sid in sample_ids]]
-        # Fallback: treat all columns as numeric Q matrix
-        q = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
-        return q
 
-    if qdim in np.arange(0, 30).astype(str):
-        if qdim == "0":
-            qmatrix = np.array([]).reshape(geno.shape[1], 0)
-        else:
-            q_int = int(qdim)
-            q_path = _pca_cache_path(gfile_prefix, mgrm="1", qdim=int(q_int))
-            with _cache_lock(q_path):
-                cache_ready = os.path.isfile(q_path)
-                if cache_ready:
-                    g_mtime = latest_genotype_mtime(genofile)
-                    q_mtime = os.path.getmtime(q_path)
-                    if g_mtime is not None and g_mtime > q_mtime:
-                        cache_ready = False
-                if cache_ready:
-                    q_src = _basename_only(q_path)
-                    with CliStatus(
-                        f"Loading Q matrix from {q_src}...",
-                        enabled=bool(use_spinner and (not quiet_terminal)),
-                    ) as task:
-                        qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
-                        if qmatrix.ndim == 1:
-                            qmatrix = qmatrix.reshape(-1, 1)
-                        if qmatrix.shape != (geno.shape[1], int(q_int)):
-                            raise ValueError(
-                                f"PCA cache shape mismatch: expected ({geno.shape[1]},{q_int}), got {qmatrix.shape}"
-                            )
-                        task.complete(f"Loading Q matrix from {q_src}")
-                else:
-                    _farm_log(f"* PCA dimension for FarmCPU Q matrix: {qdim}")
-                    grm = _load_or_build_grm_cache_for_pca()
-                    eigval, eigvec = np.linalg.eigh(grm)
-                    qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
-                    tmp_q = f"{q_path}.tmp.{os.getpid()}"
-                    np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
-                    os.replace(tmp_q, q_path)
-                    _farm_log(f"Cached PCA written to {q_path}")
+    if q_int == 0:
+        qmatrix = np.array([]).reshape(geno.shape[1], 0)
     else:
-        q_src = _basename_only(qdim)
-        with CliStatus(
-            f"Loading Q matrix from {q_src}...",
-            enabled=bool(use_spinner and (not quiet_terminal)),
-        ) as task:
-            qmatrix = _maybe_load_with_ids(qdim, geno.shape[1])
-            task.complete(f"Loading Q matrix from {q_src}")
+        q_path = _pca_cache_path(gfile_prefix, mgrm="1", qdim=int(q_int))
+        with _cache_lock(q_path):
+            cache_ready = os.path.isfile(q_path)
+            if cache_ready:
+                g_mtime = latest_genotype_mtime(genofile)
+                q_mtime = os.path.getmtime(q_path)
+                if g_mtime is not None and g_mtime > q_mtime:
+                    cache_ready = False
+            if cache_ready:
+                q_src = _basename_only(q_path)
+                with CliStatus(
+                    f"Loading Q matrix from {q_src}...",
+                    enabled=bool(use_spinner and (not quiet_terminal)),
+                ) as task:
+                    qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
+                    if qmatrix.ndim == 1:
+                        qmatrix = qmatrix.reshape(-1, 1)
+                    if qmatrix.shape != (geno.shape[1], int(q_int)):
+                        raise ValueError(
+                            f"PCA cache shape mismatch: expected ({geno.shape[1]},{q_int}), got {qmatrix.shape}"
+                        )
+                    task.complete(f"Loading Q matrix from {q_src}")
+            else:
+                _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
+                grm = _load_or_build_grm_cache_for_pca()
+                eigval, eigvec = np.linalg.eigh(grm)
+                qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
+                tmp_q = f"{q_path}.tmp.{os.getpid()}"
+                np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
+                os.replace(tmp_q, q_path)
+                _farm_log(f"Cached PCA written to {q_path}")
 
     if cov_inputs:
         if sample_ids is None:
@@ -4043,8 +4034,10 @@ def parse_args():
     )
     optional_group.add_argument(
         "-q", "--qcov", type=str, default="0",
-        help="Number of principal components for Q matrix or path to Q file "
-             "(default: %(default)s).",
+        help=(
+            "Number of principal components for Q matrix (integer >= 0). "
+            "For external covariates, use -c <file> (default: %(default)s)."
+        ),
     )
     optional_group.add_argument(
         "-c", "--cov", action="append", type=str, default=None,
@@ -4116,6 +4109,10 @@ def parse_args():
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        args.qcov = str(_parse_qcov_dim(args.qcov))
     except ValueError as e:
         parser.error(str(e))
     return args
@@ -4202,8 +4199,6 @@ def main(log: bool = True):
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
     if args.grm not in ["1", "2"]:
         checks.append(ensure_file_exists(logger, args.grm, "GRM file"))
-    if args.qcov not in np.arange(0, 30).astype(str):
-        checks.append(ensure_file_exists(logger, args.qcov, "Q matrix file"))
     if args.cov:
         for cov_item in args.cov:
             try:

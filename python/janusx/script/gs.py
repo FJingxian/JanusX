@@ -24,7 +24,7 @@ Genotype input formats
 
 Phenotype input format
 ----------------------
-  - Tab-delimited text file
+  - Tab/comma/whitespace-delimited text file
   - First column: sample IDs
   - Remaining columns: phenotype traits
   - Duplicated IDs will be averaged.
@@ -258,6 +258,84 @@ def detect_effective_threads() -> int:
         detected = min(detected, min(caps))
 
     return max(1, int(detected))
+
+
+def _sniff_sep(path: str) -> str:
+    """
+    Fast delimiter sniffing for phenotype tables.
+    Returns one of: 'tab', 'comma', 'whitespace'.
+    """
+    sample = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for _ in range(16):
+                line = fh.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if s != "":
+                    sample = s
+                    break
+    except Exception:
+        sample = ""
+
+    if "\t" in sample:
+        return "tab"
+    if "," in sample:
+        return "comma"
+    return "whitespace"
+
+
+def _candidate_orders(kind: str) -> list[str]:
+    if kind == "tab":
+        return ["tab", "comma", "whitespace"]
+    if kind == "comma":
+        return ["comma", "tab", "whitespace"]
+    return ["whitespace", "tab", "comma"]
+
+
+def _load_phenotype_flexible(path: str) -> pd.DataFrame:
+    """
+    Load phenotype table with delimiter auto-detection.
+
+    Assumes the first column is sample IDs and averages duplicated IDs.
+    """
+    sniffed = _sniff_sep(path)
+    read_err: Exception | None = None
+    df: pd.DataFrame | None = None
+    for mode in _candidate_orders(sniffed):
+        try:
+            kwargs: dict[str, typing.Any] = {}
+            if mode == "tab":
+                kwargs["sep"] = "\t"
+                kwargs["engine"] = "c"
+            elif mode == "comma":
+                kwargs["sep"] = ","
+                kwargs["engine"] = "c"
+            else:
+                kwargs["sep"] = r"\s+"
+                kwargs["engine"] = "c"
+            tmp = pd.read_csv(path, **kwargs)
+            if tmp.shape[1] <= 1:
+                continue
+            df = tmp
+            break
+        except Exception as ex:
+            read_err = ex
+            continue
+
+    if df is None:
+        if read_err is not None:
+            raise read_err
+        raise ValueError("Failed to read phenotype file.")
+    if df.empty:
+        raise ValueError("Phenotype file is empty.")
+
+    id_col = df.columns[0]
+    df[id_col] = df[id_col].astype(str).str.strip()
+    out = df.groupby(id_col, sort=False).mean(numeric_only=True)
+    out.index = out.index.astype(str)
+    return out
 
 
 def build_cv_splits(
@@ -1082,7 +1160,7 @@ def main(log: bool = True) -> None:
         "-p", "--pheno",
         type=str,
         required=False,
-        help="Phenotype file (tab-delimited, sample IDs in the first column).",
+        help="Phenotype file (tab/comma/whitespace-delimited, sample IDs in the first column).",
     )
 
     # ------------------------------------------------------------------
@@ -1420,10 +1498,7 @@ def main(log: bool = True) -> None:
     logger.info(f"Loading phenotype from {args.pheno}...")
     with CliStatus("Loading phenotype...", enabled=use_spinner) as task:
         try:
-            pheno = pd.read_csv(args.pheno, sep="\t")
-            # First column is sample ID; average duplicated IDs
-            pheno = pheno.groupby(pheno.columns[0]).mean()
-            pheno.index = pheno.index.astype(str)
+            pheno = _load_phenotype_flexible(args.pheno)
         except Exception:
             task.fail("Loading phenotype ...Failed")
             raise

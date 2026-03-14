@@ -10,7 +10,7 @@ Input table
 
 Examples
 --------
-  jx reml -file test.reml.txt -rh 1 -rh 2 -rh 3 -n 4 -o test -prefix reml
+  jx reml -file test.reml.txt -rh 0 -rh 1 -rh 2 -n 3 -o test -prefix reml
 """
 
 from __future__ import annotations
@@ -59,9 +59,18 @@ def _split_tokens(values: Iterable[str] | None) -> list[str]:
     return out
 
 
-def _resolve_columns(tokens: list[str], data_cols: list[str], label: str) -> list[str]:
+def _resolve_columns(
+    tokens: list[str],
+    data_cols: list[str],
+    label: str,
+    *,
+    index_base: int = 1,
+) -> list[str]:
     if len(tokens) == 0:
         return []
+
+    if index_base not in (0, 1):
+        raise ValueError("index_base must be 0 or 1.")
 
     lower_map = {str(c).lower(): str(c) for c in data_cols}
     resolved: list[str] = []
@@ -81,19 +90,35 @@ def _resolve_columns(tokens: list[str], data_cols: list[str], label: str) -> lis
                 start, end = int(left), int(right)
                 step = 1 if end >= start else -1
                 for idx in range(start, end + step, step):
-                    if idx < 1 or idx > len(data_cols):
+                    if index_base == 0:
+                        valid = (0 <= idx < len(data_cols))
+                        ix = idx
+                        valid_msg = f"[0..{max(0, len(data_cols)-1)}]"
+                    else:
+                        valid = (1 <= idx <= len(data_cols))
+                        ix = idx - 1
+                        valid_msg = f"[1..{len(data_cols)}]"
+                    if not valid:
                         raise ValueError(
-                            f"{label} column index out of range: {idx}. valid=[1..{len(data_cols)}]"
+                            f"{label} column index out of range: {idx}. valid={valid_msg}"
                         )
-                    resolved.append(str(data_cols[idx - 1]))
+                    resolved.append(str(data_cols[ix]))
                 continue
         if t.lstrip("+-").isdigit():
             idx = int(t)
-            if idx < 1 or idx > len(data_cols):
+            if index_base == 0:
+                valid = (0 <= idx < len(data_cols))
+                ix = idx
+                valid_msg = f"[0..{max(0, len(data_cols)-1)}]"
+            else:
+                valid = (1 <= idx <= len(data_cols))
+                ix = idx - 1
+                valid_msg = f"[1..{len(data_cols)}]"
+            if not valid:
                 raise ValueError(
-                    f"{label} column index out of range: {idx}. valid=[1..{len(data_cols)}]"
+                    f"{label} column index out of range: {idx}. valid={valid_msg}"
                 )
-            resolved.append(str(data_cols[idx - 1]))
+            resolved.append(str(data_cols[ix]))
             continue
         if t in data_cols:
             resolved.append(str(t))
@@ -309,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx reml -file test.reml.txt -rh 1 -rh 2 -rh 3 -n 4 -o test -prefix reml",
+                "jx reml -file test.reml.txt -rh 0 -rh 1 -rh 2 -n 3 -o test -prefix reml",
                 "jx reml -file test.reml.txt -f sex -rh family -n trait1 -n trait2",
             ]
         ),
@@ -330,8 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="COL",
         help=(
-            "Phenotype column(s), 1-based index (excluding sample ID), name, "
-            "comma list (e.g. 1,3), or numeric range (e.g. 1:3 or 1-3). "
+            "Phenotype column(s), zero-based index (excluding sample ID), name, "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
             "Repeat this flag for multiple traits."
         ),
     )
@@ -343,7 +368,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="COL",
-        help="Random-effect categorical column(s), one-hot encoded.",
+        help=(
+            "Random-effect categorical column(s), zero-based index (excluding sample ID), name, "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). One-hot encoded."
+        ),
     )
     opt.add_argument(
         "-fh",
@@ -351,7 +379,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="COL",
-        help="Fixed-effect categorical column(s), one-hot encoded.",
+        help=(
+            "Fixed-effect categorical column(s), zero-based index (excluding sample ID), name, "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). One-hot encoded."
+        ),
     )
     opt.add_argument(
         "-r",
@@ -359,7 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="COL",
-        help="Random-effect column(s). String columns are one-hot encoded by default.",
+        help=(
+            "Random-effect column(s), zero-based index (excluding sample ID), name, "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
+            "String columns are one-hot encoded by default."
+        ),
     )
     opt.add_argument(
         "-f",
@@ -367,7 +402,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="COL",
-        help="Fixed-effect column(s). String columns are one-hot encoded by default.",
+        help=(
+            "Fixed-effect column(s), zero-based index (excluding sample ID), name, "
+            "comma list (e.g. 0,2), or numeric range (e.g. 0:2 or 0-2). "
+            "String columns are one-hot encoded by default."
+        ),
     )
     opt.add_argument(
         "-o",
@@ -425,11 +464,11 @@ def main() -> None:
     dfx = df.iloc[:, 1:].copy()
     data_cols = [str(c) for c in dfx.columns]
 
-    n_cols = _resolve_columns(_split_tokens(args.n), data_cols, "-n")
-    rh_cols = _resolve_columns(_split_tokens(args.rh), data_cols, "-rh")
-    fh_cols = _resolve_columns(_split_tokens(args.fh), data_cols, "-fh")
-    r_cols = _resolve_columns(_split_tokens(args.r), data_cols, "-r")
-    f_cols = _resolve_columns(_split_tokens(args.f), data_cols, "-f")
+    n_cols = _resolve_columns(_split_tokens(args.n), data_cols, "-n", index_base=0)
+    rh_cols = _resolve_columns(_split_tokens(args.rh), data_cols, "-rh", index_base=0)
+    fh_cols = _resolve_columns(_split_tokens(args.fh), data_cols, "-fh", index_base=0)
+    r_cols = _resolve_columns(_split_tokens(args.r), data_cols, "-r", index_base=0)
+    f_cols = _resolve_columns(_split_tokens(args.f), data_cols, "-f", index_base=0)
 
     fixed_map: "OrderedDict[str, bool]" = OrderedDict()
     for c in fh_cols:

@@ -30,6 +30,7 @@ Modules:
 
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF (launcher-only)
+    adamixture    ADAMIXTURE ancestry inference
     hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
@@ -95,7 +96,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
-    "sim", "simulation", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "adamixture", "gformat", "gmerge", "hybrid", "webui",
 ]
 
 

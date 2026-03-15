@@ -16,7 +16,7 @@ const DLC_TOOL_CACHE_META_KEY: &str = "__meta__";
 const DEFAULT_IMAGE_TAG: &str = "janusxdlc:latest";
 const CONDA_ENV: &str = "janusxdlc";
 const CONDA_FORCE_RUNTIME_TOOLS: [&str; 2] = ["gatk", "beagle"];
-const REQUIRED_TOOLS: [&str; 15] = [
+const REQUIRED_TOOLS: [&str; 14] = [
     "fastp",
     "bwa-mem2",
     "samblaster",
@@ -31,10 +31,8 @@ const REQUIRED_TOOLS: [&str; 15] = [
     "plink",
     "beagle",
     "iqtree",
-    "admixture",
 ];
-const DLC_TOOL_ENTRIES: [(&str, &str); 15] = [
-    ("admixture", "Ancestry estimation"),
+const DLC_TOOL_ENTRIES: [(&str, &str); 14] = [
     ("bcftools", "VCF/BCF manipulation"),
     ("bgzip", "BGZF block compression"),
     ("beagle", "Phasing and imputation"),
@@ -79,11 +77,6 @@ ARG BWA_MEM2_VER="2.2.1"
 ARG SAMBLASTER_VER="0.1.26"
 ARG BEAGLE_JAR_URL="https://faculty.washington.edu/browning/beagle/beagle.28Jun21.220.jar"
 ARG PLINK19_URL="https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20231211.zip"
-ARG ADMIXTURE_URL_1="https://dalexander.github.io/admixture/binaries/admixture_linux-1.3.1.tar.gz"
-ARG ADMIXTURE_URL_2="https://dalexander.github.io/admixture/binaries/admixture_linux-1.3.0.tar.gz"
-ARG ADMIXTURE_URL_3="https://gh-proxy.org/https://raw.githubusercontent.com/NovembreLab/admixture/master/releases/admixture_linux-1.3.0.tar.gz"
-ARG ADMIXTURE_URL_4="https://raw.githubusercontent.com/NovembreLab/admixture/master/releases/admixture_linux-1.3.0.tar.gz"
-ARG ADMIXTURE_URL_5="https://www.genetics.ucla.edu/software/admixture/binaries/admixture_linux-1.3.0.tar.gz"
 
 RUN [ ! -f /etc/apt/sources.list ] || sed -i \
       -e "s|http://archive.ubuntu.com|http://${APT_MIRROR}|g" \
@@ -194,29 +187,6 @@ RUN mkdir -p /opt/gatk \
        > /usr/local/bin/gatk \
     && chmod +x /usr/local/bin/gatk
 
-RUN mkdir -p /opt/admixture \
-    && ok=0 \
-    && for url in \
-         "${ADMIXTURE_URL_1}" \
-         "${ADMIXTURE_URL_2}" \
-         "${ADMIXTURE_URL_3}" \
-         "${ADMIXTURE_URL_4}" \
-         "${ADMIXTURE_URL_5}"; do \
-         if curl -L --fail --retry 2 --connect-timeout 20 --speed-time 30 --speed-limit 10240 \
-              -o /opt/admixture/admixture.tar.gz "${url}" \
-            && tar -tzf /opt/admixture/admixture.tar.gz >/dev/null 2>&1; then \
-           ok=1; \
-           break; \
-         fi; \
-       done \
-    && [ "${ok}" -eq 1 ] \
-    && tar -xzf /opt/admixture/admixture.tar.gz -C /opt/admixture \
-    && ADMIXTURE_BIN="$(find /opt/admixture -type f -name admixture | head -n 1)" \
-    && [ -n "${ADMIXTURE_BIN}" ] \
-    && cp "${ADMIXTURE_BIN}" /usr/local/bin/admixture \
-    && chmod +x /usr/local/bin/admixture \
-    && rm -rf /opt/admixture
-
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -255,7 +225,6 @@ COPY --from=builder /usr/local/bin/gatk /usr/local/bin/gatk
 COPY --from=builder /usr/local/bin/beagle /usr/local/bin/beagle
 COPY --from=builder /usr/local/bin/samblaster /usr/local/bin/samblaster
 COPY --from=builder /usr/local/bin/bwa-mem2 /usr/local/bin/bwa-mem2
-COPY --from=builder /usr/local/bin/admixture /usr/local/bin/admixture
 
 RUN for f in /opt/bwa-mem2/bin/bwa-mem2*; do \
       [ -e "$f" ] || continue; \
@@ -285,7 +254,6 @@ RUN command -v fastp \
     && command -v plink \
     && command -v beagle \
     && (command -v iqtree || command -v iqtree2) \
-    && command -v admixture \
     && command -v awk \
     && command -v sort
 
@@ -2549,9 +2517,6 @@ fn toolchain_packages_for_tools(tools: &[String]) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     for t in tools {
         match t.as_str() {
-            "admixture" => {
-                out.insert("admixture".to_string());
-            }
             "fastp" => {
                 out.insert("fastp".to_string());
             }

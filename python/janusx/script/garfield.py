@@ -166,8 +166,12 @@ def main() -> None:
         help="Number of trees/estimators (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-t", "--threads", type=int, default=-1,
-        help="Number of threads (-1 uses all available cores; default: %(default)s).",
+        "-t", "--thread", dest="thread", type=int, default=max(1, int(cpu_count() or 1)),
+        help="Number of CPU threads (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--threads", dest="thread", type=int, default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",
@@ -203,6 +207,8 @@ def main() -> None:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
+    if int(args.thread) <= 0:
+        args.thread = max(1, int(cpu_count() or 1))
 
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
@@ -212,7 +218,7 @@ def main() -> None:
     log_path = f"{args.out}/{prefix}.garfield.log".replace("//", "/")
     logger = setup_logging(log_path)
 
-    threads = cpu_count() if args.threads == -1 else int(args.threads)
+    threads = int(args.thread)
     cfg_rows: list[tuple[str, object]] = [
         ("Genotype", gfile),
         ("Phenotype", args.pheno),

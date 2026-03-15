@@ -1311,8 +1311,7 @@ def main(log: bool = True) -> None:
         "-t", "--thread",
         type=int,
         default=detect_effective_threads(),
-        help="Threads for ML methods (RF/ET/GBDT/XGB/SVM/ENET). "
-             "(default: all available cores).",
+        help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
         "-strict-cv", "--strict-cv",

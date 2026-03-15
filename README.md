@@ -74,7 +74,7 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o t
 ### Post-GWAS
 
 ```bash
-jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -threshold 1e-6 -o testpost
+jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -thr 1e-6 -o testpost
 ```
 
 <p align="center">

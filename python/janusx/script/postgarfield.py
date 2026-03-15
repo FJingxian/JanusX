@@ -195,8 +195,8 @@ def main() -> None:
         help="Chunk size for streaming GWAS (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=-1,
-        help="Threads for GWAS/postgwas (-1 uses all cores; default: %(default)s).",
+        "-t", "--thread", type=int, default=max(1, int(os.cpu_count() or 1)),
+        help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
         "--pseudo", type=str, default=None,
@@ -207,8 +207,12 @@ def main() -> None:
         help="Pseudo chromosome label in GWAS results (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-threshold", "--threshold", type=float, default=None,
+        "-thr", "--thr", dest="thr", type=float, default=None,
         help="P-value threshold for postgwas (default: 0.05 / nSNP).",
+    )
+    optional_group.add_argument(
+        "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-bimrange", "--bimrange", type=str, action="append", default=None,
@@ -275,6 +279,8 @@ def main() -> None:
         parser.error(str(e))
     if args.only_set is not None and args.only_set < 0:
         raise ValueError("--only-set must be >= 0.")
+    if int(args.thread) <= 0:
+        args.thread = max(1, int(os.cpu_count() or 1))
 
     gfile, prefix = _determine_genotype(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
@@ -415,8 +421,8 @@ def main() -> None:
             "-fmt", args.format,
             "-t", str(args.thread),
         ]
-        if args.threshold is not None:
-            cmd.extend(["-threshold", str(args.threshold)])
+        if args.thr is not None:
+            cmd.extend(["-thr", str(args.thr)])
         if args.bimrange is not None:
             for br in args.bimrange:
                 cmd.extend(["-bimrange", br])

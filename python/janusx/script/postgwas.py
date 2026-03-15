@@ -2201,8 +2201,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
     # Bonferroni-style default threshold if not provided
     threshold = (
-        args.threshold
-        if args.threshold is not None
+        args.thr
+        if args.thr is not None
         else (0.05 / df.shape[0] if df.shape[0] > 0 else np.nan)
     )
     effective_ldblock_ratio = args.ldblock_ratio
@@ -3328,8 +3328,8 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             )
 
     threshold_merge = (
-        args.threshold
-        if args.threshold is not None
+        args.thr
+        if args.thr is not None
         else (0.05 / plot_df.shape[0] if plot_df.shape[0] > 0 else np.nan)
     )
 
@@ -3800,8 +3800,6 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     total_start_ts = time.monotonic()
     done_count = 0
     req_threads = int(args.thread)
-    if req_threads == -1:
-        req_threads = int(os.cpu_count() or 1)
     logical_workers = max(1, min(req_threads, len(files)))
     # In parallel mode, keep worker logs in file only to avoid spinner/pbar corruption.
     setattr(args, "_postgwas_worker_mute_stream", True)
@@ -3995,8 +3993,12 @@ def main():
         help="Column name for p-value (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-threshold", "--threshold", type=float, default=None,
+        "-thr", "--thr", dest="thr", type=float, default=None,
         help="P-value threshold; if not set, use 0.05 / nSNP (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-threshold", "--threshold", dest="thr", type=float, default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-merge", "--merge", nargs="+", action="append", type=str, default=None,
@@ -4134,11 +4136,13 @@ def main():
         help="Prefix of the log file (default: JanusX).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=-1,
-        help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
+        "-t", "--thread", type=int, default=max(1, int(os.cpu_count() or 1)),
+        help="Number of CPU threads (default: %(default)s).",
     )
 
     args = parser.parse_args()
+    if int(args.thread) <= 0:
+        args.thread = int(os.cpu_count() or 1)
     # `--highlight` was removed from CLI; keep a disabled attribute for
     # internal legacy branches that still check it.
     args.highlight = None
@@ -4328,14 +4332,11 @@ def main():
     host_text = socket.gethostname()
     input_files = args.merge_files if args.merge_mode else args.gwasfile
     input_files_text = _format_input_files(input_files)
-    threshold_text = str(args.threshold if args.threshold is not None else "0.05 / nSNP")
+    threshold_text = str(args.thr if args.thr is not None else "0.05 / nSNP")
     bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
     merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
     output_prefix_text = outprefix_base
-    threads_text = (
-        f"{args.thread} "
-        f"({'All cores' if args.thread == -1 else 'User-specified'})"
-    )
+    threads_text = f"{args.thread}"
 
     base_rows: list[tuple[str, str]] = [
         ("Input files", input_files_text),

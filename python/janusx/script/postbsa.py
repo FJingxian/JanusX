@@ -1586,9 +1586,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--thread",
         type=int,
-        default=-1,
+        default=max(1, int(cpu_count() or 1)),
         help=(
-            "Number of CPU threads (-1 uses all available cores; default: %(default)s). "
+            "Number of CPU threads (default: %(default)s). "
             "For glob input, this is also the max parallel chromosome jobs."
         ),
     )

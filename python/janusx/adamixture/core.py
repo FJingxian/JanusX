@@ -38,6 +38,8 @@ class ADAMixtureConfig:
     snps_only: bool = True
     maf: float = 0.02
     geno: float = 0.05
+    solver: str = "adam-em"
+    tol: float = 1e-5
 
     lr: float = 0.005
     beta1: float = 0.80
@@ -53,6 +55,28 @@ class ADAMixtureConfig:
     reg_als: float = 1e-5
     power: int = 5
     tole_svd: float = 1e-1
+
+def _resolve_solver_mode(solver: str) -> str:
+    x = str(solver).strip().lower()
+    if x in {"auto", ""}:
+        return "adam-em"
+    if x in {"adam", "adam-em"}:
+        return x
+    return "adam-em"
+
+
+def _adam_seed_init(
+    m: int,
+    n: int,
+    k: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(int(seed))
+    p = rng.random(size=(int(m), int(k)), dtype=np.float32)
+    p = np.ascontiguousarray(np.clip(p, 1e-5, 1.0 - 1e-5), dtype=np.float32)
+    q0 = rng.random(size=(int(n), int(k)), dtype=np.float32)
+    q = np.ascontiguousarray(jxrs.admx_map_q_f32(np.ascontiguousarray(q0, dtype=np.float32)))
+    return p, q
 
 
 def _set_thread_env(threads: int) -> None:
@@ -524,6 +548,8 @@ def train_adamixture(
     m, n = g.shape
     logger.info(f"{'Data loaded':<22}: SNPs={m}, samples={n}")
     _emit_progress(callback, "data_loaded", m=int(m), n=int(n))
+    solver_mode = _resolve_solver_mode(cfg.solver)
+    tol = float(max(1e-12, float(cfg.tol)))
 
     f = np.ascontiguousarray(jxrs.admx_allele_frequency(g), dtype=np.float32)
     u, s, v = _rsvd(
@@ -532,24 +558,28 @@ def train_adamixture(
         k=int(cfg.k),
         seed=int(cfg.seed),
         power=int(cfg.power),
-        tol=float(cfg.tole_svd),
+        tol=tol,
         logger=logger,
         callback=callback,
     )
-    p0, q0 = _als_init(
-        g,
-        u,
-        s,
-        v,
-        f,
-        seed=int(cfg.seed),
-        k=int(cfg.k),
-        max_iter=int(cfg.max_als),
-        tol=float(cfg.tole_als),
-        reg=float(cfg.reg_als),
-        logger=logger,
-        callback=callback,
-    )
+    if solver_mode == "adam-em":
+        p0, q0 = _als_init(
+            g,
+            u,
+            s,
+            v,
+            f,
+            seed=int(cfg.seed),
+            k=int(cfg.k),
+            max_iter=int(cfg.max_als),
+            tol=tol,
+            reg=float(cfg.reg_als),
+            logger=logger,
+            callback=callback,
+        )
+    else:
+        logger.info(f"{'Solver':<22}: ADAM (skip ALS)")
+        p0, q0 = _adam_seed_init(m, n, int(cfg.k), int(cfg.seed))
     p, q = _adam_em_optimize(
         g,
         p0,

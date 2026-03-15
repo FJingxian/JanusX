@@ -274,7 +274,7 @@ Key options:
 
 - Required: `-gwasfile` (one or many).
 - Column mapping: `-chr`, `-pos`, `-pvalue`.
-- Thresholding/range: `-threshold`, `-bimrange`, `-ylim`.
+- Thresholding/range: `-thr`, `-bimrange`, `-ylim`.
 - Plot controls: `-manh`, `-qq`, `-fmt`, `-scatter-size`, `-pallete`, `-full`.
 - LD block: `-ldblock` or `-ldblock-all` plus genotype input (`-bfile/-vcf/-file`).
 - Annotation: `-a`, `-ab`, optional `-LDclump`.
@@ -428,7 +428,7 @@ Key options:
 - Inputs: `-bfile` or `-vcf`, plus `-p`, `-k`.
 - Optional covariates: `-q`, `-cov`.
 - GWAS filters: `-maf`, `-geno`, `-chunksize`, `-t`.
-- Postgwas controls: `-threshold`, `-bimrange`, `-fmt`, `-a`, `-ab`, `-pallete`, `-noplot`.
+- Postgwas controls: `-thr`, `-bimrange`, `-fmt`, `-a`, `-ab`, `-pallete`, `-noplot`.
 
 Outputs:
 

@@ -5,11 +5,12 @@ JanusX: ADAMIXTURE ancestry inference (Rust-kernel backend)
 Examples
 --------
   jx adamixture -bfile data/geno -k 8 -o out -prefix cohort
-  jx adamixture -vcf data/geno.vcf.gz -k 6 -threads 16
+  jx adamixture -vcf data/geno.vcf.gz -k 6 -t 16
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import socket
@@ -208,13 +209,13 @@ def _write_matrix_with_row_ids(
             fw.write(f"{rid}\t{vals}\n")
 
 
-def main() -> None:
+def _build_parser() -> CliArgumentParser:
     parser = CliArgumentParser(
         prog="jx adamixture",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx adamixture -bfile data/geno -k 8 -o out -prefix cohort",
-            "jx adamixture -vcf data/geno.vcf.gz -k 6 -threads 16",
+            "jx adamixture -vcf data/geno.vcf.gz -k 6 -t 16",
         ]),
     )
 
@@ -229,78 +230,111 @@ def main() -> None:
         type=str,
         help="Text/NumPy genotype matrix prefix (requires sidecar .id).",
     )
-    required.add_argument("-k", "--k", type=int, required=True, help="Number of ancestry clusters.")
-
-    optional = parser.add_argument_group("Optional Arguments")
-    optional.add_argument(
+    required.add_argument(
+        "-k",
+        "--k",
+        type=int,
+        required=True,
+        help="Number of ancestry clusters.",
+    )
+    input_output = parser.add_argument_group("Input/Output Arguments")
+    input_output.add_argument(
         "-o",
         "--out",
         type=str,
         default=".",
         help="Output directory (default: current directory).",
     )
-    optional.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
-    optional.add_argument(
-        "-threads",
-        "--threads",
-        type=int,
-        default=None,
-        help="CPU threads for BLAS/OpenMP backends (default: all available cores).",
-    )
-    optional.add_argument(
+    input_output.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
+    input_output.add_argument(
         "-chunksize",
         "--chunksize",
         type=int,
         default=50000,
         help="Number of SNPs per loading chunk (default: 50000).",
     )
-    optional.add_argument(
+    input_output.add_argument(
         "-snps-only",
         "--snps-only",
         action="store_true",
         default=False,
         help="Input VCF/HMP: keep SNP variants only during loading.",
     )
-    optional.add_argument(
+    input_output.add_argument(
         "-maf",
         "--maf",
         type=float,
         default=0.02,
         help="Minor allele frequency threshold in loading stage (default: 0.02).",
     )
-    optional.add_argument(
+    input_output.add_argument(
         "-geno",
         "--geno",
         type=float,
         default=0.05,
         help="Missing-rate threshold in loading stage (default: 0.05).",
     )
+    runtime = parser.add_argument_group("Runtime Arguments")
+    runtime.add_argument(
+        "-t",
+        "--thread",
+        dest="thread",
+        type=int,
+        default=max(1, int(os.cpu_count() or 1)),
+        help="Number of CPU threads (default: %(default)s).",
+    )
+    runtime.add_argument(
+        "-threads",
+        "--threads",
+        dest="thread",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    runtime.add_argument("-seed", "--seed", type=int, default=42, help="Random seed (default: 42).")
 
-    optional.add_argument("-seed", "--seed", type=int, default=42, help="Random seed (default: 42).")
-    optional.add_argument("-lr", "--lr", type=float, default=0.005, help="Adam learning rate.")
-    optional.add_argument("-min_lr", "--min_lr", type=float, default=1e-6, help="Minimum learning rate.")
-    optional.add_argument("-lr_decay", "--lr_decay", type=float, default=0.5, help="Learning rate decay factor.")
-    optional.add_argument("-beta1", "--beta1", type=float, default=0.80, help="Adam beta1.")
-    optional.add_argument("-beta2", "--beta2", type=float, default=0.88, help="Adam beta2.")
-    optional.add_argument("-reg_adam", "--reg_adam", type=float, default=1e-8, help="Adam epsilon.")
-    optional.add_argument("-max_iter", "--max_iter", type=int, default=1500, help="Maximum ADAM-EM iterations.")
-    optional.add_argument("-check", "--check", type=int, default=5, help="Log-likelihood check interval.")
+    model = parser.add_argument_group("Model/Optimization Arguments")
+    model.add_argument(
+        "-solver",
+        "--solver",
+        type=str,
+        default="adam-em",
+        choices=["auto", "adam", "adam-em"],
+        help="Optimization solver (default: adam-em).",
+    )
+    model.add_argument(
+        "-max-iter",
+        "--max-iter",
+        dest="max_iter",
+        type=int,
+        default=500,
+        help="Maximum optimization iterations (default: 500).",
+    )
+    model.add_argument(
+        "-tol",
+        "--tol",
+        type=float,
+        default=1e-5,
+        help="Convergence tolerance (default: 1e-5).",
+    )
+    return parser
 
-    optional.add_argument("-max_als", "--max_als", type=int, default=1000, help="Maximum ALS iterations.")
-    optional.add_argument("-tole_als", "--tole_als", type=float, default=1e-4, help="ALS convergence tolerance.")
-    optional.add_argument("-reg_als", "--reg_als", type=float, default=1e-5, help="ALS regularization.")
-    optional.add_argument("-power", "--power", type=int, default=5, help="RSVD power iterations.")
-    optional.add_argument("-tole_svd", "--tole_svd", type=float, default=1e-1, help="RSVD convergence tolerance.")
 
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf must be within [0, 0.5].")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno must be within [0, 1.0].")
-    if args.threads is not None and int(args.threads) <= 0:
-        parser.error("-threads must be a positive integer.")
+    if float(args.tol) <= 0:
+        parser.error("-tol/--tol must be > 0.")
+    if int(args.max_iter) <= 0:
+        parser.error("-max-iter/--max-iter must be a positive integer.")
+    if int(args.thread) <= 0:
+        parser.error("-t/--thread must be a positive integer.")
 
-    resolved_threads = int(args.threads) if args.threads is not None else max(1, int(os.cpu_count() or 1))
+    resolved_threads = int(args.thread)
 
     outdir = str(args.out).replace("\\", "/").rstrip("/") or "."
     os.makedirs(outdir, exist_ok=True)
@@ -335,35 +369,32 @@ def main() -> None:
         host=socket.gethostname(),
         sections=[
             (
-                "General",
+                "Input/Output",
                 [
                     ("Genotype", genotype_path),
                     ("Input type", source_label),
-                    ("K", int(args.k)),
-                    ("Seed", int(args.seed)),
-                    ("Threads", int(resolved_threads)),
                     ("Chunk size", int(args.chunksize)),
                     ("SNPs only", bool(args.snps_only)),
                     ("MAF threshold", float(args.maf)),
                     ("Miss threshold", float(args.geno)),
+                    ("Output dir", outdir),
+                    ("Prefix", prefix),
                 ],
             ),
             (
-                "Optimization",
+                "Runtime",
                 [
-                    ("lr", float(args.lr)),
-                    ("min_lr", float(args.min_lr)),
-                    ("lr_decay", float(args.lr_decay)),
-                    ("beta1", float(args.beta1)),
-                    ("beta2", float(args.beta2)),
-                    ("reg_adam", float(args.reg_adam)),
+                    ("Threads", int(resolved_threads)),
+                    ("Seed", int(args.seed)),
+                ],
+            ),
+            (
+                "Model",
+                [
+                    ("K", int(args.k)),
+                    ("Solver", str(args.solver)),
                     ("max_iter", int(args.max_iter)),
-                    ("check", int(args.check)),
-                    ("max_als", int(args.max_als)),
-                    ("tole_als", float(args.tole_als)),
-                    ("reg_als", float(args.reg_als)),
-                    ("power", int(args.power)),
-                    ("tole_svd", float(args.tole_svd)),
+                    ("tol", float(args.tol)),
                 ],
             ),
         ],
@@ -386,19 +417,9 @@ def main() -> None:
         snps_only=bool(args.snps_only),
         maf=float(args.maf),
         geno=float(args.geno),
-        lr=float(args.lr),
-        beta1=float(args.beta1),
-        beta2=float(args.beta2),
-        reg_adam=float(args.reg_adam),
-        lr_decay=float(args.lr_decay),
-        min_lr=float(args.min_lr),
+        solver=str(args.solver),
         max_iter=max(1, int(args.max_iter)),
-        check=max(1, int(args.check)),
-        max_als=max(1, int(args.max_als)),
-        tole_als=float(args.tole_als),
-        reg_als=float(args.reg_als),
-        power=max(1, int(args.power)),
-        tole_svd=float(args.tole_svd),
+        tol=float(args.tol),
     )
 
     progress_ui: Optional[_AdmixtureCliProgress] = None

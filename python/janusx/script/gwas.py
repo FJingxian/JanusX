@@ -4095,8 +4095,8 @@ def parse_args():
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=-1,
-        help="Number of CPU threads (-1 uses all available cores; default: %(default)s).",
+        "-t", "--thread", type=int, default=cpu_count(),
+        help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
         "-o", "--out", type=str, default=".",

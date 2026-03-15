@@ -1736,7 +1736,7 @@ class WebUIState:
         ]
 
         if params["threshold"] != "":
-            cmd.extend(["-threshold", params["threshold"]])
+            cmd.extend(["-thr", params["threshold"]])
         if params["manh"]:
             cmd.extend(["-manh", params["manh_ratio"]])
         if params["qq"]:

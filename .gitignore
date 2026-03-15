@@ -34,6 +34,7 @@ webapp/media/
 # Rust build artifacts
 target
 *.lock
+*.pyd
 
 # External binaries
 ext/bin/*

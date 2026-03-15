@@ -1175,6 +1175,17 @@ class PCGLMMMatrixFree:
                             else np.unique(top_idx)
                         )
 
+                # Hard-cap exact rescoring volume per chunk to keep runtime stable.
+                if self.score_vr_refine_topk > 0 and candidates.size > self.score_vr_refine_topk:
+                    vals = pval[candidates]
+                    kcap = int(min(self.score_vr_refine_topk, candidates.size))
+                    if kcap > 0:
+                        if kcap < candidates.size:
+                            take = np.argpartition(vals, kcap - 1)[:kcap]
+                        else:
+                            take = np.arange(candidates.size, dtype=np.int64)
+                        candidates = np.asarray(candidates[take], dtype=np.int64)
+
                 if candidates.size > 0:
                     mode_before = str(getattr(self._rust_state, "scan_mode", self.scan_mode))
                     try:

@@ -141,6 +141,20 @@ except Exception:
 
 _WARNED_GWAS_CACHE_FALLBACK_KEYS: set[str] = set()
 
+_MEMLMM_DEFAULT_SCAN_MODE = "exact"
+_MEMLMM_DEFAULT_SCORE_VR_CALIB_SNPS = 128
+_MEMLMM_DEFAULT_SCORE_VR_REFINE_P = 0.0
+_MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_FRAC = 0.0
+_MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MIN = 0
+_MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MAX = 0
+_MEMLMM_DEFAULT_PCG_TOL = 1e-4
+_MEMLMM_DEFAULT_PCG_MAX_ITER = 200
+_MEMLMM_DEFAULT_BLOCK_SIZE = 0
+_MEMLMM_DEFAULT_SCAN_RHS_CAP = 0
+_MEMLMM_DEFAULT_PRECOND_KIND = "rand_nys"
+_MEMLMM_DEFAULT_PRECOND_RANK = 0
+_MEMLMM_DENSE_LBD_MAX_N = 3000
+
 
 # ======================================================================
 # Basic utilities
@@ -2472,6 +2486,8 @@ def run_chunked_gwas_lmm_lm(
     saved_paths: Union[list[str], None] = None,
     trait_names: Union[list[str], None] = None,
     show_npve_line: bool = False,
+    emit_trait_header: bool = True,
+    memlmm_options: Union[dict[str, object], None] = None,
 ) -> None:
     """
     Run LMM/FastLMM/MemLMM/LM GWAS using a streaming pipeline.
@@ -2586,6 +2602,8 @@ def run_chunked_gwas_lmm_lm(
         if cov_all is not None:
             X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
 
+        model_chunk_size = int(max(1, chunk_size))
+
         header_pve: Optional[float] = None
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
@@ -2614,7 +2632,7 @@ def run_chunked_gwas_lmm_lm(
             )
         elif model_key == "memlmm":
             mmap_window_mb_null = (
-                auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
+                auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
                 if mmap_limit else None
             )
             kinship_chunks: list[np.ndarray] = []
@@ -2625,7 +2643,7 @@ def run_chunked_gwas_lmm_lm(
             try:
                 for kin_chunk, _kin_sites in load_genotype_chunks(
                     genofile,
-                    chunk_size,
+                    model_chunk_size,
                     maf_threshold,
                     max_missing_rate,
                     model="add",
@@ -2661,7 +2679,53 @@ def run_chunked_gwas_lmm_lm(
                     np.concatenate(kinship_chunks, axis=0),
                     dtype=np.float32,
                 )
-                mod = ModelCls(y=y_vec, X=X_cov, kinship_geno=kinship_geno)
+                kinship_used = int(kinship_geno.shape[0])
+                mem_opts = dict(memlmm_options or {})
+                lbd_in = mem_opts.get("lbd", None)
+                lbd_fixed: Optional[float] = None
+                try:
+                    if lbd_in is not None:
+                        lbd_tmp = float(lbd_in)
+                        if np.isfinite(lbd_tmp) and lbd_tmp > 0.0:
+                            lbd_fixed = lbd_tmp
+                except Exception:
+                    lbd_fixed = None
+
+                if lbd_fixed is None and n_idv <= _MEMLMM_DENSE_LBD_MAX_N:
+                    try:
+                        g_center = kinship_geno - np.mean(
+                            kinship_geno, axis=1, keepdims=True, dtype=np.float32
+                        )
+                        k_sub = (g_center.T @ g_center) / max(float(kinship_used), 1.0)
+                        k_sub = np.asarray(k_sub, dtype=np.float64)
+                        k_sub.flat[:: n_idv + 1] += 1e-3
+                        fast_null = FastLMM(y=y_vec, X=X_cov, kinship=k_sub)
+                        lbd_fast = float(getattr(fast_null, "lbd_null", np.nan))
+                        if np.isfinite(lbd_fast) and lbd_fast > 0.0:
+                            lbd_fixed = lbd_fast
+                            _log_file_only(
+                                logger,
+                                logging.INFO,
+                                f"MemLMM null lambda from dense-K fallback: {lbd_fixed:.6g}",
+                            )
+                        del g_center
+                        del k_sub
+                    except Exception as _e:
+                        _log_file_only(
+                            logger,
+                            logging.DEBUG,
+                            f"MemLMM lambda dense fallback skipped: {_e}",
+                        )
+
+                if lbd_fixed is not None:
+                    mem_opts["lbd"] = float(np.clip(lbd_fixed, 1e-6, 1e6))
+                else:
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        "MemLMM null lambda fallback to HE estimate (may differ from LMM/FastLMM).",
+                    )
+                mod = ModelCls(y=y_vec, X=X_cov, kinship_geno=kinship_geno, **mem_opts)
                 del kinship_geno
                 del kinship_chunks
                 mod.fit_null()
@@ -2680,7 +2744,7 @@ def run_chunked_gwas_lmm_lm(
                 logging.INFO,
                 (
                     f"{model_label}, trait: {pname}, PVE(null): {pve_txt}, "
-                    f"kinship_snp={kinship_loaded}"
+                    f"kinship_snp={kinship_used} (loaded={kinship_loaded})"
                 ),
             )
             _log_file_only(
@@ -2692,14 +2756,15 @@ def run_chunked_gwas_lmm_lm(
             mod = ModelCls(y=y_vec, X=X_cov)
             _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
 
-        _emit_trait_header(
-            logger,
-            pname,
-            n_idv,
-            pve=header_pve,
-            use_spinner=bool(use_spinner),
-            width=60,
-        )
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                pname,
+                n_idv,
+                pve=header_pve,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
 
         done_snps = 0
         has_results = False
@@ -2707,7 +2772,7 @@ def run_chunked_gwas_lmm_lm(
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (
-            auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
+            auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
             if mmap_limit else None
         )
 
@@ -2795,7 +2860,7 @@ def run_chunked_gwas_lmm_lm(
 
                 mem_info = process.memory_info()
                 peak_rss = max(peak_rss, mem_info.rss)
-                if done_snps % (10 * chunk_size) == 0:
+                if done_snps % (10 * model_chunk_size) == 0:
                     mem_gb = mem_info.rss / 1024**3
                     pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
                 next_write_seq += 1
@@ -2824,11 +2889,14 @@ def run_chunked_gwas_lmm_lm(
                 ready_rows[seq] = (_build_chunk_df(results, info_chunk, maf_chunk), m_chunk)
             _write_ready_chunks()
 
-        ex = cf.ThreadPoolExecutor(max_workers=workers)
+        use_executor = model_key != "memlmm"
+        ex: Union[cf.ThreadPoolExecutor, None] = (
+            cf.ThreadPoolExecutor(max_workers=workers) if use_executor else None
+        )
         try:
             for genosub, sites in load_genotype_chunks(
                 genofile,
-                chunk_size,
+                model_chunk_size,
                 maf_threshold,
                 max_missing_rate,
                 model=genetic_model,
@@ -2875,32 +2943,44 @@ def run_chunked_gwas_lmm_lm(
                 geno_center = geno_model - np.mean(
                     geno_model, axis=1, dtype=np.float32, keepdims=True
                 )
+                if use_executor:
+                    assert ex is not None
+                    fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
+                    inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
+                    chunk_seq += 1
 
-                fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
-                chunk_seq += 1
-
-                if len(inflight) >= max_inflight:
-                    _drain_completed(wait_for_one=True)
+                    if len(inflight) >= max_inflight:
+                        _drain_completed(wait_for_one=True)
+                    else:
+                        _drain_completed(wait_for_one=False)
                 else:
-                    _drain_completed(wait_for_one=False)
+                    results = mod.gwas(geno_center, threads=threads_per_worker)
+                    ready_rows[chunk_seq] = (
+                        _build_chunk_df(results, info_chunk, maf_chunk),
+                        int(m_chunk),
+                    )
+                    chunk_seq += 1
+                    _write_ready_chunks()
 
-            while len(inflight) > 0:
-                _drain_completed(wait_for_one=True)
+            if use_executor:
+                while len(inflight) > 0:
+                    _drain_completed(wait_for_one=True)
             _write_ready_chunks()
             pbar.finish()
         except KeyboardInterrupt:
             interrupted = True
-            for fut, _m, _info, _maf in inflight.values():
-                try:
-                    fut.cancel()
-                except Exception:
-                    pass
+            if use_executor:
+                for fut, _m, _info, _maf in inflight.values():
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
             raise
         finally:
             # Always stop renderer first, then tear down workers.
             pbar.close(show_done=False)
-            ex.shutdown(wait=False, cancel_futures=True)
+            if ex is not None:
+                ex.shutdown(wait=False, cancel_futures=True)
             if interrupted and os.path.exists(tmp_tsv):
                 try:
                     os.remove(tmp_tsv)
@@ -4292,6 +4372,13 @@ def main(log: bool = True):
         ]
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
+        if args.memlmm:
+            cfg_rows.append(
+                (
+                    "MemLMM workflow",
+                    "null exact -> exact scan (accuracy-first)",
+                )
+            )
         if args.cov:
             cfg_rows.append(("Covariates", "; ".join(args.cov)))
         emit_cli_configuration(
@@ -4400,6 +4487,39 @@ def main(log: bool = True):
         if args.lm:
             stream_models.append("lm")
         has_farmcpu = bool(args.farmcpu)
+        memlmm_refine_topk = _MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MIN
+        if n_snps is not None and int(n_snps) > 0:
+            memlmm_refine_topk = int(
+                np.clip(
+                    int(round(_MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_FRAC * float(int(n_snps)))),
+                    _MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MIN,
+                    _MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MAX,
+                )
+            )
+        memlmm_options: dict[str, object] = {
+            "scan_mode": _MEMLMM_DEFAULT_SCAN_MODE,
+            "score_vr_calib_snps": int(_MEMLMM_DEFAULT_SCORE_VR_CALIB_SNPS),
+            "score_vr_refine_topk": int(memlmm_refine_topk),
+            "score_vr_refine_p": float(_MEMLMM_DEFAULT_SCORE_VR_REFINE_P),
+            "pcg_tol": float(_MEMLMM_DEFAULT_PCG_TOL),
+            "pcg_max_iter": int(_MEMLMM_DEFAULT_PCG_MAX_ITER),
+            "block_size": int(_MEMLMM_DEFAULT_BLOCK_SIZE),
+            "scan_rhs_cap": int(_MEMLMM_DEFAULT_SCAN_RHS_CAP),
+            "precond_kind": str(_MEMLMM_DEFAULT_PRECOND_KIND),
+            "precond_rank": int(_MEMLMM_DEFAULT_PRECOND_RANK),
+        }
+        if args.memlmm:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    "MemLMM default strategy: "
+                    f"scan_mode={_MEMLMM_DEFAULT_SCAN_MODE}, "
+                    f"calib={int(_MEMLMM_DEFAULT_SCORE_VR_CALIB_SNPS)}, "
+                    f"refine_p={float(_MEMLMM_DEFAULT_SCORE_VR_REFINE_P):.3g}, "
+                    f"refine_topk={int(memlmm_refine_topk)}"
+                ),
+            )
 
         trait_order = list(pheno.columns) if pheno is not None else []
         trait_col_map: dict[str, int] = {}
@@ -4452,11 +4572,16 @@ def main(log: bool = True):
                         saved_paths=saved_result_paths,
                         trait_names=[str(pname)],
                         show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
+                        emit_trait_header=True,
+                        memlmm_options=memlmm_options,
                     )
                 elif "memlmm" in stream_models:
-                    for model_key in stream_models:
+                    non_mem_models = [m for m in stream_models if m != "memlmm"]
+                    trait_header_emitted = False
+                    if len(non_mem_models) == 1:
+                        model_key = non_mem_models[0]
                         pve_line_model = (
-                            model_key if model_key in {"lmm", "fastlmm", "memlmm"} else None
+                            model_key if model_key in {"lmm", "fastlmm"} else None
                         )
                         run_chunked_gwas_lmm_lm(
                             model_name=model_key,
@@ -4485,7 +4610,69 @@ def main(log: bool = True):
                             saved_paths=saved_result_paths,
                             trait_names=[str(pname)],
                             show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
+                            emit_trait_header=True,
+                            memlmm_options=memlmm_options,
                         )
+                        trait_header_emitted = True
+                    elif len(non_mem_models) > 1:
+                        run_chunked_gwas_streaming_shared(
+                            model_names=non_mem_models,
+                            trait_name=str(pname),
+                            genofile=gfile,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            mmap_limit=args.mmap_limit,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                        )
+                        trait_header_emitted = True
+
+                    run_chunked_gwas_lmm_lm(
+                        model_name="memlmm",
+                        genofile=gfile,
+                        pheno=pheno,
+                        ids=ids,
+                        n_snps=n_snps,
+                        outprefix=outprefix,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        genetic_model=args.model,
+                        het_threshold=args.het,
+                        chunk_size=args.chunksize,
+                        mmap_limit=args.mmap_limit,
+                        grm=grm,
+                        qmatrix=qmatrix,
+                        cov_all=cov_all,
+                        eff_m=eff_m,
+                        plot=args.plot,
+                        threads=args.thread,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(pname)],
+                        show_npve_line=True,
+                        emit_trait_header=(not trait_header_emitted),
+                        memlmm_options=memlmm_options,
+                    )
                 else:
                     run_chunked_gwas_streaming_shared(
                         model_names=stream_models,
@@ -4586,6 +4773,16 @@ def main(log: bool = True):
                 "het": float(args.het),
                 "chunksize": int(args.chunksize),
                 "thread": int(args.thread),
+                "memlmm_scan_mode": str(memlmm_options.get("scan_mode", _MEMLMM_DEFAULT_SCAN_MODE)),
+                "memlmm_score_vr_calib_snps": int(memlmm_options.get("score_vr_calib_snps", _MEMLMM_DEFAULT_SCORE_VR_CALIB_SNPS)),
+                "memlmm_score_vr_refine_topk": int(memlmm_options.get("score_vr_refine_topk", _MEMLMM_DEFAULT_SCORE_VR_REFINE_TOPK_MIN)),
+                "memlmm_score_vr_refine_p": float(memlmm_options.get("score_vr_refine_p", _MEMLMM_DEFAULT_SCORE_VR_REFINE_P)),
+                "memlmm_pcg_tol": float(memlmm_options.get("pcg_tol", _MEMLMM_DEFAULT_PCG_TOL)),
+                "memlmm_pcg_max_iter": int(memlmm_options.get("pcg_max_iter", _MEMLMM_DEFAULT_PCG_MAX_ITER)),
+                "memlmm_block_size": int(memlmm_options.get("block_size", _MEMLMM_DEFAULT_BLOCK_SIZE)),
+                "memlmm_scan_rhs_cap": int(memlmm_options.get("scan_rhs_cap", _MEMLMM_DEFAULT_SCAN_RHS_CAP)),
+                "memlmm_precond_kind": str(memlmm_options.get("precond_kind", _MEMLMM_DEFAULT_PRECOND_KIND)),
+                "memlmm_precond_rank": int(memlmm_options.get("precond_rank", _MEMLMM_DEFAULT_PRECOND_RANK)),
                 "ncol": (list(args.ncol) if args.ncol is not None else None),
                 "cov": (list(args.cov) if args.cov is not None else []),
                 "grm": str(args.grm),

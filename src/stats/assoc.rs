@@ -3210,7 +3210,6 @@ struct MatrixFreeNullState {
 }
 
 struct MatrixFreeNullScratch {
-    b_blk: Vec<f64>,
     x_blk: Vec<f64>,
     r_blk: Vec<f64>,
     z_blk: Vec<f64>,
@@ -3226,7 +3225,6 @@ struct MatrixFreeNullScratch {
 impl MatrixFreeNullScratch {
     fn new(n: usize, rhs_cap: usize, precond_rank: usize) -> Self {
         Self {
-            b_blk: vec![0.0; n * rhs_cap],
             x_blk: vec![0.0; n * rhs_cap],
             r_blk: vec![0.0; n * rhs_cap],
             z_blk: vec![0.0; n * rhs_cap],
@@ -3283,6 +3281,40 @@ struct MatrixFreeScoreVrScratch {
 impl MatrixFreeScoreVrScratch {
     fn new(p_cov: usize) -> Self {
         Self {
+            c: vec![0.0; p_cov],
+            a_inv_c: vec![0.0; p_cov],
+        }
+    }
+}
+
+struct ScoreVrCalibScratch {
+    x_blk: Vec<f64>,
+    r_blk: Vec<f64>,
+    z_blk: Vec<f64>,
+    p_blk: Vec<f64>,
+    ap_blk: Vec<f64>,
+    norm_b: Vec<f64>,
+    rz_old: Vec<f64>,
+    tmp_proj: Vec<f64>,
+    centered_row: Vec<f64>,
+    dots: Vec<f64>,
+    c: Vec<f64>,
+    a_inv_c: Vec<f64>,
+}
+
+impl ScoreVrCalibScratch {
+    fn new(n: usize, p_cov: usize, precond_rank: usize) -> Self {
+        Self {
+            x_blk: vec![0.0; n],
+            r_blk: vec![0.0; n],
+            z_blk: vec![0.0; n],
+            p_blk: vec![0.0; n],
+            ap_blk: vec![0.0; n],
+            norm_b: vec![0.0; 1],
+            rz_old: vec![0.0; 1],
+            tmp_proj: vec![0.0; precond_rank],
+            centered_row: vec![0.0; n],
+            dots: vec![0.0; 1],
             c: vec![0.0; p_cov],
             a_inv_c: vec![0.0; p_cov],
         }
@@ -3354,80 +3386,76 @@ impl RustPcgMatrixFreeState {
             return 1.0;
         }
 
-        let mut x_blk = vec![0.0_f64; n];
-        let mut r_blk = vec![0.0_f64; n];
-        let mut z_blk = vec![0.0_f64; n];
-        let mut p_blk = vec![0.0_f64; n];
-        let mut ap_blk = vec![0.0_f64; n];
-        let mut norm_b = vec![0.0_f64; 1];
-        let mut rz_old = vec![0.0_f64; 1];
-        let mut tmp_proj = vec![0.0_f64; precond_rank];
-        let mut centered_row = vec![0.0_f64; n];
-        let mut dots = vec![0.0_f64; 1];
-        let mut c = vec![0.0_f64; p_cov];
-        let mut a_inv_c = vec![0.0_f64; p_cov];
-        let mut ratios = Vec::<f64>::with_capacity(calib_idx.len());
-        for &idx in calib_idx.iter() {
-            let row_off = idx * n;
-            let b_col = &g_flat[row_off..row_off + n];
-            let _ = pcg_solve_block_k_plus_lambda_packed_f32_rhs(
-                &self.op,
-                self.lbd,
-                &self.m_inv_diag,
-                self.precond.as_ref(),
-                b_col,
-                1,
-                &mut x_blk,
-                &mut r_blk,
-                &mut z_blk,
-                &mut p_blk,
-                &mut ap_blk,
-                &mut norm_b,
-                &mut rz_old,
-                &mut tmp_proj,
-                &mut centered_row,
-                &mut dots,
-                self.pcg_tol,
-                self.pcg_max_iter,
-            );
+        let mut ratios = calib_idx
+            .par_iter()
+            .map_init(
+                || ScoreVrCalibScratch::new(n, p_cov, precond_rank),
+                |scr, &idx| {
+                    let row_off = idx * n;
+                    let b_col = &g_flat[row_off..row_off + n];
+                    let _ = pcg_solve_block_k_plus_lambda_packed_f32_rhs(
+                        &self.op,
+                        self.lbd,
+                        &self.m_inv_diag,
+                        self.precond.as_ref(),
+                        b_col,
+                        1,
+                        &mut scr.x_blk,
+                        &mut scr.r_blk,
+                        &mut scr.z_blk,
+                        &mut scr.p_blk,
+                        &mut scr.ap_blk,
+                        &mut scr.norm_b,
+                        &mut scr.rz_old,
+                        &mut scr.tmp_proj,
+                        &mut scr.centered_row,
+                        &mut scr.dots,
+                        self.pcg_tol,
+                        self.pcg_max_iter,
+                    );
 
-            c.fill(0.0);
-            let mut d_exact = 0.0_f64;
-            let mut d_diag = 0.0_f64;
-            for i in 0..n {
-                let gi = b_col[i] as f64;
-                let vi_g_exact = x_blk[i];
-                let vi_g_diag = self.m_inv_diag[i] * gi;
-                d_exact += gi * vi_g_exact;
-                d_diag += gi * vi_g_diag;
-                let base = i * p_cov;
-                for rj in 0..p_cov {
-                    c[rj] += self.xcov[base + rj] * vi_g_exact;
-                }
-            }
-            cholesky_solve_into(&ns.a_chol, p_cov, &c, &mut a_inv_c);
-            let schur_exact = d_exact - dot_loop(&c, &a_inv_c);
+                    scr.c.fill(0.0);
+                    let mut d_exact = 0.0_f64;
+                    let mut d_diag = 0.0_f64;
+                    for i in 0..n {
+                        let gi = b_col[i] as f64;
+                        let vi_g_exact = scr.x_blk[i];
+                        let vi_g_diag = self.m_inv_diag[i] * gi;
+                        d_exact += gi * vi_g_exact;
+                        d_diag += gi * vi_g_diag;
+                        let base = i * p_cov;
+                        for rj in 0..p_cov {
+                            scr.c[rj] += self.xcov[base + rj] * vi_g_exact;
+                        }
+                    }
+                    cholesky_solve_into(&ns.a_chol, p_cov, &scr.c, &mut scr.a_inv_c);
+                    let schur_exact = d_exact - dot_loop(&scr.c, &scr.a_inv_c);
 
-            c.fill(0.0);
-            for i in 0..n {
-                let gi = b_col[i] as f64;
-                let vi_g_diag = self.m_inv_diag[i] * gi;
-                let base = i * p_cov;
-                for rj in 0..p_cov {
-                    c[rj] += self.xcov[base + rj] * vi_g_diag;
-                }
-            }
-            cholesky_solve_into(&ns.a_chol, p_cov, &c, &mut a_inv_c);
-            let schur_diag = d_diag - dot_loop(&c, &a_inv_c);
+                    scr.c.fill(0.0);
+                    for i in 0..n {
+                        let gi = b_col[i] as f64;
+                        let vi_g_diag = self.m_inv_diag[i] * gi;
+                        let base = i * p_cov;
+                        for rj in 0..p_cov {
+                            scr.c[rj] += self.xcov[base + rj] * vi_g_diag;
+                        }
+                    }
+                    cholesky_solve_into(&ns.a_chol, p_cov, &scr.c, &mut scr.a_inv_c);
+                    let schur_diag = d_diag - dot_loop(&scr.c, &scr.a_inv_c);
 
-            if schur_exact.is_finite()
-                && schur_diag.is_finite()
-                && schur_exact > 1e-12
-                && schur_diag > 1e-12
-            {
-                ratios.push(schur_exact / schur_diag);
-            }
-        }
+                    if schur_exact.is_finite()
+                        && schur_diag.is_finite()
+                        && schur_exact > 1e-12
+                        && schur_diag > 1e-12
+                    {
+                        Some(schur_exact / schur_diag)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .filter_map(|v| v)
+            .collect::<Vec<f64>>();
 
         if ratios.is_empty() {
             return 1.0;
@@ -3451,8 +3479,7 @@ impl RustPcgMatrixFreeState {
         let rhs0 = p_cov + 1;
         let precond_rank = self.precond.as_ref().map(|p| p.rank).unwrap_or(0);
 
-        let mut scratch = MatrixFreeNullScratch::new(n, rhs0, precond_rank);
-        let b0_used = &mut scratch.b_blk[..rhs0 * n];
+        let mut b0_used = vec![0.0_f64; rhs0 * n];
         for c in 0..p_cov {
             for i in 0..n {
                 b0_used[c * n + i] = self.xcov[i * p_cov + c];
@@ -3462,37 +3489,51 @@ impl RustPcgMatrixFreeState {
             b0_used[p_cov * n + i] = self.y[i];
         }
 
-        let x0_used = &mut scratch.x_blk[..rhs0 * n];
-        let r0_used = &mut scratch.r_blk[..rhs0 * n];
-        let z0_used = &mut scratch.z_blk[..rhs0 * n];
-        let p0_used = &mut scratch.p_blk[..rhs0 * n];
-        let ap0_used = &mut scratch.ap_blk[..rhs0 * n];
-        let norm_b0 = &mut scratch.norm_b[..rhs0];
-        let rz_old0 = &mut scratch.rz_old[..rhs0];
-        let tmp_proj0 = &mut scratch.tmp_proj[..rhs0 * precond_rank];
-        let dots0 = &mut scratch.dots[..rhs0];
-        let centered0 = &mut scratch.centered_row[..];
+        let x_cols = (0..rhs0)
+            .into_par_iter()
+            .map(|c| {
+                let mut scratch = MatrixFreeNullScratch::new(n, 1, precond_rank);
+                let b_col = &b0_used[c * n..(c + 1) * n];
+                let x_used = &mut scratch.x_blk[..n];
+                let r_used = &mut scratch.r_blk[..n];
+                let z_used = &mut scratch.z_blk[..n];
+                let p_used = &mut scratch.p_blk[..n];
+                let ap_used = &mut scratch.ap_blk[..n];
+                let norm_b = &mut scratch.norm_b[..1];
+                let rz_old = &mut scratch.rz_old[..1];
+                let tmp_proj = &mut scratch.tmp_proj[..precond_rank];
+                let dots = &mut scratch.dots[..1];
+                let centered = &mut scratch.centered_row[..];
 
-        let _ = pcg_solve_block_k_plus_lambda_packed(
-            &self.op,
-            self.lbd,
-            &self.m_inv_diag,
-            self.precond.as_ref(),
-            b0_used,
-            rhs0,
-            x0_used,
-            r0_used,
-            z0_used,
-            p0_used,
-            ap0_used,
-            norm_b0,
-            rz_old0,
-            tmp_proj0,
-            centered0,
-            dots0,
-            self.pcg_tol,
-            self.pcg_max_iter,
-        );
+                let _ = pcg_solve_block_k_plus_lambda_packed(
+                    &self.op,
+                    self.lbd,
+                    &self.m_inv_diag,
+                    self.precond.as_ref(),
+                    b_col,
+                    1,
+                    x_used,
+                    r_used,
+                    z_used,
+                    p_used,
+                    ap_used,
+                    norm_b,
+                    rz_old,
+                    tmp_proj,
+                    centered,
+                    dots,
+                    self.pcg_tol,
+                    self.pcg_max_iter,
+                );
+                x_used.to_vec()
+            })
+            .collect::<Vec<Vec<f64>>>();
+
+        let mut x0_used = vec![0.0_f64; rhs0 * n];
+        for c in 0..rhs0 {
+            let dst = &mut x0_used[c * n..(c + 1) * n];
+            dst.copy_from_slice(&x_cols[c]);
+        }
 
         let vinv_y = x0_used[p_cov * n..(p_cov + 1) * n].to_vec();
         let mut a = vec![0.0_f64; p_cov * p_cov];

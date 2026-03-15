@@ -219,8 +219,8 @@ def _build_parser() -> CliArgumentParser:
         ]),
     )
 
-    required = parser.add_argument_group("Required Arguments")
-    geno = required.add_mutually_exclusive_group(required=True)
+    req_geno = parser.add_argument_group("Required Genotype Input (Choose one)")
+    geno = req_geno.add_mutually_exclusive_group(required=True)
     geno.add_argument("-bfile", "--bfile", type=str, help="PLINK prefix (.bed/.bim/.fam).")
     geno.add_argument("-vcf", "--vcf", type=str, help="VCF/VCF.GZ genotype file.")
     geno.add_argument("-hmp", "--hmp", type=str, help="HMP/HMP.GZ genotype file.")
@@ -230,7 +230,8 @@ def _build_parser() -> CliArgumentParser:
         type=str,
         help="Text/NumPy genotype matrix prefix (requires sidecar .id).",
     )
-    required.add_argument(
+    req_model = parser.add_argument_group("Required Nclusters")
+    req_model.add_argument(
         "-k",
         "--k",
         type=int,

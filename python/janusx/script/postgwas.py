@@ -37,6 +37,7 @@ from ._common.status import (
     get_rich_spinner_name,
     print_success,
     print_failure,
+    print_warning,
     format_elapsed,
 )
 from ._common.genocache import configure_genotype_cache_from_out
@@ -78,6 +79,15 @@ _QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
 _ANNO_DESC_KEY = "description"
+
+
+def _warn_deprecated_threshold_alias() -> None:
+    argv = [str(x) for x in sys.argv[1:]]
+    for tok in argv:
+        key = tok.split("=", 1)[0].strip()
+        if key in {"-threshold", "--threshold"}:
+            print_warning("`-threshold/--threshold` is deprecated; use `-thr/--thr`.")
+            break
 
 try:
     from rich.progress import (
@@ -3956,6 +3966,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
 
 
 def main():
+    _warn_deprecated_threshold_alias()
     t_start = time.time()
 
     parser = CliArgumentParser(

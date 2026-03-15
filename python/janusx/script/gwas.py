@@ -2799,6 +2799,17 @@ def run_chunked_gwas_lmm_lm(
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{model_label}"
         pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc)
+        if model_key == "memlmm" and pbar_total > 0 and model_chunk_size >= pbar_total:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    "MemLMM scan runs as a single large chunk "
+                    f"(chunksize={model_chunk_size}, nsnp={pbar_total}); "
+                    "Ctrl+C/progress updates may be delayed until chunk completion. "
+                    "Use smaller -chunksize (e.g. 512-4096) for responsive interrupt/progress."
+                ),
+            )
 
         inflight: dict[
             int,

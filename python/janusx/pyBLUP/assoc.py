@@ -27,6 +27,7 @@ Type conventions
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -55,7 +56,7 @@ from janusx.janusx import (
     lmm_reml_null_f32,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
-    pcg_lmm_assoc_chunk_f32,
+    RustPCGMatrixFreeState as _RustPCGMatrixFreeState,
     fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32,
     fastlmm_assoc_chunk_f32,
@@ -642,132 +643,568 @@ def lmm_assoc_fixed(
     return beta_se_p
 
 
-def pcg_lmm_assoc_fixed(
-    kinship: np.ndarray,
-    xcov: np.ndarray,
+class _GenotypeKinshipOperator:
+    """
+    Matrix-free kinship operator from SNP-major genotype G (m, n):
+        K = (Gc^T Gc) / m,  Gc = G - row_mean(G)
+    """
+
+    def __init__(self, geno_snp_major: np.ndarray):
+        g = np.ascontiguousarray(geno_snp_major, dtype=np.float32)
+        if g.ndim != 2:
+            raise ValueError("geno_snp_major must be 2D (m, n)")
+        self.g = g
+        self.m = int(g.shape[0])
+        self.n = int(g.shape[1])
+        if self.m <= 0 or self.n <= 0:
+            raise ValueError("geno_snp_major must be non-empty")
+        self.inv_m = 1.0 / float(self.m)
+        self.row_mean = np.mean(g, axis=1, dtype=np.float64)
+
+        sumsq_col = np.einsum("ij,ij->j", g, g, dtype=np.float64)
+        mu_dot_g = self.row_mean @ g  # shape (n,)
+        mu2_sum = float(np.dot(self.row_mean, self.row_mean))
+        diag = (sumsq_col - 2.0 * mu_dot_g + mu2_sum) * self.inv_m
+        self._diag = np.clip(np.asarray(diag, dtype=np.float64), 1e-12, np.inf)
+
+    def matvec(self, x: np.ndarray) -> np.ndarray:
+        x = np.ascontiguousarray(x, dtype=np.float64).ravel()
+        if x.shape[0] != self.n:
+            raise ValueError("x has incompatible length for genotype operator")
+        sx = float(np.sum(x))
+        tmp = (self.g @ x) - self.row_mean * sx  # (m,)
+        out = self.g.T @ tmp
+        corr = float(np.dot(self.row_mean, tmp))
+        out = (out - corr) * self.inv_m
+        return np.asarray(out, dtype=np.float64)
+
+    def matmat(self, x_block: np.ndarray) -> np.ndarray:
+        x_block = np.ascontiguousarray(x_block, dtype=np.float64)
+        if x_block.ndim != 2 or x_block.shape[1] != self.n:
+            raise ValueError("x_block must be (rhs, n)")
+        sx = np.sum(x_block, axis=1, dtype=np.float64)  # (rhs,)
+        tmp = self.g @ x_block.T  # (m, rhs)
+        tmp -= np.outer(self.row_mean, sx)
+        out = self.g.T @ tmp  # (n, rhs)
+        corr = self.row_mean @ tmp  # (rhs,)
+        out -= corr[np.newaxis, :]
+        out *= self.inv_m
+        return np.asarray(out.T, dtype=np.float64)
+
+    def diag(self) -> np.ndarray:
+        return self._diag
+
+
+def _normal_sf(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=np.float64)
+    return 0.5 * np.vectorize(lambda x: math.erfc(float(x) / math.sqrt(2.0)))(z)
+
+
+def _pcg_block_solve_operator(
+    op: Any,
+    lbd: float,
+    b_block: np.ndarray,
+    m_inv_diag: np.ndarray,
+    tol: float = 1e-4,
+    max_iter: int = 200,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Block PCG solve for (K + lambda I) X = B using linear operator op for K.
+    Shapes:
+      b_block: (rhs, n), returns x_block: (rhs, n), converged: (rhs,)
+    """
+    b = np.ascontiguousarray(b_block, dtype=np.float64)
+    if b.ndim != 2:
+        raise ValueError("b_block must be 2D (rhs, n)")
+    rhs, n = b.shape
+    if rhs == 0:
+        return np.zeros((0, n), dtype=np.float64), np.zeros((0,), dtype=bool)
+    if m_inv_diag.shape[0] != n:
+        raise ValueError("m_inv_diag length mismatch in PCG solve")
+
+    tol = float(tol) if np.isfinite(tol) and tol > 0 else 1e-6
+    max_iter = max(1, int(max_iter))
+    tiny = 1e-30
+
+    x = np.zeros_like(b, dtype=np.float64)
+    r = b.copy()
+    z = r * m_inv_diag[np.newaxis, :]
+    p = z.copy()
+
+    norm_b = np.linalg.norm(b, axis=1)
+    norm_b = np.where(np.isfinite(norm_b) & (norm_b > 0.0), norm_b, 1.0)
+    rz_old = np.sum(r * z, axis=1)
+    converged = np.zeros(rhs, dtype=bool)
+
+    for _ in range(max_iter):
+        ap = op.matmat(p) + lbd * p
+        denom = np.sum(p * ap, axis=1)
+        alpha = np.zeros(rhs, dtype=np.float64)
+        good = np.isfinite(denom) & (np.abs(denom) > tiny)
+        alpha[good] = rz_old[good] / denom[good]
+
+        x += alpha[:, np.newaxis] * p
+        r -= alpha[:, np.newaxis] * ap
+
+        rel = np.linalg.norm(r, axis=1) / norm_b
+        converged |= np.isfinite(rel) & (rel <= tol)
+        if bool(np.all(converged)):
+            break
+
+        z = r * m_inv_diag[np.newaxis, :]
+        rz_new = np.sum(r * z, axis=1)
+
+        beta = np.zeros(rhs, dtype=np.float64)
+        good_beta = (
+            (~converged)
+            & np.isfinite(rz_new)
+            & np.isfinite(rz_old)
+            & (np.abs(rz_old) > tiny)
+        )
+        beta[good_beta] = rz_new[good_beta] / rz_old[good_beta]
+
+        p = z + beta[:, np.newaxis] * p
+        if bool(np.any(converged)):
+            p[converged, :] = 0.0
+        rz_old = rz_new
+
+    return x, converged
+
+
+def _estimate_lbd_he_from_genotype_subsample(
     y: np.ndarray,
-    log10_lbd: float,
-    snp_chunk: np.ndarray,
-    pcg_tol: float = 1e-6,
-    pcg_max_iter: int = 500,
-    threads: int = 0,
-) -> np.ndarray:
+    xcov: np.ndarray,
+    geno_snp_major: np.ndarray,
+    row_mean: np.ndarray,
+    *,
+    sample_size: int = 256,
+    seed: int = 42,
+    min_var: float = 1e-8,
+) -> float:
     """
-    Fixed-lambda LMM association using PCG solves on (K + lambda I).
-
-    Parameters
-    ----------
-    kinship : np.ndarray, shape (n, n)
-        Kinship matrix in sample space.
-    xcov : np.ndarray, shape (n, p)
-        Covariate matrix including intercept.
-    y : np.ndarray, shape (n,) or (n,1)
-        Phenotype vector.
-    log10_lbd : float
-        log10(lambda), where lambda = ve / vg.
-    snp_chunk : np.ndarray, shape (m, n)
-        SNP-major genotype chunk.
-    pcg_tol : float
-        Relative residual tolerance for PCG.
-    pcg_max_iter : int
-        Max iterations for each PCG solve.
-    threads : int
-        Parallel SNP worker threads in Rust (0 = global rayon pool).
-
-    Returns
-    -------
-    np.ndarray, shape (m, 3)
-        Columns: beta, se, p.
+    No-EVD lambda estimate from genotype operator using HE moments on a sample
+    subset. Avoids constructing full dense K.
     """
-    kinship = np.ascontiguousarray(kinship, dtype=np.float64)
-    xcov = np.ascontiguousarray(xcov, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64).ravel()
-    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
-    return pcg_lmm_assoc_chunk_f32(
-        kinship,
-        xcov,
-        y,
-        float(log10_lbd),
-        snp_chunk,
-        float(pcg_tol),
-        int(pcg_max_iter),
-        int(threads),
-    )
+    xcov = np.ascontiguousarray(xcov, dtype=np.float64)
+    g = np.ascontiguousarray(geno_snp_major, dtype=np.float32)
+    mu = np.ascontiguousarray(row_mean, dtype=np.float64).ravel()
+
+    n = int(y.shape[0])
+    m = int(g.shape[0])
+    if xcov.shape[0] != n or g.shape[1] != n or mu.shape[0] != m:
+        raise ValueError("shape mismatch in lambda estimation from genotype")
+
+    beta_hat, *_ = np.linalg.lstsq(xcov, y, rcond=None)
+    r = y - xcov @ beta_hat
+
+    ns = int(max(8, min(n, sample_size)))
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n) if ns == n else np.sort(rng.choice(n, size=ns, replace=False))
+    r_sub = r[idx]
+
+    # Build only a small K_sub from centered genotype columns.
+    g_sub = np.asarray(g[:, idx], dtype=np.float64)
+    g_sub -= mu[:, np.newaxis]
+    k_sub = (g_sub.T @ g_sub) / max(float(m), 1.0)
+
+    diag_k = np.diag(k_sub)
+    sum_diag_k = float(np.sum(diag_k))
+    sum_diag_k2 = float(np.dot(diag_k, diag_k))
+    sum_diag_kr2 = float(np.dot(diag_k, r_sub * r_sub))
+
+    n_pairs = ns * (ns - 1) // 2
+    if n_pairs <= 1:
+        return 1.0
+
+    sum_k_all = float(np.sum(k_sub))
+    sum_k = 0.5 * (sum_k_all - sum_diag_k)
+
+    rr_sum = float(np.sum(r_sub))
+    rr2_sum = float(np.dot(r_sub, r_sub))
+    sum_z = 0.5 * (rr_sum * rr_sum - rr2_sum)
+
+    sum_kk_all = float(np.sum(k_sub * k_sub))
+    sum_kk = 0.5 * (sum_kk_all - sum_diag_k2)
+
+    kr_all = float(r_sub @ (k_sub @ r_sub))
+    sum_kz = 0.5 * (kr_all - sum_diag_kr2)
+
+    pairs_f = float(n_pairs)
+    denom = sum_kk - (sum_k * sum_k) / pairs_f
+    if (not np.isfinite(denom)) or (abs(denom) < 1e-18):
+        return 1.0
+
+    sigma_g2 = (sum_kz - (sum_k * sum_z) / pairs_f) / denom
+    sigma_g2 = float(max(sigma_g2, min_var))
+    mean_r2 = float(rr2_sum / max(ns, 1))
+    mean_diag_k = float(sum_diag_k / max(ns, 1))
+    sigma_e2 = float(max(mean_r2 - sigma_g2 * mean_diag_k, min_var))
+
+    lbd = sigma_e2 / sigma_g2
+    if not np.isfinite(lbd) or lbd <= 0.0:
+        return 1.0
+    return float(np.clip(lbd, 1e-6, 1e6))
 
 
-class PCGLMM:
+class PCGNullScanState:
     """
-    PCG-based LMM GWAS wrapper (no spectral rotation in scanning step).
+    Reusable null/scan state for matrix-free fixed-lambda LMM scan.
+    """
 
-    Notes
-    -----
-    - Scanning uses Rust PCG solves for V^{-1}v where V = K + lambda I.
-    - If `lbd` is not provided, lambda is estimated once via spectral null REML
-      (for robust default behavior), then scanning stays in PCG path.
+    def __init__(
+        self,
+        op: Any,
+        xcov: np.ndarray,
+        y: np.ndarray,
+        lbd: float,
+        *,
+        pcg_tol: float = 1e-4,
+        pcg_max_iter: int = 200,
+        block_size: int = 8,
+    ):
+        self.op = op
+        self.xcov = np.ascontiguousarray(xcov, dtype=np.float64)
+        self.y = np.ascontiguousarray(y, dtype=np.float64).ravel()
+        self.lbd = float(lbd)
+        self.pcg_tol = float(pcg_tol)
+        self.pcg_max_iter = int(pcg_max_iter)
+        self.block_size = int(max(1, block_size))
+
+        n, p_cov = self.xcov.shape
+        if self.y.shape[0] != n:
+            raise ValueError("xcov/y shape mismatch in PCGNullScanState")
+        if n <= p_cov + 1:
+            raise ValueError("n must be > p_cov + 1")
+
+        k_diag = np.ascontiguousarray(op.diag(), dtype=np.float64).ravel()
+        if k_diag.shape[0] != n:
+            raise ValueError("operator diag length mismatch")
+        self.m_inv_diag = 1.0 / np.clip(k_diag + self.lbd, 1e-8, np.inf)
+
+        rhs0 = np.vstack([self.xcov.T, self.y[np.newaxis, :]])  # (p+1, n)
+        x0, _ = _pcg_block_solve_operator(
+            op,
+            self.lbd,
+            rhs0,
+            self.m_inv_diag,
+            tol=self.pcg_tol,
+            max_iter=self.pcg_max_iter,
+        )
+        self.vinv_x = np.ascontiguousarray(x0[:p_cov, :].T, dtype=np.float64)  # (n, p)
+        self.vinv_y = np.ascontiguousarray(x0[p_cov, :], dtype=np.float64)  # (n,)
+
+        a = self.xcov.T @ self.vinv_x
+        b0 = self.xcov.T @ self.vinv_y
+        y_vinv_y = float(self.y @ self.vinv_y)
+        a = np.asarray(a, dtype=np.float64)
+        a.flat[:: p_cov + 1] += 1e-6
+        chol = cho_factor(a, overwrite_a=False, check_finite=False)
+        a_inv_b = cho_solve(chol, b0, check_finite=False)
+
+        self.a_chol = chol
+        self.a_inv_b = np.ascontiguousarray(a_inv_b, dtype=np.float64)
+        self.b_aib = float(b0 @ a_inv_b)
+        self.y_vinv_y = y_vinv_y
+        self.df = int(n - p_cov - 1)
+        self.n = int(n)
+        self.p_cov = int(p_cov)
+
+    def scan(self, snp_chunk: np.ndarray) -> np.ndarray:
+        g = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+        if g.ndim != 2 or g.shape[1] != self.n:
+            raise ValueError("snp_chunk must be (m, n)")
+        m = int(g.shape[0])
+        out = np.full((m, 3), np.nan, dtype=np.float64)
+        if m == 0:
+            return out
+
+        p_cov = self.p_cov
+        for start in range(0, m, self.block_size):
+            end = min(start + self.block_size, m)
+            b = np.asarray(g[start:end], dtype=np.float64)  # (bs, n)
+            vinv_g, _ = _pcg_block_solve_operator(
+                self.op,
+                self.lbd,
+                b,
+                self.m_inv_diag,
+                tol=self.pcg_tol,
+                max_iter=self.pcg_max_iter,
+            )
+
+            d = np.sum(b * vinv_g, axis=1)
+            e = b @ self.vinv_y
+            c_mat = self.xcov.T @ vinv_g.T  # (p, bs)
+
+            for j in range(end - start):
+                c_vec = c_mat[:, j]
+                a_inv_c = cho_solve(self.a_chol, c_vec, check_finite=False)
+                ct_aic = float(c_vec @ a_inv_c)
+                schur = float(d[j] - ct_aic)
+                if (not np.isfinite(schur)) or schur <= 1e-12:
+                    continue
+                ct_aib = float(c_vec @ self.a_inv_b)
+                num = float(e[j] - ct_aib)
+                beta = num / schur
+                q = self.b_aib + (num * num) / schur
+                rwr = max(self.y_vinv_y - q, 0.0)
+                sigma2 = rwr / float(self.df)
+                se = math.sqrt(max(sigma2 / schur, 0.0))
+                if not np.isfinite(beta) or not np.isfinite(se) or se <= 0.0:
+                    pval = 1.0
+                else:
+                    z = abs(beta / se)
+                    pval = float(min(max(2.0 * (0.5 * math.erfc(z / math.sqrt(2.0))), np.finfo(np.float64).tiny), 1.0))
+                out[start + j, 0] = beta
+                out[start + j, 1] = se
+                out[start + j, 2] = pval
+
+        return out
+
+
+class PCGLMMMatrixFree:
+    """
+    Matrix-free PCG LMM:
+      - no dense K construction
+      - Rust packed 2-bit genotype operator (hard-call 0/1/2 + missing)
+      - optional randomized Nyström preconditioner (`precond_kind="rand_nys"`)
+      - `scan_rhs_cap` tunes scan-time RHS tile width (speed/memory trade-off, 0=auto)
+      - null-model solve once
+      - reusable scan state for repeated chunks
+      - `scan_mode="score_vr"` enables score + variance-ratio approximation (faster scan)
+      - optional two-stage refine: score_vr full scan + exact rescoring on selected hits
     """
 
     def __init__(
         self,
         y: np.ndarray,
         X: Optional[np.ndarray],
-        kinship: np.ndarray,
+        kinship_geno: np.ndarray,
         lbd: Optional[float] = None,
-        pcg_tol: float = 1e-6,
-        pcg_max_iter: int = 500,
+        pcg_tol: float = 1e-4,
+        pcg_max_iter: int = 200,
+        block_size: int = 0,
+        scan_rhs_cap: int = 0,
+        precond_kind: str = "rand_nys",
+        precond_rank: int = 0,
+        precond_oversample: int = 2,
+        precond_seed: int = 42,
+        scan_mode: str = "exact",
+        score_vr_calib_snps: int = 128,
+        score_vr_refine_topk: int = 0,
+        score_vr_refine_p: float = 0.0,
+        lbd_sample_size: int = 256,
+        lbd_seed: int = 42,
     ):
-        y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
-        X = (
-            np.concatenate([np.ones((y.shape[0], 1)), np.asarray(X, dtype=np.float64)], axis=1)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+        x_arr = (
+            np.concatenate([np.ones((y_arr.shape[0], 1)), np.asarray(X, dtype=np.float64)], axis=1)
             if X is not None
-            else np.ones((y.shape[0], 1), dtype=np.float64)
+            else np.ones((y_arr.shape[0], 1), dtype=np.float64)
         )
-        kinship = np.asarray(kinship, dtype=np.float64)
-        if kinship.shape != (y.shape[0], y.shape[0]):
+        self.y = np.ascontiguousarray(y_arr.ravel(), dtype=np.float64)
+        self.X = np.ascontiguousarray(x_arr, dtype=np.float64)
+        geno_arr = np.ascontiguousarray(kinship_geno, dtype=np.float32)
+        if geno_arr.ndim != 2:
+            raise ValueError("kinship_geno must be 2D (m, n)")
+        if geno_arr.shape[1] != self.y.shape[0]:
             raise ValueError(
-                f"kinship must be (n,n). got={kinship.shape}, n={y.shape[0]}"
+                f"kinship_geno sample size mismatch: geno n={geno_arr.shape[1]}, y n={self.y.shape[0]}"
             )
 
-        self.y = y.ravel()
-        self.X = np.ascontiguousarray(X, dtype=np.float64)
-        self.K = np.ascontiguousarray(kinship, dtype=np.float64)
         self.pcg_tol = float(pcg_tol)
         self.pcg_max_iter = int(pcg_max_iter)
+        self.block_size = int(max(0, block_size))
+        self.scan_rhs_cap = int(max(0, scan_rhs_cap))
+        self.precond_kind = str(precond_kind)
+        self.precond_rank = int(max(0, precond_rank))
+        self.precond_oversample = int(max(1, precond_oversample))
+        self.precond_seed = int(precond_seed)
+        self.scan_mode = str(scan_mode)
+        self.score_vr_calib_snps = int(max(8, score_vr_calib_snps))
+        self.score_vr_refine_topk = int(max(0, score_vr_refine_topk))
+        self.score_vr_refine_p = float(max(0.0, score_vr_refine_p))
+        self.scan_rhs_cap_resolved = self.scan_rhs_cap
+        self.block_size_resolved = self.block_size
+        self.score_vr_ratio = np.nan
 
         if lbd is None:
-            # Robust default: estimate lambda once with spectral REML null model.
-            k = np.array(self.K, copy=True)
-            k.flat[:: k.shape[0] + 1] += 1e-6
-            t0 = time.time()
-            s, dh = eigh(k, overwrite_a=True, check_finite=False)
-            self.evd_secs = float(time.time() - t0)
-            x_rot = dh.T @ self.X
-            y_rot = (dh.T @ self.y.reshape(-1, 1)).ravel()
-            lbd_null, ml0, reml0 = lmm_reml_null(
-                s, x_rot, y_rot, (-5, 5), max_iter=50, tol=1e-3
+            valid = np.isfinite(geno_arr) & (geno_arr >= 0.0)
+            row_sum = np.sum(np.where(valid, geno_arr, 0.0), axis=1, dtype=np.float64)
+            row_cnt = np.sum(valid, axis=1, dtype=np.int64)
+            row_mean = np.divide(
+                row_sum,
+                np.maximum(row_cnt, 1),
+                out=np.zeros_like(row_sum, dtype=np.float64),
+                where=row_cnt > 0,
             )
-            self.lbd_null = float(lbd_null)
-            self.ML0 = float(ml0)
-            self.LL0 = float(reml0)
+            self.lbd_null = _estimate_lbd_he_from_genotype_subsample(
+                self.y,
+                self.X,
+                geno_arr,
+                row_mean,
+                sample_size=int(lbd_sample_size),
+                seed=int(lbd_seed),
+            )
         else:
-            self.evd_secs = 0.0
             self.lbd_null = float(lbd)
-            self.ML0 = np.nan
-            self.LL0 = np.nan
+        self.lbd_null = float(np.clip(self.lbd_null, 1e-6, 1e6))
+        self.evd_secs = 0.0
+        self.ML0 = np.nan
+        self.LL0 = np.nan
 
-        mean_k = float(np.mean(np.diag(self.K)))
-        self.pve = mean_k / (mean_k + self.lbd_null) if (mean_k + self.lbd_null) > 0 else np.nan
+        self._rust_state: Optional[Any] = None
+        self._state: Optional[PCGNullScanState] = None
+        self._fallback_op: Optional[_GenotypeKinshipOperator] = None
+        self._backend_error: str = ""
 
-    def gwas(self, snp: np.ndarray, threads: int = 0) -> np.ndarray:
-        return pcg_lmm_assoc_fixed(
-            self.K,
+        def _opt_float(v: Any) -> float:
+            if v is None:
+                return float("nan")
+            try:
+                return float(v)
+            except Exception:
+                return float("nan")
+
+        try:
+            self._rust_state = _RustPCGMatrixFreeState(
+                geno_arr,
+                self.X,
+                self.y,
+                float(np.log10(self.lbd_null)),
+                float(self.pcg_tol),
+                int(self.pcg_max_iter),
+                int(self.block_size),
+                str(self.precond_kind),
+                int(self.precond_rank),
+                int(self.precond_oversample),
+                int(self.precond_seed),
+                int(self.scan_rhs_cap),
+                str(self.scan_mode),
+                int(self.score_vr_calib_snps),
+            )
+            self.pve = float(self._rust_state.pve)
+            self.scan_rhs_cap_resolved = int(getattr(self._rust_state, "scan_rhs_cap", self.scan_rhs_cap))
+            self.block_size_resolved = int(getattr(self._rust_state, "block_size", self.block_size))
+            self.scan_mode = str(getattr(self._rust_state, "scan_mode", self.scan_mode))
+            self.score_vr_ratio = _opt_float(getattr(self._rust_state, "score_vr_ratio", np.nan))
+        except Exception as e:
+            self._backend_error = str(e)
+            warnings.warn(
+                "RustPCGMatrixFreeState unavailable for current kinship_geno; "
+                "fallback to Python operator path. "
+                f"reason={self._backend_error}",
+                RuntimeWarning,
+            )
+            self._fallback_op = _GenotypeKinshipOperator(geno_arr)
+            mean_diag = float(np.mean(self._fallback_op.diag()))
+            self.pve = (
+                mean_diag / (mean_diag + self.lbd_null)
+                if (mean_diag + self.lbd_null) > 0
+                else np.nan
+            )
+            self.scan_rhs_cap_resolved = self.block_size
+            self.block_size_resolved = self.block_size
+            if self.scan_mode.lower() != "exact":
+                warnings.warn(
+                    "scan_mode != 'exact' requires Rust backend; fallback path uses exact mode.",
+                    RuntimeWarning,
+                )
+                self.scan_mode = "exact"
+            if self.score_vr_refine_topk > 0 or self.score_vr_refine_p > 0.0:
+                warnings.warn(
+                    "score_vr refine requires Rust backend; fallback path disables refine.",
+                    RuntimeWarning,
+                )
+                self.score_vr_refine_topk = 0
+                self.score_vr_refine_p = 0.0
+
+    def fit_null(self) -> "PCGLMMMatrixFree":
+        if self._rust_state is not None:
+            self._rust_state.fit_null()
+            self.pve = float(self._rust_state.pve)
+            v = getattr(self._rust_state, "score_vr_ratio", np.nan)
+            self.score_vr_ratio = float("nan") if v is None else float(v)
+            return self
+
+        if self._fallback_op is None:
+            raise RuntimeError("matrix-free backend not initialized")
+        self._state = PCGNullScanState(
+            self._fallback_op,
             self.X,
             self.y,
-            float(np.log10(self.lbd_null)),
-            snp,
+            self.lbd_null,
             pcg_tol=self.pcg_tol,
             pcg_max_iter=self.pcg_max_iter,
-            threads=threads,
+            block_size=self.block_size,
         )
+        return self
+
+    def gwas(self, snp: np.ndarray, threads: int = 0) -> np.ndarray:
+        snp = np.ascontiguousarray(snp, dtype=np.float32)
+        if self._rust_state is not None:
+            if not bool(self._rust_state.fitted):
+                self._rust_state.fit_null()
+            use_refine = (
+                str(getattr(self._rust_state, "scan_mode", self.scan_mode)).lower() == "score_vr"
+                and (self.score_vr_refine_topk > 0 or self.score_vr_refine_p > 0.0)
+            )
+            out = self._rust_state.scan_chunk(snp, int(threads))
+
+            if use_refine:
+                pval = np.asarray(out[:, 2], dtype=np.float64)
+                finite = np.isfinite(pval)
+                candidates = np.array([], dtype=np.int64)
+
+                if self.score_vr_refine_p > 0.0:
+                    candidates = np.flatnonzero(finite & (pval <= self.score_vr_refine_p)).astype(np.int64)
+
+                if self.score_vr_refine_topk > 0 and np.any(finite):
+                    finite_idx = np.flatnonzero(finite)
+                    k = int(min(self.score_vr_refine_topk, finite_idx.shape[0]))
+                    if k > 0:
+                        vals = pval[finite_idx]
+                        if k < vals.shape[0]:
+                            take = np.argpartition(vals, k - 1)[:k]
+                        else:
+                            take = np.arange(vals.shape[0], dtype=np.int64)
+                        top_idx = finite_idx[take].astype(np.int64)
+                        candidates = (
+                            np.unique(np.concatenate([candidates, top_idx]))
+                            if candidates.size > 0
+                            else np.unique(top_idx)
+                        )
+
+                if candidates.size > 0:
+                    mode_before = str(getattr(self._rust_state, "scan_mode", self.scan_mode))
+                    try:
+                        self._rust_state.set_scan_mode("exact")
+                        snp_sub = np.ascontiguousarray(snp[candidates, :], dtype=np.float32)
+                        out_sub = self._rust_state.scan_chunk(snp_sub, int(threads))
+                        out[candidates, :] = out_sub
+                    finally:
+                        try:
+                            self._rust_state.set_scan_mode(mode_before)
+                        except Exception:
+                            pass
+
+            v = getattr(self._rust_state, "score_vr_ratio", np.nan)
+            self.score_vr_ratio = float("nan") if v is None else float(v)
+            return out
+
+        # Python fallback path
+        if self._state is None:
+            self.fit_null()
+        if self._state is None:
+            raise RuntimeError("failed to initialize matrix-free PCG null state")
+        n_threads = int(max(1, threads)) if int(threads) > 0 else None
+        ctx = (
+            _threadpool_limits(limits=n_threads, user_api="blas")
+            if (n_threads is not None and _threadpool_limits is not None)
+            else nullcontext()
+        )
+        with ctx:
+            return self._state.scan(snp)
 
 
 class LMM:

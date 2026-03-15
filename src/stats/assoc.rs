@@ -9,6 +9,7 @@ use pyo3::Bound;
 use pyo3::BoundObject;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -1907,101 +1908,2091 @@ fn dot_loop(a: &[f64], b: &[f64]) -> f64 {
 }
 
 #[inline]
-fn matvec_k_plus_lambda(k: &[f64], n: usize, lbd: f64, x: &[f64], out: &mut [f64]) {
-    debug_assert_eq!(x.len(), n);
-    debug_assert_eq!(out.len(), n);
-    for i in 0..n {
-        let row = &k[i * n..(i + 1) * n];
-        let mut s = lbd * x[i];
-        for j in 0..n {
-            s += row[j] * x[j];
-        }
-        out[i] = s;
+fn dot_loop_unrolled(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut s0 = 0.0_f64;
+    let mut s1 = 0.0_f64;
+    let mut s2 = 0.0_f64;
+    let mut s3 = 0.0_f64;
+    let mut i = 0usize;
+    while i + 3 < n {
+        s0 += a[i] * b[i];
+        s1 += a[i + 1] * b[i + 1];
+        s2 += a[i + 2] * b[i + 2];
+        s3 += a[i + 3] * b[i + 3];
+        i += 4;
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+#[inline]
+fn axpy_scaled_unrolled(y: &mut [f64], x: &[f64], alpha: f64) {
+    debug_assert_eq!(y.len(), x.len());
+    if alpha == 0.0 {
+        return;
+    }
+    let n = y.len();
+    let mut i = 0usize;
+    while i + 3 < n {
+        y[i] += x[i] * alpha;
+        y[i + 1] += x[i + 1] * alpha;
+        y[i + 2] += x[i + 2] * alpha;
+        y[i + 3] += x[i + 3] * alpha;
+        i += 4;
+    }
+    while i < n {
+        y[i] += x[i] * alpha;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_loop_avx2(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::{
+        __m256d, _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_setzero_pd,
+        _mm256_storeu_pd,
+    };
+
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut i = 0usize;
+    let mut acc: __m256d = _mm256_setzero_pd();
+    while i + 4 <= n {
+        let va = unsafe { _mm256_loadu_pd(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_pd(b.as_ptr().add(i)) };
+        acc = _mm256_add_pd(acc, _mm256_mul_pd(va, vb));
+        i += 4;
+    }
+    let mut lanes = [0.0_f64; 4];
+    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), acc) };
+    let mut s = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn axpy_scaled_avx2(y: &mut [f64], x: &[f64], alpha: f64) {
+    use std::arch::x86_64::{
+        _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_set1_pd, _mm256_storeu_pd,
+    };
+
+    debug_assert_eq!(y.len(), x.len());
+    let n = y.len();
+    let mut i = 0usize;
+    let a = _mm256_set1_pd(alpha);
+    while i + 4 <= n {
+        let vy = unsafe { _mm256_loadu_pd(y.as_ptr().add(i)) };
+        let vx = unsafe { _mm256_loadu_pd(x.as_ptr().add(i)) };
+        let out = _mm256_add_pd(vy, _mm256_mul_pd(vx, a));
+        unsafe { _mm256_storeu_pd(y.as_mut_ptr().add(i), out) };
+        i += 4;
+    }
+    while i < n {
+        y[i] += x[i] * alpha;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_loop_neon(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::aarch64::{
+        vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64,
+    };
+
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut i = 0usize;
+    let mut acc = vdupq_n_f64(0.0);
+    while i + 2 <= n {
+        let va = unsafe { vld1q_f64(a.as_ptr().add(i)) };
+        let vb = unsafe { vld1q_f64(b.as_ptr().add(i)) };
+        acc = vaddq_f64(acc, vmulq_f64(va, vb));
+        i += 2;
+    }
+    let mut lanes = [0.0_f64; 2];
+    unsafe { vst1q_f64(lanes.as_mut_ptr(), acc) };
+    let mut s = lanes[0] + lanes[1];
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn axpy_scaled_neon(y: &mut [f64], x: &[f64], alpha: f64) {
+    use std::arch::aarch64::{
+        vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64,
+    };
+
+    debug_assert_eq!(y.len(), x.len());
+    let n = y.len();
+    let mut i = 0usize;
+    let a = vdupq_n_f64(alpha);
+    while i + 2 <= n {
+        let vy = unsafe { vld1q_f64(y.as_ptr().add(i)) };
+        let vx = unsafe { vld1q_f64(x.as_ptr().add(i)) };
+        let out = vaddq_f64(vy, vmulq_f64(vx, a));
+        unsafe { vst1q_f64(y.as_mut_ptr().add(i), out) };
+        i += 2;
+    }
+    while i < n {
+        y[i] += x[i] * alpha;
+        i += 1;
     }
 }
 
 #[inline]
-fn pcg_solve_k_plus_lambda(
-    k: &[f64],
+fn dot_loop_simd(a: &[f64], b: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { dot_loop_avx2(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { dot_loop_neon(a, b) };
+    }
+    #[allow(unreachable_code)]
+    dot_loop_unrolled(a, b)
+}
+
+#[inline]
+fn axpy_scaled_simd(y: &mut [f64], x: &[f64], alpha: f64) {
+    if alpha == 0.0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                axpy_scaled_avx2(y, x, alpha);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            axpy_scaled_neon(y, x, alpha);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    axpy_scaled_unrolled(y, x, alpha)
+}
+
+#[inline]
+fn auto_precond_rank(n: usize, m: usize, threads: usize) -> usize {
+    let mut rank = if n <= 512 {
+        16
+    } else if n <= 2048 {
+        32
+    } else if n <= 4096 {
+        40
+    } else {
+        48
+    };
+    if m <= 1024 {
+        rank = rank.min(24);
+    }
+    if m >= 20000 && n >= 2048 {
+        rank = (rank + 8).min(96);
+    }
+    if threads >= 16 {
+        rank = (rank + 8).min(96);
+    }
+    rank.min(n).max(1)
+}
+
+#[inline]
+fn auto_block_size(n: usize, m: usize, threads: usize) -> usize {
+    // Prefer a conservative block size for lower peak memory / stable throughput.
+    let mut bs = if n >= 8000 {
+        1
+    } else if n >= 4000 {
+        2
+    } else if n >= 2000 {
+        if m >= 1500 {
+            8
+        } else {
+            4
+        }
+    } else if n >= 1000 {
+        8
+    } else {
+        12
+    };
+    let t = threads.max(1);
+    let target_chunks = t.saturating_mul(6).max(1);
+    let cap = ((m + target_chunks - 1) / target_chunks).max(1);
+    bs = bs.min(cap);
+    bs.clamp(1, 32)
+}
+
+#[inline]
+fn auto_scan_rhs_cap(
+    requested_block_size: usize,
     n: usize,
+    precond_rank: usize,
+    threads: usize,
+) -> usize {
+    let requested = requested_block_size.max(1);
+    let mut rhs_cap = if n >= 12000 {
+        1
+    } else if n >= 6000 {
+        2
+    } else if n >= 3000 {
+        4
+    } else if n >= 1500 {
+        6
+    } else {
+        8
+    };
+    if precond_rank >= 64 {
+        rhs_cap = rhs_cap.min(4);
+    }
+    if threads >= 16 {
+        rhs_cap = rhs_cap.min(4);
+    }
+
+    // Keep per-thread scratch within a conservative budget.
+    let budget_bytes: usize = 384 * 1024 * 1024;
+    let t = threads.max(1);
+    let per_thread_budget = budget_bytes / t;
+    let fixed_bytes = 8usize.saturating_mul(n); // centered_row
+    let per_rhs_bytes = 8usize.saturating_mul(
+        6usize
+            .saturating_mul(n)
+            .saturating_add(precond_rank)
+            .saturating_add(6),
+    );
+    if per_rhs_bytes > 0 {
+        if per_thread_budget > fixed_bytes {
+            let mem_cap = (per_thread_budget - fixed_bytes) / per_rhs_bytes;
+            rhs_cap = rhs_cap.min(mem_cap.max(1));
+        } else {
+            rhs_cap = 1;
+        }
+    }
+
+    rhs_cap.clamp(1, requested)
+}
+
+#[inline]
+fn score_vr_maf_bin(maf: f64) -> usize {
+    if maf < 0.01 {
+        0
+    } else if maf < 0.05 {
+        1
+    } else if maf < 0.10 {
+        2
+    } else if maf < 0.20 {
+        3
+    } else if maf <= 0.5 {
+        4
+    } else {
+        5
+    }
+}
+
+fn sample_even_indices(src: &[usize], k: usize) -> Vec<usize> {
+    if k == 0 || src.is_empty() {
+        return Vec::new();
+    }
+    if k >= src.len() {
+        return src.to_vec();
+    }
+    let len = src.len();
+    let mut out = Vec::<usize>::with_capacity(k);
+    for t in 0..k {
+        let num = (2 * t + 1) * len;
+        let den = 2 * k;
+        let pos = (num / den).min(len - 1);
+        out.push(src[pos]);
+    }
+    out
+}
+
+fn choose_score_vr_calibration_indices(g_flat: &[f32], m_scan: usize, n: usize, calib: usize) -> Vec<usize> {
+    if m_scan == 0 {
+        return Vec::new();
+    }
+    let calib = calib.min(m_scan).max(1);
+    let mut bins: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    for row in 0..m_scan {
+        let row_off = row * n;
+        let row_slice = &g_flat[row_off..row_off + n];
+        let mut sum = 0.0_f64;
+        let mut cnt = 0usize;
+        for &v in row_slice.iter() {
+            if v.is_finite() && v >= 0.0 {
+                sum += v as f64;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            continue;
+        }
+        let p = (sum / (cnt as f64)) * 0.5;
+        let maf = p.min(1.0 - p).clamp(0.0, 0.5);
+        let b = score_vr_maf_bin(maf);
+        bins[b].push(row);
+    }
+
+    let mut nonempty = Vec::<usize>::new();
+    let mut total = 0usize;
+    for b in 0..bins.len() {
+        if !bins[b].is_empty() {
+            nonempty.push(b);
+            total += bins[b].len();
+        }
+    }
+    if nonempty.is_empty() {
+        return sample_even_indices(&(0..m_scan).collect::<Vec<_>>(), calib);
+    }
+
+    let mut quota = vec![0usize; bins.len()];
+    let mut quota_sum = 0usize;
+    for &b in nonempty.iter() {
+        let len_b = bins[b].len();
+        let mut q = (calib * len_b + total / 2) / total; // nearest integer
+        q = q.max(1).min(len_b);
+        quota[b] = q;
+        quota_sum += q;
+    }
+
+    while quota_sum > calib {
+        let mut changed = false;
+        for &b in nonempty.iter() {
+            if quota_sum <= calib {
+                break;
+            }
+            if quota[b] > 1 {
+                quota[b] -= 1;
+                quota_sum -= 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    while quota_sum < calib {
+        let mut changed = false;
+        for &b in nonempty.iter() {
+            if quota_sum >= calib {
+                break;
+            }
+            if quota[b] < bins[b].len() {
+                quota[b] += 1;
+                quota_sum += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut selected = Vec::<usize>::with_capacity(calib);
+    let mut used = vec![false; m_scan];
+    for &b in nonempty.iter() {
+        let picks = sample_even_indices(&bins[b], quota[b]);
+        for idx in picks {
+            if !used[idx] {
+                used[idx] = true;
+                selected.push(idx);
+            }
+        }
+    }
+
+    if selected.len() < calib {
+        let all = (0..m_scan).collect::<Vec<_>>();
+        let extra = sample_even_indices(&all, calib);
+        for idx in extra {
+            if selected.len() >= calib {
+                break;
+            }
+            if !used[idx] {
+                used[idx] = true;
+                selected.push(idx);
+            }
+        }
+    }
+    selected.truncate(calib);
+    selected
+}
+
+#[derive(Clone)]
+struct PackedGeno2Bit {
+    n: usize,
+    m: usize,
+    bytes_per_snp: usize,
+    // SNP-major packed bytes, 2-bit per sample:
+    // 00 -> 0, 01 -> 1, 10 -> 2, 11 -> missing
+    packed: Vec<u8>,
+    row_mean: Vec<f64>,
+    diag_k: Vec<f64>,
+    mean_diag_k: f64,
+}
+
+#[inline]
+fn quantize_hardcall(v: f32) -> Option<u8> {
+    let r = v.round();
+    if (v - r).abs() <= 1e-3 && r >= 0.0 && r <= 2.0 {
+        Some(r as u8)
+    } else {
+        None
+    }
+}
+
+fn pack_snp_major_genotype_2bit(g_flat: &[f32], m: usize, n: usize) -> PyResult<PackedGeno2Bit> {
+    if m == 0 || n == 0 {
+        return Err(PyRuntimeError::new_err(
+            "kinship_geno must be non-empty (m, n)",
+        ));
+    }
+    if g_flat.len() != m * n {
+        return Err(PyRuntimeError::new_err("kinship_geno flat length mismatch"));
+    }
+
+    let bytes_per_snp = (n + 3) / 4;
+    let mut packed = vec![0_u8; m * bytes_per_snp];
+    let mut row_mean = vec![0.0_f64; m];
+    let mut diag_acc = vec![0.0_f64; n];
+
+    for snp in 0..m {
+        let row = &g_flat[snp * n..(snp + 1) * n];
+
+        let mut sum = 0.0_f64;
+        let mut cnt = 0_usize;
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() || v < 0.0 {
+                continue;
+            }
+            let code = quantize_hardcall(v).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "kinship_geno must be hard-call 0/1/2 (or missing). invalid value={v} at snp={snp}, sample={i}"
+                ))
+            })?;
+            sum += code as f64;
+            cnt += 1;
+        }
+        let mu = if cnt > 0 { sum / (cnt as f64) } else { 0.0 };
+        row_mean[snp] = mu;
+
+        let c0 = -mu;
+        let c1 = 1.0 - mu;
+        let c2 = 2.0 - mu;
+
+        let row_bytes = &mut packed[snp * bytes_per_snp..(snp + 1) * bytes_per_snp];
+        row_bytes.fill(0_u8);
+        for i in 0..n {
+            let v = row[i];
+            let code = if !v.is_finite() || v < 0.0 {
+                3_u8
+            } else {
+                quantize_hardcall(v).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "kinship_geno must be hard-call 0/1/2 (or missing). invalid value={v} at snp={snp}, sample={i}"
+                    ))
+                })?
+            };
+            let centered = match code {
+                0 => c0,
+                1 => c1,
+                2 => c2,
+                _ => 0.0, // missing => imputed mean => centered 0
+            };
+            diag_acc[i] += centered * centered;
+
+            let byte_idx = i >> 2;
+            let shift = (i & 3) * 2;
+            row_bytes[byte_idx] |= code << shift;
+        }
+    }
+
+    let inv_m = 1.0 / (m as f64);
+    let mut diag_k = vec![0.0_f64; n];
+    let mut mean_diag_k = 0.0_f64;
+    for i in 0..n {
+        let d = (diag_acc[i] * inv_m).max(1e-12);
+        diag_k[i] = d;
+        mean_diag_k += d;
+    }
+    mean_diag_k /= n as f64;
+
+    Ok(PackedGeno2Bit {
+        n,
+        m,
+        bytes_per_snp,
+        packed,
+        row_mean,
+        diag_k,
+        mean_diag_k,
+    })
+}
+
+#[inline]
+fn accumulate_dot_tile(
+    centered_row: &[f64],
+    p_block: &[f64],
+    rhs: usize,
+    n: usize,
+    base: usize,
+    end: usize,
+    dots: &mut [f64],
+) {
+    if base >= end {
+        return;
+    }
+    let len = end - base;
+    let x_tile = &centered_row[base..end];
+    for c in 0..rhs {
+        let off = c * n + base;
+        let y_tile = &p_block[off..off + len];
+        dots[c] += dot_loop_simd(x_tile, y_tile);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn decode_16bytes_to_codes64_neon(src: *const u8, dst: *mut u8) {
+    use std::arch::aarch64::{
+        uint8x16x4_t, vandq_u8, vdupq_n_u8, vld1q_u8, vshrq_n_u8, vst4q_u8,
+    };
+
+    let b = unsafe { vld1q_u8(src) };
+    let mask = vdupq_n_u8(0x03);
+    let c0 = vandq_u8(b, mask);
+    let c1 = vandq_u8(vshrq_n_u8(b, 2), mask);
+    let c2 = vandq_u8(vshrq_n_u8(b, 4), mask);
+    let c3 = vshrq_n_u8(b, 6);
+    let quad = uint8x16x4_t(c0, c1, c2, c3);
+    unsafe { vst4q_u8(dst, quad) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_32bytes_to_code_planes_avx2(
+    src: *const u8,
+    p0: *mut u8,
+    p1: *mut u8,
+    p2: *mut u8,
+    p3: *mut u8,
+) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_srli_epi16,
+        _mm256_storeu_si256,
+    };
+
+    let b = unsafe { _mm256_loadu_si256(src as *const __m256i) };
+    let mask = _mm256_set1_epi8(0x03);
+    let c0 = _mm256_and_si256(b, mask);
+    let c1 = _mm256_and_si256(_mm256_srli_epi16(b, 2), mask);
+    let c2 = _mm256_and_si256(_mm256_srli_epi16(b, 4), mask);
+    let c3 = _mm256_and_si256(_mm256_srli_epi16(b, 6), mask);
+    unsafe {
+        _mm256_storeu_si256(p0 as *mut __m256i, c0);
+        _mm256_storeu_si256(p1 as *mut __m256i, c1);
+        _mm256_storeu_si256(p2 as *mut __m256i, c2);
+        _mm256_storeu_si256(p3 as *mut __m256i, c3);
+    }
+}
+
+#[inline]
+fn decode_centered_row_and_dot_packed_2bit(
+    op: &PackedGeno2Bit,
+    snp_idx: usize,
+    p_block: &[f64],
+    rhs: usize,
+    centered_row: &mut [f64],
+    dots: &mut [f64],
+) {
+    let n = op.n;
+    const DOT_TILE_N: usize = 256;
+
+    debug_assert!(snp_idx < op.m);
+    debug_assert_eq!(centered_row.len(), n);
+    debug_assert_eq!(p_block.len(), rhs * n);
+    debug_assert!(dots.len() >= rhs);
+    if rhs == 0 {
+        return;
+    }
+
+    dots[..rhs].fill(0.0);
+
+    let mu = op.row_mean[snp_idx];
+    let c0 = -mu;
+    let c1 = 1.0 - mu;
+    let c2 = 2.0 - mu;
+    let c3 = 0.0_f64;
+
+    let off = snp_idx * op.bytes_per_snp;
+    let row_bytes = &op.packed[off..off + op.bytes_per_snp];
+    let mut i = 0usize;
+    let mut byte_i = 0usize;
+    let mut tile_start = 0usize;
+    let lut = [c0, c1, c2, c3];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            const BYTES_PER_SIMD: usize = 32;
+            const CODES_PER_SIMD: usize = BYTES_PER_SIMD * 4;
+            let mut code0 = [0_u8; BYTES_PER_SIMD];
+            let mut code1 = [0_u8; BYTES_PER_SIMD];
+            let mut code2 = [0_u8; BYTES_PER_SIMD];
+            let mut code3 = [0_u8; BYTES_PER_SIMD];
+            while byte_i + BYTES_PER_SIMD <= row_bytes.len() && i + CODES_PER_SIMD <= n {
+                unsafe {
+                    decode_32bytes_to_code_planes_avx2(
+                        row_bytes.as_ptr().add(byte_i),
+                        code0.as_mut_ptr(),
+                        code1.as_mut_ptr(),
+                        code2.as_mut_ptr(),
+                        code3.as_mut_ptr(),
+                    );
+                }
+                for j in 0..BYTES_PER_SIMD {
+                    let base = i + (j << 2);
+                    centered_row[base] = lut[code0[j] as usize];
+                    centered_row[base + 1] = lut[code1[j] as usize];
+                    centered_row[base + 2] = lut[code2[j] as usize];
+                    centered_row[base + 3] = lut[code3[j] as usize];
+                }
+                i += CODES_PER_SIMD;
+                byte_i += BYTES_PER_SIMD;
+
+                while i >= tile_start + DOT_TILE_N {
+                    let end = tile_start + DOT_TILE_N;
+                    accumulate_dot_tile(centered_row, p_block, rhs, n, tile_start, end, dots);
+                    tile_start = end;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        const BYTES_PER_SIMD: usize = 16;
+        const CODES_PER_SIMD: usize = BYTES_PER_SIMD * 4;
+        let mut codes = [0_u8; CODES_PER_SIMD];
+        while byte_i + BYTES_PER_SIMD <= row_bytes.len() && i + CODES_PER_SIMD <= n {
+            unsafe {
+                decode_16bytes_to_codes64_neon(
+                    row_bytes.as_ptr().add(byte_i),
+                    codes.as_mut_ptr(),
+                );
+            }
+            for j in 0..CODES_PER_SIMD {
+                centered_row[i + j] = lut[codes[j] as usize];
+            }
+            i += CODES_PER_SIMD;
+            byte_i += BYTES_PER_SIMD;
+
+            while i >= tile_start + DOT_TILE_N {
+                let end = tile_start + DOT_TILE_N;
+                accumulate_dot_tile(centered_row, p_block, rhs, n, tile_start, end, dots);
+                tile_start = end;
+            }
+        }
+    }
+
+    while byte_i < row_bytes.len() {
+        let byte = row_bytes[byte_i];
+        byte_i += 1;
+        for shift in [0_u8, 2, 4, 6] {
+            if i >= n {
+                break;
+            }
+            let code = (byte >> shift) & 0b11;
+            centered_row[i] = lut[code as usize];
+            i += 1;
+        }
+        while i >= tile_start + DOT_TILE_N {
+            let end = tile_start + DOT_TILE_N;
+            accumulate_dot_tile(centered_row, p_block, rhs, n, tile_start, end, dots);
+            tile_start = end;
+        }
+    }
+
+    if tile_start < n {
+        accumulate_dot_tile(centered_row, p_block, rhs, n, tile_start, n, dots);
+    }
+}
+
+#[inline]
+fn matmat_k_plus_lambda_packed_2bit(
+    op: &PackedGeno2Bit,
     lbd: f64,
-    m_inv: &[f64],
-    b: &[f64],
-    x: &mut [f64],
-    r: &mut [f64],
-    z: &mut [f64],
-    p: &mut [f64],
-    ap: &mut [f64],
+    p_block: &[f64], // column-major: rhs blocks of len n
+    rhs: usize,
+    out_block: &mut [f64], // column-major
+    centered_row: &mut [f64],
+    dots: &mut [f64],
+) {
+    let n = op.n;
+    debug_assert_eq!(p_block.len(), rhs * n);
+    debug_assert_eq!(out_block.len(), rhs * n);
+    debug_assert_eq!(centered_row.len(), n);
+    debug_assert!(dots.len() >= rhs);
+    if rhs == 0 {
+        return;
+    }
+
+    out_block.fill(0.0);
+    for snp_idx in 0..op.m {
+        // Decode + dot are fused in one pass to reduce memory traffic.
+        decode_centered_row_and_dot_packed_2bit(op, snp_idx, p_block, rhs, centered_row, dots);
+
+        for c in 0..rhs {
+            let d = dots[c];
+            if d == 0.0 {
+                continue;
+            }
+            let out_col = &mut out_block[c * n..(c + 1) * n];
+            axpy_scaled_simd(out_col, centered_row, d);
+        }
+    }
+
+    let inv_m = 1.0 / (op.m as f64);
+    for c in 0..rhs {
+        let off = c * n;
+        for i in 0..n {
+            out_block[off + i] = out_block[off + i] * inv_m + lbd * p_block[off + i];
+        }
+    }
+}
+
+struct RandNysPrecond {
+    n: usize,
+    rank: usize,
+    // Column-major (n, rank)
+    u: Vec<f64>,
+    // Approximate top eigenvalues of K
+    d: Vec<f64>,
+}
+
+fn mgs_orthonormalize_columns(mat: &mut [f64], n: usize, cols: usize) -> usize {
+    let mut kept = 0usize;
+    for j in 0..cols {
+        for k in 0..kept {
+            let proj = dot_loop(&mat[k * n..(k + 1) * n], &mat[j * n..(j + 1) * n]);
+            for i in 0..n {
+                mat[j * n + i] -= proj * mat[k * n + i];
+            }
+        }
+        let norm2 = dot_loop(&mat[j * n..(j + 1) * n], &mat[j * n..(j + 1) * n]);
+        if !norm2.is_finite() || norm2 <= 1e-18 {
+            continue;
+        }
+        let inv = 1.0 / norm2.sqrt();
+        if kept != j {
+            for i in 0..n {
+                mat[kept * n + i] = mat[j * n + i] * inv;
+            }
+        } else {
+            for i in 0..n {
+                mat[j * n + i] *= inv;
+            }
+        }
+        kept += 1;
+    }
+    kept
+}
+
+fn build_rand_nys_precond(
+    op: &PackedGeno2Bit,
+    rank: usize,
+    oversample: usize,
+    seed: u64,
+) -> Option<RandNysPrecond> {
+    let n = op.n;
+    if n < 2 || rank == 0 {
+        return None;
+    }
+    let rank = rank.min(n).max(1);
+    let q = (rank.saturating_mul(oversample.max(1))).max(rank).min(n);
+    if q == 0 {
+        return None;
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut omega = vec![0.0_f64; n * q];
+    for v in omega.iter_mut() {
+        *v = rng.sample(StandardNormal);
+    }
+    let q_eff = mgs_orthonormalize_columns(&mut omega, n, q);
+    if q_eff == 0 {
+        return None;
+    }
+    omega.truncate(n * q_eff);
+
+    let mut y = vec![0.0_f64; n * q_eff];
+    let mut centered = vec![0.0_f64; n];
+    let mut dots = vec![0.0_f64; q_eff];
+    matmat_k_plus_lambda_packed_2bit(op, 0.0, &omega, q_eff, &mut y, &mut centered, &mut dots);
+
+    let norm_y = dot_loop(&y, &y).sqrt();
+    let shift = (n as f64).sqrt() * f64::EPSILON * norm_y.max(1.0);
+    for i in 0..(n * q_eff) {
+        y[i] += shift * omega[i];
+    }
+
+    // W = (Omega^T Y + Y^T Omega) / 2, row-major.
+    let mut w = vec![0.0_f64; q_eff * q_eff];
+    for i in 0..q_eff {
+        for j in 0..=i {
+            let oi = &omega[i * n..(i + 1) * n];
+            let oj = &omega[j * n..(j + 1) * n];
+            let yi = &y[i * n..(i + 1) * n];
+            let yj = &y[j * n..(j + 1) * n];
+            let v = 0.5 * (dot_loop(oi, yj) + dot_loop(oj, yi));
+            w[i * q_eff + j] = v;
+            w[j * q_eff + i] = v;
+        }
+    }
+    let mut l = w;
+    cholesky_inplace(&mut l, q_eff)?;
+    drop(omega);
+
+    // Convert Y to B = Y * L^{-T} in-place, stored column-major (n, q_eff).
+    let mut tmp = vec![0.0_f64; q_eff];
+    let mut sol = vec![0.0_f64; q_eff];
+    for row in 0..n {
+        for t in 0..q_eff {
+            tmp[t] = y[t * n + row];
+        }
+        for r in 0..q_eff {
+            let mut s = tmp[r];
+            for k in 0..r {
+                s -= l[r * q_eff + k] * sol[k];
+            }
+            let d = l[r * q_eff + r];
+            if !d.is_finite() || d.abs() < 1e-14 {
+                return None;
+            }
+            sol[r] = s / d;
+        }
+        for r in 0..q_eff {
+            y[r * n + row] = sol[r];
+        }
+    }
+
+    let mut btb = vec![0.0_f64; q_eff * q_eff];
+    for i in 0..q_eff {
+        for j in 0..=i {
+            let v = dot_loop(&y[i * n..(i + 1) * n], &y[j * n..(j + 1) * n]);
+            btb[i * q_eff + j] = v;
+            btb[j * q_eff + i] = v;
+        }
+    }
+    let eig = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(q_eff, q_eff, &btb));
+    let mut order: Vec<usize> = (0..q_eff).collect();
+    order.sort_by(|&a, &bidx| eig.eigenvalues[bidx].total_cmp(&eig.eigenvalues[a]));
+
+    let mut u_cols = vec![0.0_f64; n * rank];
+    let mut d_vals = Vec::<f64>::with_capacity(rank);
+    let mut kept = 0usize;
+    for idx in order {
+        if kept >= rank {
+            break;
+        }
+        let s2 = eig.eigenvalues[idx];
+        if !s2.is_finite() || s2 <= 1e-12 {
+            continue;
+        }
+        let lam = (s2 - shift).max(0.0);
+        if lam <= 1e-12 {
+            continue;
+        }
+        let s = s2.sqrt();
+        if s <= 1e-12 || !s.is_finite() {
+            continue;
+        }
+
+        for i in 0..n {
+            let mut acc = 0.0_f64;
+            for t in 0..q_eff {
+                let v_t = eig.eigenvectors[(t, idx)];
+                acc += y[t * n + i] * v_t;
+            }
+            u_cols[kept * n + i] = acc / s;
+        }
+
+        // Re-orthogonalize the produced vector for numerical stability.
+        for k in 0..kept {
+            let proj = dot_loop(
+                &u_cols[k * n..(k + 1) * n],
+                &u_cols[kept * n..(kept + 1) * n],
+            );
+            for i in 0..n {
+                u_cols[kept * n + i] -= proj * u_cols[k * n + i];
+            }
+        }
+        let norm2 = dot_loop(
+            &u_cols[kept * n..(kept + 1) * n],
+            &u_cols[kept * n..(kept + 1) * n],
+        );
+        if !norm2.is_finite() || norm2 <= 1e-18 {
+            continue;
+        }
+        let inv = 1.0 / norm2.sqrt();
+        for i in 0..n {
+            u_cols[kept * n + i] *= inv;
+        }
+        d_vals.push(lam);
+        kept += 1;
+    }
+    if kept == 0 {
+        return None;
+    }
+    u_cols.truncate(n * kept);
+    Some(RandNysPrecond {
+        n,
+        rank: kept,
+        u: u_cols,
+        d: d_vals,
+    })
+}
+
+#[inline]
+fn apply_rand_nys_precond_vec(
+    precond: &RandNysPrecond,
+    lbd: f64,
+    v: &[f64],
+    out: &mut [f64],
+    tmp_proj: &mut [f64],
+) {
+    let n = v.len();
+    let rank = precond.rank;
+    debug_assert_eq!(precond.n, n);
+    debug_assert_eq!(out.len(), n);
+    debug_assert_eq!(tmp_proj.len(), rank);
+
+    out.copy_from_slice(v);
+    for (k, tk) in tmp_proj.iter_mut().enumerate().take(rank) {
+        let uk = &precond.u[k * n..(k + 1) * n];
+        let dot_uv = dot_loop(uk, v);
+        let denom = precond.d[k] + lbd;
+        let scale = if denom.is_finite() && denom > 1e-14 {
+            precond.d[k] / denom
+        } else {
+            0.0
+        };
+        *tk = dot_uv * scale;
+    }
+    for (k, tk) in tmp_proj.iter().enumerate().take(rank) {
+        if *tk == 0.0 {
+            continue;
+        }
+        let uk = &precond.u[k * n..(k + 1) * n];
+        for i in 0..n {
+            out[i] -= uk[i] * *tk;
+        }
+    }
+}
+
+#[inline]
+fn apply_precond_block_packed(
+    precond: Option<&RandNysPrecond>,
+    lbd: f64,
+    m_inv_diag: &[f64],
+    v_block: &[f64], // column-major
+    rhs: usize,
+    out_block: &mut [f64],      // column-major
+    tmp_proj_block: &mut [f64], // rhs * rank
+) {
+    let n = m_inv_diag.len();
+    debug_assert_eq!(v_block.len(), rhs * n);
+    debug_assert_eq!(out_block.len(), rhs * n);
+    if let Some(pre) = precond {
+        let rank = pre.rank;
+        debug_assert_eq!(tmp_proj_block.len(), rhs * rank);
+        for c in 0..rhs {
+            let off = c * n;
+            let tmp = &mut tmp_proj_block[c * rank..(c + 1) * rank];
+            apply_rand_nys_precond_vec(
+                pre,
+                lbd,
+                &v_block[off..off + n],
+                &mut out_block[off..off + n],
+                tmp,
+            );
+        }
+    } else {
+        for c in 0..rhs {
+            let off = c * n;
+            for i in 0..n {
+                out_block[off + i] = m_inv_diag[i] * v_block[off + i];
+            }
+        }
+    }
+}
+
+fn pcg_solve_block_k_plus_lambda_packed(
+    op: &PackedGeno2Bit,
+    lbd: f64,
+    m_inv_diag: &[f64],
+    precond: Option<&RandNysPrecond>,
+    b_block: &[f64], // column-major (rhs, n)
+    rhs: usize,
+    x_block: &mut [f64],
+    r_block: &mut [f64],
+    z_block: &mut [f64],
+    p_block: &mut [f64],
+    ap_block: &mut [f64],
+    norm_b: &mut [f64],
+    rz_old: &mut [f64],
+    tmp_proj_block: &mut [f64], // rhs * rank
+    centered_row: &mut [f64],
+    dots: &mut [f64],
     tol: f64,
     max_iter: usize,
 ) -> bool {
-    debug_assert_eq!(m_inv.len(), n);
-    debug_assert_eq!(b.len(), n);
-    debug_assert_eq!(x.len(), n);
-    debug_assert_eq!(r.len(), n);
-    debug_assert_eq!(z.len(), n);
-    debug_assert_eq!(p.len(), n);
-    debug_assert_eq!(ap.len(), n);
+    let n = op.n;
+    let size = rhs * n;
+    debug_assert_eq!(m_inv_diag.len(), n);
+    debug_assert_eq!(b_block.len(), size);
+    debug_assert_eq!(x_block.len(), size);
+    debug_assert_eq!(r_block.len(), size);
+    debug_assert_eq!(z_block.len(), size);
+    debug_assert_eq!(p_block.len(), size);
+    debug_assert_eq!(ap_block.len(), size);
+    debug_assert!(norm_b.len() >= rhs);
+    debug_assert!(rz_old.len() >= rhs);
 
-    x.fill(0.0);
-    r.copy_from_slice(b);
+    x_block.fill(0.0);
+    r_block.copy_from_slice(b_block);
+    apply_precond_block_packed(
+        precond,
+        lbd,
+        m_inv_diag,
+        r_block,
+        rhs,
+        z_block,
+        tmp_proj_block,
+    );
+    p_block.copy_from_slice(z_block);
 
-    let mut norm_b2 = dot_loop(b, b);
-    if !norm_b2.is_finite() || norm_b2 <= 0.0 {
-        norm_b2 = 1.0;
-    }
-    let norm_b = norm_b2.sqrt();
-
-    for i in 0..n {
-        z[i] = m_inv[i] * r[i];
-        p[i] = z[i];
-    }
-    let mut rz_old = dot_loop(r, z);
-    if !rz_old.is_finite() || rz_old.abs() < 1e-30 {
-        return true;
-    }
-
-    let tol = if tol.is_finite() && tol > 0.0 { tol } else { 1e-6 };
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-6
+    };
     let max_iter = max_iter.max(1);
 
+    let norm_b = &mut norm_b[..rhs];
+    let rz_old = &mut rz_old[..rhs];
+    for c in 0..rhs {
+        let bc = &b_block[c * n..(c + 1) * n];
+        let rc = &r_block[c * n..(c + 1) * n];
+        let zc = &z_block[c * n..(c + 1) * n];
+        let nb2 = dot_loop(bc, bc);
+        norm_b[c] = if nb2.is_finite() && nb2 > 0.0 {
+            nb2.sqrt()
+        } else {
+            1.0
+        };
+        rz_old[c] = dot_loop(rc, zc);
+    }
+
     for _ in 0..max_iter {
-        matvec_k_plus_lambda(k, n, lbd, p, ap);
-        let denom = dot_loop(p, ap);
-        if !denom.is_finite() || denom.abs() < 1e-30 {
-            break;
-        }
-        let alpha = rz_old / denom;
-        if !alpha.is_finite() {
-            break;
-        }
+        matmat_k_plus_lambda_packed_2bit(op, lbd, p_block, rhs, ap_block, centered_row, dots);
 
-        for i in 0..n {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * ap[i];
+        let mut all_done = true;
+        for c in 0..rhs {
+            let off = c * n;
+            let pc = &p_block[off..off + n];
+            let apc = &ap_block[off..off + n];
+            let denom = dot_loop(pc, apc);
+            if !denom.is_finite() || denom.abs() < 1e-30 {
+                continue;
+            }
+            let alpha = rz_old[c] / denom;
+            if !alpha.is_finite() {
+                continue;
+            }
+            for i in 0..n {
+                x_block[off + i] += alpha * p_block[off + i];
+                r_block[off + i] -= alpha * ap_block[off + i];
+            }
+            let rel = dot_loop(&r_block[off..off + n], &r_block[off..off + n]).sqrt() / norm_b[c];
+            if !rel.is_finite() || rel > tol {
+                all_done = false;
+            }
         }
-
-        let rel_res = dot_loop(r, r).sqrt() / norm_b;
-        if rel_res.is_finite() && rel_res <= tol {
+        if all_done {
             return true;
         }
 
-        for i in 0..n {
-            z[i] = m_inv[i] * r[i];
+        apply_precond_block_packed(
+            precond,
+            lbd,
+            m_inv_diag,
+            r_block,
+            rhs,
+            z_block,
+            tmp_proj_block,
+        );
+        for c in 0..rhs {
+            let off = c * n;
+            let rz_new = dot_loop(&r_block[off..off + n], &z_block[off..off + n]);
+            if !rz_new.is_finite() || !rz_old[c].is_finite() || rz_old[c].abs() < 1e-30 {
+                continue;
+            }
+            let beta = rz_new / rz_old[c];
+            if !beta.is_finite() {
+                continue;
+            }
+            for i in 0..n {
+                p_block[off + i] = z_block[off + i] + beta * p_block[off + i];
+            }
+            rz_old[c] = rz_new;
         }
-        let rz_new = dot_loop(r, z);
-        if !rz_new.is_finite() || rz_new.abs() < 1e-30 {
-            break;
-        }
-        let beta = rz_new / rz_old;
-        if !beta.is_finite() {
-            break;
-        }
-        for i in 0..n {
-            p[i] = z[i] + beta * p[i];
-        }
-        rz_old = rz_new;
     }
     false
+}
+
+fn pcg_solve_block_k_plus_lambda_packed_f32_rhs(
+    op: &PackedGeno2Bit,
+    lbd: f64,
+    m_inv_diag: &[f64],
+    precond: Option<&RandNysPrecond>,
+    b_block: &[f32], // row-major (rhs, n)
+    rhs: usize,
+    x_block: &mut [f64],
+    r_block: &mut [f64],
+    z_block: &mut [f64],
+    p_block: &mut [f64],
+    ap_block: &mut [f64],
+    norm_b: &mut [f64],
+    rz_old: &mut [f64],
+    tmp_proj_block: &mut [f64], // rhs * rank
+    centered_row: &mut [f64],
+    dots: &mut [f64],
+    tol: f64,
+    max_iter: usize,
+) -> bool {
+    let n = op.n;
+    let size = rhs * n;
+    debug_assert_eq!(m_inv_diag.len(), n);
+    debug_assert_eq!(b_block.len(), size);
+    debug_assert_eq!(x_block.len(), size);
+    debug_assert_eq!(r_block.len(), size);
+    debug_assert_eq!(z_block.len(), size);
+    debug_assert_eq!(p_block.len(), size);
+    debug_assert_eq!(ap_block.len(), size);
+    debug_assert!(norm_b.len() >= rhs);
+    debug_assert!(rz_old.len() >= rhs);
+
+    x_block.fill(0.0);
+    for i in 0..size {
+        r_block[i] = b_block[i] as f64;
+    }
+    apply_precond_block_packed(
+        precond,
+        lbd,
+        m_inv_diag,
+        r_block,
+        rhs,
+        z_block,
+        tmp_proj_block,
+    );
+    p_block.copy_from_slice(z_block);
+
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-6
+    };
+    let max_iter = max_iter.max(1);
+
+    let norm_b = &mut norm_b[..rhs];
+    let rz_old = &mut rz_old[..rhs];
+    for c in 0..rhs {
+        let bc = &b_block[c * n..(c + 1) * n];
+        let rc = &r_block[c * n..(c + 1) * n];
+        let zc = &z_block[c * n..(c + 1) * n];
+        let mut nb2 = 0.0_f64;
+        for &v in bc.iter() {
+            let vf = v as f64;
+            nb2 += vf * vf;
+        }
+        norm_b[c] = if nb2.is_finite() && nb2 > 0.0 {
+            nb2.sqrt()
+        } else {
+            1.0
+        };
+        rz_old[c] = dot_loop(rc, zc);
+    }
+
+    for _ in 0..max_iter {
+        matmat_k_plus_lambda_packed_2bit(op, lbd, p_block, rhs, ap_block, centered_row, dots);
+
+        let mut all_done = true;
+        for c in 0..rhs {
+            let off = c * n;
+            let pc = &p_block[off..off + n];
+            let apc = &ap_block[off..off + n];
+            let denom = dot_loop(pc, apc);
+            if !denom.is_finite() || denom.abs() < 1e-30 {
+                continue;
+            }
+            let alpha = rz_old[c] / denom;
+            if !alpha.is_finite() {
+                continue;
+            }
+            for i in 0..n {
+                x_block[off + i] += alpha * p_block[off + i];
+                r_block[off + i] -= alpha * ap_block[off + i];
+            }
+            let rel = dot_loop(&r_block[off..off + n], &r_block[off..off + n]).sqrt() / norm_b[c];
+            if !rel.is_finite() || rel > tol {
+                all_done = false;
+            }
+        }
+        if all_done {
+            return true;
+        }
+
+        apply_precond_block_packed(
+            precond,
+            lbd,
+            m_inv_diag,
+            r_block,
+            rhs,
+            z_block,
+            tmp_proj_block,
+        );
+        for c in 0..rhs {
+            let off = c * n;
+            let rz_new = dot_loop(&r_block[off..off + n], &z_block[off..off + n]);
+            if !rz_new.is_finite() || !rz_old[c].is_finite() || rz_old[c].abs() < 1e-30 {
+                continue;
+            }
+            let beta = rz_new / rz_old[c];
+            if !beta.is_finite() {
+                continue;
+            }
+            for i in 0..n {
+                p_block[off + i] = z_block[off + i] + beta * p_block[off + i];
+            }
+            rz_old[c] = rz_new;
+        }
+    }
+    false
+}
+
+struct MatrixFreeNullState {
+    vinv_y: Vec<f64>,
+    py: Vec<f64>,
+    a_chol: Vec<f64>, // Cholesky factor L of A
+    a_inv_b: Vec<f64>,
+    b_aib: f64,
+    y_vinv_y: f64,
+    sigma2_null: f64,
+    df: i32,
+}
+
+struct MatrixFreeNullScratch {
+    b_blk: Vec<f64>,
+    x_blk: Vec<f64>,
+    r_blk: Vec<f64>,
+    z_blk: Vec<f64>,
+    p_blk: Vec<f64>,
+    ap_blk: Vec<f64>,
+    norm_b: Vec<f64>,
+    rz_old: Vec<f64>,
+    tmp_proj: Vec<f64>,
+    centered_row: Vec<f64>,
+    dots: Vec<f64>,
+}
+
+impl MatrixFreeNullScratch {
+    fn new(n: usize, rhs_cap: usize, precond_rank: usize) -> Self {
+        Self {
+            b_blk: vec![0.0; n * rhs_cap],
+            x_blk: vec![0.0; n * rhs_cap],
+            r_blk: vec![0.0; n * rhs_cap],
+            z_blk: vec![0.0; n * rhs_cap],
+            p_blk: vec![0.0; n * rhs_cap],
+            ap_blk: vec![0.0; n * rhs_cap],
+            norm_b: vec![0.0; rhs_cap],
+            rz_old: vec![0.0; rhs_cap],
+            tmp_proj: vec![0.0; rhs_cap * precond_rank],
+            centered_row: vec![0.0; n],
+            dots: vec![0.0; rhs_cap],
+        }
+    }
+}
+
+struct MatrixFreeScanScratch {
+    c: Vec<f64>,
+    a_inv_c: Vec<f64>,
+    x_blk: Vec<f64>,
+    r_blk: Vec<f64>,
+    z_blk: Vec<f64>,
+    p_blk: Vec<f64>,
+    ap_blk: Vec<f64>,
+    norm_b: Vec<f64>,
+    rz_old: Vec<f64>,
+    tmp_proj: Vec<f64>,
+    centered_row: Vec<f64>,
+    dots: Vec<f64>,
+}
+
+impl MatrixFreeScanScratch {
+    fn new(n: usize, p_cov: usize, rhs_cap: usize, precond_rank: usize) -> Self {
+        Self {
+            c: vec![0.0; p_cov],
+            a_inv_c: vec![0.0; p_cov],
+            x_blk: vec![0.0; n * rhs_cap],
+            r_blk: vec![0.0; n * rhs_cap],
+            z_blk: vec![0.0; n * rhs_cap],
+            p_blk: vec![0.0; n * rhs_cap],
+            ap_blk: vec![0.0; n * rhs_cap],
+            norm_b: vec![0.0; rhs_cap],
+            rz_old: vec![0.0; rhs_cap],
+            tmp_proj: vec![0.0; rhs_cap * precond_rank],
+            centered_row: vec![0.0; n],
+            dots: vec![0.0; rhs_cap],
+        }
+    }
+}
+
+struct MatrixFreeScoreVrScratch {
+    c: Vec<f64>,
+    a_inv_c: Vec<f64>,
+}
+
+impl MatrixFreeScoreVrScratch {
+    fn new(p_cov: usize) -> Self {
+        Self {
+            c: vec![0.0; p_cov],
+            a_inv_c: vec![0.0; p_cov],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatrixFreeScanMode {
+    Exact,
+    ScoreVr,
+}
+
+impl MatrixFreeScanMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "exact" | "pcg_exact" | "pcg" => Some(Self::Exact),
+            "score_vr" | "scorevr" | "score-vr" => Some(Self::ScoreVr),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::ScoreVr => "score_vr",
+        }
+    }
+}
+
+#[pyclass(name = "RustPCGMatrixFreeState")]
+pub struct RustPcgMatrixFreeState {
+    op: PackedGeno2Bit,
+    xcov: Vec<f64>, // row-major (n, p)
+    y: Vec<f64>,    // len n
+    n: usize,
+    p_cov: usize,
+    lbd: f64,
+    pcg_tol: f64,
+    pcg_max_iter: usize,
+    block_size: usize,
+    scan_rhs_cap: usize,
+    m_inv_diag: Vec<f64>,
+    precond: Option<RandNysPrecond>,
+    precond_kind: String,
+    precond_rank: usize,
+    scan_mode: MatrixFreeScanMode,
+    scan_mode_name: String,
+    score_vr_calib_snps: usize,
+    score_vr_ratio: Option<f64>,
+    mean_diag_k: f64,
+    null_state: Option<MatrixFreeNullState>,
+}
+
+impl RustPcgMatrixFreeState {
+    fn estimate_score_vr_ratio(&self, g_flat: &[f32], m_scan: usize, ns: &MatrixFreeNullState) -> f64 {
+        if m_scan == 0 {
+            return 1.0;
+        }
+        let n = self.n;
+        let p_cov = self.p_cov;
+        let precond_rank = self.precond_rank;
+        let calib_idx = choose_score_vr_calibration_indices(
+            g_flat,
+            m_scan,
+            n,
+            self.score_vr_calib_snps,
+        );
+        if calib_idx.is_empty() {
+            return 1.0;
+        }
+
+        let mut x_blk = vec![0.0_f64; n];
+        let mut r_blk = vec![0.0_f64; n];
+        let mut z_blk = vec![0.0_f64; n];
+        let mut p_blk = vec![0.0_f64; n];
+        let mut ap_blk = vec![0.0_f64; n];
+        let mut norm_b = vec![0.0_f64; 1];
+        let mut rz_old = vec![0.0_f64; 1];
+        let mut tmp_proj = vec![0.0_f64; precond_rank];
+        let mut centered_row = vec![0.0_f64; n];
+        let mut dots = vec![0.0_f64; 1];
+        let mut c = vec![0.0_f64; p_cov];
+        let mut a_inv_c = vec![0.0_f64; p_cov];
+        let mut ratios = Vec::<f64>::with_capacity(calib_idx.len());
+        for &idx in calib_idx.iter() {
+            let row_off = idx * n;
+            let b_col = &g_flat[row_off..row_off + n];
+            let _ = pcg_solve_block_k_plus_lambda_packed_f32_rhs(
+                &self.op,
+                self.lbd,
+                &self.m_inv_diag,
+                self.precond.as_ref(),
+                b_col,
+                1,
+                &mut x_blk,
+                &mut r_blk,
+                &mut z_blk,
+                &mut p_blk,
+                &mut ap_blk,
+                &mut norm_b,
+                &mut rz_old,
+                &mut tmp_proj,
+                &mut centered_row,
+                &mut dots,
+                self.pcg_tol,
+                self.pcg_max_iter,
+            );
+
+            c.fill(0.0);
+            let mut d_exact = 0.0_f64;
+            let mut d_diag = 0.0_f64;
+            for i in 0..n {
+                let gi = b_col[i] as f64;
+                let vi_g_exact = x_blk[i];
+                let vi_g_diag = self.m_inv_diag[i] * gi;
+                d_exact += gi * vi_g_exact;
+                d_diag += gi * vi_g_diag;
+                let base = i * p_cov;
+                for rj in 0..p_cov {
+                    c[rj] += self.xcov[base + rj] * vi_g_exact;
+                }
+            }
+            cholesky_solve_into(&ns.a_chol, p_cov, &c, &mut a_inv_c);
+            let schur_exact = d_exact - dot_loop(&c, &a_inv_c);
+
+            c.fill(0.0);
+            for i in 0..n {
+                let gi = b_col[i] as f64;
+                let vi_g_diag = self.m_inv_diag[i] * gi;
+                let base = i * p_cov;
+                for rj in 0..p_cov {
+                    c[rj] += self.xcov[base + rj] * vi_g_diag;
+                }
+            }
+            cholesky_solve_into(&ns.a_chol, p_cov, &c, &mut a_inv_c);
+            let schur_diag = d_diag - dot_loop(&c, &a_inv_c);
+
+            if schur_exact.is_finite()
+                && schur_diag.is_finite()
+                && schur_exact > 1e-12
+                && schur_diag > 1e-12
+            {
+                ratios.push(schur_exact / schur_diag);
+            }
+        }
+
+        if ratios.is_empty() {
+            return 1.0;
+        }
+        ratios.sort_by(|a, b| a.total_cmp(b));
+        let mid = ratios.len() / 2;
+        let mut vr = if ratios.len() % 2 == 1 {
+            ratios[mid]
+        } else {
+            0.5 * (ratios[mid - 1] + ratios[mid])
+        };
+        if !vr.is_finite() || vr <= 0.0 {
+            vr = 1.0;
+        }
+        vr.clamp(0.1, 10.0)
+    }
+
+    fn fit_null_internal(&mut self) -> PyResult<()> {
+        let n = self.n;
+        let p_cov = self.p_cov;
+        let rhs0 = p_cov + 1;
+        let precond_rank = self.precond.as_ref().map(|p| p.rank).unwrap_or(0);
+
+        let mut scratch = MatrixFreeNullScratch::new(n, rhs0, precond_rank);
+        let b0_used = &mut scratch.b_blk[..rhs0 * n];
+        for c in 0..p_cov {
+            for i in 0..n {
+                b0_used[c * n + i] = self.xcov[i * p_cov + c];
+            }
+        }
+        for i in 0..n {
+            b0_used[p_cov * n + i] = self.y[i];
+        }
+
+        let x0_used = &mut scratch.x_blk[..rhs0 * n];
+        let r0_used = &mut scratch.r_blk[..rhs0 * n];
+        let z0_used = &mut scratch.z_blk[..rhs0 * n];
+        let p0_used = &mut scratch.p_blk[..rhs0 * n];
+        let ap0_used = &mut scratch.ap_blk[..rhs0 * n];
+        let norm_b0 = &mut scratch.norm_b[..rhs0];
+        let rz_old0 = &mut scratch.rz_old[..rhs0];
+        let tmp_proj0 = &mut scratch.tmp_proj[..rhs0 * precond_rank];
+        let dots0 = &mut scratch.dots[..rhs0];
+        let centered0 = &mut scratch.centered_row[..];
+
+        let _ = pcg_solve_block_k_plus_lambda_packed(
+            &self.op,
+            self.lbd,
+            &self.m_inv_diag,
+            self.precond.as_ref(),
+            b0_used,
+            rhs0,
+            x0_used,
+            r0_used,
+            z0_used,
+            p0_used,
+            ap0_used,
+            norm_b0,
+            rz_old0,
+            tmp_proj0,
+            centered0,
+            dots0,
+            self.pcg_tol,
+            self.pcg_max_iter,
+        );
+
+        let vinv_y = x0_used[p_cov * n..(p_cov + 1) * n].to_vec();
+        let mut a = vec![0.0_f64; p_cov * p_cov];
+        let mut b0 = vec![0.0_f64; p_cov];
+        let mut y_vinv_y = 0.0_f64;
+        for i in 0..n {
+            let yi = self.y[i];
+            let viy = vinv_y[i];
+            y_vinv_y += yi * viy;
+            let base = i * p_cov;
+            for rj in 0..p_cov {
+                let xir = self.xcov[base + rj];
+                b0[rj] += xir * viy;
+                for cj in 0..=rj {
+                    let vix = x0_used[cj * n + i];
+                    a[rj * p_cov + cj] += xir * vix;
+                }
+            }
+        }
+        for rj in 0..p_cov {
+            a[rj * p_cov + rj] += 1e-6;
+            for cj in 0..rj {
+                let v = a[rj * p_cov + cj];
+                a[cj * p_cov + rj] = v;
+            }
+        }
+        if cholesky_inplace(&mut a, p_cov).is_none() {
+            return Err(PyRuntimeError::new_err(
+                "X'V^-1X not SPD in matrix-free fit_null",
+            ));
+        }
+
+        let mut a_inv_b = vec![0.0_f64; p_cov];
+        cholesky_solve_into(&a, p_cov, &b0, &mut a_inv_b);
+        let b_aib = dot_loop(&b0, &a_inv_b);
+        let df = (n as i32) - (p_cov as i32) - 1;
+        if df <= 0 {
+            return Err(PyRuntimeError::new_err("df <= 0"));
+        }
+        let rwr0 = (y_vinv_y - b_aib).max(0.0);
+        let sigma2_null = (rwr0 / (df as f64)).max(1e-12);
+        let mut py = vec![0.0_f64; n];
+        for i in 0..n {
+            let mut v = vinv_y[i];
+            for rj in 0..p_cov {
+                v -= x0_used[rj * n + i] * a_inv_b[rj];
+            }
+            py[i] = v;
+        }
+
+        self.null_state = Some(MatrixFreeNullState {
+            vinv_y,
+            py,
+            a_chol: a,
+            a_inv_b,
+            b_aib,
+            y_vinv_y,
+            sigma2_null,
+            df,
+        });
+        self.score_vr_ratio = None;
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl RustPcgMatrixFreeState {
+    #[new]
+    #[pyo3(signature = (
+        kinship_geno,
+        xcov,
+        y,
+        log10_lbd,
+        pcg_tol=1e-4,
+        pcg_max_iter=200,
+        block_size=0,
+        precond_kind="rand_nys",
+        precond_rank=0,
+        precond_oversample=2,
+        precond_seed=42,
+        scan_rhs_cap=0,
+        scan_mode="exact",
+        score_vr_calib_snps=128
+    ))]
+    fn new(
+        kinship_geno: PyReadonlyArray2<'_, f32>,
+        xcov: PyReadonlyArray2<'_, f64>,
+        y: PyReadonlyArray1<'_, f64>,
+        log10_lbd: f64,
+        pcg_tol: f64,
+        pcg_max_iter: usize,
+        block_size: usize,
+        precond_kind: &str,
+        precond_rank: usize,
+        precond_oversample: usize,
+        precond_seed: u64,
+        scan_rhs_cap: usize,
+        scan_mode: &str,
+        score_vr_calib_snps: usize,
+    ) -> PyResult<Self> {
+        let y_slice = y.as_slice()?;
+        let n = y_slice.len();
+        let y_vec = y_slice.to_vec();
+
+        let x_arr = xcov.as_array();
+        let (xn, p_cov) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != n {
+            return Err(PyRuntimeError::new_err("xcov.n_rows must equal len(y)"));
+        }
+        if n <= p_cov + 1 {
+            return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+        }
+        let x_flat: Cow<[f64]> = match xcov.as_slice() {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        };
+
+        let g_arr = kinship_geno.as_array();
+        let (m, gn) = (g_arr.shape()[0], g_arr.shape()[1]);
+        if gn != n {
+            return Err(PyRuntimeError::new_err(
+                "kinship_geno must be (m, n) with n=len(y)",
+            ));
+        }
+        let g_flat: Cow<[f32]> = match kinship_geno.as_slice() {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(g_arr.iter().copied().collect()),
+        };
+
+        let lbd = 10.0_f64.powf(log10_lbd);
+        if !lbd.is_finite() || lbd <= 0.0 {
+            return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+        }
+        let op = pack_snp_major_genotype_2bit(&g_flat, m, n)?;
+        let mut m_inv_diag = vec![0.0_f64; n];
+        for i in 0..n {
+            m_inv_diag[i] = 1.0 / (op.diag_k[i] + lbd).max(1e-8);
+        }
+
+        let eff_threads = rayon::current_num_threads().max(1);
+        let mut precond_kind_resolved = "diag".to_string();
+        let mut precond_rank_resolved = 0usize;
+        let precond = match precond_kind.to_ascii_lowercase().as_str() {
+            "diag" => None,
+            "rand_nys" | "randnys" | "nys" | "auto" => {
+                let rank_req = if precond_rank == 0 {
+                    auto_precond_rank(n, m, eff_threads)
+                } else {
+                    precond_rank.min(n).max(1)
+                };
+                let oversample = precond_oversample.max(1).min(8);
+                let built = build_rand_nys_precond(&op, rank_req, oversample, precond_seed);
+                if let Some(ref p) = built {
+                    precond_kind_resolved = "rand_nys".to_string();
+                    precond_rank_resolved = p.rank;
+                }
+                built
+            }
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "precond_kind must be one of: rand_nys, diag, auto",
+                ));
+            }
+        };
+        let resolved_block_size = if block_size == 0 {
+            auto_block_size(n, m, eff_threads)
+        } else {
+            block_size.max(1).min(32)
+        };
+        let resolved_scan_rhs_cap = if scan_rhs_cap == 0 {
+            auto_scan_rhs_cap(resolved_block_size, n, precond_rank_resolved, eff_threads)
+        } else {
+            scan_rhs_cap.max(1).min(resolved_block_size)
+        };
+        let resolved_scan_mode = MatrixFreeScanMode::parse(scan_mode).ok_or_else(|| {
+            PyRuntimeError::new_err("scan_mode must be one of: exact, score_vr")
+        })?;
+        let resolved_score_vr_calib_snps = score_vr_calib_snps.max(8).min(2048);
+
+        Ok(Self {
+            mean_diag_k: op.mean_diag_k,
+            op,
+            xcov: x_flat.into_owned(),
+            y: y_vec,
+            n,
+            p_cov,
+            lbd,
+            pcg_tol,
+            pcg_max_iter,
+            block_size: resolved_block_size,
+            scan_rhs_cap: resolved_scan_rhs_cap,
+            m_inv_diag,
+            precond,
+            precond_kind: precond_kind_resolved,
+            precond_rank: precond_rank_resolved,
+            scan_mode: resolved_scan_mode,
+            scan_mode_name: resolved_scan_mode.as_str().to_string(),
+            score_vr_calib_snps: resolved_score_vr_calib_snps,
+            score_vr_ratio: None,
+            null_state: None,
+        })
+    }
+
+    fn fit_null(&mut self) -> PyResult<()> {
+        self.fit_null_internal()
+    }
+
+    fn set_scan_mode(&mut self, scan_mode: &str) -> PyResult<()> {
+        let mode = MatrixFreeScanMode::parse(scan_mode).ok_or_else(|| {
+            PyRuntimeError::new_err("scan_mode must be one of: exact, score_vr")
+        })?;
+        self.scan_mode = mode;
+        self.scan_mode_name = mode.as_str().to_string();
+        Ok(())
+    }
+
+    #[pyo3(signature = (snp_chunk, threads=0))]
+    fn scan_chunk<'py>(
+        &mut self,
+        py: Python<'py>,
+        snp_chunk: PyReadonlyArray2<'py, f32>,
+        threads: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if self.null_state.is_none() {
+            self.fit_null_internal()?;
+        }
+        let ns = self
+            .null_state
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("null model not initialized"))?;
+
+        let g_arr = snp_chunk.as_array();
+        if g_arr.shape()[1] != self.n {
+            return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
+        }
+        let g_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(g_arr.iter().copied().collect()),
+        };
+
+        let m_scan = g_arr.shape()[0];
+        let out = PyArray2::<f64>::zeros(py, [m_scan, 3], false).into_bound();
+        let out_slice: &mut [f64] = unsafe {
+            out.as_slice_mut()
+                .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+        };
+
+        let pool = get_cached_pool(threads)?;
+        let n = self.n;
+        let p_cov = self.p_cov;
+        let x_flat = &self.xcov;
+        let op = &self.op;
+        let lbd = self.lbd;
+        let m_inv_diag = &self.m_inv_diag;
+        let precond = self.precond.as_ref();
+        let precond_rank = self.precond_rank;
+        let pcg_tol = self.pcg_tol;
+        let pcg_max_iter = self.pcg_max_iter;
+        let a_chol = &ns.a_chol;
+        let a_inv_b = &ns.a_inv_b;
+        let vinv_y = &ns.vinv_y;
+        let py_vec = &ns.py;
+        let b_aib = ns.b_aib;
+        let y_vinv_y_const = ns.y_vinv_y;
+        let sigma2_null = ns.sigma2_null;
+        let df = ns.df;
+        let scan_mode = self.scan_mode;
+
+        if scan_mode == MatrixFreeScanMode::ScoreVr && self.score_vr_ratio.is_none() {
+            let ratio = py.detach(|| self.estimate_score_vr_ratio(&g_flat, m_scan, ns));
+            self.score_vr_ratio = Some(ratio);
+        }
+        let score_vr_ratio = self.score_vr_ratio.unwrap_or(1.0);
+
+        py.detach(|| {
+            let block_size = self.block_size.min(m_scan.max(1));
+            let rhs_cap = self.scan_rhs_cap.min(block_size).max(1);
+            if scan_mode == MatrixFreeScanMode::ScoreVr {
+                let mut run = || {
+                    out_slice
+                        .par_chunks_mut(block_size * 3)
+                        .enumerate()
+                        .for_each_init(
+                            || MatrixFreeScoreVrScratch::new(p_cov),
+                            |scr, (blk_idx, out_blk)| {
+                                let start = blk_idx * block_size;
+                                let bs = usize::min(block_size, m_scan - start);
+                                for local in 0..bs {
+                                    let row_idx = start + local;
+                                    let b_col = &g_flat[row_idx * n..(row_idx + 1) * n];
+                                    scr.c.fill(0.0);
+                                    let mut d_diag = 0.0_f64;
+                                    let mut u = 0.0_f64;
+                                    for i in 0..n {
+                                        let gi = b_col[i] as f64;
+                                        let vi_g_diag = m_inv_diag[i] * gi;
+                                        d_diag += gi * vi_g_diag;
+                                        u += gi * py_vec[i];
+                                        let base = i * p_cov;
+                                        for rj in 0..p_cov {
+                                            scr.c[rj] += x_flat[base + rj] * vi_g_diag;
+                                        }
+                                    }
+                                    cholesky_solve_into(a_chol, p_cov, &scr.c, &mut scr.a_inv_c);
+                                    let schur_diag = d_diag - dot_loop(&scr.c, &scr.a_inv_c);
+                                    let schur = score_vr_ratio * schur_diag;
+
+                                    let out_row = &mut out_blk[local * 3..local * 3 + 3];
+                                    if !schur.is_finite() || schur <= 1e-12 || !u.is_finite() {
+                                        out_row[0] = f64::NAN;
+                                        out_row[1] = f64::NAN;
+                                        out_row[2] = f64::NAN;
+                                        continue;
+                                    }
+
+                                    let beta_g = u / schur;
+                                    let se_g = (sigma2_null / schur).sqrt();
+                                    let pval =
+                                        if beta_g.is_finite() && se_g.is_finite() && se_g > 0.0 {
+                                            (2.0 * normal_sf((beta_g / se_g).abs()))
+                                                .clamp(f64::MIN_POSITIVE, 1.0)
+                                        } else {
+                                            1.0
+                                        };
+                                    out_row[0] = beta_g;
+                                    out_row[1] = se_g;
+                                    out_row[2] = pval;
+                                }
+                            },
+                        );
+                };
+                if let Some(tp) = &pool {
+                    tp.install(run);
+                } else {
+                    run();
+                }
+            } else {
+                let mut run = || {
+                    out_slice
+                        .par_chunks_mut(block_size * 3)
+                        .enumerate()
+                        .for_each_init(
+                            || MatrixFreeScanScratch::new(n, p_cov, rhs_cap, precond_rank),
+                            |scr, (blk_idx, out_blk)| {
+                                let start = blk_idx * block_size;
+                                let bs = usize::min(block_size, m_scan - start);
+                                let mut local = 0usize;
+                                while local < bs {
+                                    let sub_bs = usize::min(rhs_cap, bs - local);
+                                    let global_start = start + local;
+
+                                    let x_used = &mut scr.x_blk[..sub_bs * n];
+                                    let r_used = &mut scr.r_blk[..sub_bs * n];
+                                    let z_used = &mut scr.z_blk[..sub_bs * n];
+                                    let p_used = &mut scr.p_blk[..sub_bs * n];
+                                    let ap_used = &mut scr.ap_blk[..sub_bs * n];
+                                    let norm_b_used = &mut scr.norm_b[..sub_bs];
+                                    let rz_old_used = &mut scr.rz_old[..sub_bs];
+                                    let tmp_proj_used = &mut scr.tmp_proj[..sub_bs * precond_rank];
+                                    let dots_used = &mut scr.dots[..sub_bs];
+                                    let row_off = global_start * n;
+                                    let b_sub = &g_flat[row_off..row_off + sub_bs * n];
+
+                                    let _ = pcg_solve_block_k_plus_lambda_packed_f32_rhs(
+                                        op,
+                                        lbd,
+                                        m_inv_diag,
+                                        precond,
+                                        b_sub,
+                                        sub_bs,
+                                        x_used,
+                                        r_used,
+                                        z_used,
+                                        p_used,
+                                        ap_used,
+                                        norm_b_used,
+                                        rz_old_used,
+                                        tmp_proj_used,
+                                        &mut scr.centered_row,
+                                        dots_used,
+                                        pcg_tol,
+                                        pcg_max_iter,
+                                    );
+
+                                    for c in 0..sub_bs {
+                                        let b_col = &b_sub[c * n..(c + 1) * n];
+                                        let x_col = &x_used[c * n..(c + 1) * n];
+                                        scr.c.fill(0.0);
+                                        let mut d = 0.0_f64;
+                                        let mut e = 0.0_f64;
+                                        for i in 0..n {
+                                            let gi = b_col[i] as f64;
+                                            let vi_g = x_col[i];
+                                            d += gi * vi_g;
+                                            e += gi * vinv_y[i];
+                                            let base = i * p_cov;
+                                            for rj in 0..p_cov {
+                                                scr.c[rj] += x_flat[base + rj] * vi_g;
+                                            }
+                                        }
+
+                                        cholesky_solve_into(a_chol, p_cov, &scr.c, &mut scr.a_inv_c);
+                                        let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
+                                        let schur = d - ct_aic;
+                                        let out_row =
+                                            &mut out_blk[(local + c) * 3..(local + c) * 3 + 3];
+                                        if !schur.is_finite() || schur <= 1e-12 {
+                                            out_row[0] = f64::NAN;
+                                            out_row[1] = f64::NAN;
+                                            out_row[2] = f64::NAN;
+                                            continue;
+                                        }
+
+                                        let ct_aib = dot_loop(&scr.c, a_inv_b);
+                                        let num = e - ct_aib;
+                                        let beta_g = num / schur;
+                                        let q = b_aib + (num * num) / schur;
+                                        let rwr = (y_vinv_y_const - q).max(0.0);
+                                        let sigma2 = rwr / (df as f64);
+                                        let se_g = (sigma2 / schur).sqrt();
+                                        let pval =
+                                            if beta_g.is_finite() && se_g.is_finite() && se_g > 0.0 {
+                                                (2.0 * normal_sf((beta_g / se_g).abs()))
+                                                    .clamp(f64::MIN_POSITIVE, 1.0)
+                                            } else {
+                                                1.0
+                                            };
+                                        out_row[0] = beta_g;
+                                        out_row[1] = se_g;
+                                        out_row[2] = pval;
+                                    }
+                                    local += sub_bs;
+                                }
+                            },
+                        );
+                };
+                if let Some(tp) = &pool {
+                    tp.install(run);
+                } else {
+                    run();
+                }
+            }
+        });
+
+        Ok(out)
+    }
+
+    #[getter]
+    fn mean_diag(&self) -> f64 {
+        self.mean_diag_k
+    }
+
+    #[getter]
+    fn pve(&self) -> f64 {
+        if (self.mean_diag_k + self.lbd) > 0.0 {
+            self.mean_diag_k / (self.mean_diag_k + self.lbd)
+        } else {
+            f64::NAN
+        }
+    }
+
+    #[getter]
+    fn lbd(&self) -> f64 {
+        self.lbd
+    }
+
+    #[getter]
+    fn fitted(&self) -> bool {
+        self.null_state.is_some()
+    }
+
+    #[getter]
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    #[getter]
+    fn scan_rhs_cap(&self) -> usize {
+        self.scan_rhs_cap
+    }
+
+    #[getter]
+    fn precond_kind(&self) -> String {
+        self.precond_kind.clone()
+    }
+
+    #[getter]
+    fn precond_rank(&self) -> usize {
+        self.precond_rank
+    }
+
+    #[getter]
+    fn scan_mode(&self) -> String {
+        self.scan_mode_name.clone()
+    }
+
+    #[getter]
+    fn score_vr_ratio(&self) -> Option<f64> {
+        self.score_vr_ratio
+    }
 }
 
 struct AssocScratch {
@@ -2019,257 +4010,6 @@ impl AssocScratch {
     fn reset(&mut self) {
         self.c.fill(0.0);
     }
-}
-
-struct PcgAssocScratch {
-    b: Vec<f64>,
-    x: Vec<f64>,
-    r: Vec<f64>,
-    z: Vec<f64>,
-    p: Vec<f64>,
-    ap: Vec<f64>,
-    c: Vec<f64>,
-    a_inv_c: Vec<f64>,
-}
-
-impl PcgAssocScratch {
-    fn new(n: usize, p: usize) -> Self {
-        Self {
-            b: vec![0.0; n],
-            x: vec![0.0; n],
-            r: vec![0.0; n],
-            z: vec![0.0; n],
-            p: vec![0.0; n],
-            ap: vec![0.0; n],
-            c: vec![0.0; p],
-            a_inv_c: vec![0.0; p],
-        }
-    }
-}
-
-#[pyfunction]
-#[pyo3(signature = (kinship, xcov, y, log10_lbd, snp_chunk, pcg_tol=1e-6, pcg_max_iter=500, threads=0))]
-pub fn pcg_lmm_assoc_chunk_f32<'py>(
-    py: Python<'py>,
-    kinship: PyReadonlyArray2<'py, f64>,
-    xcov: PyReadonlyArray2<'py, f64>,
-    y: PyReadonlyArray1<'py, f64>,
-    log10_lbd: f64,
-    snp_chunk: PyReadonlyArray2<'py, f32>,
-    pcg_tol: f64,
-    pcg_max_iter: usize,
-    threads: usize,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let k_arr = kinship.as_array();
-    let x_arr = xcov.as_array();
-    let y_slice = y.as_slice()?;
-    let g_arr = snp_chunk.as_array();
-
-    let n = y_slice.len();
-    if k_arr.shape() != [n, n] {
-        return Err(PyRuntimeError::new_err("kinship must be (n, n)"));
-    }
-    let (xn, p_cov) = (x_arr.shape()[0], x_arr.shape()[1]);
-    if xn != n {
-        return Err(PyRuntimeError::new_err("xcov.n_rows must equal len(y)"));
-    }
-    if g_arr.shape()[1] != n {
-        return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
-    }
-    if n <= p_cov + 1 {
-        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
-    }
-
-    let lbd = 10.0_f64.powf(log10_lbd);
-    if !lbd.is_finite() || lbd <= 0.0 {
-        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
-    }
-
-    let k_flat: Cow<[f64]> = match kinship.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(k_arr.iter().copied().collect()),
-    };
-    let x_flat: Cow<[f64]> = match xcov.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
-    };
-
-    let mut m_inv = vec![0.0_f64; n];
-    for i in 0..n {
-        let d = k_flat[i * n + i] + lbd;
-        m_inv[i] = 1.0 / d.max(1e-8);
-    }
-
-    let mut vinv_x = vec![0.0_f64; n * p_cov];
-    let mut b_col = vec![0.0_f64; n];
-    let mut x_sol = vec![0.0_f64; n];
-    let mut r = vec![0.0_f64; n];
-    let mut z = vec![0.0_f64; n];
-    let mut p = vec![0.0_f64; n];
-    let mut ap = vec![0.0_f64; n];
-
-    for c in 0..p_cov {
-        for i in 0..n {
-            b_col[i] = x_flat[i * p_cov + c];
-        }
-        let _ = pcg_solve_k_plus_lambda(
-            &k_flat,
-            n,
-            lbd,
-            &m_inv,
-            &b_col,
-            &mut x_sol,
-            &mut r,
-            &mut z,
-            &mut p,
-            &mut ap,
-            pcg_tol,
-            pcg_max_iter,
-        );
-        for i in 0..n {
-            vinv_x[i * p_cov + c] = x_sol[i];
-        }
-    }
-
-    let _ = pcg_solve_k_plus_lambda(
-        &k_flat,
-        n,
-        lbd,
-        &m_inv,
-        y_slice,
-        &mut x_sol,
-        &mut r,
-        &mut z,
-        &mut p,
-        &mut ap,
-        pcg_tol,
-        pcg_max_iter,
-    );
-    let vinv_y = x_sol.clone();
-
-    let mut a = vec![0.0_f64; p_cov * p_cov];
-    let mut b0 = vec![0.0_f64; p_cov];
-    let mut y_vinv_y = 0.0_f64;
-    for i in 0..n {
-        let yi = y_slice[i];
-        let viy = vinv_y[i];
-        y_vinv_y += yi * viy;
-        let base = i * p_cov;
-        for rj in 0..p_cov {
-            let xir = x_flat[base + rj];
-            b0[rj] += xir * viy;
-            for cj in 0..=rj {
-                a[rj * p_cov + cj] += xir * vinv_x[base + cj];
-            }
-        }
-    }
-    for rj in 0..p_cov {
-        a[rj * p_cov + rj] += 1e-6;
-        for cj in 0..rj {
-            let v = a[rj * p_cov + cj];
-            a[cj * p_cov + rj] = v;
-        }
-    }
-    if cholesky_inplace(&mut a, p_cov).is_none() {
-        return Err(PyRuntimeError::new_err("X'V^-1X not SPD"));
-    }
-    let mut a_inv_b = vec![0.0_f64; p_cov];
-    cholesky_solve_into(&a, p_cov, &b0, &mut a_inv_b);
-    let b_aib = dot_loop(&b0, &a_inv_b);
-
-    let df = (n as i32) - (p_cov as i32) - 1;
-    if df <= 0 {
-        return Err(PyRuntimeError::new_err("df <= 0"));
-    }
-
-    let m = g_arr.shape()[0];
-    let out = PyArray2::<f64>::zeros(py, [m, 3], false).into_bound();
-    let out_slice: &mut [f64] = unsafe {
-        out.as_slice_mut()
-            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
-    };
-
-    let pool = get_cached_pool(threads)?;
-    let y_vinv_y_const = y_vinv_y;
-
-    py.detach(|| {
-        let mut run = || {
-            out_slice
-                .par_chunks_mut(3)
-                .enumerate()
-                .for_each_init(
-                    || PcgAssocScratch::new(n, p_cov),
-                    |scr, (idx, out_row)| {
-                        for i in 0..n {
-                            scr.b[i] = g_arr[(idx, i)] as f64;
-                        }
-                        let _converged = pcg_solve_k_plus_lambda(
-                            &k_flat,
-                            n,
-                            lbd,
-                            &m_inv,
-                            &scr.b,
-                            &mut scr.x,
-                            &mut scr.r,
-                            &mut scr.z,
-                            &mut scr.p,
-                            &mut scr.ap,
-                            pcg_tol,
-                            pcg_max_iter,
-                        );
-
-                        scr.c.fill(0.0);
-                        let mut d = 0.0_f64;
-                        let mut e = 0.0_f64;
-                        for i in 0..n {
-                            let gi = scr.b[i];
-                            let vi_g = scr.x[i];
-                            d += gi * vi_g;
-                            e += gi * vinv_y[i];
-                            let base = i * p_cov;
-                            for rj in 0..p_cov {
-                                scr.c[rj] += x_flat[base + rj] * vi_g;
-                            }
-                        }
-
-                        cholesky_solve_into(&a, p_cov, &scr.c, &mut scr.a_inv_c);
-                        let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
-                        let schur = d - ct_aic;
-                        if !schur.is_finite() || schur <= 1e-12 {
-                            out_row[0] = f64::NAN;
-                            out_row[1] = f64::NAN;
-                            out_row[2] = f64::NAN;
-                            return;
-                        }
-
-                        let ct_aib = dot_loop(&scr.c, &a_inv_b);
-                        let num = e - ct_aib;
-                        let beta_g = num / schur;
-
-                        let q = b_aib + (num * num) / schur;
-                        let rwr = (y_vinv_y_const - q).max(0.0);
-                        let sigma2 = rwr / (df as f64);
-                        let se_g = (sigma2 / schur).sqrt();
-                        let pval = if beta_g.is_finite() && se_g.is_finite() && se_g > 0.0 {
-                            (2.0 * normal_sf((beta_g / se_g).abs())).clamp(f64::MIN_POSITIVE, 1.0)
-                        } else {
-                            1.0
-                        };
-
-                        out_row[0] = beta_g;
-                        out_row[1] = se_g;
-                        out_row[2] = pval;
-                    },
-                );
-        };
-        if let Some(tp) = &pool {
-            tp.install(run);
-        } else {
-            run();
-        }
-    });
-
-    Ok(out)
 }
 
 #[pyfunction]

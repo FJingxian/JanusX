@@ -6,6 +6,7 @@ Design overview
 ---------------
 Models:
   - LMM     : streaming, low-memory implementation (slim.LMM)
+  - MemLMM  : streaming scan + matrix-free PCG null model (pyBLUP.PCGLMMMatrixFree)
   - LM      : streaming, low-memory implementation (slim.LM)
   - FarmCPU : in-memory implementation (pyBLUP.farmcpu) that loads the
               full genotype matrix
@@ -85,7 +86,7 @@ from janusx.gfreader import (
     auto_mmap_window_mb,
 )
 from janusx.pyBLUP.QK2 import QK
-from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
+from janusx.pyBLUP.assoc import LMM, LM, FastLMM, PCGLMMMatrixFree, farmcpu
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -2473,15 +2474,25 @@ def run_chunked_gwas_lmm_lm(
     show_npve_line: bool = False,
 ) -> None:
     """
-    Run LMM or LM GWAS using a streaming, low-memory pipeline.
+    Run LMM/FastLMM/MemLMM/LM GWAS using a streaming pipeline.
 
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
     """
-    model_map = {"lmm": LMM, "lm": LM, "fastlmm": FastLMM}
+    model_map = {
+        "lmm": LMM,
+        "lm": LM,
+        "fastlmm": FastLMM,
+        "memlmm": PCGLMMMatrixFree,
+    }
     model_key = model_name.lower()
     ModelCls = model_map[model_key]
-    model_label = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM"}[model_key]
+    model_label = {
+        "lmm": "LMM",
+        "lm": "LM",
+        "fastlmm": "FastLMM",
+        "memlmm": "MemLMM",
+    }[model_key]
     # Keep output file suffixes consistent and lowercase.
     model_tag = model_label.lower()
 
@@ -2601,6 +2612,82 @@ def run_chunked_gwas_lmm_lm(
                 logging.INFO,
                 f"Eigen-Decomposition ...Finished [{evd_elapsed}]",
             )
+        elif model_key == "memlmm":
+            mmap_window_mb_null = (
+                auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
+                if mmap_limit else None
+            )
+            kinship_chunks: list[np.ndarray] = []
+            kinship_loaded = 0
+            kinship_total_hint = int(eff_m if int(eff_m) > 0 else n_snps)
+            kin_pbar = _ProgressAdapter(total=kinship_total_hint, desc="MemLMM null")
+            evd_t0 = time.monotonic()
+            try:
+                for kin_chunk, _kin_sites in load_genotype_chunks(
+                    genofile,
+                    chunk_size,
+                    maf_threshold,
+                    max_missing_rate,
+                    model="add",
+                    snps_only=bool(snps_only),
+                    sample_ids=trait_ids,
+                    mmap_window_mb=mmap_window_mb_null,
+                ):
+                    if kin_chunk.shape[1] != n_idv:
+                        if kin_chunk.shape[1] == int(sameidx.shape[0]):
+                            kin_chunk = kin_chunk[:, sameidx]
+                        else:
+                            raise ValueError(
+                                f"MemLMM kinship sample dimension mismatch for trait {pname}: "
+                                f"chunk has {kin_chunk.shape[1]} columns, expected {n_idv}."
+                            )
+                    if kin_chunk.shape[0] == 0:
+                        continue
+                    kinship_chunks.append(np.ascontiguousarray(kin_chunk, dtype=np.float32))
+                    k_add = int(kin_chunk.shape[0])
+                    kinship_loaded += k_add
+                    kin_pbar.update(k_add)
+                kin_pbar.finish()
+            finally:
+                kin_pbar.close(show_done=False)
+
+            if len(kinship_chunks) == 0:
+                raise ValueError(
+                    f"MemLMM null-model received no SNPs after filtering for trait {pname}."
+                )
+
+            with CliStatus("Fitting PCG null model...", enabled=bool(use_spinner)):
+                kinship_geno = np.ascontiguousarray(
+                    np.concatenate(kinship_chunks, axis=0),
+                    dtype=np.float32,
+                )
+                mod = ModelCls(y=y_vec, X=X_cov, kinship_geno=kinship_geno)
+                del kinship_geno
+                del kinship_chunks
+                mod.fit_null()
+
+            try:
+                pve_tmp = float(mod.pve)
+                if np.isfinite(pve_tmp):
+                    header_pve = pve_tmp
+            except Exception:
+                header_pve = None
+            evd_secs = time.monotonic() - evd_t0
+            evd_elapsed = format_elapsed(evd_secs)
+            pve_txt = "NA" if header_pve is None else f"{header_pve:.3f}"
+            _log_file_only(
+                logger,
+                logging.INFO,
+                (
+                    f"{model_label}, trait: {pname}, PVE(null): {pve_txt}, "
+                    f"kinship_snp={kinship_loaded}"
+                ),
+            )
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Matrix-free null fit ...Finished [{evd_elapsed}]",
+            )
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
@@ -2631,9 +2718,16 @@ def run_chunked_gwas_lmm_lm(
         scan_threads = int(threads)
         if scan_threads <= 0:
             scan_threads = int(n_cores)
-        max_inflight = 2 if scan_threads >= 2 else 1
-        workers = max(1, max_inflight)
-        threads_per_worker = max(1, scan_threads // workers)
+        if model_key == "memlmm":
+            # MemLMM keeps mutable scan state in Rust; avoid concurrent calls
+            # on the same model object across chunk workers.
+            max_inflight = 1
+            workers = 1
+            threads_per_worker = max(1, scan_threads)
+        else:
+            max_inflight = 2 if scan_threads >= 2 else 1
+            workers = max(1, max_inflight)
+            threads_per_worker = max(1, scan_threads // workers)
 
         process.cpu_percent(interval=None)
         scan_t0 = time.time()
@@ -3973,6 +4067,7 @@ def parse_args():
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
+            "jx gwas -vcf example.vcf.gz -p pheno.tsv -memlmm",
             "jx gwas -hmp example.hmp.gz -p pheno.tsv -lmm",
             "jx gwas -bfile example_prefix -p pheno.tsv -lm",
         ]),
@@ -4017,6 +4112,10 @@ def parse_args():
         help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-memlmm", "--memlmm", action="store_true", default=False,
+        help="Run matrix-free PCG LMM (streaming scan with matrix-free null model; default: %(default)s).",
+    )
+    models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
@@ -4026,7 +4125,7 @@ def parse_args():
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for streaming LM/LMM/fastLMM (default: %(default)s).",
+        help="Genetic effect coding model for streaming LM/LMM/FastLMM/MemLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -4171,6 +4270,8 @@ def main(log: bool = True):
             model_tokens.append("LMM")
         if args.fastlmm:
             model_tokens.append("fastLMM")
+        if args.memlmm:
+            model_tokens.append("MemLMM")
         if args.lm:
             model_tokens.append("LM")
         if args.farmcpu:
@@ -4228,12 +4329,14 @@ def main(log: bool = True):
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
-        logger.error("No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu.")
+    if not (args.lm or args.lmm or args.fastlmm or args.memlmm or args.farmcpu):
+        logger.error(
+            "No model selected. Use -lm, -lmm, -fastlmm, -memlmm, and/or -farmcpu."
+        )
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to streaming LM/LMM/fastLMM; "
+            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM/MemLMM; "
             "FarmCPU keeps additive coding."
         )
 
@@ -4249,7 +4352,7 @@ def main(log: bool = True):
         eff_m = None
         eff_snp_by_trait: dict[str, int] = {}
 
-        stream_selected = bool(args.lmm or args.lm or args.fastlmm)
+        stream_selected = bool(args.lmm or args.lm or args.fastlmm or args.memlmm)
         if stream_selected:
             _section(logger, "Metadata preparation")
             _log_file_only(
@@ -4292,6 +4395,8 @@ def main(log: bool = True):
             stream_models.append("lmm")
         if args.fastlmm:
             stream_models.append("fastlmm")
+        if args.memlmm:
+            stream_models.append("memlmm")
         if args.lm:
             stream_models.append("lm")
         has_farmcpu = bool(args.farmcpu)
@@ -4317,7 +4422,9 @@ def main(log: bool = True):
             for trait_idx, pname in enumerate(trait_order):
                 if len(stream_models) == 1:
                     model_key = stream_models[0]
-                    pve_line_model = model_key if model_key in {"lmm", "fastlmm"} else None
+                    pve_line_model = (
+                        model_key if model_key in {"lmm", "fastlmm", "memlmm"} else None
+                    )
                     run_chunked_gwas_lmm_lm(
                         model_name=model_key,
                         genofile=gfile,
@@ -4346,6 +4453,39 @@ def main(log: bool = True):
                         trait_names=[str(pname)],
                         show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
                     )
+                elif "memlmm" in stream_models:
+                    for model_key in stream_models:
+                        pve_line_model = (
+                            model_key if model_key in {"lmm", "fastlmm", "memlmm"} else None
+                        )
+                        run_chunked_gwas_lmm_lm(
+                            model_name=model_key,
+                            genofile=gfile,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            mmap_limit=args.mmap_limit,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=[str(pname)],
+                            show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
+                        )
                 else:
                     run_chunked_gwas_streaming_shared(
                         model_names=stream_models,
@@ -4435,6 +4575,7 @@ def main(log: bool = True):
                 "models": {
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
+                    "memlmm": bool(args.memlmm),
                     "lm": bool(args.lm),
                     "farmcpu": bool(args.farmcpu),
                 },

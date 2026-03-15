@@ -43,7 +43,9 @@ use admixture::{
     admx_adam_optimize_f32,
     admx_allele_frequency, admx_em_step, admx_em_step_inplace, admx_em_step_inplace_f32,
     admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_f32, admx_map_p_f32, admx_map_q_f32,
-    admx_multiply_a_omega, admx_multiply_at_omega, admx_rmse_f32, admx_rmse_f64, admx_set_threads,
+    admx_multiply_a_omega, admx_multiply_a_omega_inplace, admx_multiply_at_omega,
+    admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64, admx_rsvd_power_step_inplace,
+    admx_set_threads,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use bsa::preprocess_bsa;
@@ -93,6 +95,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayescpi, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_multiply_a_omega_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_rsvd_power_step_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_allele_frequency, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood_f32, m)?)?;

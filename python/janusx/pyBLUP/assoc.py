@@ -55,6 +55,7 @@ from janusx.janusx import (
     lmm_reml_null_f32,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
+    pcg_lmm_assoc_chunk_f32,
     fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32,
     fastlmm_assoc_chunk_f32,
@@ -639,6 +640,134 @@ def lmm_assoc_fixed(
         None if nullml is None else float(nullml),
     )
     return beta_se_p
+
+
+def pcg_lmm_assoc_fixed(
+    kinship: np.ndarray,
+    xcov: np.ndarray,
+    y: np.ndarray,
+    log10_lbd: float,
+    snp_chunk: np.ndarray,
+    pcg_tol: float = 1e-6,
+    pcg_max_iter: int = 500,
+    threads: int = 0,
+) -> np.ndarray:
+    """
+    Fixed-lambda LMM association using PCG solves on (K + lambda I).
+
+    Parameters
+    ----------
+    kinship : np.ndarray, shape (n, n)
+        Kinship matrix in sample space.
+    xcov : np.ndarray, shape (n, p)
+        Covariate matrix including intercept.
+    y : np.ndarray, shape (n,) or (n,1)
+        Phenotype vector.
+    log10_lbd : float
+        log10(lambda), where lambda = ve / vg.
+    snp_chunk : np.ndarray, shape (m, n)
+        SNP-major genotype chunk.
+    pcg_tol : float
+        Relative residual tolerance for PCG.
+    pcg_max_iter : int
+        Max iterations for each PCG solve.
+    threads : int
+        Parallel SNP worker threads in Rust (0 = global rayon pool).
+
+    Returns
+    -------
+    np.ndarray, shape (m, 3)
+        Columns: beta, se, p.
+    """
+    kinship = np.ascontiguousarray(kinship, dtype=np.float64)
+    xcov = np.ascontiguousarray(xcov, dtype=np.float64)
+    y = np.ascontiguousarray(y, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    return pcg_lmm_assoc_chunk_f32(
+        kinship,
+        xcov,
+        y,
+        float(log10_lbd),
+        snp_chunk,
+        float(pcg_tol),
+        int(pcg_max_iter),
+        int(threads),
+    )
+
+
+class PCGLMM:
+    """
+    PCG-based LMM GWAS wrapper (no spectral rotation in scanning step).
+
+    Notes
+    -----
+    - Scanning uses Rust PCG solves for V^{-1}v where V = K + lambda I.
+    - If `lbd` is not provided, lambda is estimated once via spectral null REML
+      (for robust default behavior), then scanning stays in PCG path.
+    """
+
+    def __init__(
+        self,
+        y: np.ndarray,
+        X: Optional[np.ndarray],
+        kinship: np.ndarray,
+        lbd: Optional[float] = None,
+        pcg_tol: float = 1e-6,
+        pcg_max_iter: int = 500,
+    ):
+        y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+        X = (
+            np.concatenate([np.ones((y.shape[0], 1)), np.asarray(X, dtype=np.float64)], axis=1)
+            if X is not None
+            else np.ones((y.shape[0], 1), dtype=np.float64)
+        )
+        kinship = np.asarray(kinship, dtype=np.float64)
+        if kinship.shape != (y.shape[0], y.shape[0]):
+            raise ValueError(
+                f"kinship must be (n,n). got={kinship.shape}, n={y.shape[0]}"
+            )
+
+        self.y = y.ravel()
+        self.X = np.ascontiguousarray(X, dtype=np.float64)
+        self.K = np.ascontiguousarray(kinship, dtype=np.float64)
+        self.pcg_tol = float(pcg_tol)
+        self.pcg_max_iter = int(pcg_max_iter)
+
+        if lbd is None:
+            # Robust default: estimate lambda once with spectral REML null model.
+            k = np.array(self.K, copy=True)
+            k.flat[:: k.shape[0] + 1] += 1e-6
+            t0 = time.time()
+            s, dh = eigh(k, overwrite_a=True, check_finite=False)
+            self.evd_secs = float(time.time() - t0)
+            x_rot = dh.T @ self.X
+            y_rot = (dh.T @ self.y.reshape(-1, 1)).ravel()
+            lbd_null, ml0, reml0 = lmm_reml_null(
+                s, x_rot, y_rot, (-5, 5), max_iter=50, tol=1e-3
+            )
+            self.lbd_null = float(lbd_null)
+            self.ML0 = float(ml0)
+            self.LL0 = float(reml0)
+        else:
+            self.evd_secs = 0.0
+            self.lbd_null = float(lbd)
+            self.ML0 = np.nan
+            self.LL0 = np.nan
+
+        mean_k = float(np.mean(np.diag(self.K)))
+        self.pve = mean_k / (mean_k + self.lbd_null) if (mean_k + self.lbd_null) > 0 else np.nan
+
+    def gwas(self, snp: np.ndarray, threads: int = 0) -> np.ndarray:
+        return pcg_lmm_assoc_fixed(
+            self.K,
+            self.X,
+            self.y,
+            float(np.log10(self.lbd_null)),
+            snp,
+            pcg_tol=self.pcg_tol,
+            pcg_max_iter=self.pcg_max_iter,
+            threads=threads,
+        )
 
 
 class LMM:

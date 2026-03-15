@@ -1906,6 +1906,104 @@ fn dot_loop(a: &[f64], b: &[f64]) -> f64 {
     s
 }
 
+#[inline]
+fn matvec_k_plus_lambda(k: &[f64], n: usize, lbd: f64, x: &[f64], out: &mut [f64]) {
+    debug_assert_eq!(x.len(), n);
+    debug_assert_eq!(out.len(), n);
+    for i in 0..n {
+        let row = &k[i * n..(i + 1) * n];
+        let mut s = lbd * x[i];
+        for j in 0..n {
+            s += row[j] * x[j];
+        }
+        out[i] = s;
+    }
+}
+
+#[inline]
+fn pcg_solve_k_plus_lambda(
+    k: &[f64],
+    n: usize,
+    lbd: f64,
+    m_inv: &[f64],
+    b: &[f64],
+    x: &mut [f64],
+    r: &mut [f64],
+    z: &mut [f64],
+    p: &mut [f64],
+    ap: &mut [f64],
+    tol: f64,
+    max_iter: usize,
+) -> bool {
+    debug_assert_eq!(m_inv.len(), n);
+    debug_assert_eq!(b.len(), n);
+    debug_assert_eq!(x.len(), n);
+    debug_assert_eq!(r.len(), n);
+    debug_assert_eq!(z.len(), n);
+    debug_assert_eq!(p.len(), n);
+    debug_assert_eq!(ap.len(), n);
+
+    x.fill(0.0);
+    r.copy_from_slice(b);
+
+    let mut norm_b2 = dot_loop(b, b);
+    if !norm_b2.is_finite() || norm_b2 <= 0.0 {
+        norm_b2 = 1.0;
+    }
+    let norm_b = norm_b2.sqrt();
+
+    for i in 0..n {
+        z[i] = m_inv[i] * r[i];
+        p[i] = z[i];
+    }
+    let mut rz_old = dot_loop(r, z);
+    if !rz_old.is_finite() || rz_old.abs() < 1e-30 {
+        return true;
+    }
+
+    let tol = if tol.is_finite() && tol > 0.0 { tol } else { 1e-6 };
+    let max_iter = max_iter.max(1);
+
+    for _ in 0..max_iter {
+        matvec_k_plus_lambda(k, n, lbd, p, ap);
+        let denom = dot_loop(p, ap);
+        if !denom.is_finite() || denom.abs() < 1e-30 {
+            break;
+        }
+        let alpha = rz_old / denom;
+        if !alpha.is_finite() {
+            break;
+        }
+
+        for i in 0..n {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+        }
+
+        let rel_res = dot_loop(r, r).sqrt() / norm_b;
+        if rel_res.is_finite() && rel_res <= tol {
+            return true;
+        }
+
+        for i in 0..n {
+            z[i] = m_inv[i] * r[i];
+        }
+        let rz_new = dot_loop(r, z);
+        if !rz_new.is_finite() || rz_new.abs() < 1e-30 {
+            break;
+        }
+        let beta = rz_new / rz_old;
+        if !beta.is_finite() {
+            break;
+        }
+        for i in 0..n {
+            p[i] = z[i] + beta * p[i];
+        }
+        rz_old = rz_new;
+    }
+    false
+}
+
 struct AssocScratch {
     c: Vec<f64>,       // len p
     a_inv_c: Vec<f64>, // len p
@@ -1921,6 +2019,257 @@ impl AssocScratch {
     fn reset(&mut self) {
         self.c.fill(0.0);
     }
+}
+
+struct PcgAssocScratch {
+    b: Vec<f64>,
+    x: Vec<f64>,
+    r: Vec<f64>,
+    z: Vec<f64>,
+    p: Vec<f64>,
+    ap: Vec<f64>,
+    c: Vec<f64>,
+    a_inv_c: Vec<f64>,
+}
+
+impl PcgAssocScratch {
+    fn new(n: usize, p: usize) -> Self {
+        Self {
+            b: vec![0.0; n],
+            x: vec![0.0; n],
+            r: vec![0.0; n],
+            z: vec![0.0; n],
+            p: vec![0.0; n],
+            ap: vec![0.0; n],
+            c: vec![0.0; p],
+            a_inv_c: vec![0.0; p],
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (kinship, xcov, y, log10_lbd, snp_chunk, pcg_tol=1e-6, pcg_max_iter=500, threads=0))]
+pub fn pcg_lmm_assoc_chunk_f32<'py>(
+    py: Python<'py>,
+    kinship: PyReadonlyArray2<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    pcg_tol: f64,
+    pcg_max_iter: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let k_arr = kinship.as_array();
+    let x_arr = xcov.as_array();
+    let y_slice = y.as_slice()?;
+    let g_arr = snp_chunk.as_array();
+
+    let n = y_slice.len();
+    if k_arr.shape() != [n, n] {
+        return Err(PyRuntimeError::new_err("kinship must be (n, n)"));
+    }
+    let (xn, p_cov) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err("xcov.n_rows must equal len(y)"));
+    }
+    if g_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let k_flat: Cow<[f64]> = match kinship.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(k_arr.iter().copied().collect()),
+    };
+    let x_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+
+    let mut m_inv = vec![0.0_f64; n];
+    for i in 0..n {
+        let d = k_flat[i * n + i] + lbd;
+        m_inv[i] = 1.0 / d.max(1e-8);
+    }
+
+    let mut vinv_x = vec![0.0_f64; n * p_cov];
+    let mut b_col = vec![0.0_f64; n];
+    let mut x_sol = vec![0.0_f64; n];
+    let mut r = vec![0.0_f64; n];
+    let mut z = vec![0.0_f64; n];
+    let mut p = vec![0.0_f64; n];
+    let mut ap = vec![0.0_f64; n];
+
+    for c in 0..p_cov {
+        for i in 0..n {
+            b_col[i] = x_flat[i * p_cov + c];
+        }
+        let _ = pcg_solve_k_plus_lambda(
+            &k_flat,
+            n,
+            lbd,
+            &m_inv,
+            &b_col,
+            &mut x_sol,
+            &mut r,
+            &mut z,
+            &mut p,
+            &mut ap,
+            pcg_tol,
+            pcg_max_iter,
+        );
+        for i in 0..n {
+            vinv_x[i * p_cov + c] = x_sol[i];
+        }
+    }
+
+    let _ = pcg_solve_k_plus_lambda(
+        &k_flat,
+        n,
+        lbd,
+        &m_inv,
+        y_slice,
+        &mut x_sol,
+        &mut r,
+        &mut z,
+        &mut p,
+        &mut ap,
+        pcg_tol,
+        pcg_max_iter,
+    );
+    let vinv_y = x_sol.clone();
+
+    let mut a = vec![0.0_f64; p_cov * p_cov];
+    let mut b0 = vec![0.0_f64; p_cov];
+    let mut y_vinv_y = 0.0_f64;
+    for i in 0..n {
+        let yi = y_slice[i];
+        let viy = vinv_y[i];
+        y_vinv_y += yi * viy;
+        let base = i * p_cov;
+        for rj in 0..p_cov {
+            let xir = x_flat[base + rj];
+            b0[rj] += xir * viy;
+            for cj in 0..=rj {
+                a[rj * p_cov + cj] += xir * vinv_x[base + cj];
+            }
+        }
+    }
+    for rj in 0..p_cov {
+        a[rj * p_cov + rj] += 1e-6;
+        for cj in 0..rj {
+            let v = a[rj * p_cov + cj];
+            a[cj * p_cov + rj] = v;
+        }
+    }
+    if cholesky_inplace(&mut a, p_cov).is_none() {
+        return Err(PyRuntimeError::new_err("X'V^-1X not SPD"));
+    }
+    let mut a_inv_b = vec![0.0_f64; p_cov];
+    cholesky_solve_into(&a, p_cov, &b0, &mut a_inv_b);
+    let b_aib = dot_loop(&b0, &a_inv_b);
+
+    let df = (n as i32) - (p_cov as i32) - 1;
+    if df <= 0 {
+        return Err(PyRuntimeError::new_err("df <= 0"));
+    }
+
+    let m = g_arr.shape()[0];
+    let out = PyArray2::<f64>::zeros(py, [m, 3], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let pool = get_cached_pool(threads)?;
+    let y_vinv_y_const = y_vinv_y;
+
+    py.detach(|| {
+        let mut run = || {
+            out_slice
+                .par_chunks_mut(3)
+                .enumerate()
+                .for_each_init(
+                    || PcgAssocScratch::new(n, p_cov),
+                    |scr, (idx, out_row)| {
+                        for i in 0..n {
+                            scr.b[i] = g_arr[(idx, i)] as f64;
+                        }
+                        let _converged = pcg_solve_k_plus_lambda(
+                            &k_flat,
+                            n,
+                            lbd,
+                            &m_inv,
+                            &scr.b,
+                            &mut scr.x,
+                            &mut scr.r,
+                            &mut scr.z,
+                            &mut scr.p,
+                            &mut scr.ap,
+                            pcg_tol,
+                            pcg_max_iter,
+                        );
+
+                        scr.c.fill(0.0);
+                        let mut d = 0.0_f64;
+                        let mut e = 0.0_f64;
+                        for i in 0..n {
+                            let gi = scr.b[i];
+                            let vi_g = scr.x[i];
+                            d += gi * vi_g;
+                            e += gi * vinv_y[i];
+                            let base = i * p_cov;
+                            for rj in 0..p_cov {
+                                scr.c[rj] += x_flat[base + rj] * vi_g;
+                            }
+                        }
+
+                        cholesky_solve_into(&a, p_cov, &scr.c, &mut scr.a_inv_c);
+                        let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
+                        let schur = d - ct_aic;
+                        if !schur.is_finite() || schur <= 1e-12 {
+                            out_row[0] = f64::NAN;
+                            out_row[1] = f64::NAN;
+                            out_row[2] = f64::NAN;
+                            return;
+                        }
+
+                        let ct_aib = dot_loop(&scr.c, &a_inv_b);
+                        let num = e - ct_aib;
+                        let beta_g = num / schur;
+
+                        let q = b_aib + (num * num) / schur;
+                        let rwr = (y_vinv_y_const - q).max(0.0);
+                        let sigma2 = rwr / (df as f64);
+                        let se_g = (sigma2 / schur).sqrt();
+                        let pval = if beta_g.is_finite() && se_g.is_finite() && se_g > 0.0 {
+                            (2.0 * normal_sf((beta_g / se_g).abs())).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        out_row[0] = beta_g;
+                        out_row[1] = se_g;
+                        out_row[2] = pval;
+                    },
+                );
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    });
+
+    Ok(out)
 }
 
 #[pyfunction]

@@ -63,7 +63,7 @@ def _symbol_or_ascii(preferred: str, fallback: str) -> str:
 
 _SUCCESS_SYMBOL = _symbol_or_ascii("\u2714\ufe0e", "[OK]")
 _FAIL_SYMBOL = _symbol_or_ascii("\u2718\ufe0e", "[X]")
-_WARN_SYMBOL = _symbol_or_ascii("\u26a0\ufe0e", "[!]")
+_WARN_SYMBOL = "!"
 
 
 def success_symbol() -> str:

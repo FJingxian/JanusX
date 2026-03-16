@@ -2185,11 +2185,12 @@ def load_or_build_q_with_cache(
                     f"Cached PCA written to {q_path}",
                 )
     elif qdim == 0:
-        _rich_success(
-            logger,
-            "PC dimension set to 0; using empty Q matrix.",
-            use_spinner=use_spinner,
-        )
+        pc_warn_msg = "PC dimension set to 0; using empty Q matrix."
+        if use_spinner or stdout_is_tty():
+            _log_file_only(logger, logging.WARNING, pc_warn_msg)
+            print_warning(pc_warn_msg, force_color=bool(use_spinner))
+        else:
+            logger.warning(pc_warn_msg)
         qmatrix = np.zeros((n, 0), dtype="float32")
         q_ids = ids
     else:

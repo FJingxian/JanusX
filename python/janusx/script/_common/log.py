@@ -34,7 +34,7 @@ class _ColorLevelPrefixFormatter(_LevelPrefixFormatter):
     _RED = "\033[31m"
     _RESET = "\033[0m"
     _FAIL = _console_symbol("\u2718\ufe0e", "[X]")
-    _WARN = _console_symbol("\u26a0\ufe0e", "[!]")
+    _WARN = "!"
 
     def __init__(self, *, enable_color: bool) -> None:
         super().__init__()

@@ -49,7 +49,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     safe_expanduser,
 )
-from ._common.status import CliStatus, stdout_is_tty
+from ._common.status import CliStatus, log_success, stdout_is_tty
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
 
@@ -654,39 +654,39 @@ def main(log: bool = True) -> None:
         logger.info("*" * 60)
 
         if final_format == "plink":
-            logger.info(
-                "Merged PLINK files saved:\n  %s.bed\n  %s.bim\n  %s.fam",
-                final_output,
-                final_output,
-                final_output,
+            log_success(
+                logger,
+                "Merged PLINK files saved:\n"
+                f"  {final_output}.bed\n"
+                f"  {final_output}.bim\n"
+                f"  {final_output}.fam",
             )
         elif final_format == "vcf":
-            logger.info(f"Merged VCF saved:\n  {final_output}")
+            log_success(logger, f"Merged VCF saved:\n  {final_output}")
         elif final_format == "txt":
-            logger.info(
-                "Merged text matrix saved:\n  %s\n  %s.id\n  %s.site",
-                final_output,
-                strip_known_suffix(final_output),
-                strip_known_suffix(final_output),
+            log_success(
+                logger,
+                "Merged text matrix saved:\n"
+                f"  {final_output}\n"
+                f"  {strip_known_suffix(final_output)}.id\n"
+                f"  {strip_known_suffix(final_output)}.site",
             )
         elif final_format == "npy":
-            logger.info(
-                "Merged npy matrix saved:\n  %s\n  %s.id\n  %s.site",
-                final_output,
-                strip_known_suffix(final_output),
-                strip_known_suffix(final_output),
+            log_success(
+                logger,
+                "Merged npy matrix saved:\n"
+                f"  {final_output}\n"
+                f"  {strip_known_suffix(final_output)}.id\n"
+                f"  {strip_known_suffix(final_output)}.site",
             )
 
     lt = time.localtime()
-    logger.info(
-        "\nFinished genotype merge. Total wall time: %.2f seconds\n%d-%d-%d %d:%d:%d",
-        time.time() - t_start,
-        lt.tm_year,
-        lt.tm_mon,
-        lt.tm_mday,
-        lt.tm_hour,
-        lt.tm_min,
-        lt.tm_sec,
+    log_success(
+        logger,
+        "\nFinished genotype merge. Total wall time: "
+        f"{time.time() - t_start:.2f} seconds\n"
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
     )
 
 

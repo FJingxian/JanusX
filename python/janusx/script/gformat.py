@@ -58,7 +58,7 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.status import CliStatus, stdout_is_tty
+from ._common.status import CliStatus, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
 
 
@@ -620,8 +620,8 @@ def main() -> None:
     else:
         write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
 
-    logger.info(f"Format conversion completed in {time.time() - t0:.2f} s")
-    logger.info(f"Output written: {output_display}")
+    log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
+    log_success(logger, f"Output written: {output_display}")
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from janusx.script._common.pathcheck import (
 from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.status import CliStatus, stdout_is_tty
+from janusx.script._common.status import CliStatus, log_success, stdout_is_tty
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
@@ -491,8 +491,9 @@ def main() -> None:
             trait_outprefix = outprefix
 
         write_xcombine_results(f"{trait_outprefix}.garfield", list(common), results)
-        logger.info(
-            f"Saved GARFIELD output for trait '{trait_name}': {trait_outprefix}.garfield"
+        log_success(
+            logger,
+            f"Saved GARFIELD output for trait '{trait_name}': {trait_outprefix}.garfield",
         )
         saved += 1
 
@@ -500,10 +501,11 @@ def main() -> None:
         raise ValueError("No GARFIELD outputs were generated for the selected phenotype columns.")
 
     lt = time.localtime()
-    logger.info(
+    log_success(
+        logger,
         f"\nFinished GARFIELD. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
+        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
     )
 
 

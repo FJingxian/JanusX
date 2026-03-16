@@ -37,7 +37,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists
 from ._common.genoio import strip_default_prefix_suffix
-from ._common.status import print_success, print_failure, format_elapsed
+from ._common.status import log_success, print_success, print_failure, format_elapsed
 
 
 @dataclass
@@ -726,8 +726,8 @@ def main() -> None:
     blup_out.to_csv(out_blup, sep="\t", index=False)
     pd.DataFrame(summary_rows).to_csv(out_summary, sep="\t", index=False)
     logger.info("=" * 60)
-    logger.info(f"BLUP table saved: {out_blup}")
-    logger.info(f"Summary table saved: {out_summary}")
+    log_success(logger, f"BLUP table saved: {out_blup}")
+    log_success(logger, f"Summary table saved: {out_summary}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
     print_success(f"REML ...Finished [{format_elapsed(time.time() - t0)}]")
 

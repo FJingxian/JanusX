@@ -48,7 +48,7 @@ from ._common.pathcheck import (
 )
 from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
-from ._common.status import format_elapsed
+from ._common.status import format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
 
@@ -329,8 +329,9 @@ def main(log: bool = True):
         mmap_window_mb=mmap_window_mb,
         logger=logger,
     )
-    logger.info(
-        f"GRM calculation completed in {round(time.time() - t_loading, 3)} seconds"
+    log_success(
+        logger,
+        f"GRM calculation completed in {round(time.time() - t_loading, 3)} seconds",
     )
 
     # ------------------------------------------------------------------
@@ -341,20 +342,22 @@ def main(log: bool = True):
         np.save(grm_path, grm)
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
-        logger.info(
+        log_success(
+            logger,
             f"Saved GRM in NPY format:\n"
             f"  {id_path}\n"
-            f"  {grm_path}"
+            f"  {grm_path}",
         )
     else:
         grm_path = f"{outprefix}.grm.txt"
         np.savetxt(grm_path, grm, fmt="%.6f")
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
-        logger.info(
+        log_success(
+            logger,
             f"Saved GRM in text format:\n"
             f"  {id_path}\n"
-            f"  {grm_path}"
+            f"  {grm_path}",
         )
 
     # ------------------------------------------------------------------
@@ -367,7 +370,7 @@ def main(log: bool = True):
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

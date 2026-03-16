@@ -43,6 +43,7 @@ from ._common.pathcheck import ensure_all_true, ensure_file_exists
 from ._common.status import (
     CliStatus,
     format_elapsed,
+    log_success,
     print_failure,
     print_success,
 )
@@ -865,7 +866,7 @@ def compute_smooth_df(
 
 def save_table(df: pd.DataFrame, path: str, logger: logging.Logger, label: str) -> None:
     df.to_csv(path, sep="\t", index=False)
-    logger.info(f"{label} saved: {path}")
+    log_success(logger, f"{label} saved: {path}")
 
 
 def normalize_position_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1330,7 +1331,7 @@ def plot_bsa(
         ).round(4)
         threshold_path = f"{output_stem}.thr.tsv"
         threshold_df.to_csv(threshold_path, sep="\t", index=False)
-        logger.info(f"Threshold regions saved: {threshold_path}")
+        log_success(logger, f"Threshold regions saved: {threshold_path}")
 
     x_max = raw_df["pos"].max()
     bulk1_short = bulk1_name.split(".")[0]
@@ -1442,8 +1443,8 @@ def plot_bsa(
     fig_stats.savefig(stats_out, dpi=300, bbox_inches="tight", transparent=False, facecolor="white")
     plt.close(fig_snp)
     plt.close(fig_stats)
-    logger.info(f"Figure saved: {snp_out}")
-    logger.info(f"Figure saved: {stats_out}")
+    log_success(logger, f"Figure saved: {snp_out}")
+    log_success(logger, f"Figure saved: {stats_out}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1742,9 +1743,7 @@ def main() -> None:
         finally:
             _restore_handler_levels(preprocess_muted_handlers)
 
-    logger.info(f"Filter details saved in log: {log_path}")
-    if use_spinner:
-        print_success("Filter details saved in log file.")
+    log_success(logger, f"Filter details saved in log: {log_path}")
 
     raw_df, smooth_df = reoffset_global_chr_positions(raw_df, smooth_df)
     raw_df, smooth_df = filter_low_loci_contigs(raw_df, smooth_df, logger)
@@ -1806,7 +1805,8 @@ def main() -> None:
             print("\n".join(plot_info_lines))
 
     lt = time.localtime()
-    logger.info(
+    log_success(
+        logger,
         "\nFinished post-BSA analysis. Total wall time: "
         f"{round(time.time() - t_start, 2)} seconds\n"
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "

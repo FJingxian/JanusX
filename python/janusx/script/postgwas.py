@@ -34,6 +34,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.status import (
+    log_success,
     print_success,
     print_failure,
     print_warning,
@@ -2989,12 +2990,12 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             saved_paths.append(("Manhattan+LD", manhld_path))
 
         if len(saved_paths) == 1:
-            logger.info(f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}")
+            log_success(logger, f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}")
         elif len(saved_paths) > 1:
             title = ", ".join([x[0] for x in saved_paths])
             body = "\n".join([f"  {x[1]}" for x in saved_paths])
-            logger.info(f"{title} plots saved to:\n{body}")
-        logger.info(f"Visualization completed in {round(time.time() - t_plot, 2)} seconds.\n")
+            log_success(logger, f"{title} plots saved to:\n{body}")
+        log_success(logger, f"Visualization completed in {round(time.time() - t_plot, 2)} seconds.\n")
 
     # ------------------------------------------------------------------
     # 2. Annotation of significant loci
@@ -3160,8 +3161,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
             anno_path = f"{args.out}/{args.prefix}.{threshold}.anno.tsv"
             df_out.to_csv(anno_path, sep="\t", index=False)
-            logger.info(f"Annotation table saved to {anno_path}")
-            logger.info(f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
+            log_success(logger, f"Annotation table saved to {anno_path}")
+            log_success(logger, f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
         else:
             logger.info(f"Annotation file not found: {args.anno}\n")
 
@@ -3743,11 +3744,11 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     if len(saved_paths) == 0:
         logger.warning("Warning: no merged figure was generated (both --manh and --qq are off).")
     elif len(saved_paths) == 1:
-        logger.info(f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}\n")
+        log_success(logger, f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}\n")
     else:
         title = ", ".join([x[0] for x in saved_paths])
         body = "\n".join([f"  {x[1]}" for x in saved_paths])
-        logger.info(f"{title} plots saved to:\n{body}\n")
+        log_success(logger, f"{title} plots saved to:\n{body}\n")
 
 
 def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
@@ -4523,7 +4524,7 @@ def main():
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

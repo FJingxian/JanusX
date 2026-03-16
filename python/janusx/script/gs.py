@@ -117,6 +117,7 @@ from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.status import (
     CliStatus,
     failure_symbol,
+    log_success,
     print_success,
     print_failure,
     format_elapsed,
@@ -1747,8 +1748,8 @@ def main(log: bool = True) -> None:
         )
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
-        logger.info(f"Saved predictions to {out_tsv}".replace("//", "/"))
-        logger.info(f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
+        log_success(logger, f"Saved predictions to {out_tsv}".replace("//", "/"))
+        log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
 
     # ----------------------------------------------------------------------
     # Final summary
@@ -1759,7 +1760,7 @@ def main(log: bool = True) -> None:
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

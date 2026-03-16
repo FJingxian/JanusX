@@ -39,7 +39,7 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
-from janusx.script._common.status import CliStatus, warn_deprecated_alias_usage, stdout_is_tty
+from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
 from janusx.script._common.colspec import parse_zero_based_index_specs
 
 
@@ -409,7 +409,7 @@ def main() -> None:
         decode_path = gwas_file.replace(".lmm.tsv", ".decode.lmm.tsv")
         dfdecode.to_csv(decode_path, sep="\t", index=False)
         decoded_files.append(decode_path)
-        logger.info(f"Decoded result saved to {decode_path}")
+        log_success(logger, f"Decoded result saved to {decode_path}")
 
     # ------------------------- postgwas plotting -------------------------
     for decode_path in decoded_files:
@@ -444,7 +444,7 @@ def main() -> None:
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

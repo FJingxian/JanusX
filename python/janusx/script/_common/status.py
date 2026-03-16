@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import sys
 from itertools import cycle
@@ -168,6 +169,45 @@ def print_warning(message: str, *, force_color: bool = False) -> None:
         _safe_print(f"{_YELLOW}{line}{_RESET}")
     else:
         _safe_print(line)
+
+
+def _emit_to_file_handlers(logger, level: int, message: str) -> bool:
+    handled = False
+    try:
+        for handler in getattr(logger, "handlers", []):
+            if isinstance(handler, logging.FileHandler):
+                record = logger.makeRecord(
+                    logger.name,
+                    int(level),
+                    __file__,
+                    0,
+                    str(message),
+                    args=(),
+                    exc_info=None,
+                    func=None,
+                    extra=None,
+                )
+                handler.handle(record)
+                handled = True
+    except Exception:
+        handled = False
+    return handled
+
+
+def log_success(
+    logger,
+    message: str,
+    *,
+    log_message: str | None = None,
+    force_color: bool = False,
+) -> None:
+    msg = str(message)
+    file_msg = str(msg if log_message is None else log_message)
+    if stdout_is_tty() or bool(force_color):
+        _emit_to_file_handlers(logger, logging.INFO, file_msg)
+        print_success(msg, force_color=bool(force_color))
+    else:
+        logger.info(file_msg)
 
 
 def warn_deprecated_alias_usage(

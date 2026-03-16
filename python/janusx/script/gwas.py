@@ -4720,10 +4720,10 @@ def main(log: bool = True):
             _emit_gwas_summary(logger, gwas_summary_rows)
         if len(saved_result_paths) > 0:
             logger.info("")
-            logger.info("Results saved:")
+            _rich_success(logger, "Results saved:")
             for p in saved_result_paths:
-                logger.info(f"  {p}")
-        logger.info(f"Log saved in {str(log_path).replace('//', '/')}")
+                _rich_success(logger, f"  {p}")
+        _rich_success(logger, f"Log saved in {str(log_path).replace('//', '/')}")
 
     except KeyboardInterrupt:
         run_status = "failed"
@@ -4800,7 +4800,7 @@ def main(log: bool = True):
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    _rich_success(logger, endinfo)
 
 
 if __name__ == "__main__":

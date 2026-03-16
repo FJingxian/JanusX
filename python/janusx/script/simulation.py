@@ -35,6 +35,7 @@ from ._common.pathcheck import (
 )
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
+from ._common.status import log_success
 
 
 # -----------------------------
@@ -402,7 +403,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.write_sites:
         write_sites(outprefix, outsites)
 
-    logger.info(f"Finished in {time.time() - t_start:.2f} s")
+    log_success(logger, f"Finished in {time.time() - t_start:.2f} s")
     logger.info("Done. Outputs:")
     logger.info(f"  {outprefix}.pheno")
     logger.info(f"  {outprefix}.pheno.txt")

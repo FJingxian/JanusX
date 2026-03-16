@@ -77,7 +77,7 @@ from ._common.pathcheck import (
 )
 from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
-from ._common.status import format_elapsed
+from ._common.status import format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -561,8 +561,9 @@ def main(log: bool = True):
             # Eigen decomposition
             eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
 
-        logger.info(
-            f"Completed PCA from genotype in {round(time.time() - t_loading, 3)} seconds"
+        log_success(
+            logger,
+            f"Completed PCA from genotype in {round(time.time() - t_loading, 3)} seconds",
         )
 
         # Save core PCA results
@@ -581,10 +582,11 @@ def main(log: bool = True):
             eigenval,
             fmt="%.2f",
         )
-        logger.info(
+        log_success(
+            logger,
             f'Saved eigen results in "{args.out}" with files '
             f'"{args.prefix}.eigenvec", '
-            f'"{args.prefix}.eigenval"'
+            f'"{args.prefix}.eigenval"',
         )
 
     # --- Case 2: GRM prefix -> load GRM -> PCA ---
@@ -622,8 +624,9 @@ def main(log: bool = True):
 
         # Eigen decomposition
         eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
-        logger.info(
-            f"Completed PCA from GRM in {round(time.time() - t_loading, 3)} seconds"
+        log_success(
+            logger,
+            f"Completed PCA from GRM in {round(time.time() - t_loading, 3)} seconds",
         )
 
         # Save core PCA results
@@ -642,10 +645,11 @@ def main(log: bool = True):
             eigenval,
             fmt="%.2f",
         )
-        logger.info(
+        log_success(
+            logger,
             f'Saved eigen results in "{args.out}" with files '
             f'"{args.prefix}.eigenvec", '
-            f'"{args.prefix}.eigenval"'
+            f'"{args.prefix}.eigenval"',
         )
 
     # --- Case 3: qcov prefix -> load PC results only for plotting ---
@@ -712,7 +716,7 @@ def main(log: bool = True):
         out_pdf = f"{outprefix}.eigenvec.2D.pdf"
         plt.savefig(out_pdf, transparent=True)
         plt.close()
-        logger.info(f"2D PCA figure saved to {out_pdf.replace('//', '/')}")
+        log_success(logger, f"2D PCA figure saved to {out_pdf.replace('//', '/')}")
 
     if args.plot3D:
         logger.info("* Generating 3D PCA rotating GIF...")
@@ -727,7 +731,7 @@ def main(log: bool = True):
             color_set=args.color,
             out_gif=out_gif,
         )
-        logger.info(f"3D PCA GIF saved to {out_gif.replace('//', '/')}")
+        log_success(logger, f"3D PCA GIF saved to {out_gif.replace('//', '/')}")
 
     # ------------------------- Final logging -------------------------
     lt = time.localtime()
@@ -736,7 +740,7 @@ def main(log: bool = True):
         f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
-    logger.info(endinfo)
+    log_success(logger, endinfo)
 
 
 if __name__ == "__main__":

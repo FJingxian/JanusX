@@ -34,7 +34,7 @@ from ._common.pathcheck import (
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
-from ._common.status import CliStatus, print_failure, print_success, stdout_is_tty
+from ._common.status import CliStatus, log_success, print_failure, print_success, stdout_is_tty
 
 
 def _mute_stdout_info_logs(
@@ -464,7 +464,7 @@ def main() -> None:
     wall = float(time.time() - t0)
     now = datetime.now()
     logger.info("")
-    logger.info(f"Finished. Total wall time: {wall:.2f} seconds")
+    log_success(logger, f"Finished. Total wall time: {wall:.2f} seconds")
     logger.info(
         f"{now.year}-{now.month}-{now.day} {now.hour}:{now.minute}:{now.second}"
     )

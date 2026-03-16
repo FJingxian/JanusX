@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{open_text_maybe_gz, read_bim, read_fam, SiteInfo};
+use crate::gfcore::{open_text_maybe_gz, read_bim, read_fam, HmpSnpIter, SiteInfo};
 use crate::vcfout::VcfOut;
 
 // ============================================================
@@ -28,6 +28,11 @@ enum OutFmt {
 fn is_vcf_path(s: &str) -> bool {
     let x = s.to_ascii_lowercase();
     x.ends_with(".vcf") || x.ends_with(".vcf.gz")
+}
+
+fn is_hmp_path(s: &str) -> bool {
+    let x = s.to_ascii_lowercase();
+    x.ends_with(".hmp") || x.ends_with(".hmp.gz")
 }
 
 fn has_dataset_prefix(name: &str) -> bool {
@@ -538,15 +543,43 @@ impl VcfSnpIterRaw {
     }
 }
 
+struct HmpSnpIterRaw {
+    samples: Vec<String>,
+    inner: HmpSnpIter,
+}
+
+impl HmpSnpIterRaw {
+    fn new(path: &str) -> Result<Self, String> {
+        let inner = HmpSnpIter::new_with_fill(path, 0.0, 1.0, false, false, 0.02)?;
+        let samples = inner.samples.clone();
+        Ok(Self { samples, inner })
+    }
+
+    fn sample_ids(&self) -> &[String] {
+        &self.samples
+    }
+
+    fn n_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn next_snp(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
+        self.inner.next_snp_raw()
+    }
+}
+
 enum InputIter {
     Bed(BedSnpIterRaw),
     Vcf(VcfSnpIterRaw),
+    Hmp(HmpSnpIterRaw),
 }
 
 impl InputIter {
     fn new(path_or_prefix: &str) -> Result<Self, String> {
         if is_vcf_path(path_or_prefix) {
             Ok(InputIter::Vcf(VcfSnpIterRaw::new(path_or_prefix)?))
+        } else if is_hmp_path(path_or_prefix) {
+            Ok(InputIter::Hmp(HmpSnpIterRaw::new(path_or_prefix)?))
         } else {
             // Treat input as a PLINK prefix, not a filename stem extension.
             // This preserves prefixes containing dots, e.g. "geno/DH.10k".
@@ -566,6 +599,7 @@ impl InputIter {
         match self {
             InputIter::Bed(it) => it.sample_ids(),
             InputIter::Vcf(it) => it.sample_ids(),
+            InputIter::Hmp(it) => it.sample_ids(),
         }
     }
 
@@ -573,6 +607,7 @@ impl InputIter {
         match self {
             InputIter::Bed(it) => it.n_samples(),
             InputIter::Vcf(it) => it.n_samples(),
+            InputIter::Hmp(it) => it.n_samples(),
         }
     }
 
@@ -580,6 +615,7 @@ impl InputIter {
         match self {
             InputIter::Bed(it) => it.next_snp(),
             InputIter::Vcf(it) => it.next_snp(),
+            InputIter::Hmp(it) => it.next_snp(),
         }
     }
 }

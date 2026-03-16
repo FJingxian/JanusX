@@ -336,11 +336,103 @@ def _ensure_plink_cache_from_source_at(
                 warnings.warn(rebuild_reason, RuntimeWarning, stacklevel=2)
                 _remove_plink_cache_files(cache_prefix)
 
-        convert_genotypes(source_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
+        try:
+            convert_genotypes(source_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
+        except Exception as ex:
+            # Backward-compat fallback:
+            # older Rust extension builds may not support HMP as convert_genotypes input.
+            # In that case convert_genotypes misinterprets '*.hmp' as a PLINK prefix.
+            ex_msg = str(ex).lower()
+            hmp_src = str(source_path).lower().endswith((".hmp", ".hmp.gz"))
+            looks_like_old_hmp_bug = (
+                "plink prefix not found or missing .bed/.bim/.fam" in ex_msg
+                and hmp_src
+            )
+            if (str(source_label).upper() == "HMP") and looks_like_old_hmp_bug:
+                warnings.warn(
+                    (
+                        "Current Rust extension does not support direct HMP->PLINK conversion "
+                        "in convert_genotypes; falling back to streaming HMP conversion."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _convert_hmp_to_plink_streaming(
+                    source_path=source_path,
+                    out_prefix=cache_prefix,
+                    snps_only=bool(snps_only),
+                )
+            else:
+                raise
         if not _is_plink_prefix(cache_prefix):
             raise RuntimeError(
                 f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
             )
+
+
+def _convert_hmp_to_plink_streaming(
+    *,
+    source_path: str,
+    out_prefix: str,
+    snps_only: bool,
+    chunk_size: int = 50000,
+) -> None:
+    """
+    Python-side HMP -> PLINK streaming converter used as compatibility fallback.
+
+    This path avoids full matrix materialization and works with older Rust wheels.
+    """
+    reader = HmpChunkReader(
+        str(source_path),
+        0.0,
+        1.0,
+        False,
+        None,
+        None,
+        "add",
+        0.0,
+    )
+    sample_ids = [str(x) for x in reader.sample_ids]
+    if len(sample_ids) == 0:
+        raise RuntimeError(f"HMP has no samples: {source_path}")
+
+    def _iter_chunks():
+        while True:
+            out = reader.next_chunk(int(chunk_size))
+            if out is None:
+                break
+            geno, sites = out
+            geno_np = np.asarray(geno, dtype=np.float32)
+            sites_list = list(sites)
+            if bool(snps_only):
+                keep_idx: list[int] = []
+                for i, s in enumerate(sites_list):
+                    r = str(getattr(s, "ref_allele", "")).upper()
+                    a = str(getattr(s, "alt_allele", "")).upper()
+                    if (
+                        len(r) == 1
+                        and len(a) == 1
+                        and r in {"A", "C", "G", "T"}
+                        and a in {"A", "C", "G", "T"}
+                    ):
+                        keep_idx.append(i)
+                if len(keep_idx) == 0:
+                    continue
+                if len(keep_idx) != len(sites_list):
+                    geno_np = np.asarray(geno_np[keep_idx, :], dtype=np.float32)
+                    sites_list = [sites_list[i] for i in keep_idx]
+            if geno_np.shape[0] == 0:
+                continue
+            yield geno_np, sites_list
+
+    save_genotype_streaming(
+        str(out_prefix),
+        sample_ids,
+        _iter_chunks(),
+        fmt="plink",
+        total_snps=None,
+        desc="Caching HMP as PLINK",
+    )
 
 
 def _ensure_plink_cache(

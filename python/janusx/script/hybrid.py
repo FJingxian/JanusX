@@ -24,7 +24,6 @@ Notes
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,8 +46,8 @@ from ._common.genoio import (
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
-from ._common.pathcheck import safe_expanduser
-from ._common.status import CliStatus, print_success, print_warning
+from ._common.pathcheck import format_path_for_display, safe_expanduser
+from ._common.status import CliStatus, print_success, print_warning, stdout_is_tty
 
 
 @dataclass
@@ -625,6 +624,17 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     raise ValueError("Unsupported output format. Use one of: plink, vcf, txt, npy.")
 
 
+def _format_output_display(out_fmt: str, out_prefix: str, out_path: str) -> str:
+    fmt = str(out_fmt).lower()
+    if fmt == "plink":
+        return f"{out_prefix} (.bed/.bim/.fam)"
+    if fmt == "npy":
+        return f"{out_prefix} (.npy/.site/.id)"
+    if fmt == "txt":
+        return f"{out_prefix} (.txt/.site/.id)"
+    return f"{out_path} ({fmt})"
+
+
 def _validate_parent_ids(
     source: HybridInputSource,
     p1_ids: Sequence[str],
@@ -732,12 +742,14 @@ def main() -> None:
         raise ValueError("--chunksize must be > 0")
 
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
+    output_display = _format_output_display(out_fmt, out_prefix, out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     configure_genotype_cache_from_out(str(Path(out_prefix).parent))
     log_path = f"{out_prefix}.hybrid.log"
     logger = setup_logging(log_path)
+    status_enabled = stdout_is_tty()
 
-    with CliStatus("Inspecting genotype input...", enabled=bool(getattr(os.sys.stdout, "isatty", lambda: False)())) as task:
+    with CliStatus("Inspecting genotype input...", enabled=status_enabled) as task:
         try:
             if args.vcf:
                 source = _build_vcf_source(args.vcf)
@@ -763,7 +775,7 @@ def main() -> None:
             "Please provide a matching prefix.site or prefix.bim sidecar."
         )
 
-    print(f"Genotype source: {source.label}")
+    print(f"Genotype source: {format_path_for_display(source.path)}")
     print(f"Source samples: {len(source.sample_ids)}, sites: {source.n_sites}")
     if p1_dup:
         print(f"P1 duplicates removed: {', '.join(p1_dup[:10])}")
@@ -780,8 +792,7 @@ def main() -> None:
     print(f"P1 parents: {len(p1_ids)}")
     print(f"P2 parents: {len(p2_ids)}")
     print(f"Hybrid progeny: {len(hybrid_ids)}")
-    print(f"Output prefix: {out_prefix}")
-    print(f"Output: {out_path} ({out_fmt})")
+    print(f"Output: {format_path_for_display(output_display)}")
 
     chunks = _make_hybrid_chunk_iterator(
         source,
@@ -790,7 +801,7 @@ def main() -> None:
         int(args.chunksize),
     )
 
-    with CliStatus("Building hybrid genotypes...", enabled=bool(getattr(os.sys.stdout, "isatty", lambda: False)())) as task:
+    with CliStatus("Building hybrid genotypes...", enabled=status_enabled) as task:
         try:
             if out_fmt == "vcf":
                 Path(out_path).parent.mkdir(parents=True, exist_ok=True)

@@ -49,7 +49,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     safe_expanduser,
 )
-from ._common.status import CliStatus
+from ._common.status import CliStatus, stdout_is_tty
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
 
@@ -481,7 +481,7 @@ def build_parser() -> CliArgumentParser:
 
 def main(log: bool = True) -> None:
     t_start = time.time()
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = stdout_is_tty()
     args = build_parser().parse_args()
 
     vcf_inputs = [x.replace("\\", "/") for x in (args.vcf or [])]

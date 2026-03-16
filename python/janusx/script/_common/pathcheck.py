@@ -5,11 +5,17 @@ from pathlib import Path
 from typing import Iterable
 
 
-def _norm(path: str) -> str:
+def format_path_for_display(path: str | Path) -> str:
     s = str(path)
+    if s == "" or "://" in s:
+        return s
     if os.name == "nt":
         return s.replace("/", "\\")
     return s.replace("\\", "/")
+
+
+def _norm(path: str | Path) -> str:
+    return format_path_for_display(path)
 
 
 def safe_expanduser(path: str | Path) -> Path:

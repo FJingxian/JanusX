@@ -28,7 +28,6 @@ import os
 import time
 import socket
 import argparse
-import sys
 from typing import Union
 
 import numpy as np
@@ -48,126 +47,10 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
-from ._common.status import get_rich_spinner_name, print_success, format_elapsed
+from ._common.progress import ProgressAdapter
+from ._common.status import format_elapsed
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
-
-try:
-    from tqdm.auto import tqdm
-    _HAS_TQDM = True
-except Exception:
-    tqdm = None  # type: ignore[assignment]
-    _HAS_TQDM = False
-
-
-class _ProgressAdapter:
-    """
-    Progress adapter for rich-first rendering with tqdm fallback.
-    """
-    def __init__(self, total: int, desc: str) -> None:
-        self.total = int(max(0, total))
-        self.desc = str(desc)
-        self._backend = "none"
-        self._progress = None
-        self._task_id = None
-        self._tqdm = None
-        self._start_ts = time.monotonic()
-        self._finished = False
-
-        if _HAS_RICH_PROGRESS and sys.stdout.isatty():
-            try:
-                self._progress = Progress(
-                    SpinnerColumn(
-                        spinner_name=get_rich_spinner_name(),
-                        style="cyan",
-                        finished_text="[green]✔︎[/green]",
-                    ),
-                    TextColumn("[green]{task.description}"),
-                    BarColumn(),
-                    TextColumn("{task.percentage:>6.1f}%"),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
-                    TextColumn("{task.fields[postfix]}"),
-                    transient=True,
-                )
-                self._progress.start()
-                self._task_id = self._progress.add_task(
-                    self.desc,
-                    total=self.total,
-                    postfix="",
-                )
-                self._backend = "rich"
-            except Exception:
-                self._progress = None
-                self._task_id = None
-
-        if self._backend == "none" and _HAS_TQDM:
-            self._tqdm = tqdm(
-                total=self.total,
-                desc=self.desc,
-                ascii=True,
-                leave=False,
-                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                           "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-            )
-            self._backend = "tqdm"
-
-    def update(self, n: int) -> None:
-        step = int(max(0, n))
-        if step == 0:
-            return
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, advance=step)
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.update(step)
-
-    def set_postfix(self, **kwargs: object) -> None:
-        if len(kwargs) == 0:
-            return
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            text = " ".join([f"{k}={v}" for k, v in kwargs.items()])
-            self._progress.update(self._task_id, postfix=text)
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.set_postfix(kwargs)
-
-    def finish(self) -> None:
-        if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, completed=self.total)
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.n = self._tqdm.total
-            self._tqdm.refresh()
-        self._finished = True
-
-    def close(self) -> None:
-        elapsed = format_elapsed(time.monotonic() - self._start_ts)
-        if self._backend == "rich" and self._progress is not None:
-            self._progress.stop()
-            self._progress = None
-            self._task_id = None
-        elif self._backend == "tqdm" and self._tqdm is not None:
-            self._tqdm.close()
-            self._tqdm = None
-        if self._finished:
-            print_success(f"{self.desc} ...Finished [{elapsed}]")
 
 
 def build_grm_streaming(
@@ -218,7 +101,7 @@ def build_grm_streaming(
     )
 
     grm = np.zeros((n_samples, n_samples), dtype="float32")
-    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
+    pbar = ProgressAdapter(total=n_snps, desc="GRM (streaming)")
     process = psutil.Process()
 
     varsum = 0.0

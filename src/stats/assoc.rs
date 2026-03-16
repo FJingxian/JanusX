@@ -57,7 +57,7 @@ fn get_cached_pool(threads: usize) -> PyResult<Option<Arc<rayon::ThreadPool>>> {
     })
 }
 
-/// 鐢?cholesky(L) 瑙?A x = b锛宎 涓瓨鐨勬槸 L锛堜笅涓夎锛?
+/// Solve `A x = b` from the in-place Cholesky factor `L` stored in `a`.
 fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
     let mut y = vec![0.0_f64; dim];
     for i in 0..dim {

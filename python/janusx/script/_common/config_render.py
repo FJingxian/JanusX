@@ -3,6 +3,9 @@ import os
 import sys
 from typing import Any, Optional, Sequence
 
+from .pathcheck import format_path_for_display
+from .status import stdout_is_tty
+
 try:
     from rich.console import Console, Group
     from rich.panel import Panel
@@ -70,21 +73,6 @@ def truncate_line(
     return s[: (max_chars - len(mark))] + mark
 
 
-def _format_path_for_os(text: str) -> str:
-    """
-    Normalize displayed path separators for the current OS.
-    - Windows: use backslash
-    - Unix-like: use slash
-    Keep URL-like strings unchanged.
-    """
-    s = str(text)
-    if s == "" or "://" in s:
-        return s
-    if os.name == "nt":
-        return s.replace("/", "\\")
-    return s.replace("\\", "/")
-
-
 def _is_path_like_key(key: str) -> bool:
     k = str(key).strip().lower()
     markers = ("file", "path", "prefix", "dir", "folder")
@@ -94,7 +82,7 @@ def _is_path_like_key(key: str) -> bool:
 def _format_config_value_for_display(key: str, value: object) -> str:
     s = str(value)
     if _is_path_like_key(key):
-        return _format_path_for_os(s)
+        return format_path_for_display(s)
     return s
 
 
@@ -109,7 +97,7 @@ def _render_rich_panel(
     line_max_chars: int,
     overflow_mark: str,
 ) -> bool:
-    if not (_HAS_RICH and sys.stdout.isatty()):
+    if not (_HAS_RICH and stdout_is_tty()):
         return False
 
     try:

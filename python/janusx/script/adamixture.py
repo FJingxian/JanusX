@@ -34,7 +34,7 @@ from ._common.pathcheck import (
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
-from ._common.status import CliStatus, print_failure, print_success
+from ._common.status import CliStatus, print_failure, print_success, stdout_is_tty
 
 
 def _mute_stdout_info_logs(
@@ -358,7 +358,7 @@ def main() -> None:
     log_path = os.path.join(outdir, f"{prefix}.adamixture.log")
     logger = setup_logging(log_path)
     logger.info("")
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = stdout_is_tty()
 
     q_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.Q").replace("\\", "/")
     p_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.P").replace("\\", "/")

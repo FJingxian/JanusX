@@ -24,7 +24,7 @@ from janusx.script._common.pathcheck import (
 from janusx.script.gwas import load_phenotype
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
-from janusx.script._common.status import CliStatus
+from janusx.script._common.status import CliStatus, stdout_is_tty
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
@@ -109,7 +109,7 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
 
 def main() -> None:
     t_start = time.time()
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = stdout_is_tty()
     parser = CliArgumentParser(
         prog="jx garfield",
         formatter_class=cli_help_formatter(),

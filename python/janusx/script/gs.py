@@ -43,7 +43,7 @@ Genomic selection workflow
   3. For each phenotype column:
        - Split individuals into training (non-missing phenotype) and test sets.
        - Run 5-fold CV on the training set for each selected model.
-       - Report Pearson, Spearman, and R² per fold.
+       - Report Pearson, Spearman, and R2 per fold.
        - Use the best fold for diagnostic plotting.
        - Refit model on full training set and predict the test set.
   4. Write prediction results to {prefix}.{trait}.gs.tsv.
@@ -113,32 +113,18 @@ from ._common.pathcheck import (
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
 )
+from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.status import (
     CliStatus,
-    get_rich_spinner_name,
+    failure_symbol,
     print_success,
     print_failure,
     format_elapsed,
+    stdout_is_tty,
+    success_symbol,
 )
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.colspec import parse_zero_based_index_specs
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        BarColumn,
-        TimeElapsedColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
 
 try:
     from tqdm.auto import tqdm
@@ -456,7 +442,7 @@ def GSapi(
         Predicted phenotypes for test individuals, shape (n_test, 1).
     pve : float
         Variance-component PVE/h2 for mixed models and Bayes models,
-        or predictive PVE (inner-CV R²) for ML models.
+        or predictive PVE (inner-CV R2) for ML models.
     """
     Xtrain, Xtest = _apply_optional_pca(Xtrain, Xtest, enabled=PCAdec)
 
@@ -703,19 +689,15 @@ def _run_methods_parallel(
             m: (fold_total_map[m] + 1) if show_method_progress else fold_total_map[m]
             for m in methods
         }
-        if show_method_progress and _HAS_RICH_PROGRESS and sys.stdout.isatty():
-            progress = Progress(
-                SpinnerColumn(
-                    spinner_name=get_rich_spinner_name(),
-                    style="cyan",
-                    finished_text=" ",
-                ),
-                TextColumn("{task.fields[method]}{task.fields[suffix]}"),
-                BarColumn(),
-                TextColumn("{task.percentage:>6.1f}%"),
-                TimeElapsedColumn(),
+        if show_method_progress and rich_progress_available():
+            progress = build_rich_progress(
+                description_template="{task.fields[method]}{task.fields[suffix]}",
+                show_elapsed=True,
+                show_remaining=False,
+                finished_text=" ",
                 transient=True,
             )
+            assert progress is not None
             with progress:
                 task_map: dict[str, int] = {}
                 done_map: dict[str, int] = {}
@@ -772,7 +754,7 @@ def _run_methods_parallel(
                             pass
                         elapsed = format_elapsed(time.monotonic() - t0)
                         progress.console.print(
-                            f"[red]✘ {m} ...Failed [{elapsed}][/red]"
+                            f"[red]{failure_symbol()} {m} ...Failed [{elapsed}][/red]"
                         )
                         raise
                     left_final = max(0, total_n - int(done_map[m]))
@@ -785,7 +767,7 @@ def _run_methods_parallel(
                     out.append(res)
                     elapsed = format_elapsed(time.monotonic() - t0)
                     progress.console.print(
-                        f"[green]✔︎ {m} ...Finished [{elapsed}][/green]"
+                        f"[green]{success_symbol()} {m} ...Finished [{elapsed}][/green]"
                     )
             return out
         for m in methods:
@@ -866,28 +848,25 @@ def _run_methods_parallel(
                     f"{method} ...Finished [{elapsed}]",
                     force_color=True,
                 )
-    elif _HAS_RICH_PROGRESS and sys.stdout.isatty():
-        progress = Progress(
-            SpinnerColumn(
-                spinner_name=get_rich_spinner_name(),
-                style="cyan",
-                finished_text=" ",
-            ),
-            TextColumn("{task.fields[method]}"),
-            BarColumn(),
-            TextColumn("{task.percentage:>6.1f}%{task.fields[suffix]}"),
-            TimeElapsedColumn(),
+    elif rich_progress_available():
+        progress = build_rich_progress(
+            description_template="{task.fields[method]}",
+            field_templates=["{task.fields[suffix]}"],
+            show_elapsed=True,
+            show_remaining=False,
+            finished_text=" ",
             transient=True,
         )
+        assert progress is not None
         with progress:
             def _rich_print_success(method_name: str, elapsed_text: str) -> None:
                 progress.console.print(
-                    f"[green]✔︎ {method_name} ...Finished [{elapsed_text}][/green]"
+                    f"[green]{success_symbol()} {method_name} ...Finished [{elapsed_text}][/green]"
                 )
 
             def _rich_print_failure(method_name: str, elapsed_text: str) -> None:
                 progress.console.print(
-                    f"[red]✘ {method_name} ...Failed [{elapsed_text}][/red]"
+                    f"[red]{failure_symbol()} {method_name} ...Failed [{elapsed_text}][/red]"
                 )
 
             task_map: dict[str, int] = {}
@@ -1112,7 +1091,7 @@ def _load_genotype_with_rust_gfreader(
 
 def main(log: bool = True) -> None:
     t_start = time.time()
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = stdout_is_tty()
     parser = CliArgumentParser(
         prog="jx gs",
         formatter_class=cli_help_formatter(),
@@ -1697,8 +1676,8 @@ def main(log: bool = True) -> None:
                     method="Method",
                     pear="Pearsonr",
                     spear="Spearmanr",
-                    r2="R²",
-                    h2="h²/PVE",
+                    r2="R2",
+                    h2="h2/PVE",
                     time="time(secs)",
                 )
             )

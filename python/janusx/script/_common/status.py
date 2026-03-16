@@ -6,7 +6,7 @@ from itertools import cycle
 from shutil import get_terminal_size
 from threading import Thread
 from time import monotonic, sleep
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 try:
     from rich.console import Console
@@ -16,7 +16,7 @@ try:
 except Exception:
     Console = None  # type: ignore[assignment]
     SPINNERS = {}  # type: ignore[assignment]
-_HAS_RICH = False
+    _HAS_RICH = False
 
 _SPINNER_NAME = "janusx_ascii"
 _SPINNER_FRAMES = ["|", "/", "-", "\\"]
@@ -25,6 +25,10 @@ _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
+
+
+def stdout_is_tty() -> bool:
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
 
 
 def _encoding_supports(text: str) -> bool:
@@ -40,8 +44,16 @@ def _symbol_or_ascii(preferred: str, fallback: str) -> str:
     return str(preferred) if _encoding_supports(preferred) else str(fallback)
 
 
-_SUCCESS_SYMBOL = _symbol_or_ascii("✔︎", "[OK]")
-_FAIL_SYMBOL = _symbol_or_ascii("✗", "[X]")
+_SUCCESS_SYMBOL = _symbol_or_ascii("\u2714", "[OK]")
+_FAIL_SYMBOL = _symbol_or_ascii("\u2718", "[X]")
+
+
+def success_symbol() -> str:
+    return _SUCCESS_SYMBOL
+
+
+def failure_symbol() -> str:
+    return _FAIL_SYMBOL
 
 
 def _safe_console_text(text: str) -> str:
@@ -98,17 +110,29 @@ def get_rich_spinner_name() -> str:
     return JANUSX_SPINNER_NAME
 
 
+def _console_for_print(*, force_color: bool) -> Optional["Console"]:
+    if not _HAS_RICH:
+        return None
+    is_tty = stdout_is_tty()
+    if not (is_tty or force_color):
+        return None
+    try:
+        return Console(force_terminal=bool(force_color), no_color=False)
+    except Exception:
+        return None
+
+
 def print_success(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
-    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
     line = f"{_SUCCESS_SYMBOL} {msg}"
-    if _HAS_RICH and (is_tty or bool(force_color)):
+    console = _console_for_print(force_color=bool(force_color))
+    if console is not None:
         try:
-            Console(force_terminal=True, no_color=False).print(f"[green]{line}[/green]")
+            console.print(f"[green]{line}[/green]")
             return
         except Exception:
             pass
-    if is_tty or bool(force_color):
+    if stdout_is_tty() or bool(force_color):
         _safe_print(f"{_GREEN}{line}{_RESET}")
     else:
         _safe_print(line)
@@ -116,15 +140,15 @@ def print_success(message: str, *, force_color: bool = False) -> None:
 
 def print_failure(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
-    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
     line = f"{_FAIL_SYMBOL} {msg}"
-    if _HAS_RICH and (is_tty or bool(force_color)):
+    console = _console_for_print(force_color=bool(force_color))
+    if console is not None:
         try:
-            Console(force_terminal=True, no_color=False).print(f"[red]{line}[/red]")
+            console.print(f"[red]{line}[/red]")
             return
         except Exception:
             pass
-    if is_tty or bool(force_color):
+    if stdout_is_tty() or bool(force_color):
         _safe_print(f"{_RED}{line}{_RESET}")
     else:
         _safe_print(line)
@@ -133,17 +157,36 @@ def print_failure(message: str, *, force_color: bool = False) -> None:
 def print_warning(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
     line = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
-    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    if _HAS_RICH and (is_tty or bool(force_color)):
+    console = _console_for_print(force_color=bool(force_color))
+    if console is not None:
         try:
-            Console(force_terminal=True, no_color=False).print(f"[yellow]{line}[/yellow]")
+            console.print(f"[yellow]{line}[/yellow]")
             return
         except Exception:
             pass
-    if is_tty or bool(force_color):
+    if stdout_is_tty() or bool(force_color):
         _safe_print(f"{_YELLOW}{line}{_RESET}")
     else:
         _safe_print(line)
+
+
+def warn_deprecated_alias_usage(
+    aliases: Iterable[str],
+    *,
+    replacement: str,
+    argv: Sequence[str] | None = None,
+) -> bool:
+    alias_list = [str(x).strip() for x in aliases if str(x).strip()]
+    if len(alias_list) == 0:
+        return False
+    alias_set = set(alias_list)
+    for tok in (argv if argv is not None else sys.argv[1:]):
+        key = str(tok).split("=", 1)[0].strip()
+        if key in alias_set:
+            joined = "/".join(alias_list)
+            print_warning(f"`{joined}` is deprecated; use `{replacement}`.")
+            return True
+    return False
 
 
 class CliStatus:
@@ -192,9 +235,10 @@ class CliStatus:
             self._backend = "none"
             return self
 
-        if _HAS_RICH and getattr(sys.stdout, "isatty", lambda: False)():
+        if _HAS_RICH and stdout_is_tty():
             try:
                 ensure_rich_spinner_registered()
+                assert Console is not None
                 self._console = Console()
                 self._status_cm = self._console.status(
                     self._running_line(),
@@ -263,7 +307,7 @@ class CliStatus:
         line = self._compose_line(symbol, str(message))
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[green]{line}[/green]")
-        elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
+        elif self.enabled and stdout_is_tty():
             _safe_print(f"{_GREEN}{line}{_RESET}")
         else:
             _safe_print(line)
@@ -278,7 +322,7 @@ class CliStatus:
         tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[red]{symbol}[/red]{tail}")
-        elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
+        elif self.enabled and stdout_is_tty():
             _safe_print(f"{_RED}{symbol}{_RESET}{tail}")
         else:
             _safe_print(line)

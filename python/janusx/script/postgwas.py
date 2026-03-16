@@ -34,12 +34,14 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.status import (
-    get_rich_spinner_name,
     print_success,
     print_failure,
     print_warning,
     format_elapsed,
+    stdout_is_tty,
+    warn_deprecated_alias_usage,
 )
+from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
 
 # Ensure matplotlib uses a non-interactive backend.
@@ -79,34 +81,6 @@ _QQ_FAST_MAX_POINTS = 120_000
 _CONFIG_LINE_MAX_CHARS = 60
 _CONFIG_OVERFLOW_MARK = "***"
 _ANNO_DESC_KEY = "description"
-
-
-def _warn_deprecated_threshold_alias() -> None:
-    argv = [str(x) for x in sys.argv[1:]]
-    for tok in argv:
-        key = tok.split("=", 1)[0].strip()
-        if key in {"-threshold", "--threshold"}:
-            print_warning("`-threshold/--threshold` is deprecated; use `-thr/--thr`.")
-            break
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
 
 try:
     from tqdm.auto import tqdm
@@ -248,7 +222,7 @@ def _render_postgwas_config_rich(
     threads_text: str,
     key_width: int = 20,
 ) -> bool:
-    if not (_HAS_RICH_CONSOLE and sys.stdout.isatty()):
+    if not (_HAS_RICH_CONSOLE and stdout_is_tty()):
         return False
 
     try:
@@ -1501,7 +1475,7 @@ def _ldclump_significant_snps(
 
     warn_count = 0
     warn_limit = 5
-    use_rich_progress = bool(show_progress and _HAS_RICH_PROGRESS and sys.stdout.isatty())
+    use_rich_progress = bool(show_progress and rich_progress_available())
     progress = None
     task_id = None
     progress_tqdm = None
@@ -1509,17 +1483,9 @@ def _ldclump_significant_snps(
     clump_success = False
     if use_rich_progress:
         try:
-            progress = Progress(
-                SpinnerColumn(
-                    spinner_name=get_rich_spinner_name(),
-                    style="cyan",
-                    finished_text="[green]✔︎[/green]",
-                ),
-                TextColumn("[green]{task.description}"),
-                BarColumn(),
-                TextColumn("{task.percentage:>6.1f}%"),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
+            progress = build_rich_progress(
+                show_remaining=True,
+                finished_text=" ",
                 transient=True,
             )
         except Exception:
@@ -3122,7 +3088,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 for x in desc_exact
             ]
 
-            # Optional broadened window around SNP (± annobroaden kb)
+            # Optional broadened window around SNP (卤 annobroaden kb)
             if args.annobroaden is not None:
                 kb = args.annobroaden * 1_000
                 desc_broad = [
@@ -3814,7 +3780,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     # In parallel mode, keep worker logs in file only to avoid spinner/pbar corruption.
     setattr(args, "_postgwas_worker_mute_stream", True)
 
-    if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+    if rich_progress_available():
         n_total = len(files)
         basenames = [os.path.basename(f) for f in files]
         name_width = max((len(x) for x in basenames), default=0)
@@ -3823,16 +3789,16 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         n_workers = max(1, min(req_threads, max_visible, n_total))
         setattr(args, "_postgwas_job_workers", int(n_workers))
         file_to_idx = {f: i for i, f in enumerate(files, start=1)}
-        progress = Progress(
-            SpinnerColumn(
-                spinner_name=get_rich_spinner_name(),
-                style="cyan",
-                finished_text=" ",
-            ),
-            TextColumn("Task {task.fields[task_label]}: {task.fields[file_pad]}"),
+        progress = build_rich_progress(
+            description_template="Task {task.fields[task_label]}: {task.fields[file_pad]}",
+            show_bar=False,
+            show_percentage=False,
+            show_elapsed=False,
+            show_remaining=False,
+            finished_text=" ",
             transient=True,
         )
-        with progress:
+        with (progress if progress is not None else nullcontext()):
             task_start_ts: dict[str, float] = {}
             task_map: dict[str, int] = {}
             future_map: dict[cf.Future[str], str] = {}
@@ -3844,6 +3810,8 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                 if len(task_map) >= max_visible:
                     return
                 idx = file_to_idx[file_path]
+                if progress is None:
+                    return
                 task_map[file_path] = progress.add_task(
                     description="",
                     total=None,
@@ -3966,7 +3934,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
 
 
 def main():
-    _warn_deprecated_threshold_alias()
+    warn_deprecated_alias_usage(("-threshold", "--threshold"), replacement="-thr/--thr")
     t_start = time.time()
 
     parser = CliArgumentParser(

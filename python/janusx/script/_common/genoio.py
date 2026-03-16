@@ -7,28 +7,16 @@ from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from janusx.gfreader import SiteInfo, prepare_cli_input_cache
 from .pathcheck import safe_expanduser
-from .status import CliStatus
+from .progress import build_rich_progress, rich_progress_available
+from .status import CliStatus, stdout_is_tty
 
 try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-    )
-    _HAS_RICH_PROGRESS = True
+    from tqdm.auto import tqdm
 except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
+    tqdm = None  # type: ignore[assignment]
 
 
 GENOTYPE_TEXT_SUFFIXES: tuple[str, ...] = (".txt", ".tsv", ".csv")
@@ -323,18 +311,21 @@ def write_id_file(path: str, sample_ids: Sequence[str]) -> None:
 
 
 def _open_site_progress(desc: str, total_sites: int):
-    use_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    if bool(_HAS_RICH_PROGRESS and use_tty):
-        progress = Progress(
-            SpinnerColumn(style="green"),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40),
-            TextColumn("{task.percentage:>5.1f}%"),
-            TimeElapsedColumn(),
+    use_tty = stdout_is_tty()
+    if rich_progress_available():
+        progress = build_rich_progress(
+            description_template="[progress.description]{task.description}",
+            show_remaining=False,
+            bar_width=40,
+            finished_text=" ",
+            transient=True,
         )
-        task_id = progress.add_task(str(desc), total=float(max(0, int(total_sites))))
-        progress.start()
-        return progress, task_id, None
+        if progress is not None:
+            task_id = progress.add_task(str(desc), total=float(max(0, int(total_sites))))
+            progress.start()
+            return progress, task_id, None
+    if tqdm is None:
+        return None, None, None
     pbar = tqdm(
         total=max(0, int(total_sites)),
         unit="SNP",

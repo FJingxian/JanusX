@@ -32,6 +32,7 @@ import tempfile
 import time
 import sys
 from pathlib import Path
+from contextlib import nullcontext
 from typing import Any, Optional
 from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 
@@ -42,20 +43,10 @@ from ._common.pathcheck import ensure_all_true, ensure_file_exists
 from ._common.status import (
     CliStatus,
     format_elapsed,
-    get_rich_spinner_name,
     print_failure,
     print_success,
 )
-
-try:
-    from rich.progress import Progress, SpinnerColumn, TextColumn
-
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
+from ._common.progress import build_rich_progress, rich_progress_available
 
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -1052,7 +1043,7 @@ def preprocess_tables_parallel(
             return False
         return not bool(df.isna().all(axis=None))
 
-    if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+    if rich_progress_available():
         muted_console_handlers: list[tuple[logging.Handler, int]] = []
         for h in logger.handlers:
             if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
@@ -1065,17 +1056,17 @@ def preprocess_tables_parallel(
         idx_width = len(str(n_total))
         name_width = max((len(x) for x in basenames), default=0)
         task_start_ts: dict[str, float] = {}
-        progress = Progress(
-            SpinnerColumn(
-                spinner_name=get_rich_spinner_name(),
-                style="cyan",
-                finished_text=" ",
-            ),
-            TextColumn("Task {task.fields[task_label]}: {task.fields[file_pad]}"),
+        progress = build_rich_progress(
+            description_template="Task {task.fields[task_label]}: {task.fields[file_pad]}",
+            show_bar=False,
+            show_percentage=False,
+            show_elapsed=False,
+            show_remaining=False,
+            finished_text=" ",
             transient=True,
         )
         try:
-            with progress:
+            with (progress if progress is not None else nullcontext()):
                 with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:
                     fut_map: dict[cf.Future, str] = {}
                     task_map: dict[cf.Future, int] = {}
@@ -1100,6 +1091,8 @@ def preprocess_tables_parallel(
                         for fut in pending[: display_limit - len(task_map)]:
                             table_path = fut_map[fut]
                             idx = file_to_idx.get(table_path, 0)
+                            if progress is None:
+                                continue
                             task_map[fut] = progress.add_task(
                                 description="",
                                 total=None,
@@ -1124,7 +1117,8 @@ def preprocess_tables_parallel(
                             tid = task_map.pop(fut, None)
                             if tid is not None:
                                 try:
-                                    progress.remove_task(tid)
+                                    if progress is not None:
+                                        progress.remove_task(tid)
                                 except Exception:
                                     pass
                             elapsed = format_elapsed(

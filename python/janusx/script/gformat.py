@@ -54,9 +54,10 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.status import CliStatus
+from ._common.status import CliStatus, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
 
 
@@ -438,7 +439,7 @@ def main() -> None:
     configure_genotype_cache_from_out(str(args.out))
     log_path = f"{out_prefix}.gformat.log"
     logger = setup_logging(log_path)
-    status_enabled = bool(getattr(os.sys.stdout, "isatty", lambda: False)())
+    status_enabled = stdout_is_tty()
 
     extract_mode, extract_file = _parse_extract_arg(args.extract)
     chr_keys = _expand_chr_selector(args.chr_filter)
@@ -576,9 +577,9 @@ def main() -> None:
             raise ValueError("All variants were filtered out by --extract/--chr/--from-bp/--to-bp.")
 
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
-    print(f"Genotype source: {gfile}")
+    print(f"Genotype source: {format_path_for_display(gfile)}")
     print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
-    print(f"Output: {output_display}")
+    print(f"Output: {format_path_for_display(output_display)}")
 
     def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         c = load_genotype_chunks(

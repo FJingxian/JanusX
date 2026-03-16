@@ -102,10 +102,10 @@ from ._common.pathcheck import (
 from ._common.prefetch import prefetch_iter
 from ._common.status import (
     CliStatus,
-    get_rich_spinner_name,
     print_success,
     format_elapsed,
 )
+from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.gwas_history import record_gwas_run
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
@@ -115,25 +115,6 @@ from ._common.genoio import (
     read_id_file as _read_id_file,
 )
 from ._common.colspec import parse_zero_based_index_specs
-
-try:
-    from rich.progress import (
-        Progress,
-        SpinnerColumn,
-        BarColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    _HAS_RICH_PROGRESS = True
-except Exception:
-    Progress = None  # type: ignore[assignment]
-    SpinnerColumn = None  # type: ignore[assignment]
-    BarColumn = None  # type: ignore[assignment]
-    TextColumn = None  # type: ignore[assignment]
-    TimeElapsedColumn = None  # type: ignore[assignment]
-    TimeRemainingColumn = None  # type: ignore[assignment]
-    _HAS_RICH_PROGRESS = False
 
 try:
     from tqdm.auto import tqdm
@@ -328,21 +309,16 @@ class _ProgressAdapter:
         self._memory_text = ""
         self._memory_until_tick = 0
 
-        if _HAS_RICH_PROGRESS and sys.stdout.isatty():
+        if rich_progress_available():
             try:
-                self._progress = Progress(
-                    SpinnerColumn(
-                        spinner_name=get_rich_spinner_name(),
-                        style="cyan",
-                        finished_text="[green]✔︎[/green]",
-                    ),
-                    TextColumn("[green]{task.description}"),
-                    BarColumn(),
-                    TextColumn("{task.fields[metric]}"),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
+                self._progress = build_rich_progress(
+                    show_remaining=True,
+                    field_templates=["{task.fields[metric]}"],
+                    finished_text=" ",
                     transient=True,
                 )
+                if self._progress is None:
+                    raise RuntimeError("rich progress unavailable")
                 self._progress.start()
                 self._task_id = self._progress.add_task(
                     self.desc,
@@ -448,7 +424,7 @@ class _ProgressAdapter:
             if success_style:
                 print_success(msg)
             else:
-                print(f"✔︎ {msg}", flush=True)
+                print(msg, flush=True)
 
 
 def fastplot(
@@ -3237,31 +3213,27 @@ def run_chunked_gwas_streaming_shared(
     )
 
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
-    use_rich_multi = bool(use_spinner and _HAS_RICH_PROGRESS and sys.stdout.isatty())
+    use_rich_multi = bool(use_spinner and rich_progress_available())
     rich_progress = None
     if use_rich_multi:
-        rich_progress = Progress(
-            SpinnerColumn(
-                spinner_name=get_rich_spinner_name(),
-                style="cyan",
-                finished_text="[green]✔︎[/green]",
-            ),
-            TextColumn("[green]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.fields[metric]}"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
+        rich_progress = build_rich_progress(
+            show_remaining=True,
+            field_templates=["{task.fields[metric]}"],
+            finished_text=" ",
             transient=True,
         )
-        rich_progress.start()
-        for ctx in model_ctxs:
-            tid = rich_progress.add_task(
-                str(ctx["model_label"]),
-                total=pbar_total,
-                metric="0.0%",
-            )
-            ctx["task_id"] = int(tid)
-    else:
+        if rich_progress is not None:
+            rich_progress.start()
+            for ctx in model_ctxs:
+                tid = rich_progress.add_task(
+                    str(ctx["model_label"]),
+                    total=pbar_total,
+                    metric="0.0%",
+                )
+                ctx["task_id"] = int(tid)
+        else:
+            use_rich_multi = False
+    if not use_rich_multi:
         for ctx in model_ctxs:
             ctx["pbar"] = _ProgressAdapter(total=pbar_total, desc=str(ctx["model_label"]))
 

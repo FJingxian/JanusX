@@ -39,7 +39,7 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
     ensure_plink_prefix_exists,
 )
-from janusx.script._common.status import CliStatus, print_warning
+from janusx.script._common.status import CliStatus, warn_deprecated_alias_usage, stdout_is_tty
 from janusx.script._common.colspec import parse_zero_based_index_specs
 
 
@@ -55,16 +55,6 @@ def _determine_genotype(args) -> tuple[str, str]:
     if args.prefix:
         prefix = args.prefix
     return gfile.replace("\\", "/"), prefix
-
-
-def _warn_deprecated_threshold_alias() -> None:
-    argv = [str(x) for x in sys.argv[1:]]
-    for tok in argv:
-        key = tok.split("=", 1)[0].strip()
-        if key in {"-threshold", "--threshold"}:
-            print_warning("`-threshold/--threshold` is deprecated; use `-thr/--thr`.")
-            break
-
 
 def _find_gwas_results(outprefix: str, model: str) -> list[str]:
     model = model.lower()
@@ -82,7 +72,7 @@ def _find_gwas_results(outprefix: str, model: str) -> list[str]:
 
 def _run_subprocess(cmd: List[str], logger, desc: str) -> None:
     logger.info(f"* {desc}: {' '.join(cmd)}")
-    use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    use_spinner = stdout_is_tty()
     with CliStatus(desc, enabled=use_spinner) as task:
         res = subprocess.run(
             cmd,
@@ -138,7 +128,7 @@ def _filter_pseudomap_by_set_distance(pseudodf: pd.DataFrame, max_span_bp: int) 
 
 
 def main() -> None:
-    _warn_deprecated_threshold_alias()
+    warn_deprecated_alias_usage(("-threshold", "--threshold"), replacement="-thr/--thr")
     t_start = time.time()
 
     parser = CliArgumentParser(

@@ -221,6 +221,7 @@ class MLGS:
         confirm_repeats: int = 2,
         fit_on_init: bool = True,
         verbose: bool = False,
+        progress_callback: typing.Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.method = str(method)
         self.seed = 0 if seed is None else int(seed)
@@ -273,9 +274,19 @@ class MLGS:
         self.best_boost_rounds_: int | None = None
         self.best_n_estimators_: int | None = None
         self.cv_results_: list[dict[str, Any]] = []
+        self._progress_callback = progress_callback
 
         if fit_on_init:
             self.fit()
+
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        cb = self._progress_callback
+        if cb is None:
+            return
+        try:
+            cb(str(event), dict(payload))
+        except Exception:
+            return
 
     def _parallel_mode(self) -> typing.Literal["model", "search"]:
         if self.method in {"svm", "enet"}:
@@ -937,11 +948,18 @@ class MLGS:
         if eval_fn is None:
             eval_fn = lambda params: self._evaluate_candidate(params, stage=stage)
         if self.parallel_mode_ == "search" and self.n_jobs > 1 and len(candidates) > 1:
-            return Parallel(n_jobs=self.n_jobs, prefer="threads")(
+            rows = Parallel(n_jobs=self.n_jobs, prefer="threads")(
                 delayed(eval_fn)(params)
                 for params in candidates
             )
-        return [eval_fn(params) for params in candidates]
+            if len(rows) > 0:
+                self._emit_progress("search_advance", stage=stage, inc=int(len(rows)))
+            return rows
+        out: list[dict[str, Any]] = []
+        for params in candidates:
+            out.append(eval_fn(params))
+            self._emit_progress("search_advance", stage=stage, inc=1)
+        return out
 
     def fit(self) -> "MLGS":
         coarse_space = self._coarse_space()
@@ -949,11 +967,13 @@ class MLGS:
         if not coarse_candidates:
             raise RuntimeError("No coarse-search candidate was generated.")
 
+        self._emit_progress("search_plan", stage="coarse", count=int(len(coarse_candidates)))
         results = self._evaluate_candidates(coarse_candidates, stage="coarse")
         if self.search_scheme == "legacy":
             best_coarse = max(results, key=self._result_sort_key)
             fine_space = self._fine_space(best_coarse["params"])
             fine_candidates = self._parameter_candidates(fine_space, self.fine_iter, "fine")
+            self._emit_progress("search_plan", stage="fine", count=int(len(fine_candidates)))
             fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
             if fine_results:
                 results.extend(fine_results)
@@ -969,10 +989,12 @@ class MLGS:
                     self._parameter_candidates(fine_space, self.fine_iter, "fine")
                 )
             fine_candidates = self._dedup_candidates(fine_candidates_all)
+            self._emit_progress("search_plan", stage="fine", count=int(len(fine_candidates)))
             fine_results = self._evaluate_candidates(fine_candidates, stage="fine")
             if fine_results:
                 results.extend(fine_results)
             confirm_centers = self._top_result_rows(results, self.confirm_top_k)
+            self._emit_progress("search_plan", stage="confirm", count=int(len(confirm_centers)))
             confirm_results = self._evaluate_candidates(
                 [dict(row["params"]) for row in confirm_centers],
                 stage="confirm",

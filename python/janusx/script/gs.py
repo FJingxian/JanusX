@@ -121,7 +121,6 @@ from ._common.status import (
     print_success,
     print_failure,
     format_elapsed,
-    should_animate_status,
     stdout_is_tty,
     success_symbol,
 )
@@ -388,9 +387,19 @@ def _tune_ml_method_once(
     Xtrain: np.ndarray,
     PCAdec: bool,
     n_jobs: int,
+    progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
     empty_test = np.zeros((Xtrain.shape[0], 0), dtype=Xtrain.dtype)
     Xtrain_tuned, _ = _apply_optional_pca(Xtrain, empty_test, enabled=PCAdec)
+
+    def _on_ml_search_progress(event: str, payload: dict[str, typing.Any]) -> None:
+        if progress_hook is None:
+            return
+        try:
+            progress_hook(str(event), dict(payload))
+        except Exception:
+            return
+
     model = MLGS(
         y=Y.reshape(-1),
         M=Xtrain_tuned,
@@ -398,9 +407,11 @@ def _tune_ml_method_once(
         seed=42,
         cv=_mlgs_inner_cv(int(Y.shape[0])),
         n_jobs=max(1, int(n_jobs)),
-        fit_on_init=True,
+        fit_on_init=False,
         verbose=False,
+        progress_callback=_on_ml_search_progress,
     )
+    model.fit()
     return {
         "params": model.get_final_params(),
         "pve": float((model.best_metrics_ or {}).get("r2", np.nan)),
@@ -547,6 +558,7 @@ def _run_method_task(
     strict_cv: bool,
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
+    search_progress_hook: typing.Any = None,
 ) -> dict[str, typing.Any]:
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     best_test = None
@@ -563,6 +575,7 @@ def _run_method_task(
             Xtrain=train_snp_ml,
             PCAdec=pca_dec,
             n_jobs=n_jobs,
+            progress_hook=search_progress_hook,
         )
 
     if cv_splits is not None:
@@ -687,14 +700,10 @@ def _run_methods_parallel(
             m: (int(len(cv_splits)) if cv_splits is not None else 1)
             for m in methods
         }
-        task_total_map = {
-            m: (fold_total_map[m] + 1) if show_method_progress else fold_total_map[m]
-            for m in methods
-        }
-        animate_method_progress = bool(show_method_progress and should_animate_status("Methods"))
+        animate_method_progress = bool(show_method_progress)
         if animate_method_progress and rich_progress_available():
             progress = build_rich_progress(
-                description_template="{task.fields[method]}{task.fields[suffix]}",
+                description_template="{task.fields[label]}",
                 show_elapsed=True,
                 show_remaining=False,
                 finished_text=" ",
@@ -702,38 +711,105 @@ def _run_methods_parallel(
             )
             assert progress is not None
             with progress:
-                task_map: dict[str, int] = {}
-                done_map: dict[str, int] = {}
-                for idx, m in enumerate(methods):
-                    total_n = int(max(1, task_total_map.get(m, 1)))
-                    task_map[m] = progress.add_task(
-                        description="",
-                        total=total_n,
-                        method=m,
-                        suffix="" if idx == 0 else " waiting",
-                        start=False,
-                    )
-                    done_map[m] = 0
+                for m in methods:
+                    cv_total = int(max(1, fold_total_map.get(m, 1)))
+                    has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
+                    search_task_id: int | None = None
+                    search_done = 0
+                    search_total = 0
+                    cv_task_id: int | None = None
+                    cv_done = 0
 
-                for idx, m in enumerate(methods):
-                    total_n = int(max(1, task_total_map.get(m, 1)))
-                    tid = int(task_map[m])
-                    progress.update(tid, suffix="")
-                    try:
-                        progress.start_task(tid)
-                    except Exception:
-                        pass
+                    def _close_search_task() -> None:
+                        nonlocal search_task_id, search_done, search_total
+                        if search_task_id is None:
+                            return
+                        left = max(0, int(search_total) - int(search_done))
+                        if left > 0:
+                            progress.update(
+                                search_task_id,
+                                advance=left,
+                                label=f"{m} search {int(search_total)}/{int(search_total)}",
+                            )
+                        try:
+                            progress.remove_task(search_task_id)
+                        except Exception:
+                            pass
+                        search_task_id = None
+
+                    def _ensure_cv_task() -> None:
+                        nonlocal cv_task_id
+                        if cv_task_id is None:
+                            cv_task_id = progress.add_task(
+                                description="",
+                                total=cv_total,
+                                label=f"{m} cv {cv_done}/{cv_total}",
+                            )
+
+                    def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                        nonlocal search_task_id, search_done, search_total
+                        ev = str(event)
+                        if ev == "search_plan":
+                            count = int(max(0, int(payload.get("count", 0))))
+                            if count <= 0:
+                                return
+                            search_total += count
+                            if search_task_id is None:
+                                search_task_id = progress.add_task(
+                                    description="",
+                                    total=int(max(1, search_total)),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+                            else:
+                                progress.update(
+                                    search_task_id,
+                                    total=int(max(1, search_total)),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+                            return
+                        if ev == "search_advance":
+                            inc = int(max(0, int(payload.get("inc", 0))))
+                            if inc <= 0:
+                                return
+                            if search_done + inc > search_total:
+                                search_total = search_done + inc
+                            if search_task_id is None:
+                                search_task_id = progress.add_task(
+                                    description="",
+                                    total=int(max(1, search_total)),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+                            left = max(0, int(search_total) - int(search_done))
+                            adv = min(left, inc)
+                            if adv > 0:
+                                search_done += adv
+                                progress.update(
+                                    search_task_id,
+                                    total=int(max(1, search_total)),
+                                    advance=int(adv),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+
+                    def _cv_hook(method_name: str, inc: int) -> None:
+                        nonlocal cv_done
+                        if str(method_name) != str(m):
+                            return
+                        _close_search_task()
+                        _ensure_cv_task()
+                        left = max(0, cv_total - int(cv_done))
+                        adv = min(left, int(max(0, int(inc))))
+                        if adv > 0 and cv_task_id is not None:
+                            cv_done += adv
+                            progress.update(
+                                cv_task_id,
+                                advance=adv,
+                                label=f"{m} cv {cv_done}/{cv_total}",
+                            )
+
+                    if not has_search_stage:
+                        _ensure_cv_task()
                     t0 = time.monotonic()
                     try:
-                        def _hook(method_name: str, inc: int) -> None:
-                            if str(method_name) != str(m):
-                                return
-                            left = max(0, total_n - int(done_map[m]))
-                            adv = min(left, int(max(0, int(inc))))
-                            if adv > 0:
-                                progress.update(tid, advance=adv)
-                                done_map[m] = int(done_map[m]) + adv
-
                         res = _run_method_task(
                             m,
                             train_pheno,
@@ -748,25 +824,36 @@ def _run_methods_parallel(
                             model_n_jobs,
                             strict_cv,
                             progress_queue=None,
-                            progress_hook=_hook,
+                            progress_hook=_cv_hook,
+                            search_progress_hook=_search_hook,
                         )
                     except Exception:
-                        try:
-                            progress.remove_task(tid)
-                        except Exception:
-                            pass
+                        _close_search_task()
+                        if cv_task_id is not None:
+                            try:
+                                progress.remove_task(cv_task_id)
+                            except Exception:
+                                pass
                         elapsed = format_elapsed(time.monotonic() - t0)
                         progress.console.print(
                             f"[red]{failure_symbol()} {m} ...Failed [{elapsed}][/red]"
                         )
                         raise
-                    left_final = max(0, total_n - int(done_map[m]))
-                    if left_final > 0:
-                        progress.update(tid, advance=left_final)
-                    try:
-                        progress.remove_task(tid)
-                    except Exception:
-                        pass
+                    _close_search_task()
+                    _ensure_cv_task()
+                    left_cv = max(0, cv_total - int(cv_done))
+                    if left_cv > 0 and cv_task_id is not None:
+                        cv_done += left_cv
+                        progress.update(
+                            cv_task_id,
+                            advance=left_cv,
+                            label=f"{m} cv {cv_done}/{cv_total}",
+                        )
+                    if cv_task_id is not None:
+                        try:
+                            progress.remove_task(cv_task_id)
+                        except Exception:
+                            pass
                     out.append(res)
                     elapsed = format_elapsed(time.monotonic() - t0)
                     progress.console.print(
@@ -851,7 +938,7 @@ def _run_methods_parallel(
                     f"{method} ...Finished [{elapsed}]",
                     force_color=True,
                 )
-    elif bool(show_method_progress and should_animate_status("Methods") and rich_progress_available()):
+    elif bool(show_method_progress and rich_progress_available()):
         progress = build_rich_progress(
             description_template="{task.fields[method]}",
             field_templates=["{task.fields[suffix]}"],
@@ -962,7 +1049,7 @@ def _run_methods_parallel(
                     manager.shutdown()
                 except Exception:
                     pass
-    elif bool(show_method_progress and should_animate_status("Methods") and _HAS_TQDM and stdout_is_tty()):
+    elif bool(show_method_progress and _HAS_TQDM and stdout_is_tty()):
         pbar = tqdm(
             total=len(methods),
             desc="Methods",

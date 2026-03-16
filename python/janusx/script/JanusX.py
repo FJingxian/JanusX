@@ -48,6 +48,7 @@ from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 from ._common.gwas_history import remove_loaded_file_by_id
+from ._common.interrupt import install_interrupt_handlers, force_exit
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -99,7 +100,6 @@ _MODULE_NAMES = [
     "sim", "simulation", "adamixture", "gformat", "gmerge", "hybrid", "webui",
 ]
 
-
 def _load_script_module(name: str):
     return importlib.import_module(f"janusx.script.{name}")
 
@@ -148,6 +148,7 @@ def _clean_loaded_by_id(load_id: str) -> None:
 
 
 def main():
+    install_interrupt_handlers()
     if len(sys.argv) > 1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             _print_help()
@@ -178,7 +179,10 @@ def main():
                 # Keep argparse usage as "jx <module> ..."
                 sys.argv[0] = f"jx {module_name}"
                 del sys.argv[1]
-                _load_script_module(module_name).main()  # Process of target module
+                try:
+                    _load_script_module(module_name).main()  # Process of target module
+                except KeyboardInterrupt:
+                    force_exit(130, "Interrupted by user (Ctrl+C).")
             elif module_name not in _MODULE_NAMES:
                 print(f"Unknown module: {sys.argv[1]}")
                 _print_help()
@@ -186,4 +190,5 @@ def main():
         _print_help()
 
 if __name__ == "__main__":
+    install_interrupt_handlers()
     main()

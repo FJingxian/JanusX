@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import sys
 import math
+import sys
 from itertools import cycle
 from shutil import get_terminal_size
 from threading import Thread
-from time import sleep, monotonic
+from time import monotonic, sleep
 from typing import Optional
 
 try:
@@ -16,27 +16,48 @@ try:
 except Exception:
     Console = None  # type: ignore[assignment]
     SPINNERS = {}  # type: ignore[assignment]
-    _HAS_RICH = False
+_HAS_RICH = False
 
-_SPINNER_NAME = "janusx_braille"
-_SPINNER_FRAMES = [
-    "⠋",
-    "⠙",
-    "⠹",
-    "⠸",
-    "⠼",
-    "⠴",
-    "⠦",
-    "⠧",
-    "⠇",
-    "⠏",
-    "⠞",
-]
+_SPINNER_NAME = "janusx_ascii"
+_SPINNER_FRAMES = ["|", "/", "-", "\\"]
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
+
+
+def _encoding_supports(text: str) -> bool:
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        str(text).encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+def _symbol_or_ascii(preferred: str, fallback: str) -> str:
+    return str(preferred) if _encoding_supports(preferred) else str(fallback)
+
+
+_SUCCESS_SYMBOL = _symbol_or_ascii("✔︎", "[OK]")
+_FAIL_SYMBOL = _symbol_or_ascii("✗", "[X]")
+
+
+def _safe_console_text(text: str) -> str:
+    s = str(text)
+    enc = getattr(sys.stdout, "encoding", None)
+    if not enc:
+        return s
+    try:
+        s.encode(enc)
+        return s
+    except Exception:
+        return s.encode(enc, errors="replace").decode(enc, errors="replace")
+
+
+def _safe_print(text: str, *, end: str = "\n", flush: bool = True) -> None:
+    print(_safe_console_text(text), end=end, flush=flush)
 
 
 def format_elapsed(seconds: Optional[float]) -> str:
@@ -80,35 +101,33 @@ def get_rich_spinner_name() -> str:
 def print_success(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
     is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    line = f"{_SUCCESS_SYMBOL} {msg}"
     if _HAS_RICH and (is_tty or bool(force_color)):
         try:
-            Console(force_terminal=True, no_color=False).print(
-                f"[green]✔︎ {msg}[/green]"
-            )
+            Console(force_terminal=True, no_color=False).print(f"[green]{line}[/green]")
             return
         except Exception:
             pass
     if is_tty or bool(force_color):
-        print(f"{_GREEN}✔︎ {msg}{_RESET}", flush=True)
+        _safe_print(f"{_GREEN}{line}{_RESET}")
     else:
-        print(f"✔︎ {msg}", flush=True)
+        _safe_print(line)
 
 
 def print_failure(message: str, *, force_color: bool = False) -> None:
     msg = str(message)
     is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    line = f"{_FAIL_SYMBOL} {msg}"
     if _HAS_RICH and (is_tty or bool(force_color)):
         try:
-            Console(force_terminal=True, no_color=False).print(
-                f"[red]✘ {msg}[/red]"
-            )
+            Console(force_terminal=True, no_color=False).print(f"[red]{line}[/red]")
             return
         except Exception:
             pass
     if is_tty or bool(force_color):
-        print(f"{_RED}✘ {msg}{_RESET}", flush=True)
+        _safe_print(f"{_RED}{line}{_RESET}")
     else:
-        print(f"✘ {msg}", flush=True)
+        _safe_print(line)
 
 
 def print_warning(message: str, *, force_color: bool = False) -> None:
@@ -117,16 +136,14 @@ def print_warning(message: str, *, force_color: bool = False) -> None:
     is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
     if _HAS_RICH and (is_tty or bool(force_color)):
         try:
-            Console(force_terminal=True, no_color=False).print(
-                f"[yellow]{line}[/yellow]"
-            )
+            Console(force_terminal=True, no_color=False).print(f"[yellow]{line}[/yellow]")
             return
         except Exception:
             pass
     if is_tty or bool(force_color):
-        print(f"{_YELLOW}{line}{_RESET}", flush=True)
+        _safe_print(f"{_YELLOW}{line}{_RESET}")
     else:
-        print(line, flush=True)
+        _safe_print(line)
 
 
 class CliStatus:
@@ -156,7 +173,7 @@ class CliStatus:
         for frame in cycle(_SPINNER_FRAMES):
             if self._plain_done:
                 break
-            print(f"\r{frame} {self._running_line()}", flush=True, end="")
+            _safe_print(f"\r{frame} {self._running_line()}", flush=True, end="")
             sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
     def _animate_rich(self) -> None:
@@ -214,8 +231,8 @@ class CliStatus:
 
         if self._backend == "plain":
             cols = get_terminal_size((80, 20)).columns
-            print("\r" + " " * cols, end="", flush=True)
-            print("\r", end="", flush=True)
+            _safe_print("\r" + " " * cols, end="", flush=True)
+            _safe_print("\r", end="", flush=True)
 
     def _elapsed_seconds(self) -> Optional[float]:
         if self._start_ts is None:
@@ -242,29 +259,29 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
-        symbol = "✔︎"
+        symbol = _SUCCESS_SYMBOL
         line = self._compose_line(symbol, str(message))
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[green]{line}[/green]")
         elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
-            print(f"{_GREEN}{line}{_RESET}", flush=True)
+            _safe_print(f"{_GREEN}{line}{_RESET}")
         else:
-            print(line, flush=True)
+            _safe_print(line)
         self._done = True
 
     def fail(self, message: str) -> None:
         if self._done:
             return
         self._stop_spinner()
-        symbol = "✘"
+        symbol = _FAIL_SYMBOL
         line = self._compose_line(symbol, str(message))
         tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[red]{symbol}[/red]{tail}")
         elif self.enabled and getattr(sys.stdout, "isatty", lambda: False)():
-            print(f"{_RED}{symbol}{_RESET}{tail}", flush=True)
+            _safe_print(f"{_RED}{symbol}{_RESET}{tail}")
         else:
-            print(line, flush=True)
+            _safe_print(line)
         self._done = True
 
     def __exit__(self, exc_type, exc, tb) -> None:

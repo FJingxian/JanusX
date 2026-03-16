@@ -39,6 +39,7 @@ Citation
 """
 
 import os
+import io
 import time
 import socket
 import argparse
@@ -1281,11 +1282,14 @@ def load_phenotype(
     sniffed = _sniff_sep(phenofile)
     read_err: Optional[Exception] = None
     df = None
+    mixed_type_warned = False
     for mode in _candidate_orders(sniffed):
         try:
             kwargs: dict[str, object] = {"header": None}
             if usecols is not None:
                 kwargs["usecols"] = usecols
+            # Keep dtype inference in one pass and avoid chunked mixed-type warnings.
+            kwargs["low_memory"] = False
             if mode == "tab":
                 kwargs["sep"] = "\t"
                 kwargs["engine"] = "c"
@@ -1295,7 +1299,14 @@ def load_phenotype(
             else:
                 kwargs["delim_whitespace"] = True
                 kwargs["engine"] = "c"
-            df_try = pd.read_csv(phenofile, **kwargs)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                df_try = pd.read_csv(phenofile, **kwargs)
+            if len(caught) > 0:
+                for w in caught:
+                    if "DtypeWarning" in str(type(getattr(w, "message", w))):
+                        mixed_type_warned = True
+                        break
             if df_try.shape[1] <= int(id_col):
                 continue
             data_cols = int(df_try.shape[1]) - 1 - (1 if int(id_col) == 1 else 0)
@@ -1311,6 +1322,12 @@ def load_phenotype(
         if read_err is not None:
             raise read_err
         raise ValueError("Failed to read phenotype file.")
+    if mixed_type_warned:
+        logger.warning(
+            "Phenotype file has mixed-type columns; JanusX will coerce phenotype "
+            "values to numeric and set non-numeric cells to NaN. "
+            "If this is unintended, clean the phenotype file or select columns via -n."
+        )
 
     if df.empty:
         raise ValueError("Phenotype file is empty.")
@@ -3225,11 +3242,62 @@ def run_chunked_gwas_streaming_shared(
         keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
         return keep
 
-    def _build_chunk_df(
+    class _ChunkBatchWriter:
+        """
+        Lightweight batch writer for GWAS TSV rows.
+        Buffers multiple chunks and flushes in one file append call.
+        """
+
+        def __init__(self, path: str, *, batch_chunks: int = 8) -> None:
+            self.path = str(path)
+            self.batch_chunks = max(1, int(batch_chunks))
+            self._parts: list[str] = []
+            self._has_plrt: Optional[bool] = None
+            self._wrote_header = False
+            self.rows_written = 0
+
+        def append(self, text: str, *, has_plrt: bool, rows: int) -> None:
+            n_rows = int(rows)
+            if n_rows <= 0:
+                return
+            hp = bool(has_plrt)
+            if self._has_plrt is None:
+                self._has_plrt = hp
+            elif self._has_plrt != hp:
+                raise ValueError(
+                    "Inconsistent result columns across chunks while writing GWAS TSV."
+                )
+            self._parts.append(str(text))
+            self.rows_written += n_rows
+            if len(self._parts) >= self.batch_chunks:
+                self.flush()
+
+        def flush(self) -> None:
+            if len(self._parts) == 0:
+                return
+            mode = "a" if self._wrote_header else "w"
+            with open(self.path, mode, encoding="utf-8", newline="") as fh:
+                if not self._wrote_header:
+                    header = "chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald"
+                    if bool(self._has_plrt):
+                        header += "\tplrt"
+                    fh.write(header + "\n")
+                    self._wrote_header = True
+                fh.write("".join(self._parts))
+            self._parts.clear()
+
+        @property
+        def wrote_header(self) -> bool:
+            return bool(self._wrote_header)
+
+    def _format_chunk_tsv_text(
         results: np.ndarray,
         info_chunk: list[tuple[str, int, str, str]],
         maf_chunk: np.ndarray,
-    ) -> pd.DataFrame:
+    ) -> tuple[str, bool]:
+        if len(info_chunk) == 0:
+            return "", bool(np.asarray(results).shape[1] > 3)
+
         chroms, poss, allele0, allele1 = zip(*info_chunk)
         allele0_list = list(allele0)
         allele1_list = list(allele1)
@@ -3237,24 +3305,26 @@ def run_chunked_gwas_streaming_shared(
             allele0_list, allele1_list = _transform_allele_labels(
                 allele0_list, allele1_list, genetic_model
             )
-        chunk_df = pd.DataFrame(
-            {
-                "chrom": chroms,
-                "pos": poss,
-                "allele0": allele0_list,
-                "allele1": allele1_list,
-                "maf": maf_chunk,
-                "beta": results[:, 0],
-                "se": results[:, 1],
-                "pwald": results[:, 2],
-            }
-        )
-        if results.shape[1] > 3:
-            chunk_df["plrt"] = results[:, 3]
-            chunk_df["plrt"] = chunk_df["plrt"].map(lambda x: f"{x:.4e}")
-        chunk_df["pos"] = chunk_df["pos"].astype(int)
-        chunk_df["pwald"] = chunk_df["pwald"].map(lambda x: f"{x:.4e}")
-        return chunk_df
+
+        res = np.asarray(results, dtype=np.float64)
+        cols = [
+            np.asarray(chroms, dtype=object),
+            np.asarray(poss, dtype=np.int64).astype(str),
+            np.asarray(allele0_list, dtype=object),
+            np.asarray(allele1_list, dtype=object),
+            np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
+            np.char.mod("%.4f", res[:, 0]),
+            np.char.mod("%.4f", res[:, 1]),
+            np.char.mod("%.4e", res[:, 2]),
+        ]
+        has_plrt = bool(res.shape[1] > 3)
+        if has_plrt:
+            cols.append(np.char.mod("%.4e", res[:, 3]))
+
+        out = np.column_stack(cols)
+        buf = io.StringIO()
+        np.savetxt(buf, out, fmt="%s", delimiter="\t")
+        return buf.getvalue(), has_plrt
 
     model_label_map = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM"}
     model_ctxs: list[dict[str, object]] = []
@@ -3281,7 +3351,9 @@ def run_chunked_gwas_streaming_shared(
             "task_id": None,
             "tmp_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
             "out_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv",
+            "writer": None,
         }
+        ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
 
         cpu_before = process.cpu_times()
         init_t0 = time.monotonic()
@@ -3407,10 +3479,11 @@ def run_chunked_gwas_streaming_shared(
     if scan_threads <= 0:
         scan_threads = int(n_cores)
     threads_per_model = max(1, scan_threads)
+    prefetch_depth = 2 if scan_threads >= 2 else 1
 
     interrupted = False
     try:
-        for genosub, sites in load_genotype_chunks(
+        chunk_iter = load_genotype_chunks(
             genofile,
             chunk_size,
             maf_threshold,
@@ -3420,7 +3493,8 @@ def run_chunked_gwas_streaming_shared(
             snps_only=bool(snps_only),
             sample_ids=sample_sub,
             mmap_window_mb=mmap_window_mb,
-        ):
+        )
+        for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
             genosub: np.ndarray
             if genosub.shape[1] != expected_n:
                 if genosub.shape[1] == int(sameidx.shape[0]):
@@ -3468,19 +3542,16 @@ def run_chunked_gwas_streaming_shared(
                     (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
                 )
 
-                chunk_df = _build_chunk_df(results, info_chunk, maf_chunk)
-                tmp_tsv = str(ctx["tmp_tsv"])
-                wrote_header = bool(ctx["wrote_header"])
-                chunk_df.to_csv(
-                    tmp_tsv,
-                    sep="\t",
-                    float_format="%.4f",
-                    index=False,
-                    header=not wrote_header,
-                    mode="w" if not wrote_header else "a",
+                chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
+                writer = ctx.get("writer")
+                if writer is None:
+                    raise RuntimeError("Internal error: shared GWAS writer not initialized.")
+                writer.append(
+                    chunk_text,
+                    has_plrt=bool(has_plrt),
+                    rows=m_chunk,
                 )
-                ctx["wrote_header"] = True
-                ctx["has_results"] = True
+                ctx["has_results"] = int(writer.rows_written) > 0
 
                 mem_info = process.memory_info()
                 ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
@@ -3489,6 +3560,13 @@ def run_chunked_gwas_streaming_shared(
                 if done_next % (10 * chunk_size) == 0:
                     mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
                 _advance_ctx(ctx, m_chunk, mem_text)
+
+        for ctx in model_ctxs:
+            writer = ctx.get("writer")
+            if writer is not None:
+                writer.flush()
+                ctx["wrote_header"] = bool(writer.wrote_header)
+                ctx["has_results"] = int(writer.rows_written) > 0
 
         first_done = 0
         for ctx in model_ctxs:
@@ -3911,29 +3989,98 @@ def run_farmcpu_fullmem(
     cov = args.cov
     snps_only = bool(getattr(args, "snps_only", False))
 
-    def _load_bim_ref_alt(prefix: str) -> pd.DataFrame:
+    def _load_bim_ref_alt_filtered(
+        prefix: str,
+        keep_mask: np.ndarray,
+        *,
+        snps_only_mode: bool,
+    ) -> tuple[pd.DataFrame, np.ndarray]:
         bim_path = f"{prefix}.bim"
         src = _basename_only(bim_path)
-        with CliStatus(
-            f"Loading site metadata from {src}...",
-            enabled=bool(use_spinner and (not context_prepared)),
-        ) as task:
-            ref_alt_df = pd.read_csv(
-                bim_path,
-                sep=r"\s+",
-                header=None,
-                usecols=[0, 3, 4, 5],
-                names=["chrom", "pos", "allele0", "allele1"],
-                dtype={0: str, 3: np.int64, 4: str, 5: str},
-                engine="c",
+        keep = np.ascontiguousarray(np.asarray(keep_mask, dtype=np.bool_).reshape(-1))
+        n_total = int(keep.shape[0])
+        if n_total == 0:
+            return (
+                pd.DataFrame(columns=["chrom", "pos", "allele0", "allele1"]),
+                keep,
             )
-            ref_alt_df["pos"] = pd.to_numeric(
-                ref_alt_df["pos"], errors="coerce"
-            ).fillna(0).astype(int)
-            task.complete(
-                f"Loading site metadata from {src} (nSNP={ref_alt_df.shape[0]})"
+
+        n_pre_keep = int(np.sum(keep))
+        if n_pre_keep == 0:
+            return (
+                pd.DataFrame(columns=["chrom", "pos", "allele0", "allele1"]),
+                keep,
             )
-        return ref_alt_df
+
+        # Stream BIM and keep only SNPs that survive numeric filters, optionally
+        # applying SNP-only filtering in the same pass.
+        chrom = np.empty(n_pre_keep, dtype=object)
+        pos = np.empty(n_pre_keep, dtype=np.int64)
+        allele0 = np.empty(n_pre_keep, dtype=object)
+        allele1 = np.empty(n_pre_keep, dtype=object)
+
+        pbar = _ProgressAdapter(total=n_total, desc=f"Loading site metadata ({src})")
+        lines = 0
+        done = 0
+        out = 0
+        try:
+            with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    if lines >= n_total:
+                        raise ValueError(
+                            f"BIM has more rows than genotype matrix: bim>{n_total} ({src})"
+                        )
+                    idx = lines
+                    lines += 1
+
+                    if keep[idx]:
+                        parts = raw.strip().split()
+                        if len(parts) < 6:
+                            raise ValueError(
+                                f"Invalid BIM row at line {idx + 1}: expected >=6 columns."
+                            )
+                        a0 = str(parts[4])
+                        a1 = str(parts[5])
+                        if snps_only_mode and (len(a0) != 1 or len(a1) != 1):
+                            keep[idx] = False
+                        else:
+                            chrom[out] = str(parts[0])
+                            try:
+                                pval = int(parts[3])
+                            except Exception:
+                                try:
+                                    pval = int(float(parts[3]))
+                                except Exception:
+                                    pval = 0
+                            pos[out] = int(pval)
+                            allele0[out] = a0
+                            allele1[out] = a1
+                            out += 1
+
+                    if lines - done >= 200_000:
+                        step = lines - done
+                        pbar.update(step)
+                        done = lines
+
+            if lines != n_total:
+                raise ValueError(
+                    f"BIM row count mismatch: bim={lines}, genotype={n_total} ({src})"
+                )
+            if done < n_total:
+                pbar.update(n_total - done)
+            pbar.finish()
+        finally:
+            pbar.close(success_style=True, show_done=True)
+
+        ref_alt_df = pd.DataFrame(
+            {
+                "chrom": chrom[:out],
+                "pos": pos[:out].astype(int, copy=False),
+                "allele0": allele0[:out],
+                "allele1": allele1[:out],
+            }
+        )
+        return ref_alt_df, keep
 
     if farmcpu_cache is None:
         t_loading = time.time()
@@ -3977,58 +4124,64 @@ def run_farmcpu_fullmem(
             and os.path.isfile(f"{gfile}.fam")
         )
         if can_use_packed:
-            pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
-            try:
-                packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(gfile)
-                if int(packed_n) != int(famid.shape[0]):
-                    raise ValueError(
-                        f"Packed sample size mismatch: packed n={packed_n}, expected {famid.shape[0]}"
-                    )
+            packed_load_t0 = time.monotonic()
+            packed_status = CliStatus(
+                "Loading genotype (Full)...",
+                enabled=bool(use_spinner),
+            )
+            with packed_status as task:
+                try:
+                    packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(gfile)
+                except Exception:
+                    task.fail("Loading genotype (Full) ...Failed")
+                    raise
+                task.complete(f"Loading genotype (Full, {int(n_snps)} SNPs) ...Finished")
+            if not bool(use_spinner):
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"Loading genotype (Full, {int(n_snps)} SNPs) ...Finished "
+                    f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
+                )
+            if int(packed_n) != int(famid.shape[0]):
+                raise ValueError(
+                    f"Packed sample size mismatch: packed n={packed_n}, expected {famid.shape[0]}"
+                )
 
-                ref_alt_all = _load_bim_ref_alt(gfile)
-                if int(ref_alt_all.shape[0]) != int(packed_raw.shape[0]):
-                    raise ValueError(
-                        f"BIM/packed SNP count mismatch: bim={ref_alt_all.shape[0]}, packed={packed_raw.shape[0]}"
-                    )
+            miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+            maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+            keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
+            maf_thr = float(args.maf)
+            if maf_thr > 0.0:
+                keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+            miss_thr = float(args.geno)
+            if miss_thr < 1.0:
+                keep &= miss_arr <= miss_thr
 
-                miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-                maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-                keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
-                maf_thr = float(args.maf)
-                if maf_thr > 0.0:
-                    keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
-                miss_thr = float(args.geno)
-                if miss_thr < 1.0:
-                    keep &= miss_arr <= miss_thr
-                if bool(snps_only):
-                    a0 = ref_alt_all["allele0"].astype(str).to_numpy()
-                    a1 = ref_alt_all["allele1"].astype(str).to_numpy()
-                    keep &= (np.char.str_len(a0) == 1) & (np.char.str_len(a1) == 1)
+            ref_alt, keep_final = _load_bim_ref_alt_filtered(
+                gfile,
+                keep,
+                snps_only_mode=bool(snps_only),
+            )
+            if not np.any(keep_final):
+                raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
 
-                if not np.any(keep):
-                    raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
+            if np.all(keep_final):
+                packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+                miss_arr = np.ascontiguousarray(miss_arr, dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_arr, dtype=np.float32)
+            else:
+                packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)[keep_final])
+                miss_arr = np.ascontiguousarray(miss_arr[keep_final], dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_arr[keep_final], dtype=np.float32)
 
-                if np.all(keep):
-                    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-                    ref_alt = ref_alt_all
-                else:
-                    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)[keep])
-                    miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
-                    maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
-                    ref_alt = ref_alt_all.loc[keep].reset_index(drop=True)
-
-                loaded_snps = int(ref_alt.shape[0])
-                pbar.update(loaded_snps)
-                pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
-                pbar.finish()
-                packed_ctx = {
-                    "packed": packed,
-                    "missing_rate": miss_arr,
-                    "maf": maf_arr,
-                    "n_samples": int(packed_n),
-                }
-            finally:
-                pbar.close(success_style=False, show_done=True)
+            loaded_snps = int(ref_alt.shape[0])
+            packed_ctx = {
+                "packed": packed,
+                "missing_rate": miss_arr,
+                "maf": maf_arr,
+                "n_samples": int(packed_n),
+            }
         else:
             geno_chunks = []
             site_rows = []
@@ -5019,4 +5172,6 @@ def main(log: bool = True):
 
 
 if __name__ == "__main__":
+    from janusx.script._common.interrupt import install_interrupt_handlers
+    install_interrupt_handlers()
     main()

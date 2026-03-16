@@ -1821,4 +1821,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from janusx.script._common.interrupt import install_interrupt_handlers
+    install_interrupt_handlers()
     main()

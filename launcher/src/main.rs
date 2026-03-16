@@ -2071,7 +2071,7 @@ fn run_update_internal(
             if opts.verbose {
                 println!("Updating from local source: {local_spec}");
             }
-            let _ = pip_install_update(
+            let local_res = pip_install_update(
                 &python,
                 &home,
                 &local_spec,
@@ -2080,7 +2080,32 @@ fn run_update_internal(
                 opts.verbose,
                 "Updating from local source...",
                 true,
-            )?;
+            );
+            #[cfg(target_os = "windows")]
+            let local_res = match local_res {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if opts.editable && is_editable_local_pyd_copy_failure(&e) {
+                        eprintln!(
+                            "Editable local install failed due to in-tree .pyd copy/lock conflict; retrying non-editable local install..."
+                        );
+                        pip_install_update(
+                            &python,
+                            &home,
+                            &local_spec,
+                            true,
+                            false,
+                            opts.verbose,
+                            "Retrying local source install (non-editable)...",
+                            true,
+                        )
+                        .map_err(|e2| format!("{e}\n\nRetry without editable failed: {e2}"))
+                    } else {
+                        Err(e)
+                    }
+                }
+            };
+            let _ = local_res?;
             warm_up_after_update(jx_bin.as_deref(), &home)?;
             return Ok(0);
         }
@@ -4073,6 +4098,18 @@ fn should_retry_after_installing_rust(err: &str) -> bool {
         || e.contains("cargo, the rust package manager, is not installed")
         || e.contains("is not installed or is not on path")
         || e.contains("no such file or directory (os error 2)") && e.contains("rust")
+}
+
+#[cfg(target_os = "windows")]
+fn is_editable_local_pyd_copy_failure(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    // Typical maturin editable failure when in-tree .pyd is locked by another process.
+    (e.contains("building editable for janusx")
+        || e.contains("--editable")
+        || e.contains("editable for janusx"))
+        && e.contains("maturin")
+        && e.contains("failed to copy")
+        && e.contains(".pyd")
 }
 
 fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<(), String> {

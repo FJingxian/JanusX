@@ -733,8 +733,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from janusx.script._common.interrupt import force_exit, install_interrupt_handlers
+    install_interrupt_handlers()
     try:
         main()
+    except KeyboardInterrupt:
+        force_exit(130, "Interrupted by user (Ctrl+C).")
     except Exception as exc:
         print_failure("REML ...Failed")
         print(f"Error: {exc}")

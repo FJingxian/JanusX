@@ -686,13 +686,14 @@ def main(log: bool = True) -> None:
 
 
 if __name__ == "__main__":
+    from janusx.script._common.interrupt import force_exit, install_interrupt_handlers
+    install_interrupt_handlers()
     try:
         main()
     except BrokenPipeError:
         raise SystemExit(1)
     except KeyboardInterrupt:
-        print("Error: Interrupted.", file=sys.stderr)
-        raise SystemExit(1)
+        force_exit(130, "Interrupted by user (Ctrl+C).")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)

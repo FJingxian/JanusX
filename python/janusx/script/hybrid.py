@@ -46,7 +46,7 @@ from ._common.genoio import (
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
-from ._common.pathcheck import format_path_for_display, safe_expanduser
+from ._common.pathcheck import format_output_display, format_path_for_display, safe_expanduser
 from ._common.status import CliStatus, print_success, print_warning, stdout_is_tty
 
 
@@ -623,18 +623,6 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
         return fmt, base, base
     raise ValueError("Unsupported output format. Use one of: plink, vcf, txt, npy.")
 
-
-def _format_output_display(out_fmt: str, out_prefix: str, out_path: str) -> str:
-    fmt = str(out_fmt).lower()
-    if fmt == "plink":
-        return f"{out_prefix} (.bed/.bim/.fam)"
-    if fmt == "npy":
-        return f"{out_prefix} (.npy/.site/.id)"
-    if fmt == "txt":
-        return f"{out_prefix} (.txt/.site/.id)"
-    return f"{out_path} ({fmt})"
-
-
 def _validate_parent_ids(
     source: HybridInputSource,
     p1_ids: Sequence[str],
@@ -742,7 +730,7 @@ def main() -> None:
         raise ValueError("--chunksize must be > 0")
 
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
-    output_display = _format_output_display(out_fmt, out_prefix, out_path)
+    output_display = format_output_display(out_fmt, out_prefix, out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     configure_genotype_cache_from_out(str(Path(out_prefix).parent))
     log_path = f"{out_prefix}.hybrid.log"
@@ -792,7 +780,7 @@ def main() -> None:
     print(f"P1 parents: {len(p1_ids)}")
     print(f"P2 parents: {len(p2_ids)}")
     print(f"Hybrid progeny: {len(hybrid_ids)}")
-    print(f"Output: {format_path_for_display(output_display)}")
+    print(f"Output: {output_display}")
 
     chunks = _make_hybrid_chunk_iterator(
         source,

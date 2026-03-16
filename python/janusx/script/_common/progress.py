@@ -124,7 +124,7 @@ class ProgressAdapter:
                 self._task_id = None
                 self._backend = "none"
 
-        if self._backend == "none" and _HAS_TQDM:
+        if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
             assert _tqdm_auto is not None
             self._tqdm = _tqdm_auto(
                 total=self.total,

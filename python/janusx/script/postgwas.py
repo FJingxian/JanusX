@@ -1495,7 +1495,7 @@ def _ldclump_significant_snps(
     with (progress if progress is not None else nullcontext()):
         if progress is not None:
             task_id = progress.add_task("LD clumping...", total=int(work.shape[0]))
-        elif bool(show_progress and _HAS_TQDM):
+        elif bool(show_progress and _HAS_TQDM and stdout_is_tty()):
             progress_tqdm = tqdm(
                 total=int(work.shape[0]),
                 desc="LD clumping",
@@ -3896,7 +3896,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         print_success(f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]")
         return
 
-    if _HAS_TQDM:
+    if _HAS_TQDM and stdout_is_tty():
         setattr(args, "_postgwas_job_workers", int(logical_workers))
         pbar = tqdm(
             total=len(files),

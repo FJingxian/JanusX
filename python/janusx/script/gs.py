@@ -959,7 +959,7 @@ def _run_methods_parallel(
                     manager.shutdown()
                 except Exception:
                     pass
-    elif _HAS_TQDM:
+    elif _HAS_TQDM and stdout_is_tty():
         pbar = tqdm(
             total=len(methods),
             desc="Methods",

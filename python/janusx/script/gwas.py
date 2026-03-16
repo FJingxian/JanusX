@@ -104,6 +104,7 @@ from ._common.status import (
     CliStatus,
     print_success,
     format_elapsed,
+    stdout_is_tty,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.gwas_history import record_gwas_run
@@ -284,7 +285,7 @@ def _rich_success(
 ) -> None:
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
-    if use_spinner:
+    if use_spinner or stdout_is_tty():
         _log_file_only(logger, logging.INFO, file_msg)
         print_success(msg)
     else:
@@ -330,7 +331,7 @@ class _ProgressAdapter:
                 self._progress = None
                 self._task_id = None
 
-        if self._backend == "none" and _HAS_TQDM:
+        if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
             self._tqdm = tqdm(
                 total=self.total,
                 desc=self.desc,
@@ -2920,10 +2921,7 @@ def run_chunked_gwas_lmm_lm(
         if plot:
             time_parts.append(format_elapsed(viz_secs))
         done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
-        if use_spinner:
-            print_success(done_msg)
-        else:
-            logger.info(done_msg)
+        _rich_success(logger, done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")  # ensure blank line between traits
 
@@ -3512,10 +3510,7 @@ def run_chunked_gwas_streaming_shared(
         if plot and has_results:
             time_parts.append(format_elapsed(viz_secs))
         done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
-        if use_spinner:
-            print_success(done_msg)
-        else:
-            logger.info(done_msg)
+        _rich_success(logger, done_msg, use_spinner=use_spinner)
 
 
 # ======================================================================
@@ -4267,10 +4262,7 @@ def run_farmcpu_fullmem(
         if args.plot:
             farm_times.append(format_elapsed(viz_secs))
         farm_done_msg = f"FarmCPU ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"
-        if use_spinner:
-            print_success(farm_done_msg)
-        else:
-            logger.info(farm_done_msg)
+        _rich_success(logger, farm_done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")
     return farmcpu_cache

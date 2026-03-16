@@ -54,6 +54,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_output_display,
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
@@ -285,18 +286,6 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
         return fmt, base, base
     raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy.")
 
-
-def _format_output_display(out_fmt: str, out_prefix: str, out_path: str) -> str:
-    fmt = str(out_fmt).lower()
-    if fmt == "plink":
-        return f"{out_prefix} (.bed/.bim/.fam)"
-    if fmt == "npy":
-        return f"{out_prefix} (.npy/.site/.id)"
-    if fmt == "txt":
-        return f"{out_prefix} (.txt/.site/.id)"
-    return f"{out_path} ({fmt})"
-
-
 def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
     flt: SiteFilterSpec,
@@ -433,7 +422,7 @@ def main() -> None:
     if args.prefix is None:
         args.prefix = default_prefix
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
-    output_display = _format_output_display(out_fmt, out_prefix, out_path)
+    output_display = format_output_display(out_fmt, out_prefix, out_path)
 
     os.makedirs(str(args.out), exist_ok=True, mode=0o755)
     configure_genotype_cache_from_out(str(args.out))
@@ -467,7 +456,6 @@ def main() -> None:
             )
         ],
         footer_rows=[
-            ("Output prefix", out_prefix),
             ("Output", output_display),
         ],
         line_max_chars=60,
@@ -579,7 +567,7 @@ def main() -> None:
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
     print(f"Genotype source: {format_path_for_display(gfile)}")
     print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
-    print(f"Output: {format_path_for_display(output_display)}")
+    print(f"Output: {output_display}")
 
     def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         c = load_genotype_chunks(

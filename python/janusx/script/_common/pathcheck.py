@@ -14,6 +14,23 @@ def format_path_for_display(path: str | Path) -> str:
     return s.replace("\\", "/")
 
 
+def format_output_display(
+    out_fmt: str,
+    out_prefix: str | Path,
+    out_path: str | Path,
+) -> str:
+    fmt = str(out_fmt).lower()
+    prefix_disp = format_path_for_display(out_prefix)
+    path_disp = format_path_for_display(out_path)
+    if fmt == "plink":
+        return f"{prefix_disp} (.bed/.bim/.fam)"
+    if fmt == "npy":
+        return f"{prefix_disp} (.npy/.site/.id)"
+    if fmt == "txt":
+        return f"{prefix_disp} (.txt/.site/.id)"
+    return f"{path_disp} ({fmt})"
+
+
 def _norm(path: str | Path) -> str:
     return format_path_for_display(path)
 

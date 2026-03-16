@@ -43,6 +43,19 @@ _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
 _WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
 
 
+def _expanduser_unambiguous(path: Union[str, os.PathLike[str]]) -> str:
+    """
+    Expand only true home-directory syntax:
+      "~", "~/...", "~\\..."
+
+    Keep JanusX cache-like prefixes such as "~panel" literal.
+    """
+    s = str(path)
+    if not (s == "~" or s.startswith("~/") or s.startswith("~\\")):
+        return s
+    return os.path.expanduser(s)
+
+
 def load_bed_2bit_packed(prefix: str):
     """
     Load PLINK BED genotypes as packed 2-bit matrix plus per-SNP statistics.
@@ -73,7 +86,7 @@ def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:
     if s == "":
         os.environ.pop(_GENO_CACHE_ENV, None)
         return None
-    path = os.path.abspath(os.path.expanduser(s))
+    path = os.path.abspath(_expanduser_unambiguous(s))
     os.makedirs(path, mode=0o755, exist_ok=True)
     os.environ[_GENO_CACHE_ENV] = path
     return path
@@ -83,7 +96,7 @@ def _cache_dir_from_env() -> Union[str, None]:
     raw = os.environ.get(_GENO_CACHE_ENV, "").strip()
     if raw == "":
         return None
-    return os.path.abspath(os.path.expanduser(raw))
+    return os.path.abspath(_expanduser_unambiguous(raw))
 
 
 def _dir_is_writable(path: str) -> bool:

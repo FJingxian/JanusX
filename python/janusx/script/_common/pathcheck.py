@@ -14,12 +14,19 @@ def _norm(path: str) -> str:
 
 def safe_expanduser(path: str | Path) -> Path:
     """
-    Expand '~' when possible.
+    Expand only unambiguous home-directory syntax.
     On some HPC/batch environments, pathlib.expanduser() can raise
     RuntimeError("Could not determine home directory.").
     In that case, keep the original path unchanged.
+
+    JanusX also uses cache prefixes like "~panel" / "~mouse_hs1940".
+    Those must remain literal relative paths instead of being interpreted
+    as a home-directory reference or "~user".
     """
     p = Path(path)
+    raw = str(p)
+    if not (raw == "~" or raw.startswith("~/") or raw.startswith("~\\")):
+        return p
     try:
         return p.expanduser()
     except RuntimeError:

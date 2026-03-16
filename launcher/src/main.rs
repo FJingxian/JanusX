@@ -1429,7 +1429,8 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
     if let Some(dir) = cleanup_dir {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    match replace_result? {
+    let replace_state = replace_result?;
+    match replace_state {
         LauncherReplaceResult::ReplacedNow => {
             print_success_line("Launcher upgrade completed. Current `jx` has been replaced.");
         }
@@ -1461,7 +1462,14 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
             format!("jx -update -e {path}"),
         ),
     };
-    match run_update_internal(core_update, false) {
+    let core_update_result = run_update_internal(core_update, false);
+
+    #[cfg(windows)]
+    if matches!(replace_state, LauncherReplaceResult::ReplacedAfterExit) {
+        schedule_windows_staged_launcher_replace(opts.verbose)?;
+    }
+
+    match core_update_result {
         Ok(_) => {
             print_success_line(&format!(
                 "Core package update completed via `{core_update_hint}`."
@@ -1752,42 +1760,7 @@ fn replace_current_launcher_binary(
 
     #[cfg(windows)]
     {
-        let helper = install_dir.join("jx_replace_launcher.cmd");
-        let esc_stage = staged.to_string_lossy().replace('"', "\"\"");
-        let esc_current = current.to_string_lossy().replace('"', "\"\"");
-        let helper_script = format!(
-            "@echo off\r\n\
-setlocal enableextensions\r\n\
-set \"SRC={esc_stage}\"\r\n\
-set \"DST={esc_current}\"\r\n\
-for /L %%i in (1,1,900) do (\r\n\
-  move /Y \"%SRC%\" \"%DST%\" >NUL 2>NUL && goto :done\r\n\
-  >NUL 2>NUL ping 127.0.0.1 -n 2\r\n\
-)\r\n\
-:done\r\n\
-del /F /Q \"%~f0\" >NUL 2>NUL\r\n\
-endlocal\r\n"
-        );
-        std::fs::write(&helper, helper_script).map_err(|e| {
-            format!(
-                "Failed to create launcher replacement helper {}: {e}",
-                helper.display()
-            )
-        })?;
-        if verbose {
-            println!(
-                "Applying launcher replacement after exit via helper: {}",
-                helper.display()
-            );
-        }
-        Command::new("cmd")
-            .arg("/C")
-            .arg(&helper)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to stage launcher replacement: {e}"))?;
+        let _ = verbose;
         return Ok(LauncherReplaceResult::ReplacedAfterExit);
     }
 
@@ -1809,6 +1782,56 @@ endlocal\r\n"
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn schedule_windows_staged_launcher_replace(verbose: bool) -> Result<(), String> {
+    let current = env::current_exe().map_err(|e| format!("Failed to locate current jx: {e}"))?;
+    let install_dir = current
+        .parent()
+        .ok_or_else(|| "Failed to resolve current jx install directory.".to_string())?;
+    let staged = install_dir.join("jx.new.exe");
+    if !staged.exists() {
+        // Nothing to do (already replaced, or staging failed earlier and was surfaced).
+        return Ok(());
+    }
+    let helper = install_dir.join("jx_replace_launcher.cmd");
+    let esc_stage = staged.to_string_lossy().replace('"', "\"\"");
+    let esc_current = current.to_string_lossy().replace('"', "\"\"");
+    let helper_script = format!(
+        "@echo off\r\n\
+setlocal enableextensions\r\n\
+set \"SRC={esc_stage}\"\r\n\
+set \"DST={esc_current}\"\r\n\
+for /L %%i in (1,1,900) do (\r\n\
+  move /Y \"%SRC%\" \"%DST%\" >NUL 2>NUL && goto :done\r\n\
+  >NUL 2>NUL ping 127.0.0.1 -n 2\r\n\
+)\r\n\
+:done\r\n\
+del /F /Q \"%~f0\" >NUL 2>NUL\r\n\
+endlocal\r\n"
+    );
+    std::fs::write(&helper, helper_script).map_err(|e| {
+        format!(
+            "Failed to create launcher replacement helper {}: {e}",
+            helper.display()
+        )
+    })?;
+    if verbose {
+        println!(
+            "Applying launcher replacement after exit via helper: {}",
+            helper.display()
+        );
+    }
+    Command::new("cmd")
+        .arg("/C")
+        .arg(&helper)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to stage launcher replacement: {e}"))?;
+    Ok(())
 }
 
 fn parse_update_args(args: &[String]) -> Result<UpdateOptions, String> {

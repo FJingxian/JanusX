@@ -1476,14 +1476,16 @@ def main(log: bool = True) -> None:
     # Load phenotype
     # ------------------------------------------------------------------
     t_loading = time.time()
-    logger.info(f"Loading phenotype from {args.pheno}...")
-    with CliStatus("Loading phenotype...", enabled=use_spinner) as task:
+    psrc = os.path.basename(str(args.pheno).rstrip("/\\")) or str(args.pheno)
+    with CliStatus(f"Loading phenotype from {psrc}...", enabled=use_spinner) as task:
         try:
             pheno = _load_phenotype_flexible(args.pheno)
         except Exception:
-            task.fail("Loading phenotype ...Failed")
+            task.fail(f"Loading phenotype from {psrc} ...Failed")
             raise
-        task.complete("Loading phenotype ...Finished")
+        task.complete(
+            f"Loading phenotype from {psrc} (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
+        )
 
     if pheno.shape[1] <= 0:
         logger.error(

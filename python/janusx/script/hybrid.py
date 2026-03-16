@@ -830,7 +830,10 @@ def main() -> None:
             raise
         task.complete("Building hybrid genotypes ...Finished")
 
-    print_success(f"Hybrid build completed. Hybrids written: {len(hybrid_ids)}")
+    print_success(
+        f"Hybrid build completed. Hybrids written: {len(hybrid_ids)}",
+        force_color=True,
+    )
 
 
 if __name__ == "__main__":

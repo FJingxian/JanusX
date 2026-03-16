@@ -428,7 +428,7 @@ class CliStatus:
         if should_animate_status(message):
             if self._backend == "rich" and self._console is not None:
                 self._console.print(f"[green]{line}[/green]")
-            elif self.enabled and stdout_is_tty():
+            elif self.enabled:
                 _safe_print(f"{_GREEN}{line}{_RESET}")
             else:
                 _safe_print(line)
@@ -436,7 +436,7 @@ class CliStatus:
             plain = str(message)
             if self.show_elapsed:
                 plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
-            print_warning(plain)
+            print_warning(plain, force_color=bool(self.enabled))
         else:
             plain = str(message)
             if self.show_elapsed:
@@ -452,7 +452,7 @@ class CliStatus:
             plain = str(message)
             if self.show_elapsed:
                 plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
-            print_warning(plain)
+            print_warning(plain, force_color=bool(self.enabled))
             self._done = True
             return
         symbol = _FAIL_SYMBOL
@@ -460,7 +460,7 @@ class CliStatus:
         tail = line[len(symbol):]
         if self._backend == "rich" and self._console is not None:
             self._console.print(f"[red]{symbol}[/red]{tail}")
-        elif self.enabled and stdout_is_tty():
+        elif self.enabled:
             _safe_print(f"{_RED}{symbol}{_RESET}{tail}")
         else:
             _safe_print(line)

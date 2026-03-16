@@ -77,7 +77,7 @@ from ._common.pathcheck import (
 )
 from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
-from ._common.status import format_elapsed, log_success
+from ._common.status import CliStatus, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -605,22 +605,27 @@ def main(log: bool = True):
         if grm_file is None:
             raise ValueError("GRM matrix (.grm.txt/.grm.npy or direct path) not found.")
 
-        logger.info(f"Loading GRM from {grm_file} ...")
-        if grm_file.endswith(".npy"):
-            grm = np.load(grm_file)
-        else:
-            grm = np.genfromtxt(grm_file)
+        grm_src = os.path.basename(str(grm_file).rstrip("/\\")) or str(grm_file)
+        with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:
+            try:
+                if grm_file.endswith(".npy"):
+                    grm = np.load(grm_file)
+                else:
+                    grm = np.genfromtxt(grm_file)
 
-        id_path = f"{grm_file}.id"
-        samples = _read_id_file(id_path, logger, "GRM", show_status=False)
-        if samples is None:
-            raise ValueError(f"GRM ID file not found: {id_path}")
-        logger.info(f"Loaded GRM sample IDs from {id_path}")
+                id_path = f"{grm_file}.id"
+                samples = _read_id_file(id_path, logger, "GRM", show_status=False)
+                if samples is None:
+                    raise ValueError(f"GRM ID file not found: {id_path}")
 
-        if grm.shape[0] != len(samples):
-            raise ValueError(
-                f"GRM size mismatch: {grm.shape[0]} != {len(samples)} (ID count)."
-            )
+                if grm.shape[0] != len(samples):
+                    raise ValueError(
+                        f"GRM size mismatch: {grm.shape[0]} != {len(samples)} (ID count)."
+                    )
+            except Exception:
+                task.fail(f"Loading GRM from {grm_src} ...Failed")
+                raise
+            task.complete(f"Loading GRM from {grm_src} (n={grm.shape[0]})")
 
         # Eigen decomposition
         eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
@@ -654,9 +659,20 @@ def main(log: bool = True):
 
     # --- Case 3: qcov prefix -> load PC results only for plotting ---
     elif args.qcov:
-        logger.info("* Loading existing PC results for visualization only.")
-        samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
-        eigenval = np.genfromtxt(f"{gfile}.eigenval")
+        logger.info("* Using existing PC results for visualization only.")
+        qsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
+        with CliStatus(f"Loading existing PC results from {qsrc}...", enabled=use_spinner) as task:
+            try:
+                samples, eigenvec = _read_matrix_with_ids(f"{gfile}.eigenvec", logger, "Eigenvec")
+                eigenval = np.genfromtxt(f"{gfile}.eigenval")
+            except Exception:
+                task.fail(f"Loading existing PC results from {qsrc} ...Failed")
+                raise
+            n_samples = int(eigenvec.shape[0]) if isinstance(eigenvec, np.ndarray) else 0
+            n_comp = int(eigenvec.shape[1]) if isinstance(eigenvec, np.ndarray) and eigenvec.ndim >= 2 else 0
+            task.complete(
+                f"Loading existing PC results from {qsrc} (n={n_samples}, nPC={n_comp})"
+            )
         logger.info(
             f"Loaded PC results from {gfile}.eigenvec(.id/.eigenval) in "
             f"{round(time.time() - t_loading, 3)} seconds"

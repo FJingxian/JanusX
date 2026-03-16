@@ -1624,7 +1624,7 @@ def _ldclump_significant_snps(
     clump_elapsed = format_elapsed(time.monotonic() - clump_start_ts)
     if bool(show_progress):
         if clump_success:
-            print_success(f"LD clumping ...Finished [{clump_elapsed}]")
+            print_success(f"LD clumping ...Finished [{clump_elapsed}]", force_color=True)
         else:
             print_failure(f"LD clumping ...Failed [{clump_elapsed}]")
 
@@ -3896,7 +3896,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
                     task_map.pop(f, None)
                 raise
         total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
-        print_success(f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]")
+        print_success(f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]", force_color=True)
         return
 
     if _HAS_TQDM and stdout_is_tty() and should_animate_status("Loading merged post-GWAS tasks..."):
@@ -3927,7 +3927,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         finally:
             pbar.close()
         total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
-        print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]")
+        print_success(f"Task {done_count}/{len(files)} ...Finished [{total_elapsed}]", force_color=True)
         return
 
     setattr(args, "_postgwas_job_workers", int(logical_workers))

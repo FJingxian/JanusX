@@ -90,7 +90,10 @@ class _AdmixtureCliProgress:
             m = int(payload.get("m", 0))
             n = int(payload.get("n", 0))
             if self.enabled:
-                print_success(f"Loaded genotype matrix (SNPs={m}, samples={n})")
+                print_success(
+                    f"Loaded genotype matrix (SNPs={m}, samples={n})",
+                    force_color=True,
+                )
                 print(f"Data shape: SNPs={m}, samples={n}", flush=True)
             return
 

@@ -625,7 +625,7 @@ def load_bsa_in_python(
     depth_difference: int,
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    logger.info(f"Loading BSA table: {table_path}")
+    logger.info(f"BSA table source: {table_path}")
     header = pd.read_csv(table_path, sep="\t", nrows=1)
     required_cols = [
         "CHROM",
@@ -647,7 +647,7 @@ def load_bsa_in_python(
         usecols=required_cols,
         low_memory=False,
     )
-    logger.info(f"Input shape: {df.shape}")
+    logger.info(f"BSA table shape: {df.shape}")
 
     initial_rows = len(df)
     df = df.dropna(subset=required_cols)
@@ -1150,7 +1150,10 @@ def preprocess_tables_parallel(
         if errors:
             raise RuntimeError("Failed chromosome tables:\n- " + "\n- ".join(errors))
         total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
-        print_success(f"Task {len(raw_parts)}/{n_total} ...Finished [{total_elapsed}]")
+        print_success(
+            f"Task {len(raw_parts)}/{n_total} ...Finished [{total_elapsed}]",
+            force_color=True,
+        )
     else:
         with CliStatus(
             f"Preprocessing {len(input_files)} chromosome tables...",

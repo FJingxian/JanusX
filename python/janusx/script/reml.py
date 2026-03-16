@@ -729,7 +729,10 @@ def main() -> None:
     log_success(logger, f"BLUP table saved: {out_blup}")
     log_success(logger, f"Summary table saved: {out_summary}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
-    print_success(f"REML ...Finished [{format_elapsed(time.time() - t0)}]")
+    print_success(
+        f"REML ...Finished [{format_elapsed(time.time() - t0)}]",
+        force_color=True,
+    )
 
 
 if __name__ == "__main__":

@@ -189,6 +189,6 @@ class ProgressAdapter:
         if self._finished and self.emit_done:
             msg = f"{self.desc} ...Finished [{elapsed}]"
             if self._animate:
-                print_success(msg)
+                print_success(msg, force_color=True)
             else:
                 print(msg, flush=True)

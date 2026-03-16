@@ -179,8 +179,8 @@ def _emit_trait_header(
             )
             lines = trait_lines + [n_line]
     for ln in lines:
-        _log_file_only(logger, logging.INFO, ln)
         if use_spinner:
+            _log_file_only(logger, logging.INFO, ln)
             print(ln, flush=True)
         else:
             logger.info(ln)
@@ -274,6 +274,16 @@ def _log_info(logger: logging.Logger, message: str, *, use_spinner: bool = False
         _log_file_only(logger, logging.INFO, str(message))
     else:
         logger.info(str(message))
+
+
+def _log_model_line(
+    logger: logging.Logger,
+    model_label: str,
+    message: str,
+    *,
+    use_spinner: bool = False,
+) -> None:
+    _log_info(logger, f"{str(model_label)}: {str(message)}", use_spinner=use_spinner)
 
 
 def _rich_success(
@@ -2590,6 +2600,7 @@ def run_chunked_gwas_lmm_lm(
         model_chunk_size = int(max(1, chunk_size))
 
         header_pve: Optional[float] = None
+        init_log_message: Optional[str] = None
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
@@ -2605,19 +2616,10 @@ def run_chunked_gwas_lmm_lm(
                 header_pve = None
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"{model_label}, trait: {pname}, PVE(null): {mod.pve:.3f}",
-            )
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"Eigen-Decomposition ...Finished [{evd_elapsed}]",
-            )
+            init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
-            _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
+            init_log_message = "streaming scan initialized"
 
         if bool(emit_trait_header):
             _emit_trait_header(
@@ -2627,6 +2629,13 @@ def run_chunked_gwas_lmm_lm(
                 pve=header_pve,
                 use_spinner=bool(use_spinner),
                 width=60,
+            )
+        if init_log_message is not None:
+            _log_model_line(
+                logger,
+                model_label,
+                init_log_message,
+                use_spinner=bool(use_spinner),
             )
 
         done_snps = 0
@@ -2838,15 +2847,15 @@ def run_chunked_gwas_lmm_lm(
 
         avg_cpu_pct = 100.0 * total_cpu / wall / (n_cores or 1) if wall > 0 else 0.0
         peak_rss_gb = peak_rss / 1024**3
-        _log_file_only(
+        _log_model_line(
             logger,
-            logging.INFO,
-            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, "
-            f"peak RSS ~ {peak_rss_gb:.2f} G",
+            model_label,
+            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
         )
 
         if not has_results:
-            logger.info(f"No SNPs passed filters for trait {pname}.")
+            logger.info(f"{model_label}: no SNPs passed filters for trait {pname}.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = int(done_snps)
             summary_rows.append(
@@ -2909,10 +2918,11 @@ def run_chunked_gwas_lmm_lm(
 
         os.replace(tmp_tsv, out_tsv)
         saved_paths.append(str(out_tsv).replace("//", "/"))
-        _log_file_only(
+        _log_model_line(
             logger,
-            logging.INFO,
+            model_label,
             f"Results saved to {str(out_tsv).replace('//', '/')}",
+            use_spinner=bool(use_spinner),
         )
         time_parts: list[str] = []
         if evd_secs > 0:
@@ -3153,6 +3163,7 @@ def run_chunked_gwas_streaming_shared(
             "tmp_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
             "out_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv",
             "writer": None,
+            "init_log": None,
         }
         ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
 
@@ -3166,20 +3177,11 @@ def run_chunked_gwas_streaming_shared(
                 mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
             evd_secs = max(time.monotonic() - init_t0, 0.0)
             evd_elapsed = format_elapsed(evd_secs)
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"{model_label}, trait: {pname}, PVE(null): {mod.pve:.3f}",
-            )
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"Eigen-Decomposition ...Finished [{evd_elapsed}]",
-            )
             ctx["evd_secs"] = float(evd_secs)
+            ctx["init_log"] = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
-            _log_file_only(logger, logging.INFO, f"{model_label}, trait: {pname}")
+            ctx["init_log"] = "streaming scan initialized"
 
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
@@ -3209,7 +3211,6 @@ def run_chunked_gwas_streaming_shared(
         use_spinner=bool(use_spinner),
         width=60,
     )
-
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
     use_rich_multi = bool(use_spinner and rich_progress_available())
     rich_progress = None
@@ -3419,11 +3420,19 @@ def run_chunked_gwas_streaming_shared(
         peak_rss_gb = float(int(ctx["peak_rss"]) / 1024**3)
         denom = max(evd_secs + scan_secs, 1e-9)
         avg_cpu_pct = 100.0 * cpu_used / denom / max(1, int(n_cores))
-        _log_file_only(
+        init_log = str(ctx.get("init_log", "") or "").strip()
+        if init_log != "":
+            _log_model_line(
+                logger,
+                model_label,
+                init_log,
+                use_spinner=bool(use_spinner),
+            )
+        _log_model_line(
             logger,
-            logging.INFO,
-            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, "
-            f"peak RSS ~ {peak_rss_gb:.2f} G",
+            model_label,
+            f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
         )
 
         has_results = bool(ctx["has_results"])
@@ -3440,7 +3449,7 @@ def run_chunked_gwas_streaming_shared(
                 except Exception:
                     ctx_pve = None
         if not has_results:
-            logger.info(f"No SNPs passed filters for trait {pname} ({model_label}).")
+            logger.info(f"{model_label}: no SNPs passed filters for trait {pname}.")
             summary_rows.append(
                 {
                     "phenotype": str(pname),
@@ -3497,10 +3506,11 @@ def run_chunked_gwas_streaming_shared(
 
             os.replace(tmp_tsv, out_tsv)
             saved_paths.append(str(out_tsv).replace("//", "/"))
-            _log_file_only(
+            _log_model_line(
                 logger,
-                logging.INFO,
+                model_label,
                 f"Results saved to {str(out_tsv).replace('//', '/')}",
+                use_spinner=bool(use_spinner),
             )
 
         time_parts: list[str] = []
@@ -4149,16 +4159,14 @@ def run_farmcpu_fullmem(
             maf = np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1)
             eff_snp = int(maf.shape[0])
 
-        _log_file_only(
+        _emit_trait_header(
             logger,
-            logging.INFO,
-            f"FarmCPU, trait: {phename}, Samples: {n_idv}",
+            phename,
+            n_idv,
+            pve=None,
+            use_spinner=bool(use_spinner),
+            width=60,
         )
-        trait_line = f"{phename} (n={n_idv})"
-        if use_spinner:
-            print(trait_line, flush=True)
-        else:
-            logger.info(trait_line)
 
         cpu_t0 = process.cpu_times()
         t0 = time.time()
@@ -4228,11 +4236,12 @@ def run_farmcpu_fullmem(
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
         out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
-        _log_file_only(
+        _log_model_line(
             logger,
-            logging.INFO,
+            "FarmCPU",
             f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, "
             f"peak RSS ~ {peak_rss_gb:.2f} G, pseudoQTNs ~ {n_pseudo_qtn}",
+            use_spinner=bool(use_spinner),
         )
         summary_rows.append(
             {
@@ -4253,10 +4262,11 @@ def run_farmcpu_fullmem(
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         saved_paths.append(str(out_tsv).replace("//", "/"))
-        _log_file_only(
+        _log_model_line(
             logger,
-            logging.INFO,
+            "FarmCPU",
             f"Results saved to {str(out_tsv).replace('//', '/')}",
+            use_spinner=bool(use_spinner),
         )
         farm_times = [format_elapsed(gwas_secs)]
         if args.plot:

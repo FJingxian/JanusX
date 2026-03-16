@@ -436,6 +436,24 @@ class MLGS:
             return 6
         return 8 if stage == "coarse" else 4
 
+    def planned_search_steps(self) -> int:
+        """
+        Return a deterministic planned search-step count for progress reporting.
+
+        Notes
+        -----
+        This is an upfront plan, not the exact realized count:
+        - multicenter fine-stage candidates may be deduplicated in practice.
+        - confirm centers may be fewer than confirm_top_k if unique rows are limited.
+        """
+        coarse_n = max(0, int(self.coarse_iter))
+        fine_n = max(0, int(self.fine_iter))
+        if str(self.search_scheme) == "legacy":
+            return int(coarse_n + fine_n)
+        coarse_top = max(1, int(self.coarse_top_k))
+        confirm_top = max(1, int(self.confirm_top_k))
+        return int(coarse_n + (coarse_top * fine_n) + confirm_top)
+
     @staticmethod
     def _merge_features(X_marker: np.ndarray, cov: np.ndarray | None) -> np.ndarray:
         if cov is None:

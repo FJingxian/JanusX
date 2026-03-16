@@ -411,6 +411,11 @@ def _tune_ml_method_once(
         verbose=False,
         progress_callback=_on_ml_search_progress,
     )
+    try:
+        planned_total = int(max(1, int(model.planned_search_steps())))
+        _on_ml_search_progress("search_total", {"count": planned_total})
+    except Exception:
+        pass
     model.fit()
     return {
         "params": model.get_final_params(),
@@ -717,6 +722,7 @@ def _run_methods_parallel(
                     search_task_id: int | None = None
                     search_done = 0
                     search_total = 0
+                    search_total_fixed = False
                     cv_task_id: int | None = None
                     cv_done = 0
 
@@ -747,13 +753,35 @@ def _run_methods_parallel(
                             )
 
                     def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                        nonlocal search_task_id, search_done, search_total
+                        nonlocal search_task_id, search_done, search_total, search_total_fixed
                         ev = str(event)
+                        if ev == "search_total":
+                            count = int(max(0, int(payload.get("count", 0))))
+                            if count <= 0:
+                                return
+                            search_total = int(count)
+                            search_total_fixed = True
+                            if search_task_id is None:
+                                search_task_id = progress.add_task(
+                                    description="",
+                                    total=int(max(1, search_total)),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+                            else:
+                                progress.update(
+                                    search_task_id,
+                                    total=int(max(1, search_total)),
+                                    label=f"{m} search {search_done}/{search_total}",
+                                )
+                            return
                         if ev == "search_plan":
                             count = int(max(0, int(payload.get("count", 0))))
                             if count <= 0:
                                 return
-                            search_total += count
+                            if not search_total_fixed:
+                                search_total += count
+                            if search_total <= 0:
+                                search_total = count
                             if search_task_id is None:
                                 search_task_id = progress.add_task(
                                     description="",
@@ -771,7 +799,7 @@ def _run_methods_parallel(
                             inc = int(max(0, int(payload.get("inc", 0))))
                             if inc <= 0:
                                 return
-                            if search_done + inc > search_total:
+                            if (not search_total_fixed) and (search_done + inc > search_total):
                                 search_total = search_done + inc
                             if search_task_id is None:
                                 search_task_id = progress.add_task(

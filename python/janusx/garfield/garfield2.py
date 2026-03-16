@@ -4,9 +4,22 @@ from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
+from janusx.gfreader import (
+    load_genotype_chunks,
+    inspect_genotype_file,
+    load_bed_2bit_packed,
+)
 from janusx.garfield.logreg import logreg
 from tqdm import tqdm
+
+try:
+    from janusx.janusx import (
+        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
+        bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
+    )
+except Exception:
+    _bed_packed_row_flip_mask = None
+    _bed_packed_decode_rows_f32 = None
 
 def load_all_genotype_int8(
     genofile: str,
@@ -75,6 +88,146 @@ def load_all_genotype_int8(
         return np.empty((0, n_use), dtype=np.int8), []
     M = np.vstack(M_list)
     return np.ascontiguousarray(M, dtype=np.int8), sites_list
+
+
+def _normalize_bed_prefix(genofile: str) -> str:
+    p = str(genofile)
+    low = p.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        return p[:-4]
+    return p
+
+
+def _load_bim_chrom_pos_filtered(prefix: str, keep_mask: np.ndarray) -> list[tuple[str, int]]:
+    keep = np.ascontiguousarray(np.asarray(keep_mask, dtype=np.bool_).reshape(-1))
+    n_total = int(keep.shape[0])
+    out: list[tuple[str, int]] = []
+    bim_path = f"{prefix}.bim"
+    lines = 0
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            if lines >= n_total:
+                raise ValueError(
+                    f"BIM has more rows than packed genotype rows: bim>{n_total} ({bim_path})"
+                )
+            idx = lines
+            lines += 1
+            if not keep[idx]:
+                continue
+            parts = raw.strip().split()
+            if len(parts) < 4:
+                raise ValueError(
+                    f"Invalid BIM row at line {idx + 1}: expected >=4 columns."
+                )
+            chrom = str(parts[0])
+            try:
+                pos = int(parts[3])
+            except Exception:
+                try:
+                    pos = int(float(parts[3]))
+                except Exception:
+                    pos = 0
+            out.append((chrom, int(pos)))
+    if lines != n_total:
+        raise ValueError(
+            f"BIM row count mismatch: bim={lines}, packed_rows={n_total} ({bim_path})"
+        )
+    if len(out) != int(np.sum(keep)):
+        raise ValueError("Internal error: filtered BIM rows do not match keep mask.")
+    return out
+
+
+def load_all_genotype_packed_bed(
+    genofile: str,
+    maf: float = 0.02,
+    missing_rate: float = 0.05,
+) -> tuple[dict[str, Any], list[tuple[str, int]]]:
+    """
+    Load all filtered genotypes once into memory as BED-packed 2-bit matrix.
+
+    Returned packed context can be decoded region-wise for selected samples
+    without materializing a full SNP x sample int8 matrix.
+    """
+    if _bed_packed_row_flip_mask is None or _bed_packed_decode_rows_f32 is None:
+        raise RuntimeError(
+            "Rust packed BED decode helpers are unavailable. Rebuild JanusX extension."
+        )
+    prefix = _normalize_bed_prefix(genofile)
+    if not (
+        os.path.isfile(f"{prefix}.bed")
+        and os.path.isfile(f"{prefix}.bim")
+        and os.path.isfile(f"{prefix}.fam")
+    ):
+        raise ValueError(f"PLINK BED/BIM/FAM prefix not found: {prefix}")
+
+    packed_raw, miss_raw, maf_raw, _std_raw, n_samples = load_bed_2bit_packed(prefix)
+    packed_arr = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+    miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+    maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+    if packed_arr.shape[0] != maf_arr.shape[0] or miss_arr.shape[0] != maf_arr.shape[0]:
+        raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+
+    keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
+    maf_thr = float(maf)
+    if maf_thr > 0.0:
+        keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+    miss_thr = float(missing_rate)
+    if miss_thr < 1.0:
+        keep &= miss_arr <= miss_thr
+    if not np.any(keep):
+        raise ValueError("No SNP remains after BED packed filtering.")
+
+    all_sites = _load_bim_chrom_pos_filtered(prefix, keep)
+    if np.all(keep):
+        packed = packed_arr
+        maf_keep = maf_arr
+        miss_keep = miss_arr
+    else:
+        packed = np.ascontiguousarray(packed_arr[keep], dtype=np.uint8)
+        maf_keep = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
+        miss_keep = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
+
+    row_flip = np.ascontiguousarray(
+        np.asarray(_bed_packed_row_flip_mask(packed, int(n_samples)), dtype=np.bool_).reshape(-1)
+    )
+    if row_flip.shape[0] != packed.shape[0]:
+        raise ValueError("Packed row_flip length mismatch.")
+
+    packed_ctx = {
+        "packed": packed,
+        "maf": maf_keep,
+        "missing_rate": miss_keep,
+        "row_flip": row_flip,
+        "n_samples": int(n_samples),
+    }
+    return packed_ctx, all_sites
+
+
+def _decode_packed_rows_int8(
+    packed_ctx: dict[str, Any],
+    row_indices: np.ndarray,
+    sample_indices: np.ndarray,
+) -> np.ndarray:
+    if _bed_packed_decode_rows_f32 is None:
+        raise RuntimeError("Rust packed BED decode helper is unavailable.")
+
+    rows = np.ascontiguousarray(np.asarray(row_indices, dtype=np.int64).reshape(-1))
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
+    if rows.size == 0:
+        return np.empty((0, int(sidx.size)), dtype=np.int8)
+
+    decoded = _bed_packed_decode_rows_f32(
+        packed_ctx["packed"],
+        int(packed_ctx["n_samples"]),
+        rows,
+        packed_ctx["row_flip"],
+        packed_ctx["maf"],
+        sidx,
+    )
+    decoded_arr = np.asarray(decoded, dtype=np.float32)
+    # Keep GARFIELD behavior consistent with dense preload path:
+    # imputed hard-calls are rounded to int8.
+    return np.ascontiguousarray(np.rint(decoded_arr), dtype=np.int8)
 
 def ldprune(
     M: np.ndarray,
@@ -180,6 +333,8 @@ def getLogicgate(
             first = sites[0]
             if hasattr(first, "chrom") and hasattr(first, "pos"):
                 sites = np.array([f"{i.chrom}_{i.pos}" for i in sites])
+            elif isinstance(first, (tuple, list)) and len(first) >= 2:
+                sites = np.array([f"{str(i[0])}_{int(i[1])}" for i in sites])
             else:
                 sites = np.array([str(i) for i in sites])
     else:
@@ -670,28 +825,42 @@ def _process(
 
 def _build_site_index(
     sites: List[Any],
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+) -> dict[str, tuple[np.ndarray, np.ndarray, bool]]:
     """
     Build per-chromosome positional index for fast range query.
     Returns {chrom: (pos, global_indices)} in original SNP order.
     """
+    def _site_chrom_pos(site: Any) -> tuple[str, int]:
+        if hasattr(site, "chrom") and hasattr(site, "pos"):
+            return str(site.chrom), int(site.pos)
+        if isinstance(site, (tuple, list)) and len(site) >= 2:
+            return str(site[0]), int(site[1])
+        s = str(site)
+        if "_" in s:
+            chrom, pos = s.rsplit("_", 1)
+            try:
+                return str(chrom), int(pos)
+            except Exception:
+                pass
+        raise ValueError(f"Unsupported site format: {site!r}")
+
     by_chrom: dict[str, list[tuple[int, int]]] = {}
     for i, site in enumerate(sites):
-        chrom = str(site.chrom)
-        pos = int(site.pos)
+        chrom, pos = _site_chrom_pos(site)
         if chrom not in by_chrom:
             by_chrom[chrom] = []
         by_chrom[chrom].append((pos, i))
 
-    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    out: dict[str, tuple[np.ndarray, np.ndarray, bool]] = {}
     for chrom, pairs in by_chrom.items():
         pos = np.fromiter((p for p, _ in pairs), dtype=np.int64, count=len(pairs))
         idx = np.fromiter((j for _, j in pairs), dtype=np.int64, count=len(pairs))
-        out[chrom] = (pos, idx)
+        is_sorted = bool(pos.size <= 1 or np.all(pos[1:] >= pos[:-1]))
+        out[chrom] = (pos, idx, is_sorted)
     return out
 
 def _select_range_indices(
-    site_index: dict[str, tuple[np.ndarray, np.ndarray]],
+    site_index: dict[str, tuple[np.ndarray, np.ndarray, bool]],
     chrom: str,
     start: int,
     end: int,
@@ -699,8 +868,8 @@ def _select_range_indices(
     item = site_index.get(str(chrom))
     if item is None:
         return np.empty(0, dtype=np.int64)
-    pos, idx = item
-    if pos.size > 1 and np.any(pos[1:] < pos[:-1]):
+    pos, idx, is_sorted = item
+    if not is_sorted:
         mask = (pos >= int(start)) & (pos <= int(end))
         return idx[mask]
     lo = int(np.searchsorted(pos, int(start), side="left"))
@@ -713,7 +882,7 @@ def _process_inmemory(
     ChromPos: Union[chrposTuple, List[chrposTuple]],
     all_genotype_i8: np.ndarray,
     all_sites: List[Any],
-    site_index: dict[str, tuple[np.ndarray, np.ndarray]],
+    site_index: dict[str, tuple[np.ndarray, np.ndarray, bool]],
     y: np.ndarray,
     nsnp: int = 5,
     n_estimators: int = 200,
@@ -740,6 +909,79 @@ def _process_inmemory(
             if idx.size == 0:
                 continue
             M_gene = all_genotype_i8[idx]
+            sites_gene: List[Any] = [all_sites[int(i)] for i in idx]
+            if M_gene.shape[0] > max_gene_snps:
+                M_gene, sites_kept = ldprune(
+                    M_gene, np.array(sites_gene), max_snps=max_gene_snps
+                )
+                sites_gene = list(sites_kept)
+            if M_gene.shape[0] == 0:
+                continue
+
+            M_list.append(M_gene)
+            sites_list.extend(sites_gene)
+            gset_groups.append(np.arange(offset, offset + M_gene.shape[0], dtype=int))
+            offset += M_gene.shape[0]
+
+        if not M_list:
+            return None
+        M = np.vstack(M_list)
+    else:
+        return None
+
+    if M.shape[0] < 2:
+        return None
+    try:
+        resdict = getLogicgate(
+            y,
+            M,
+            nsnp=nsnp,
+            n_estimators=n_estimators,
+            sites=sites_list,
+            response=response,
+            gsetmode=gsetmode,
+            gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
+        )
+    except Exception as e:
+        print(f"[WARN] process {ChromPos} failed: {e}")
+        return None
+    if resdict is None:
+        return None
+    return resdict
+
+
+def _process_inmemory_packed(
+    ChromPos: Union[chrposTuple, List[chrposTuple]],
+    packed_ctx: dict[str, Any],
+    all_sites: List[Any],
+    site_index: dict[str, tuple[np.ndarray, np.ndarray, bool]],
+    sample_indices: np.ndarray,
+    y: np.ndarray,
+    nsnp: int = 5,
+    n_estimators: int = 200,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
+):
+    if isinstance(ChromPos, tuple):
+        chrom, start, end = ChromPos
+        idx = _select_range_indices(site_index, str(chrom), int(start), int(end))
+        if idx.size == 0:
+            return None
+        M = _decode_packed_rows_int8(packed_ctx, idx, sample_indices)
+        sites_list = [all_sites[int(i)] for i in idx]
+        gset_groups = None
+    elif isinstance(ChromPos, list):
+        M_list: List[np.ndarray] = []
+        sites_list: List[Any] = []
+        gset_groups: List[np.ndarray] = []
+        offset = 0
+        max_gene_snps = max(200, int(nsnp) * 60)
+
+        for chrom, start, end in ChromPos:
+            idx = _select_range_indices(site_index, str(chrom), int(start), int(end))
+            if idx.size == 0:
+                continue
+            M_gene = _decode_packed_rows_int8(packed_ctx, idx, sample_indices)
             sites_gene: List[Any] = [all_sites[int(i)] for i in idx]
             if M_gene.shape[0] > max_gene_snps:
                 M_gene, sites_kept = ldprune(
@@ -851,6 +1093,55 @@ def main_inmemory(
             all_genotype_i8,
             all_sites,
             site_index,
+            y,
+            nsnp,
+            n_estimators,
+            response,
+            gsetmodes[i] if gsetmodes is not None else gsetmode,
+        )
+        for i, ChromPos in enumerate(tqdm(bedlist))
+    )
+    return results
+
+
+def main_inmemory_packed(
+    packed_ctx: dict[str, Any],
+    all_sites: List[Any],
+    sample_indices: np.ndarray,
+    y: np.ndarray,
+    bedlist,
+    nsnp: int = 5,
+    n_estimators: int = 200,
+    threads: int = 4,
+    response: Literal['binary', 'continuous'] = "continuous",
+    gsetmode: bool = True,
+    gsetmodes: Optional[List[bool]] = None,
+):
+    """
+    Run GARFIELD search from preloaded BED-packed genotype matrix.
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
+    if sidx.size != y.shape[0]:
+        raise ValueError(
+            f"sample_indices length mismatch: {sidx.size} != len(y)={y.shape[0]}"
+        )
+    packed = np.asarray(packed_ctx.get("packed"))
+    if packed.ndim != 2:
+        raise ValueError("packed_ctx['packed'] must be a 2D SNP-major packed matrix.")
+    if len(all_sites) != int(packed.shape[0]):
+        raise ValueError("all_sites length must match packed_ctx['packed'].shape[0].")
+    if gsetmodes is not None and len(gsetmodes) != len(bedlist):
+        raise ValueError("gsetmodes length must match bedlist length")
+
+    site_index = _build_site_index(all_sites)
+    results = Parallel(n_jobs=threads, backend="threading")(
+        delayed(_process_inmemory_packed)(
+            ChromPos,
+            packed_ctx,
+            all_sites,
+            site_index,
+            sidx,
             y,
             nsnp,
             n_estimators,

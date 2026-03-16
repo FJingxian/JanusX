@@ -7,7 +7,9 @@ import numpy as np
 from joblib import cpu_count
 from janusx.garfield.garfield2 import (
     load_all_genotype_int8,
+    load_all_genotype_packed_bed,
     main_inmemory as garfield_main_inmemory,
+    main_inmemory_packed as garfield_main_inmemory_packed,
     window as garfield_window,
 )
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
@@ -34,6 +36,26 @@ def _safe_trait_label(label: object) -> str:
     if name == "":
         return "trait"
     return name.replace("/", "_").replace("\\", "_")
+
+
+def _resolve_plink_prefix(path_or_prefix: str):
+    """
+    Return normalized PLINK prefix if {prefix}.bed/.bim/.fam all exist.
+    Accept both bare prefix and explicit .bed/.bim/.fam paths.
+    """
+    raw = str(path_or_prefix)
+    cand = [raw]
+    low = raw.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        cand.append(raw[:-4])
+    for pfx in cand:
+        if (
+            os.path.isfile(f"{pfx}.bed")
+            and os.path.isfile(f"{pfx}.bim")
+            and os.path.isfile(f"{pfx}.fam")
+        ):
+            return pfx
+    return None
 
 
 def write_xcombine_results(
@@ -301,9 +323,11 @@ def main() -> None:
     bimranges = []
     gset_flags = []
     all_genotype_i8 = None
+    all_packed_ctx = None
     all_sites = None
     sample_pool_arr = np.asarray(sample_pool, dtype=str)
     sample_pool_index = {sid: i for i, sid in enumerate(sample_pool)}
+    sample_geno_index = {sid: i for i, sid in enumerate(sample_ids.tolist())}
 
     # Gene/gff3 mode
     if args.genefile and args.gff3 and os.path.isfile(args.genefile) and os.path.isfile(args.gff3):
@@ -334,30 +358,54 @@ def main() -> None:
                 bimranges.append(ranges)
                 gset_flags.append(use_gset)
 
-        logger.info(
-            "Gene/gff3 mode: loading all genotype as int8 into memory "
-            "(supports PLINK/VCF/TXT; VCF/TXT use cache conversion)."
-        )
-        with CliStatus("Loading genotype matrix...", enabled=use_spinner) as task:
-            try:
-                all_genotype_i8, all_sites = load_all_genotype_int8(
-                    gfile,
-                    sample_pool_arr,
-                    chunk_size=chunk_size,
-                    maf=0.02,
-                    missing_rate=0.05,
-                    mmap_window_mb=mmap_window_mb,
-                    total_snps=n_snps,
-                )
-            except Exception:
-                task.fail("Loading genotype matrix ...Failed")
-                raise
-            task.complete("Loading genotype matrix ...Finished")
-        logger.info(
-            "Loaded genotype matrix for gene/gset mode: "
-            f"{all_genotype_i8.shape[0]} SNPs x {all_genotype_i8.shape[1]} samples, "
-            f"dtype={all_genotype_i8.dtype}"
-        )
+        plink_prefix = _resolve_plink_prefix(gfile)
+        if plink_prefix is not None:
+            logger.info(
+                "Gene/gff3 mode: loading all genotype as BED-packed matrix "
+                "(memory-optimized; decode by region during GARFIELD scan)."
+            )
+            with CliStatus("Loading packed genotype matrix...", enabled=use_spinner) as task:
+                try:
+                    all_packed_ctx, all_sites = load_all_genotype_packed_bed(
+                        plink_prefix,
+                        maf=0.02,
+                        missing_rate=0.05,
+                    )
+                except Exception:
+                    task.fail("Loading packed genotype matrix ...Failed")
+                    raise
+                task.complete("Loading packed genotype matrix ...Finished")
+            packed = np.asarray(all_packed_ctx["packed"])
+            logger.info(
+                "Loaded packed genotype for gene/gset mode: "
+                f"{packed.shape[0]} SNPs x {int(all_packed_ctx['n_samples'])} samples, "
+                f"bytes_per_snp={packed.shape[1]}, dtype={packed.dtype}"
+            )
+        else:
+            logger.info(
+                "Gene/gff3 mode: loading all genotype as int8 into memory "
+                "(supports PLINK/VCF/TXT; VCF/TXT use cache conversion)."
+            )
+            with CliStatus("Loading genotype matrix...", enabled=use_spinner) as task:
+                try:
+                    all_genotype_i8, all_sites = load_all_genotype_int8(
+                        gfile,
+                        sample_pool_arr,
+                        chunk_size=chunk_size,
+                        maf=0.02,
+                        missing_rate=0.05,
+                        mmap_window_mb=mmap_window_mb,
+                        total_snps=n_snps,
+                    )
+                except Exception:
+                    task.fail("Loading genotype matrix ...Failed")
+                    raise
+                task.complete("Loading genotype matrix ...Finished")
+            logger.info(
+                "Loaded genotype matrix for gene/gset mode: "
+                f"{all_genotype_i8.shape[0]} SNPs x {all_genotype_i8.shape[1]} samples, "
+                f"dtype={all_genotype_i8.dtype}"
+            )
     else:
         logger.info(
             "Window mode: streaming genotype loading "
@@ -384,7 +432,23 @@ def main() -> None:
 
         with CliStatus(f"GARFIELD trait '{trait_name}'...", enabled=use_spinner) as task:
             try:
-                if all_genotype_i8 is not None and all_sites is not None:
+                if all_packed_ctx is not None and all_sites is not None:
+                    idx = np.asarray(
+                        [sample_geno_index[sid] for sid in common], dtype=np.int64
+                    )
+                    results = garfield_main_inmemory_packed(
+                        all_packed_ctx,
+                        all_sites,
+                        idx,
+                        y,
+                        bimranges,
+                        nsnp=args.nsnp,
+                        n_estimators=args.nestimators,
+                        threads=threads,
+                        response=args.vartype,
+                        gsetmodes=gset_flags,
+                    )
+                elif all_genotype_i8 is not None and all_sites is not None:
                     idx = np.asarray([sample_pool_index[sid] for sid in common], dtype=np.int64)
                     geno_trait = np.ascontiguousarray(all_genotype_i8[:, idx], dtype=np.int8)
                     results = garfield_main_inmemory(

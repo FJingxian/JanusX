@@ -3847,8 +3847,9 @@ def run_farmcpu_fullmem(
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).
 
-    If pheno_preloaded is provided, it will reuse that phenotype table to avoid
-    repeated "Loading phenotype ..." logs and repeated I/O.
+    If pheno_preloaded is provided from a non-streaming path, it may be reused.
+    When called after streaming GWAS context preparation, FarmCPU must use full
+    genotype IDs and therefore reload phenotype/Q/cov on the full ID space.
     """
     phenofile = args.pheno
     outfolder = args.out
@@ -3951,7 +3952,10 @@ def run_farmcpu_fullmem(
 
     if farmcpu_cache is None:
         t_loading = time.time()
-        pheno = pheno_preloaded
+        # If FarmCPU is invoked after streaming models, pheno_preloaded/ids_preloaded
+        # are usually intersection-aligned. FarmCPU must operate on full genotype IDs.
+        reuse_preloaded_pheno = bool(pheno_preloaded is not None) and (not bool(context_prepared))
+        pheno = pheno_preloaded if reuse_preloaded_pheno else None
         if pheno is None:
             pheno = _load_phenotype_with_status(
                 phenofile,
@@ -3967,20 +3971,18 @@ def run_farmcpu_fullmem(
                         f"Loading phenotype from dataframe (n={pheno.shape[0]}, npheno={pheno.shape[1]})"
                     )
 
-        if ids_preloaded is not None and n_snps_preloaded is not None:
-            famid = np.asarray(ids_preloaded, dtype=str)
-            n_snps = int(n_snps_preloaded)
-        else:
-            famid, n_snps = _inspect_genotype_with_status(
-                gfile,
-                logger,
-                use_spinner=use_spinner,
-                snps_only=bool(snps_only),
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
-                het_threshold=float(args.het),
-            )
-            famid = np.asarray(famid, dtype=str)
+        # Always inspect full genotype metadata for FarmCPU to avoid reusing
+        # streaming-intersection IDs (which can be smaller than packed BED n).
+        famid, n_snps = _inspect_genotype_with_status(
+            gfile,
+            logger,
+            use_spinner=use_spinner,
+            snps_only=bool(snps_only),
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            het_threshold=float(args.het),
+        )
+        famid = np.asarray(famid, dtype=str)
         geno = None
         packed_ctx: Union[dict[str, object], None] = None
 
@@ -4105,46 +4107,39 @@ def run_farmcpu_fullmem(
             logger.error(msg)
             raise ValueError(msg)
 
-        if bool(context_prepared) and qmatrix_preloaded is not None:
-            qmatrix = np.asarray(qmatrix_preloaded, dtype="float32")
-            if cov_preloaded is not None:
-                cov_arr = np.asarray(cov_preloaded, dtype="float32")
-                if cov_arr.shape[0] != qmatrix.shape[0]:
-                    raise ValueError(
-                        f"FarmCPU preloaded covariate rows ({cov_arr.shape[0]}) "
-                        f"do not match preloaded Q rows ({qmatrix.shape[0]})."
-                    )
-                qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
-        else:
-            gfile_prefix = _gwas_cache_prefix_with_params(
-                gfile,
-                maf=float(args.maf),
-                geno=float(args.geno),
-                snps_only=bool(snps_only),
-                logger=logger,
-            )
-            qmatrix = build_qmatrix_farmcpu(
-                genofile=gfile,
-                gfile_prefix=gfile_prefix,
-                geno=geno,
-                qdim=qdim,
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
-                het_threshold=float(args.het),
-                cov_inputs=cov,
-                chunk_size=args.chunksize,
-                logger=logger,
-                sample_ids=famid.astype(str),
-                use_spinner=use_spinner,
-                quiet_terminal=bool(context_prepared),
-                snps_only=bool(snps_only),
-                n_snps_hint=int(ref_alt.shape[0]),
-                threads=int(args.thread),
-                mmap_limit=bool(args.mmap_limit),
-            )
+        # Build FarmCPU Q/cov on full genotype IDs; do not reuse streaming-aligned
+        # preloaded Q/cov because they may be trimmed by GRM/Q/cov intersections.
+        gfile_prefix = _gwas_cache_prefix_with_params(
+            gfile,
+            maf=float(args.maf),
+            geno=float(args.geno),
+            snps_only=bool(snps_only),
+            logger=logger,
+        )
+        qmatrix = build_qmatrix_farmcpu(
+            genofile=gfile,
+            gfile_prefix=gfile_prefix,
+            geno=geno,
+            qdim=qdim,
+            maf_threshold=float(args.maf),
+            max_missing_rate=float(args.geno),
+            het_threshold=float(args.het),
+            cov_inputs=cov,
+            chunk_size=args.chunksize,
+            logger=logger,
+            sample_ids=famid.astype(str),
+            use_spinner=use_spinner,
+            quiet_terminal=bool(context_prepared),
+            snps_only=bool(snps_only),
+            n_snps_hint=int(ref_alt.shape[0]),
+            threads=int(args.thread),
+            mmap_limit=bool(args.mmap_limit),
+        )
 
         if bool(context_prepared):
-            cov_n = "NA" if cov_preloaded is None else int(np.asarray(cov_preloaded).shape[0])
+            cov_n = "NA"
+            if len(_normalize_cov_inputs(cov)) > 0:
+                cov_n = int(famid.shape[0])
             geno_n = int(famid.shape[0]) if geno is None else int(geno.shape[1])
             _log_file_only(
                 logger,

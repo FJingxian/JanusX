@@ -31,6 +31,10 @@ _LOADING_PREFIXES = (
     "inspecting ",
     "loaded ",
 )
+_COMPLETION_TOKENS = (
+    "...finished",
+    "...found",
+)
 _SKIP_TOKENS = (
     "skip",
     "skipped",
@@ -105,6 +109,14 @@ def is_loading_status_text(text: object) -> bool:
     return any(t.startswith(prefix) for prefix in _LOADING_PREFIXES)
 
 
+def is_completed_status_text(text: object) -> bool:
+    _, msg = _split_leading_newlines(text)
+    t = str(msg).strip().lower()
+    if t == "":
+        return False
+    return any(tok in t for tok in _COMPLETION_TOKENS)
+
+
 def is_skip_status_text(text: object) -> bool:
     _, msg = _split_leading_newlines(text)
     t = str(msg).strip().lower()
@@ -172,7 +184,7 @@ def print_success(message: str, *, force_color: bool = False) -> None:
     if is_skip_status_text(msg):
         print_warning(msg, force_color=bool(force_color))
         return
-    if not is_loading_status_text(msg):
+    if (not is_loading_status_text(msg)) and (not is_completed_status_text(msg)):
         _safe_print(msg)
         return
     line = f"{_SUCCESS_SYMBOL} {msg}" if msg != "" else f"{_SUCCESS_SYMBOL}"

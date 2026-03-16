@@ -4730,9 +4730,8 @@ def main(log: bool = True):
             _emit_gwas_summary(logger, gwas_summary_rows)
         if len(saved_result_paths) > 0:
             logger.info("")
-            _rich_success(logger, "Results saved:")
-            for p in saved_result_paths:
-                _rich_success(logger, f"  {p}")
+            saved_body = "\n".join([f"  {p}" for p in saved_result_paths])
+            _rich_success(logger, f"Results saved:\n{saved_body}")
         _rich_success(logger, f"Log saved in {str(log_path).replace('//', '/')}")
 
     except KeyboardInterrupt:
@@ -4806,8 +4805,8 @@ def main(log: bool = True):
 
     lt = time.localtime()
     endinfo = (
-        f"\n\n\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
+        f"  {lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
     _rich_success(logger, endinfo)

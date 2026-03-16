@@ -45,8 +45,8 @@ def _symbol_or_ascii(preferred: str, fallback: str) -> str:
     return str(preferred) if _encoding_supports(preferred) else str(fallback)
 
 
-_SUCCESS_SYMBOL = _symbol_or_ascii("\u2714", "[OK]")
-_FAIL_SYMBOL = _symbol_or_ascii("\u2718", "[X]")
+_SUCCESS_SYMBOL = _symbol_or_ascii("\u2714\ufe0e", "[OK]")
+_FAIL_SYMBOL = _symbol_or_ascii("\u2718\ufe0e", "[X]")
 
 
 def success_symbol() -> str:
@@ -71,6 +71,20 @@ def _safe_console_text(text: str) -> str:
 
 def _safe_print(text: str, *, end: str = "\n", flush: bool = True) -> None:
     print(_safe_console_text(text), end=end, flush=flush)
+
+
+def _safe_write(text: str, *, flush: bool = True) -> None:
+    sys.stdout.write(_safe_console_text(text))
+    if flush:
+        sys.stdout.flush()
+
+
+def _split_leading_newlines(text: str) -> tuple[str, str]:
+    s = str(text)
+    i = 0
+    while i < len(s) and s[i] in "\r\n":
+        i += 1
+    return s[:i], s[i:]
 
 
 def format_elapsed(seconds: Optional[float]) -> str:
@@ -124,8 +138,10 @@ def _console_for_print(*, force_color: bool) -> Optional["Console"]:
 
 
 def print_success(message: str, *, force_color: bool = False) -> None:
-    msg = str(message)
-    line = f"{_SUCCESS_SYMBOL} {msg}"
+    leading, msg = _split_leading_newlines(message)
+    if leading:
+        _safe_write(leading)
+    line = f"{_SUCCESS_SYMBOL} {msg}" if msg != "" else f"{_SUCCESS_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
         try:
@@ -140,8 +156,10 @@ def print_success(message: str, *, force_color: bool = False) -> None:
 
 
 def print_failure(message: str, *, force_color: bool = False) -> None:
-    msg = str(message)
-    line = f"{_FAIL_SYMBOL} {msg}"
+    leading, msg = _split_leading_newlines(message)
+    if leading:
+        _safe_write(leading)
+    line = f"{_FAIL_SYMBOL} {msg}" if msg != "" else f"{_FAIL_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
         try:

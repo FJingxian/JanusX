@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..script._common.helptext import cli_help_formatter, minimal_help_epilog
+from ..script._common.pathcheck import safe_expanduser, safe_home, safe_resolve
 from ..script._common.gwas_history import (
     get_gwas_history_row,
     get_postgwas_run,
@@ -104,18 +105,18 @@ def _resolve_existing_path(raw_path: str, base_dirs: list[Path] | None = None) -
     txt = str(raw_path or "").strip()
     if txt == "":
         return ""
-    p = Path(txt).expanduser()
+    p = safe_expanduser(txt)
     if p.exists():
-        return str(p.resolve())
+        return str(safe_resolve(p))
     if p.is_absolute():
         return ""
     for bd in (base_dirs or []):
         try:
-            cand = (bd / p).expanduser()
+            cand = safe_expanduser(bd / p)
         except Exception:
             continue
         if cand.exists():
-            return str(cand.resolve())
+            return str(safe_resolve(cand))
     return ""
 
 
@@ -475,9 +476,9 @@ class WebUIState:
 
         def _add(p: Path) -> None:
             try:
-                rp = p.expanduser().resolve()
+                rp = safe_resolve(p)
             except Exception:
-                rp = p.expanduser()
+                rp = safe_expanduser(p)
             key = str(rp)
             if key in seen:
                 return
@@ -487,8 +488,9 @@ class WebUIState:
         env_home = str(os.environ.get("JX_HOME", "")).strip()
         if env_home != "":
             _add(Path(env_home) / "janusx_tasks.db")
-        _add(Path.home() / "JanusX" / ".janusx" / "janusx_tasks.db")
-        _add(Path.home() / ".janusx" / "janusx_tasks.db")
+        home = safe_home()
+        _add(home / "JanusX" / ".janusx" / "janusx_tasks.db")
+        _add(home / ".janusx" / "janusx_tasks.db")
         _add(self.db_path)
         return out
 
@@ -502,9 +504,9 @@ class WebUIState:
             if v == "":
                 continue
             try:
-                parent = Path(v).expanduser().parent.resolve()
+                parent = safe_resolve(safe_expanduser(v).parent)
             except Exception:
-                parent = Path(v).expanduser().parent
+                parent = safe_expanduser(v).parent
             if parent not in bases:
                 bases.append(parent)
         return bases
@@ -514,7 +516,7 @@ class WebUIState:
         txt = str(prefix or "").strip()
         if txt == "":
             return ""
-        base = Path(txt).expanduser()
+        base = safe_expanduser(txt)
         candidates: list[Path] = []
         if base.is_absolute():
             candidates.append(base)
@@ -522,7 +524,7 @@ class WebUIState:
             candidates.append(base)
             for bd in base_dirs:
                 try:
-                    candidates.append((bd / base).expanduser())
+                    candidates.append(safe_expanduser(bd / base))
                 except Exception:
                     continue
         for cand in candidates:
@@ -908,7 +910,7 @@ class WebUIState:
         base_dirs = [Path.cwd(), self.root_dir, self.db_path.parent, base]
         if gtxt == "":
             try:
-                return str(base.expanduser().absolute()), "tsv"
+                return str(safe_expanduser(base).absolute()), "tsv"
             except Exception:
                 return str(base), "tsv"
         if ktxt == "bfile":
@@ -934,7 +936,7 @@ class WebUIState:
         genofile: str = "",
         genofile_kind: str = "",
     ) -> dict[str, Any]:
-        p0 = Path(file_path).expanduser()
+        p0 = safe_expanduser(file_path)
         try:
             p = p0.absolute()
         except Exception:
@@ -1093,7 +1095,7 @@ class WebUIState:
         gkind = str(row.get("genofile_kind", "")).strip().lower()
         if gfile != "":
             try:
-                gp = str(Path(gfile).expanduser().resolve())
+                gp = str(safe_resolve(gfile))
             except Exception:
                 gp = gfile
             return f"{gkind}:{gp}"
@@ -1280,7 +1282,7 @@ class WebUIState:
         anno_txt = str(anno_file or "").strip()
         anno_tag = ""
         if anno_txt != "":
-            ap = Path(anno_txt).expanduser()
+            ap = safe_expanduser(anno_txt)
             try:
                 arp = str(ap.resolve())
                 am = float(ap.stat().st_mtime) if ap.exists() else -1.0
@@ -1406,7 +1408,7 @@ class WebUIState:
         anno_txt = str(anno_file or "").strip()
         anno_tag = ""
         if anno_txt != "":
-            ap = Path(anno_txt).expanduser()
+            ap = safe_expanduser(anno_txt)
             try:
                 arp = str(ap.resolve())
                 am = float(ap.stat().st_mtime) if ap.exists() else -1.0
@@ -1820,7 +1822,7 @@ class WebUIState:
             v = str(row.get(key, "")).strip()
             if v == "":
                 continue
-            p = Path(v).expanduser()
+            p = safe_expanduser(v)
             bd = p.parent if use_parent else p
             if bd not in base_dirs:
                 base_dirs.append(bd)
@@ -4291,7 +4293,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    root = Path(args.root).expanduser().resolve()
+    root = safe_resolve(args.root)
     root.mkdir(parents=True, exist_ok=True)
     state = WebUIState(root)
     cleanup = state.startup_cleanup_report()

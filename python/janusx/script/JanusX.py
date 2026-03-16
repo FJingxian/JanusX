@@ -49,6 +49,7 @@ from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 from ._common.gwas_history import remove_loaded_file_by_id
 from ._common.interrupt import install_interrupt_handlers, force_exit
+from ._common.pathcheck import safe_expanduser, safe_home, safe_resolve
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -112,9 +113,10 @@ def _print_help() -> None:
 def _resolve_runtime_home() -> Path:
     env_home = os.environ.get("JX_HOME", "").strip()
     if env_home:
-        return Path(env_home).expanduser().resolve()
-    p1 = (Path.home() / "JanusX" / ".janusx").resolve()
-    p2 = (Path.home() / ".janusx").resolve()
+        return safe_resolve(safe_expanduser(env_home))
+    home = safe_home()
+    p1 = safe_resolve(home / "JanusX" / ".janusx")
+    p2 = safe_resolve(home / ".janusx")
     return p1 if p1.exists() else p2
 
 

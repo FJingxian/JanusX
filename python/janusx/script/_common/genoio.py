@@ -10,6 +10,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from janusx.gfreader import SiteInfo, prepare_cli_input_cache
+from .pathcheck import safe_expanduser
 from .status import CliStatus
 
 try:
@@ -144,7 +145,7 @@ def build_prefix_candidates(
     *,
     text_suffixes: Sequence[str] = GENOTYPE_TEXT_SUFFIXES,
 ) -> tuple[str, list[str]]:
-    raw = Path(file_arg).expanduser()
+    raw = safe_expanduser(file_arg)
     text_suffix_set = {str(x).lower() for x in text_suffixes}
 
     if raw.suffix.lower() in text_suffix_set:

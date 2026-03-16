@@ -19,6 +19,7 @@ from janusx.bioplotkit.manhanden import GWASPLOT
 from janusx.gfreader import load_genotype_chunks, inspect_genotype_file
 from janusx.gtools.reader import readanno
 from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
+from ..script._common.pathcheck import safe_expanduser, safe_resolve
 try:
     from janusx.janusx import load_gwas_triplet_fast as _load_gwas_triplet_fast
 except Exception:
@@ -663,9 +664,9 @@ def _resolve_result_file(row: dict[str, Any]) -> Path:
             if v == "":
                 continue
             try:
-                parent = Path(v).expanduser().parent.resolve()
+                parent = safe_resolve(safe_expanduser(v).parent)
             except Exception:
-                parent = Path(v).expanduser().parent
+                parent = safe_expanduser(v).parent
             if parent not in bases:
                 bases.append(parent)
         return bases
@@ -674,22 +675,22 @@ def _resolve_result_file(row: dict[str, Any]) -> Path:
         txt = str(raw_path or "").strip()
         if txt == "":
             return None
-        p = Path(txt).expanduser()
+        p = safe_expanduser(txt)
         if p.exists():
             try:
-                return p.resolve()
+                return safe_resolve(p)
             except Exception:
                 return p
         if p.is_absolute():
             return None
         for bd in base_dirs:
             try:
-                cand = (bd / p).expanduser()
+                cand = safe_expanduser(bd / p)
             except Exception:
                 continue
             if cand.exists():
                 try:
-                    return cand.resolve()
+                    return safe_resolve(cand)
                 except Exception:
                     return cand
         return None
@@ -728,9 +729,9 @@ def activate_task_cache(row: dict[str, Any], *, anno_file: Any = None, preload: 
     if anno_change_requested:
         anno_txt = str(anno_file or "").strip()
         if anno_txt != "":
-            p = Path(anno_txt).expanduser()
+            p = safe_expanduser(anno_txt)
             try:
-                anno_key = str(p.resolve())
+                anno_key = str(safe_resolve(p))
             except Exception:
                 anno_key = str(p)
 
@@ -1356,7 +1357,7 @@ def _load_track_anno_cached(anno_file: str) -> pd.DataFrame:
     txt = str(anno_file or "").strip()
     if txt == "":
         return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
-    p = Path(txt).expanduser()
+    p = safe_expanduser(txt)
     if not p.exists() or not p.is_file():
         return pd.DataFrame(columns=["chrom_norm", "start", "end", "name", "feature", "parent", "strand"])
 
@@ -1560,7 +1561,7 @@ def _estimate_n_from_phenofile(phenofile: str) -> int | None:
     cached = _META_CACHE.get(cache_key)
     if cached is not None and int(cached) > 0:
         return int(cached)
-    path = Path(p).expanduser()
+    path = safe_expanduser(p)
     if not path.exists() or not path.is_file():
         return None
     sep_kind = _sniff_sep_file(str(path))
@@ -1658,7 +1659,7 @@ def _compute_ld_r2(
         if mat.ndim == 2 and mat.shape[0] >= 2 and mat.shape[0] == mat.shape[1]:
             return mat.copy(), list(cached[1]), ""
 
-    path = Path(genofile).expanduser()
+    path = safe_expanduser(genofile)
     if genokind == "bfile":
         if not (
             Path(f"{genofile}.bed").exists()
@@ -1816,7 +1817,7 @@ def _load_anno_table_for_sig(anno_file: str) -> pd.DataFrame:
     if txt == "":
         return pd.DataFrame(columns=["chrom_norm", "start", "end", "gene", "desc", "add"])
 
-    p = Path(txt).expanduser()
+    p = safe_expanduser(txt)
     if not p.exists() or not p.is_file():
         return pd.DataFrame(columns=["chrom_norm", "start", "end", "gene", "desc", "add"])
 

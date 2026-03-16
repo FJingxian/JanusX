@@ -12,7 +12,7 @@ def _norm(path: str) -> str:
     return s.replace("\\", "/")
 
 
-def _safe_expanduser(path: str | Path) -> Path:
+def safe_expanduser(path: str | Path) -> Path:
     """
     Expand '~' when possible.
     On some HPC/batch environments, pathlib.expanduser() can raise
@@ -26,8 +26,42 @@ def _safe_expanduser(path: str | Path) -> Path:
         return p
 
 
+def safe_home() -> Path:
+    """
+    Best-effort home directory.
+    Prefer explicit environment variables when available and
+    gracefully fall back when Path.home() is unavailable.
+    """
+    env_home = str(os.environ.get("HOME", "")).strip()
+    if env_home:
+        return Path(env_home)
+    env_userprofile = str(os.environ.get("USERPROFILE", "")).strip()
+    if env_userprofile:
+        return Path(env_userprofile)
+    home_drive = str(os.environ.get("HOMEDRIVE", "")).strip()
+    home_path = str(os.environ.get("HOMEPATH", "")).strip()
+    if home_drive and home_path:
+        return Path(f"{home_drive}{home_path}")
+    try:
+        return Path.home()
+    except RuntimeError:
+        return Path(".")
+
+
+def safe_resolve(path: str | Path, *, strict: bool = False) -> Path:
+    p = safe_expanduser(path)
+    try:
+        return p.resolve(strict=strict)
+    except Exception:
+        return p
+
+
+# Backward-compatible alias for existing internal usage.
+_safe_expanduser = safe_expanduser
+
+
 def ensure_file_exists(logger, path: str, label: str) -> bool:
-    p = _safe_expanduser(path)
+    p = safe_expanduser(path)
     if p.is_file():
         return True
     # Accept PLINK prefix paths (prefix + .bed/.bim/.fam) for
@@ -41,7 +75,7 @@ def ensure_file_exists(logger, path: str, label: str) -> bool:
 
 
 def ensure_dir_exists(logger, path: str, label: str) -> bool:
-    p = _safe_expanduser(path)
+    p = safe_expanduser(path)
     if p.is_dir():
         return True
     logger.error(f"{label} not found: {_norm(str(p))}")
@@ -49,7 +83,7 @@ def ensure_dir_exists(logger, path: str, label: str) -> bool:
 
 
 def ensure_file_input_exists(logger, path: str, label: str = "Genotype file input") -> bool:
-    p = _safe_expanduser(path)
+    p = safe_expanduser(path)
     low = str(p).lower()
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
@@ -87,7 +121,7 @@ def ensure_file_input_site_metadata_exists(
     path: str,
     label: str = "Genotype FILE site metadata",
 ) -> bool:
-    p = _safe_expanduser(path)
+    p = safe_expanduser(path)
     low = str(p).lower()
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
@@ -120,7 +154,7 @@ def ensure_file_input_site_metadata_exists(
 
 
 def ensure_plink_prefix_exists(logger, prefix: str, label: str = "PLINK prefix") -> bool:
-    pfx = _safe_expanduser(prefix)
+    pfx = safe_expanduser(prefix)
     required = [Path(f"{pfx}{ext}") for ext in (".bed", ".bim", ".fam")]
     missing = [p for p in required if not p.is_file()]
     if not missing:

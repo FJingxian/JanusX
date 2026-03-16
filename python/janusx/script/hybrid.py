@@ -47,6 +47,7 @@ from ._common.genoio import (
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
+from ._common.pathcheck import safe_expanduser
 from ._common.status import CliStatus, print_success, print_warning
 
 
@@ -215,7 +216,7 @@ def _resolve_file_input(file_arg: str) -> tuple[str, str]:
     kind : "text" | "npy"
     matrix_path : actual matrix path
     """
-    raw = Path(file_arg).expanduser()
+    raw = safe_expanduser(file_arg)
     base = Path(_strip_known_matrix_suffix(str(raw)))
 
     npy_candidates = []
@@ -256,7 +257,7 @@ def _resolve_file_input(file_arg: str) -> tuple[str, str]:
 
 
 def _site_prefix_candidates(file_arg: str, matrix_path: str) -> list[str]:
-    raw = str(Path(file_arg).expanduser())
+    raw = str(safe_expanduser(file_arg))
     prefixes: list[str] = []
     for cand in [
         _strip_known_matrix_suffix(raw),

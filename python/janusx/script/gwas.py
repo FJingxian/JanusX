@@ -97,6 +97,8 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
+    safe_expanduser,
+    safe_resolve,
 )
 from ._common.prefetch import prefetch_iter
 from ._common.status import (
@@ -602,8 +604,8 @@ def _normalize_cache_warning_message(msg: str) -> str:
             left, right = s.split(marker, 1)
             src = left[len(prefix):].strip()
             dst = right.strip()
-            src_abs = os.path.abspath(os.path.expanduser(src))
-            dst_abs = os.path.abspath(os.path.expanduser(dst))
+            src_abs = str(safe_resolve(src))
+            dst_abs = str(safe_resolve(dst))
             return f"{prefix} {src_abs}{marker} {dst_abs}"
         except Exception:
             return s
@@ -649,7 +651,7 @@ def _resolve_gwas_cache_dir(
     if preferred == "":
         preferred = os.environ.get("JANUSX_CACHE_DIR", "").strip()
     if preferred:
-        fallback_dir = os.path.abspath(os.path.expanduser(preferred))
+        fallback_dir = str(safe_resolve(preferred))
         try:
             os.makedirs(fallback_dir, mode=0o755, exist_ok=True)
         except Exception:
@@ -827,7 +829,7 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
 
 
 def _resolve_file_input_matrix(genofile: str) -> tuple[Optional[str], Optional[str]]:
-    path = os.path.expanduser(str(genofile))
+    path = str(safe_expanduser(str(genofile)))
     low = path.lower()
     if low.endswith(".npy"):
         return path[: -len(".npy")], path

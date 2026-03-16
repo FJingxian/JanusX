@@ -43,7 +43,12 @@ from ._common.genoio import (
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
-from ._common.pathcheck import ensure_all_true, ensure_file_exists, ensure_plink_prefix_exists
+from ._common.pathcheck import (
+    ensure_all_true,
+    ensure_file_exists,
+    ensure_plink_prefix_exists,
+    safe_expanduser,
+)
 from ._common.status import CliStatus
 from janusx.gfreader import SiteInfo, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 from janusx.gfreader.gmerge import merge
@@ -189,7 +194,7 @@ def _discover_file_matrix(file_arg: str) -> tuple[str, str, list[str]]:
     raw_prefix, prefixes = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
 
     npy_candidates = []
-    raw = Path(file_arg).expanduser()
+    raw = safe_expanduser(file_arg)
     if raw.suffix.lower() == ".npy":
         npy_candidates.append(str(raw))
     npy_candidates.extend([f"{p}.npy" for p in prefixes])

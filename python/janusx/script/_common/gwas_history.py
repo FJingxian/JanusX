@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .pathcheck import safe_expanduser, safe_home, safe_resolve
+
 
 _DB_NAME = "janusx_tasks.db"
 
@@ -69,10 +71,11 @@ def resolve_jx_home() -> Path:
     """
     env_home = os.environ.get("JX_HOME", "").strip()
     if env_home:
-        return Path(env_home).expanduser().resolve()
+        return safe_resolve(env_home)
 
-    p1 = (Path.home() / "JanusX" / ".janusx").expanduser()
-    p2 = (Path.home() / ".janusx").expanduser()
+    home = safe_home()
+    p1 = safe_expanduser(home / "JanusX" / ".janusx")
+    p2 = safe_expanduser(home / ".janusx")
 
     # Prefer the home that already has a real history DB.
     # This avoids selecting an empty/new runtime dir while older history
@@ -87,19 +90,19 @@ def resolve_jx_home() -> Path:
             continue
     if len(db_candidates) > 0:
         db_candidates.sort(key=lambda x: x[0], reverse=True)
-        return db_candidates[0][1].resolve()
+        return safe_resolve(db_candidates[0][1])
 
     if p1.exists():
-        return p1.resolve()
+        return safe_resolve(p1)
     if p2.exists():
-        return p2.resolve()
-    return p1.resolve()
+        return safe_resolve(p2)
+    return safe_resolve(p1)
 
 
 def resolve_db_path() -> Path:
     home = resolve_jx_home()
     home.mkdir(parents=True, exist_ok=True)
-    return (home / _DB_NAME).resolve()
+    return safe_resolve(home / _DB_NAME)
 
 
 def _candidate_db_paths() -> list[Path]:
@@ -108,16 +111,17 @@ def _candidate_db_paths() -> list[Path]:
     env_home = os.environ.get("JX_HOME", "").strip()
     homes = []
     if env_home:
-        homes.append(Path(env_home).expanduser())
+        homes.append(safe_expanduser(env_home))
+    home = safe_home()
     homes.extend(
         [
-            Path.home() / "JanusX" / ".janusx",
-            Path.home() / ".janusx",
+            home / "JanusX" / ".janusx",
+            home / ".janusx",
         ]
     )
     for h in homes:
         try:
-            p = (h / _DB_NAME).expanduser().resolve()
+            p = safe_resolve(h / _DB_NAME)
         except Exception:
             continue
         k = str(p)
@@ -284,7 +288,7 @@ def _init_db(conn: sqlite3.Connection, *, mutate: bool = True) -> None:
 
 
 def _file_md5(path: str, chunk_size: int = 4 * 1024 * 1024) -> str:
-    p = Path(str(path or "")).expanduser()
+    p = safe_expanduser(str(path or ""))
     if (not p.exists()) or (not p.is_file()):
         return ""
     h = hashlib.md5()
@@ -304,9 +308,9 @@ def _genotype_input_md5(genofile: str, genofile_kind: str) -> str:
     kind = _normalize_genofile_kind(genofile_kind, genofile)
     if kind == "bfile":
         base = str(genofile or "").strip()
-        bed = Path(f"{base}.bed").expanduser()
-        bim = Path(f"{base}.bim").expanduser()
-        fam = Path(f"{base}.fam").expanduser()
+        bed = safe_expanduser(f"{base}.bed")
+        bim = safe_expanduser(f"{base}.bim")
+        fam = safe_expanduser(f"{base}.fam")
         files = [bed, bim, fam]
         if not all(p.exists() and p.is_file() for p in files):
             return ""
@@ -331,7 +335,7 @@ def _file_stat_fingerprint(path: str) -> str:
     Fast file fingerprint based on metadata only (size + mtime_ns).
     Avoids full-file MD5 scan for large inputs in GWAS run recording.
     """
-    p = Path(str(path or "")).expanduser()
+    p = safe_expanduser(str(path or ""))
     if (not p.exists()) or (not p.is_file()):
         return ""
     try:
@@ -352,9 +356,9 @@ def _genotype_input_stat_fingerprint(genofile: str, genofile_kind: str) -> str:
     if kind == "bfile":
         base = str(genofile or "").strip()
         files = [
-            Path(f"{base}.bed").expanduser(),
-            Path(f"{base}.bim").expanduser(),
-            Path(f"{base}.fam").expanduser(),
+            safe_expanduser(f"{base}.bed"),
+            safe_expanduser(f"{base}.bim"),
+            safe_expanduser(f"{base}.fam"),
         ]
         if not all(p.exists() and p.is_file() for p in files):
             return ""
@@ -973,14 +977,14 @@ def _strip_known_suffixes(file_name: str) -> str:
 
 
 def _normalize_bfile_prefix(raw_path: str) -> Path:
-    p = Path(str(raw_path or "").strip()).expanduser()
+    p = safe_expanduser(str(raw_path or "").strip())
     s = str(p)
     low = s.lower()
     for ext in (".bed", ".bim", ".fam"):
         if low.endswith(ext):
             s = s[: -len(ext)]
             break
-    return Path(s).expanduser().resolve()
+    return safe_resolve(s)
 
 
 def _source_exists_for_type(file_type: str, source_path: str) -> bool:
@@ -988,7 +992,7 @@ def _source_exists_for_type(file_type: str, source_path: str) -> bool:
     if t == "bfile":
         base = str(source_path or "").strip()
         return all(Path(f"{base}{ext}").exists() for ext in (".bed", ".bim", ".fam"))
-    p = Path(str(source_path or "")).expanduser()
+    p = safe_expanduser(str(source_path or ""))
     return p.exists() and p.is_file()
 
 
@@ -1004,7 +1008,7 @@ def _source_mtime_for_type(file_type: str, source_path: str) -> float:
                     return 0.0
                 vals.append(float(p.stat().st_mtime))
             return max(vals) if vals else 0.0
-        p = Path(str(source_path or "")).expanduser()
+        p = safe_expanduser(str(source_path or ""))
         if not p.exists():
             return 0.0
         return float(p.stat().st_mtime)
@@ -1142,7 +1146,7 @@ def register_loaded_file(file_type: str, name: str, source_path: str) -> dict[st
         file_name = src.name
         src_path = str(src)
     else:
-        srcp = Path(raw).expanduser().resolve()
+        srcp = safe_resolve(raw)
         src_path = str(srcp)
         file_name = srcp.name
         if t == "gff" and _safe_anno_filename(file_name) == "":
@@ -1256,7 +1260,7 @@ def register_loaded_gwas_result(source_path: str) -> dict[str, Any]:
     raw = str(source_path or "").strip()
     if raw == "":
         raise ValueError("gwas file path is required.")
-    src = Path(raw).expanduser().resolve()
+    src = safe_resolve(raw)
     if not src.exists() or not src.is_file():
         raise ValueError(f"source file not found: {src}")
     if _safe_gwas_filename(src.name) == "":

@@ -383,7 +383,7 @@ class _ProgressAdapter:
         if self.total <= 0:
             pct = 0.0
         else:
-            pct = 100.0 * float(self._done) / float(self.total)
+            pct = 100.0 * float(min(self._done, self.total)) / float(self.total)
         return f"{pct:>6.1f}%"
 
     def update(self, n: int) -> None:
@@ -427,10 +427,17 @@ class _ProgressAdapter:
             self._tqdm.set_description_str(self.desc)
 
     def finish(self) -> None:
+        self._done = self.total
+        self._tick += 1
         if self._backend == "rich" and self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, completed=self.total)
+            self._progress.update(
+                self._task_id,
+                completed=self.total,
+                metric=self._metric_text(),
+            )
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.n = self._tqdm.total
+            self._tqdm.set_postfix_str(self._metric_text())
             self._tqdm.refresh()
         self._finished = True
 
@@ -3918,7 +3925,7 @@ def run_farmcpu_fullmem(
             pbar.finish()
         finally:
             # Ensure spinner/progress stops on Ctrl+C.
-            pbar.close(success_style=False, show_done=False)
+            pbar.close(success_style=False, show_done=True)
 
         if len(geno_chunks) == 0:
             msg = "After filtering, number of SNPs is zero for FarmCPU."

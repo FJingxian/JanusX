@@ -254,6 +254,1138 @@ impl GlmScratch {
     }
 }
 
+#[inline]
+fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
+    match code {
+        0b00 => Some(0.0),
+        0b10 => Some(1.0),
+        0b11 => Some(2.0),
+        _ => None, // 0b01 => missing
+    }
+}
+
+fn parse_index_vec_i64(
+    indices: &[i64],
+    upper_bound: usize,
+    label: &str,
+) -> PyResult<Vec<usize>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for (i, &v) in indices.iter().enumerate() {
+        if v < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{label}[{i}] must be >= 0, got {v}"
+            )));
+        }
+        let u = v as usize;
+        if u >= upper_bound {
+            return Err(PyRuntimeError::new_err(format!(
+                "{label}[{i}] out of range: {u} >= {upper_bound}"
+            )));
+        }
+        out.push(u);
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (packed, n_samples))]
+pub fn bed_packed_row_flip_mask<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let out = PyArray1::<bool>::zeros(py, [m], false).into_bound();
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+
+    out_slice.par_iter_mut().enumerate().for_each(|(row_idx, dst)| {
+        let row =
+            &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+        let mut alt_sum = 0.0_f64;
+        let mut non_missing = 0usize;
+        for l in 0..n_samples {
+            let b = row[l >> 2];
+            let code = (b >> ((l & 3) * 2)) & 0b11;
+            match code {
+                0b00 => {
+                    non_missing += 1;
+                }
+                0b10 => {
+                    non_missing += 1;
+                    alt_sum += 1.0;
+                }
+                0b11 => {
+                    non_missing += 1;
+                    alt_sum += 2.0;
+                }
+                _ => {}
+            }
+        }
+        if non_missing == 0 {
+            *dst = false;
+        } else {
+            let p = alt_sum / (2.0 * non_missing as f64);
+            *dst = p > 0.5;
+        }
+    });
+
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_indices,
+    row_flip,
+    row_maf,
+    sample_indices=None
+))]
+pub fn bed_packed_decode_rows_f32<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip.len()
+        )));
+    }
+    if row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        )));
+    }
+
+    let row_idx_raw = row_indices.as_slice()?;
+    let row_idx = parse_index_vec_i64(row_idx_raw, m, "row_indices")?;
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n_out = sample_idx.len();
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let mut out = vec![0.0_f32; row_idx.len() * n_out];
+    out.par_chunks_mut(n_out)
+        .enumerate()
+        .for_each(|(i_row, out_row)| {
+            let src_row = row_idx[i_row];
+            let row =
+                &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+            let flip = row_flip[src_row];
+            let mean_g = (2.0_f32 * row_maf[src_row]).max(0.0);
+            for (j, &sidx) in sample_idx.iter().enumerate() {
+                let b = row[sidx >> 2];
+                let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                let mut gv = match code {
+                    0b00 => 0.0_f32,
+                    0b10 => 1.0_f32,
+                    0b11 => 2.0_f32,
+                    _ => mean_g, // missing
+                };
+                if flip && code != 0b01 {
+                    gv = 2.0_f32 - gv;
+                }
+                out_row[j] = gv;
+            }
+        });
+
+    let arr = PyArray2::<f32>::zeros(py, [row_idx.len(), n_out], false).into_bound();
+    let arr_slice = unsafe {
+        arr.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    arr_slice.copy_from_slice(&out);
+    Ok(arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    y,
+    x,
+    ixx,
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    step=10000,
+    threads=0
+))]
+pub fn glmf32_packed<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    ixx: PyReadonlyArray2<'py, f64>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    step: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let y = y.as_slice()?;
+    let x_arr = x.as_array();
+    let ixx_arr = ixx.as_array();
+    let packed_arr = packed.as_array();
+
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip.len()
+        )));
+    }
+    if row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        )));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+
+    let n = y.len();
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let (xn, q0) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+    }
+    if n <= q0 + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n too small: require n > q0+1, got n={n}, q0={q0}"
+        )));
+    }
+
+    let row_stride = q0 + 3;
+    let dim = q0 + 1;
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    };
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let mut xy = vec![0.0_f64; q0];
+    for i in 0..n {
+        let yi = y[i];
+        let row = &x_flat[i * q0..(i + 1) * q0];
+        for j in 0..q0 {
+            xy[j] += row[j] * yi;
+        }
+    }
+    let yy: f64 = y.iter().map(|v| v * v).sum();
+
+    let out = PyArray2::<f64>::zeros(py, [m, row_stride], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+
+    let pool = get_cached_pool(threads)?;
+    py.detach(|| {
+        let mut runner = || {
+            let mut i_marker = 0usize;
+            while i_marker < m {
+                let cnt = std::cmp::min(step, m - i_marker);
+                let block = &mut out_slice[i_marker * row_stride..(i_marker + cnt) * row_stride];
+                block.par_chunks_mut(row_stride).enumerate().for_each_init(
+                    || GlmScratch::new(q0),
+                    |scr, (l, row_out)| {
+                        let idx = i_marker + l;
+                        scr.reset_xs();
+
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip[idx];
+                        let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+
+                        let mut sy = 0.0_f64;
+                        let mut ss = 0.0_f64;
+                        for (k, &sidx) in sample_idx.iter().enumerate() {
+                            let b = row[sidx >> 2];
+                            let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                            let mut gv = match decode_plink_bed_hardcall(code) {
+                                Some(v) => v,
+                                None => mean_g,
+                            };
+                            if flip && code != 0b01 {
+                                gv = 2.0 - gv;
+                            }
+
+                            sy += gv * y[k];
+                            ss += gv * gv;
+                            let xrow = &x_flat[k * q0..(k + 1) * q0];
+                            for j in 0..q0 {
+                                scr.xs[j] += xrow[j] * gv;
+                            }
+                        }
+
+                        xs_t_ixx_into(&scr.xs, &ixx_flat, q0, &mut scr.b21);
+                        let t2 = dot(&scr.b21, &scr.xs);
+                        let b22 = ss - t2;
+
+                        let (invb22, df) = if b22 < 1e-8 {
+                            (0.0, (n as i32) - (q0 as i32))
+                        } else {
+                            (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                        };
+                        if df <= 0 {
+                            row_out.fill(f64::NAN);
+                            return;
+                        }
+
+                        build_ixxs_into(&ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                        scr.rhs[..q0].copy_from_slice(&xy);
+                        scr.rhs[q0] = sy;
+                        matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+
+                        let beta_rhs = dot(&scr.beta, &scr.rhs);
+                        let ve = (yy - beta_rhs) / (df as f64);
+
+                        for ff in 0..dim {
+                            let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+                            let t = scr.beta[ff] / se;
+                            row_out[2 + ff] = student_t_p_two_sided(t, df);
+                        }
+
+                        if invb22 == 0.0 {
+                            row_out[0] = f64::NAN;
+                            row_out[1] = f64::NAN;
+                            row_out[2 + q0] = f64::NAN;
+                        } else {
+                            row_out[0] = scr.beta[q0];
+                            row_out[1] = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+                        }
+                    },
+                );
+                i_marker += cnt;
+            }
+        };
+
+        if let Some(p) = &pool {
+            p.install(runner);
+        } else {
+            runner();
+        }
+    });
+
+    Ok(out)
+}
+
+#[inline]
+fn decode_packed_rows_to_sample_major(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_indices: &[usize],
+    sample_idx: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+) -> Vec<f64> {
+    let n = sample_idx.len();
+    let k = row_indices.len();
+    let mut out = vec![0.0_f64; n * k]; // row-major: (n_samples_used, k_rows)
+    for (col, &row_idx) in row_indices.iter().enumerate() {
+        let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+        let flip = row_flip[row_idx];
+        let mean_g = 2.0_f64 * row_maf[row_idx] as f64;
+        for (i, &sidx) in sample_idx.iter().enumerate() {
+            let b = row[sidx >> 2];
+            let code = (b >> ((sidx & 3) * 2)) & 0b11;
+            let mut gv = match decode_plink_bed_hardcall(code) {
+                Some(v) => v,
+                None => mean_g,
+            };
+            if flip && code != 0b01 {
+                gv = 2.0 - gv;
+            }
+            out[i * k + col] = gv;
+        }
+    }
+    out
+}
+
+#[inline]
+fn decode_dense_rows_to_sample_major(
+    g_arr: &numpy::ndarray::ArrayView2<'_, f32>,
+    g_slice_opt: Option<&[f32]>,
+    n: usize,
+    row_indices: &[usize],
+) -> Vec<f64> {
+    let k = row_indices.len();
+    let mut out = vec![0.0_f64; n * k]; // row-major: (n_samples, k_rows)
+    for (col, &row_idx) in row_indices.iter().enumerate() {
+        if let Some(g_slice) = g_slice_opt {
+            let row = &g_slice[row_idx * n..(row_idx + 1) * n];
+            for i in 0..n {
+                out[i * k + col] = row[i] as f64;
+            }
+        } else {
+            for i in 0..n {
+                out[i * k + col] = g_arr[(row_idx, i)] as f64;
+            }
+        }
+    }
+    out
+}
+
+fn select_lead_indices(sz: i64, n_lead: usize, pvalue: &[f64], pos: &[i64]) -> Vec<usize> {
+    let m = pvalue.len();
+    if m == 0 || n_lead == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| {
+        let ba = pos[a].div_euclid(sz);
+        let bb = pos[b].div_euclid(sz);
+        match ba.cmp(&bb) {
+            std::cmp::Ordering::Equal => pvalue[a].total_cmp(&pvalue[b]),
+            other => other,
+        }
+    });
+
+    let mut lead: Vec<usize> = Vec::new();
+    let mut last_bin: Option<i64> = None;
+    for &idx in order.iter() {
+        let b = pos[idx].div_euclid(sz);
+        if last_bin.map_or(true, |lb| lb != b) {
+            lead.push(idx);
+            last_bin = Some(b);
+        }
+    }
+
+    lead.sort_by(|&a, &b| pvalue[a].total_cmp(&pvalue[b]));
+    if lead.len() > n_lead {
+        lead.truncate(n_lead);
+    }
+    lead.sort_unstable();
+    lead
+}
+
+fn solve_linear_system_stable(a: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
+    let p = a.nrows();
+    if p == 0 {
+        return Some(DVector::zeros(0));
+    }
+    let eye = DMatrix::<f64>::identity(p, p);
+    for ridge in [0.0_f64, 1e-10, 1e-8, 1e-6] {
+        let mut a_use = a.clone();
+        if ridge > 0.0 {
+            a_use += &eye * ridge;
+        }
+        if let Some(ch) = a_use.cholesky() {
+            return Some(ch.solve(b));
+        }
+    }
+    let lu = a.clone().lu();
+    lu.solve(b)
+}
+
+fn farmcpu_ll_score_from_sample_major(
+    y: &[f64],
+    x: &[f64], // row-major (n, p)
+    n: usize,
+    p: usize,
+    snp_pool_sample_major: &[f64], // row-major (n, k)
+    k: usize,
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+    delta_step: f64,
+    svd_eps: f64,
+) -> Result<f64, String> {
+    if n == 0 || p == 0 {
+        return Err("invalid shape in ll score: empty y/X".to_string());
+    }
+    if y.len() != n {
+        return Err("invalid y length in ll score".to_string());
+    }
+    if x.len() != n * p {
+        return Err("invalid X length in ll score".to_string());
+    }
+    if snp_pool_sample_major.len() != n * k {
+        return Err("invalid snp_pool length in ll score".to_string());
+    }
+    if !(delta_step.is_finite() && delta_step > 0.0) {
+        return Err("delta_step must be positive and finite".to_string());
+    }
+
+    let yvec = DVector::<f64>::from_column_slice(y);
+    let xmat = DMatrix::<f64>::from_row_slice(n, p, x);
+    let snp_pool = if k > 0 {
+        DMatrix::<f64>::from_row_slice(n, k, snp_pool_sample_major)
+    } else {
+        DMatrix::<f64>::zeros(n, 0)
+    };
+
+    let mut d_start = delta_exp_start;
+    let mut d_end = delta_exp_end;
+
+    if k > 0 {
+        // Match Python logic: if any SNP variance is zero, force a degenerate high-delta grid.
+        let mut has_zero_var = n <= 1;
+        if !has_zero_var {
+            for col in 0..k {
+                let mut mean = 0.0_f64;
+                for i in 0..n {
+                    mean += snp_pool[(i, col)];
+                }
+                mean /= n as f64;
+                let mut ss = 0.0_f64;
+                for i in 0..n {
+                    let d = snp_pool[(i, col)] - mean;
+                    ss += d * d;
+                }
+                let var = ss / ((n - 1) as f64);
+                if var <= 0.0 || !var.is_finite() {
+                    has_zero_var = true;
+                    break;
+                }
+            }
+        }
+        if has_zero_var {
+            d_start = 100.0;
+            d_end = 100.0;
+        }
+    }
+
+    let (u1, d): (DMatrix<f64>, Vec<f64>) = if k == 0 {
+        (DMatrix::<f64>::zeros(n, 0), Vec::new())
+    } else {
+        let svd = snp_pool.svd(true, false);
+        let u = svd
+            .u
+            .ok_or_else(|| "SVD failed to produce U in ll score".to_string())?;
+        let s = svd.singular_values;
+        let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > svd_eps).collect();
+        if keep.is_empty() {
+            (DMatrix::<f64>::zeros(n, 0), Vec::new())
+        } else {
+            let r = keep.len();
+            let mut u1_data = Vec::with_capacity(n * r);
+            for i in 0..n {
+                for &c in keep.iter() {
+                    u1_data.push(u[(i, c)]);
+                }
+            }
+            let d = keep.iter().map(|&c| s[c] * s[c]).collect::<Vec<_>>();
+            (DMatrix::<f64>::from_row_slice(n, r, &u1_data), d)
+        }
+    };
+
+    let r = d.len();
+    let u1tx = if r > 0 {
+        u1.transpose() * &xmat
+    } else {
+        DMatrix::<f64>::zeros(0, p)
+    };
+    let u1ty = if r > 0 {
+        u1.transpose() * &yvec
+    } else {
+        DVector::<f64>::zeros(0)
+    };
+    let x_u = if r > 0 {
+        &xmat - &u1 * &u1tx
+    } else {
+        xmat.clone()
+    };
+    let y_u = if r > 0 {
+        &yvec - &u1 * &u1ty
+    } else {
+        yvec.clone()
+    };
+
+    let xtx_u = x_u.transpose() * &x_u;
+    let xty_u = x_u.transpose() * &y_u;
+
+    let mut best_ll = f64::NEG_INFINITY;
+    let mut expv = d_start;
+    let end = d_end + 1e-12;
+    while expv <= end {
+        let delta = expv.exp();
+        if !(delta.is_finite() && delta > 0.0) {
+            expv += delta_step;
+            continue;
+        }
+
+        let mut beta1 = DMatrix::<f64>::zeros(p, p);
+        let mut beta3 = DVector::<f64>::zeros(p);
+        let mut part12 = 0.0_f64;
+
+        if r > 0 {
+            for t in 0..r {
+                let dt = d[t] + delta;
+                if !(dt.is_finite() && dt > 0.0) {
+                    continue;
+                }
+                let w = 1.0 / dt;
+                part12 += dt.ln();
+                for i in 0..p {
+                    let vi = u1tx[(t, i)];
+                    beta3[i] += vi * w * u1ty[t];
+                    for j in 0..p {
+                        beta1[(i, j)] += vi * w * u1tx[(t, j)];
+                    }
+                }
+            }
+        }
+
+        let a = beta1 + (&xtx_u / delta);
+        let b = beta3 + (&xty_u / delta);
+        let Some(beta) = solve_linear_system_stable(&a, &b) else {
+            expv += delta_step;
+            continue;
+        };
+
+        let part11 = (n as f64) * (2.0 * PI).ln();
+        let part13 = ((n - r) as f64) * delta.ln();
+        let part1 = -0.5 * (part11 + part12 + part13);
+
+        let mut part221 = 0.0_f64;
+        if r > 0 {
+            for t in 0..r {
+                let mut pred = 0.0_f64;
+                for j in 0..p {
+                    pred += u1tx[(t, j)] * beta[j];
+                }
+                let resid = u1ty[t] - pred;
+                part221 += (resid * resid) / (d[t] + delta);
+            }
+        }
+
+        let resid_i = &y_u - &x_u * &beta;
+        let part222 = resid_i.dot(&resid_i) / delta;
+        let part22 = part221 + part222;
+        if !(part22.is_finite() && part22 > 0.0) {
+            expv += delta_step;
+            continue;
+        }
+        let part2 = -0.5 * ((n as f64) + (n as f64) * (part22 / (n as f64)).ln());
+        let ll = part1 + part2;
+        if ll > best_ll {
+            best_ll = ll;
+        }
+        expv += delta_step;
+    }
+
+    if !best_ll.is_finite() {
+        return Err("failed to evaluate valid LL in farmcpu ll scorer".to_string());
+    }
+    Ok(-2.0 * best_ll)
+}
+
+fn farmcpu_super_keep_from_sample_major(
+    sample_major: &[f64], // row-major (n, k)
+    n: usize,
+    k: usize,
+    pval: &[f64],
+    thr: f64,
+) -> Vec<bool> {
+    let mut keep = vec![true; k];
+    if k == 0 || n == 0 {
+        return keep;
+    }
+
+    let mut centered = vec![0.0_f64; k * n]; // col-major per SNP
+    let mut std = vec![0.0_f64; k];
+    for c in 0..k {
+        let mut mean = 0.0_f64;
+        for i in 0..n {
+            mean += sample_major[i * k + c];
+        }
+        mean /= n as f64;
+
+        let mut ss = 0.0_f64;
+        for i in 0..n {
+            let z = sample_major[i * k + c] - mean;
+            centered[c * n + i] = z;
+            ss += z * z;
+        }
+        std[c] = if n > 1 {
+            (ss / ((n - 1) as f64)).sqrt()
+        } else {
+            0.0
+        };
+    }
+
+    for i in 0..k {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..k {
+            if !keep[j] {
+                continue;
+            }
+            let denom = ((n.saturating_sub(1)) as f64) * std[i] * std[j];
+            let cij = if denom > 0.0 && denom.is_finite() {
+                let mut dot_ij = 0.0_f64;
+                for t in 0..n {
+                    dot_ij += centered[i * n + t] * centered[j * n + t];
+                }
+                dot_ij / denom
+            } else {
+                f64::NAN
+            };
+            if cij >= thr || cij <= -thr {
+                if pval[i] >= pval[j] {
+                    keep[i] = false;
+                } else {
+                    keep[j] = false;
+                    break;
+                }
+            }
+        }
+    }
+    keep
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    sz,
+    n_lead,
+    pvalue,
+    pos,
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    y,
+    x,
+    sample_indices=None,
+    delta_exp_start=-5.0,
+    delta_exp_end=5.0,
+    delta_step=0.1,
+    svd_eps=1e-8
+))]
+pub fn farmcpu_rem_packed(
+    py: Python<'_>,
+    sz: i64,
+    n_lead: usize,
+    pvalue: PyReadonlyArray1<'_, f64>,
+    pos: PyReadonlyArray1<'_, i64>,
+    packed: PyReadonlyArray2<'_, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'_, bool>,
+    row_maf: PyReadonlyArray1<'_, f32>,
+    y: PyReadonlyArray1<'_, f64>,
+    x: PyReadonlyArray2<'_, f64>,
+    sample_indices: Option<PyReadonlyArray1<'_, i64>>,
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+    delta_step: f64,
+    svd_eps: f64,
+) -> PyResult<(f64, Vec<i64>)> {
+    if sz <= 0 {
+        return Err(PyRuntimeError::new_err("sz must be > 0"));
+    }
+    let pvalue = pvalue.as_slice()?;
+    let pos = pos.as_slice()?;
+    if pvalue.len() != pos.len() {
+        return Err(PyRuntimeError::new_err(
+            "pvalue and pos length mismatch in farmcpu_rem_packed",
+        ));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+    if m != pvalue.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed row count mismatch: packed m={m}, pvalue len={}",
+            pvalue.len()
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(
+            "row_flip/row_maf length mismatch with packed rows",
+        ));
+    }
+
+    let y = y.as_slice()?;
+    let x_arr = x.as_array();
+    let n = y.len();
+    if x_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    let p = x_arr.shape()[1];
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    if sample_idx.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_indices length mismatch: got {}, expected len(y)={n}",
+            sample_idx.len()
+        )));
+    }
+
+    let leadidx = select_lead_indices(sz, n_lead, pvalue, pos);
+    let k = leadidx.len();
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let (score, leadidx_i64) = py.detach(|| -> PyResult<(f64, Vec<i64>)> {
+        let snp_pool_sample_major = decode_packed_rows_to_sample_major(
+            &packed_flat,
+            bytes_per_snp,
+            &leadidx,
+            &sample_idx,
+            row_flip,
+            row_maf,
+        );
+
+        let score = farmcpu_ll_score_from_sample_major(
+            y,
+            &x_flat,
+            n,
+            p,
+            &snp_pool_sample_major,
+            k,
+            delta_exp_start,
+            delta_exp_end,
+            delta_step,
+            svd_eps,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+
+        let leadidx_i64 = leadidx.iter().map(|&v| v as i64).collect::<Vec<_>>();
+        Ok((score, leadidx_i64))
+    })?;
+    Ok((score, leadidx_i64))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    row_indices,
+    pvalue,
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    thr=0.7
+))]
+pub fn farmcpu_super_packed<'py>(
+    py: Python<'py>,
+    row_indices: PyReadonlyArray1<'py, i64>,
+    pvalue: PyReadonlyArray1<'py, f64>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    thr: f64,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let ridx_raw = row_indices.as_slice()?;
+    let pval = pvalue.as_slice()?;
+    if ridx_raw.len() != pval.len() {
+        return Err(PyRuntimeError::new_err(
+            "row_indices and pvalue length mismatch in farmcpu_super_packed",
+        ));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(
+            "row_flip/row_maf length mismatch with packed rows",
+        ));
+    }
+
+    let ridx = parse_index_vec_i64(ridx_raw, m, "row_indices")?;
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    let k = ridx.len();
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let keep = py.detach(|| {
+        let sample_major = decode_packed_rows_to_sample_major(
+            &packed_flat,
+            bytes_per_snp,
+            &ridx,
+            &sample_idx,
+            row_flip,
+            row_maf,
+        );
+        farmcpu_super_keep_from_sample_major(&sample_major, n, k, pval, thr)
+    });
+
+    let out = PyArray1::<bool>::zeros(py, [k], false).into_bound();
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    out_slice.copy_from_slice(&keep);
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    sz,
+    n_lead,
+    pvalue,
+    pos,
+    g,
+    y,
+    x,
+    delta_exp_start=-5.0,
+    delta_exp_end=5.0,
+    delta_step=0.1,
+    svd_eps=1e-8
+))]
+pub fn farmcpu_rem_dense(
+    py: Python<'_>,
+    sz: i64,
+    n_lead: usize,
+    pvalue: PyReadonlyArray1<'_, f64>,
+    pos: PyReadonlyArray1<'_, i64>,
+    g: PyReadonlyArray2<'_, f32>,
+    y: PyReadonlyArray1<'_, f64>,
+    x: PyReadonlyArray2<'_, f64>,
+    delta_exp_start: f64,
+    delta_exp_end: f64,
+    delta_step: f64,
+    svd_eps: f64,
+) -> PyResult<(f64, Vec<i64>)> {
+    if sz <= 0 {
+        return Err(PyRuntimeError::new_err("sz must be > 0"));
+    }
+    let pvalue = pvalue.as_slice()?;
+    let pos = pos.as_slice()?;
+    if pvalue.len() != pos.len() {
+        return Err(PyRuntimeError::new_err(
+            "pvalue and pos length mismatch in farmcpu_rem_dense",
+        ));
+    }
+
+    let g_arr = g.as_array();
+    if g_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("g must be 2D (m, n)"));
+    }
+    let m = g_arr.shape()[0];
+    let n = g_arr.shape()[1];
+    if m != pvalue.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "g row count mismatch: g m={m}, pvalue len={}",
+            pvalue.len()
+        )));
+    }
+
+    let y = y.as_slice()?;
+    if y.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "y length mismatch: got {}, expected n={n}",
+            y.len()
+        )));
+    }
+
+    let x_arr = x.as_array();
+    if x_arr.shape()[0] != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    let p = x_arr.shape()[1];
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let g_slice_opt = g.as_slice().ok();
+
+    let leadidx = select_lead_indices(sz, n_lead, pvalue, pos);
+    let k = leadidx.len();
+
+    let (score, leadidx_i64) = py.detach(|| -> PyResult<(f64, Vec<i64>)> {
+        let snp_pool_sample_major =
+            decode_dense_rows_to_sample_major(&g_arr, g_slice_opt, n, &leadidx);
+        let score = farmcpu_ll_score_from_sample_major(
+            y,
+            &x_flat,
+            n,
+            p,
+            &snp_pool_sample_major,
+            k,
+            delta_exp_start,
+            delta_exp_end,
+            delta_step,
+            svd_eps,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        let leadidx_i64 = leadidx.iter().map(|&v| v as i64).collect::<Vec<_>>();
+        Ok((score, leadidx_i64))
+    })?;
+    Ok((score, leadidx_i64))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    row_indices,
+    pvalue,
+    g,
+    thr=0.7
+))]
+pub fn farmcpu_super_dense<'py>(
+    py: Python<'py>,
+    row_indices: PyReadonlyArray1<'py, i64>,
+    pvalue: PyReadonlyArray1<'py, f64>,
+    g: PyReadonlyArray2<'py, f32>,
+    thr: f64,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let ridx_raw = row_indices.as_slice()?;
+    let pval = pvalue.as_slice()?;
+    if ridx_raw.len() != pval.len() {
+        return Err(PyRuntimeError::new_err(
+            "row_indices and pvalue length mismatch in farmcpu_super_dense",
+        ));
+    }
+
+    let g_arr = g.as_array();
+    if g_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("g must be 2D (m, n)"));
+    }
+    let m = g_arr.shape()[0];
+    let n = g_arr.shape()[1];
+    let ridx = parse_index_vec_i64(ridx_raw, m, "row_indices")?;
+    let k = ridx.len();
+    let g_slice_opt = g.as_slice().ok();
+
+    let keep = py.detach(|| {
+        let sample_major = decode_dense_rows_to_sample_major(&g_arr, g_slice_opt, n, &ridx);
+        farmcpu_super_keep_from_sample_major(&sample_major, n, k, pval, thr)
+    });
+
+    let out = PyArray1::<bool>::zeros(py, [k], false).into_bound();
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    out_slice.copy_from_slice(&keep);
+    Ok(out)
+}
+
 /// Fast GLM interface:
 /// y: (n,) float64
 /// X: (n, q0) float64

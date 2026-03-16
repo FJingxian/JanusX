@@ -40,18 +40,20 @@ use admixture::{
     admx_em_step_inplace_f32, admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_f32,
     admx_map_p_f32, admx_map_q_f32, admx_multiply_a_omega, admx_multiply_a_omega_inplace,
     admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
-    admx_rsvd_power_step_inplace, admx_set_threads,
+    admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
 use assoc::{
-    ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, glmf32, glmf32_full,
-    lmm_assoc_chunk_f32, lmm_reml_chunk_f32, lmm_reml_null_f32, ml_loglike_null_f32,
-    RustPcgMatrixFreeState,
+    ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_row_flip_mask,
+    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
+    fastlmm_assoc_chunk_f32, glmf32, glmf32_full, glmf32_packed, lmm_assoc_chunk_f32,
+    lmm_reml_chunk_f32, lmm_reml_null_f32, ml_loglike_null_f32, RustPcgMatrixFreeState,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use bsa::preprocess_bsa;
 use gfreader::{
-    count_hmp_snps, count_vcf_snps, load_bed_u8_matrix, BedChunkReader, HmpChunkReader,
-    HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
+    count_hmp_snps, count_vcf_snps, load_bed_2bit_packed, load_bed_u8_matrix, BedChunkReader,
+    HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
+    VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
@@ -78,10 +80,18 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
+    m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;
+    m.add_function(wrap_pyfunction!(glmf32_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ml_loglike_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_null_f64, m)?)?;
@@ -99,6 +109,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rsvd_power_step_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_rsvd_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(admx_rsvd_stream_sample, m)?)?;
     m.add_function(wrap_pyfunction!(admx_allele_frequency, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood, m)?)?;
     m.add_function(wrap_pyfunction!(admx_loglikelihood_f32, m)?)?;

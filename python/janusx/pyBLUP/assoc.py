@@ -62,14 +62,169 @@ from janusx.janusx import (
     fastlmm_assoc_chunk_f32,
 )
 
+try:
+    from janusx.janusx import (
+        glmf32_packed as _glmf32_packed,
+        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
+        bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
+        farmcpu_rem_dense as _farmcpu_rem_dense,
+        farmcpu_rem_packed as _farmcpu_rem_packed,
+        farmcpu_super_dense as _farmcpu_super_dense,
+        farmcpu_super_packed as _farmcpu_super_packed,
+    )
+except Exception:
+    _glmf32_packed = None
+    _bed_packed_row_flip_mask = None
+    _bed_packed_decode_rows_f32 = None
+    _farmcpu_rem_dense = None
+    _farmcpu_rem_packed = None
+    _farmcpu_super_dense = None
+    _farmcpu_super_packed = None
+
+
+def _coerce_bed_packed_ctx(M: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize BED-packed payload into a dict context.
+
+    Accepted input forms:
+    1) dict with keys:
+       - packed (uint8, shape=(m, ceil(n/4)))
+       - maf (float32/float64, shape=(m,))
+       - n_samples (int)
+       Optional:
+       - missing_rate
+       - row_flip (bool, shape=(m,))
+    2) tuple/list from `load_bed_2bit_packed(prefix)`:
+       (packed, missing_rate, maf, std_denom, n_samples)
+    """
+    ctx_in: Optional[Dict[str, Any]] = None
+    if isinstance(M, dict):
+        if "packed" in M and "maf" in M and "n_samples" in M:
+            ctx_in = M
+    elif isinstance(M, (tuple, list)) and len(M) >= 5:
+        packed, miss, maf, _denom, n_samples = M[:5]
+        ctx_in = {
+            "packed": packed,
+            "missing_rate": miss,
+            "maf": maf,
+            "n_samples": n_samples,
+        }
+    if ctx_in is None:
+        return None
+
+    packed = np.ascontiguousarray(np.asarray(ctx_in["packed"], dtype=np.uint8))
+    if packed.ndim != 2:
+        raise ValueError("packed must be 2D with shape (m, ceil(n_samples/4)).")
+
+    maf = np.ascontiguousarray(np.asarray(ctx_in["maf"], dtype=np.float32).reshape(-1))
+    if maf.shape[0] != packed.shape[0]:
+        raise ValueError(
+            f"maf length mismatch: got {maf.shape[0]}, expected {packed.shape[0]}"
+        )
+
+    n_samples = int(ctx_in["n_samples"])
+    if n_samples <= 0:
+        raise ValueError("n_samples must be > 0 in packed context.")
+    exp_bps = (n_samples + 3) // 4
+    if packed.shape[1] != exp_bps:
+        raise ValueError(
+            f"packed bytes_per_snp mismatch: got {packed.shape[1]}, expected {exp_bps}"
+        )
+
+    row_flip = ctx_in.get("row_flip", None)
+    if row_flip is None:
+        if _bed_packed_row_flip_mask is None:
+            raise RuntimeError(
+                "Rust extension missing bed_packed_row_flip_mask. Rebuild janusx extension."
+            )
+        row_flip = np.asarray(
+            _bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+    row_flip = np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1))
+    if row_flip.shape[0] != packed.shape[0]:
+        raise ValueError(
+            f"row_flip length mismatch: got {row_flip.shape[0]}, expected {packed.shape[0]}"
+        )
+
+    ctx_out = {
+        "packed": packed,
+        "maf": maf,
+        "n_samples": n_samples,
+        "row_flip": row_flip,
+    }
+    if "missing_rate" in ctx_in:
+        ctx_out["missing_rate"] = np.ascontiguousarray(
+            np.asarray(ctx_in["missing_rate"], dtype=np.float32).reshape(-1)
+        )
+    if isinstance(M, dict):
+        M.update(ctx_out)
+        return M
+    return ctx_out
+
+
+def _normalize_sample_indices(
+    sample_indices: Optional[np.ndarray],
+    n_samples: int,
+    n_target: int,
+) -> Optional[np.ndarray]:
+    if sample_indices is None:
+        return None
+    sidx = np.asarray(sample_indices, dtype=np.int64).reshape(-1)
+    if sidx.size != int(n_target):
+        raise ValueError(
+            f"sample_indices length mismatch: got {sidx.size}, expected {n_target}"
+        )
+    if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
+        raise ValueError("sample_indices has out-of-range values.")
+    return np.ascontiguousarray(sidx, dtype=np.int64)
+
+
+def _select_snp_rows(
+    M: Any,
+    row_idx: np.ndarray,
+    *,
+    sample_indices: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Return selected genotype rows as float32 matrix with shape (k, n_selected).
+    """
+    ridx = np.asarray(row_idx, dtype=np.int64).reshape(-1)
+    packed_ctx = _coerce_bed_packed_ctx(M)
+    if packed_ctx is None:
+        arr = np.asarray(M, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError("M must be 2D (m, n).")
+        if np.any(ridx < 0) or np.any(ridx >= arr.shape[0]):
+            raise ValueError("row_idx out of range for dense genotype matrix.")
+        out = arr[ridx]
+        if sample_indices is not None:
+            out = out[:, sample_indices]
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    if _bed_packed_decode_rows_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing bed_packed_decode_rows_f32. Rebuild janusx extension."
+        )
+    decoded = _bed_packed_decode_rows_f32(
+        packed_ctx["packed"],
+        int(packed_ctx["n_samples"]),
+        np.ascontiguousarray(ridx, dtype=np.int64),
+        packed_ctx["row_flip"],
+        packed_ctx["maf"],
+        sample_indices,
+    )
+    return np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
+
 
 def FEM(
     y: np.ndarray,
     X: np.ndarray,
-    M: np.ndarray,
+    M: Any,
     chunksize: int = 50_000,
     threads: int = 1,
     ixx: Optional[np.ndarray] = None,
+    sample_indices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Fixed Effects Model (FEM) GWAS scan (fast GLM/LM in Rust, chunked).
@@ -90,10 +245,10 @@ def FEM(
         NOTE: Add an intercept column in your caller if you want one.
         (FarmCPU and LM wrapper already do that.)
 
-    M : np.ndarray
-        Genotype matrix in SNP-major layout: shape (m, n).
-        Rows are SNPs, columns are samples.
-        Internally coerced to contiguous float32.
+    M : np.ndarray or packed tuple/dict
+        Either:
+        - Dense genotype matrix in SNP-major layout (m, n), or
+        - BED-packed payload from `load_bed_2bit_packed(...)`.
 
     chunksize : int, default=50_000
         Number of SNPs processed per internal chunk in Rust.
@@ -105,6 +260,10 @@ def FEM(
     threads : int, default=1
         Number of Rust worker threads used inside glmf32.
         (This is *not* joblib threads; it's passed to Rust.)
+
+    sample_indices : np.ndarray or None
+        Optional sample-index mapping used for packed input. Length must equal
+        len(y). Ignored for dense input unless you explicitly provide it.
 
     Returns
     -------
@@ -139,29 +298,64 @@ def FEM(
     else:
         ixx = np.ascontiguousarray(ixx, dtype=np.float64)
 
-    if M.ndim != 2:
-        raise ValueError("M must be a 2D array with shape (m, n) [SNP-major].")
-    if M.shape[1] != y.shape[0]:
-        raise ValueError(
-            f"M must be shape (m, n). Got M.shape={M.shape}, but n=len(y)={y.shape[0]}"
+    packed_ctx = _coerce_bed_packed_ctx(M)
+    if packed_ctx is not None:
+        if _glmf32_packed is None:
+            raise RuntimeError(
+                "Rust extension missing glmf32_packed. Rebuild janusx extension."
+            )
+        sidx = _normalize_sample_indices(
+            sample_indices,
+            int(packed_ctx["n_samples"]),
+            int(y.shape[0]),
+        )
+        if sidx is None and int(packed_ctx["n_samples"]) != int(y.shape[0]):
+            raise ValueError(
+                f"Packed n_samples={packed_ctx['n_samples']} does not match len(y)={y.shape[0]}. "
+                "Provide sample_indices to align packed genotype samples."
+            )
+        return np.asarray(
+            _glmf32_packed(
+                y,
+                X,
+                ixx,
+                packed_ctx["packed"],
+                int(packed_ctx["n_samples"]),
+                packed_ctx["row_flip"],
+                packed_ctx["maf"],
+                sidx,
+                int(chunksize),
+                int(threads),
+            )
         )
 
+    M = np.asarray(M)
+    if M.ndim != 2:
+        raise ValueError("M must be a 2D array with shape (m, n) [SNP-major].")
+    if sample_indices is not None:
+        sidx = _normalize_sample_indices(sample_indices, int(M.shape[1]), int(y.shape[0]))
+        M = np.ascontiguousarray(M[:, sidx], dtype=np.float32)
+    else:
+        if M.shape[1] != y.shape[0]:
+            raise ValueError(
+                f"M must be shape (m, n). Got M.shape={M.shape}, but n=len(y)={y.shape[0]}"
+            )
+        M = np.ascontiguousarray(M, dtype=np.float32)
+
     result = []
-    for start in range(0,M.shape[0],chunksize):
-        end = min(start+chunksize,M.shape[0])
-        # Genotypes as f32 for Rust SIMD / bandwidth-friendly kernels
-        # ---- Call Rust kernel ----
+    for start in range(0, M.shape[0], chunksize):
+        end = min(start + chunksize, M.shape[0])
         result.append(
             glmf32(
                 y,
                 X,
                 ixx,
-                np.ascontiguousarray(M[start:end], dtype=np.float32),
+                M[start:end],
                 int(end - start),
                 int(threads),
             )
         )
-    return np.concatenate(result,axis=0)
+    return np.concatenate(result, axis=0)
 
 
 def lmm_reml(
@@ -1455,7 +1649,7 @@ class LM:
 # FarmCPU helper utilities
 # ----------------------------
 
-def REM(sz, n, pvalue, pos, M, y, X):
+def REM(sz, n, pvalue, pos, M, y, X, sample_indices: Optional[np.ndarray] = None):
     """
     One REM (Random Effect Model) step used by FarmCPU to pick lead SNPs.
 
@@ -1478,7 +1672,8 @@ def REM(sz, n, pvalue, pos, M, y, X):
     lead = order[np.concatenate(([True], bin_id[order][1:] != bin_id[order][:-1]))]
     leadidx = np.sort(lead[np.argsort(pvalue[lead])[:n]])
 
-    results = ll(y, M[leadidx].T, X)
+    lead_rows = _select_snp_rows(M, leadidx, sample_indices=sample_indices)
+    results = ll(y, lead_rows.T, X)
     return -2 * results["LL"], leadidx
 
 
@@ -1714,7 +1909,7 @@ def SUPER(corr: np.ndarray, pval: np.ndarray, thr: float = 0.7) -> np.ndarray:
 
 def farmcpu(
     y: np.ndarray,
-    M: np.ndarray,
+    M: Any,
     X: Optional[np.ndarray],
     chrlist: np.ndarray,
     poslist: np.ndarray,
@@ -1726,6 +1921,7 @@ def farmcpu(
     threads: int = 1,
     fem_threads: Optional[int] = None,
     rem_jobs: Optional[int] = None,
+    sample_indices: Optional[np.ndarray] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     return_info: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
@@ -1734,15 +1930,19 @@ def farmcpu(
 
     This implementation uses:
       - Rust FEM kernel for fast fixed-effect scanning
-      - Python logic for binning / lead SNP selection / de-redundancy
+      - Packed and dense paths: Rust REM/ll/SUPER helpers when available
+      - Python REM/SUPER fallback if Rust helper symbols are unavailable
 
     Parameters
     ----------
     y : np.ndarray, shape (n,) or (n,1)
         Phenotype.
 
-    M : np.ndarray, shape (m, n)
-        SNP-major genotype matrix (m SNPs, n samples).
+    M : np.ndarray or packed tuple/dict
+        Either:
+        - Dense SNP-major genotype matrix with shape (m, n), or
+        - BED-packed payload from `janusx.gfreader.load_bed_2bit_packed(...)`
+          (tuple or dict with packed/maf/n_samples).
 
     X : np.ndarray or None, shape (n, p)
         Covariates. Intercept is always added internally.
@@ -1777,6 +1977,9 @@ def farmcpu(
     rem_jobs : int or None
         Number of joblib workers for REM grid-search. None -> use `threads`
         but capped by current REM task count.
+    sample_indices : np.ndarray or None, shape (n_used,)
+        Optional genotype sample indices used only for packed input.
+        If provided, `y` and `X` must already be aligned to this index order.
 
     progress_cb : callable or None
         Optional callback receiving `(done_iter, total_iter)` to report
@@ -1798,8 +2001,40 @@ def farmcpu(
     threads = max(1, threads)
     fem_threads = threads if fem_threads is None else int(fem_threads)
     fem_threads = max(1, fem_threads)
-
-    m, n = M.shape
+    y = np.ascontiguousarray(np.asarray(y, dtype=np.float64).reshape(-1))
+    packed_ctx = _coerce_bed_packed_ctx(M)
+    if packed_ctx is None:
+        M_work = np.asarray(M, dtype=np.float32)
+        if M_work.ndim != 2:
+            raise ValueError("M must be 2D (m, n) for dense FarmCPU input.")
+        if sample_indices is not None:
+            sidx = _normalize_sample_indices(sample_indices, int(M_work.shape[1]), int(y.shape[0]))
+            M_work = np.ascontiguousarray(M_work[:, sidx], dtype=np.float32)
+        else:
+            if int(M_work.shape[1]) != int(y.shape[0]):
+                raise ValueError(
+                    f"M sample size mismatch: M.shape[1]={M_work.shape[1]} but len(y)={y.shape[0]}"
+                )
+            M_work = np.ascontiguousarray(M_work, dtype=np.float32)
+        packed_sample_idx = None
+        m, n = M_work.shape
+    else:
+        M_work = packed_ctx
+        m = int(M_work["packed"].shape[0])
+        packed_sample_idx = _normalize_sample_indices(
+            sample_indices,
+            int(M_work["n_samples"]),
+            int(y.shape[0]),
+        )
+        if packed_sample_idx is None:
+            if int(M_work["n_samples"]) != int(y.shape[0]):
+                raise ValueError(
+                    f"Packed n_samples={M_work['n_samples']} does not match len(y)={y.shape[0]}. "
+                    "Provide sample_indices to align samples."
+                )
+            n = int(M_work["n_samples"])
+        else:
+            n = int(packed_sample_idx.shape[0])
 
     # Map chromosome labels to integer blocks for global ordering
     chrlist = np.asarray(chrlist)
@@ -1807,7 +2042,10 @@ def farmcpu(
     _, chr_idx = np.unique(chrlist, return_inverse=True)
 
     # "global position" = pos + chr_block * 1e12 (avoids chr collisions)
-    pos = poslist + chr_idx.astype(np.int64) * 1_000_000_000_000
+    pos = np.ascontiguousarray(
+        poslist + chr_idx.astype(np.int64) * 1_000_000_000_000,
+        dtype=np.int64,
+    )
 
     if QTNbound is None:
         QTNbound = int(np.sqrt(n / np.log10(n)))
@@ -1825,9 +2063,23 @@ def farmcpu(
     QTNidx = np.array([], dtype=int)
 
     for i_iter in range(int(iter)):
-        X_QTN = np.concatenate([X, M[QTNidx].T], axis=1) if QTNidx.size > 0 else X
+        if QTNidx.size > 0:
+            qtn_rows = _select_snp_rows(
+                M_work,
+                QTNidx,
+                sample_indices=packed_sample_idx,
+            )
+            X_QTN = np.concatenate([X, qtn_rows.T], axis=1)
+        else:
+            X_QTN = X
 
-        FEMresult = FEM(y, X_QTN, M, threads=fem_threads)
+        FEMresult = FEM(
+            y,
+            X_QTN,
+            M_work,
+            threads=fem_threads,
+            sample_indices=packed_sample_idx,
+        )
         FEMresult[:, 2:] = np.nan_to_num(FEMresult[:, 2:], nan=1)
 
         # p-values of pseudo-QTNs as covariates
@@ -1847,6 +2099,10 @@ def farmcpu(
         combine_list = [(sz, n_) for sz in szbin for n_ in nbin]
         rem_jobs_i = threads if rem_jobs is None else int(rem_jobs)
         rem_jobs_i = max(1, min(int(len(combine_list)), int(rem_jobs_i)))
+        use_rust_dense_rem = packed_ctx is None and _farmcpu_rem_dense is not None
+        use_rust_packed_rem = packed_ctx is not None and _farmcpu_rem_packed is not None
+        use_rust_dense_super = packed_ctx is None and _farmcpu_super_dense is not None
+        use_rust_packed_super = packed_ctx is not None and _farmcpu_super_packed is not None
         blas_guard = (
             _threadpool_limits(limits=1)
             if _threadpool_limits is not None
@@ -1854,18 +2110,96 @@ def farmcpu(
         )
 
         with blas_guard:
-            REMresult = Parallel(
-                n_jobs=rem_jobs_i,
-                prefer="threads",
-            )(
-                delayed(REM)(sz, n_, FEMp, pos, M, y, X_QTN)
-                for sz, n_ in combine_list
-            )
+            if use_rust_packed_rem:
+                femp_contig = np.ascontiguousarray(FEMp, dtype=np.float64)
+                xqtn_contig = np.ascontiguousarray(X_QTN, dtype=np.float64)
+                REMresult = Parallel(
+                    n_jobs=rem_jobs_i,
+                    prefer="threads",
+                )(
+                    delayed(_farmcpu_rem_packed)(
+                        int(sz),
+                        int(n_),
+                        femp_contig,
+                        pos,
+                        M_work["packed"],
+                        int(M_work["n_samples"]),
+                        M_work["row_flip"],
+                        M_work["maf"],
+                        y,
+                        xqtn_contig,
+                        packed_sample_idx,
+                    )
+                    for sz, n_ in combine_list
+                )
+            elif use_rust_dense_rem:
+                femp_contig = np.ascontiguousarray(FEMp, dtype=np.float64)
+                xqtn_contig = np.ascontiguousarray(X_QTN, dtype=np.float64)
+                REMresult = Parallel(
+                    n_jobs=rem_jobs_i,
+                    prefer="threads",
+                )(
+                    delayed(_farmcpu_rem_dense)(
+                        int(sz),
+                        int(n_),
+                        femp_contig,
+                        pos,
+                        M_work,
+                        y,
+                        xqtn_contig,
+                    )
+                    for sz, n_ in combine_list
+                )
+            else:
+                REMresult = Parallel(
+                    n_jobs=rem_jobs_i,
+                    prefer="threads",
+                )(
+                    delayed(REM)(
+                        sz,
+                        n_,
+                        FEMp,
+                        pos,
+                        M_work,
+                        y,
+                        X_QTN,
+                        sample_indices=packed_sample_idx,
+                    )
+                    for sz, n_ in combine_list
+                )
 
         optcombidx = int(np.argmin([l for l, _idx in REMresult]))
-        QTNidx_pre = np.unique(np.concatenate([REMresult[optcombidx][1], QTNidx]))
-
-        keep = SUPER(np.corrcoef(M[QTNidx_pre]), FEMp[QTNidx_pre])
+        opt_lead = np.asarray(REMresult[optcombidx][1], dtype=int)
+        QTNidx_pre = np.unique(np.concatenate([opt_lead, QTNidx]))
+        if use_rust_packed_super:
+            keep = np.asarray(
+                _farmcpu_super_packed(
+                    np.ascontiguousarray(QTNidx_pre, dtype=np.int64),
+                    np.ascontiguousarray(FEMp[QTNidx_pre], dtype=np.float64),
+                    M_work["packed"],
+                    int(M_work["n_samples"]),
+                    M_work["row_flip"],
+                    M_work["maf"],
+                    packed_sample_idx,
+                ),
+                dtype=np.bool_,
+            )
+        elif use_rust_dense_super:
+            keep = np.asarray(
+                _farmcpu_super_dense(
+                    np.ascontiguousarray(QTNidx_pre, dtype=np.int64),
+                    np.ascontiguousarray(FEMp[QTNidx_pre], dtype=np.float64),
+                    M_work,
+                ),
+                dtype=np.bool_,
+            )
+        else:
+            corr_rows = _select_snp_rows(
+                M_work,
+                QTNidx_pre,
+                sample_indices=packed_sample_idx,
+            )
+            keep = SUPER(np.corrcoef(corr_rows), FEMp[QTNidx_pre])
         QTNidx_pre = QTNidx_pre[keep]
 
         if np.array_equal(QTNidx_pre, QTNidx):
@@ -1876,8 +2210,22 @@ def farmcpu(
         if progress_cb is not None:
             progress_cb(i_iter + 1, int(iter))
     # Final scan with final QTN set
-    X_QTN = np.concatenate([X, M[QTNidx].T], axis=1)
-    FEMresult = FEM(y, X_QTN, M, threads=fem_threads)
+    if QTNidx.size > 0:
+        qtn_rows = _select_snp_rows(
+            M_work,
+            QTNidx,
+            sample_indices=packed_sample_idx,
+        )
+        X_QTN = np.concatenate([X, qtn_rows.T], axis=1)
+    else:
+        X_QTN = X
+    FEMresult = FEM(
+        y,
+        X_QTN,
+        M_work,
+        threads=fem_threads,
+        sample_indices=packed_sample_idx,
+    )
     FEMresult[:, 2:] = np.nan_to_num(FEMresult[:, 2:], nan=1)
 
     QTNpval = FEMresult[:, 2 + X.shape[1] : -1].min(axis=0)
@@ -1890,7 +2238,11 @@ def farmcpu(
     if QTNidx.size > 0:
         qtn_cols = slice(2 + X.shape[1], -1)
         min_idx = np.nanargmin(FEMresult[:, qtn_cols], axis=0)
-        M_sub = np.ascontiguousarray(M[min_idx], dtype=np.float32)
+        M_sub = _select_snp_rows(
+            M_work,
+            min_idx,
+            sample_indices=packed_sample_idx,
+        )
         ixx = np.ascontiguousarray(np.linalg.pinv(X_QTN.T @ X_QTN), dtype=np.float64)
         full = glmf32_full(
             np.ascontiguousarray(y, dtype=np.float64).ravel(),

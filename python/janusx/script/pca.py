@@ -18,6 +18,7 @@ PCA computation strategy
       * Stream genotypes via rust2py.gfreader.load_genotype_chunks.
       * Build the GRM in a low-memory, chunk-based fashion.
       * Perform eigendecomposition of the GRM using numpy.linalg.eigh.
+      * Optional: --rsvd uses Rust streaming randomized SVD directly.
 
   - For GRM:
       * Read the precomputed GRM from .grm.txt or .grm.npy.
@@ -52,6 +53,7 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import psutil
+from janusx import janusx as jxrs
 
 mpl.use("Agg")
 logging.getLogger("fontTools.subset").setLevel(logging.ERROR)
@@ -333,6 +335,7 @@ def main(log: bool = True):
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx pca -vcf geno.vcf.gz -dim 3 -plot",
+            "jx pca -vcf geno.vcf.gz -dim 20 -rsvd --power 5 --tol 0.1",
             "jx pca -hmp geno.hmp.gz -dim 3 -plot",
             "jx pca -k data.grm -dim 3 -plot",
             "jx pca -c data_prefix -plot -plot3D",
@@ -437,8 +440,33 @@ def main(log: bool = True):
         help="Color palette index for PCA plots, 0-6; -1 uses auto palette "
              "(default: %(default)s).",
     )
+    optional_group.add_argument(
+        "-rsvd", "--rsvd", action="store_true", default=False,
+        help="Use streaming Rust RSVD for PCA from genotype input.",
+    )
+    optional_group.add_argument(
+        "--power", type=int, default=5,
+        help="RSVD power iterations (used with --rsvd; default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--tol", type=float, default=1e-1,
+        help="RSVD relative convergence tolerance (used with --rsvd; default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for RSVD (used with --rsvd; default: %(default)s).",
+    )
 
     args = parser.parse_args()
+    if int(args.power) < 0:
+        parser.error("--power must be >= 0")
+    if not (float(args.tol) > 0):
+        parser.error("--tol must be > 0")
+    if bool(args.rsvd) and not bool(args.vcf or args.hmp or args.file or args.bfile):
+        parser.error("--rsvd is only supported for genotype inputs (-vcf/-hmp/-file/-bfile).")
+    # Keep RSVD preprocessing aligned with load_genotype_chunks defaults:
+    # only VCF path applies SNP-only allele filter in current pipeline.
+    rsvd_snps_only = bool(args.vcf)
 
     # ------------------------- Resolve input file & output prefix -------------------------
     if args.vcf:
@@ -518,8 +546,18 @@ def main(log: bool = True):
                     ("Missing rate", args.geno),
                     ("Chunk size", args.chunksize),
                     ("Mmap limit", args.mmap_limit),
+                    ("RSVD mode", args.rsvd),
                 ]
             )
+            if bool(args.rsvd):
+                cfg_rows.extend(
+                    [
+                        ("RSVD power", args.power),
+                        ("RSVD tol", args.tol),
+                        ("RSVD seed", args.seed),
+                        ("RSVD SNP-only filter", rsvd_snps_only),
+                    ]
+                )
         elif args.grm:
             cfg_rows.extend([("GRM prefix", gfile), ("Output PCs", f"top {args.dim}")])
         elif args.qcov:
@@ -590,21 +628,56 @@ def main(log: bool = True):
 
     # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
     if args.vcf or args.hmp or args.file or args.bfile:
-        logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming GRM.")
-        logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
+        if bool(args.rsvd):
+            logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming RSVD.")
+            logger.info(
+                f"  RSVD: k={int(args.dim)}, power={int(args.power)}, tol={float(args.tol):.3g}, "
+                f"MAF filter = {args.maf}, missing rate filter = {args.geno}, "
+                f"snp_only = {rsvd_snps_only}."
+            )
+            if not hasattr(jxrs, "admx_rsvd_stream_sample"):
+                raise RuntimeError(
+                    "Rust extension is missing admx_rsvd_stream_sample. "
+                    "Rebuild/install JanusX extension first."
+                )
+            sample_ids, n_snps = inspect_genotype_file(gfile)
+            samples = np.asarray(sample_ids, dtype=str)
+            mmap_window_mb = (
+                auto_mmap_window_mb(gfile, len(samples), int(n_snps), int(args.chunksize))
+                if args.mmap_limit else None
+            )
+            eigenval, eigenvec = jxrs.admx_rsvd_stream_sample(
+                str(gfile),
+                int(args.dim),
+                int(args.seed),
+                int(args.power),
+                float(args.tol),
+                bool(rsvd_snps_only),
+                float(args.maf),
+                float(args.geno),
+                None,
+                int(mmap_window_mb) if mmap_window_mb is not None else 0,
+            )
+            eigenval = np.asarray(eigenval, dtype=np.float32)
+            eigenvec = np.asarray(eigenvec, dtype=np.float32)
+            if eigenvec.shape[0] != samples.shape[0]:
+                samples = samples[: eigenvec.shape[0]]
+        else:
+            logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming GRM.")
+            logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
 
-        # Build GRM in streaming mode
-        grm, samples = build_grm_streaming_for_pca(
-            genofile=gfile,
-            maf_threshold=args.maf,
-            max_missing_rate=args.geno,
-            chunk_size=int(args.chunksize),
-            mmap_limit=args.mmap_limit,
-            logger=logger,
-        )
+            # Build GRM in streaming mode
+            grm, samples = build_grm_streaming_for_pca(
+                genofile=gfile,
+                maf_threshold=args.maf,
+                max_missing_rate=args.geno,
+                chunk_size=int(args.chunksize),
+                mmap_limit=args.mmap_limit,
+                logger=logger,
+            )
 
-        # Eigen decomposition
-        eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
+            # Eigen decomposition
+            eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
 
         logger.info(
             f"Completed PCA from genotype in {round(time.time() - t_loading, 3)} seconds"

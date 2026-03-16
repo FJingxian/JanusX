@@ -12,6 +12,12 @@ def ensure_file_exists(logger, path: str, label: str) -> bool:
     p = Path(path).expanduser()
     if p.is_file():
         return True
+    # Accept PLINK prefix paths (prefix + .bed/.bim/.fam) for
+    # genotype inputs that are normalized to cache-backed BED prefixes.
+    if p.suffix == "":
+        required = [Path(f"{p}{ext}") for ext in (".bed", ".bim", ".fam")]
+        if all(r.is_file() for r in required):
+            return True
     logger.error(f"{label} not found: {_norm(str(p))}")
     return False
 

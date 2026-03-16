@@ -132,6 +132,48 @@ def _adaptive_chunk_size(requested: int, n_samples: int) -> int:
     return int(max(1000, min(req, rows_by_budget)))
 
 
+def rsvd_streaming(
+    genotype_path: str,
+    *,
+    k: int,
+    seed: int = 42,
+    power: int = 5,
+    tol: float = 1e-1,
+    snps_only: bool = True,
+    maf: float = 0.02,
+    missing_rate: float = 0.05,
+    delimiter: Optional[str] = None,
+    mmap_window_mb: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Streaming RSVD fully in Rust.
+
+    Returns
+    -------
+    eigvals : np.ndarray, shape (k_eff,), float32
+        Top-k eigenvalues (from singular values^2).
+
+    eigvecs : np.ndarray, shape (m_filtered, k_eff), float32
+        Left singular vectors/eigenvectors corresponding to eigvals.
+    """
+    evals, evecs = jxrs.admx_rsvd_stream(
+        str(genotype_path),
+        int(k),
+        int(seed),
+        int(power),
+        float(tol),
+        bool(snps_only),
+        float(maf),
+        float(missing_rate),
+        (None if delimiter is None else str(delimiter)),
+        int(mmap_window_mb),
+    )
+    return (
+        np.ascontiguousarray(np.asarray(evals, dtype=np.float32)),
+        np.ascontiguousarray(np.asarray(evecs, dtype=np.float32)),
+    )
+
+
 def _plink_prefix_path(genotype_path: str) -> Optional[Path]:
     p = Path(genotype_path)
     if p.suffix.lower() in {".bed", ".bim", ".fam"}:

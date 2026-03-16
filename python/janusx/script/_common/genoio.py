@@ -7,7 +7,7 @@ from typing import Any, Iterable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from janusx.gfreader import SiteInfo
+from janusx.gfreader import SiteInfo, prepare_cli_input_cache
 from .status import CliStatus
 
 
@@ -73,6 +73,9 @@ def determine_genotype_source(
     file: str | None,
     bfile: str | None,
     prefix: str | None = None,
+    snps_only: bool = False,
+    delimiter: str | None = None,
+    apply_cache: bool = True,
 ) -> tuple[str, str]:
     if vcf:
         gfile = str(vcf)
@@ -89,8 +92,17 @@ def determine_genotype_source(
     else:
         raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
 
+    gfile_norm = gfile.replace("\\", "/")
+    if apply_cache:
+        gfile_norm = prepare_cli_input_cache(
+            gfile_norm,
+            snps_only=bool(snps_only),
+            delimiter=delimiter,
+        )
+        gfile_norm = str(gfile_norm).replace("\\", "/")
+
     resolved_prefix = str(prefix) if prefix is not None else auto_prefix
-    return gfile.replace("\\", "/"), resolved_prefix
+    return gfile_norm, resolved_prefix
 
 
 def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
@@ -100,6 +112,9 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
         prefix=getattr(args, "prefix", None),
+        snps_only=bool(getattr(args, "snps_only", False)),
+        delimiter=getattr(args, "delimiter", None),
+        apply_cache=bool(getattr(args, "cache_input", True)),
     )
 
 

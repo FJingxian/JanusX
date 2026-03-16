@@ -5,6 +5,7 @@ import warnings
 import shutil
 import sys
 import time
+import tempfile
 import numpy as np
 from tqdm import tqdm
 from janusx.janusx import (
@@ -13,6 +14,7 @@ from janusx.janusx import (
     TxtChunkReader,
     convert_genotypes,
     count_hmp_snps,
+    load_bed_2bit_packed as _load_bed_2bit_packed,
     PlinkStreamWriter,
     HmpStreamWriter,
     VcfStreamWriter,
@@ -39,6 +41,24 @@ except Exception:
 _WARNED_BED_MODEL_FALLBACK = False
 _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
 _WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
+
+
+def load_bed_2bit_packed(prefix: str):
+    """
+    Load PLINK BED genotypes as packed 2-bit matrix plus per-SNP statistics.
+
+    Returns
+    -------
+    packed : np.ndarray[uint8], shape (n_snps, ceil(n_samples/4))
+        Raw BED 2-bit payload (header removed), SNP-major.
+        Codes: 00->0, 10->1, 11->2, 01->missing.
+    missing_rate : np.ndarray[float32], shape (n_snps,)
+    maf : np.ndarray[float32], shape (n_snps,)
+    std_denom : np.ndarray[float32], shape (n_snps,)
+        sqrt(2 * p * (1 - p)), where p is ALT allele frequency on non-missing calls.
+    n_samples : int
+    """
+    return _load_bed_2bit_packed(str(prefix))
 
 
 def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:
@@ -276,6 +296,23 @@ def _ensure_plink_cache_at(
     missing_rate: Union[float, None] = None,
     het: Union[float, None] = None,
 ) -> None:
+    _ensure_plink_cache_from_source_at(
+        cache_prefix,
+        prefix,
+        vcf_path,
+        source_label="VCF",
+        snps_only=snps_only,
+    )
+
+
+def _ensure_plink_cache_from_source_at(
+    cache_prefix: str,
+    prefix: str,
+    source_path: str,
+    *,
+    source_label: str,
+    snps_only: bool = True,
+) -> None:
     cache_files = [f"{cache_prefix}.bed", f"{cache_prefix}.bim", f"{cache_prefix}.fam"]
     with _cache_lock(cache_prefix):
         cache_present = any(os.path.exists(p) for p in cache_files)
@@ -283,23 +320,23 @@ def _ensure_plink_cache_at(
             rebuild_reason = None
             if not _is_plink_prefix(cache_prefix):
                 rebuild_reason = (
-                    f"Incomplete VCF cache detected for '{prefix}' at '{cache_prefix}'. "
+                    f"Incomplete {source_label} cache detected for '{prefix}' at '{cache_prefix}'. "
                     "Removing cache files and rebuilding."
                 )
             else:
-                src_mtime = os.path.getmtime(vcf_path)
+                src_mtime = os.path.getmtime(source_path)
                 cache_mtime = min(os.path.getmtime(p) for p in cache_files)
                 if cache_mtime >= src_mtime:
                     return
                 rebuild_reason = (
-                    f"Detected stale VCF cache for '{prefix}': cache files are older than "
-                    f"source VCF '{vcf_path}'. Removing and rebuilding."
+                    f"Detected stale {source_label} cache for '{prefix}': cache files are older than "
+                    f"source '{source_path}'. Removing and rebuilding."
                 )
             if rebuild_reason is not None:
                 warnings.warn(rebuild_reason, RuntimeWarning, stacklevel=2)
                 _remove_plink_cache_files(cache_prefix)
 
-        convert_genotypes(vcf_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
+        convert_genotypes(source_path, cache_prefix, out_fmt="plink", snps_only=bool(snps_only))
         if not _is_plink_prefix(cache_prefix):
             raise RuntimeError(
                 f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
@@ -386,6 +423,141 @@ def _ensure_plink_cache(
             het=het,
         )
         return fallback
+
+
+def _ensure_plink_cache_for_cli_source(
+    prefix: str,
+    source_path: str,
+    *,
+    source_label: str,
+    snps_only: bool = False,
+) -> str:
+    primary = _cache_prefix(prefix)
+    cache_dir = _cache_dir_from_env()
+    fallback = _cache_prefix(prefix, cache_dir=cache_dir) if cache_dir else None
+    if fallback is None:
+        auto_cache_dir = os.path.join(tempfile.gettempdir(), "janusx_cache")
+        os.makedirs(auto_cache_dir, mode=0o755, exist_ok=True)
+        fallback = _cache_prefix(prefix, cache_dir=auto_cache_dir)
+
+    if fallback is not None and not _dir_is_writable(os.path.dirname(primary) or "."):
+        _warn_cache_once(
+            f"{source_label.lower()}:{prefix}:{cache_dir}",
+            (
+                f"No write permission for genotype-side cache directory: "
+                f"{os.path.dirname(primary) or '.'}. "
+                f"Falling back to cache directory from {_GENO_CACHE_ENV}: {cache_dir}"
+            ),
+        )
+        _ensure_plink_cache_from_source_at(
+            fallback,
+            prefix,
+            source_path,
+            source_label=source_label,
+            snps_only=bool(snps_only),
+        )
+        return fallback
+
+    try:
+        _ensure_plink_cache_from_source_at(
+            primary,
+            prefix,
+            source_path,
+            source_label=source_label,
+            snps_only=bool(snps_only),
+        )
+        return primary
+    except Exception as ex:
+        if fallback is None or (fallback == primary) or (not _looks_like_permission_error(ex)):
+            raise
+        _warn_cache_once(
+            f"{source_label.lower()}-perm:{prefix}:{cache_dir}",
+            (
+                f"Failed to build/read genotype-side cache at '{primary}' due to permission issue. "
+                f"Falling back to {_GENO_CACHE_ENV}={cache_dir}."
+            ),
+        )
+        _ensure_plink_cache_from_source_at(
+            fallback,
+            prefix,
+            source_path,
+            source_label=source_label,
+            snps_only=bool(snps_only),
+        )
+        return fallback
+
+
+def _ensure_txt_npy_cache_for_cli(
+    prefix: str,
+    src_path: str,
+    *,
+    delimiter: Union[str, None] = None,
+) -> str:
+    txt_input = _prepare_txtlike_input_for_cache("txt", prefix, src_path)
+    # Constructing TxtChunkReader triggers Rust-side txt->npy cache build/refresh.
+    _ = TxtChunkReader(
+        txt_input,
+        delimiter,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    base_prefix = _strip_known_suffix(txt_input)
+    candidates = [
+        f"{base_prefix}.npy",
+        f"{_cache_prefix(base_prefix)}.npy",
+        f"{_cache_prefix(prefix)}.npy",
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return candidates[-1]
+
+
+def prepare_cli_input_cache(
+    path_or_prefix: str,
+    *,
+    snps_only: bool = False,
+    delimiter: Union[str, None] = None,
+) -> str:
+    """
+    Normalize CLI genotype input to cache-backed paths:
+      - VCF/HMP -> PLINK BED prefix cache
+      - TXT     -> NPY cache path
+      - others  -> unchanged
+    """
+    kind, prefix, src_path = _resolve_input(path_or_prefix)
+    if kind == "vcf":
+        if src_path is None:
+            raise ValueError("VCF source path not found.")
+        return _ensure_plink_cache_for_cli_source(
+            prefix,
+            src_path,
+            source_label="VCF",
+            snps_only=bool(snps_only),
+        )
+    if kind == "hmp":
+        if src_path is None:
+            raise ValueError("HMP source path not found.")
+        return _ensure_plink_cache_for_cli_source(
+            prefix,
+            src_path,
+            source_label="HMP",
+            snps_only=bool(snps_only),
+        )
+    if kind == "txt":
+        if src_path is None:
+            raise ValueError("TXT source path not found.")
+        return _ensure_txt_npy_cache_for_cli(prefix, src_path, delimiter=delimiter)
+    if kind == "npy":
+        if src_path is not None:
+            return src_path
+        return f"{prefix}.npy"
+    return path_or_prefix
 
 
 def _remove_plink_cache_files(cache_prefix: str) -> None:

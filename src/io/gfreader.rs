@@ -2,12 +2,12 @@ use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
 
-use numpy::ndarray::Array2;
-use numpy::{PyArray2, PyReadonlyArray2};
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray2};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::gfcore as core;
@@ -793,6 +793,138 @@ impl TxtChunkReader {
 }
 
 // -------- count_vcf_snps (Py function) --------
+#[pyfunction]
+pub fn load_bed_2bit_packed<'py>(
+    py: Python<'py>,
+    prefix: String,
+) -> PyResult<(
+    Bound<'py, PyArray2<u8>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    usize,
+)> {
+    let mut bed_prefix = prefix;
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(PyRuntimeError::new_err)?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
+    }
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let mut bed_file = File::open(&bed_path)
+        .map_err(|e| PyIOError::new_err(format!("failed to open {bed_path}: {e}")))?;
+    let bed_len = bed_file
+        .metadata()
+        .map_err(|e| PyIOError::new_err(format!("failed to stat {bed_path}: {e}")))?
+        .len() as usize;
+    if bed_len < 3 {
+        return Err(PyRuntimeError::new_err("BED too small"));
+    }
+
+    let mut header = [0u8; 3];
+    bed_file
+        .read_exact(&mut header)
+        .map_err(|e| PyIOError::new_err(format!("failed to read BED header: {e}")))?;
+    if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+        return Err(PyRuntimeError::new_err("Only SNP-major BED supported"));
+    }
+
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = bed_len - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(PyRuntimeError::new_err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        )));
+    }
+    let n_snps = data_len / bytes_per_snp;
+
+    let mut packed: Vec<u8> = vec![0u8; data_len];
+    bed_file
+        .read_exact(&mut packed)
+        .map_err(|e| PyIOError::new_err(format!("failed to read BED payload: {e}")))?;
+
+    let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
+    let mut maf: Vec<f32> = vec![0.0; n_snps];
+    let mut std_denom: Vec<f32> = vec![0.0; n_snps];
+    let n_samples_f = n_samples as f32;
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+
+    for snp_idx in 0..n_snps {
+        let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+        let mut non_missing: usize = 0;
+        let mut alt_sum: usize = 0;
+
+        for &byte in row.iter().take(full_bytes) {
+            for within in 0..4 {
+                let code = (byte >> (within * 2)) & 0b11;
+                match code {
+                    0b00 => {
+                        non_missing += 1;
+                    }
+                    0b10 => {
+                        non_missing += 1;
+                        alt_sum += 1;
+                    }
+                    0b11 => {
+                        non_missing += 1;
+                        alt_sum += 2;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if rem > 0 {
+            let byte = row[full_bytes];
+            for within in 0..rem {
+                let code = (byte >> (within * 2)) & 0b11;
+                match code {
+                    0b00 => {
+                        non_missing += 1;
+                    }
+                    0b10 => {
+                        non_missing += 1;
+                        alt_sum += 1;
+                    }
+                    0b11 => {
+                        non_missing += 1;
+                        alt_sum += 2;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let miss = 1.0_f32 - (non_missing as f32 / n_samples_f);
+        missing_rate[snp_idx] = miss;
+        if non_missing > 0 {
+            let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+            let maf_v = p.min(1.0_f32 - p);
+            maf[snp_idx] = maf_v;
+            let d = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
+            std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
+        }
+    }
+
+    let packed_mat = Array2::from_shape_vec((n_snps, bytes_per_snp), packed)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    #[allow(deprecated)]
+    let packed_arr = PyArray2::from_owned_array(py, packed_mat).into_bound();
+    #[allow(deprecated)]
+    let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(missing_rate)).into_bound();
+    #[allow(deprecated)]
+    let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound();
+    #[allow(deprecated)]
+    let denom_arr = PyArray1::from_owned_array(py, Array1::from_vec(std_denom)).into_bound();
+    Ok((packed_arr, miss_arr, maf_arr, denom_arr, n_samples))
+}
+
 #[pyfunction]
 #[pyo3(signature = (prefix, maf_threshold=None, max_missing_rate=None, fill_missing=None))]
 pub fn load_bed_u8_matrix<'py>(

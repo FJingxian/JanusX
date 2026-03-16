@@ -12,8 +12,22 @@ def _norm(path: str) -> str:
     return s.replace("\\", "/")
 
 
+def _safe_expanduser(path: str | Path) -> Path:
+    """
+    Expand '~' when possible.
+    On some HPC/batch environments, pathlib.expanduser() can raise
+    RuntimeError("Could not determine home directory.").
+    In that case, keep the original path unchanged.
+    """
+    p = Path(path)
+    try:
+        return p.expanduser()
+    except RuntimeError:
+        return p
+
+
 def ensure_file_exists(logger, path: str, label: str) -> bool:
-    p = Path(path).expanduser()
+    p = _safe_expanduser(path)
     if p.is_file():
         return True
     # Accept PLINK prefix paths (prefix + .bed/.bim/.fam) for
@@ -27,7 +41,7 @@ def ensure_file_exists(logger, path: str, label: str) -> bool:
 
 
 def ensure_dir_exists(logger, path: str, label: str) -> bool:
-    p = Path(path).expanduser()
+    p = _safe_expanduser(path)
     if p.is_dir():
         return True
     logger.error(f"{label} not found: {_norm(str(p))}")
@@ -35,7 +49,7 @@ def ensure_dir_exists(logger, path: str, label: str) -> bool:
 
 
 def ensure_file_input_exists(logger, path: str, label: str = "Genotype file input") -> bool:
-    p = Path(path).expanduser()
+    p = _safe_expanduser(path)
     low = str(p).lower()
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
@@ -73,7 +87,7 @@ def ensure_file_input_site_metadata_exists(
     path: str,
     label: str = "Genotype FILE site metadata",
 ) -> bool:
-    p = Path(path).expanduser()
+    p = _safe_expanduser(path)
     low = str(p).lower()
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
@@ -106,7 +120,7 @@ def ensure_file_input_site_metadata_exists(
 
 
 def ensure_plink_prefix_exists(logger, prefix: str, label: str = "PLINK prefix") -> bool:
-    pfx = Path(prefix).expanduser()
+    pfx = _safe_expanduser(prefix)
     required = [Path(f"{pfx}{ext}") for ext in (".bed", ".bim", ".fam")]
     missing = [p for p in required if not p.is_file()]
     if not missing:

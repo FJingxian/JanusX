@@ -26,6 +26,18 @@ _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
+_LOADING_PREFIXES = (
+    "loading ",
+    "inspecting ",
+    "loaded ",
+)
+_SKIP_TOKENS = (
+    "skip",
+    "skipped",
+    "skipping",
+    "ignored",
+    "ignore",
+)
 
 
 def stdout_is_tty() -> bool:
@@ -87,6 +99,22 @@ def _split_leading_newlines(text: str) -> tuple[str, str]:
     return s[:i], s[i:]
 
 
+def is_loading_status_text(text: object) -> bool:
+    _, msg = _split_leading_newlines(text)
+    t = str(msg).strip().lower()
+    return any(t.startswith(prefix) for prefix in _LOADING_PREFIXES)
+
+
+def is_skip_status_text(text: object) -> bool:
+    _, msg = _split_leading_newlines(text)
+    t = str(msg).strip().lower()
+    return any(tok in t for tok in _SKIP_TOKENS)
+
+
+def should_animate_status(text: object) -> bool:
+    return is_loading_status_text(text) and (not is_skip_status_text(text))
+
+
 def format_elapsed(seconds: Optional[float]) -> str:
     if seconds is None:
         return "0.0s"
@@ -141,6 +169,12 @@ def print_success(message: str, *, force_color: bool = False) -> None:
     leading, msg = _split_leading_newlines(message)
     if leading:
         _safe_write(leading)
+    if is_skip_status_text(msg):
+        print_warning(msg, force_color=bool(force_color))
+        return
+    if not is_loading_status_text(msg):
+        _safe_print(msg)
+        return
     line = f"{_SUCCESS_SYMBOL} {msg}" if msg != "" else f"{_SUCCESS_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
@@ -159,6 +193,9 @@ def print_failure(message: str, *, force_color: bool = False) -> None:
     leading, msg = _split_leading_newlines(message)
     if leading:
         _safe_write(leading)
+    if is_skip_status_text(msg):
+        print_warning(msg, force_color=bool(force_color))
+        return
     line = f"{_FAIL_SYMBOL} {msg}" if msg != "" else f"{_FAIL_SYMBOL}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
@@ -174,8 +211,12 @@ def print_failure(message: str, *, force_color: bool = False) -> None:
 
 
 def print_warning(message: str, *, force_color: bool = False) -> None:
-    msg = str(message)
-    line = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
+    leading, msg = _split_leading_newlines(message)
+    if leading:
+        _safe_write(leading)
+    msg = str(msg)
+    body = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
+    line = f"{_FAIL_SYMBOL} {body}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
         try:
@@ -221,6 +262,13 @@ def log_success(
 ) -> None:
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
+    if is_skip_status_text(msg):
+        if stdout_is_tty() or bool(force_color):
+            _emit_to_file_handlers(logger, logging.WARNING, file_msg)
+            print_warning(msg, force_color=bool(force_color))
+        else:
+            logger.warning(file_msg)
+        return
     if stdout_is_tty() or bool(force_color):
         _emit_to_file_handlers(logger, logging.INFO, file_msg)
         print_success(msg, force_color=bool(force_color))
@@ -262,6 +310,7 @@ class CliStatus:
         self.enabled = bool(enabled)
         self.timeout = float(timeout)
         self.show_elapsed = bool(show_elapsed)
+        self._animate = bool(self.enabled and should_animate_status(self.desc))
         self._backend = "none"
         self._done = False
         self._thread: Optional[Thread] = None
@@ -289,7 +338,7 @@ class CliStatus:
 
     def __enter__(self) -> "CliStatus":
         self._start_ts = monotonic()
-        if not self.enabled:
+        if not self._animate:
             self._backend = "none"
             return self
 
@@ -363,18 +412,36 @@ class CliStatus:
         self._stop_spinner()
         symbol = _SUCCESS_SYMBOL
         line = self._compose_line(symbol, str(message))
-        if self._backend == "rich" and self._console is not None:
-            self._console.print(f"[green]{line}[/green]")
-        elif self.enabled and stdout_is_tty():
-            _safe_print(f"{_GREEN}{line}{_RESET}")
+        if should_animate_status(message):
+            if self._backend == "rich" and self._console is not None:
+                self._console.print(f"[green]{line}[/green]")
+            elif self.enabled and stdout_is_tty():
+                _safe_print(f"{_GREEN}{line}{_RESET}")
+            else:
+                _safe_print(line)
+        elif is_skip_status_text(message):
+            plain = str(message)
+            if self.show_elapsed:
+                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
+            print_warning(plain)
         else:
-            _safe_print(line)
+            plain = str(message)
+            if self.show_elapsed:
+                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
+            _safe_print(plain)
         self._done = True
 
     def fail(self, message: str) -> None:
         if self._done:
             return
         self._stop_spinner()
+        if is_skip_status_text(message):
+            plain = str(message)
+            if self.show_elapsed:
+                plain = f"{plain} [{self._format_elapsed(self._elapsed_seconds())}]"
+            print_warning(plain)
+            self._done = True
+            return
         symbol = _FAIL_SYMBOL
         line = self._compose_line(symbol, str(message))
         tail = line[len(symbol):]

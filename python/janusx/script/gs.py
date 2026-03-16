@@ -121,6 +121,7 @@ from ._common.status import (
     print_success,
     print_failure,
     format_elapsed,
+    should_animate_status,
     stdout_is_tty,
     success_symbol,
 )
@@ -690,7 +691,8 @@ def _run_methods_parallel(
             m: (fold_total_map[m] + 1) if show_method_progress else fold_total_map[m]
             for m in methods
         }
-        if show_method_progress and rich_progress_available():
+        animate_method_progress = bool(show_method_progress and should_animate_status("Methods"))
+        if animate_method_progress and rich_progress_available():
             progress = build_rich_progress(
                 description_template="{task.fields[method]}{task.fields[suffix]}",
                 show_elapsed=True,
@@ -849,7 +851,7 @@ def _run_methods_parallel(
                     f"{method} ...Finished [{elapsed}]",
                     force_color=True,
                 )
-    elif rich_progress_available():
+    elif bool(show_method_progress and should_animate_status("Methods") and rich_progress_available()):
         progress = build_rich_progress(
             description_template="{task.fields[method]}",
             field_templates=["{task.fields[suffix]}"],
@@ -960,7 +962,7 @@ def _run_methods_parallel(
                     manager.shutdown()
                 except Exception:
                     pass
-    elif _HAS_TQDM and stdout_is_tty():
+    elif bool(show_method_progress and should_animate_status("Methods") and _HAS_TQDM and stdout_is_tty()):
         pbar = tqdm(
             total=len(methods),
             desc="Methods",
@@ -1617,7 +1619,7 @@ def main(log: bool = True) -> None:
         logger.info(f"* Genomic Selection for trait: {trait_name}\nTrain size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {train_snp.shape[0]}")
 
         if train_pheno.size == 0:
-            logger.info(f"No non-missing phenotypes for trait {trait_name}; skipped.")
+            logger.warning(f"No non-missing phenotypes for trait {trait_name}; skipped.")
             continue
 
         # 5-fold cross-validation on training population

@@ -46,6 +46,7 @@ from ._common.status import (
     log_success,
     print_failure,
     print_success,
+    should_animate_status,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
 
@@ -1065,7 +1066,7 @@ def preprocess_tables_parallel(
             show_remaining=False,
             finished_text=" ",
             transient=True,
-        )
+        ) if should_animate_status("Loading chromosome tables...") else None
         try:
             with (progress if progress is not None else nullcontext()):
                 with cf.ThreadPoolExecutor(max_workers=worker_count) as ex:

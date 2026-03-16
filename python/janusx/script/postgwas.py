@@ -39,6 +39,7 @@ from ._common.status import (
     print_failure,
     print_warning,
     format_elapsed,
+    should_animate_status,
     stdout_is_tty,
     warn_deprecated_alias_usage,
 )
@@ -1476,7 +1477,8 @@ def _ldclump_significant_snps(
 
     warn_count = 0
     warn_limit = 5
-    use_rich_progress = bool(show_progress and rich_progress_available())
+    animate_progress = bool(show_progress and should_animate_status("LD clumping..."))
+    use_rich_progress = bool(animate_progress and rich_progress_available())
     progress = None
     task_id = None
     progress_tqdm = None
@@ -1496,7 +1498,7 @@ def _ldclump_significant_snps(
     with (progress if progress is not None else nullcontext()):
         if progress is not None:
             task_id = progress.add_task("LD clumping...", total=int(work.shape[0]))
-        elif bool(show_progress and _HAS_TQDM and stdout_is_tty()):
+        elif bool(animate_progress and _HAS_TQDM and stdout_is_tty()):
             progress_tqdm = tqdm(
                 total=int(work.shape[0]),
                 desc="LD clumping",
@@ -3798,7 +3800,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
             show_remaining=False,
             finished_text=" ",
             transient=True,
-        )
+        ) if should_animate_status("Loading merged post-GWAS tasks...") else None
         with (progress if progress is not None else nullcontext()):
             task_start_ts: dict[str, float] = {}
             task_map: dict[str, int] = {}
@@ -3897,7 +3899,7 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
         print_success(f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]")
         return
 
-    if _HAS_TQDM and stdout_is_tty():
+    if _HAS_TQDM and stdout_is_tty() and should_animate_status("Loading merged post-GWAS tasks..."):
         setattr(args, "_postgwas_job_workers", int(logical_workers))
         pbar = tqdm(
             total=len(files),

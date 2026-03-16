@@ -6,6 +6,15 @@ logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
 
+def _console_symbol(preferred: str, fallback: str) -> str:
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        str(preferred).encode(enc)
+        return str(preferred)
+    except Exception:
+        return str(fallback)
+
+
 class _LevelPrefixFormatter(logging.Formatter):
     """Add fixed prefix for warning/error log records."""
 
@@ -24,6 +33,7 @@ class _ColorLevelPrefixFormatter(_LevelPrefixFormatter):
     _YELLOW = "\033[33m"
     _RED = "\033[31m"
     _RESET = "\033[0m"
+    _FAIL = _console_symbol("\u2718\ufe0e", "[X]")
 
     def __init__(self, *, enable_color: bool) -> None:
         super().__init__()
@@ -31,6 +41,10 @@ class _ColorLevelPrefixFormatter(_LevelPrefixFormatter):
 
     def format(self, record: logging.LogRecord) -> str:
         msg = super().format(record)
+        if record.levelno >= logging.ERROR:
+            msg = f"{self._FAIL} {msg}"
+        elif record.levelno == logging.WARNING:
+            msg = f"{self._FAIL} {msg}"
         if not self.enable_color:
             return msg
         if record.levelno >= logging.ERROR:

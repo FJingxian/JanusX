@@ -3,7 +3,13 @@ from __future__ import annotations
 import time
 from typing import Iterable, Sequence
 
-from .status import format_elapsed, get_rich_spinner_name, print_success, stdout_is_tty
+from .status import (
+    format_elapsed,
+    get_rich_spinner_name,
+    print_success,
+    should_animate_status,
+    stdout_is_tty,
+)
 
 try:
     from rich.progress import (
@@ -101,40 +107,42 @@ class ProgressAdapter:
         self._backend = "none"
         self._finished = False
         self._start_ts = time.monotonic()
+        self._animate = bool(should_animate_status(self.desc))
 
-        progress = build_rich_progress(
-            show_remaining=bool(show_remaining),
-            field_templates=["{task.fields[postfix]}"],
-            bar_width=bar_width,
-            finished_text=" ",
-            transient=True,
-        )
-        if progress is not None:
-            try:
-                self._progress = progress
-                self._progress.start()
-                self._task_id = self._progress.add_task(
-                    self.desc,
-                    total=self.total,
-                    postfix="",
-                )
-                self._backend = "rich"
-            except Exception:
-                self._progress = None
-                self._task_id = None
-                self._backend = "none"
-
-        if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
-            assert _tqdm_auto is not None
-            self._tqdm = _tqdm_auto(
-                total=self.total,
-                desc=self.desc,
-                ascii=True,
-                leave=False,
-                bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        if self._animate:
+            progress = build_rich_progress(
+                show_remaining=bool(show_remaining),
+                field_templates=["{task.fields[postfix]}"],
+                bar_width=bar_width,
+                finished_text=" ",
+                transient=True,
             )
-            self._backend = "tqdm"
+            if progress is not None:
+                try:
+                    self._progress = progress
+                    self._progress.start()
+                    self._task_id = self._progress.add_task(
+                        self.desc,
+                        total=self.total,
+                        postfix="",
+                    )
+                    self._backend = "rich"
+                except Exception:
+                    self._progress = None
+                    self._task_id = None
+                    self._backend = "none"
+
+            if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
+                assert _tqdm_auto is not None
+                self._tqdm = _tqdm_auto(
+                    total=self.total,
+                    desc=self.desc,
+                    ascii=True,
+                    leave=False,
+                    bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                    "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                )
+                self._backend = "tqdm"
 
     def update(self, n: int) -> None:
         step = int(max(0, n))
@@ -179,4 +187,8 @@ class ProgressAdapter:
             self._tqdm.close()
             self._tqdm = None
         if self._finished and self.emit_done:
-            print_success(f"{self.desc} ...Finished [{elapsed}]")
+            msg = f"{self.desc} ...Finished [{elapsed}]"
+            if self._animate:
+                print_success(msg)
+            else:
+                print(msg, flush=True)

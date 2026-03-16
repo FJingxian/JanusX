@@ -11,7 +11,7 @@ import pandas as pd
 from janusx.gfreader import SiteInfo, prepare_cli_input_cache
 from .pathcheck import safe_expanduser
 from .progress import build_rich_progress, rich_progress_available
-from .status import CliStatus, stdout_is_tty
+from .status import CliStatus, should_animate_status, stdout_is_tty
 
 try:
     from tqdm.auto import tqdm
@@ -312,7 +312,8 @@ def write_id_file(path: str, sample_ids: Sequence[str]) -> None:
 
 def _open_site_progress(desc: str, total_sites: int):
     use_tty = stdout_is_tty()
-    if rich_progress_available():
+    animate = bool(should_animate_status(desc))
+    if animate and rich_progress_available():
         progress = build_rich_progress(
             description_template="[progress.description]{task.description}",
             show_remaining=False,
@@ -324,7 +325,7 @@ def _open_site_progress(desc: str, total_sites: int):
             task_id = progress.add_task(str(desc), total=float(max(0, int(total_sites))))
             progress.start()
             return progress, task_id, None
-    if tqdm is None:
+    if (not animate) or tqdm is None:
         return None, None, None
     pbar = tqdm(
         total=max(0, int(total_sites)),

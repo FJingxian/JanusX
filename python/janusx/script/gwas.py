@@ -102,8 +102,11 @@ from ._common.pathcheck import (
 from ._common.prefetch import prefetch_iter
 from ._common.status import (
     CliStatus,
+    is_skip_status_text,
     print_success,
+    print_warning,
     format_elapsed,
+    should_animate_status,
     stdout_is_tty,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
@@ -206,7 +209,7 @@ def _emit_gwas_summary(
     ]
 
     out_rows: list[list[str]] = []
-    for r in rows:
+    for r in _ordered_gwas_summary_rows(rows):
         pve_raw = r.get("pve", None)
         pve_text = "NA"
         try:
@@ -238,6 +241,52 @@ def _emit_gwas_summary(
     logger.info(header_line)
     for row in out_rows:
         logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+
+
+def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
+    model = str(model_name or "").strip()
+    order = {
+        "LM": 0,
+        "LMM": 1,
+        "FastLMM": 2,
+        "Farm": 3,
+        "FarmCPU": 3,
+    }
+    return (order.get(model, 99), model.lower())
+
+
+def _ordered_gwas_summary_rows(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return sorted(
+        list(rows),
+        key=lambda r: (
+            int(r.get("pheno_col_idx", 10**9)),
+            str(r.get("phenotype", "")),
+            _gwas_model_sort_key(r.get("model", "")),
+        ),
+    )
+
+
+def _ordered_saved_result_paths(
+    rows: list[dict[str, object]],
+    saved_paths: list[str],
+) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for row in _ordered_gwas_summary_rows(rows):
+        path = str(row.get("result_file", "") or "").strip()
+        if path == "" or path in seen:
+            continue
+        seen.add(path)
+        ordered.append(path)
+    for path in saved_paths:
+        p = str(path).strip()
+        if p == "" or p in seen:
+            continue
+        seen.add(p)
+        ordered.append(p)
+    return ordered
 
 
 def _log_file_only(logger: logging.Logger, level: int, message: str) -> None:
@@ -295,6 +344,13 @@ def _rich_success(
 ) -> None:
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
+    if is_skip_status_text(msg):
+        if use_spinner or stdout_is_tty():
+            _log_file_only(logger, logging.WARNING, file_msg)
+            print_warning(msg)
+        else:
+            logger.warning(file_msg)
+        return
     if use_spinner or stdout_is_tty():
         _log_file_only(logger, logging.INFO, file_msg)
         print_success(msg)
@@ -309,6 +365,7 @@ class _ProgressAdapter:
     def __init__(self, total: int, desc: str) -> None:
         self.total = int(max(0, total))
         self.desc = str(desc)
+        self._animate = bool(should_animate_status(self.desc))
         self._backend = "none"
         self._progress = None
         self._task_id = None
@@ -320,7 +377,7 @@ class _ProgressAdapter:
         self._memory_text = ""
         self._memory_until_tick = 0
 
-        if rich_progress_available():
+        if self._animate and rich_progress_available():
             try:
                 self._progress = build_rich_progress(
                     show_remaining=True,
@@ -341,7 +398,7 @@ class _ProgressAdapter:
                 self._progress = None
                 self._task_id = None
 
-        if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
+        if self._animate and self._backend == "none" and _HAS_TQDM and stdout_is_tty():
             self._tqdm = tqdm(
                 total=self.total,
                 desc=self.desc,
@@ -432,7 +489,7 @@ class _ProgressAdapter:
             self._tqdm = None
         if self._finished and show_done:
             msg = f"{self.desc} ...{done_text} [{elapsed}]"
-            if success_style:
+            if success_style and self._animate:
                 print_success(msg)
             else:
                 print(msg, flush=True)
@@ -2583,7 +2640,7 @@ def run_chunked_gwas_lmm_lm(
         sameidx = np.isin(ids, pheno_sub.index)
         n_idv = int(np.sum(sameidx))
         if n_idv == 0:
-            logger.info(f"{pname}: no overlapping samples, skipped.")
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = 0
             if multi_trait_mode:
@@ -2989,7 +3046,7 @@ def run_chunked_gwas_streaming_shared(
     sameidx = np.isin(ids, pheno_sub.index)
     n_idv = int(np.sum(sameidx))
     if n_idv == 0:
-        logger.info(f"{pname}: no overlapping samples, skipped.")
+        logger.warning(f"{pname}: no overlapping samples, skipped.")
         if pname not in eff_snp_by_trait:
             eff_snp_by_trait[pname] = 0
         return
@@ -3212,7 +3269,11 @@ def run_chunked_gwas_streaming_shared(
         width=60,
     )
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
-    use_rich_multi = bool(use_spinner and rich_progress_available())
+    use_rich_multi = bool(
+        use_spinner
+        and should_animate_status("Loading shared GWAS model progress...")
+        and rich_progress_available()
+    )
     rich_progress = None
     if use_rich_multi:
         rich_progress = build_rich_progress(
@@ -4137,7 +4198,7 @@ def run_farmcpu_fullmem(
         p = pheno[phename].dropna()
         famidretain = np.isin(famid, p.index)
         if np.sum(famidretain) == 0:
-            logger.info(f"{phename}: no overlapping samples, skipped.")
+            logger.warning(f"{phename}: no overlapping samples, skipped.")
             if multi_trait_mode:
                 logger.info("")  # single blank line between traits
             continue
@@ -4728,9 +4789,13 @@ def main(log: bool = True):
                 pnm = str(row.get("phenotype", ""))
                 row["pheno_col_idx"] = int(trait_col_map.get(pnm, -1))
             _emit_gwas_summary(logger, gwas_summary_rows)
-        if len(saved_result_paths) > 0:
+        ordered_result_paths = _ordered_saved_result_paths(
+            gwas_summary_rows,
+            saved_result_paths,
+        )
+        if len(ordered_result_paths) > 0:
             logger.info("")
-            saved_body = "\n".join([f"  {p}" for p in saved_result_paths])
+            saved_body = "\n".join([f"  {p}" for p in ordered_result_paths])
             _rich_success(logger, f"Results saved:\n{saved_body}")
         _rich_success(logger, f"Log saved in {str(log_path).replace('//', '/')}")
 
@@ -4794,8 +4859,8 @@ def main(log: bool = True):
                 phenofile=str(args.pheno),
                 outprefix=str(outprefix),
                 log_file=str(log_path),
-                result_files=[str(x) for x in saved_result_paths],
-                summary_rows=[dict(x) for x in gwas_summary_rows],
+                result_files=[str(x) for x in ordered_result_paths],
+                summary_rows=[dict(x) for x in _ordered_gwas_summary_rows(gwas_summary_rows)],
                 args_data=args_data,
                 error_text="",
                 created_at=run_created_at,

@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from typing import Any, Optional, Sequence
 
@@ -67,6 +68,34 @@ def truncate_line(
     if max_chars <= len(mark):
         return mark[:max_chars]
     return s[: (max_chars - len(mark))] + mark
+
+
+def _format_path_for_os(text: str) -> str:
+    """
+    Normalize displayed path separators for the current OS.
+    - Windows: use backslash
+    - Unix-like: use slash
+    Keep URL-like strings unchanged.
+    """
+    s = str(text)
+    if s == "" or "://" in s:
+        return s
+    if os.name == "nt":
+        return s.replace("/", "\\")
+    return s.replace("\\", "/")
+
+
+def _is_path_like_key(key: str) -> bool:
+    k = str(key).strip().lower()
+    markers = ("file", "path", "prefix", "dir", "folder")
+    return any(m in k for m in markers)
+
+
+def _format_config_value_for_display(key: str, value: object) -> str:
+    s = str(value)
+    if _is_path_like_key(key):
+        return _format_path_for_os(s)
+    return s
 
 
 def _render_rich_panel(
@@ -150,11 +179,17 @@ def emit_cli_configuration(
 ) -> None:
     sec_norm: list[tuple[str, list[tuple[str, str]]]] = []
     for sec_name, sec_rows in sections:
-        rows_str = [(str(k), str(v)) for k, v in sec_rows]
+        rows_str = [
+            (str(k), _format_config_value_for_display(str(k), v))
+            for k, v in sec_rows
+        ]
         if len(rows_str) > 0:
             sec_norm.append((str(sec_name), rows_str))
 
-    footer_norm = [(str(k), str(v)) for k, v in (footer_rows or [])]
+    footer_norm = [
+        (str(k), _format_config_value_for_display(str(k), v))
+        for k, v in (footer_rows or [])
+    ]
     key_width = 8
     for _, rows in sec_norm:
         for k, _ in rows:

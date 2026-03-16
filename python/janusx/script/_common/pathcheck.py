@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
 
 def _norm(path: str) -> str:
-    return str(path).replace("\\", "/")
+    s = str(path)
+    if os.name == "nt":
+        return s.replace("/", "\\")
+    return s.replace("\\", "/")
 
 
 def ensure_file_exists(logger, path: str, label: str) -> bool:

@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from janusx.gfreader import SiteInfo, prepare_cli_input_cache
 from .status import CliStatus
+
+try:
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    _HAS_RICH_PROGRESS = True
+except Exception:
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    _HAS_RICH_PROGRESS = False
 
 
 GENOTYPE_TEXT_SUFFIXES: tuple[str, ...] = (".txt", ".tsv", ".csv")
@@ -75,7 +94,7 @@ def determine_genotype_source(
     prefix: str | None = None,
     snps_only: bool = False,
     delimiter: str | None = None,
-    apply_cache: bool = True,
+    apply_cache: bool = False,
 ) -> tuple[str, str]:
     if vcf:
         gfile = str(vcf)
@@ -114,7 +133,9 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         prefix=getattr(args, "prefix", None),
         snps_only=bool(getattr(args, "snps_only", False)),
         delimiter=getattr(args, "delimiter", None),
-        apply_cache=bool(getattr(args, "cache_input", True)),
+        # Cache conversion is delayed to first real genotype read so CLI can
+        # print config/help promptly instead of blocking at startup.
+        apply_cache=bool(getattr(args, "cache_input", False)),
     )
 
 
@@ -300,6 +321,44 @@ def write_id_file(path: str, sample_ids: Sequence[str]) -> None:
         fid.write("\n".join(map(str, sample_ids)) + "\n")
 
 
+def _open_site_progress(desc: str, total_sites: int):
+    use_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if bool(_HAS_RICH_PROGRESS and use_tty):
+        progress = Progress(
+            SpinnerColumn(style="green"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TextColumn("{task.percentage:>5.1f}%"),
+            TimeElapsedColumn(),
+        )
+        task_id = progress.add_task(str(desc), total=float(max(0, int(total_sites))))
+        progress.start()
+        return progress, task_id, None
+    pbar = tqdm(
+        total=max(0, int(total_sites)),
+        unit="SNP",
+        desc=str(desc),
+        disable=not use_tty,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+    )
+    return None, None, pbar
+
+
+def _advance_site_progress(progress, task_id, pbar, n_sites: int) -> None:
+    n = int(max(0, n_sites))
+    if progress is not None and task_id is not None:
+        progress.update(task_id, advance=n)
+    elif pbar is not None:
+        pbar.update(n)
+
+
+def _close_site_progress(progress, pbar) -> None:
+    if progress is not None:
+        progress.stop()
+    if pbar is not None:
+        pbar.close()
+
+
 def write_text_output(
     out_path: str,
     sample_ids: Sequence[str],
@@ -311,14 +370,20 @@ def write_text_output(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     write_id_file(f"{prefix}.id", sample_ids)
     written = 0
+    progress, task_id, pbar = _open_site_progress("Writing TXT", int(total_sites))
     with open(out_path, "w", encoding="utf-8") as fw, open(
         f"{prefix}.site", "w", encoding="utf-8"
     ) as fsite:
-        for block, sites in chunks:
-            arr = np.asarray(block, dtype=np.float32)
-            np.savetxt(fw, arr, fmt="%.6g", delimiter="\t")
-            write_site_file(fsite, sites)
-            written += int(arr.shape[0])
+        try:
+            for block, sites in chunks:
+                arr = np.asarray(block, dtype=np.float32)
+                np.savetxt(fw, arr, fmt="%.6g", delimiter="\t")
+                write_site_file(fsite, sites)
+                n_rows = int(arr.shape[0])
+                written += n_rows
+                _advance_site_progress(progress, task_id, pbar, n_rows)
+        finally:
+            _close_site_progress(progress, pbar)
     if written != int(total_sites):
         raise RuntimeError(
             f"Written site count mismatch for text output: {written} vs {total_sites}"
@@ -341,14 +406,19 @@ def write_npy_output(
         shape=(int(total_sites), len(sample_ids)),
     )
     offset = 0
+    progress, task_id, pbar = _open_site_progress("Writing NPY", int(total_sites))
     write_id_file(f"{prefix}.id", sample_ids)
     with open(f"{prefix}.site", "w", encoding="utf-8") as fsite:
-        for block, sites in chunks:
-            arr = np.asarray(block, dtype=np.float32)
-            n_rows = int(arr.shape[0])
-            out_mm[offset : offset + n_rows, :] = arr
-            write_site_file(fsite, sites)
-            offset += n_rows
+        try:
+            for block, sites in chunks:
+                arr = np.asarray(block, dtype=np.float32)
+                n_rows = int(arr.shape[0])
+                out_mm[offset : offset + n_rows, :] = arr
+                write_site_file(fsite, sites)
+                offset += n_rows
+                _advance_site_progress(progress, task_id, pbar, n_rows)
+        finally:
+            _close_site_progress(progress, pbar)
     out_mm.flush()
     if offset != int(total_sites):
         raise RuntimeError(

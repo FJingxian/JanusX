@@ -285,6 +285,17 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy.")
 
 
+def _format_output_display(out_fmt: str, out_prefix: str, out_path: str) -> str:
+    fmt = str(out_fmt).lower()
+    if fmt == "plink":
+        return f"{out_prefix} (.bed/.bim/.fam)"
+    if fmt == "npy":
+        return f"{out_prefix} (.npy/.site/.id)"
+    if fmt == "txt":
+        return f"{out_prefix} (.txt/.site/.id)"
+    return f"{out_path} ({fmt})"
+
+
 def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
     flt: SiteFilterSpec,
@@ -421,11 +432,13 @@ def main() -> None:
     if args.prefix is None:
         args.prefix = default_prefix
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
+    output_display = _format_output_display(out_fmt, out_prefix, out_path)
 
     os.makedirs(str(args.out), exist_ok=True, mode=0o755)
     configure_genotype_cache_from_out(str(args.out))
     log_path = f"{out_prefix}.gformat.log"
     logger = setup_logging(log_path)
+    status_enabled = bool(getattr(os.sys.stdout, "isatty", lambda: False)())
 
     extract_mode, extract_file = _parse_extract_arg(args.extract)
     chr_keys = _expand_chr_selector(args.chr_filter)
@@ -454,7 +467,7 @@ def main() -> None:
         ],
         footer_rows=[
             ("Output prefix", out_prefix),
-            ("Output", out_path),
+            ("Output", output_display),
         ],
         line_max_chars=60,
     )
@@ -479,7 +492,25 @@ def main() -> None:
             "Please provide a matching prefix.site or prefix.bim sidecar."
         )
 
-    sample_ids, n_sites = inspect_genotype_file(gfile)
+    inspect_desc = "Inspecting genotype metadata (and preparing cache if needed)..."
+    if not status_enabled:
+        logger.info(inspect_desc)
+    with CliStatus(
+        inspect_desc,
+        enabled=status_enabled,
+    ) as task:
+        try:
+            sample_ids, n_sites = inspect_genotype_file(gfile)
+        except Exception:
+            task.fail("Inspecting genotype metadata ...Failed")
+            raise
+        task.complete(
+            f"Inspecting genotype metadata ...Finished (n={len(sample_ids)}, nSNP={int(n_sites)})"
+        )
+    if not status_enabled:
+        logger.info(
+            f"Inspecting genotype metadata ...Finished (n={len(sample_ids)}, nSNP={int(n_sites)})"
+        )
     keep_sample_ids: list[str] | None = None
     if args.keep:
         keep_list = _read_keep_samples(str(args.keep))
@@ -547,8 +578,7 @@ def main() -> None:
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
     print(f"Genotype source: {gfile}")
     print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
-    print(f"Output prefix: {out_prefix}")
-    print(f"Output: {out_path} ({out_fmt})")
+    print(f"Output: {output_display}")
 
     def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
         c = load_genotype_chunks(
@@ -566,49 +596,43 @@ def main() -> None:
         return c
 
     t0 = time.time()
-    with CliStatus("Converting genotype format...", enabled=bool(getattr(os.sys.stdout, "isatty", lambda: False)())) as task:
-        try:
-            if out_fmt == "vcf":
-                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                save_genotype_streaming(
-                    out_path,
-                    out_sample_ids,
-                    _make_chunks(),
-                    fmt="vcf",
-                    total_snps=int(selected_n_sites),
-                    desc="Writing VCF",
-                )
-            elif out_fmt == "hmp":
-                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-                save_genotype_streaming(
-                    out_path,
-                    out_sample_ids,
-                    _make_chunks(),
-                    fmt="hmp",
-                    total_snps=int(selected_n_sites),
-                    desc="Writing HMP",
-                )
-            elif out_fmt == "plink":
-                Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)
-                save_genotype_streaming(
-                    out_prefix,
-                    out_sample_ids,
-                    _make_chunks(),
-                    fmt="plink",
-                    total_snps=int(selected_n_sites),
-                    desc="Writing PLINK",
-                )
-            elif out_fmt == "txt":
-                write_text_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
-            else:
-                write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
-        except Exception:
-            task.fail("Converting genotype format ...Failed")
-            raise
-        task.complete("Converting genotype format ...Finished")
+    if out_fmt == "vcf":
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        save_genotype_streaming(
+            out_path,
+            out_sample_ids,
+            _make_chunks(),
+            fmt="vcf",
+            total_snps=int(selected_n_sites),
+            desc="Writing VCF",
+        )
+    elif out_fmt == "hmp":
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        save_genotype_streaming(
+            out_path,
+            out_sample_ids,
+            _make_chunks(),
+            fmt="hmp",
+            total_snps=int(selected_n_sites),
+            desc="Writing HMP",
+        )
+    elif out_fmt == "plink":
+        Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)
+        save_genotype_streaming(
+            out_prefix,
+            out_sample_ids,
+            _make_chunks(),
+            fmt="plink",
+            total_snps=int(selected_n_sites),
+            desc="Writing PLINK",
+        )
+    elif out_fmt == "txt":
+        write_text_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
+    else:
+        write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
 
     logger.info(f"Format conversion completed in {time.time() - t0:.2f} s")
-    logger.info(f"Output written: {out_path}")
+    logger.info(f"Output written: {output_display}")
 
 
 if __name__ == "__main__":

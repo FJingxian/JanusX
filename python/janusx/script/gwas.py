@@ -82,6 +82,7 @@ import psutil
 from janusx.bioplotkit import GWASPLOT
 from janusx.gfreader import (
     load_genotype_chunks,
+    load_bed_2bit_packed,
     inspect_genotype_file,
     auto_mmap_window_mb,
 )
@@ -3675,7 +3676,7 @@ def prepare_qk_and_filter(
 def build_qmatrix_farmcpu(
     genofile: str,
     gfile_prefix: str,
-    geno: np.ndarray,
+    geno: Union[np.ndarray, None],
     qdim: str,
     maf_threshold: float,
     max_missing_rate: float,
@@ -3687,6 +3688,9 @@ def build_qmatrix_farmcpu(
     use_spinner: bool = False,
     quiet_terminal: bool = False,
     snps_only: bool = True,
+    n_snps_hint: Union[int, None] = None,
+    threads: int = 1,
+    mmap_limit: bool = False,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
@@ -3699,9 +3703,18 @@ def build_qmatrix_farmcpu(
         else:
             logger.info(str(msg))
 
+    sid_arr = None if sample_ids is None else np.asarray(sample_ids, dtype=str)
+    if sid_arr is not None:
+        n = int(sid_arr.shape[0])
+    elif geno is not None:
+        n = int(geno.shape[1])
+    else:
+        raise ValueError(
+            "FarmCPU Q-matrix build requires either sample_ids or dense geno matrix."
+        )
+
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
         grm_path, id_path = _grm_cache_paths(gfile_prefix, mgrm="1")
-        n = geno.shape[1]
         with _cache_lock(grm_path):
             cache_ready = os.path.exists(grm_path)
             if cache_ready:
@@ -3719,14 +3732,14 @@ def build_qmatrix_farmcpu(
                     cache_ready = False
                 else:
                     grm = grm.reshape(n, n)
-                    if sample_ids is not None and os.path.exists(id_path):
+                    if sid_arr is not None and os.path.exists(id_path):
                         grm_ids = _read_id_file(id_path, logger, "GRM", use_spinner=use_spinner)
                         if grm_ids is None or len(grm_ids) != n:
                             _farm_log("GRM cache IDs are invalid; rebuilding GRM cache.")
                             cache_ready = False
                         else:
                             grm_ids = np.asarray(grm_ids, dtype=str)
-                            sid = sample_ids.astype(str)
+                            sid = sid_arr
                             if np.array_equal(grm_ids, sid):
                                 return np.asarray(grm, dtype="float32")
                             index = {s: i for i, s in enumerate(grm_ids)}
@@ -3741,7 +3754,7 @@ def build_qmatrix_farmcpu(
                                 grm = grm[np.ix_(ord_idx, ord_idx)]
                                 return np.asarray(grm, dtype="float32")
                     else:
-                        if sample_ids is not None and not os.path.exists(id_path):
+                        if sid_arr is not None and not os.path.exists(id_path):
                             _farm_log("GRM cache ID file not found; assuming genotype sample order.")
                         return np.asarray(grm, dtype="float32")
             if not cache_ready:
@@ -3753,13 +3766,43 @@ def build_qmatrix_farmcpu(
                             pass
 
                 _farm_log("* Building GRM cache for FarmCPU PCA...")
-                grm = GRM(geno).astype("float32")
+                if geno is not None:
+                    grm = GRM(geno).astype("float32")
+                else:
+                    if n_snps_hint is not None:
+                        n_snps_eff = int(n_snps_hint)
+                    else:
+                        _ids0, n_snps0 = inspect_genotype_file(
+                            genofile,
+                            snps_only=bool(snps_only),
+                            maf=float(maf_threshold),
+                            missing_rate=float(max_missing_rate),
+                            het=float(het_threshold),
+                        )
+                        n_snps_eff = int(n_snps0)
+                    grm, _eff_m = build_grm_streaming(
+                        genofile=genofile,
+                        n_samples=n,
+                        n_snps=n_snps_eff,
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        chunk_size=int(chunk_size),
+                        method=1,
+                        mmap_window_mb=auto_mmap_window_mb(
+                            genofile, n, n_snps_eff, int(chunk_size)
+                        ) if bool(mmap_limit) else None,
+                        threads=max(1, int(threads)),
+                        logger=logger,
+                        use_spinner=bool(use_spinner and (not quiet_terminal)),
+                        snps_only=bool(snps_only),
+                    )
+                    grm = np.asarray(grm, dtype="float32")
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 np.save(tmp_grm, grm)
                 os.replace(tmp_grm, grm_path)
-                if sample_ids is not None:
+                if sid_arr is not None:
                     tmp_id = f"{id_path}.tmp.{os.getpid()}"
-                    pd.Series(sample_ids.astype(str)).to_csv(
+                    pd.Series(sid_arr).to_csv(
                         tmp_id, sep="\t", index=False, header=False
                     )
                     os.replace(tmp_id, id_path)
@@ -3767,14 +3810,14 @@ def build_qmatrix_farmcpu(
                 return grm
 
     q_int = _parse_qcov_dim(qdim)
-    if q_int >= geno.shape[1] and q_int != 0:
+    if q_int >= n and q_int != 0:
         raise ValueError(
             f"Q/PC dimension out of range for FarmCPU: {q_int}. "
-            f"valid=[0..{max(0, geno.shape[1]-1)}]"
+            f"valid=[0..{max(0, n-1)}]"
         )
 
     if q_int == 0:
-        qmatrix = np.array([]).reshape(geno.shape[1], 0)
+        qmatrix = np.zeros((n, 0), dtype="float32")
     else:
         q_path = _pca_cache_path(gfile_prefix, mgrm="1", qdim=int(q_int))
         with _cache_lock(q_path):
@@ -3793,9 +3836,9 @@ def build_qmatrix_farmcpu(
                     qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
                     if qmatrix.ndim == 1:
                         qmatrix = qmatrix.reshape(-1, 1)
-                    if qmatrix.shape != (geno.shape[1], int(q_int)):
+                    if qmatrix.shape != (n, int(q_int)):
                         raise ValueError(
-                            f"PCA cache shape mismatch: expected ({geno.shape[1]},{q_int}), got {qmatrix.shape}"
+                            f"PCA cache shape mismatch: expected ({n},{q_int}), got {qmatrix.shape}"
                         )
                     task.complete(f"Loading Q matrix from {q_src}")
             else:
@@ -3809,12 +3852,12 @@ def build_qmatrix_farmcpu(
                 _farm_log(f"Cached PCA written to {q_path}")
 
     if cov_inputs:
-        if sample_ids is None:
+        if sid_arr is None:
             raise ValueError("FarmCPU covariate loading requires sample IDs.")
         cov_arr, cov_ids = _load_covariates_for_models(
             cov_inputs=cov_inputs,
             genofile=genofile,
-            sample_ids=np.asarray(sample_ids, dtype=str),
+            sample_ids=sid_arr,
             chunk_size=int(chunk_size),
             logger=logger,
             context="FarmCPU",
@@ -3824,7 +3867,7 @@ def build_qmatrix_farmcpu(
         if cov_arr is not None:
             if cov_ids is None:
                 raise ValueError("Internal error: covariate IDs are missing for FarmCPU.")
-            sid = np.asarray(sample_ids, dtype=str)
+            sid = sid_arr
             if cov_arr.shape[0] != sid.shape[0]:
                 raise ValueError(
                     f"FarmCPU covariate rows ({cov_arr.shape[0]}) do not match sample count ({sid.shape[0]})."
@@ -3868,6 +3911,30 @@ def run_farmcpu_fullmem(
     cov = args.cov
     snps_only = bool(getattr(args, "snps_only", False))
 
+    def _load_bim_ref_alt(prefix: str) -> pd.DataFrame:
+        bim_path = f"{prefix}.bim"
+        src = _basename_only(bim_path)
+        with CliStatus(
+            f"Loading site metadata from {src}...",
+            enabled=bool(use_spinner and (not context_prepared)),
+        ) as task:
+            ref_alt_df = pd.read_csv(
+                bim_path,
+                sep=r"\s+",
+                header=None,
+                usecols=[0, 3, 4, 5],
+                names=["chrom", "pos", "allele0", "allele1"],
+                dtype={0: str, 3: np.int64, 4: str, 5: str},
+                engine="c",
+            )
+            ref_alt_df["pos"] = pd.to_numeric(
+                ref_alt_df["pos"], errors="coerce"
+            ).fillna(0).astype(int)
+            task.complete(
+                f"Loading site metadata from {src} (nSNP={ref_alt_df.shape[0]})"
+            )
+        return ref_alt_df
+
     if farmcpu_cache is None:
         t_loading = time.time()
         pheno = pheno_preloaded
@@ -3900,46 +3967,110 @@ def run_farmcpu_fullmem(
                 het_threshold=float(args.het),
             )
             famid = np.asarray(famid, dtype=str)
-        geno_chunks = []
-        site_rows = []
-        pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
-        try:
-            for chunk, sites in load_genotype_chunks(
-                gfile,
-                chunk_size=args.chunksize,
-                maf=args.maf,
-                missing_rate=args.geno,
-                impute=True,
-                snps_only=bool(snps_only),
-                sample_ids=famid.tolist(),
-            ):
-                if chunk.shape[0] == 0:
-                    continue
-                geno_chunks.append(np.asarray(chunk, dtype="float32"))
-                site_rows.extend(
-                    [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
-                )
-                pbar.update(chunk.shape[0])
-            loaded_snps = int(sum(c.shape[0] for c in geno_chunks))
-            pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
-            pbar.finish()
-        finally:
-            # Ensure spinner/progress stops on Ctrl+C.
-            pbar.close(success_style=False, show_done=True)
+        geno = None
+        packed_ctx: Union[dict[str, object], None] = None
 
-        if len(geno_chunks) == 0:
-            msg = "After filtering, number of SNPs is zero for FarmCPU."
-            logger.error(msg)
-            raise ValueError(msg)
-        geno = np.concatenate(geno_chunks, axis=0)
-        ref_alt = pd.DataFrame(site_rows, columns=["chrom", "pos", "allele0", "allele1"])
-        ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
+        can_use_packed = (
+            bool(getattr(args, "model", "add") == "add")
+            and os.path.isfile(f"{gfile}.bed")
+            and os.path.isfile(f"{gfile}.bim")
+            and os.path.isfile(f"{gfile}.fam")
+        )
+        if can_use_packed:
+            pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
+            try:
+                packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(gfile)
+                if int(packed_n) != int(famid.shape[0]):
+                    raise ValueError(
+                        f"Packed sample size mismatch: packed n={packed_n}, expected {famid.shape[0]}"
+                    )
+
+                ref_alt_all = _load_bim_ref_alt(gfile)
+                if int(ref_alt_all.shape[0]) != int(packed_raw.shape[0]):
+                    raise ValueError(
+                        f"BIM/packed SNP count mismatch: bim={ref_alt_all.shape[0]}, packed={packed_raw.shape[0]}"
+                    )
+
+                miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+                maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+                keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
+                maf_thr = float(args.maf)
+                if maf_thr > 0.0:
+                    keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+                miss_thr = float(args.geno)
+                if miss_thr < 1.0:
+                    keep &= miss_arr <= miss_thr
+                if bool(snps_only):
+                    a0 = ref_alt_all["allele0"].astype(str).to_numpy()
+                    a1 = ref_alt_all["allele1"].astype(str).to_numpy()
+                    keep &= (np.char.str_len(a0) == 1) & (np.char.str_len(a1) == 1)
+
+                if not np.any(keep):
+                    raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
+
+                if np.all(keep):
+                    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+                    ref_alt = ref_alt_all
+                else:
+                    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)[keep])
+                    miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
+                    maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
+                    ref_alt = ref_alt_all.loc[keep].reset_index(drop=True)
+
+                loaded_snps = int(ref_alt.shape[0])
+                pbar.update(loaded_snps)
+                pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
+                pbar.finish()
+                packed_ctx = {
+                    "packed": packed,
+                    "missing_rate": miss_arr,
+                    "maf": maf_arr,
+                    "n_samples": int(packed_n),
+                }
+            finally:
+                pbar.close(success_style=False, show_done=True)
+        else:
+            geno_chunks = []
+            site_rows = []
+            pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
+            try:
+                for chunk, sites in load_genotype_chunks(
+                    gfile,
+                    chunk_size=args.chunksize,
+                    maf=args.maf,
+                    missing_rate=args.geno,
+                    impute=True,
+                    snps_only=bool(snps_only),
+                    sample_ids=famid.tolist(),
+                ):
+                    if chunk.shape[0] == 0:
+                        continue
+                    geno_chunks.append(np.asarray(chunk, dtype="float32"))
+                    site_rows.extend(
+                        [(s.chrom, int(s.pos), s.ref_allele, s.alt_allele) for s in sites]
+                    )
+                    pbar.update(chunk.shape[0])
+                loaded_snps = int(sum(c.shape[0] for c in geno_chunks))
+                pbar.set_desc(f"Loading genotype (Full, {loaded_snps} SNPs)")
+                pbar.finish()
+            finally:
+                # Ensure spinner/progress stops on Ctrl+C.
+                pbar.close(success_style=False, show_done=True)
+
+            if len(geno_chunks) == 0:
+                msg = "After filtering, number of SNPs is zero for FarmCPU."
+                logger.error(msg)
+                raise ValueError(msg)
+            geno = np.concatenate(geno_chunks, axis=0)
+            ref_alt = pd.DataFrame(site_rows, columns=["chrom", "pos", "allele0", "allele1"])
+            ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
 
         t_loaded = time.time() - t_loading
         if not bool(context_prepared):
+            ns_loaded = int(ref_alt.shape[0])
             _rich_success(
                 logger,
-                f"FarmCPU input ready (n={len(famid)}, nSNP={geno.shape[0]}) [{format_elapsed(t_loaded)}]",
+                f"FarmCPU input ready (n={len(famid)}, nSNP={ns_loaded}) [{format_elapsed(t_loaded)}]",
                 use_spinner=use_spinner,
                 log_message=f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
             )
@@ -3949,7 +4080,7 @@ def run_farmcpu_fullmem(
                 logging.INFO,
                 f"Genotype and phenotype loaded in {t_loaded:.2f} seconds",
             )
-        if geno.size == 0:
+        if ref_alt.shape[0] == 0:
             msg = "After filtering, number of SNPs is zero for FarmCPU."
             logger.error(msg)
             raise ValueError(msg)
@@ -3987,27 +4118,52 @@ def run_farmcpu_fullmem(
                 use_spinner=use_spinner,
                 quiet_terminal=bool(context_prepared),
                 snps_only=bool(snps_only),
+                n_snps_hint=int(ref_alt.shape[0]),
+                threads=int(args.thread),
+                mmap_limit=bool(args.mmap_limit),
             )
 
         if bool(context_prepared):
             cov_n = "NA" if cov_preloaded is None else int(np.asarray(cov_preloaded).shape[0])
+            geno_n = int(famid.shape[0]) if geno is None else int(geno.shape[1])
             _log_file_only(
                 logger,
                 logging.INFO,
-                f"geno={geno.shape[1]}, pheno={pheno.shape[0]}, "
+                f"geno={geno_n}, pheno={pheno.shape[0]}, "
                 f"q={qmatrix.shape[0]}, cov={cov_n} -> {famid.shape[0]}"
             )
         farmcpu_cache = {
             "pheno": pheno,
             "famid": famid,
             "geno": geno,
+            "packed_ctx": packed_ctx,
             "ref_alt": ref_alt,
             "qmatrix": qmatrix,
         }
     else:
         pheno = farmcpu_cache["pheno"]  # type: ignore[assignment]
         famid = np.asarray(farmcpu_cache["famid"], dtype=str)
-        geno = np.asarray(farmcpu_cache["geno"], dtype="float32")
+        geno_obj = farmcpu_cache.get("geno")
+        geno = (
+            None
+            if geno_obj is None
+            else np.ascontiguousarray(np.asarray(geno_obj, dtype="float32"))
+        )
+        packed_obj = farmcpu_cache.get("packed_ctx")
+        packed_ctx = None
+        if isinstance(packed_obj, dict):
+            packed_ctx = {
+                "packed": np.ascontiguousarray(
+                    np.asarray(packed_obj["packed"], dtype=np.uint8)
+                ),
+                "missing_rate": np.ascontiguousarray(
+                    np.asarray(packed_obj["missing_rate"], dtype=np.float32)
+                ),
+                "maf": np.ascontiguousarray(
+                    np.asarray(packed_obj["maf"], dtype=np.float32)
+                ),
+                "n_samples": int(packed_obj["n_samples"]),
+            }
         ref_alt = farmcpu_cache["ref_alt"]  # type: ignore[assignment]
         qmatrix = np.asarray(farmcpu_cache["qmatrix"], dtype="float32")
 
@@ -4029,10 +4185,23 @@ def run_farmcpu_fullmem(
                 logger.info("")  # single blank line between traits
             continue
 
-        snp_sub = geno[:, famidretain]
         p_sub = p.loc[famid[famidretain]].values.reshape(-1, 1)
+        keep_idx = np.flatnonzero(famidretain).astype(np.int64, copy=False)
         q_sub = qmatrix[famidretain]
         n_idv = int(np.sum(famidretain))
+        if packed_ctx is None:
+            if geno is None:
+                raise ValueError("FarmCPU genotype payload is missing.")
+            m_input = np.ascontiguousarray(geno[:, famidretain], dtype=np.float32)
+            sample_idx_arg = None
+            maf = (m_input.mean(axis=1) / 2.0).astype(np.float32, copy=False)
+            eff_snp = int(m_input.shape[0])
+        else:
+            m_input = packed_ctx
+            sample_idx_arg = keep_idx
+            maf = np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1)
+            eff_snp = int(maf.shape[0])
+
         _log_file_only(
             logger,
             logging.INFO,
@@ -4048,7 +4217,6 @@ def run_farmcpu_fullmem(
         t0 = time.time()
         gwas_t0 = time.time()
         peak_rss = process.memory_info().rss
-        maf = snp_sub.mean(axis=1)/2
         farm_iter = 20
         farm_label = f"FarmCPU-{phename} (n={n_idv})"
         farm_pbar = _ProgressAdapter(total=farm_iter, desc=farm_label)
@@ -4069,12 +4237,13 @@ def run_farmcpu_fullmem(
         try:
             farm_out = farmcpu(
                 y=p_sub,
-                M=snp_sub,
+                M=m_input,
                 X=q_sub,
                 chrlist=ref_alt["chrom"].values,
                 poslist=ref_alt["pos"].values,
                 iter=farm_iter,
                 threads=args.thread,
+                sample_indices=sample_idx_arg,
                 progress_cb=_farmcpu_progress,
                 return_info=True,
             )
@@ -4123,7 +4292,7 @@ def run_farmcpu_fullmem(
                 "phenotype": str(phename),
                 "model": "Farm",
                 "nidv": int(n_idv),
-                "eff_snp": int(snp_sub.shape[0]),
+                "eff_snp": int(eff_snp),
                 "pve": None,
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
@@ -4764,6 +4933,18 @@ def main(log: bool = True):
         run_status = "failed"
         run_error = "Interrupted by user (Ctrl+C)"
         logger.info("Interrupted by user (Ctrl+C).")
+        # On Windows, worker threads/native kernels can continue briefly after
+        # KeyboardInterrupt. Force-exit the Python process to prevent lingering
+        # high CPU/RSS background jobs after Ctrl+C.
+        if os.name == "nt":
+            try:
+                logger.info("Terminating all GWAS workers immediately on Windows.")
+            except Exception:
+                pass
+            try:
+                logging.shutdown()
+            finally:
+                os._exit(130)
     except Exception as e:
         run_status = "failed"
         run_error = str(e)

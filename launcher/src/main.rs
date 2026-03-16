@@ -1439,7 +1439,7 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
             print_success_line(
                 "Launcher upgrade compiled and staged. `jx` will be replaced after this command exits.",
             );
-            println!("Keep this command running until update steps finish, then run `jx -h` to verify.");
+            println!("Keep this command running until update steps finish, then run `jx -v` to verify.");
         }
     }
     let (core_update, core_update_hint) = match &opts.source {

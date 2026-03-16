@@ -809,108 +809,123 @@ pub fn load_bed_2bit_packed<'py>(
     if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
         bed_prefix.truncate(bed_prefix.len() - 4);
     }
+    let (packed, missing_rate, maf, std_denom, n_samples, n_snps, bytes_per_snp) = py
+        .detach(move || -> Result<
+            (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize, usize),
+            String,
+        > {
+            let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+            let n_samples = samples.len();
+            if n_samples == 0 {
+                return Err("no samples found in PLINK input".to_string());
+            }
 
-    let samples = core::read_fam(&bed_prefix).map_err(PyRuntimeError::new_err)?;
-    let n_samples = samples.len();
-    if n_samples == 0 {
-        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
-    }
+            let bed_path = format!("{bed_prefix}.bed");
+            let mut bed_file = File::open(&bed_path)
+                .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+            let bed_len = bed_file
+                .metadata()
+                .map_err(|e| format!("failed to stat {bed_path}: {e}"))?
+                .len() as usize;
+            if bed_len < 3 {
+                return Err("BED too small".to_string());
+            }
 
-    let bed_path = format!("{bed_prefix}.bed");
-    let mut bed_file = File::open(&bed_path)
-        .map_err(|e| PyIOError::new_err(format!("failed to open {bed_path}: {e}")))?;
-    let bed_len = bed_file
-        .metadata()
-        .map_err(|e| PyIOError::new_err(format!("failed to stat {bed_path}: {e}")))?
-        .len() as usize;
-    if bed_len < 3 {
-        return Err(PyRuntimeError::new_err("BED too small"));
-    }
+            let mut header = [0u8; 3];
+            bed_file
+                .read_exact(&mut header)
+                .map_err(|e| format!("failed to read BED header: {e}"))?;
+            if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+                return Err("Only SNP-major BED supported".to_string());
+            }
 
-    let mut header = [0u8; 3];
-    bed_file
-        .read_exact(&mut header)
-        .map_err(|e| PyIOError::new_err(format!("failed to read BED header: {e}")))?;
-    if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
-        return Err(PyRuntimeError::new_err("Only SNP-major BED supported"));
-    }
+            let bytes_per_snp = (n_samples + 3) / 4;
+            let data_len = bed_len - 3;
+            if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+                ));
+            }
+            let n_snps = data_len / bytes_per_snp;
 
-    let bytes_per_snp = (n_samples + 3) / 4;
-    let data_len = bed_len - 3;
-    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
-        return Err(PyRuntimeError::new_err(format!(
-            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
-        )));
-    }
-    let n_snps = data_len / bytes_per_snp;
+            let mut packed: Vec<u8> = vec![0u8; data_len];
+            bed_file
+                .read_exact(&mut packed)
+                .map_err(|e| format!("failed to read BED payload: {e}"))?;
 
-    let mut packed: Vec<u8> = vec![0u8; data_len];
-    bed_file
-        .read_exact(&mut packed)
-        .map_err(|e| PyIOError::new_err(format!("failed to read BED payload: {e}")))?;
+            let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
+            let mut maf: Vec<f32> = vec![0.0; n_snps];
+            let mut std_denom: Vec<f32> = vec![0.0; n_snps];
+            let n_samples_f = n_samples as f32;
+            let full_bytes = n_samples / 4;
+            let rem = n_samples % 4;
 
-    let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
-    let mut maf: Vec<f32> = vec![0.0; n_snps];
-    let mut std_denom: Vec<f32> = vec![0.0; n_snps];
-    let n_samples_f = n_samples as f32;
-    let full_bytes = n_samples / 4;
-    let rem = n_samples % 4;
+            for snp_idx in 0..n_snps {
+                let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                let mut non_missing: usize = 0;
+                let mut alt_sum: usize = 0;
 
-    for snp_idx in 0..n_snps {
-        let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-        let mut non_missing: usize = 0;
-        let mut alt_sum: usize = 0;
-
-        for &byte in row.iter().take(full_bytes) {
-            for within in 0..4 {
-                let code = (byte >> (within * 2)) & 0b11;
-                match code {
-                    0b00 => {
-                        non_missing += 1;
+                for &byte in row.iter().take(full_bytes) {
+                    for within in 0..4 {
+                        let code = (byte >> (within * 2)) & 0b11;
+                        match code {
+                            0b00 => {
+                                non_missing += 1;
+                            }
+                            0b10 => {
+                                non_missing += 1;
+                                alt_sum += 1;
+                            }
+                            0b11 => {
+                                non_missing += 1;
+                                alt_sum += 2;
+                            }
+                            _ => {}
+                        }
                     }
-                    0b10 => {
-                        non_missing += 1;
-                        alt_sum += 1;
+                }
+                if rem > 0 {
+                    let byte = row[full_bytes];
+                    for within in 0..rem {
+                        let code = (byte >> (within * 2)) & 0b11;
+                        match code {
+                            0b00 => {
+                                non_missing += 1;
+                            }
+                            0b10 => {
+                                non_missing += 1;
+                                alt_sum += 1;
+                            }
+                            0b11 => {
+                                non_missing += 1;
+                                alt_sum += 2;
+                            }
+                            _ => {}
+                        }
                     }
-                    0b11 => {
-                        non_missing += 1;
-                        alt_sum += 2;
-                    }
-                    _ => {}
+                }
+
+                let miss = 1.0_f32 - (non_missing as f32 / n_samples_f);
+                missing_rate[snp_idx] = miss;
+                if non_missing > 0 {
+                    let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                    let maf_v = p.min(1.0_f32 - p);
+                    maf[snp_idx] = maf_v;
+                    let d = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
+                    std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
                 }
             }
-        }
-        if rem > 0 {
-            let byte = row[full_bytes];
-            for within in 0..rem {
-                let code = (byte >> (within * 2)) & 0b11;
-                match code {
-                    0b00 => {
-                        non_missing += 1;
-                    }
-                    0b10 => {
-                        non_missing += 1;
-                        alt_sum += 1;
-                    }
-                    0b11 => {
-                        non_missing += 1;
-                        alt_sum += 2;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let miss = 1.0_f32 - (non_missing as f32 / n_samples_f);
-        missing_rate[snp_idx] = miss;
-        if non_missing > 0 {
-            let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-            let maf_v = p.min(1.0_f32 - p);
-            maf[snp_idx] = maf_v;
-            let d = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
-            std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
-        }
-    }
+            Ok((
+                packed,
+                missing_rate,
+                maf,
+                std_denom,
+                n_samples,
+                n_snps,
+                bytes_per_snp,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?;
 
     let packed_mat = Array2::from_shape_vec((n_snps, bytes_per_snp), packed)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

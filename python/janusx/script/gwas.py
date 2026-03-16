@@ -344,16 +344,17 @@ def _rich_success(
 ) -> None:
     msg = str(message)
     file_msg = str(msg if log_message is None else log_message)
+    force_color = bool(use_spinner)
     if is_skip_status_text(msg):
         if use_spinner or stdout_is_tty():
             _log_file_only(logger, logging.WARNING, file_msg)
-            print_warning(msg)
+            print_warning(msg, force_color=force_color)
         else:
             logger.warning(file_msg)
         return
     if use_spinner or stdout_is_tty():
         _log_file_only(logger, logging.INFO, file_msg)
-        print_success(msg)
+        print_success(msg, force_color=force_color)
     else:
         logger.info(file_msg)
 

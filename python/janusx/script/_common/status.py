@@ -63,6 +63,7 @@ def _symbol_or_ascii(preferred: str, fallback: str) -> str:
 
 _SUCCESS_SYMBOL = _symbol_or_ascii("\u2714\ufe0e", "[OK]")
 _FAIL_SYMBOL = _symbol_or_ascii("\u2718\ufe0e", "[X]")
+_WARN_SYMBOL = _symbol_or_ascii("\u26a0\ufe0e", "[!]")
 
 
 def success_symbol() -> str:
@@ -228,7 +229,7 @@ def print_warning(message: str, *, force_color: bool = False) -> None:
         _safe_write(leading)
     msg = str(msg)
     body = msg if msg.startswith("Warning: ") else f"Warning: {msg}"
-    line = f"{_FAIL_SYMBOL} {body}"
+    line = f"{_WARN_SYMBOL} {body}"
     console = _console_for_print(force_color=bool(force_color))
     if console is not None:
         try:

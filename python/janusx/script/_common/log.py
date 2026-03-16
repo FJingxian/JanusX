@@ -34,6 +34,7 @@ class _ColorLevelPrefixFormatter(_LevelPrefixFormatter):
     _RED = "\033[31m"
     _RESET = "\033[0m"
     _FAIL = _console_symbol("\u2718\ufe0e", "[X]")
+    _WARN = _console_symbol("\u26a0\ufe0e", "[!]")
 
     def __init__(self, *, enable_color: bool) -> None:
         super().__init__()
@@ -44,7 +45,7 @@ class _ColorLevelPrefixFormatter(_LevelPrefixFormatter):
         if record.levelno >= logging.ERROR:
             msg = f"{self._FAIL} {msg}"
         elif record.levelno == logging.WARNING:
-            msg = f"{self._FAIL} {msg}"
+            msg = f"{self._WARN} {msg}"
         if not self.enable_color:
             return msg
         if record.levelno >= logging.ERROR:

@@ -4169,14 +4169,12 @@ def run_farmcpu_fullmem(
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
                     raise
-                task.complete(f"Loading genotype (Full, {int(n_snps)} SNPs)")
-            if not bool(use_spinner):
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    f"Loading genotype (Full, {int(n_snps)} SNPs) "
-                    f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
-                )
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Loading genotype (Full, {int(n_snps)} SNPs) "
+                f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
+            )
             if int(packed_n) != int(famid.shape[0]):
                 raise ValueError(
                     f"Packed sample size mismatch: packed n={packed_n}, expected {famid.shape[0]}"
@@ -4244,11 +4242,11 @@ def run_farmcpu_fullmem(
             finally:
                 # Ensure spinner/progress stops on Ctrl+C.
                 pbar.close(success_style=False, show_done=False)
-            _rich_success(
+            _log_file_only(
                 logger,
+                logging.INFO,
                 f"Loading genotype (Full, {loaded_snps} SNPs) "
                 f"[{format_elapsed(time.monotonic() - full_load_t0)}]",
-                use_spinner=bool(use_spinner),
             )
 
             if len(geno_chunks) == 0:

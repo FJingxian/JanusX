@@ -377,10 +377,10 @@ class _ProgressAdapter:
     """
     Progress bar adapter with rich-first rendering and tqdm fallback.
     """
-    def __init__(self, total: int, desc: str) -> None:
+    def __init__(self, total: int, desc: str, *, force_animate: bool = False) -> None:
         self.total = int(max(0, total))
         self.desc = str(desc)
-        self._animate = bool(should_animate_status(self.desc))
+        self._animate = bool(force_animate or should_animate_status(self.desc))
         self._backend = "none"
         self._progress = None
         self._task_id = None
@@ -1870,7 +1870,7 @@ def build_grm_streaming(
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
     """
     _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
-    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)")
+    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)", force_animate=True)
     process = psutil.Process()
 
     prefetch_depth = 2
@@ -2757,7 +2757,7 @@ def run_chunked_gwas_lmm_lm(
         scan_t0 = time.time()
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{effective_model_label}"
-        pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc)
+        pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc, force_animate=True)
 
         inflight: dict[
             int,
@@ -3450,7 +3450,11 @@ def run_chunked_gwas_streaming_shared(
             use_rich_multi = False
     if not use_rich_multi:
         for ctx in model_ctxs:
-            ctx["pbar"] = _ProgressAdapter(total=pbar_total, desc=str(ctx["model_label"]))
+            ctx["pbar"] = _ProgressAdapter(
+                total=pbar_total,
+                desc=str(ctx["model_label"]),
+                force_animate=True,
+            )
 
     def _metric_text(ctx: dict[str, object]) -> str:
         tick = int(ctx.get("tick", 0))

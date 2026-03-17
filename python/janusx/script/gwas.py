@@ -131,7 +131,7 @@ _WARNED_GWAS_CACHE_FALLBACK_KEYS: set[str] = set()
 _FASTLMM_PVE_LOW = 0.05
 _FASTLMM_PVE_HIGH = 0.95
 _SECTION_WIDTH = 60
-_GWAS_PROGRESS_BAR_WIDTH = 15
+_GWAS_PROGRESS_BAR_WIDTH = 30
 
 # ======================================================================
 # Basic utilities
@@ -159,7 +159,7 @@ def _format_progress_metric(
     mem_raw = str(memory_text or "").strip()
     if mem_raw != "":
         return f"[{mem_raw:>7}]"
-    return f"[{pct:5.1f}%]"
+    return f"[{pct:5.1f}% ]"
 
 
 def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:

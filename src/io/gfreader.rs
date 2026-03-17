@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use rayon::prelude::*;
 
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
@@ -328,61 +329,155 @@ impl BedChunkReader {
         let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let full_samples = self.sample_indices.len() == self.it.n_samples();
+        let can_parallel = !self.it.is_windowed();
         let mut m: usize = 0;
 
         if let Some(ref snp_indices) = self.snp_indices {
             while m < chunk_size && self.snp_pos < snp_indices.len() {
-                let snp_idx = snp_indices[self.snp_pos];
-                self.snp_pos += 1;
-                if let Some((row, mut site)) = self.it.get_snp_row_raw(snp_idx) {
-                    let mut row_sub = if full_samples {
-                        row
-                    } else {
-                        self.sample_indices.iter().map(|&i| row[i]).collect()
-                    };
-                    let keep = core::process_snp_row(
-                        &mut row_sub,
-                        &mut site.ref_allele,
-                        &mut site.alt_allele,
-                        self.maf,
-                        self.miss,
-                        self.fill_missing,
-                        self.apply_het_filter,
-                        self.het_threshold,
-                    );
-                    if keep {
+                let need = chunk_size - m;
+                let end = (self.snp_pos + need).min(snp_indices.len());
+                let batch = &snp_indices[self.snp_pos..end];
+                self.snp_pos = end;
+
+                if can_parallel {
+                    let it = &self.it;
+                    let sample_indices = &self.sample_indices;
+                    let maf = self.maf;
+                    let miss = self.miss;
+                    let fill_missing = self.fill_missing;
+                    let apply_het_filter = self.apply_het_filter;
+                    let het_threshold = self.het_threshold;
+                    let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = batch
+                        .par_iter()
+                        .map(|&snp_idx| {
+                            let (mut row_sub, mut site) = if full_samples {
+                                it.get_snp_row_raw(snp_idx)?
+                            } else {
+                                it.get_snp_row_selected_raw(snp_idx, sample_indices)?
+                            };
+                            let keep = core::process_snp_row(
+                                &mut row_sub,
+                                &mut site.ref_allele,
+                                &mut site.alt_allele,
+                                maf,
+                                miss,
+                                fill_missing,
+                                apply_het_filter,
+                                het_threshold,
+                            );
+                            if keep {
+                                Some((row_sub, site.into()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for item in decoded.into_iter().flatten() {
+                        let (row_sub, site) = item;
                         data.extend_from_slice(&row_sub);
-                        sites.push(site.into());
+                        sites.push(site);
                         m += 1;
+                    }
+                } else {
+                    for &snp_idx in batch.iter() {
+                        let maybe = if full_samples {
+                            self.it.get_snp_row_raw(snp_idx)
+                        } else {
+                            self.it.get_snp_row_selected_raw(snp_idx, &self.sample_indices)
+                        };
+                        if let Some((mut row_sub, mut site)) = maybe {
+                            let keep = core::process_snp_row(
+                                &mut row_sub,
+                                &mut site.ref_allele,
+                                &mut site.alt_allele,
+                                self.maf,
+                                self.miss,
+                                self.fill_missing,
+                                self.apply_het_filter,
+                                self.het_threshold,
+                            );
+                            if keep {
+                                data.extend_from_slice(&row_sub);
+                                sites.push(site.into());
+                                m += 1;
+                            }
+                        }
                     }
                 }
             }
         } else {
-            while m < chunk_size {
-                match self.it.next_snp_raw() {
-                    Some((row, mut site)) => {
-                        let mut row_sub = if full_samples {
-                            row
-                        } else {
-                            self.sample_indices.iter().map(|&i| row[i]).collect()
-                        };
-                        let keep = core::process_snp_row(
-                            &mut row_sub,
-                            &mut site.ref_allele,
-                            &mut site.alt_allele,
-                            self.maf,
-                            self.miss,
-                            self.fill_missing,
-                            self.apply_het_filter,
-                            self.het_threshold,
-                        );
-                        if keep {
-                            data.extend_from_slice(&row_sub);
-                            sites.push(site.into());
-                            m += 1;
-                        }
+            if can_parallel {
+                while m < chunk_size && self.it.cursor() < self.it.n_snps() {
+                    let need = chunk_size - m;
+                    let start = self.it.cursor();
+                    let end = (start + need).min(self.it.n_snps());
+                    self.it.set_cursor(end);
+                    let it = &self.it;
+                    let sample_indices = &self.sample_indices;
+                    let maf = self.maf;
+                    let miss = self.miss;
+                    let fill_missing = self.fill_missing;
+                    let apply_het_filter = self.apply_het_filter;
+                    let het_threshold = self.het_threshold;
+                    let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = (start..end)
+                        .into_par_iter()
+                        .map(|snp_idx| {
+                            let (mut row_sub, mut site) = if full_samples {
+                                it.get_snp_row_raw(snp_idx)?
+                            } else {
+                                it.get_snp_row_selected_raw(snp_idx, sample_indices)?
+                            };
+                            let keep = core::process_snp_row(
+                                &mut row_sub,
+                                &mut site.ref_allele,
+                                &mut site.alt_allele,
+                                maf,
+                                miss,
+                                fill_missing,
+                                apply_het_filter,
+                                het_threshold,
+                            );
+                            if keep {
+                                Some((row_sub, site.into()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for item in decoded.into_iter().flatten() {
+                        let (row_sub, site) = item;
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site);
+                        m += 1;
                     }
-                    None => break,
+                }
+            } else {
+                while m < chunk_size {
+                    let maybe = if full_samples {
+                        self.it.next_snp_raw()
+                    } else {
+                        self.it.next_snp_selected_raw(&self.sample_indices)
+                    };
+                    match maybe {
+                        Some((mut row_sub, mut site)) => {
+                            let keep = core::process_snp_row(
+                                &mut row_sub,
+                                &mut site.ref_allele,
+                                &mut site.alt_allele,
+                                self.maf,
+                                self.miss,
+                                self.fill_missing,
+                                self.apply_het_filter,
+                                self.het_threshold,
+                            );
+                            if keep {
+                                data.extend_from_slice(&row_sub);
+                                sites.push(site.into());
+                                m += 1;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }

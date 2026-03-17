@@ -21,7 +21,66 @@ except Exception:
     Table = None  # type: ignore[assignment]
     Text = None  # type: ignore[assignment]
     box = None  # type: ignore[assignment]
-    _HAS_RICH = False
+_HAS_RICH = False
+
+
+def _is_light_terminal() -> bool:
+    """
+    Best-effort light-background terminal detection.
+
+    Priority:
+    1) Explicit override via JANUSX_TERM_BG=light|dark
+    2) COLORFGBG (use last numeric token as background index)
+    """
+    forced = str(os.environ.get("JANUSX_TERM_BG", "")).strip().lower()
+    if forced in {"light", "white", "1", "true", "yes", "on"}:
+        return True
+    if forced in {"dark", "black", "0", "false", "no", "off"}:
+        return False
+
+    cfgbg = str(os.environ.get("COLORFGBG", "")).strip()
+    if cfgbg != "":
+        tokens = (
+            cfgbg.replace(";", " ")
+            .replace(":", " ")
+            .replace(",", " ")
+            .split()
+        )
+        ints: list[int] = []
+        for tok in tokens:
+            try:
+                ints.append(int(tok))
+            except Exception:
+                continue
+        if len(ints) > 0:
+            bg = int(ints[-1])
+            # ANSI palette convention: 0-7 dark, 8-15 bright.
+            # Treat bright backgrounds as light terminals.
+            return bool(bg >= 7)
+
+    # Conservative default: dark theme keeps existing CLI look.
+    return False
+
+
+def get_config_color_styles() -> dict[str, str]:
+    """
+    Return high-contrast style tokens for config panels.
+    """
+    if _is_light_terminal():
+        return {
+            "title": "bold",
+            "key": "bold blue",
+            "value": "default",
+            "section": "bold blue",
+            "border": "blue",
+        }
+    return {
+        "title": "bold",
+        "key": "bold cyan",
+        "value": "default",
+        "section": "bold cyan",
+        "border": "green",
+    }
 
 
 def _emit_info_to_file_handlers(logger: logging.Logger, message: str) -> None:
@@ -108,6 +167,8 @@ def _render_rich_panel(
         assert Text is not None
         assert box is not None
 
+        styles = get_config_color_styles()
+
         def _kv_table(rows: Sequence[tuple[str, str]]) -> Any:
             table = Table(
                 show_header=False,
@@ -116,8 +177,8 @@ def _render_rich_panel(
                 expand=False,
             )
             key_w = max(8, int(key_width))
-            table.add_column(style="bold cyan", no_wrap=True, width=key_w, justify="left")
-            table.add_column(style="white", no_wrap=True, justify="left")
+            table.add_column(style=styles["key"], no_wrap=True, width=key_w, justify="left")
+            table.add_column(style=styles["value"], no_wrap=True, justify="left")
             for key, val in rows:
                 key_txt = str(key)
                 val_max = max(1, int(line_max_chars) - key_w - 2)
@@ -129,23 +190,23 @@ def _render_rich_panel(
         host_txt = truncate_line(f"Host: {host}", max_chars=line_max_chars, overflow_mark=overflow_mark)
         panel_title_txt = truncate_line(config_title, max_chars=line_max_chars, overflow_mark=overflow_mark)
         parts: list[Any] = [
-            Text(app_title_txt, style="bold"),
+            Text(app_title_txt, style=styles["title"]),
             Text(host_txt),
             Text(""),
         ]
         for sec_name, sec_rows in sections:
-            parts.append(Text(str(sec_name), style="bold cyan"))
+            parts.append(Text(str(sec_name), style=styles["section"]))
             parts.append(_kv_table(sec_rows))
             parts.append(Text(""))
 
         if len(footer_rows) > 0:
-            parts.append(Text("Output", style="bold cyan"))
+            parts.append(Text("Output", style=styles["section"]))
             parts.append(_kv_table(footer_rows))
 
         panel = Panel(
             Group(*parts),
             title=panel_title_txt,
-            border_style="green",
+            border_style=styles["border"],
             expand=False,
         )
         Console().print(panel)

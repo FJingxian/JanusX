@@ -62,6 +62,15 @@ from janusx.janusx import (
 
 try:
     from janusx.janusx import (
+        lmm_reml_chunk_from_snp_f32 as _lmm_reml_chunk_from_snp_f32,
+        lmm_assoc_chunk_from_snp_f32 as _lmm_assoc_chunk_from_snp_f32,
+    )
+except Exception:
+    _lmm_reml_chunk_from_snp_f32 = None
+    _lmm_assoc_chunk_from_snp_f32 = None
+
+try:
+    from janusx.janusx import (
         glmf32_packed as _glmf32_packed,
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
@@ -458,6 +467,62 @@ def lmm_reml(
     return beta_se_p
 
 
+def lmm_reml_from_snp(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    snp_chunk: np.ndarray,
+    u_t: np.ndarray,
+    bounds: tuple,
+    max_iter: int = 30,
+    tol: float = 1e-2,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+    rotate_block_rows: int = 256,
+) -> np.ndarray:
+    """
+    REML-based LMM scan on raw SNP chunk with Rust-side rotation + association.
+    """
+    if _lmm_reml_chunk_from_snp_f32 is None:
+        # Backward compatibility: extension not rebuilt yet.
+        snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+        u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+        g_rot_chunk = snp_chunk @ u_t.T
+        return lmm_reml(
+            S,
+            utx,
+            uty,
+            g_rot_chunk,
+            bounds,
+            max_iter=max_iter,
+            tol=tol,
+            threads=threads,
+            nullml=nullml,
+        )
+
+    low, high = bounds
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    utx = np.ascontiguousarray(utx, dtype=np.float64)
+    uty = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+    beta_se_p = _lmm_reml_chunk_from_snp_f32(
+        S,
+        utx,
+        uty,
+        float(low),
+        float(high),
+        snp_chunk,
+        u_t,
+        int(max_iter),
+        float(tol),
+        int(threads),
+        None if nullml is None else float(nullml),
+        int(rotate_block_rows),
+    )
+    return beta_se_p
+
+
 def lmm_reml_null(
     S: np.ndarray,
     utx: np.ndarray,
@@ -835,6 +900,54 @@ def lmm_assoc_fixed(
     return beta_se_p
 
 
+def lmm_assoc_fixed_from_snp(
+    S: np.ndarray,
+    utx: np.ndarray,
+    uty: np.ndarray,
+    log10_lbd: float,
+    snp_chunk: np.ndarray,
+    u_t: np.ndarray,
+    threads: int = 4,
+    nullml: Optional[float] = None,
+    rotate_block_rows: int = 512,
+) -> np.ndarray:
+    """
+    Fixed-lambda LMM scan on raw SNP chunk with Rust-side rotation + association.
+    """
+    if _lmm_assoc_chunk_from_snp_f32 is None:
+        # Backward compatibility: extension not rebuilt yet.
+        snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+        u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+        g_rot_chunk = snp_chunk @ u_t.T
+        return lmm_assoc_fixed(
+            S,
+            utx,
+            uty,
+            log10_lbd,
+            g_rot_chunk,
+            threads=threads,
+            nullml=nullml,
+        )
+
+    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
+    Xcov = np.ascontiguousarray(utx, dtype=np.float64)
+    y_rot = np.ascontiguousarray(uty, dtype=np.float64).ravel()
+    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
+    u_t = np.ascontiguousarray(u_t, dtype=np.float32)
+    beta_se_p = _lmm_assoc_chunk_from_snp_f32(
+        S,
+        Xcov,
+        y_rot,
+        float(log10_lbd),
+        snp_chunk,
+        u_t,
+        int(threads),
+        None if nullml is None else float(nullml),
+        int(rotate_block_rows),
+    )
+    return beta_se_p
+
+
 class LMM:
     """
     Fast LMM GWAS using eigen-decomposition of kinship + REML per SNP (Rust).
@@ -923,6 +1036,24 @@ class LMM:
         else:
             self.bounds = (np.log10(lbd_null) - 2, np.log10(lbd_null) + 2)
 
+    @classmethod
+    def from_lmm(cls, other: "LMM") -> "LMM":
+        """
+        Create a lightweight model clone that reuses precomputed EVD/rotations.
+        """
+        obj = cls.__new__(cls)
+        obj.S = other.S
+        obj.Dh = other.Dh
+        obj.Xcov = other.Xcov
+        obj.y = other.y
+        obj.lbd_null = other.lbd_null
+        obj.pve = other.pve
+        obj.LL0 = other.LL0
+        obj.ML0 = other.ML0
+        obj.bounds = other.bounds
+        obj.evd_secs = float(getattr(other, "evd_secs", 0.0))
+        return obj
+
     def _NULLREML(self, lbd: float) -> float:
         """
         Restricted Maximum Likelihood (REML) for the null model (no SNP effect).
@@ -985,12 +1116,12 @@ class LMM:
         beta_se_p : np.ndarray, shape (m, 4)
             Per-SNP beta, se, pwald, plrt.
         """
-        g_rot_chunk = snp @ self.Dh.T
-        beta_se_p = lmm_reml(
+        beta_se_p = lmm_reml_from_snp(
             self.S,
             self.Xcov,
             self.y,
-            g_rot_chunk,
+            snp,
+            self.Dh,
             self.bounds,
             max_iter=30,
             tol=1e-2,
@@ -1010,13 +1141,13 @@ class FastLMM(LMM):
             return super().gwas(snp, threads=threads)
 
         log10_lbd = float(np.log10(self.lbd_null))
-        g_rot_chunk = snp @ self.Dh.T
-        beta_se_p = lmm_assoc_fixed(
+        beta_se_p = lmm_assoc_fixed_from_snp(
             self.S,
             self.Xcov,
             self.y,
             log10_lbd,
-            g_rot_chunk,
+            snp,
+            self.Dh,
             threads=threads,
             nullml=self.ML0,
         )

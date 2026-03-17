@@ -2714,9 +2714,18 @@ def run_chunked_gwas_lmm_lm(
         scan_threads = int(threads)
         if scan_threads <= 0:
             scan_threads = int(n_cores)
-        max_inflight = 2 if scan_threads >= 2 else 1
-        workers = max(1, max_inflight)
-        threads_per_worker = max(1, scan_threads // workers)
+        if model_key == "fastlmm":
+            # FastLMM is often decode/write bound; prefer one in-flight chunk
+            # so the kernel can use all configured threads.
+            max_inflight = 1
+            workers = 1
+            threads_per_worker = max(1, scan_threads)
+            prefetch_depth = 2 if scan_threads >= 2 else 1
+        else:
+            max_inflight = 2 if scan_threads >= 2 else 1
+            workers = max(1, max_inflight)
+            threads_per_worker = max(1, scan_threads // workers)
+            prefetch_depth = 1
 
         process.cpu_percent(interval=None)
         scan_t0 = time.time()
@@ -2728,16 +2737,69 @@ def run_chunked_gwas_lmm_lm(
             int,
             tuple[cf.Future, int, list[tuple[str, int, str, str]], np.ndarray],
         ] = {}
-        ready_rows: dict[int, tuple[pd.DataFrame, int]] = {}
+        ready_rows: dict[int, tuple[str, bool, int, int]] = {}
         chunk_seq = 0
         next_write_seq = 0
         interrupted = False
 
-        def _build_chunk_df(
+        class _ChunkBatchWriter:
+            """
+            Lightweight batch writer for GWAS TSV rows.
+            Buffers multiple chunks and flushes in one file append call.
+            """
+
+            def __init__(self, path: str, *, batch_chunks: int = 8) -> None:
+                self.path = str(path)
+                self.batch_chunks = max(1, int(batch_chunks))
+                self._parts: list[str] = []
+                self._has_plrt: Optional[bool] = None
+                self._wrote_header = False
+                self.rows_written = 0
+
+            def append(self, text: str, *, has_plrt: bool, rows: int) -> None:
+                n_rows = int(rows)
+                if n_rows <= 0:
+                    return
+                hp = bool(has_plrt)
+                if self._has_plrt is None:
+                    self._has_plrt = hp
+                elif self._has_plrt != hp:
+                    raise ValueError(
+                        "Inconsistent result columns across chunks while writing GWAS TSV."
+                    )
+                self._parts.append(str(text))
+                self.rows_written += n_rows
+                if len(self._parts) >= self.batch_chunks:
+                    self.flush()
+
+            def flush(self) -> None:
+                if len(self._parts) == 0:
+                    return
+                mode = "a" if self._wrote_header else "w"
+                with open(self.path, mode, encoding="utf-8", newline="") as fh:
+                    if not self._wrote_header:
+                        header = "chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald"
+                        if bool(self._has_plrt):
+                            header += "\tplrt"
+                        fh.write(header + "\n")
+                        self._wrote_header = True
+                    fh.write("".join(self._parts))
+                self._parts.clear()
+
+            @property
+            def wrote_header(self) -> bool:
+                return bool(self._wrote_header)
+
+        writer = _ChunkBatchWriter(str(tmp_tsv), batch_chunks=8)
+
+        def _format_chunk_tsv_text(
             results: np.ndarray,
             info_chunk: list[tuple[str, int, str, str]],
             maf_chunk: np.ndarray,
-        ) -> pd.DataFrame:
+        ) -> tuple[str, bool, int]:
+            if len(info_chunk) == 0:
+                return "", bool(np.asarray(results).shape[1] > 3), 0
+
             chroms, poss, allele0, allele1 = zip(*info_chunk)
             allele0_list = list(allele0)
             allele1_list = list(allele1)
@@ -2745,39 +2807,37 @@ def run_chunked_gwas_lmm_lm(
                 allele0_list, allele1_list = _transform_allele_labels(
                     allele0_list, allele1_list, genetic_model
                 )
-            chunk_df = pd.DataFrame(
-                {
-                    "chrom": chroms,
-                    "pos": poss,
-                    "allele0": allele0_list,
-                    "allele1": allele1_list,
-                    "maf": maf_chunk,
-                    "beta": results[:, 0],
-                    "se": results[:, 1],
-                    "pwald": results[:, 2],
-                }
-            )
-            if results.shape[1] > 3:
-                chunk_df["plrt"] = results[:, 3]
-                chunk_df["plrt"] = chunk_df["plrt"].map(lambda x: f"{x:.4e}")
-            chunk_df["pos"] = chunk_df["pos"].astype(int)
-            chunk_df["pwald"] = chunk_df["pwald"].map(lambda x: f"{x:.4e}")
-            return chunk_df
+            res = np.asarray(results, dtype=np.float64)
+            cols = [
+                np.asarray(chroms, dtype=object),
+                np.asarray(poss, dtype=np.int64).astype(str),
+                np.asarray(allele0_list, dtype=object),
+                np.asarray(allele1_list, dtype=object),
+                np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
+                np.char.mod("%.4f", res[:, 0]),
+                np.char.mod("%.4f", res[:, 1]),
+                np.char.mod("%.4e", res[:, 2]),
+            ]
+            has_plrt = bool(res.shape[1] > 3)
+            if has_plrt:
+                cols.append(np.char.mod("%.4e", res[:, 3]))
+            rows = np.column_stack(cols)
+            text = "\n".join("\t".join(map(str, row)) for row in rows)
+            if text:
+                text += "\n"
+            return text, has_plrt, int(rows.shape[0])
 
         def _write_ready_chunks() -> None:
             nonlocal next_write_seq, wrote_header, has_results, done_snps, peak_rss
             while next_write_seq in ready_rows:
-                chunk_df, m_chunk = ready_rows.pop(next_write_seq)
-                chunk_df.to_csv(
-                    tmp_tsv,
-                    sep="\t",
-                    float_format="%.4f",
-                    index=False,
-                    header=not wrote_header,
-                    mode="w" if not wrote_header else "a",
+                chunk_text, has_plrt, n_rows, m_chunk = ready_rows.pop(next_write_seq)
+                writer.append(
+                    chunk_text,
+                    has_plrt=has_plrt,
+                    rows=n_rows,
                 )
-                wrote_header = True
-                has_results = True
+                wrote_header = bool(writer.wrote_header)
+                has_results = int(writer.rows_written) > 0
 
                 done_snps += m_chunk
                 pbar.update(m_chunk)
@@ -2810,12 +2870,17 @@ def run_chunked_gwas_lmm_lm(
             for seq in done_seq:
                 fut, m_chunk, info_chunk, maf_chunk = inflight.pop(seq)
                 results = fut.result()
-                ready_rows[seq] = (_build_chunk_df(results, info_chunk, maf_chunk), m_chunk)
+                chunk_text, has_plrt, n_rows = _format_chunk_tsv_text(
+                    results,
+                    info_chunk,
+                    maf_chunk,
+                )
+                ready_rows[seq] = (chunk_text, has_plrt, n_rows, m_chunk)
             _write_ready_chunks()
 
         ex = cf.ThreadPoolExecutor(max_workers=workers)
         try:
-            for genosub, sites in load_genotype_chunks(
+            chunk_iter = load_genotype_chunks(
                 genofile,
                 model_chunk_size,
                 maf_threshold,
@@ -2825,7 +2890,8 @@ def run_chunked_gwas_lmm_lm(
                 snps_only=bool(snps_only),
                 sample_ids=sample_sub,
                 mmap_window_mb=mmap_window_mb,
-            ):
+            )
+            for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
                 genosub: np.ndarray
                 if genosub.shape[1] != expected_n:
                     # Backward-compatible fallback: if backend ignored sample_ids and
@@ -2861,8 +2927,10 @@ def run_chunked_gwas_lmm_lm(
                     maf_chunk = (maf_chunk / 2).astype(np.float32, copy=False)
                 else:
                     maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-                geno_center = geno_model - np.mean(
-                    geno_model, axis=1, dtype=np.float32, keepdims=True
+                # In-place centering avoids one extra (m_chunk, n_samples) allocation.
+                geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
+                geno_center -= np.mean(
+                    geno_center, axis=1, dtype=np.float32, keepdims=True
                 )
                 fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
                 inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
@@ -2876,6 +2944,9 @@ def run_chunked_gwas_lmm_lm(
             while len(inflight) > 0:
                 _drain_completed(wait_for_one=True)
             _write_ready_chunks()
+            writer.flush()
+            wrote_header = bool(writer.wrote_header)
+            has_results = int(writer.rows_written) > 0
             pbar.finish()
         except KeyboardInterrupt:
             interrupted = True
@@ -3197,6 +3268,9 @@ def run_chunked_gwas_streaming_shared(
         return buf.getvalue(), has_plrt
 
     model_label_map = {"lmm": "LMM", "lm": "LM", "fastlmm": "FastLMM"}
+    share_evd_lmm_fast = ("lmm" in model_order) and ("fastlmm" in model_order)
+    shared_lmm_model: Optional[LMM] = None
+    shared_ksub: Optional[np.ndarray] = None
     model_ctxs: list[dict[str, object]] = []
     for mkey in model_order:
         ModelCls = model_map[mkey]
@@ -3231,13 +3305,27 @@ def run_chunked_gwas_streaming_shared(
         if mkey in {"lmm", "fastlmm"}:
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
-            Ksub = grm[np.ix_(sameidx, sameidx)]
-            with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
-                mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
-            evd_secs = max(time.monotonic() - init_t0, 0.0)
-            evd_elapsed = format_elapsed(evd_secs)
-            ctx["evd_secs"] = float(evd_secs)
-            ctx["init_log"] = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+            if (
+                mkey == "fastlmm"
+                and share_evd_lmm_fast
+                and shared_lmm_model is not None
+            ):
+                mod = FastLMM.from_lmm(shared_lmm_model)
+                ctx["evd_secs"] = 0.0
+                ctx["init_log"] = (
+                    f"PVE(null) ~ {mod.pve:.3f}; reusing shared eigen-decomposition from LMM"
+                )
+            else:
+                if shared_ksub is None:
+                    shared_ksub = grm[np.ix_(sameidx, sameidx)]
+                with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
+                    mod = ModelCls(y=y_vec, X=X_cov, kinship=shared_ksub)
+                evd_secs = max(time.monotonic() - init_t0, 0.0)
+                evd_elapsed = format_elapsed(evd_secs)
+                ctx["evd_secs"] = float(evd_secs)
+                ctx["init_log"] = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
+                if mkey == "lmm" and share_evd_lmm_fast:
+                    shared_lmm_model = mod
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             ctx["init_log"] = "streaming scan initialized"
@@ -3388,8 +3476,10 @@ def run_chunked_gwas_streaming_shared(
                 maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
             else:
                 maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-            geno_center = geno_model - np.mean(
-                geno_model, axis=1, dtype=np.float32, keepdims=True
+            # In-place centering avoids one extra (m_chunk, n_samples) allocation.
+            geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
+            geno_center -= np.mean(
+                geno_center, axis=1, dtype=np.float32, keepdims=True
             )
 
             for ctx in model_ctxs:

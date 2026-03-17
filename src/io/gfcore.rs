@@ -933,6 +933,17 @@ pub struct BedSnpIter {
     het_threshold: f32,
 }
 
+#[inline]
+fn bed_code_to_dosage(code: u8) -> f32 {
+    match code {
+        0b00 => 0.0,
+        0b10 => 1.0,
+        0b11 => 2.0,
+        0b01 => -9.0,
+        _ => -9.0,
+    }
+}
+
 impl BedSnpIter {
     pub fn new_with_fill(
         prefix: &str,
@@ -1132,13 +1143,7 @@ impl BedSnpIter {
                     break;
                 }
                 let code = (byte >> (within * 2)) & 0b11;
-                row[samp_idx] = match code {
-                    0b00 => 0.0,
-                    0b10 => 1.0,
-                    0b11 => 2.0,
-                    0b01 => -9.0,
-                    _ => -9.0,
-                };
+                row[samp_idx] = bed_code_to_dosage(code);
             }
         }
 
@@ -1149,6 +1154,35 @@ impl BedSnpIter {
     /// 随机访问解码某个 SNP（用于并行）
     pub fn get_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
         self.decode_snp_row_raw(snp_idx)
+    }
+
+    /// Random access + decode only selected samples (in requested order).
+    pub fn get_snp_row_selected_raw(
+        &self,
+        snp_idx: usize,
+        sample_indices: &[usize],
+    ) -> Option<(Vec<f32>, SiteInfo)> {
+        if sample_indices.len() == self.n_samples {
+            return self.decode_snp_row_raw(snp_idx);
+        }
+        if snp_idx >= self.n_snps {
+            return None;
+        }
+        if self.window_snps.is_some() {
+            panic!("windowed mmap does not support random SNP access");
+        }
+        let snp_bytes = self.snp_bytes(snp_idx)?;
+        let mut row: Vec<f32> = vec![-9.0; sample_indices.len()];
+        for (out_i, &samp_idx) in sample_indices.iter().enumerate() {
+            if samp_idx >= self.n_samples {
+                return None;
+            }
+            let byte = snp_bytes[samp_idx >> 2];
+            let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
+            row[out_i] = bed_code_to_dosage(code);
+        }
+        let site = self.sites[snp_idx].clone();
+        Some((row, site))
     }
 
     /// 随机访问并按迭代器参数过滤 SNP
@@ -1174,6 +1208,22 @@ impl BedSnpIter {
 
     pub fn n_samples(&self) -> usize {
         self.n_samples
+    }
+
+    pub fn n_snps(&self) -> usize {
+        self.n_snps
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cur
+    }
+
+    pub fn set_cursor(&mut self, idx: usize) {
+        self.cur = idx.min(self.n_snps);
+    }
+
+    pub fn is_windowed(&self) -> bool {
+        self.window_snps.is_some()
     }
 
     pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {
@@ -1204,14 +1254,49 @@ impl BedSnpIter {
                         break;
                     }
                     let code = (byte >> (within * 2)) & 0b11;
-                    row[samp_idx] = match code {
-                        0b00 => 0.0,
-                        0b10 => 1.0,
-                        0b11 => 2.0,
-                        0b01 => -9.0,
-                        _ => -9.0,
-                    };
+                    row[samp_idx] = bed_code_to_dosage(code);
                 }
+            }
+
+            let site = self.sites[snp_idx].clone();
+            return Some((row, site));
+        }
+        None
+    }
+
+    pub fn next_snp_selected_raw(
+        &mut self,
+        sample_indices: &[usize],
+    ) -> Option<(Vec<f32>, SiteInfo)> {
+        if sample_indices.len() == self.n_samples {
+            return self.next_snp_raw();
+        }
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+
+            let mut row: Vec<f32> = vec![-9.0; sample_indices.len()];
+            for (out_i, &samp_idx) in sample_indices.iter().enumerate() {
+                if samp_idx >= self.n_samples {
+                    return None;
+                }
+                let byte = snp_bytes[samp_idx >> 2];
+                let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
+                row[out_i] = bed_code_to_dosage(code);
             }
 
             let site = self.sites[snp_idx].clone();

@@ -1,4 +1,5 @@
 use nalgebra::{DMatrix, DVector};
+use matrixmultiply::sgemm;
 use numpy::PyArray1;
 use numpy::PyReadonlyArray3;
 use numpy::PyUntypedArrayMethods;
@@ -3025,6 +3026,201 @@ pub fn lmm_reml_chunk_f32<'py>(
     Ok(beta_se_p)
 }
 
+#[inline]
+fn rotate_snp_block_with_ut(
+    snp_block: &[f32],
+    rows: usize,
+    n: usize,
+    u_t: &[f32],
+    out_block: &mut [f32],
+) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    // C(rows, n) = A(rows, n) * U(n, n)
+    // We store U^T in row-major (`u_t`). For matrixmultiply strides, expose U by
+    // setting B row stride = 1 and col stride = n, i.e. B(i,j)=u_t[j*n + i].
+    unsafe {
+        sgemm(
+            rows,
+            n,
+            n,
+            1.0,
+            snp_block.as_ptr(),
+            n as isize,
+            1,
+            u_t.as_ptr(),
+            1,
+            n as isize,
+            0.0,
+            out_block.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, max_iter=50, tol=1e-2, threads=0, nullml=None, rotate_block_rows=256))]
+pub fn lmm_reml_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let snp_arr = snp_chunk.as_array();
+    let ut_arr = u_t.as_array();
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if snp_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m_chunk, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("u_t must be (n, n) and row-major U^T"));
+    }
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+
+    let m_chunk = snp_arr.shape()[0];
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let out_cols = if with_plrt { 4 } else { 3 };
+
+    let beta_se_p = PyArray2::<f64>::zeros(py, [m_chunk, out_cols], false).into_bound();
+    let beta_se_p_slice: &mut [f64] = unsafe {
+        beta_se_p
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("beta_se_p not contiguous"))?
+    };
+
+    // Keep same behavior as lmm_reml_chunk_f32: dedicated pool can be faster here.
+    let pool = if threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let block_rows = rotate_block_rows.max(1);
+
+    py.detach(|| {
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+
+        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            out_block
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; n],
+                    |snp_vec, (idx, out_row)| {
+                        let row = &g_block[idx * n..(idx + 1) * n];
+                        for i in 0..n {
+                            snp_vec[i] = row[i] as f64;
+                        }
+
+                        let (best_log10_lbd, _best_cost) = brent_minimize(
+                            |x| -reml_loglike(x, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
+                            low,
+                            high,
+                            tol,
+                            max_iter,
+                        );
+
+                        let (beta, se, _lbd) =
+                            final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
+
+                        let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                            let z = beta / se;
+                            (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        out_row[2] = if p.is_finite() { p } else { 1.0 };
+
+                        if with_plrt {
+                            let ml = ml_loglike(
+                                best_log10_lbd,
+                                s,
+                                &xcov_flat,
+                                y,
+                                Some(&snp_vec[..]),
+                                n,
+                                p_cov,
+                            );
+                            out_row[3] = if ml.is_finite() {
+                                let mut stat = 2.0 * (ml - nullml_val);
+                                if !stat.is_finite() || stat < 0.0 {
+                                    stat = 0.0;
+                                }
+                                chi2_sf_df1(stat)
+                            } else {
+                                1.0
+                            };
+                        }
+                    },
+                );
+        };
+
+        let mut start = 0usize;
+        while start < m_chunk {
+            let rows = (m_chunk - start).min(block_rows);
+            let snp_block = &snp_flat[start * n..(start + rows) * n];
+            let rot_block = &mut rot_buf[..rows * n];
+            rotate_snp_block_with_ut(snp_block, rows, n, &ut_flat, rot_block);
+
+            let out_block = &mut beta_se_p_slice[start * out_cols..(start + rows) * out_cols];
+            if let Some(tp) = &pool {
+                tp.install(|| run_rows(rot_block, out_block));
+            } else {
+                run_rows(rot_block, out_block);
+            }
+            start += rows;
+        }
+    });
+
+    Ok(beta_se_p)
+}
+
 // ------------------------------------------------------------
 // Helpers: dot loops
 // ------------------------------------------------------------
@@ -3457,6 +3653,246 @@ pub fn lmm_assoc_chunk_f32<'py>(
             tp.install(run);
         } else {
             run();
+        }
+    });
+
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd, snp_chunk, u_t, threads=0, nullml=None, rotate_block_rows=512))]
+pub fn lmm_assoc_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let snp_arr = snp_chunk.as_array();
+    let ut_arr = u_t.as_array();
+
+    let n = y.len();
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
+    }
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+    if snp_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err("u_t must be (n, n) and row-major U^T"));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return Err(PyRuntimeError::new_err("invalid log10_lbd"));
+    }
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let out_cols = if with_plrt { 4 } else { 3 };
+
+    let m = snp_arr.shape()[0];
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let xcov_slice: &[f64] = xcov
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let p = p_cov;
+
+    // Build weights W = V^{-1} = 1/(s + lbd) (store as f32 to reduce bandwidth)
+    let mut w = vec![0.0_f32; n];
+    let mut log_det_v = 0.0_f64;
+    for i in 0..n {
+        let vv = s[i] + lbd;
+        if vv <= 0.0 {
+            return Err(PyRuntimeError::new_err("non-positive s[i]+lbd"));
+        }
+        w[i] = (1.0 / vv) as f32;
+        log_det_v += vv.ln();
+    }
+
+    let n_f = n as f64;
+    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+
+    // Precompute A = X'WX, b = X'Wy, yWy
+    let mut a = vec![0.0_f64; p * p];
+    let mut b = vec![0.0_f64; p];
+    let mut ywy = 0.0_f64;
+
+    for i in 0..n {
+        let wi = w[i] as f64;
+        let yi = y[i];
+        ywy += wi * yi * yi;
+
+        let base = i * p;
+        for r in 0..p {
+            let xir = xcov_slice[base + r];
+            b[r] += wi * xir * yi;
+            for c in 0..=r {
+                let xic = xcov_slice[base + c];
+                a[r * p + c] += wi * xir * xic;
+            }
+        }
+    }
+
+    // symmetrize + ridge
+    let ridge = 1e-6;
+    for r in 0..p {
+        a[r * p + r] += ridge;
+        for c in 0..r {
+            let vrc = a[r * p + c];
+            a[c * p + r] = vrc;
+        }
+    }
+
+    // Cholesky(A) in-place; now a stores L
+    if cholesky_inplace(&mut a, p).is_none() {
+        return Err(PyRuntimeError::new_err("X'WX not SPD"));
+    }
+
+    // Solve A^{-1} b once (no-alloc version into tmp)
+    let mut a_inv_b = vec![0.0_f64; p];
+    cholesky_solve_into(&a, p, &b, &mut a_inv_b);
+
+    // b'A^{-1}b is constant
+    let b_aib = dot_loop(&b, &a_inv_b);
+
+    let df = (n as i32) - (p as i32) - 1;
+    if df <= 0 {
+        return Err(PyRuntimeError::new_err("df <= 0"));
+    }
+
+    let pool = get_cached_pool(threads)?;
+    let block_rows = rotate_block_rows.max(1);
+
+    py.detach(|| {
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+
+        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            out_block
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || AssocScratch::new(p),
+                    |scr, (idx, out_row)| {
+                        scr.reset();
+                        let row = &g_block[idx * n..(idx + 1) * n];
+
+                        // c = X'Wg , d = g'Wg, e = g'Wy
+                        let mut d = 0.0_f64;
+                        let mut e = 0.0_f64;
+
+                        for i in 0..n {
+                            let gi = row[i] as f64;
+                            let wi = w[i] as f64;
+                            let yi = y[i];
+                            let base = i * p;
+
+                            let wgi = wi * gi;
+                            d += wgi * gi;
+                            e += wgi * yi;
+
+                            for r in 0..p {
+                                scr.c[r] += wgi * xcov_slice[base + r];
+                            }
+                        }
+
+                        cholesky_solve_into(&a, p, &scr.c, &mut scr.a_inv_c);
+                        let ct_aic = dot_loop(&scr.c, &scr.a_inv_c);
+                        let schur = d - ct_aic;
+
+                        if schur <= 1e-12 || !schur.is_finite() {
+                            out_row[0] = f64::NAN;
+                            out_row[1] = f64::NAN;
+                            out_row[2] = f64::NAN;
+                            return;
+                        }
+
+                        let mut ct_aib = 0.0_f64;
+                        for r in 0..p {
+                            ct_aib += scr.c[r] * a_inv_b[r];
+                        }
+
+                        let num = e - ct_aib;
+                        let beta_g = num / schur;
+
+                        let q = b_aib + (num * num) / schur;
+                        let rwr = (ywy - q).max(0.0);
+                        let sigma2 = rwr / (df as f64);
+
+                        let se_g = (sigma2 / schur).sqrt();
+                        let pval = if se_g.is_finite() && se_g > 0.0 && beta_g.is_finite() {
+                            let z = (beta_g / se_g).abs();
+                            (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        out_row[0] = beta_g;
+                        out_row[1] = se_g;
+                        out_row[2] = pval;
+                        if with_plrt {
+                            let ml = if rwr > 0.0 && rwr.is_finite() {
+                                let total_log = n_f * rwr.ln() + log_det_v;
+                                c_ml - 0.5 * total_log
+                            } else {
+                                f64::NAN
+                            };
+                            let mut stat = if ml.is_finite() {
+                                2.0 * (ml - nullml_val)
+                            } else {
+                                0.0
+                            };
+                            if !stat.is_finite() || stat < 0.0 {
+                                stat = 0.0;
+                            }
+                            out_row[3] = chi2_sf_df1(stat);
+                        }
+                    },
+                );
+        };
+
+        let mut start = 0usize;
+        while start < m {
+            let rows = (m - start).min(block_rows);
+            let snp_block = &snp_flat[start * n..(start + rows) * n];
+            let rot_block = &mut rot_buf[..rows * n];
+            rotate_snp_block_with_ut(snp_block, rows, n, &ut_flat, rot_block);
+
+            let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
+            if let Some(tp) = &pool {
+                tp.install(|| run_rows(rot_block, out_block));
+            } else {
+                run_rows(rot_block, out_block);
+            }
+            start += rows;
         }
     });
 

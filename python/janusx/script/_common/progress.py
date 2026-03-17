@@ -62,12 +62,22 @@ def build_rich_progress(
     assert SpinnerColumn is not None
     assert TextColumn is not None
 
-    columns: list[object] = [
-        SpinnerColumn(
-            spinner_name=get_rich_spinner_name(),
+    spinner_name = get_rich_spinner_name()
+    try:
+        spinner_col = SpinnerColumn(
+            spinner_name=spinner_name,
             style="cyan",
             finished_text=str(finished_text),
-        ),
+        )
+    except Exception:
+        # Absolute fallback for environment-specific Rich spinner registries.
+        spinner_col = SpinnerColumn(
+            spinner_name="line",
+            style="cyan",
+            finished_text=str(finished_text),
+        )
+    columns: list[object] = [
+        spinner_col,
         TextColumn(str(description_template)),
     ]
     if show_bar:

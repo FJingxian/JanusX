@@ -21,6 +21,7 @@ except Exception:
 
 _SPINNER_NAME = "janusx_ascii"
 _SPINNER_FRAMES = ["|", "/", "-", "\\"]
+_SPINNER_FALLBACKS = ("line", "dots", "simpleDots", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
@@ -154,16 +155,33 @@ def spinner_refresh_interval(seconds: Optional[float]) -> float:
 def ensure_rich_spinner_registered() -> None:
     if not _HAS_RICH:
         return
-    if _SPINNER_NAME not in SPINNERS:
-        SPINNERS[_SPINNER_NAME] = {
-            "interval": 80,
-            "frames": _SPINNER_FRAMES,
-        }
+    try:
+        if _SPINNER_NAME not in SPINNERS:
+            SPINNERS[_SPINNER_NAME] = {
+                "interval": 80,
+                "frames": _SPINNER_FRAMES,
+            }
+    except Exception:
+        # Some Rich builds may expose a non-mutable spinner registry.
+        # In that case we silently fall back to a built-in spinner name.
+        return
+
+
+def _resolve_spinner_name(preferred: str) -> str:
+    if (not _HAS_RICH) or (not hasattr(SPINNERS, "__contains__")):
+        return "line"
+    if str(preferred) in SPINNERS:
+        return str(preferred)
+    for name in _SPINNER_FALLBACKS:
+        if name in SPINNERS:
+            return name
+    # Last-resort built-in name; Rich will usually have it.
+    return "line"
 
 
 def get_rich_spinner_name() -> str:
     ensure_rich_spinner_registered()
-    return JANUSX_SPINNER_NAME
+    return _resolve_spinner_name(JANUSX_SPINNER_NAME)
 
 
 def _console_for_print(*, force_color: bool) -> Optional["Console"]:
@@ -362,7 +380,7 @@ class CliStatus:
                 self._console = Console()
                 self._status_cm = self._console.status(
                     self._running_line(),
-                    spinner=_SPINNER_NAME,
+                    spinner=get_rich_spinner_name(),
                     spinner_style="cyan",
                 )
                 self._status_cm.__enter__()

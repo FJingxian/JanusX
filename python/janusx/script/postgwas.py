@@ -45,6 +45,7 @@ from ._common.status import (
 )
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.config_render import get_config_color_styles
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -235,6 +236,8 @@ def _render_postgwas_config_rich(
         assert Text is not None
         assert box is not None
 
+        styles = get_config_color_styles()
+
         def _kv_table(rows: list[tuple[str, str]]) -> Any:
             t = Table(
                 show_header=False,
@@ -243,8 +246,8 @@ def _render_postgwas_config_rich(
                 expand=False,
             )
             key_w = max(8, int(key_width))
-            t.add_column(style="bold cyan", no_wrap=True, width=key_w, justify="left")
-            t.add_column(style="white", no_wrap=True, justify="left")
+            t.add_column(style=styles["key"], no_wrap=True, width=key_w, justify="left")
+            t.add_column(style=styles["value"], no_wrap=True, justify="left")
             for k, v in rows:
                 k_txt = str(k)
                 v_max = max(1, _CONFIG_LINE_MAX_CHARS - key_w - 2)
@@ -253,10 +256,10 @@ def _render_postgwas_config_rich(
             return t
 
         parts: list[Any] = [
-            Text(title, style="bold"),
+            Text(title, style=styles["title"]),
             Text(f"Host: {host}"),
             Text(""),
-            Text("General", style="bold cyan"),
+            Text("General", style=styles["section"]),
             _kv_table(base_rows),
         ]
 
@@ -267,35 +270,35 @@ def _render_postgwas_config_rich(
                 pad_edge=False,
                 expand=True,
             )
-            map_table.add_column("ID", style="bold cyan", no_wrap=True, width=6)
-            map_table.add_column("GWAS file", style="white")
+            map_table.add_column("ID", style=styles["key"], no_wrap=True, width=6)
+            map_table.add_column("GWAS file", style=styles["value"])
             for idx, file in merge_map_rows:
                 idx_txt = str(idx)
                 file_max = max(1, _CONFIG_LINE_MAX_CHARS - len(idx_txt) - 1)
                 map_table.add_row(idx_txt, _truncate_config_line(file, max_chars=file_max))
-            parts.extend([Text(""), Text("Merge trait-id mapping", style="bold cyan"), map_table])
+            parts.extend([Text(""), Text("Merge trait-id mapping", style=styles["section"]), map_table])
 
         parts.append(Text(""))
         if vis_rows is None:
-            parts.extend([Text("Visualization", style="bold cyan"), Text("disabled", style="white")])
+            parts.extend([Text("Visualization", style=styles["section"]), Text("disabled", style=styles["value"])])
         else:
-            parts.extend([Text("Visualization", style="bold cyan"), _kv_table(vis_rows)])
+            parts.extend([Text("Visualization", style=styles["section"]), _kv_table(vis_rows)])
 
         if anno_rows is not None:
-            parts.extend([Text(""), Text("Annotation", style="bold cyan"), _kv_table(anno_rows)])
+            parts.extend([Text(""), Text("Annotation", style=styles["section"]), _kv_table(anno_rows)])
 
         parts.extend(
             [
                 Text(""),
-                Text(_truncate_config_line(f"Output prefix: {output_prefix}"), style="white"),
-                Text(_truncate_config_line(f"Threads: {threads_text}"), style="white"),
+                Text(_truncate_config_line(f"Output prefix: {output_prefix}"), style=styles["value"]),
+                Text(_truncate_config_line(f"Threads: {threads_text}"), style=styles["value"]),
             ]
         )
 
         panel = Panel(
             Group(*parts),
             title="POST-GWAS CONFIG",
-            border_style="green",
+            border_style=styles["border"],
             expand=False,
         )
         Console().print(panel)

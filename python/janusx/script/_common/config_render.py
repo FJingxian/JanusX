@@ -134,7 +134,15 @@ def truncate_line(
 
 def _is_path_like_key(key: str) -> bool:
     k = str(key).strip().lower()
-    markers = ("file", "path", "prefix", "dir", "folder")
+    markers = (
+        "file",
+        "path",
+        "prefix",
+        "dir",
+        "folder",
+        "genotype",
+        "phenotype",
+    )
     return any(m in k for m in markers)
 
 
@@ -226,8 +234,20 @@ def emit_cli_configuration(
     line_max_chars: int = 60,
     overflow_mark: str = "***",
 ) -> None:
+    def _dedupe_rows(rows: Sequence[tuple[str, object]]) -> list[tuple[str, object]]:
+        out: list[tuple[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for key, val in rows:
+            pair = (str(key), str(val))
+            if pair in seen:
+                continue
+            seen.add(pair)
+            out.append((str(key), val))
+        return out
+
     sec_norm: list[tuple[str, list[tuple[str, str]]]] = []
     for sec_name, sec_rows in sections:
+        sec_rows = _dedupe_rows(sec_rows)
         rows_str = [
             (str(k), _format_config_value_for_display(str(k), v))
             for k, v in sec_rows

@@ -402,7 +402,8 @@ Key options:
 - Inputs: `-vcf/-hmp/-bfile/-file`, `-p`.
 - Trait selector: `-n`.
 - Gene-set/annotation: `-g`, `-gff`, `-forceset`.
-- Model control: `-vartype`, `-step`, `-ext`, `-nsnp`, `-nestimators`.
+- Model control: `-step` (default: `-ext/2`), `-ext`, `-nsnp`, `-nestimators`.
+- Phenotype type is auto-detected per trait (`binary` vs `continuous`).
 - Performance: `-t`, `-mmap-limit`.
 
 Outputs:

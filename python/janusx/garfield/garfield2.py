@@ -1,4 +1,6 @@
 import os
+import sys
+from threading import Event, Thread
 from typing import Any, List, Literal, Tuple, Union, Optional
 from joblib import Parallel, delayed
 import numpy as np
@@ -10,7 +12,88 @@ from janusx.gfreader import (
     load_bed_2bit_packed,
 )
 from janusx.garfield.logreg import logreg
-from tqdm import tqdm
+try:
+    from janusx.script._common.progress import ProgressAdapter as _CliProgressAdapter
+except Exception:
+    _CliProgressAdapter = None
+
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:
+    _tqdm = None
+
+
+_TQDM_SPINNER_FRAMES: tuple[str, ...] = ("/", "-", "\\", "|")
+_TQDM_REFRESH_SECONDS = 0.3
+_TQDM_GREEN = "\033[32m"
+_TQDM_RESET = "\033[0m"
+
+
+class _TqdmSpinnerAdapter:
+    """
+    TQDM wrapper that adds a rotating left spinner and green running style.
+    """
+
+    def __init__(
+        self,
+        *,
+        total: Union[int, None],
+        desc: str,
+        unit: str,
+        refresh_interval: float = _TQDM_REFRESH_SECONDS,
+    ) -> None:
+        if _tqdm is None:
+            raise RuntimeError("tqdm is unavailable")
+        self._desc = str(desc).strip() or "Progress"
+        self._idx = 0
+        self._refresh_interval = float(max(0.05, float(refresh_interval)))
+        self._use_color = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._stop_event = Event()
+        self._thread: Optional[Thread] = None
+        kwargs: dict[str, Any] = {
+            "total": total,
+            "desc": self._render_desc(),
+            "unit": str(unit),
+            "leave": False,
+            "file": sys.stdout,
+            "mininterval": self._refresh_interval,
+        }
+        # Newer tqdm versions support `colour`; ignore silently if unsupported.
+        if self._use_color:
+            kwargs["colour"] = "green"
+        try:
+            self._bar = _tqdm(**kwargs)
+        except TypeError:
+            kwargs.pop("colour", None)
+            self._bar = _tqdm(**kwargs)
+        self._thread = Thread(target=self._refresh_loop, daemon=True)
+        self._thread.start()
+
+    def _render_desc(self) -> str:
+        frame = _TQDM_SPINNER_FRAMES[self._idx % len(_TQDM_SPINNER_FRAMES)]
+        text = f"{frame} {self._desc}"
+        if self._use_color:
+            return f"{_TQDM_GREEN}{text}{_TQDM_RESET}"
+        return text
+
+    def _refresh_loop(self) -> None:
+        while not self._stop_event.wait(self._refresh_interval):
+            self._idx = (self._idx + 1) % len(_TQDM_SPINNER_FRAMES)
+            try:
+                self._bar.set_description_str(self._render_desc(), refresh=False)
+                self._bar.refresh()
+            except Exception:
+                break
+
+    def update(self, n: int = 1) -> None:
+        self._bar.update(int(n))
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self._refresh_interval * 4.0))
+            self._thread = None
+        self._bar.close()
 
 try:
     from janusx.janusx import (
@@ -71,18 +154,43 @@ def load_all_genotype_int8(
     )
     M_list: List[np.ndarray] = []
     sites_list: List[Any] = []
-    for chunk, sites in tqdm(
-        chunks,
-        total=total_chunks,
-        desc="Loading genotype",
-        unit="chunk",
-    ):
-        if chunk.size == 0 or len(sites) == 0:
-            continue
-        if sameidx is not None:
-            chunk = chunk[:, sameidx]
-        M_list.append(np.asarray(np.rint(chunk), dtype=np.int8))
-        sites_list.extend(sites)
+    use_cli_progress = (
+        _CliProgressAdapter is not None
+        and total_chunks is not None
+        and int(total_chunks) > 0
+    )
+    pbar = (
+        _CliProgressAdapter(total=int(total_chunks), desc="Loading genotype")
+        if use_cli_progress
+        else (
+            _tqdm(
+                total=total_chunks,
+                desc="Loading genotype",
+                unit="chunk",
+            )
+            if _tqdm is not None
+            else None
+        )
+    )
+    try:
+        for chunk, sites in chunks:
+            if chunk.size == 0 or len(sites) == 0:
+                if pbar is not None:
+                    pbar.update(1)
+                continue
+            if sameidx is not None:
+                chunk = chunk[:, sameidx]
+            M_list.append(np.asarray(np.rint(chunk), dtype=np.int8))
+            sites_list.extend(sites)
+            if pbar is not None:
+                pbar.update(1)
+    finally:
+        if pbar is not None:
+            if use_cli_progress:
+                pbar.finish()
+                pbar.close()
+            else:
+                pbar.close()
 
     if not M_list:
         return np.empty((0, n_use), dtype=np.int8), []
@@ -414,7 +522,7 @@ def getLogicgate(
             return None
     else:
         idx = np.argsort(Imp)[::-1][:topk]
-    # 0/1/2 â†’ 0/1
+    # 0/1/2 â†?0/1
     Mchoice = (M[idx] / 2).astype(int).T
 
     resdict = logreg(Mchoice, y, response=response, tags=sites[idx])
@@ -436,7 +544,7 @@ def _window_task(
     n_estimators: int,
     response: Literal['binary', 'continuous'],
     gsetmode: bool,
-) -> Union[dict[str,Any], None]:
+) -> tuple[Union[dict[str,Any], None], Union[str, None]]:
     chrom, start, end, M_win, tags = task
     try:
         resdict = getLogicgate(
@@ -449,11 +557,16 @@ def _window_task(
             gsetmode=gsetmode,
         )
     except Exception as e:
-        print(f"[WARN] window {chrom}:{start}-{end} failed: {e}")
-        return None
+        emsg = str(e)
+        if (
+            "Found array with 0 feature(s)" in emsg
+            and "minimum of 1 is required" in emsg
+        ):
+            return None, None
+        return None, f"window {chrom}:{start}-{end} failed: {e}"
     if resdict is None:
-        return None
-    return resdict
+        return None, None
+    return resdict, None
 
 
 def _resolve_stream_sample_subset(
@@ -495,6 +608,7 @@ def window(
     threads: int = 4,
     batch_size: int = 128,
     mmap_window_mb: Union[int, None] = None,
+    collect_warnings: bool = False,
 ):
     """
     Whole-genome sliding-window traversal (load by chunksize order to reduce repeated IO).
@@ -527,8 +641,33 @@ def window(
                     total_windows = int(counts.sum())
             except Exception:
                 total_windows = None
-    pbar = tqdm(total=total_windows, desc="Windows", unit="win")
+    use_cli_progress = (
+        _CliProgressAdapter is not None
+        and total_windows is not None
+        and int(total_windows) > 0
+    )
+    pbar = (
+        _CliProgressAdapter(total=int(total_windows), desc="Loading windows")
+        if use_cli_progress
+        else (
+            _TqdmSpinnerAdapter(total=total_windows, desc="Windows", unit="win")
+            if _tqdm is not None
+            else None
+        )
+    )
     sample_sub, sameidx = _resolve_stream_sample_subset(genofile, sampleid)
+
+    window_warnings: List[str] = []
+
+    def _consume_task_outputs(task_outputs: List[tuple[Union[dict[str,Any], None], Union[str, None]]]) -> None:
+        for out, warn in task_outputs:
+            if warn is not None:
+                if collect_warnings:
+                    window_warnings.append(str(warn))
+                else:
+                    print(f"[WARN] {warn}")
+            if out is not None:
+                results.append(out)
 
     buffer_M = None
     buffer_sites: List[Any] = []
@@ -606,21 +745,21 @@ def window(
                         max_pos = int(buffer_pos.max())
                         while window_start is not None and window_start <= max_pos:
                             res = _emit_window(window_start)
-                            pbar.update(1)
+                            if pbar is not None:
+                                pbar.update(1)
                             if res is not None:
                                 tasks.append(res)
                                 if len(tasks) >= batch_size:
                                     if threads <= 1:
-                                        batch = [
-                                            out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
-                                            if out is not None
+                                        batch_outputs = [
+                                            _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                            for t in tasks
                                         ]
                                     else:
-                                        batch = Parallel(n_jobs=threads, backend="loky")(
+                                        batch_outputs = Parallel(n_jobs=threads, backend="loky")(
                                             delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                                         )
-                                        batch = [r for r in batch if r is not None]
-                                    results.extend(batch)
+                                    _consume_task_outputs(batch_outputs)
                                     tasks.clear()
                             window_start += step
                     # reset buffers for new chromosome
@@ -636,21 +775,21 @@ def window(
                 # process windows when we have two windows worth of data
                 while buffer_pos is not None and buffer_pos.max() >= window_start + windowsize + step:
                     res = _emit_window(window_start)
-                    pbar.update(1)
+                    if pbar is not None:
+                        pbar.update(1)
                     if res is not None:
                         tasks.append(res)
                         if len(tasks) >= batch_size:
                             if threads <= 1:
-                                batch = [
-                                    out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
-                                    if out is not None
+                                batch_outputs = [
+                                    _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                    for t in tasks
                                 ]
                             else:
-                                batch = Parallel(n_jobs=threads, backend="loky")(
+                                batch_outputs = Parallel(n_jobs=threads, backend="loky")(
                                     delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                                 )
-                                batch = [r for r in batch if r is not None]
-                            results.extend(batch)
+                            _consume_task_outputs(batch_outputs)
                             tasks.clear()
                     # drop the first window, advance
                     _drop_before(next_start)
@@ -664,39 +803,45 @@ def window(
             max_pos = int(buffer_pos.max())
             while window_start is not None and window_start <= max_pos:
                 res = _emit_window(window_start)
-                pbar.update(1)
+                if pbar is not None:
+                    pbar.update(1)
                 if res is not None:
                     tasks.append(res)
                     if len(tasks) >= batch_size:
                         if threads <= 1:
-                            batch = [
-                                out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
-                                if out is not None
+                            batch_outputs = [
+                                _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                for t in tasks
                             ]
                         else:
-                            batch = Parallel(n_jobs=threads, backend="loky")(
+                            batch_outputs = Parallel(n_jobs=threads, backend="loky")(
                                 delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                             )
-                            batch = [r for r in batch if r is not None]
-                        results.extend(batch)
+                        _consume_task_outputs(batch_outputs)
                         tasks.clear()
                 window_start += step
 
         if tasks:
             if threads <= 1:
-                batch = [
-                    out for out in (_window_task(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks)
-                    if out is not None
+                batch_outputs = [
+                    _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                    for t in tasks
                 ]
             else:
-                batch = Parallel(n_jobs=threads, backend="loky")(
+                batch_outputs = Parallel(n_jobs=threads, backend="loky")(
                     delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
                 )
-                batch = [r for r in batch if r is not None]
-            results.extend(batch)
+            _consume_task_outputs(batch_outputs)
     finally:
-        pbar.close()
+        if pbar is not None:
+            if use_cli_progress:
+                pbar.finish()
+                pbar.close()
+            else:
+                pbar.close()
 
+    if collect_warnings:
+        return results, window_warnings
     return results
 
 
@@ -1058,7 +1203,7 @@ def main(
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             mmap_window_mb,
         )
-        for i, ChromPos in enumerate(tqdm(bedlist))
+        for i, ChromPos in enumerate(bedlist)
     )
     return results
 
@@ -1099,7 +1244,7 @@ def main_inmemory(
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
         )
-        for i, ChromPos in enumerate(tqdm(bedlist))
+        for i, ChromPos in enumerate(bedlist)
     )
     return results
 
@@ -1148,6 +1293,6 @@ def main_inmemory_packed(
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
         )
-        for i, ChromPos in enumerate(tqdm(bedlist))
+        for i, ChromPos in enumerate(bedlist)
     )
     return results

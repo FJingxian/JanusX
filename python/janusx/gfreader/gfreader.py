@@ -38,6 +38,17 @@ except Exception:
     TimeElapsedColumn = None  # type: ignore[assignment]
     _HAS_RICH_PROGRESS = False
 
+try:
+    from janusx.script._common.status import get_rich_spinner_name as _get_rich_spinner_name
+except Exception:
+    def _get_rich_spinner_name() -> str:  # type: ignore[override]
+        return "line"
+
+try:
+    from janusx.script._common.progress import build_rich_progress as _build_rich_progress
+except Exception:
+    _build_rich_progress = None
+
 _WARNED_BED_MODEL_FALLBACK = False
 _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
 _WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
@@ -1602,23 +1613,46 @@ def save_genotype_streaming(
     progress = None
     task_id = None
     if use_rich:
-        if total_snps is None:
-            progress = Progress(
-                SpinnerColumn(style="green"),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
+        if _build_rich_progress is not None:
+            progress = _build_rich_progress(
+                description_template="[green]{task.description}",
+                show_bar=(total_snps is not None),
+                show_percentage=(total_snps is not None),
+                show_elapsed=True,
+                show_remaining=False,
+                bar_width=(40 if total_snps is not None else None),
+                finished_text=" ",
+                transient=True,
             )
-            task_id = progress.add_task(desc, total=None)
-        else:
-            progress = Progress(
-                SpinnerColumn(style="green"),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(bar_width=40),
-                TextColumn("{task.percentage:>5.1f}%"),
-                TimeElapsedColumn(),
-            )
-            task_id = progress.add_task(desc, total=float(total_snps))
-        progress.start()
+            if progress is not None:
+                task_id = progress.add_task(
+                    str(desc),
+                    total=(None if total_snps is None else float(total_snps)),
+                )
+                progress.start()
+        if progress is None:
+            spinner_name = "line"
+            try:
+                spinner_name = str(_get_rich_spinner_name() or "line")
+            except Exception:
+                spinner_name = "line"
+            if total_snps is None:
+                progress = Progress(
+                    SpinnerColumn(spinner_name=spinner_name, style="green", finished_text=" "),
+                    TextColumn("[green]{task.description}"),
+                    TimeElapsedColumn(),
+                )
+                task_id = progress.add_task(desc, total=None)
+            else:
+                progress = Progress(
+                    SpinnerColumn(spinner_name=spinner_name, style="green", finished_text=" "),
+                    TextColumn("[green]{task.description}"),
+                    BarColumn(bar_width=40),
+                    TextColumn("{task.percentage:>5.1f}%"),
+                    TimeElapsedColumn(),
+                )
+                task_id = progress.add_task(desc, total=float(total_snps))
+            progress.start()
     else:
         pbar = tqdm(
             total=total_snps,

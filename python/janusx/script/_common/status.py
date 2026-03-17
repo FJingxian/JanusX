@@ -20,7 +20,7 @@ except Exception:
     _HAS_RICH = False
 
 _SPINNER_NAME = "janusx_ascii"
-_SPINNER_FRAMES = ["|", "/", "-", "\\"]
+_SPINNER_FRAMES = ["/", "-", "\\", "|"]
 _SPINNER_FALLBACKS = ("line", "dots", "simpleDots", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
@@ -443,7 +443,7 @@ class CliStatus:
         self._stop_spinner()
         symbol = _SUCCESS_SYMBOL
         line = self._compose_line(symbol, str(message))
-        if should_animate_status(message):
+        if should_animate_status(message) or is_completed_status_text(message):
             if self._backend == "rich" and self._console is not None:
                 self._console.print(f"[green]{line}[/green]")
             elif self.enabled:

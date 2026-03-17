@@ -427,7 +427,7 @@ def main() -> None:
     for decode_path in decoded_files:
         cmd = [
             "jx", "postgwas",
-            "-file", decode_path,
+            "-gwasfile", decode_path,
             "-o", args.out,
             "-prefix", prefix,
             "-fmt", args.format,

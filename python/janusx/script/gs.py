@@ -890,28 +890,181 @@ def _run_methods_parallel(
             return out
         for m in methods:
             t0 = time.monotonic()
-            try:
-                res = _run_method_task(
-                    m,
-                    train_pheno,
-                    train_snp,
-                    test_snp,
-                    train_snp_add,
-                    test_snp_add,
-                    train_snp_ml,
-                    test_snp_ml,
-                    pca_dec,
-                    cv_splits,
-                    model_n_jobs,
-                    strict_cv,
+            cv_total = int(max(1, fold_total_map.get(m, 1)))
+            has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
+            enable_tqdm_progress = bool(show_method_progress and _HAS_TQDM and stdout_is_tty())
+            enable_method_spinner = bool((not show_method_progress) and stdout_is_tty())
+            search_bar = None
+            cv_bar = None
+            search_done = 0
+            search_total = 0
+            search_total_fixed = False
+            cv_done = 0
+
+            def _close_search_bar() -> None:
+                nonlocal search_bar
+                if search_bar is not None:
+                    search_bar.close()
+                    search_bar = None
+
+            def _close_cv_bar() -> None:
+                nonlocal cv_bar
+                if cv_bar is not None:
+                    cv_bar.close()
+                    cv_bar = None
+
+            def _ensure_cv_bar() -> None:
+                nonlocal cv_bar
+                if (not enable_tqdm_progress) or cv_bar is not None:
+                    return
+                assert tqdm is not None
+                cv_bar = tqdm(
+                    total=cv_total,
+                    desc=f"{m} cv",
+                    unit="fold",
+                    leave=False,
+                    dynamic_ncols=True,
+                    bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                    "[{elapsed}, {rate_fmt}{postfix}]",
                 )
-            except Exception:
+
+            def _ensure_search_bar() -> None:
+                nonlocal search_bar, search_total
+                if (not enable_tqdm_progress) or search_bar is not None:
+                    return
+                assert tqdm is not None
+                search_bar = tqdm(
+                    total=int(max(1, search_total)),
+                    desc=f"{m} search",
+                    unit="cfg",
+                    leave=False,
+                    dynamic_ncols=True,
+                    bar_format="{desc}: {percentage:3.0f}%|{bar}| "
+                    "[{elapsed}, {rate_fmt}{postfix}]",
+                )
+
+            def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                nonlocal search_done, search_total, search_total_fixed
+                if not enable_tqdm_progress:
+                    return
+                ev = str(event)
+                stage = str(payload.get("stage", "")).strip()
+                if ev == "search_total":
+                    count = int(max(0, int(payload.get("count", 0))))
+                    if count <= 0:
+                        return
+                    search_total = int(count)
+                    search_total_fixed = True
+                    _ensure_search_bar()
+                    if search_bar is not None:
+                        search_bar.total = int(max(1, search_total))
+                        search_bar.refresh()
+                    return
+                if ev == "search_plan":
+                    count = int(max(0, int(payload.get("count", 0))))
+                    if count <= 0:
+                        return
+                    if not search_total_fixed:
+                        search_total += count
+                    if search_total <= 0:
+                        search_total = count
+                    _ensure_search_bar()
+                    if search_bar is not None:
+                        search_bar.total = int(max(1, search_total))
+                        if stage != "":
+                            search_bar.set_postfix_str(stage, refresh=False)
+                        search_bar.refresh()
+                    return
+                if ev == "search_advance":
+                    inc = int(max(0, int(payload.get("inc", 0))))
+                    if inc <= 0:
+                        return
+                    if (not search_total_fixed) and (search_done + inc > search_total):
+                        search_total = search_done + inc
+                    _ensure_search_bar()
+                    if search_bar is None:
+                        return
+                    left = max(0, int(search_total) - int(search_done))
+                    adv = min(left, inc)
+                    if adv > 0:
+                        search_done += adv
+                        search_bar.total = int(max(1, search_total))
+                        if stage != "":
+                            search_bar.set_postfix_str(stage, refresh=False)
+                        search_bar.update(int(adv))
+
+            def _cv_hook(method_name: str, inc: int) -> None:
+                nonlocal cv_done
+                if str(method_name) != str(m):
+                    return
+                _close_search_bar()
+                _ensure_cv_bar()
+                if cv_bar is None:
+                    return
+                left = max(0, cv_total - int(cv_done))
+                adv = min(left, int(max(0, int(inc))))
+                if adv > 0:
+                    cv_done += adv
+                    cv_bar.update(adv)
+
+            if enable_tqdm_progress and (not has_search_stage):
+                _ensure_cv_bar()
+
+            method_status = (
+                CliStatus(f"Loading {m}...", enabled=True)
+                if enable_method_spinner
+                else None
+            )
+            if method_status is not None:
+                method_status.__enter__()
+            try:
+                try:
+                    res = _run_method_task(
+                        m,
+                        train_pheno,
+                        train_snp,
+                        test_snp,
+                        train_snp_add,
+                        test_snp_add,
+                        train_snp_ml,
+                        test_snp_ml,
+                        pca_dec,
+                        cv_splits,
+                        model_n_jobs,
+                        strict_cv,
+                        progress_queue=None,
+                        progress_hook=(_cv_hook if enable_tqdm_progress else None),
+                        search_progress_hook=(_search_hook if enable_tqdm_progress else None),
+                    )
+                except Exception:
+                    _close_search_bar()
+                    _close_cv_bar()
+                    elapsed = format_elapsed(time.monotonic() - t0)
+                    if method_status is not None:
+                        method_status.fail(f"{m} ...Failed")
+                    else:
+                        print_failure(f"{m} ...Failed [{elapsed}]", force_color=True)
+                    raise
+
+                _close_search_bar()
+                if enable_tqdm_progress:
+                    _ensure_cv_bar()
+                    if cv_bar is not None:
+                        left_cv = max(0, cv_total - int(cv_done))
+                        if left_cv > 0:
+                            cv_done += left_cv
+                            cv_bar.update(left_cv)
+                _close_cv_bar()
+
+                out.append(res)
                 elapsed = format_elapsed(time.monotonic() - t0)
-                print_failure(f"{m} ...Failed [{elapsed}]", force_color=True)
-                raise
-            out.append(res)
-            elapsed = format_elapsed(time.monotonic() - t0)
-            print_success(f"{m} ...Finished [{elapsed}]", force_color=True)
+                if method_status is not None:
+                    method_status.complete(f"{m} ...Finished")
+                else:
+                    print_success(f"{m} ...Finished [{elapsed}]", force_color=True)
+            finally:
+                if method_status is not None:
+                    method_status.__exit__(None, None, None)
         return out
 
     results_by_method: "OrderedDict[str, dict[str, typing.Any]]" = OrderedDict()
@@ -1841,6 +1994,10 @@ def main(log: bool = True) -> None:
                     continue
                 fig = plt.figure(figsize=(5, 4), dpi=300)
                 gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
+                for ax in fig.axes:
+                    if str(ax.get_ylabel()).strip() == "Predicted Value":
+                        ax.set_ylabel(f"Predicted Value ({method})")
+                        break
                 out_svg = f"{outprefix}.{trait_name}.gs.{method}.svg"
                 # Avoid tight_layout warnings on dense decorations.
                 fig.subplots_adjust(left=0.16, right=0.98, bottom=0.14, top=0.98)

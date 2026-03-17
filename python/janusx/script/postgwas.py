@@ -46,6 +46,7 @@ from ._common.status import (
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.config_render import get_config_color_styles
+from ._common.threads import detect_effective_threads
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -4121,13 +4122,19 @@ def main():
         help="Prefix of the log file (default: JanusX).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=max(1, int(os.cpu_count() or 1)),
+        "-t", "--thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
 
     args = parser.parse_args()
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
     if int(args.thread) <= 0:
-        args.thread = int(os.cpu_count() or 1)
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
     # `--highlight` was removed from CLI; keep a disabled attribute for
     # internal legacy branches that still check it.
     args.highlight = None
@@ -4145,6 +4152,11 @@ def main():
     outprefix_base = os.path.join(args.out, args.prefix).replace("\\", "/")
     log_path = f"{outprefix_base}.postGWAS.log".replace("//", "/")
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
 
     # ------------------------------------------------------------------
     # Basic checks and configuration
@@ -4321,7 +4333,7 @@ def main():
     bimrange_text = _format_bimrange_summary(args.bimrange_tuples)
     merge_map_rows = [(str(i), str(file)) for i, file in enumerate(args.merge_files)] if args.merge_mode else []
     output_prefix_text = outprefix_base
-    threads_text = f"{args.thread}"
+    threads_text = f"{args.thread} ({detected_threads} available)"
 
     base_rows: list[tuple[str, str]] = [
         ("Input files", input_files_text),

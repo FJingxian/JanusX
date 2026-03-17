@@ -35,6 +35,7 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.status import CliStatus, log_success, print_failure, print_success, stdout_is_tty
+from ._common.threads import detect_effective_threads
 
 
 def _mute_stdout_info_logs(
@@ -284,7 +285,7 @@ def _build_parser() -> CliArgumentParser:
         "--thread",
         dest="thread",
         type=int,
-        default=max(1, int(os.cpu_count() or 1)),
+        default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
     runtime.add_argument(
@@ -337,8 +338,13 @@ def main() -> None:
         parser.error("-max-iter/--max-iter must be a positive integer.")
     if int(args.thread) <= 0:
         parser.error("-t/--thread must be a positive integer.")
-
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
     resolved_threads = int(args.thread)
+    if int(resolved_threads) > int(detected_threads):
+        thread_capped = True
+        resolved_threads = int(detected_threads)
 
     outdir = str(args.out).replace("\\", "/").rstrip("/") or "."
     os.makedirs(outdir, exist_ok=True)
@@ -360,6 +366,11 @@ def main() -> None:
     prefix = args.prefix or auto_prefix
     log_path = os.path.join(outdir, f"{prefix}.adamixture.log")
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(resolved_threads)}."
+        )
     logger.info("")
     use_spinner = stdout_is_tty()
 
@@ -388,7 +399,7 @@ def main() -> None:
             (
                 "Runtime",
                 [
-                    ("Threads", int(resolved_threads)),
+                    ("Threads", f"{int(resolved_threads)} ({detected_threads} available)"),
                     ("Seed", int(args.seed)),
                 ],
             ),

@@ -49,6 +49,7 @@ from ._common.status import (
     should_animate_status,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
+from ._common.threads import detect_effective_threads
 
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -65,7 +66,6 @@ mpl.rcParams["svg.hashsalt"] = "hello"
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from joblib import cpu_count
 
 try:
     from janusx.janusx import preprocess_bsa as _preprocess_bsa
@@ -1585,7 +1585,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--thread",
         type=int,
-        default=max(1, int(cpu_count() or 1)),
+        default=detect_effective_threads(),
         help=(
             "Number of CPU threads (default: %(default)s). "
             "For glob input, this is also the max parallel chromosome jobs."
@@ -1606,8 +1606,14 @@ def main() -> None:
     if args.step is None:
         args.step = args.window * DEFAULT_STEP_RATIO
 
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
     if args.thread <= 0:
-        args.thread = cpu_count()
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
 
     file_args = list(args.file) if isinstance(args.file, list) else [str(args.file)]
     input_files: list[str] = []
@@ -1633,6 +1639,11 @@ def main() -> None:
 
     log_path = f"{output_stem}.postbsa.log"
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
 
     if len(input_files) == 0:
         logger.error(f"No input BSA table matched: {input_hint}")
@@ -1672,7 +1683,7 @@ def main() -> None:
             )
         ],
         footer_rows=[
-            ("Threads", f"{args.thread} ({cpu_count()} available)"),
+            ("Threads", f"{args.thread} ({detected_threads} available)"),
             ("Parallel jobs", worker_count if len(input_files) > 1 else 1),
             ("Output stem", output_stem),
         ],

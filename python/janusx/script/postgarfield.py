@@ -41,6 +41,7 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
 from janusx.script._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.threads import detect_effective_threads
 
 
 def _determine_genotype(args) -> tuple[str, str]:
@@ -195,7 +196,7 @@ def main() -> None:
         help="Chunk size for streaming GWAS (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=max(1, int(os.cpu_count() or 1)),
+        "-t", "--thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
@@ -279,8 +280,14 @@ def main() -> None:
         parser.error(str(e))
     if args.only_set is not None and args.only_set < 0:
         raise ValueError("--only-set must be >= 0.")
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
     if int(args.thread) <= 0:
-        args.thread = max(1, int(os.cpu_count() or 1))
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
 
     gfile, prefix = _determine_genotype(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
@@ -288,6 +295,11 @@ def main() -> None:
 
     log_path = f"{args.out}/{prefix}.postGARFIELD.log".replace("//", "/")
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
 
     emit_cli_configuration(
         logger,
@@ -307,7 +319,7 @@ def main() -> None:
                     ("MAF", args.maf),
                     ("Missing rate", args.geno),
                     ("Chunk size", args.chunksize),
-                    ("Threads", args.thread),
+                    ("Threads", f"{args.thread} ({detected_threads} available)"),
                     ("Pseudo map", args.pseudo or f"{gfile}.pseudo"),
                     ("Only-set filter (bp)", args.only_set),
                     ("Bimrange", args.bimrange),

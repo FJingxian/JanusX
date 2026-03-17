@@ -77,7 +77,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
-from joblib import cpu_count
 import psutil
 from janusx.bioplotkit import GWASPLOT
 from janusx.gfreader import (
@@ -110,6 +109,7 @@ from ._common.status import (
     stdout_is_tty,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
+from ._common.threads import detect_effective_threads
 from ._common.gwas_history import record_gwas_run
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
@@ -2620,7 +2620,7 @@ def run_chunked_gwas_lmm_lm(
         return keep
 
     process = psutil.Process()
-    n_cores = psutil.cpu_count(logical=True) or cpu_count()
+    n_cores = detect_effective_threads()
 
     if eff_snp_by_trait is None:
         eff_snp_by_trait = {}
@@ -3105,7 +3105,7 @@ def run_chunked_gwas_streaming_shared(
         return
 
     process = psutil.Process()
-    n_cores = psutil.cpu_count(logical=True) or cpu_count()
+    n_cores = detect_effective_threads()
 
     if eff_snp_by_trait is None:
         eff_snp_by_trait = {}
@@ -4273,7 +4273,7 @@ def run_farmcpu_fullmem(
         qmatrix = np.asarray(farmcpu_cache["qmatrix"], dtype="float32")
 
     process = psutil.Process()
-    n_cores = psutil.cpu_count(logical=True) or cpu_count()
+    n_cores = detect_effective_threads()
     if summary_rows is None:
         summary_rows = []
     if saved_paths is None:
@@ -4558,7 +4558,7 @@ def parse_args():
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
     optional_group.add_argument(
-        "-t", "--thread", type=int, default=cpu_count(),
+        "-t", "--thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
@@ -4609,9 +4609,15 @@ def main(log: bool = True):
     # Plotting is always enabled for GWAS CLI.
     args.plot = True
     args.cov = _normalize_cov_inputs(args.cov)
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
 
     if args.thread <= 0:
-        args.thread = cpu_count()
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
     args.model = args.model.lower()
     if not (0.0 <= args.het <= 0.5):
         raise ValueError("--het must be within [0, 0.5].")
@@ -4624,6 +4630,11 @@ def main(log: bool = True):
     outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
     gwas_summary_rows: list[dict[str, object]] = []
     saved_result_paths: list[str] = []
     trait_order: list[str] = []
@@ -4663,7 +4674,7 @@ def main(log: bool = True):
             host=socket.gethostname(),
             sections=[("General", cfg_rows)],
             footer_rows=[
-                ("Threads", f"{args.thread} ({cpu_count()} available)"),
+                ("Threads", f"{args.thread} ({detected_threads} available)"),
                 ("Output prefix", outprefix),
             ],
             line_max_chars=60,

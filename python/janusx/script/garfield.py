@@ -4,7 +4,6 @@ import socket
 import argparse
 import sys
 import numpy as np
-from joblib import cpu_count
 from janusx.garfield.garfield2 import (
     load_all_genotype_int8,
     load_all_genotype_packed_bed,
@@ -29,6 +28,7 @@ from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.threads import detect_effective_threads
 
 
 def _safe_trait_label(label: object) -> str:
@@ -188,7 +188,7 @@ def main() -> None:
         help="Number of trees/estimators (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-t", "--thread", dest="thread", type=int, default=max(1, int(cpu_count() or 1)),
+        "-t", "--thread", dest="thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
@@ -229,8 +229,14 @@ def main() -> None:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
     if int(args.thread) <= 0:
-        args.thread = max(1, int(cpu_count() or 1))
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
 
     gfile, prefix = determine_genotype_source(args)
     outprefix = f"{args.out}/{prefix}".replace("//", "/")
@@ -239,6 +245,11 @@ def main() -> None:
 
     log_path = f"{args.out}/{prefix}.garfield.log".replace("//", "/")
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
 
     threads = int(args.thread)
     cfg_rows: list[tuple[str, object]] = [
@@ -265,7 +276,7 @@ def main() -> None:
         host=socket.gethostname(),
         sections=[("General", cfg_rows)],
         footer_rows=[
-            ("Threads", threads),
+            ("Threads", f"{threads} ({detected_threads} available)"),
             ("Output prefix", outprefix),
         ],
         line_max_chars=60,

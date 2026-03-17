@@ -128,6 +128,8 @@ except Exception:
     _HAS_TQDM = False
 
 _WARNED_GWAS_CACHE_FALLBACK_KEYS: set[str] = set()
+_FASTLMM_PVE_LOW = 0.05
+_FASTLMM_PVE_HIGH = 0.95
 
 # ======================================================================
 # Basic utilities
@@ -139,6 +141,18 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * 60)
     logger.info(title)
     logger.info("=" * 60)
+
+
+def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:
+    if pve is None:
+        return False
+    try:
+        v = float(pve)
+    except Exception:
+        return False
+    if not np.isfinite(v):
+        return False
+    return bool(v < _FASTLMM_PVE_LOW or v > _FASTLMM_PVE_HIGH)
 
 
 def _emit_trait_header(
@@ -2558,13 +2572,13 @@ def run_chunked_gwas_lmm_lm(
     }
     model_key = model_name.lower()
     ModelCls = model_map[model_key]
-    model_label = {
+    base_model_label = {
         "lmm": "LMM",
         "lm": "LM",
         "fastlmm": "FastLMM",
     }[model_key]
     # Keep output file suffixes consistent and lowercase.
-    model_tag = model_label.lower()
+    base_model_tag = base_model_label.lower()
 
     def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
         m = model.lower()
@@ -2660,6 +2674,9 @@ def run_chunked_gwas_lmm_lm(
 
         header_pve: Optional[float] = None
         init_log_message: Optional[str] = None
+        effective_model_key = str(model_key)
+        effective_model_label = str(base_model_label)
+        effective_model_tag = str(base_model_tag)
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
@@ -2675,6 +2692,15 @@ def run_chunked_gwas_lmm_lm(
                 header_pve = None
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
+            if model_key == "fastlmm" and _fastlmm_pve_is_degenerate(header_pve):
+                logger.warning(
+                    f"Warning: FastLMM fallback to LMM for trait {pname}: "
+                    f"PVE(null)={float(header_pve):.3f} outside "
+                    f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
+                )
+                effective_model_key = "lmm"
+                effective_model_label = "LMM"
+                effective_model_tag = "lmm"
             init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
@@ -2692,14 +2718,14 @@ def run_chunked_gwas_lmm_lm(
         if init_log_message is not None:
             _log_model_line(
                 logger,
-                model_label,
+                effective_model_label,
                 init_log_message,
                 use_spinner=bool(use_spinner),
             )
 
         done_snps = 0
         has_results = False
-        out_tsv = f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv"
+        out_tsv = f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv"
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (
@@ -2714,7 +2740,7 @@ def run_chunked_gwas_lmm_lm(
         scan_threads = int(threads)
         if scan_threads <= 0:
             scan_threads = int(n_cores)
-        if model_key == "fastlmm":
+        if effective_model_key == "fastlmm":
             # FastLMM is often decode/write bound; prefer one in-flight chunk
             # so the kernel can use all configured threads.
             max_inflight = 1
@@ -2730,7 +2756,7 @@ def run_chunked_gwas_lmm_lm(
         process.cpu_percent(interval=None)
         scan_t0 = time.time()
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
-        pbar_desc = f"{model_label}"
+        pbar_desc = f"{effective_model_label}"
         pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc)
 
         inflight: dict[
@@ -2979,19 +3005,19 @@ def run_chunked_gwas_lmm_lm(
         peak_rss_gb = peak_rss / 1024**3
         _log_model_line(
             logger,
-            model_label,
+            effective_model_label,
             f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
             use_spinner=bool(use_spinner),
         )
 
         if not has_results:
-            logger.info(f"{model_label}: no SNPs passed filters for trait {pname}.")
+            logger.info(f"{effective_model_label}: no SNPs passed filters for trait {pname}.")
             if pname not in eff_snp_by_trait:
                 eff_snp_by_trait[pname] = int(done_snps)
             summary_rows.append(
                 {
                     "phenotype": str(pname),
-                    "model": model_label,
+                    "model": effective_model_label,
                     "nidv": int(n_idv),
                     "eff_snp": int(done_snps),
                     "pve": (float(header_pve) if header_pve is not None else None),
@@ -3023,7 +3049,7 @@ def run_chunked_gwas_lmm_lm(
                     plot_df,
                     y_vec,
                     xlabel=pname,
-                    outpdf=f"{outprefix}.{pname}.{genetic_model}.{model_tag}.svg",
+                    outpdf=f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.svg",
                 )
 
             _run_plot()
@@ -3034,7 +3060,7 @@ def run_chunked_gwas_lmm_lm(
         summary_rows.append(
             {
                 "phenotype": str(pname),
-                "model": model_label,
+                "model": effective_model_label,
                 "nidv": int(n_idv),
                 "eff_snp": int(done_snps),
                 "pve": (float(header_pve) if header_pve is not None else None),
@@ -3050,7 +3076,7 @@ def run_chunked_gwas_lmm_lm(
         saved_paths.append(str(out_tsv).replace("//", "/"))
         _log_model_line(
             logger,
-            model_label,
+            effective_model_label,
             f"Results saved to {str(out_tsv).replace('//', '/')}",
             use_spinner=bool(use_spinner),
         )
@@ -3060,7 +3086,7 @@ def run_chunked_gwas_lmm_lm(
         time_parts.append(format_elapsed(scan_secs))
         if plot:
             time_parts.append(format_elapsed(viz_secs))
-        done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
+        done_msg = f"{effective_model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")  # ensure blank line between traits
@@ -3276,6 +3302,9 @@ def run_chunked_gwas_streaming_shared(
         ModelCls = model_map[mkey]
         model_label = model_label_map[mkey]
         model_tag = model_label.lower()
+        effective_model_key = str(mkey)
+        effective_model_label = str(model_label)
+        effective_model_tag = str(model_tag)
         ctx: dict[str, object] = {
             "model_key": mkey,
             "model_label": model_label,
@@ -3330,10 +3359,46 @@ def run_chunked_gwas_streaming_shared(
             mod = ModelCls(y=y_vec, X=X_cov)
             ctx["init_log"] = "streaming scan initialized"
 
+        pve_now: Optional[float] = None
+        if mkey in {"lmm", "fastlmm"}:
+            try:
+                pve_tmp = float(getattr(mod, "pve"))
+                if np.isfinite(pve_tmp):
+                    pve_now = pve_tmp
+            except Exception:
+                pve_now = None
+
+        if mkey == "fastlmm" and _fastlmm_pve_is_degenerate(pve_now):
+            if share_evd_lmm_fast and shared_lmm_model is not None:
+                logger.warning(
+                    f"Warning: FastLMM skipped for trait {pname}: "
+                    f"PVE(null)={float(pve_now):.3f} outside "
+                    f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
+                )
+                continue
+            logger.warning(
+                f"Warning: FastLMM fallback to LMM for trait {pname}: "
+                f"PVE(null)={float(pve_now):.3f} outside "
+                f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
+            )
+            effective_model_key = "lmm"
+            effective_model_label = "LMM"
+            effective_model_tag = "lmm"
+
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
             (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
         )
+        ctx["model_key"] = effective_model_key
+        ctx["model_label"] = effective_model_label
+        ctx["model_tag"] = effective_model_tag
+        if effective_model_tag != model_tag:
+            ctx["tmp_tsv"] = (
+                f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv.tmp."
+                f"{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            ctx["out_tsv"] = f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv"
+            ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
         ctx["mod"] = mod
         model_ctxs.append(ctx)
 

@@ -3060,6 +3060,62 @@ fn rotate_snp_block_with_ut(
     }
 }
 
+#[inline]
+fn choose_rotate_tile_rows(rows: usize, thread_hint: usize) -> usize {
+    if rows <= 1 {
+        return 1;
+    }
+    let threads = thread_hint.max(1);
+    // Avoid splitting when there is no real parallelism (or chunk is tiny):
+    // one large SGEMM is much faster than many tiny calls in this case.
+    if threads <= 1 || rows <= 32 {
+        return rows;
+    }
+    // Keep enough independent tiles to feed the rayon pool, but avoid tiles
+    // so small that SGEMM launch overhead dominates.
+    let target_tasks = threads.saturating_mul(2).max(1);
+    let mut tile_rows = (rows + target_tasks - 1) / target_tasks;
+    tile_rows = tile_rows.clamp(16, 128);
+    tile_rows.min(rows)
+}
+
+#[inline]
+fn rotate_snp_block_with_ut_parallel(
+    snp_block: &[f32],
+    rows: usize,
+    n: usize,
+    u_t: &[f32],
+    out_block: &mut [f32],
+    tile_rows: usize,
+) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+
+    let tile_rows = tile_rows.max(1).min(rows);
+    if tile_rows >= rows {
+        rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
+        return;
+    }
+
+    out_block
+        .par_chunks_mut(tile_rows * n)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let row_start = chunk_idx * tile_rows;
+            let rows_here = out_chunk.len() / n;
+            let a_start = row_start * n;
+            let a_end = a_start + rows_here * n;
+            rotate_snp_block_with_ut(
+                &snp_block[a_start..a_end],
+                rows_here,
+                n,
+                u_t,
+                out_chunk,
+            );
+        });
+}
+
 #[pyfunction]
 #[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, max_iter=50, tol=1e-2, threads=0, nullml=None, rotate_block_rows=256))]
 pub fn lmm_reml_chunk_from_snp_f32<'py>(
@@ -3206,12 +3262,37 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
             let rows = (m_chunk - start).min(block_rows);
             let snp_block = &snp_flat[start * n..(start + rows) * n];
             let rot_block = &mut rot_buf[..rows * n];
-            rotate_snp_block_with_ut(snp_block, rows, n, &ut_flat, rot_block);
+            let rotate_tile_rows = choose_rotate_tile_rows(
+                rows,
+                if threads > 0 {
+                    threads
+                } else {
+                    rayon::current_num_threads()
+                },
+            );
 
             let out_block = &mut beta_se_p_slice[start * out_cols..(start + rows) * out_cols];
             if let Some(tp) = &pool {
-                tp.install(|| run_rows(rot_block, out_block));
+                tp.install(|| {
+                    rotate_snp_block_with_ut_parallel(
+                        snp_block,
+                        rows,
+                        n,
+                        &ut_flat,
+                        rot_block,
+                        rotate_tile_rows,
+                    );
+                    run_rows(rot_block, out_block);
+                });
             } else {
+                rotate_snp_block_with_ut_parallel(
+                    snp_block,
+                    rows,
+                    n,
+                    &ut_flat,
+                    rot_block,
+                    rotate_tile_rows,
+                );
                 run_rows(rot_block, out_block);
             }
             start += rows;
@@ -3884,12 +3965,37 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
             let rows = (m - start).min(block_rows);
             let snp_block = &snp_flat[start * n..(start + rows) * n];
             let rot_block = &mut rot_buf[..rows * n];
-            rotate_snp_block_with_ut(snp_block, rows, n, &ut_flat, rot_block);
+            let rotate_tile_rows = choose_rotate_tile_rows(
+                rows,
+                if threads > 0 {
+                    threads
+                } else {
+                    rayon::current_num_threads()
+                },
+            );
 
             let out_block = &mut out_slice[start * out_cols..(start + rows) * out_cols];
             if let Some(tp) = &pool {
-                tp.install(|| run_rows(rot_block, out_block));
+                tp.install(|| {
+                    rotate_snp_block_with_ut_parallel(
+                        snp_block,
+                        rows,
+                        n,
+                        &ut_flat,
+                        rot_block,
+                        rotate_tile_rows,
+                    );
+                    run_rows(rot_block, out_block);
+                });
             } else {
+                rotate_snp_block_with_ut_parallel(
+                    snp_block,
+                    rows,
+                    n,
+                    &ut_flat,
+                    rot_block,
+                    rotate_tile_rows,
+                );
                 run_rows(rot_block, out_block);
             }
             start += rows;

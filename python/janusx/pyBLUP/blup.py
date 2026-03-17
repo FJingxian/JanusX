@@ -38,17 +38,20 @@ def _pardiso_spsolve(m: sparse.csc_matrix, b: np.ndarray) -> np.ndarray:
     if _pypardiso is None:
         raise RuntimeError("pypardiso not available")
     b_arr = np.asarray(b, dtype=float)
-    try:
+    if b_arr.ndim == 1:
         x = _pypardiso.spsolve(m, b_arr)
         return np.asarray(x, dtype=float)
-    except Exception:
-        if b_arr.ndim != 2:
-            raise
+    if b_arr.ndim == 2:
+        if b_arr.shape[1] == 0:
+            return np.zeros((b_arr.shape[0], 0), dtype=float)
+        # Keep 2D RHS shape stable (especially n x 1), so downstream matrix math
+        # does not silently broadcast to wrong dimensions.
         cols = [
             np.asarray(_pypardiso.spsolve(m, b_arr[:, i]), dtype=float).reshape(-1, 1)
             for i in range(b_arr.shape[1])
         ]
         return np.hstack(cols)
+    raise ValueError(f"rhs must be 1D or 2D, got shape={b_arr.shape}")
 
 def REML(
     theta: np.ndarray,
@@ -356,7 +359,9 @@ def _sparse_z_reml_objective(
         lu = splu(m)
 
         tmp_y = lu.solve(np.asarray(zty, dtype=float).reshape(-1)).reshape(-1, 1)
-        tmp_x = lu.solve(np.asarray(ztx, dtype=float))
+        tmp_x = np.asarray(lu.solve(np.asarray(ztx, dtype=float)), dtype=float)
+        if tmp_x.ndim == 1:
+            tmp_x = tmp_x.reshape(-1, 1)
 
         vinvy = y * inv_lbd - (z_csc @ tmp_y) * (inv_lbd * inv_lbd)
         vinvx = X * inv_lbd - (z_csc @ tmp_x) * (inv_lbd * inv_lbd)
@@ -421,6 +426,9 @@ def _sparse_z_fit_state(
         lu = splu(m)
         tmp_y = lu.solve(zty).reshape(-1, 1)
         tmp_x = lu.solve(ztx)
+    tmp_x = np.asarray(tmp_x, dtype=float)
+    if tmp_x.ndim == 1:
+        tmp_x = tmp_x.reshape(-1, 1)
 
     vinvy = y * inv_lbd - (z_csc @ tmp_y) * (inv_lbd * inv_lbd)
     vinvx = X * inv_lbd - (z_csc @ tmp_x) * (inv_lbd * inv_lbd)

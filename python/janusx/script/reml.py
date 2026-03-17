@@ -37,7 +37,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_file_exists
 from ._common.genoio import strip_default_prefix_suffix
-from ._common.status import log_success, print_success, print_failure, format_elapsed
+from ._common.status import log_success, print_failure, format_elapsed, success_symbol
 
 
 @dataclass
@@ -220,6 +220,32 @@ def _onehot_encode_series(
     mat = sparse.csr_matrix((data, (rows, cols)), shape=(n, n_cols), dtype=float)
     names = [f"{prefix}-{lv}" for lv in kept_levels]
     return (mat if sparse_output else mat.toarray()), names
+
+
+def _onehot_level_count(series: pd.Series) -> int:
+    ss = series.astype("string").fillna("NA").astype(str)
+    return int(ss.nunique(dropna=False))
+
+
+def _format_onehot_terms_with_counts(
+    df_sub: pd.DataFrame,
+    cols: list[str],
+    *,
+    dropped: dict[str, int] | None = None,
+) -> str:
+    if len(cols) == 0:
+        return "None"
+    out: list[str] = []
+    for c in cols:
+        if c not in df_sub.columns:
+            out.append(f"{c} (?)")
+            continue
+        lv = _onehot_level_count(df_sub[c])
+        if dropped is not None and c in dropped:
+            out.append(f"{c} ({lv}, dropped)")
+        else:
+            out.append(f"{c} ({lv})")
+    return ", ".join(out)
 
 
 def _is_repeat_like(name: str) -> bool:
@@ -482,8 +508,21 @@ def main() -> None:
         random_map[c] = True
     for c in r_cols:
         random_map[c] = bool(random_map.get(c, False))
-    random_terms = [_TermSpec(name=k, force_onehot=v) for k, v in random_map.items()]
-    env_cols_auto, rep_cols_auto = _infer_env_rep_columns(random_terms)
+    random_terms_all = [_TermSpec(name=k, force_onehot=v) for k, v in random_map.items()]
+    env_cols_auto, rep_cols_auto = _infer_env_rep_columns(random_terms_all)
+
+    dropped_random_onehot: dict[str, int] = {}
+    random_terms: list[_TermSpec] = []
+    for term in random_terms_all:
+        if term.name not in dfx.columns:
+            continue
+        is_onehot = bool(term.force_onehot or (not _is_numeric_series(dfx[term.name])))
+        if is_onehot:
+            lv = _onehot_level_count(dfx[term.name])
+            if lv < 2:
+                dropped_random_onehot[term.name] = lv
+                continue
+        random_terms.append(term)
 
     emit_cli_configuration(
         logger,
@@ -495,7 +534,6 @@ def main() -> None:
                 "Input",
                 [
                     ("File", str(args.file)),
-                    ("Load table", f"Finished [{load_elapsed}]"),
                     ("Sample column", sample_col),
                     ("Samples(total)", n_samples_total),
                     ("Samples(unique)", n_samples_unique),
@@ -506,11 +544,11 @@ def main() -> None:
                 [
                     ("Phenotypes", ", ".join(n_cols)),
                     ("ID random effect", f"{sample_col} (auto one-hot)"),
-                    ("Auto env columns", ", ".join(env_cols_auto) if env_cols_auto else "None"),
-                    ("Auto rep columns", ", ".join(rep_cols_auto) if rep_cols_auto else "None"),
-                    ("Fixed onehot", ", ".join(fh_cols) if fh_cols else "None"),
+                    ("Auto env columns", _format_onehot_terms_with_counts(dfx, env_cols_auto, dropped=dropped_random_onehot)),
+                    ("Auto rep columns", _format_onehot_terms_with_counts(dfx, rep_cols_auto, dropped=dropped_random_onehot)),
+                    ("Fixed onehot", _format_onehot_terms_with_counts(dfx, fh_cols)),
                     ("Fixed", ", ".join(f_cols) if f_cols else "None"),
-                    ("Random onehot", ", ".join(rh_cols) if rh_cols else "None"),
+                    ("Random onehot", _format_onehot_terms_with_counts(dfx, rh_cols, dropped=dropped_random_onehot)),
                     ("Random", ", ".join(r_cols) if r_cols else "None"),
                 ],
             ),
@@ -687,7 +725,7 @@ def main() -> None:
 
         logger.info("-" * 60)
         logger.info(
-            f"Trait: {trait} | used={n_used}/{df.shape[0]} | e={e_eff:.2f} | r={r_eff:.2f} | elapsed={format_elapsed(time.time()-step_t0)}"
+            f"{success_symbol()} Trait: {trait} | used={n_used}/{df.shape[0]} | e={e_eff:.2f} | r={r_eff:.2f} | elapsed={format_elapsed(time.time()-step_t0)}"
         )
         logger.info(f"hsqr={h2:.6g}" if np.isfinite(h2) else "hsqr=NA")
         logger.info("Fixed effects:")
@@ -729,10 +767,6 @@ def main() -> None:
     log_success(logger, f"BLUP table saved: {out_blup}")
     log_success(logger, f"Summary table saved: {out_summary}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
-    print_success(
-        f"REML ...Finished [{format_elapsed(time.time() - t0)}]",
-        force_color=True,
-    )
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ except Exception:
     Table = None  # type: ignore[assignment]
     Text = None  # type: ignore[assignment]
     box = None  # type: ignore[assignment]
-_HAS_RICH = False
+    _HAS_RICH = False
 
 
 def _is_light_terminal() -> bool:

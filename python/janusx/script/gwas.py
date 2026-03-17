@@ -396,6 +396,7 @@ class _ProgressAdapter:
             try:
                 self._progress = build_rich_progress(
                     show_remaining=True,
+                    show_percentage=False,
                     field_templates=["{task.fields[metric]}"],
                     finished_text=" ",
                     transient=True,
@@ -3433,6 +3434,7 @@ def run_chunked_gwas_streaming_shared(
     if use_rich_multi:
         rich_progress = build_rich_progress(
             show_remaining=True,
+            show_percentage=False,
             field_templates=["{task.fields[metric]}"],
             finished_text=" ",
             transient=True,

@@ -130,6 +130,9 @@ except Exception:
 _WARNED_GWAS_CACHE_FALLBACK_KEYS: set[str] = set()
 _FASTLMM_PVE_LOW = 0.05
 _FASTLMM_PVE_HIGH = 0.95
+_SECTION_WIDTH = 60
+_GWAS_PROGRESS_BAR_WIDTH = 16
+_GWAS_PROGRESS_MEM_PLACEHOLDER = "--.--GB"
 
 # ======================================================================
 # Basic utilities
@@ -138,9 +141,25 @@ _FASTLMM_PVE_HIGH = 0.95
 def _section(logger:logging.Logger, title: str) -> None:
     """Emit a formatted log section header with a leading blank line."""
     logger.info("")
-    logger.info("=" * 60)
+    logger.info("=" * _SECTION_WIDTH)
     logger.info(title)
-    logger.info("=" * 60)
+    logger.info("=" * _SECTION_WIDTH)
+
+
+def _format_progress_metric(
+    done: int,
+    total: int,
+    memory_text: Optional[str] = None,
+) -> str:
+    tot = int(max(0, total))
+    dn = int(max(0, done))
+    if tot <= 0:
+        pct = 0.0
+    else:
+        pct = 100.0 * float(min(dn, tot)) / float(tot)
+    mem_raw = str(memory_text or "").strip()
+    mem = mem_raw if mem_raw != "" else _GWAS_PROGRESS_MEM_PLACEHOLDER
+    return f"({pct:5.1f}%/{mem:>7})"
 
 
 def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:
@@ -395,9 +414,10 @@ class _ProgressAdapter:
         if self._animate and rich_progress_available():
             try:
                 self._progress = build_rich_progress(
-                    show_remaining=True,
+                    show_remaining=False,
                     show_percentage=False,
                     field_templates=["{task.fields[metric]}"],
+                    bar_width=_GWAS_PROGRESS_BAR_WIDTH,
                     finished_text=" ",
                     transient=True,
                 )
@@ -407,7 +427,7 @@ class _ProgressAdapter:
                 self._task_id = self._progress.add_task(
                     self.desc,
                     total=self.total,
-                    metric="0.0%",
+                    metric=_format_progress_metric(0, self.total, None),
                 )
                 self._backend = "rich"
             except Exception:
@@ -426,13 +446,7 @@ class _ProgressAdapter:
             self._backend = "tqdm"
 
     def _metric_text(self) -> str:
-        if self._memory_text and self._tick <= self._memory_until_tick:
-            return self._memory_text
-        if self.total <= 0:
-            pct = 0.0
-        else:
-            pct = 100.0 * float(min(self._done, self.total)) / float(self.total)
-        return f"{pct:>6.1f}%"
+        return _format_progress_metric(self._done, self.total, self._memory_text)
 
     def update(self, n: int) -> None:
         step = int(max(0, n))
@@ -509,6 +523,162 @@ class _ProgressAdapter:
                 print_success(msg, force_color=True)
             else:
                 print(msg, flush=True)
+
+
+class _OrderedAsyncChunkWriter:
+    """
+    Ordered asynchronous writer for chunked GWAS rows.
+
+    Chunks may complete out-of-order; this helper accepts `(seq, payload)` and
+    writes in strictly increasing `seq` order on a dedicated writer thread.
+    """
+
+    def __init__(self, writer: object) -> None:
+        self._writer = writer
+        self._cv = threading.Condition()
+        self._pending: dict[int, tuple[str, bool, int]] = {}
+        self._next_seq = 0
+        self._closed = False
+        self._exc: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _raise_if_error(self) -> None:
+        if self._exc is not None:
+            raise RuntimeError("Async GWAS writer failed.") from self._exc
+
+    def submit(self, seq: int, text: str, *, has_plrt: bool, rows: int) -> None:
+        with self._cv:
+            self._raise_if_error()
+            if self._closed:
+                raise RuntimeError("Async GWAS writer is already closed.")
+            self._pending[int(seq)] = (str(text), bool(has_plrt), int(rows))
+            self._cv.notify_all()
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._thread.join()
+        self._raise_if_error()
+
+    def abort(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._pending.clear()
+            self._cv.notify_all()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self._cv:
+                    while self._next_seq not in self._pending:
+                        if self._closed:
+                            return
+                        self._cv.wait()
+                    text, has_plrt, rows = self._pending.pop(self._next_seq)
+                    self._next_seq += 1
+                self._writer.append(
+                    text,
+                    has_plrt=bool(has_plrt),
+                    rows=int(rows),
+                )
+        except BaseException as e:  # pragma: no cover - defensive thread capture
+            with self._cv:
+                self._exc = e
+                self._closed = True
+                self._cv.notify_all()
+
+
+class _AsyncPlotManager:
+    """
+    Async plot task manager for GWAS.
+
+    Plot jobs are submitted during scan and collected at the end so scan/write
+    can continue without waiting for per-trait/per-model visualization.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        max_workers: int,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self._executor: Optional[cf.ThreadPoolExecutor]
+        self._jobs: list[tuple[int, str, str, cf.Future]] = []
+        if self.enabled:
+            self._executor = cf.ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
+        else:
+            self._executor = None
+
+    def submit(
+        self,
+        *,
+        row_index: int,
+        model_label: str,
+        trait_name: str,
+        tsv_path: str,
+        y_vec: np.ndarray,
+        out_svg: str,
+    ) -> None:
+        if (not self.enabled) or (self._executor is None):
+            return
+
+        y_payload = np.asarray(y_vec, dtype=np.float64).reshape(-1)
+
+        def _plot_job() -> float:
+            t0 = time.time()
+            plot_df = pd.read_csv(
+                tsv_path,
+                sep="\t",
+                usecols=["chrom", "pos", "pwald"],
+                dtype={"chrom": str, "pos": "int64"},
+            )
+            plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+            fastplot(
+                plot_df,
+                y_payload,
+                xlabel=trait_name,
+                outpdf=out_svg,
+            )
+            return max(time.time() - t0, 0.0)
+
+        fut = self._executor.submit(_plot_job)
+        self._jobs.append((int(row_index), str(model_label), str(trait_name), fut))
+
+    def finalize(self, summary_rows: list[dict[str, object]], logger, *, use_spinner: bool) -> None:
+        if (not self.enabled) or (self._executor is None):
+            return
+        for row_idx, model_label, trait_name, fut in self._jobs:
+            viz_secs = float(fut.result())
+            if 0 <= int(row_idx) < len(summary_rows):
+                summary_rows[int(row_idx)]["viz_time_s"] = viz_secs
+            _log_model_line(
+                logger,
+                model_label,
+                f"Plot saved for trait {trait_name} [{format_elapsed(viz_secs)}]",
+                use_spinner=bool(use_spinner),
+            )
+        self._jobs.clear()
+
+    def shutdown(self, *, abort: bool = False) -> None:
+        if self._executor is None:
+            return
+        if abort:
+            try:
+                for _row_idx, _model, _trait, fut in self._jobs:
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._jobs.clear()
+        self._executor.shutdown(wait=not abort, cancel_futures=bool(abort))
+        self._executor = None
 
 
 def fastplot(
@@ -2643,6 +2813,17 @@ def run_chunked_gwas_lmm_lm(
         summary_rows = []
     if saved_paths is None:
         saved_paths = []
+    plot_workers = max(
+        1,
+        min(
+            4,
+            int(threads) if int(threads) > 0 else int(detect_effective_threads()),
+        ),
+    )
+    plot_manager = _AsyncPlotManager(
+        enabled=bool(plot),
+        max_workers=int(plot_workers),
+    )
 
     trait_iter = list(pheno.columns) if trait_names is None else [t for t in trait_names if t in pheno.columns]
     multi_trait_mode = len(trait_iter) > 1
@@ -2764,9 +2945,7 @@ def run_chunked_gwas_lmm_lm(
             int,
             tuple[cf.Future, int, list[tuple[str, int, str, str]], np.ndarray],
         ] = {}
-        ready_rows: dict[int, tuple[str, bool, int, int]] = {}
         chunk_seq = 0
-        next_write_seq = 0
         interrupted = False
 
         class _ChunkBatchWriter:
@@ -2818,6 +2997,8 @@ def run_chunked_gwas_lmm_lm(
                 return bool(self._wrote_header)
 
         writer = _ChunkBatchWriter(str(tmp_tsv), batch_chunks=8)
+        async_writer = _OrderedAsyncChunkWriter(writer)
+        async_writer_closed = False
 
         def _format_chunk_tsv_text(
             results: np.ndarray,
@@ -2854,29 +3035,8 @@ def run_chunked_gwas_lmm_lm(
                 text += "\n"
             return text, has_plrt, int(rows.shape[0])
 
-        def _write_ready_chunks() -> None:
-            nonlocal next_write_seq, wrote_header, has_results, done_snps, peak_rss
-            while next_write_seq in ready_rows:
-                chunk_text, has_plrt, n_rows, m_chunk = ready_rows.pop(next_write_seq)
-                writer.append(
-                    chunk_text,
-                    has_plrt=has_plrt,
-                    rows=n_rows,
-                )
-                wrote_header = bool(writer.wrote_header)
-                has_results = int(writer.rows_written) > 0
-
-                done_snps += m_chunk
-                pbar.update(m_chunk)
-
-                mem_info = process.memory_info()
-                peak_rss = max(peak_rss, mem_info.rss)
-                if done_snps % (10 * model_chunk_size) == 0:
-                    mem_gb = mem_info.rss / 1024**3
-                    pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
-                next_write_seq += 1
-
         def _drain_completed(*, wait_for_one: bool) -> None:
+            nonlocal done_snps, peak_rss
             if len(inflight) == 0:
                 return
             futures = [x[0] for x in inflight.values()]
@@ -2902,8 +3062,20 @@ def run_chunked_gwas_lmm_lm(
                     info_chunk,
                     maf_chunk,
                 )
-                ready_rows[seq] = (chunk_text, has_plrt, n_rows, m_chunk)
-            _write_ready_chunks()
+                async_writer.submit(
+                    seq,
+                    chunk_text,
+                    has_plrt=has_plrt,
+                    rows=n_rows,
+                )
+                done_snps += int(m_chunk)
+                pbar.update(int(m_chunk))
+
+                mem_info = process.memory_info()
+                peak_rss = max(peak_rss, mem_info.rss)
+                if done_snps % (10 * model_chunk_size) == 0:
+                    mem_gb = mem_info.rss / 1024**3
+                    pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
 
         ex = cf.ThreadPoolExecutor(max_workers=workers)
         try:
@@ -2970,7 +3142,8 @@ def run_chunked_gwas_lmm_lm(
 
             while len(inflight) > 0:
                 _drain_completed(wait_for_one=True)
-            _write_ready_chunks()
+            async_writer.close()
+            async_writer_closed = True
             writer.flush()
             wrote_header = bool(writer.wrote_header)
             has_results = int(writer.rows_written) > 0
@@ -2982,11 +3155,16 @@ def run_chunked_gwas_lmm_lm(
                     fut.cancel()
                 except Exception:
                     pass
+            if not async_writer_closed:
+                async_writer.abort()
             raise
         finally:
             # Always stop renderer first, then tear down workers.
             pbar.close(show_done=False)
             ex.shutdown(wait=False, cancel_futures=True)
+            if (not interrupted) and (not async_writer_closed):
+                # Exception path: ensure writer thread doesn't leak.
+                async_writer.abort()
             if interrupted and os.path.exists(tmp_tsv):
                 try:
                     os.remove(tmp_tsv)
@@ -3035,29 +3213,17 @@ def run_chunked_gwas_lmm_lm(
                 logger.info("")  # single blank line between traits
             continue
 
-        viz_secs = 0.0
-        if plot:
-            viz_t0 = time.time()
-            def _run_plot() -> None:
-                plot_df = pd.read_csv(
-                    tmp_tsv,
-                    sep="\t",
-                    usecols=["chrom", "pos", "pwald"],
-                    dtype={"chrom": str, "pos": "int64"},
-                )
-                plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-                fastplot(
-                    plot_df,
-                    y_vec,
-                    xlabel=pname,
-                    outpdf=f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.svg",
-                )
-
-            _run_plot()
-            viz_secs = max(time.time() - viz_t0, 0.0)
-
+        os.replace(tmp_tsv, out_tsv)
+        saved_paths.append(str(out_tsv).replace("//", "/"))
+        _log_model_line(
+            logger,
+            effective_model_label,
+            f"Results saved to {str(out_tsv).replace('//', '/')}",
+            use_spinner=bool(use_spinner),
+        )
         if pname not in eff_snp_by_trait:
             eff_snp_by_trait[pname] = int(done_snps)
+        row_idx = len(summary_rows)
         summary_rows.append(
             {
                 "phenotype": str(pname),
@@ -3068,29 +3234,35 @@ def run_chunked_gwas_lmm_lm(
                 "avg_cpu": float(avg_cpu_pct),
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(evd_secs + scan_secs),
-                "viz_time_s": float(viz_secs),
+                "viz_time_s": 0.0,
                 "result_file": str(out_tsv).replace("//", "/"),
             }
         )
-
-        os.replace(tmp_tsv, out_tsv)
-        saved_paths.append(str(out_tsv).replace("//", "/"))
-        _log_model_line(
-            logger,
-            effective_model_label,
-            f"Results saved to {str(out_tsv).replace('//', '/')}",
-            use_spinner=bool(use_spinner),
-        )
+        if plot:
+            plot_manager.submit(
+                row_index=int(row_idx),
+                model_label=str(effective_model_label),
+                trait_name=str(pname),
+                tsv_path=str(out_tsv),
+                y_vec=np.asarray(y_vec, dtype=np.float64).reshape(-1),
+                out_svg=f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.svg",
+            )
         time_parts: list[str] = []
         if evd_secs > 0:
             time_parts.append(format_elapsed(evd_secs))
         time_parts.append(format_elapsed(scan_secs))
         if plot:
-            time_parts.append(format_elapsed(viz_secs))
+            time_parts.append("plot-async")
         done_msg = f"{effective_model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")  # ensure blank line between traits
+
+    # Collect async plot jobs before returning so summary has final viz_time_s.
+    try:
+        plot_manager.finalize(summary_rows, logger, use_spinner=bool(use_spinner))
+    finally:
+        plot_manager.shutdown(abort=False)
 
 
 def run_chunked_gwas_streaming_shared(
@@ -3140,6 +3312,17 @@ def run_chunked_gwas_streaming_shared(
         summary_rows = []
     if saved_paths is None:
         saved_paths = []
+    plot_workers = max(
+        1,
+        min(
+            4,
+            int(threads) if int(threads) > 0 else int(detect_effective_threads()),
+        ),
+    )
+    plot_manager = _AsyncPlotManager(
+        enabled=bool(plot),
+        max_workers=int(plot_workers),
+    )
 
     pname = str(trait_name)
     pheno_sub = pheno[pname].dropna()
@@ -3326,9 +3509,12 @@ def run_chunked_gwas_streaming_shared(
             "tmp_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
             "out_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv",
             "writer": None,
+            "async_writer": None,
+            "async_writer_closed": False,
             "init_log": None,
         }
         ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
+        ctx["async_writer"] = _OrderedAsyncChunkWriter(ctx["writer"])
 
         cpu_before = process.cpu_times()
         init_t0 = time.monotonic()
@@ -3394,12 +3580,21 @@ def run_chunked_gwas_streaming_shared(
         ctx["model_label"] = effective_model_label
         ctx["model_tag"] = effective_model_tag
         if effective_model_tag != model_tag:
+            old_async = ctx.get("async_writer")
+            old_closed = bool(ctx.get("async_writer_closed", False))
+            if old_async is not None and (not old_closed):
+                try:
+                    old_async.abort()
+                except Exception:
+                    pass
             ctx["tmp_tsv"] = (
                 f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv.tmp."
                 f"{os.getpid()}.{uuid.uuid4().hex}"
             )
             ctx["out_tsv"] = f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv"
             ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
+            ctx["async_writer"] = _OrderedAsyncChunkWriter(ctx["writer"])
+            ctx["async_writer_closed"] = False
         ctx["mod"] = mod
         model_ctxs.append(ctx)
 
@@ -3433,9 +3628,10 @@ def run_chunked_gwas_streaming_shared(
     rich_progress = None
     if use_rich_multi:
         rich_progress = build_rich_progress(
-            show_remaining=True,
+            show_remaining=False,
             show_percentage=False,
             field_templates=["{task.fields[metric]}"],
+            bar_width=_GWAS_PROGRESS_BAR_WIDTH,
             finished_text=" ",
             transient=True,
         )
@@ -3445,7 +3641,7 @@ def run_chunked_gwas_streaming_shared(
                 tid = rich_progress.add_task(
                     str(ctx["model_label"]),
                     total=pbar_total,
-                    metric="0.0%",
+                    metric=_format_progress_metric(0, pbar_total, None),
                 )
                 ctx["task_id"] = int(tid)
         else:
@@ -3459,16 +3655,12 @@ def run_chunked_gwas_streaming_shared(
             )
 
     def _metric_text(ctx: dict[str, object]) -> str:
-        tick = int(ctx.get("tick", 0))
-        mem_until = int(ctx.get("memory_until_tick", 0))
         mem_text = str(ctx.get("memory_text", ""))
-        if mem_text and tick <= mem_until:
-            return mem_text
-        if pbar_total <= 0:
-            pct = 0.0
-        else:
-            pct = 100.0 * float(int(ctx.get("done_snps", 0))) / float(pbar_total)
-        return f"{pct:>6.1f}%"
+        return _format_progress_metric(
+            int(ctx.get("done_snps", 0)),
+            int(pbar_total),
+            mem_text,
+        )
 
     def _advance_ctx(ctx: dict[str, object], m_chunk: int, mem_text: Union[str, None]) -> None:
         done = int(ctx.get("done_snps", 0)) + int(m_chunk)
@@ -3502,6 +3694,7 @@ def run_chunked_gwas_streaming_shared(
     prefetch_depth = 2 if scan_threads >= 2 else 1
 
     interrupted = False
+    chunk_seq = 0
     try:
         chunk_iter = load_genotype_chunks(
             genofile,
@@ -3565,15 +3758,16 @@ def run_chunked_gwas_streaming_shared(
                 )
 
                 chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
-                writer = ctx.get("writer")
-                if writer is None:
+                async_writer = ctx.get("async_writer")
+                if async_writer is None:
                     raise RuntimeError("Internal error: shared GWAS writer not initialized.")
-                writer.append(
+                async_writer.submit(
+                    int(chunk_seq),
                     chunk_text,
                     has_plrt=bool(has_plrt),
                     rows=m_chunk,
                 )
-                ctx["has_results"] = int(writer.rows_written) > 0
+                ctx["has_results"] = True
 
                 mem_info = process.memory_info()
                 ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
@@ -3582,8 +3776,13 @@ def run_chunked_gwas_streaming_shared(
                 if done_next % (10 * chunk_size) == 0:
                     mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
                 _advance_ctx(ctx, m_chunk, mem_text)
+            chunk_seq += 1
 
         for ctx in model_ctxs:
+            async_writer = ctx.get("async_writer")
+            if async_writer is not None and (not bool(ctx.get("async_writer_closed", False))):
+                async_writer.close()
+                ctx["async_writer_closed"] = True
             writer = ctx.get("writer")
             if writer is not None:
                 writer.flush()
@@ -3620,6 +3819,14 @@ def run_chunked_gwas_streaming_shared(
                     pbar_obj.close(show_done=False)
                 except Exception:
                     pass
+            async_writer = ctx.get("async_writer")
+            async_closed = bool(ctx.get("async_writer_closed", False))
+            if async_writer is not None and (not async_closed):
+                try:
+                    async_writer.abort()
+                except Exception:
+                    pass
+                ctx["async_writer_closed"] = True
             if interrupted:
                 tmp_tsv = str(ctx.get("tmp_tsv", ""))
                 if tmp_tsv and os.path.exists(tmp_tsv):
@@ -3690,29 +3897,17 @@ def run_chunked_gwas_streaming_shared(
             )
             if os.path.exists(tmp_tsv):
                 os.remove(tmp_tsv)
-        viz_secs = 0.0
         if has_results:
-            if plot:
-                viz_t0 = time.time()
+            os.replace(tmp_tsv, out_tsv)
+            saved_paths.append(str(out_tsv).replace("//", "/"))
+            _log_model_line(
+                logger,
+                model_label,
+                f"Results saved to {str(out_tsv).replace('//', '/')}",
+                use_spinner=bool(use_spinner),
+            )
 
-                def _run_plot() -> None:
-                    plot_df = pd.read_csv(
-                        tmp_tsv,
-                        sep="\t",
-                        usecols=["chrom", "pos", "pwald"],
-                        dtype={"chrom": str, "pos": "int64"},
-                    )
-                    plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-                    fastplot(
-                        plot_df,
-                        y_vec,
-                        xlabel=pname,
-                        outpdf=f"{outprefix}.{pname}.{genetic_model}.{str(ctx['model_tag'])}.svg",
-                    )
-
-                _run_plot()
-                viz_secs = max(time.time() - viz_t0, 0.0)
-
+            row_idx = len(summary_rows)
             summary_rows.append(
                 {
                     "phenotype": str(pname),
@@ -3723,28 +3918,33 @@ def run_chunked_gwas_streaming_shared(
                     "avg_cpu": float(avg_cpu_pct),
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
-                    "viz_time_s": float(viz_secs),
+                    "viz_time_s": 0.0,
                     "result_file": str(out_tsv).replace("//", "/"),
                 }
             )
-
-            os.replace(tmp_tsv, out_tsv)
-            saved_paths.append(str(out_tsv).replace("//", "/"))
-            _log_model_line(
-                logger,
-                model_label,
-                f"Results saved to {str(out_tsv).replace('//', '/')}",
-                use_spinner=bool(use_spinner),
-            )
+            if plot:
+                plot_manager.submit(
+                    row_index=int(row_idx),
+                    model_label=str(model_label),
+                    trait_name=str(pname),
+                    tsv_path=str(out_tsv),
+                    y_vec=np.asarray(y_vec, dtype=np.float64).reshape(-1),
+                    out_svg=f"{outprefix}.{pname}.{genetic_model}.{str(ctx['model_tag'])}.svg",
+                )
 
         time_parts: list[str] = []
         if evd_secs > 0:
             time_parts.append(format_elapsed(evd_secs))
         time_parts.append(format_elapsed(scan_secs))
         if plot and has_results:
-            time_parts.append(format_elapsed(viz_secs))
+            time_parts.append("plot-async")
         done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
+
+    try:
+        plot_manager.finalize(summary_rows, logger, use_spinner=bool(use_spinner))
+    finally:
+        plot_manager.shutdown(abort=False)
 
 
 # ======================================================================

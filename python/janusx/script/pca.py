@@ -830,8 +830,16 @@ def main(log: bool = True):
 
     if log:
         cfg_rows: list[tuple[str, object]] = []
-        rsvd_force_bed_cache = bool(
+        rsvd_bed_cache_build = bool(
             args.rsvd and (args.vcf or args.hmp or (args.file and _is_txt_like_input_path(gfile)))
+        )
+        rsvd_packed_bed_backend = bool(
+            args.rsvd and (
+                _is_plink_prefix_path(str(gfile))
+                or bool(args.vcf)
+                or bool(args.hmp)
+                or bool(args.file and _is_txt_like_input_path(gfile))
+            )
         )
         if args.vcf or args.hmp or args.file or args.bfile:
             cfg_rows.extend(
@@ -850,7 +858,8 @@ def main(log: bool = True):
                     [
                         ("RSVD power", args.rsvd_power),
                         ("RSVD tol", args.rsvd_tol),
-                        ("RSVD packed BED policy", rsvd_force_bed_cache),
+                        ("RSVD BED cache build", rsvd_bed_cache_build),
+                        ("RSVD packed BED backend", rsvd_packed_bed_backend),
                         ("RSVD SNP-only filter", rsvd_snps_only),
                     ]
                 )

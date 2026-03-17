@@ -367,10 +367,16 @@ def _ensure_plink_cache_from_source_at(
             # older Rust extension builds may not support HMP as convert_genotypes input.
             # In that case convert_genotypes misinterprets '*.hmp' as a PLINK prefix.
             ex_msg = str(ex).lower()
-            hmp_src = str(source_path).lower().endswith((".hmp", ".hmp.gz"))
+            source_low = str(source_path).lower()
+            hmp_src = source_low.endswith((".hmp", ".hmp.gz"))
+            txt_src = source_low.endswith((".txt", ".tsv", ".csv"))
             looks_like_old_hmp_bug = (
                 "plink prefix not found or missing .bed/.bim/.fam" in ex_msg
                 and hmp_src
+            )
+            looks_like_txt_unsupported = (
+                "plink prefix not found or missing .bed/.bim/.fam" in ex_msg
+                and txt_src
             )
             if (str(source_label).upper() == "HMP") and looks_like_old_hmp_bug:
                 warnings.warn(
@@ -385,6 +391,16 @@ def _ensure_plink_cache_from_source_at(
                     source_path=source_path,
                     out_prefix=cache_prefix,
                     snps_only=bool(snps_only),
+                )
+            elif (str(source_label).upper() == "TXT") and looks_like_txt_unsupported:
+                # TXT->PLINK direct conversion is unavailable in some builds.
+                # Fall back to a stable streaming conversion path.
+                delim = "," if source_low.endswith(".csv") else None
+                _convert_txt_to_plink_streaming(
+                    source_path=source_path,
+                    out_prefix=cache_prefix,
+                    snps_only=bool(snps_only),
+                    delimiter=delim,
                 )
             else:
                 raise
@@ -456,6 +472,65 @@ def _convert_hmp_to_plink_streaming(
         fmt="plink",
         total_snps=None,
         desc="Caching HMP as PLINK",
+    )
+
+
+def _convert_txt_to_plink_streaming(
+    *,
+    source_path: str,
+    out_prefix: str,
+    snps_only: bool,
+    delimiter: Union[str, None] = None,
+    chunk_size: int = 50000,
+) -> None:
+    """
+    Python-side TXT/TSV/CSV -> PLINK streaming converter used as compatibility fallback.
+    """
+    sample_ids, _ = inspect_genotype_file(str(source_path))
+    sample_ids = [str(x) for x in sample_ids]
+    if len(sample_ids) == 0:
+        raise RuntimeError(f"TXT input has no samples: {source_path}")
+
+    def _is_simple_base(a: str) -> bool:
+        aa = str(a).strip().upper()
+        return len(aa) == 1 and aa in {"A", "C", "G", "T"}
+
+    def _iter_chunks():
+        it = load_genotype_chunks(
+            str(source_path),
+            chunk_size=int(chunk_size),
+            maf=0.0,
+            missing_rate=1.0,
+            impute=False,
+            model="add",
+            delimiter=delimiter,
+        )
+        for geno, sites in it:
+            geno_np = np.asarray(geno, dtype=np.float32)
+            sites_list = list(sites)
+            if bool(snps_only):
+                keep_idx: list[int] = []
+                for i, s in enumerate(sites_list):
+                    r = str(getattr(s, "ref_allele", ""))
+                    a = str(getattr(s, "alt_allele", ""))
+                    if _is_simple_base(r) and _is_simple_base(a):
+                        keep_idx.append(i)
+                if len(keep_idx) == 0:
+                    continue
+                if len(keep_idx) != len(sites_list):
+                    geno_np = np.asarray(geno_np[keep_idx, :], dtype=np.float32)
+                    sites_list = [sites_list[i] for i in keep_idx]
+            if geno_np.shape[0] == 0:
+                continue
+            yield geno_np, sites_list
+
+    save_genotype_streaming(
+        str(out_prefix),
+        sample_ids,
+        _iter_chunks(),
+        fmt="plink",
+        total_snps=None,
+        desc="Caching TXT as PLINK",
     )
 
 
@@ -639,11 +714,12 @@ def prepare_cli_input_cache(
     *,
     snps_only: bool = False,
     delimiter: Union[str, None] = None,
+    prefer_plink_for_txt: bool = False,
 ) -> str:
     """
     Normalize CLI genotype input to cache-backed paths:
       - VCF/HMP -> PLINK BED prefix cache
-      - TXT     -> NPY cache path
+      - TXT     -> NPY cache path (default) or PLINK BED prefix cache
       - others  -> unchanged
     """
     kind, prefix, src_path = _resolve_input(path_or_prefix)
@@ -668,6 +744,13 @@ def prepare_cli_input_cache(
     if kind == "txt":
         if src_path is None:
             raise ValueError("TXT source path not found.")
+        if bool(prefer_plink_for_txt):
+            return _ensure_plink_cache_for_cli_source(
+                prefix,
+                src_path,
+                source_label="TXT",
+                snps_only=bool(snps_only),
+            )
         return _ensure_txt_npy_cache_for_cli(prefix, src_path, delimiter=delimiter)
     if kind == "npy":
         if src_path is not None:

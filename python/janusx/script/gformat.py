@@ -31,6 +31,7 @@ import os
 import socket
 import time
 import re
+import gzip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -38,12 +39,15 @@ from typing import Iterator, Sequence
 import numpy as np
 
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming, SiteInfo
+from janusx.janusx import VcfChunkReader, HmpChunkReader, count_vcf_snps, count_hmp_snps
+from janusx.gfreader.gfreader import _resolve_input, _process_txt_like_chunk
 
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import (
     GENOTYPE_TEXT_SUFFIXES,
     build_prefix_candidates,
     determine_genotype_source_from_args as determine_genotype_source,
+    discover_id_sidecar_path,
     discover_site_path,
     write_npy_output,
     write_text_output,
@@ -264,7 +268,8 @@ def _filter_chunk_by_site(
 
 
 def _has_real_file_sites(file_arg: str) -> bool:
-    _, prefixes = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
+    raw_prefix, _ = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
+    prefixes = [raw_prefix]
     return discover_site_path(prefixes) is not None
 
 
@@ -297,6 +302,282 @@ def _iter_filtered_chunks(
         yield g2, s2
 
 
+def _count_sites_from_chunks(
+    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
+) -> int:
+    cnt = 0
+    for block, _sites in chunks:
+        cnt += int(np.asarray(block).shape[0])
+    return int(cnt)
+
+
+def _open_text_auto(path: str):
+    low = str(path).lower()
+    if low.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
+def _read_id_sidecar(id_path: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    with open(id_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            tok = _split_tokens(s)
+            if not tok:
+                continue
+            sid = str(tok[0]).strip()
+            if sid and sid not in seen:
+                seen.add(sid)
+                out.append(sid)
+    if len(out) == 0:
+        raise ValueError(f"ID sidecar is empty or invalid: {id_path}")
+    return out
+
+
+def _count_text_matrix_rows(matrix_path: str) -> int:
+    n = 0
+    with _open_text_auto(matrix_path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            n += 1
+    return int(n)
+
+
+def _resolve_txt_direct_paths(file_arg: str) -> tuple[str, str, str | None]:
+    raw_prefix, _ = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
+    p = str(file_arg)
+    low = p.lower()
+
+    matrix_path = None
+    if low.endswith((".txt", ".tsv", ".csv")) and Path(p).is_file():
+        matrix_path = p
+    else:
+        for ext in (".txt", ".tsv", ".csv"):
+            cand = f"{raw_prefix}{ext}"
+            if Path(cand).is_file():
+                matrix_path = cand
+                break
+    if matrix_path is None:
+        raise ValueError(
+            f"Cannot find FILE text matrix for direct conversion: {file_arg}"
+        )
+
+    id_path = discover_id_sidecar_path(matrix_path, [raw_prefix])
+    if id_path is None:
+        raise ValueError(
+            f"Cannot find ID sidecar for text matrix: {matrix_path} (expected {raw_prefix}.id or {matrix_path}.id)"
+        )
+    site_path = discover_site_path([raw_prefix])
+    return matrix_path, id_path, site_path
+
+
+def _parse_site_line(site_line: str, *, is_bim: bool, row_idx: int, site_path: str) -> SiteInfo:
+    tok = _split_tokens(site_line)
+    if is_bim:
+        if len(tok) < 6:
+            raise ValueError(
+                f"Invalid BIM row at {site_path}:{row_idx} (need >=6 columns)."
+            )
+        chrom = str(tok[0])
+        pos = int(float(tok[3]))
+        ref = str(tok[4])
+        alt = str(tok[5])
+    else:
+        if len(tok) < 4:
+            raise ValueError(
+                f"Invalid SITE row at {site_path}:{row_idx} (need >=4 columns: CHR POS REF ALT)."
+            )
+        chrom = str(tok[0])
+        pos = int(float(tok[1]))
+        ref = str(tok[2])
+        alt = str(tok[3])
+    return SiteInfo(chrom, int(pos), ref, alt)
+
+
+def _parse_text_row_values(line: str, *, expected_cols: int, row_idx: int, matrix_path: str) -> np.ndarray:
+    tok = _split_tokens(line)
+    if len(tok) != int(expected_cols):
+        raise ValueError(
+            f"Text matrix column mismatch at {matrix_path}:{row_idx}: expected {expected_cols}, got {len(tok)}."
+        )
+    vals = np.empty(int(expected_cols), dtype=np.float32)
+    for i, t in enumerate(tok):
+        tt = str(t).strip()
+        up = tt.upper()
+        if up in {"NA", "NAN", "."}:
+            vals[i] = np.float32(-9.0)
+            continue
+        try:
+            vals[i] = np.float32(float(tt))
+        except Exception as e:
+            raise ValueError(
+                f"Invalid numeric token at {matrix_path}:{row_idx}, col={i + 1}: {tt}"
+            ) from e
+    return vals
+
+
+def _iter_vcf_direct_chunks(
+    vcf_path: str,
+    *,
+    chunk_size: int,
+    sample_ids: list[str] | None,
+    maf_threshold: float,
+    max_missing_rate: float,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    reader = VcfChunkReader(
+        str(vcf_path),
+        float(maf_threshold),
+        float(max_missing_rate),
+        False,
+        sample_ids,
+        None,
+        "add",
+        0.02,
+    )
+    while True:
+        out = reader.next_chunk(int(chunk_size))
+        if out is None:
+            break
+        geno, sites = out
+        yield np.asarray(geno, dtype=np.float32), list(sites)
+
+
+def _iter_hmp_direct_chunks(
+    hmp_path: str,
+    *,
+    chunk_size: int,
+    sample_ids: list[str] | None,
+    maf_threshold: float,
+    max_missing_rate: float,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    reader = HmpChunkReader(
+        str(hmp_path),
+        float(maf_threshold),
+        float(max_missing_rate),
+        False,
+        sample_ids,
+        None,
+        "add",
+        0.02,
+    )
+    while True:
+        out = reader.next_chunk(int(chunk_size))
+        if out is None:
+            break
+        geno, sites = out
+        yield np.asarray(geno, dtype=np.float32), list(sites)
+
+
+def _iter_txt_direct_chunks(
+    matrix_path: str,
+    *,
+    id_path: str,
+    site_path: str | None,
+    chunk_size: int,
+    sample_ids: list[str] | None,
+    maf_threshold: float,
+    max_missing_rate: float,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    all_sample_ids = _read_id_sidecar(id_path)
+    sample_index_map = {sid: i for i, sid in enumerate(all_sample_ids)}
+    if sample_ids is None:
+        selected_indices = np.arange(len(all_sample_ids), dtype=np.int64)
+    else:
+        idx: list[int] = []
+        for sid in sample_ids:
+            if sid not in sample_index_map:
+                raise ValueError(f"Sample ID not found in {id_path}: {sid}")
+            idx.append(int(sample_index_map[sid]))
+        selected_indices = np.asarray(idx, dtype=np.int64)
+    n_expected = int(len(all_sample_ids))
+
+    site_fh = None
+    is_bim = False
+    site_row_idx = 0
+    if site_path is not None:
+        site_fh = open(site_path, "r", encoding="utf-8", errors="replace")
+        is_bim = str(site_path).lower().endswith(".bim")
+
+    def _next_site(matrix_row_idx: int) -> SiteInfo:
+        nonlocal site_row_idx
+        if site_fh is None:
+            return SiteInfo("N", int(matrix_row_idx), "N", "N")
+        while True:
+            line = site_fh.readline()
+            if line == "":
+                raise ValueError(
+                    f"Site metadata ended early at row {matrix_row_idx} in {site_path}."
+                )
+            site_row_idx += 1
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            return _parse_site_line(
+                s,
+                is_bim=bool(is_bim),
+                row_idx=site_row_idx,
+                site_path=str(site_path),
+            )
+
+    rows: list[np.ndarray] = []
+    sites: list[SiteInfo] = []
+    matrix_row_idx = 0
+    try:
+        with _open_text_auto(matrix_path) as f:
+            for line_idx, line in enumerate(f, start=1):
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                matrix_row_idx += 1
+                row = _parse_text_row_values(
+                    s,
+                    expected_cols=n_expected,
+                    row_idx=line_idx,
+                    matrix_path=matrix_path,
+                )
+                if selected_indices.size != n_expected:
+                    row = np.asarray(row[selected_indices], dtype=np.float32)
+                rows.append(row)
+                sites.append(_next_site(matrix_row_idx))
+                if len(rows) >= int(chunk_size):
+                    arr = np.asarray(rows, dtype=np.float32)
+                    arr, sites_out = _process_txt_like_chunk(
+                        arr,
+                        sites,
+                        maf=float(maf_threshold),
+                        missing_rate=float(max_missing_rate),
+                        impute=False,
+                        model="add",
+                        het=0.02,
+                    )
+                    if arr.shape[0] > 0:
+                        yield arr, list(sites_out)
+                    rows = []
+                    sites = []
+        if len(rows) > 0:
+            arr = np.asarray(rows, dtype=np.float32)
+            arr, sites_out = _process_txt_like_chunk(
+                arr,
+                sites,
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                impute=False,
+                model="add",
+                het=0.02,
+            )
+            if arr.shape[0] > 0:
+                yield arr, list(sites_out)
+    finally:
+        if site_fh is not None:
+            site_fh.close()
+
+
 def _count_selected_sites(
     gfile: str,
     *,
@@ -304,13 +585,15 @@ def _count_selected_sites(
     snp_sites: list[tuple[str, int]] | None,
     bim_range: tuple[str, int, int] | None,
     site_filter: SiteFilterSpec,
+    maf_threshold: float,
+    max_missing_rate: float,
 ) -> int:
     cnt = 0
     chunks = load_genotype_chunks(
         gfile,
         chunk_size=50_000,
-        maf=0.0,
-        missing_rate=1.0,
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
         impute=False,
         sample_ids=sample_ids,
         snp_sites=snp_sites,
@@ -374,6 +657,26 @@ def build_parser() -> CliArgumentParser:
         help="Output prefix (default: input basename).",
     )
     opt.add_argument(
+        "-maf",
+        "--maf",
+        type=float,
+        default=0.0,
+        help=(
+            "Exclude variants with minor allele frequency lower than a threshold "
+            "(default: %(default)s; no filtering)."
+        ),
+    )
+    opt.add_argument(
+        "-geno",
+        "--geno",
+        type=float,
+        default=1.0,
+        help=(
+            "Exclude variants with missing call frequencies greater than a threshold "
+            "(default: %(default)s; no filtering)."
+        ),
+    )
+    opt.add_argument(
         "-keep",
         "--keep",
         type=str,
@@ -417,6 +720,10 @@ def main() -> None:
     args, extras = parser.parse_known_args()
     if extras:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    if not (0.0 <= float(args.maf) <= 0.5):
+        parser.error("-maf must be within [0, 0.5].")
+    if not (0.0 <= float(args.geno) <= 1.0):
+        parser.error("-geno must be within [0, 1.0].")
 
     gfile, default_prefix = determine_genotype_source(args)
     if args.prefix is None:
@@ -452,6 +759,8 @@ def main() -> None:
                     ("Extract", f"{extract_mode or 'None'}:{extract_file or 'None'}"),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
+                    ("MAF threshold", float(args.maf)),
+                    ("Miss threshold", float(args.geno)),
                 ],
             )
         ],
@@ -481,7 +790,13 @@ def main() -> None:
             "Please provide a matching prefix.site or prefix.bim sidecar."
         )
 
-    inspect_desc = "Inspecting genotype metadata (and preparing cache if needed)..."
+    source_kind, _source_prefix, source_path = _resolve_input(gfile)
+    use_direct_no_cache = bool(source_kind in {"vcf", "hmp", "txt"})
+    txt_matrix_path: str | None = None
+    txt_id_path: str | None = None
+    txt_site_path: str | None = None
+
+    inspect_desc = "Inspecting genotype metadata..."
     if not status_enabled:
         logger.info(inspect_desc)
     with CliStatus(
@@ -489,7 +804,43 @@ def main() -> None:
         enabled=status_enabled,
     ) as task:
         try:
-            sample_ids, n_sites = inspect_genotype_file(gfile)
+            if use_direct_no_cache and source_kind == "vcf":
+                if source_path is None:
+                    raise ValueError(f"VCF source path not found: {gfile}")
+                vcf_reader = VcfChunkReader(
+                    str(source_path),
+                    0.0,
+                    1.0,
+                    False,
+                    None,
+                    None,
+                    "add",
+                    0.02,
+                )
+                sample_ids = [str(x) for x in vcf_reader.sample_ids]
+                n_sites = int(count_vcf_snps(str(source_path)))
+            elif use_direct_no_cache and source_kind == "hmp":
+                if source_path is None:
+                    raise ValueError(f"HMP source path not found: {gfile}")
+                hmp_reader = HmpChunkReader(
+                    str(source_path),
+                    0.0,
+                    1.0,
+                    False,
+                    None,
+                    None,
+                    "add",
+                    0.02,
+                )
+                sample_ids = [str(x) for x in hmp_reader.sample_ids]
+                n_sites = int(count_hmp_snps(str(source_path)))
+            elif use_direct_no_cache and source_kind == "txt":
+                txt_arg = str(args.file or gfile)
+                txt_matrix_path, txt_id_path, txt_site_path = _resolve_txt_direct_paths(txt_arg)
+                sample_ids = _read_id_sidecar(txt_id_path)
+                n_sites = _count_text_matrix_rows(txt_matrix_path)
+            else:
+                sample_ids, n_sites = inspect_genotype_file(gfile)
         except Exception:
             task.fail("Inspecting genotype metadata ...Failed")
             raise
@@ -551,38 +902,83 @@ def main() -> None:
         push_bim_range = (c, start, end)
         post_filter = SiteFilterSpec()
 
-    has_site_filter = bool(push_snp_sites) or (push_bim_range is not None) or post_filter.active()
+    def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+        if use_direct_no_cache and source_kind == "vcf":
+            if source_path is None:
+                raise ValueError(f"VCF source path not found: {gfile}")
+            if push_snp_sites is not None:
+                post_filter.exact_sites = set(push_snp_sites)
+            if push_bim_range is not None:
+                post_filter.ranges = [push_bim_range]
+            c = _iter_vcf_direct_chunks(
+                str(source_path),
+                chunk_size=50_000,
+                sample_ids=keep_sample_ids,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+            )
+        elif use_direct_no_cache and source_kind == "hmp":
+            if source_path is None:
+                raise ValueError(f"HMP source path not found: {gfile}")
+            if push_snp_sites is not None:
+                post_filter.exact_sites = set(push_snp_sites)
+            if push_bim_range is not None:
+                post_filter.ranges = [push_bim_range]
+            c = _iter_hmp_direct_chunks(
+                str(source_path),
+                chunk_size=50_000,
+                sample_ids=keep_sample_ids,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+            )
+        elif use_direct_no_cache and source_kind == "txt":
+            if txt_matrix_path is None or txt_id_path is None:
+                raise ValueError("Internal error: text input paths are unresolved.")
+            if push_snp_sites is not None:
+                post_filter.exact_sites = set(push_snp_sites)
+            if push_bim_range is not None:
+                post_filter.ranges = [push_bim_range]
+            c = _iter_txt_direct_chunks(
+                str(txt_matrix_path),
+                id_path=str(txt_id_path),
+                site_path=txt_site_path,
+                chunk_size=50_000,
+                sample_ids=keep_sample_ids,
+                maf_threshold=float(args.maf),
+                max_missing_rate=float(args.geno),
+            )
+        else:
+            c = load_genotype_chunks(
+                gfile,
+                chunk_size=50_000,
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                impute=False,
+                sample_ids=keep_sample_ids,
+                snp_sites=push_snp_sites,
+                bim_range=push_bim_range,
+            )
+        if post_filter.active():
+            c = _iter_filtered_chunks(c, post_filter)
+        return c
+
+    need_selected_count = (
+        bool(push_snp_sites)
+        or (push_bim_range is not None)
+        or post_filter.active()
+        or (float(args.maf) > 0.0)
+        or (float(args.geno) < 1.0)
+        or (use_direct_no_cache and out_fmt in {"npy", "txt"})
+    )
     selected_n_sites = int(n_sites)
-    if has_site_filter:
-        selected_n_sites = _count_selected_sites(
-            gfile,
-            sample_ids=keep_sample_ids,
-            snp_sites=push_snp_sites,
-            bim_range=push_bim_range,
-            site_filter=post_filter,
-        )
+    if need_selected_count:
+        selected_n_sites = _count_sites_from_chunks(_make_chunks())
         if selected_n_sites <= 0:
-            raise ValueError("All variants were filtered out by --extract/--chr/--from-bp/--to-bp.")
+            raise ValueError("All variants were filtered out by filters (-extract/-chr/-from-bp/-to-bp/-maf/-geno).")
 
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
     print(f"Genotype source: {format_path_for_display(gfile)}")
     print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
-    print(f"Output: {output_display}")
-
-    def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-        c = load_genotype_chunks(
-            gfile,
-            chunk_size=50_000,
-            maf=0.0,
-            missing_rate=1.0,
-            impute=False,
-            sample_ids=keep_sample_ids,
-            snp_sites=push_snp_sites,
-            bim_range=push_bim_range,
-        )
-        if post_filter.active():
-            c = _iter_filtered_chunks(c, post_filter)
-        return c
 
     t0 = time.time()
     if out_fmt == "vcf":

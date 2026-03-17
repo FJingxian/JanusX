@@ -4169,12 +4169,12 @@ def run_farmcpu_fullmem(
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
                     raise
-                task.complete(f"Loading genotype (Full, {int(n_snps)} SNPs) ...Finished")
+                task.complete(f"Loading genotype (Full, {int(n_snps)} SNPs)")
             if not bool(use_spinner):
                 _log_file_only(
                     logger,
                     logging.INFO,
-                    f"Loading genotype (Full, {int(n_snps)} SNPs) ...Finished "
+                    f"Loading genotype (Full, {int(n_snps)} SNPs) "
                     f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
                 )
             if int(packed_n) != int(famid.shape[0]):
@@ -4219,6 +4219,7 @@ def run_farmcpu_fullmem(
         else:
             geno_chunks = []
             site_rows = []
+            full_load_t0 = time.monotonic()
             pbar = _ProgressAdapter(total=n_snps, desc="Loading genotype (Full)")
             try:
                 for chunk, sites in load_genotype_chunks(
@@ -4242,7 +4243,13 @@ def run_farmcpu_fullmem(
                 pbar.finish()
             finally:
                 # Ensure spinner/progress stops on Ctrl+C.
-                pbar.close(success_style=False, show_done=True)
+                pbar.close(success_style=False, show_done=False)
+            _rich_success(
+                logger,
+                f"Loading genotype (Full, {loaded_snps} SNPs) "
+                f"[{format_elapsed(time.monotonic() - full_load_t0)}]",
+                use_spinner=bool(use_spinner),
+            )
 
             if len(geno_chunks) == 0:
                 msg = "After filtering, number of SNPs is zero for FarmCPU."

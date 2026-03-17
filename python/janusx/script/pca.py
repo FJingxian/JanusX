@@ -242,6 +242,28 @@ def _rsvd_worker(
         raise
 
 
+def _select_rsvd_mp_context():
+    """
+    Select a multiprocessing context for RSVD subprocesses.
+
+    Prefer spawn to avoid Python 3.12+ fork warnings in multi-threaded processes
+    on Unix-like systems. Allow manual override via JANUSX_MP_START_METHOD.
+    """
+    try:
+        methods = [str(m).strip().lower() for m in mp.get_all_start_methods()]
+    except Exception:
+        methods = []
+
+    env_method = str(os.environ.get("JANUSX_MP_START_METHOD", "")).strip().lower()
+    if env_method and env_method in methods:
+        return mp.get_context(env_method)
+
+    for name in ("spawn", "forkserver", "fork"):
+        if name in methods:
+            return mp.get_context(name)
+    return mp.get_context()
+
+
 def _run_rsvd_subprocess(
     *,
     genotype_path: str,
@@ -256,7 +278,7 @@ def _run_rsvd_subprocess(
     force_packed_bed: bool,
     progress_callback=None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+    ctx = _select_rsvd_mp_context()
     q = ctx.Queue(maxsize=1)
     tmpdir = tempfile.mkdtemp(prefix="janusx_pca_rsvd_")
     eval_path = os.path.join(tmpdir, "eval.npy")

@@ -2031,6 +2031,7 @@ def load_or_build_grm_with_cache(
                     task.complete(f"Loading GRM from {src} (n={grm.shape[0]})")
             else:
                 method_int = int(mgrm)
+                grm_calc_t0 = time.monotonic()
                 grm, eff_m = build_grm_streaming(
                     genofile=genofile,
                     n_samples=n_samples,
@@ -2047,6 +2048,12 @@ def load_or_build_grm_with_cache(
                     use_spinner=use_spinner,
                     snps_only=bool(snps_only),
                 )
+                grm_msg = (
+                    f"Calculating GRM from genotype (n={int(n_samples)}) "
+                    f"...Finished [{format_elapsed(time.monotonic() - grm_calc_t0)}]"
+                )
+                _log_file_only(logger, logging.INFO, grm_msg)
+                print_success(grm_msg, force_color=bool(use_spinner))
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 np.save(tmp_grm, grm)
                 os.replace(tmp_grm, grm_path)
@@ -2198,21 +2205,15 @@ def load_or_build_q_with_cache(
                     raise ValueError(
                         "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
                     )
-                if use_spinner:
-                    with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
-                        try:
-                            eigval, eigvec = np.linalg.eigh(grm)
-                        except Exception:
-                            task.fail(f"Computing top {dim} PCs from GRM ...Failed")
-                            raise
-                        task.complete(
-                            f"Computing top {dim} PCs from GRM (n={eigvec.shape[0]}, nPC={dim})"
-                        )
-                else:
-                    logger.info(f"Computing top {dim} PCs from GRM...")
-                    eigval, eigvec = np.linalg.eigh(grm)
-                    logger.info("PC computation finished.")
+                pc_calc_t0 = time.monotonic()
+                eigval, eigvec = np.linalg.eigh(grm)
                 qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
+                pc_msg = (
+                    f"Calculating PCs from GRM (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
+                    f"...Finished [{format_elapsed(time.monotonic() - pc_calc_t0)}]"
+                )
+                _log_file_only(logger, logging.INFO, pc_msg)
+                print_success(pc_msg, force_color=bool(use_spinner))
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
                 os.replace(tmp_q, q_path)
@@ -2339,6 +2340,14 @@ def prepare_streaming_context(
         f"Cache prefix: {cache_prefix}",
         use_spinner=use_spinner,
     )
+    stream_genofile = str(genofile)
+    genofile_low = str(genofile).lower()
+    if genofile_low.endswith(".vcf") or genofile_low.endswith(".vcf.gz"):
+        if all(os.path.isfile(f"{cache_prefix}.{ext}") for ext in ("bed", "bim", "fam")):
+            # Reuse the parameterized VCF cache prefix across streaming steps.
+            # This avoids creating extra VCF->BED caches with other default filter tags.
+            stream_genofile = str(cache_prefix)
+
     need_generate_q = False
     if pcdim in np.arange(1, n_samples).astype(str):
         qdim = int(pcdim)
@@ -2369,7 +2378,7 @@ def prepare_streaming_context(
         if need_grm:
             # GRM stream...
             grm, eff_m, grm_ids = load_or_build_grm_with_cache(
-                genofile=genofile,
+                genofile=stream_genofile,
                 cache_prefix=cache_prefix,
                 mgrm=mgrm,
                 maf_threshold=maf_threshold,
@@ -2387,7 +2396,7 @@ def prepare_streaming_context(
         else:
             _rich_success(
                 logger,
-                "Skipping GRM construction: no LMM/fastLMM and no PCA generation needed.",
+                "GRM not required (no LMM/fastLMM and q=0).",
                 use_spinner=use_spinner,
             )
 
@@ -2410,7 +2419,7 @@ def prepare_streaming_context(
 
         cov_all, cov_ids = _load_covariate_for_streaming(
             cov_inputs,
-            genofile,
+            stream_genofile,
             ids,
             chunk_size,
             logger,
@@ -2551,7 +2560,7 @@ def prepare_streaming_context(
         cov_idx = [cov_index[sid] for sid in ids]
         cov_all = cov_all[cov_idx]
 
-    return pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m
+    return pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, stream_genofile
 
 
 def run_chunked_gwas_lmm_lm(
@@ -4789,6 +4798,7 @@ def main(log: bool = True):
         qmatrix = None
         cov_all = None
         eff_m = None
+        genofile_stream = gfile
         eff_snp_by_trait: dict[str, int] = {}
 
         stream_selected = bool(args.lmm or args.lm or args.fastlmm)
@@ -4799,7 +4809,7 @@ def main(log: bool = True):
                 logging.INFO,
                 "Prepare streaming context (phenotype/genotype meta/GRM/Q/cov)",
             )
-            pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m = prepare_streaming_context(
+            pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream = prepare_streaming_context(
                 genofile=gfile,
                 phenofile=args.pheno,
                 pheno_cols=args.ncol,
@@ -4864,7 +4874,7 @@ def main(log: bool = True):
                     )
                     run_chunked_gwas_lmm_lm(
                         model_name=model_key,
-                        genofile=gfile,
+                        genofile=genofile_stream,
                         pheno=pheno,
                         ids=ids,
                         n_snps=n_snps,
@@ -4895,7 +4905,7 @@ def main(log: bool = True):
                     run_chunked_gwas_streaming_shared(
                         model_names=stream_models,
                         trait_name=str(pname),
-                        genofile=gfile,
+                        genofile=genofile_stream,
                         pheno=pheno,
                         ids=ids,
                         n_snps=n_snps,

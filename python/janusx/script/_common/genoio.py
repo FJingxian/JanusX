@@ -378,8 +378,10 @@ def write_text_output(
         finally:
             _close_site_progress(progress, pbar)
     if written != int(total_sites):
-        raise RuntimeError(
-            f"Written site count mismatch for text output: {written} vs {total_sites}"
+        print(
+            f"! Warning: Written site count mismatch for text output: {written} vs {total_sites}. "
+            f"Kept written rows={written}.",
+            file=sys.stderr,
         )
 
 
@@ -413,7 +415,33 @@ def write_npy_output(
         finally:
             _close_site_progress(progress, pbar)
     out_mm.flush()
-    if offset != int(total_sites):
+    expected = int(total_sites)
+    if offset != expected:
+        # Keep conversion usable when upstream site counting is conservative:
+        # rewrite the npy file to the true written row count.
+        if offset < expected:
+            print(
+                f"! Warning: Written site count mismatch for npy output: {offset} vs {total_sites}. "
+                f"Adjusting output shape to written rows={offset}.",
+                file=sys.stderr,
+            )
+            tmp_out = f"{out_path}.tmp"
+            fixed_mm = np.lib.format.open_memmap(
+                tmp_out,
+                mode="w+",
+                dtype=np.float32,
+                shape=(int(offset), len(sample_ids)),
+            )
+            if offset > 0:
+                step = 10_000
+                for i in range(0, int(offset), step):
+                    j = min(int(offset), i + step)
+                    fixed_mm[i:j, :] = out_mm[i:j, :]
+            fixed_mm.flush()
+            del fixed_mm
+            del out_mm
+            os.replace(tmp_out, out_path)
+            return
         raise RuntimeError(
             f"Written site count mismatch for npy output: {offset} vs {total_sites}"
         )

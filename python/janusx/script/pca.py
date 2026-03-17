@@ -37,7 +37,7 @@ Output:
 """
 
 import os
-from typing import Union
+from typing import Optional, Union
 for key in ["MPLBACKEND"]:
     if key in os.environ:
         del os.environ[key]
@@ -46,6 +46,12 @@ import time
 import socket
 import argparse
 import logging
+import re
+import multiprocessing as mp
+import tempfile
+import shutil
+import sys
+import threading
 
 import numpy as np
 import pandas as pd
@@ -65,6 +71,7 @@ from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
+    prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
@@ -74,10 +81,11 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_file_input_exists,
     ensure_plink_prefix_exists,
+    format_path_for_display,
 )
 from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
-from ._common.status import CliStatus, format_elapsed, log_success
+from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -102,17 +110,371 @@ def load_group_table(group_path: str) -> tuple[pd.DataFrame, Union[str , None], 
     return group_df, "group", "label"
 
 
+def _is_plink_prefix_path(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix)
+    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+
+
+def _is_txt_like_input_path(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix)
+    low = p.lower()
+    if low.endswith((".txt", ".tsv", ".csv")):
+        return True
+    return any(os.path.isfile(f"{p}{ext}") for ext in (".txt", ".tsv", ".csv"))
+
+
+def _resolve_txt_matrix_path(path_or_prefix: str) -> Union[str, None]:
+    p = str(path_or_prefix)
+    low = p.lower()
+    if low.endswith((".txt", ".tsv", ".csv")) and os.path.isfile(p):
+        return p
+    for ext in (".txt", ".tsv", ".csv"):
+        cand = f"{p}{ext}"
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _txt_is_discrete_012_matrix(matrix_path: str) -> bool:
+    """
+    Return True only when all non-missing numeric entries are in {0,1,2}.
+
+    Missing tokens accepted: NA/NAN/. and -9.
+    """
+    if not os.path.isfile(matrix_path):
+        return False
+
+    def _split_tokens(line: str) -> list[str]:
+        return [x.lstrip("\ufeff") for x in re.split(r"[,\s]+", line.strip().lstrip("\ufeff")) if x]
+
+    def _is_missing_token(tok: str) -> bool:
+        t = str(tok).strip().upper()
+        return t in {"NA", "NAN", "."}
+
+    seen_numeric = False
+    with open(matrix_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            toks = _split_tokens(s)
+            if not toks:
+                continue
+
+            vals: list[float] = []
+            parse_fail = 0
+            for t in toks:
+                if _is_missing_token(t):
+                    continue
+                try:
+                    vals.append(float(t))
+                except Exception:
+                    parse_fail += 1
+
+            if parse_fail > 0:
+                # tolerate a possible leading row label column
+                vals2: list[float] = []
+                parse_fail2 = 0
+                for t in toks[1:]:
+                    if _is_missing_token(t):
+                        continue
+                    try:
+                        vals2.append(float(t))
+                    except Exception:
+                        parse_fail2 += 1
+                if parse_fail2 == 0 and len(vals2) > 0:
+                    vals = vals2
+                elif not seen_numeric:
+                    # likely header line, skip once/early lines
+                    continue
+                else:
+                    return False
+
+            if len(vals) == 0:
+                continue
+            seen_numeric = True
+            for v in vals:
+                if abs(v + 9.0) <= 1e-8:
+                    continue
+                if abs(v - 0.0) <= 1e-8 or abs(v - 1.0) <= 1e-8 or abs(v - 2.0) <= 1e-8:
+                    continue
+                return False
+    return seen_numeric
+
+
+def _rsvd_worker(
+    q,
+    genotype_path: str,
+    dim: int,
+    seed: int,
+    power: int,
+    tol: float,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    mmap_window_mb: int,
+    force_packed_bed: bool,
+    eval_path: str,
+    evec_path: str,
+) -> None:
+    try:
+        if bool(force_packed_bed):
+            os.environ["JANUSX_RSVD_BED_PACKED"] = "1"
+        eval_raw, evec_raw = jxrs.admx_rsvd_stream_sample(
+            str(genotype_path),
+            int(dim),
+            int(seed),
+            int(power),
+            float(tol),
+            bool(snps_only),
+            float(maf),
+            float(missing_rate),
+            None,
+            int(mmap_window_mb),
+        )
+        eval_np = np.asarray(eval_raw, dtype=np.float32)
+        evec_np = np.asarray(evec_raw, dtype=np.float32)
+        np.save(eval_path, eval_np)
+        np.save(evec_path, evec_np)
+        q.put(("ok", ""))
+    except Exception as e:
+        q.put(("err", str(e)))
+        raise
+
+
+def _run_rsvd_subprocess(
+    *,
+    genotype_path: str,
+    dim: int,
+    seed: int,
+    power: int,
+    tol: float,
+    snps_only: bool,
+    maf: float,
+    missing_rate: float,
+    mmap_window_mb: int,
+    force_packed_bed: bool,
+    progress_callback=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+    q = ctx.Queue(maxsize=1)
+    tmpdir = tempfile.mkdtemp(prefix="janusx_pca_rsvd_")
+    eval_path = os.path.join(tmpdir, "eval.npy")
+    evec_path = os.path.join(tmpdir, "evec.npy")
+    proc = ctx.Process(
+        target=_rsvd_worker,
+        args=(
+            q,
+            str(genotype_path),
+            int(dim),
+            int(seed),
+            int(power),
+            float(tol),
+            bool(snps_only),
+            float(maf),
+            float(missing_rate),
+            int(mmap_window_mb),
+            bool(force_packed_bed),
+            str(eval_path),
+            str(evec_path),
+        ),
+        daemon=True,
+    )
+    try:
+        proc.start()
+        t0 = time.monotonic()
+        while proc.is_alive():
+            proc.join(timeout=0.1)
+            if progress_callback is not None:
+                try:
+                    progress_callback(max(0.0, time.monotonic() - t0))
+                except Exception:
+                    pass
+        proc.join(timeout=0.1)
+
+        state = None
+        msg = ""
+        try:
+            if not q.empty():
+                state, msg = q.get_nowait()
+        except Exception:
+            state = None
+
+        if proc.exitcode != 0:
+            if state == "err" and msg:
+                raise RuntimeError(f"Random-SVD worker failed: {msg}")
+            raise RuntimeError("Random-SVD worker failed or was interrupted.")
+        if state != "ok":
+            raise RuntimeError("Random-SVD worker did not return completion state.")
+        eval_np = np.load(eval_path)
+        evec_np = np.load(evec_path)
+        return np.asarray(eval_np, dtype=np.float32), np.asarray(evec_np, dtype=np.float32)
+    finally:
+        try:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=0.2)
+        except Exception:
+            pass
+        try:
+            q.close()
+        except Exception:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _algo_spinner_symbol(elapsed_s: float) -> str:
+    # Keep the first frame as "\" on Windows for consistency with prior UX.
+    frames = ("\\", "|", "/", "-") if os.name == "nt" else ("/", "-", "\\", "|")
+    idx = int(max(0.0, float(elapsed_s)) * 10.0) % len(frames)
+    return frames[idx]
+
+
+def _algo_metrics_suffix(
+    n_samples: Optional[int] = None,
+    n_snps: Optional[int] = None,
+) -> str:
+    if n_samples is None or n_snps is None:
+        return ""
+    return f" (n={int(n_samples)}, snp={int(n_snps)})"
+
+
+def _algo_progress_text(
+    algo_name: str,
+    elapsed_s: float,
+    n_samples: Optional[int] = None,
+    n_snps: Optional[int] = None,
+) -> str:
+    symbol = _algo_spinner_symbol(elapsed_s)
+    suffix = _algo_metrics_suffix(n_samples=n_samples, n_snps=n_snps)
+    return f"{symbol} Process of {algo_name}{suffix} ... [{format_elapsed(elapsed_s)}]"
+
+
+def _print_algo_progress(
+    algo_name: str,
+    elapsed_s: float,
+    n_samples: Optional[int] = None,
+    n_snps: Optional[int] = None,
+) -> None:
+    if not stdout_is_tty():
+        return
+    text = _algo_progress_text(
+        algo_name,
+        elapsed_s,
+        n_samples=n_samples,
+        n_snps=n_snps,
+    )
+    sys.stdout.write("\r" + text)
+    sys.stdout.flush()
+
+
+def _clear_algo_progress_line() -> None:
+    if not stdout_is_tty():
+        return
+    cols = shutil.get_terminal_size((80, 20)).columns
+    sys.stdout.write("\r" + (" " * cols) + "\r")
+    sys.stdout.flush()
+
+
+def _run_with_algo_progress(
+    algo_name: str,
+    fn,
+    logger=None,
+    n_samples: Optional[int] = None,
+    n_snps: Optional[int] = None,
+):
+    t0 = time.monotonic()
+    stop_event = threading.Event()
+    ticker = None
+
+    if stdout_is_tty():
+        _print_algo_progress(
+            algo_name,
+            0.0,
+            n_samples=n_samples,
+            n_snps=n_snps,
+        )
+
+        def _tick() -> None:
+            while not stop_event.wait(0.1):
+                _print_algo_progress(
+                    algo_name,
+                    max(0.0, time.monotonic() - t0),
+                    n_samples=n_samples,
+                    n_snps=n_snps,
+                )
+
+        ticker = threading.Thread(target=_tick, daemon=True)
+        ticker.start()
+    elif logger is not None:
+        logger.info(
+            _algo_progress_text(
+                algo_name,
+                0.0,
+                n_samples=n_samples,
+                n_snps=n_snps,
+            )
+        )
+
+    try:
+        return fn(), max(0.0, time.monotonic() - t0)
+    finally:
+        stop_event.set()
+        if ticker is not None:
+            ticker.join(timeout=0.2)
+        _clear_algo_progress_line()
+
+
+def _log_saved_eigen_results(logger, outprefix: str) -> None:
+    log_success(
+        logger,
+        "Results saved:\n"
+        f"   {str(outprefix)}.eigenvec\n"
+        f"   {str(outprefix)}.eigenval",
+    )
+
+
+def _count_effective_snps_from_input(
+    genofile: str,
+    *,
+    maf_threshold: float,
+    max_missing_rate: float,
+    snps_only: bool,
+    chunk_size: int = 100_000,
+) -> int:
+    """
+    Count effective SNP rows after MAF/missing filtering from current input.
+
+    For RSVD with VCF/HMP/TXT inputs, `genofile` is already a PLINK BED cache prefix,
+    so this count is read directly from cached BED chunks under the same filter setup.
+    """
+    eff_m = 0
+    scan_chunk = int(max(10_000, int(chunk_size)))
+    for genosub, _sites in load_genotype_chunks(
+        genofile,
+        chunk_size=scan_chunk,
+        maf=float(maf_threshold),
+        missing_rate=float(max_missing_rate),
+        impute=False,
+        snps_only=bool(snps_only),
+    ):
+        eff_m += int(genosub.shape[0])
+    return int(eff_m)
+
+
 def build_grm_streaming_for_pca(
     genofile: str,
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
     chunk_size: int = 100_000,
     mmap_limit: bool = False,
+    inspected_meta: Optional[tuple[list[str], int]] = None,
     logger=None,
-) -> tuple[np.ndarray, np.ndarray]:
+    emit_progress_done: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Construct the GRM in streaming mode via rust2py.gfreader.load_genotype_chunks
-    and return (GRM, sample_ids).
+    and return (GRM, sample_ids, effective_snp_count).
 
     This follows the same strategy as the GWAS module:
       - genotypes are read in chunks
@@ -124,12 +486,19 @@ def build_grm_streaming_for_pca(
         logger.info("* Building GRM (streaming) for PCA")
 
     # Inspect genotype meta information
-    sample_ids, n_snps = inspect_genotype_file(genofile)
-    sample_ids = np.array(sample_ids, dtype=str)
+    if inspected_meta is None:
+        sample_ids_raw, n_snps = inspect_genotype_file(genofile)
+    else:
+        sample_ids_raw, n_snps = inspected_meta
+    sample_ids = np.array(sample_ids_raw, dtype=str)
     n_samples = len(sample_ids)
 
     grm = np.zeros((n_samples, n_samples), dtype="float32")
-    pbar = ProgressAdapter(total=n_snps, desc="GRM (streaming)")
+    pbar = ProgressAdapter(
+        total=n_snps,
+        desc="GRM (streaming)",
+        emit_done=bool(emit_progress_done),
+    )
     process = psutil.Process()
 
     varsum = 0.0
@@ -179,7 +548,7 @@ def build_grm_streaming_for_pca(
         logger.info(f"GRM construction finished. Effective SNPs: {eff_m}")
         logger.info(f"GRM shape: {grm.shape}")
 
-    return grm, sample_ids
+    return grm, sample_ids, int(eff_m)
 
 
 def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.ndarray]:
@@ -217,7 +586,7 @@ def main(log: bool = True):
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx pca -vcf geno.vcf.gz -dim 3 -plot",
-            "jx pca -vcf geno.vcf.gz -dim 20 -rsvd --power 5 --tol 0.1",
+            "jx pca -vcf geno.vcf.gz -dim 20 -rsvd 3 0.1",
             "jx pca -hmp geno.hmp.gz -dim 3 -plot",
             "jx pca -k data.grm -dim 3 -plot",
             "jx pca -c data_prefix -plot -plot3D",
@@ -323,27 +692,45 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
-        "-rsvd", "--rsvd", action="store_true", default=False,
-        help="Use streaming Rust RSVD for PCA from genotype input.",
-    )
-    optional_group.add_argument(
-        "--power", type=int, default=5,
-        help="RSVD power iterations (used with --rsvd; default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--tol", type=float, default=1e-1,
-        help="RSVD relative convergence tolerance (used with --rsvd; default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for RSVD (used with --rsvd; default: %(default)s).",
+        "-rsvd",
+        "--rsvd",
+        nargs="*",
+        default=None,
+        metavar="RSVD_ARG",
+        help=(
+            "Use streaming Rust RSVD for PCA from genotype input. "
+            "Accepted forms: '-rsvd', '-rsvd 3', or '-rsvd 3 0.1' "
+            "(defaults: power=3, tol=0.1)."
+        ),
     )
 
     args = parser.parse_args()
-    if int(args.power) < 0:
-        parser.error("--power must be >= 0")
-    if not (float(args.tol) > 0):
-        parser.error("--tol must be > 0")
+
+    # Parse -rsvd optional values: -rsvd [power] [tol]
+    # Seed is fixed to 42 to keep CLI concise and deterministic.
+    raw_rsvd_args = args.rsvd
+    args.rsvd = raw_rsvd_args is not None
+    args.rsvd_power = 3
+    args.rsvd_tol = 1e-1
+    args.rsvd_seed = 42
+    if raw_rsvd_args is not None:
+        if len(raw_rsvd_args) > 2:
+            parser.error("-rsvd accepts at most two optional values: [power] [tol].")
+        if len(raw_rsvd_args) >= 1:
+            try:
+                args.rsvd_power = int(raw_rsvd_args[0])
+            except Exception:
+                parser.error("Invalid RSVD power. Use integer >= 0, e.g. '-rsvd 3' or '-rsvd 3 0.1'.")
+        if len(raw_rsvd_args) >= 2:
+            try:
+                args.rsvd_tol = float(raw_rsvd_args[1])
+            except Exception:
+                parser.error("Invalid RSVD tol. Use float > 0, e.g. '-rsvd 3 0.1'.")
+
+    if int(args.rsvd_power) < 0:
+        parser.error("RSVD power must be >= 0.")
+    if not (float(args.rsvd_tol) > 0):
+        parser.error("RSVD tol must be > 0.")
     if bool(args.rsvd) and not bool(args.vcf or args.hmp or args.file or args.bfile):
         parser.error("--rsvd is only supported for genotype inputs (-vcf/-hmp/-file/-bfile).")
     # Keep RSVD preprocessing aligned with load_genotype_chunks defaults:
@@ -408,6 +795,8 @@ def main(log: bool = True):
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.pca.log".replace("//", "/")
     logger = setup_logging(log_path)
+    # Keep algorithm status visible immediately.
+    use_spinner = True
 
     if palette_idx == -1:
         args.color = None
@@ -419,6 +808,9 @@ def main(log: bool = True):
 
     if log:
         cfg_rows: list[tuple[str, object]] = []
+        rsvd_force_bed_cache = bool(
+            args.rsvd and (args.vcf or args.hmp or (args.file and _is_txt_like_input_path(gfile)))
+        )
         if args.vcf or args.hmp or args.file or args.bfile:
             cfg_rows.extend(
                 [
@@ -434,9 +826,9 @@ def main(log: bool = True):
             if bool(args.rsvd):
                 cfg_rows.extend(
                     [
-                        ("RSVD power", args.power),
-                        ("RSVD tol", args.tol),
-                        ("RSVD seed", args.seed),
+                        ("RSVD power", args.rsvd_power),
+                        ("RSVD tol", args.rsvd_tol),
+                        ("RSVD packed BED policy", rsvd_force_bed_cache),
                         ("RSVD SNP-only filter", rsvd_snps_only),
                     ]
                 )
@@ -511,60 +903,166 @@ def main(log: bool = True):
     # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
     if args.vcf or args.hmp or args.file or args.bfile:
         if bool(args.rsvd):
-            logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming RSVD.")
-            logger.info(
-                f"  RSVD: k={int(args.dim)}, power={int(args.power)}, tol={float(args.tol):.3g}, "
-                f"MAF filter = {args.maf}, missing rate filter = {args.geno}, "
-                f"snp_only = {rsvd_snps_only}."
-            )
-            if not hasattr(jxrs, "admx_rsvd_stream_sample"):
-                raise RuntimeError(
-                    "Rust extension is missing admx_rsvd_stream_sample. "
-                    "Rebuild/install JanusX extension first."
+            rsvd_input = str(gfile)
+            txt_force_eig = False
+            txt_delim = "," if str(gfile).lower().endswith(".csv") else None
+            if args.file and _is_txt_like_input_path(gfile):
+                txt_matrix_path = _resolve_txt_matrix_path(gfile)
+                txt_is_012 = bool(
+                    txt_matrix_path is not None and _txt_is_discrete_012_matrix(txt_matrix_path)
                 )
-            sample_ids, n_snps = inspect_genotype_file(gfile)
-            samples = np.asarray(sample_ids, dtype=str)
-            mmap_window_mb = (
-                auto_mmap_window_mb(gfile, len(samples), int(n_snps), int(args.chunksize))
-                if args.mmap_limit else None
+                if not txt_is_012:
+                    txt_force_eig = True
+                    rsvd_input = prepare_cli_input_cache(
+                        str(gfile),
+                        snps_only=bool(rsvd_snps_only),
+                        delimiter=txt_delim,
+                        prefer_plink_for_txt=False,
+                    )
+
+            force_cache_bed = bool(args.vcf or args.hmp or (args.file and _is_txt_like_input_path(gfile) and not txt_force_eig))
+            if force_cache_bed:
+                rsvd_input = prepare_cli_input_cache(
+                    str(gfile),
+                    snps_only=bool(rsvd_snps_only),
+                    delimiter=txt_delim,
+                    prefer_plink_for_txt=True,
+                )
+            load_src_disp = format_path_for_display(str(gfile))
+            log_success(logger, f"Loading genotype from {load_src_disp}", force_color=True)
+
+            algo_name = "Eigen-Decomposition" if txt_force_eig else "Random-SVD"
+            if txt_force_eig:
+                meta_sample_ids, meta_n_snps = inspect_genotype_file(rsvd_input)
+                algo_n = int(len(meta_sample_ids))
+                algo_snp = int(meta_n_snps)
+
+                def _run_txt_force_eig():
+                    grm, samples_local, snp_local = build_grm_streaming_for_pca(
+                        genofile=rsvd_input,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        chunk_size=int(args.chunksize),
+                        mmap_limit=args.mmap_limit,
+                        inspected_meta=(meta_sample_ids, meta_n_snps),
+                        logger=None,
+                        emit_progress_done=False,
+                    )
+                    eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
+                    _ = snp_local
+                    return eigenvec_local, eigenval_local, samples_local
+
+                (eigenvec, eigenval, samples), algo_elapsed_s = _run_with_algo_progress(
+                    algo_name,
+                    _run_txt_force_eig,
+                    logger=logger,
+                    n_samples=algo_n,
+                    n_snps=algo_snp,
+                )
+            else:
+                if not hasattr(jxrs, "admx_rsvd_stream_sample"):
+                    raise RuntimeError(
+                        "Rust extension is missing admx_rsvd_stream_sample. "
+                        "Rebuild/install JanusX extension first."
+                    )
+                sample_ids, _n_snps_total = inspect_genotype_file(rsvd_input)
+                samples = np.asarray(sample_ids, dtype=str)
+                algo_n = int(samples.shape[0])
+                algo_snp = _count_effective_snps_from_input(
+                    str(rsvd_input),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    snps_only=bool(rsvd_snps_only),
+                    chunk_size=int(args.chunksize),
+                )
+                mmap_window_mb = (
+                    auto_mmap_window_mb(rsvd_input, len(samples), int(algo_snp), int(args.chunksize))
+                    if args.mmap_limit else None
+                )
+                if stdout_is_tty():
+                    _print_algo_progress(
+                        algo_name,
+                        0.0,
+                        n_samples=algo_n,
+                        n_snps=algo_snp,
+                    )
+                else:
+                    logger.info(
+                        _algo_progress_text(
+                            algo_name,
+                            0.0,
+                            n_samples=algo_n,
+                            n_snps=algo_snp,
+                        )
+                    )
+                algo_t0 = time.monotonic()
+                try:
+                    eigenval, eigenvec = _run_rsvd_subprocess(
+                        genotype_path=str(rsvd_input),
+                        dim=int(args.dim),
+                        seed=int(args.rsvd_seed),
+                        power=int(args.rsvd_power),
+                        tol=float(args.rsvd_tol),
+                        snps_only=bool(rsvd_snps_only),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                        mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
+                        force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
+                        progress_callback=(
+                            lambda sec: _print_algo_progress(
+                                algo_name,
+                                sec,
+                                n_samples=algo_n,
+                                n_snps=algo_snp,
+                            )
+                        ),
+                    )
+                finally:
+                    _clear_algo_progress_line()
+                algo_elapsed_s = max(0.0, time.monotonic() - algo_t0)
+                if eigenvec.shape[0] != samples.shape[0]:
+                    samples = samples[: eigenvec.shape[0]]
+            log_success(
+                logger,
+                f"{algo_name} (n={algo_n}, snp={int(algo_snp)}) "
+                f"...Finished [{format_elapsed(algo_elapsed_s)}]",
+                force_color=True,
             )
-            eigenval, eigenvec = jxrs.admx_rsvd_stream_sample(
-                str(gfile),
-                int(args.dim),
-                int(args.seed),
-                int(args.power),
-                float(args.tol),
-                bool(rsvd_snps_only),
-                float(args.maf),
-                float(args.geno),
-                None,
-                int(mmap_window_mb) if mmap_window_mb is not None else 0,
-            )
-            eigenval = np.asarray(eigenval, dtype=np.float32)
-            eigenvec = np.asarray(eigenvec, dtype=np.float32)
-            if eigenvec.shape[0] != samples.shape[0]:
-                samples = samples[: eigenvec.shape[0]]
         else:
-            logger.info("* PCA from genotype (VCF/HMP/BFILE/TXT) using streaming GRM.")
-            logger.info(f"  MAF filter = {args.maf}, missing rate filter = {args.geno}.")
+            load_src_disp = format_path_for_display(str(gfile))
+            log_success(logger, f"Loading genotype from {load_src_disp}", force_color=True)
+            meta_sample_ids, meta_n_snps = inspect_genotype_file(gfile)
+            algo_n = int(len(meta_sample_ids))
+            algo_snp = int(meta_n_snps)
 
-            # Build GRM in streaming mode
-            grm, samples = build_grm_streaming_for_pca(
-                genofile=gfile,
-                maf_threshold=args.maf,
-                max_missing_rate=args.geno,
-                chunk_size=int(args.chunksize),
-                mmap_limit=args.mmap_limit,
+            def _run_streaming_eig():
+                grm, samples_local, snp_local = build_grm_streaming_for_pca(
+                    genofile=gfile,
+                    maf_threshold=args.maf,
+                    max_missing_rate=args.geno,
+                    chunk_size=int(args.chunksize),
+                    mmap_limit=args.mmap_limit,
+                    inspected_meta=(meta_sample_ids, meta_n_snps),
+                    logger=None,
+                    emit_progress_done=False,
+                )
+                eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
+                _ = snp_local
+                return eigenvec_local, eigenval_local, samples_local
+
+            (eigenvec, eigenval, samples), algo_elapsed_s = _run_with_algo_progress(
+                "Eigen-Decomposition",
+                _run_streaming_eig,
                 logger=logger,
+                n_samples=algo_n,
+                n_snps=algo_snp,
             )
-
-            # Eigen decomposition
-            eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
-
-        log_success(
-            logger,
-            f"Completed PCA from genotype in {round(time.time() - t_loading, 3)} seconds",
-        )
+            log_success(
+                logger,
+                f"Eigen-Decomposition (n={algo_n}, snp={int(algo_snp)}) "
+                f"...Finished [{format_elapsed(algo_elapsed_s)}]",
+                force_color=True,
+            )
 
         # Save core PCA results
         df_vec = pd.DataFrame(
@@ -582,12 +1080,7 @@ def main(log: bool = True):
             eigenval,
             fmt="%.2f",
         )
-        log_success(
-            logger,
-            f'Saved eigen results in "{args.out}" with files '
-            f'"{args.prefix}.eigenvec", '
-            f'"{args.prefix}.eigenval"',
-        )
+        _log_saved_eigen_results(logger, outprefix)
 
     # --- Case 2: GRM prefix -> load GRM -> PCA ---
     elif args.grm:
@@ -650,12 +1143,7 @@ def main(log: bool = True):
             eigenval,
             fmt="%.2f",
         )
-        log_success(
-            logger,
-            f'Saved eigen results in "{args.out}" with files '
-            f'"{args.prefix}.eigenvec", '
-            f'"{args.prefix}.eigenval"',
-        )
+        _log_saved_eigen_results(logger, outprefix)
 
     # --- Case 3: qcov prefix -> load PC results only for plotting ---
     elif args.qcov:

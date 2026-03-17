@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import warnings
+import time
 logging.getLogger('fontTools.subset').setLevel(logging.ERROR)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
@@ -92,10 +93,46 @@ def _supports_color(stream) -> bool:
     return True
 
 
+def _fallback_log_path(log_file_path: str) -> str:
+    base, ext = os.path.splitext(str(log_file_path))
+    suffix = ext if ext else ".log"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    pid = os.getpid()
+    cand = f"{base}.{stamp}.{pid}{suffix}"
+    idx = 1
+    while os.path.exists(cand):
+        idx += 1
+        cand = f"{base}.{stamp}.{pid}.{idx}{suffix}"
+    return cand
+
+
 def setup_logging(log_file_path):
     """Configure logging to file and stdout."""
-    if os.path.exists(log_file_path) and log_file_path[-4:]=='.log':
-        os.remove(log_file_path)
+    chosen_log_path = str(log_file_path)
+    fallback_note = None
+    try:
+        out_dir = os.path.dirname(chosen_log_path)
+        if out_dir:
+            os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    except Exception:
+        pass
+    if os.path.exists(chosen_log_path) and chosen_log_path.lower().endswith(".log"):
+        try:
+            os.remove(chosen_log_path)
+        except PermissionError:
+            alt = _fallback_log_path(chosen_log_path)
+            fallback_note = (
+                f"Log file is in use: {chosen_log_path}. "
+                f"Using fallback log file: {alt}"
+            )
+            chosen_log_path = alt
+        except Exception:
+            alt = _fallback_log_path(chosen_log_path)
+            fallback_note = (
+                f"Cannot reset log file: {chosen_log_path}. "
+                f"Using fallback log file: {alt}"
+            )
+            chosen_log_path = alt
     # Create logger
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -107,7 +144,16 @@ def setup_logging(log_file_path):
         enable_color=_supports_color(sys.stdout)
     )
     # File handler
-    file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+    try:
+        file_handler = logging.FileHandler(chosen_log_path, mode="w", encoding='utf-8')
+    except PermissionError:
+        alt = _fallback_log_path(chosen_log_path)
+        fallback_note = (
+            f"Log file is in use: {chosen_log_path}. "
+            f"Using fallback log file: {alt}"
+        )
+        chosen_log_path = alt
+        file_handler = logging.FileHandler(chosen_log_path, mode="w", encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(file_formatter)
     # Console handler
@@ -123,4 +169,6 @@ def setup_logging(log_file_path):
     pywarn_logger.handlers.clear()
     pywarn_logger.propagate = True
     warnings.simplefilter("default")
+    if fallback_note:
+        logger.warning(fallback_note)
     return logger

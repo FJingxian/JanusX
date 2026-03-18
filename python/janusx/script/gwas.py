@@ -3388,12 +3388,6 @@ def run_lrlmm_packed(
             f"LowRankLMM ...Finished [{'/'.join(done_times)}]",
             use_spinner=bool(use_spinner),
         )
-        if pve is not None and np.isfinite(float(pve)):
-            _emit_plain_info_line(
-                logger,
-                f"pve={float(pve):.3f} (from LrLMM)",
-                use_spinner=bool(use_spinner),
-            )
         if multi_trait_mode:
             logger.info("")
 
@@ -3609,7 +3603,11 @@ def run_chunked_gwas_lmm_lm(
 
         done_snps = 0
         has_results = False
-        out_tsv = f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv"
+        gm_tag = str(genetic_model).lower()
+        if gm_tag == "add":
+            out_tsv = f"{outprefix}.{pname}.{effective_model_tag}.tsv"
+        else:
+            out_tsv = f"{outprefix}.{pname}.{gm_tag}.{effective_model_tag}.tsv"
         tmp_tsv = f"{out_tsv}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         wrote_header = False
         mmap_window_mb = (
@@ -3954,7 +3952,7 @@ def run_chunked_gwas_lmm_lm(
                 plot_df,
                 y_vec,
                 xlabel=str(pname),
-                outpdf=f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.svg",
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
             )
             viz_secs = max(time.time() - viz_t0, 0.0)
         if pname not in eff_snp_by_trait:
@@ -4204,6 +4202,14 @@ def run_chunked_gwas_streaming_shared(
     share_evd_lmm_fast = ("lmm" in model_order) and ("fastlmm" in model_order)
     shared_lmm_model: Optional[LMM] = None
     shared_ksub: Optional[np.ndarray] = None
+    gm_tag = str(genetic_model).lower()
+
+    def _stream_model_outbase(tag: str) -> str:
+        t = str(tag).lower()
+        if gm_tag == "add":
+            return f"{outprefix}.{pname}.{t}"
+        return f"{outprefix}.{pname}.{gm_tag}.{t}"
+
     model_ctxs: list[dict[str, object]] = []
     for mkey in model_order:
         ModelCls = model_map[mkey]
@@ -4212,6 +4218,7 @@ def run_chunked_gwas_streaming_shared(
         effective_model_key = str(mkey)
         effective_model_label = str(model_label)
         effective_model_tag = str(model_tag)
+        out_base = _stream_model_outbase(model_tag)
         ctx: dict[str, object] = {
             "model_key": mkey,
             "model_label": model_label,
@@ -4229,8 +4236,8 @@ def run_chunked_gwas_streaming_shared(
             "memory_until_tick": 0,
             "pbar": None,
             "task_id": None,
-            "tmp_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
-            "out_tsv": f"{outprefix}.{pname}.{genetic_model}.{model_tag}.tsv",
+            "tmp_tsv": f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}",
+            "out_tsv": f"{out_base}.tsv",
             "writer": None,
             "init_log": None,
         }
@@ -4311,11 +4318,11 @@ def run_chunked_gwas_streaming_shared(
         ctx["model_label"] = effective_model_label
         ctx["model_tag"] = effective_model_tag
         if effective_model_tag != model_tag:
+            out_base = _stream_model_outbase(effective_model_tag)
             ctx["tmp_tsv"] = (
-                f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv.tmp."
-                f"{os.getpid()}.{uuid.uuid4().hex}"
+                f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}"
             )
-            ctx["out_tsv"] = f"{outprefix}.{pname}.{genetic_model}.{effective_model_tag}.tsv"
+            ctx["out_tsv"] = f"{out_base}.tsv"
             ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
         ctx["mod"] = mod
         model_ctxs.append(ctx)
@@ -4647,7 +4654,7 @@ def run_chunked_gwas_streaming_shared(
                     plot_df,
                     y_vec,
                     xlabel=str(pname),
-                    outpdf=f"{outprefix}.{pname}.{genetic_model}.{str(ctx['model_tag'])}.svg",
+                    outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
                 )
                 viz_secs = max(time.time() - viz_t0, 0.0)
 
@@ -5951,6 +5958,7 @@ def main(log: bool = True):
         # 2) Full genotype task (LowRankLMM / FarmCPU)
         # -------------------------------
         if has_lrlmm or has_farmcpu:
+            full_task_summary_start = int(len(gwas_summary_rows))
             if len(stream_models) > 0:
                 logger.info("")
             _section(logger, "Full genotype task")
@@ -6029,6 +6037,39 @@ def main(log: bool = True):
                     farmcpu_cache=shared_full_cache,
                     emit_trait_header=(not has_lrlmm),
                 )
+
+            # Print LrLMM PVE after all full-task methods finish (e.g., after FarmCPU).
+            if has_lrlmm:
+                pve_lines: list[tuple[str, float]] = []
+                seen_trait: set[str] = set()
+                for row in gwas_summary_rows[full_task_summary_start:]:
+                    if str(row.get("model", "")).strip().lower() != "lrlmm":
+                        continue
+                    trait_name = str(row.get("phenotype", "")).strip()
+                    if trait_name in seen_trait:
+                        continue
+                    pve_raw = row.get("pve")
+                    try:
+                        pve_val = float(pve_raw) if pve_raw is not None else float("nan")
+                    except Exception:
+                        pve_val = float("nan")
+                    if not np.isfinite(pve_val):
+                        continue
+                    seen_trait.add(trait_name)
+                    pve_lines.append((trait_name, pve_val))
+                if len(pve_lines) == 1:
+                    _emit_plain_info_line(
+                        logger,
+                        f"pve={pve_lines[0][1]:.3f} (from LrLMM)",
+                        use_spinner=bool(use_spinner),
+                    )
+                elif len(pve_lines) > 1:
+                    for tname, pve_val in pve_lines:
+                        _emit_plain_info_line(
+                            logger,
+                            f"{tname}: pve={pve_val:.3f} (from LrLMM)",
+                            use_spinner=bool(use_spinner),
+                        )
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:

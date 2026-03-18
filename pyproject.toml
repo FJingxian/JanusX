@@ -38,4 +38,4 @@ module-name = "janusx.janusx"
 python-source = "python"
 
 [project.scripts]
-jx = "janusx.script.JanusX:main"
+jxpy = "janusx.script.JanusX:main"

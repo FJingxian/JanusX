@@ -341,6 +341,25 @@ def _ordered_saved_result_paths(
     return ordered
 
 
+def _display_path(path: str) -> str:
+    """
+    Render path separators according to current OS style for terminal output.
+    Windows: backslash, Unix-like: slash.
+    """
+    p = str(path).strip()
+    if p == "":
+        return p
+    if os.name == "nt":
+        out = p.replace("/", "\\")
+    else:
+        out = p.replace("\\", "/")
+    try:
+        out = os.path.normpath(out)
+    except Exception:
+        pass
+    return out
+
+
 def _log_file_only(logger: logging.Logger, level: int, message: str) -> None:
     """
     Emit a log record to file handlers only.
@@ -3321,7 +3340,7 @@ def run_lrlmm_packed(
         if "plrt" in res_df.columns:
             res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
-        saved_paths.append(str(out_tsv).replace("//", "/"))
+        saved_paths.append(str(out_tsv))
 
         peak_rss = max(peak_rss, process.memory_info().rss)
         cpu_t1 = process.cpu_times()
@@ -3339,7 +3358,7 @@ def run_lrlmm_packed(
         _log_model_line(
             logger,
             "LowRankLMM",
-            f"Results saved to {str(out_tsv).replace('//', '/')}",
+            f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
 
@@ -3357,7 +3376,7 @@ def run_lrlmm_packed(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(compute_secs),
                 "viz_time_s": float(viz_secs),
-                "result_file": str(out_tsv).replace("//", "/"),
+                "result_file": str(out_tsv),
             }
         )
 
@@ -3914,11 +3933,11 @@ def run_chunked_gwas_lmm_lm(
             continue
 
         os.replace(tmp_tsv, out_tsv)
-        saved_paths.append(str(out_tsv).replace("//", "/"))
+        saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
             effective_model_label,
-            f"Results saved to {str(out_tsv).replace('//', '/')}",
+            f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
         viz_secs = 0.0
@@ -3951,7 +3970,7 @@ def run_chunked_gwas_lmm_lm(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(evd_secs + scan_secs),
                 "viz_time_s": float(viz_secs),
-                "result_file": str(out_tsv).replace("//", "/"),
+                "result_file": str(out_tsv),
             }
         )
         time_parts: list[str] = []
@@ -4608,11 +4627,11 @@ def run_chunked_gwas_streaming_shared(
                 os.remove(tmp_tsv)
         if has_results:
             os.replace(tmp_tsv, out_tsv)
-            saved_paths.append(str(out_tsv).replace("//", "/"))
+            saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,
                 model_label,
-                f"Results saved to {str(out_tsv).replace('//', '/')}",
+                f"Results saved to {_display_path(str(out_tsv))}",
                 use_spinner=bool(use_spinner),
             )
             if plot:
@@ -4643,7 +4662,7 @@ def run_chunked_gwas_streaming_shared(
                     "peak_rss_gb": float(peak_rss_gb),
                     "gwas_time_s": float(evd_secs + scan_secs),
                     "viz_time_s": float(viz_secs),
-                    "result_file": str(out_tsv).replace("//", "/"),
+                    "result_file": str(out_tsv),
                 }
             )
 
@@ -5424,7 +5443,7 @@ def run_farmcpu_fullmem(
                 res_df,
                 p_sub,
                 xlabel=phename,
-                outpdf=f"{outfolder}/{prefix}.{phename}.farmcpu.svg",
+                outpdf=os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.svg"),
             )
             viz_secs = max(time.time() - viz_t0, 0.0)
 
@@ -5434,7 +5453,7 @@ def run_farmcpu_fullmem(
         cpu_used = (cpu_t1.user + cpu_t1.system) - (cpu_t0.user + cpu_t0.system)
         avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
         peak_rss_gb = peak_rss / (1024 ** 3)
-        out_tsv = f"{outfolder}/{prefix}.{phename}.farmcpu.tsv"
+        out_tsv = os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.tsv")
         _log_model_line(
             logger,
             "FarmCPU",
@@ -5453,18 +5472,18 @@ def run_farmcpu_fullmem(
                 "peak_rss_gb": float(peak_rss_gb),
                 "gwas_time_s": float(gwas_secs),
                 "viz_time_s": float(viz_secs),
-                "result_file": str(out_tsv).replace("//", "/"),
+                "result_file": str(out_tsv),
             }
         )
 
         res_df = res_df.astype({"pwald": "object","pos":int})
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
-        saved_paths.append(str(out_tsv).replace("//", "/"))
+        saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
             "FarmCPU",
-            f"Results saved to {str(out_tsv).replace('//', '/')}",
+            f"Results saved to {_display_path(str(out_tsv))}",
             use_spinner=bool(use_spinner),
         )
         farm_times = [format_elapsed(gwas_secs)]
@@ -5687,7 +5706,7 @@ def main(log: bool = True):
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     os.makedirs(args.out, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
-    outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
+    outprefix = os.path.join(args.out, prefix)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
     if thread_capped:
@@ -6022,7 +6041,7 @@ def main(log: bool = True):
         )
         if len(ordered_result_paths) > 0:
             logger.info("")
-            saved_body = "\n".join([f"  {p}" for p in ordered_result_paths])
+            saved_body = "\n".join([f"  {_display_path(p)}" for p in ordered_result_paths])
             _rich_success(logger, f"Results saved:\n{saved_body}")
         # _rich_success(logger, f"  {str(log_path).replace('//', '/')}")
 

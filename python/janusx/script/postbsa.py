@@ -39,7 +39,7 @@ from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.pathcheck import ensure_all_true, ensure_file_exists
+from ._common.pathcheck import ensure_all_true, ensure_file_exists, format_path_for_display
 from ._common.status import (
     CliStatus,
     format_elapsed,
@@ -246,7 +246,7 @@ def build_output_stem(out_dir: str, prefix: str, bulk1: str, bulk2: str) -> str:
         stem = f"{clean_prefix}.{bulk1}vs{bulk2}"
     else:
         stem = f"{bulk1}vs{bulk2}"
-    return f"{out_dir}/{stem}".replace("\\", "/").replace("//", "/")
+    return os.path.join(out_dir, stem)
 
 
 def strip_known_suffix(path: str) -> str:
@@ -510,7 +510,7 @@ def try_rust_preprocess(
 
     try:
         with tempfile.TemporaryDirectory(prefix="janusx_postbsa_") as tmpdir:
-            tmp_prefix = f"{tmpdir}/postbsa"
+            tmp_prefix = os.path.join(tmpdir, "postbsa")
             rust_out = _preprocess_bsa(
                 input_path=table_path,
                 bulk1=bulk1,
@@ -867,7 +867,7 @@ def compute_smooth_df(
 
 def save_table(df: pd.DataFrame, path: str, logger: logging.Logger, label: str) -> None:
     df.to_csv(path, sep="\t", index=False)
-    log_success(logger, f"{label} saved: {path}")
+    log_success(logger, f"{label} saved: {format_path_for_display(path)}")
 
 
 def normalize_position_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1335,7 +1335,7 @@ def plot_bsa(
         ).round(4)
         threshold_path = f"{output_stem}.thr.tsv"
         threshold_df.to_csv(threshold_path, sep="\t", index=False)
-        log_success(logger, f"Threshold regions saved: {threshold_path}")
+        log_success(logger, f"Threshold regions saved: {format_path_for_display(threshold_path)}")
 
     x_max = raw_df["pos"].max()
     bulk1_short = bulk1_name.split(".")[0]
@@ -1447,8 +1447,8 @@ def plot_bsa(
     fig_stats.savefig(stats_out, dpi=300, bbox_inches="tight", transparent=False, facecolor="white")
     plt.close(fig_snp)
     plt.close(fig_stats)
-    log_success(logger, f"Figure saved: {snp_out}")
-    log_success(logger, f"Figure saved: {stats_out}")
+    log_success(logger, f"Figure saved: {format_path_for_display(snp_out)}")
+    log_success(logger, f"Figure saved: {format_path_for_display(stats_out)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1758,7 +1758,7 @@ def main() -> None:
         finally:
             _restore_handler_levels(preprocess_muted_handlers)
 
-    log_success(logger, f"Filter details saved in log: {log_path}")
+    log_success(logger, f"Filter details saved in log: {format_path_for_display(log_path)}")
 
     raw_df, smooth_df = reoffset_global_chr_positions(raw_df, smooth_df)
     raw_df, smooth_df = filter_low_loci_contigs(raw_df, smooth_df, logger)

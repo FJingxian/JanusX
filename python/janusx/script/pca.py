@@ -802,9 +802,8 @@ def main(log: bool = True):
     else:
         raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--cov must be provided.")
 
-    gfile = gfile.replace("\\", "/")
     args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
+    outprefix = os.path.join(args.out, args.prefix)
 
     # Keep index for logging and validate after logger is ready
     palette_idx = int(args.color)
@@ -812,7 +811,7 @@ def main(log: bool = True):
     # ------------------------- Logging -------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
-    log_path = f"{outprefix}.pca.log".replace("//", "/")
+    log_path = f"{outprefix}.pca.log"
     logger = setup_logging(log_path)
     # Keep algorithm status visible immediately.
     use_spinner = True
@@ -1248,7 +1247,7 @@ def main(log: bool = True):
         out_pdf = f"{outprefix}.eigenvec.2D.pdf"
         plt.savefig(out_pdf, transparent=True)
         plt.close()
-        log_success(logger, f"2D PCA figure saved to {out_pdf.replace('//', '/')}")
+        log_success(logger, f"2D PCA figure saved to {format_path_for_display(out_pdf)}")
 
     if args.plot3D:
         logger.info("* Generating 3D PCA rotating GIF...")
@@ -1263,7 +1262,7 @@ def main(log: bool = True):
             color_set=args.color,
             out_gif=out_gif,
         )
-        log_success(logger, f"3D PCA GIF saved to {out_gif.replace('//', '/')}")
+        log_success(logger, f"3D PCA GIF saved to {format_path_for_display(out_gif)}")
 
     # ------------------------- Final logging -------------------------
     lt = time.localtime()

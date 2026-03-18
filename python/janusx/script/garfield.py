@@ -20,6 +20,7 @@ from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from janusx.script.gwas import load_phenotype
@@ -396,11 +397,12 @@ def main() -> None:
         args.thread = int(detected_threads)
 
     gfile, prefix = determine_genotype_source(args)
-    outprefix = f"{args.out}/{prefix}".replace("//", "/")
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, prefix)
     os.makedirs(args.out, mode=0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
 
-    log_path = f"{args.out}/{prefix}.garfield.log".replace("//", "/")
+    log_path = os.path.join(args.out, f"{prefix}.garfield.log")
     logger = setup_logging(log_path)
     if thread_capped:
         logger.warning(
@@ -671,7 +673,8 @@ def main() -> None:
         write_xcombine_results(f"{trait_outprefix}.garfield", list(common), results)
         log_success(
             logger,
-            f"Saved GARFIELD output for trait '{trait_name}': {trait_outprefix}.garfield",
+            f"Saved GARFIELD output for trait '{trait_name}': "
+            f"{format_path_for_display(f'{trait_outprefix}.garfield')}",
         )
         saved += 1
 

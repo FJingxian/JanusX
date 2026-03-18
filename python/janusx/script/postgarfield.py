@@ -37,6 +37,7 @@ from janusx.script._common.helptext import (
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
@@ -55,7 +56,7 @@ def _determine_genotype(args) -> tuple[str, str]:
         raise ValueError("One of --vcf or --bfile must be provided.")
     if args.prefix:
         prefix = args.prefix
-    return gfile.replace("\\", "/"), prefix
+    return gfile, prefix
 
 def _find_gwas_results(outprefix: str, model: str) -> list[str]:
     model = model.lower()
@@ -290,10 +291,11 @@ def main() -> None:
         args.thread = int(detected_threads)
 
     gfile, prefix = _determine_genotype(args)
-    outprefix = f"{args.out}/{prefix}".replace("//", "/")
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, prefix)
     os.makedirs(args.out, mode=0o755, exist_ok=True)
 
-    log_path = f"{args.out}/{prefix}.postGARFIELD.log".replace("//", "/")
+    log_path = os.path.join(args.out, f"{prefix}.postGARFIELD.log")
     logger = setup_logging(log_path)
     if thread_capped:
         logger.warning(
@@ -421,7 +423,7 @@ def main() -> None:
         decode_path = gwas_file.replace(".lmm.tsv", ".decode.lmm.tsv")
         dfdecode.to_csv(decode_path, sep="\t", index=False)
         decoded_files.append(decode_path)
-        log_success(logger, f"Decoded result saved to {decode_path}")
+        log_success(logger, f"Decoded result saved to {format_path_for_display(decode_path)}")
 
     # ------------------------- postgwas plotting -------------------------
     for decode_path in decoded_files:

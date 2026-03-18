@@ -111,6 +111,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
@@ -1636,9 +1637,8 @@ def main(log: bool = True) -> None:
     else:
         raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
 
-    gfile = gfile.replace("\\", "/")  # Normalize Windows-style paths
     args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
+    outprefix = os.path.join(args.out, args.prefix)
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
     thread_capped = False
@@ -1653,7 +1653,7 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
-    log_path = f"{outprefix}.gs.log".replace("//", "/")
+    log_path = f"{outprefix}.gs.log"
     logger = setup_logging(log_path)
     if thread_capped:
         logger.warning(
@@ -1843,7 +1843,7 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     # Load genotype
     # ------------------------------------------------------------------
-    gsrc = os.path.basename(str(gfile).rstrip("/")) or str(gfile)
+    gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
     with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
         try:
             sample_ids, geno = _load_genotype_with_rust_gfreader(
@@ -2024,7 +2024,7 @@ def main(log: bool = True) -> None:
         )
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
-        log_success(logger, f"Saved predictions to {out_tsv}".replace("//", "/"))
+        log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
         log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
 
     # ----------------------------------------------------------------------

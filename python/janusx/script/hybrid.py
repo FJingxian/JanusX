@@ -609,10 +609,9 @@ def _make_hybrid_chunk_iterator(
 
 def _resolve_output_target(args) -> tuple[str, str, str]:
     _, prefix = determine_genotype_source(args)
-    outdir = str(args.out or ".").replace("\\", "/")
-    outdir = outdir.rstrip("/") or "."
+    outdir = os.path.normpath(str(args.out or "."))
     fmt = str(args.format).lower()
-    base = f"{outdir}/{prefix}".replace("//", "/")
+    base = os.path.join(outdir, prefix)
     if fmt == "vcf":
         return fmt, base, f"{base}.vcf.gz"
     if fmt == "txt":

@@ -47,6 +47,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_plink_prefix_exists,
+    format_path_for_display,
     safe_expanduser,
 )
 from ._common.status import CliStatus, log_success, stdout_is_tty
@@ -484,9 +485,9 @@ def main(log: bool = True) -> None:
     use_spinner = stdout_is_tty()
     args = build_parser().parse_args()
 
-    vcf_inputs = [x.replace("\\", "/") for x in (args.vcf or [])]
-    bfile_inputs = [x.replace("\\", "/") for x in (args.bfile or [])]
-    file_inputs = [x.replace("\\", "/") for x in (args.file or [])]
+    vcf_inputs = [str(x) for x in (args.vcf or [])]
+    bfile_inputs = [str(x) for x in (args.bfile or [])]
+    file_inputs = [str(x) for x in (args.file or [])]
 
     total_inputs = len(vcf_inputs) + len(bfile_inputs) + len(file_inputs)
     if total_inputs < 2:
@@ -494,12 +495,12 @@ def main(log: bool = True) -> None:
             "At least 2 inputs are required across -vcf/-bfile/-file."
         )
 
-    outdir = args.out.replace("\\", "/")
-    prefix = (args.prefix or _infer_default_prefix(vcf_inputs, bfile_inputs, file_inputs)).replace("\\", "/")
+    outdir = os.path.normpath(str(args.out or "."))
+    prefix = str(args.prefix or _infer_default_prefix(vcf_inputs, bfile_inputs, file_inputs))
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     configure_genotype_cache_from_out(outdir)
 
-    log_path = os.path.join(outdir, f"{prefix}.merge.log").replace("\\", "/")
+    log_path = os.path.join(outdir, f"{prefix}.merge.log")
     logger = setup_logging(log_path)
 
     final_format, final_output = _resolve_output(args.format_name, outdir, prefix)
@@ -637,7 +638,7 @@ def main(log: bool = True) -> None:
         logger.info("*" * 60)
         logger.info("GMERGE SUMMARY")
         logger.info("*" * 60)
-        logger.info(f"Final output: {final_output}")
+        logger.info(f"Final output: {format_path_for_display(final_output)}")
         logger.info(f"Final format: {final_format}")
         logger.info(f"Total inputs: {len(prepared_inputs)}")
         logger.info(f"Sample counts per input: {d.get('sample_counts')}")
@@ -657,27 +658,27 @@ def main(log: bool = True) -> None:
             log_success(
                 logger,
                 "Merged PLINK files saved:\n"
-                f"  {final_output}.bed\n"
-                f"  {final_output}.bim\n"
-                f"  {final_output}.fam",
+                f"  {format_path_for_display(f'{final_output}.bed')}\n"
+                f"  {format_path_for_display(f'{final_output}.bim')}\n"
+                f"  {format_path_for_display(f'{final_output}.fam')}",
             )
         elif final_format == "vcf":
-            log_success(logger, f"Merged VCF saved:\n  {final_output}")
+            log_success(logger, f"Merged VCF saved:\n  {format_path_for_display(final_output)}")
         elif final_format == "txt":
             log_success(
                 logger,
                 "Merged text matrix saved:\n"
-                f"  {final_output}\n"
-                f"  {strip_known_suffix(final_output)}.id\n"
-                f"  {strip_known_suffix(final_output)}.site",
+                f"  {format_path_for_display(final_output)}\n"
+                f"  {format_path_for_display(f'{strip_known_suffix(final_output)}.id')}\n"
+                f"  {format_path_for_display(f'{strip_known_suffix(final_output)}.site')}",
             )
         elif final_format == "npy":
             log_success(
                 logger,
                 "Merged npy matrix saved:\n"
-                f"  {final_output}\n"
-                f"  {strip_known_suffix(final_output)}.id\n"
-                f"  {strip_known_suffix(final_output)}.site",
+                f"  {format_path_for_display(final_output)}\n"
+                f"  {format_path_for_display(f'{strip_known_suffix(final_output)}.id')}\n"
+                f"  {format_path_for_display(f'{strip_known_suffix(final_output)}.site')}",
             )
 
     lt = time.localtime()

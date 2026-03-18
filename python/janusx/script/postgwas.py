@@ -31,6 +31,7 @@ from ._common.pathcheck import (
     ensure_file_exists,
     ensure_file_input_exists,
     ensure_file_input_site_metadata_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from ._common.status import (
@@ -2446,7 +2447,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             manh_height_in = fig.get_figheight()
             fig.tight_layout()
             manh_axes_bounds = ax.get_position().bounds
-            manh_path = f"{args.out}/{args.prefix}.manh.{args.format}"
+            manh_path = os.path.join(args.out, f"{args.prefix}.manh.{args.format}")
             if enable_pure_manhqq_parallel:
                 pending_manh_fig = fig
                 pending_manh_path = manh_path
@@ -2532,7 +2533,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax2.set_xlabel("")
                         ax2.set_ylabel("")
                     fig.tight_layout()
-                    qq_path = f"{args.out}/{args.prefix}.qq.{args.format}"
+                    qq_path = os.path.join(args.out, f"{args.prefix}.qq.{args.format}")
                     fig.savefig(qq_path, transparent=True)
                     plt.close(fig)
             finally:
@@ -2778,7 +2779,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 dpi=dpi,
             )
             ax_ld = fig_ld.add_subplot(111)
-            ld_path = f"{args.out}/{args.prefix}.ldblock.{args.format}"
+            ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
             _draw_ld_axis(ax_ld)
 
             fig_ld.subplots_adjust(
@@ -2830,7 +2831,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     mx0, _my0, mw, _mh = manh_axes_bounds
                     _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                     ax_gene.set_position([mx0, cy0, mw, ch])
-                gene_path = f"{args.out}/{args.prefix}.gene.{args.format}"
+                gene_path = os.path.join(args.out, f"{args.prefix}.gene.{args.format}")
                 fig_gene.savefig(gene_path, transparent=True)
                 plt.close(fig_gene)
             else:
@@ -2972,7 +2973,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     label_fontsize=max(3.0, float(_tmp_fontsize) * 0.85),
                 )
 
-            manhld_path = f"{args.out}/{args.prefix}.manhld.{args.format}"
+            manhld_path = os.path.join(args.out, f"{args.prefix}.manhld.{args.format}")
             fig_manhld.savefig(manhld_path, transparent=True)
             plt.close(fig_manhld)
         else:
@@ -2993,10 +2994,13 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             saved_paths.append(("Manhattan+LD", manhld_path))
 
         if len(saved_paths) == 1:
-            log_success(logger, f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}")
+            log_success(
+                logger,
+                f"{saved_paths[0][0]} plot saved to:\n  {format_path_for_display(saved_paths[0][1])}",
+            )
         elif len(saved_paths) > 1:
             title = ", ".join([x[0] for x in saved_paths])
-            body = "\n".join([f"  {x[1]}" for x in saved_paths])
+            body = "\n".join([f"  {format_path_for_display(x[1])}" for x in saved_paths])
             log_success(logger, f"{title} plots saved to:\n{body}")
         log_success(logger, f"Visualization completed in {round(time.time() - t_plot, 2)} seconds.\n")
 
@@ -3162,9 +3166,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
             logger.info(df_out)
 
-            anno_path = f"{args.out}/{args.prefix}.{threshold}.anno.tsv"
+            anno_path = os.path.join(args.out, f"{args.prefix}.{threshold}.anno.tsv")
             df_out.to_csv(anno_path, sep="\t", index=False)
-            log_success(logger, f"Annotation table saved to {anno_path}")
+            log_success(logger, f"Annotation table saved to {format_path_for_display(anno_path)}")
             log_success(logger, f"Annotation completed in {round(time.time() - t_anno, 2)} seconds.\n")
         else:
             logger.info(f"Annotation file not found: {args.anno}\n")
@@ -3492,7 +3496,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
 
         fig.tight_layout()
         manh_axes_bounds = ax.get_position().bounds
-        manh_path = f"{args.out}/{args.prefix}.merge.manh.{args.format}".replace("//", "/")
+        manh_path = os.path.join(args.out, f"{args.prefix}.merge.manh.{args.format}")
         fig.savefig(manh_path, transparent=True)
         manh_height_in = fig.get_figheight()
         plt.close(fig)
@@ -3573,7 +3577,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             fontsize=qq_fontsize,
         )
         fig.tight_layout()
-        qq_path = f"{args.out}/{args.prefix}.merge.qq.{args.format}".replace("//", "/")
+        qq_path = os.path.join(args.out, f"{args.prefix}.merge.qq.{args.format}")
         fig.savefig(qq_path, transparent=True)
         plt.close(fig)
 
@@ -3668,7 +3672,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             new_w = float(mw) * float(fx1 - fx0)
             ax_ld.set_position([new_x0, cy0, new_w, ch])
             ax_ld.set_anchor("N")
-        ld_path = f"{args.out}/{args.prefix}.merge.ldblock.{args.format}".replace("//", "/")
+        ld_path = os.path.join(args.out, f"{args.prefix}.merge.ldblock.{args.format}")
         fig_ld.savefig(ld_path, transparent=True)
         plt.close(fig_ld)
 
@@ -3736,7 +3740,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         mx0, _my0, mw, _mh = manh_axes_bounds
                         _cx0, cy0, _cw, ch = ax_gene.get_position().bounds
                         ax_gene.set_position([mx0, cy0, mw, ch])
-                    gene_path = f"{args.out}/{args.prefix}.merge.gene.{args.format}".replace("//", "/")
+                    gene_path = os.path.join(args.out, f"{args.prefix}.merge.gene.{args.format}")
                     fig_gene.savefig(gene_path, transparent=True)
                     plt.close(fig_gene)
 
@@ -3753,10 +3757,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     if len(saved_paths) == 0:
         logger.warning("Warning: no merged figure was generated (both --manh and --qq are off).")
     elif len(saved_paths) == 1:
-        log_success(logger, f"{saved_paths[0][0]} plot saved to:\n  {saved_paths[0][1]}\n")
+        log_success(
+            logger,
+            f"{saved_paths[0][0]} plot saved to:\n  {format_path_for_display(saved_paths[0][1])}\n",
+        )
     else:
         title = ", ".join([x[0] for x in saved_paths])
-        body = "\n".join([f"  {x[1]}" for x in saved_paths])
+        body = "\n".join([f"  {format_path_for_display(x[1])}" for x in saved_paths])
         log_success(logger, f"{title} plots saved to:\n{body}\n")
 
 
@@ -4152,8 +4159,8 @@ def main():
     else:
         args.out = "."
 
-    outprefix_base = os.path.join(args.out, args.prefix).replace("\\", "/")
-    log_path = f"{outprefix_base}.postGWAS.log".replace("//", "/")
+    outprefix_base = os.path.join(args.out, args.prefix)
+    log_path = f"{outprefix_base}.postGWAS.log"
     logger = setup_logging(log_path)
     if thread_capped:
         logger.warning(

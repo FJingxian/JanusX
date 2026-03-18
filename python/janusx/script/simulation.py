@@ -31,6 +31,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from ._common.genocache import configure_genotype_cache_from_out
@@ -335,7 +336,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Existing genotype file
     # -------------------------
     gfile, prefix = determine_genotype_source(args)
-    outprefix = f"{args.out}/{prefix}".replace("\\", "/").replace("//", "/")
+    args.out = os.path.normpath(args.out if args.out is not None else ".")
+    outprefix = os.path.join(args.out, prefix)
     os.makedirs(args.out, exist_ok=True, mode=0o755)
     configure_genotype_cache_from_out(args.out)
 
@@ -405,11 +407,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log_success(logger, f"Finished in {time.time() - t_start:.2f} s")
     logger.info("Done. Outputs:")
-    logger.info(f"  {outprefix}.pheno")
-    logger.info(f"  {outprefix}.pheno.txt")
-    logger.info(f"  {outprefix}.pheno.NA.txt")
+    logger.info(f"  {format_path_for_display(f'{outprefix}.pheno')}")
+    logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.txt')}")
+    logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.NA.txt')}")
     if args.write_sites:
-        logger.info(f"  {outprefix}.causal.sites.tsv")
+        logger.info(f"  {format_path_for_display(f'{outprefix}.causal.sites.tsv')}")
 
     return 0
 

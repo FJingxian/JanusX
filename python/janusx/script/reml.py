@@ -35,7 +35,7 @@ from janusx.pyBLUP.blup import BLUP
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.pathcheck import ensure_file_exists
+from ._common.pathcheck import ensure_file_exists, format_path_for_display
 from ._common.genoio import strip_default_prefix_suffix
 from ._common.status import log_success, print_failure, format_elapsed, success_symbol
 
@@ -464,7 +464,7 @@ def main() -> None:
     outdir = os.path.normpath(str(args.out or "."))
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     prefix = str(args.prefix or strip_default_prefix_suffix(os.path.basename(str(args.file))))
-    outprefix = os.path.join(outdir, prefix).replace("\\", "/")
+    outprefix = os.path.join(outdir, prefix)
     log_path = f"{outprefix}.reml.log"
     logger = setup_logging(log_path)
 
@@ -764,8 +764,8 @@ def main() -> None:
     blup_out.to_csv(out_blup, sep="\t", index=False)
     pd.DataFrame(summary_rows).to_csv(out_summary, sep="\t", index=False)
     logger.info("=" * 60)
-    log_success(logger, f"BLUP table saved: {out_blup}")
-    log_success(logger, f"Summary table saved: {out_summary}")
+    log_success(logger, f"BLUP table saved: {format_path_for_display(out_blup)}")
+    log_success(logger, f"Summary table saved: {format_path_for_display(out_summary)}")
     logger.info(f"Total elapsed: {format_elapsed(time.time() - t0)}")
 
 

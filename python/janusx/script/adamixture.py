@@ -32,6 +32,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from ._common.status import CliStatus, log_success, print_failure, print_success, stdout_is_tty
@@ -159,7 +160,7 @@ def _resolve_input(args, logger) -> tuple[str, str, str]:
         raise FileNotFoundError("Input validation failed.")
 
     prefix = args.prefix or strip_default_prefix_suffix(auto_prefix)
-    return gfile.replace("\\", "/"), source_label, prefix
+    return gfile, source_label, prefix
 
 
 def _safe_sample_ids(
@@ -346,7 +347,7 @@ def main() -> None:
         thread_capped = True
         resolved_threads = int(detected_threads)
 
-    outdir = str(args.out).replace("\\", "/").rstrip("/") or "."
+    outdir = os.path.normpath(str(args.out or "."))
     os.makedirs(outdir, exist_ok=True)
     t0 = time.time()
 
@@ -374,8 +375,8 @@ def main() -> None:
     logger.info("")
     use_spinner = stdout_is_tty()
 
-    q_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.Q").replace("\\", "/")
-    p_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.P").replace("\\", "/")
+    q_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.Q")
+    p_out = os.path.join(outdir, f"{prefix}.{int(args.k)}.P")
 
     emit_cli_configuration(
         logger,
@@ -414,7 +415,7 @@ def main() -> None:
             ),
         ],
         footer_rows=[
-            ("Output prefix", f"{outdir}/{prefix}"),
+            ("Output prefix", os.path.join(outdir, prefix)),
             ("Q output", q_out),
             ("P output", p_out),
             ("Log file", log_path),
@@ -473,8 +474,8 @@ def main() -> None:
         print_failure("ADAMIXTURE ...Failed", force_color=True)
         raise
 
-    logger.info(f"Q output: {q_out}")
-    logger.info(f"P output: {p_out}")
+    logger.info(f"Q output: {format_path_for_display(q_out)}")
+    logger.info(f"P output: {format_path_for_display(p_out)}")
     wall = float(time.time() - t0)
     now = datetime.now()
     logger.info("")

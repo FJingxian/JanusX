@@ -44,6 +44,7 @@ from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
+    format_path_for_display,
     ensure_plink_prefix_exists,
 )
 from ._common.prefetch import prefetch_iter
@@ -261,14 +262,14 @@ def main(log: bool = True):
     args.prefix = auto_prefix if args.prefix is None else args.prefix
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix).replace("\\", "/")
+    outprefix = os.path.join(args.out, args.prefix)
 
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
-    log_path = f"{outprefix}.grm.log".replace("//", "/")
+    log_path = f"{outprefix}.grm.log"
     logger = setup_logging(log_path)
 
     if log:
@@ -345,8 +346,8 @@ def main(log: bool = True):
         log_success(
             logger,
             f"Saved GRM in NPY format:\n"
-            f"  {id_path}\n"
-            f"  {grm_path}",
+            f"  {format_path_for_display(id_path)}\n"
+            f"  {format_path_for_display(grm_path)}",
         )
     else:
         grm_path = f"{outprefix}.grm.txt"
@@ -356,8 +357,8 @@ def main(log: bool = True):
         log_success(
             logger,
             f"Saved GRM in text format:\n"
-            f"  {id_path}\n"
-            f"  {grm_path}",
+            f"  {format_path_for_display(id_path)}\n"
+            f"  {format_path_for_display(grm_path)}",
         )
 
     # ------------------------------------------------------------------

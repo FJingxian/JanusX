@@ -504,9 +504,6 @@ def build_grm_streaming_for_pca(
       - genotypes are centered by allele frequency
       - GRM is accumulated and symmetrized at the end
     """
-    if logger is not None:
-        logger.info("* Building GRM (streaming) for PCA")
-
     # Inspect genotype meta information
     if inspected_meta is None:
         sample_ids_raw, n_snps = inspect_genotype_file(genofile)
@@ -520,6 +517,7 @@ def build_grm_streaming_for_pca(
         total=n_snps,
         desc="GRM (streaming)",
         emit_done=bool(emit_progress_done),
+        force_animate=True,
     )
     process = psutil.Process()
 
@@ -568,7 +566,6 @@ def build_grm_streaming_for_pca(
 
     if logger is not None:
         logger.info(f"GRM construction finished. Effective SNPs: {eff_m}")
-        logger.info(f"GRM shape: {grm.shape}")
 
     return grm, sample_ids, int(eff_m)
 

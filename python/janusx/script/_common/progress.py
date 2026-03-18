@@ -107,6 +107,7 @@ class ProgressAdapter:
         show_remaining: bool = True,
         emit_done: bool = True,
         bar_width: int | None = None,
+        force_animate: bool = False,
     ) -> None:
         self.total = int(max(0, total))
         self.desc = str(desc)
@@ -117,7 +118,7 @@ class ProgressAdapter:
         self._backend = "none"
         self._finished = False
         self._start_ts = time.monotonic()
-        self._animate = bool(should_animate_status(self.desc))
+        self._animate = bool(force_animate or should_animate_status(self.desc))
 
         if self._animate:
             progress = build_rich_progress(

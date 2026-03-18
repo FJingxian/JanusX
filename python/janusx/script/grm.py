@@ -95,13 +95,14 @@ def build_grm_streaming(
     eff_m : int
         Effective number of SNPs after filtering.
     """
-    logger.info(
-        f"* Building GRM in streaming mode (method={method}, "
-        f"MAF >= {maf_threshold}, missing rate <= {max_missing_rate})"
-    )
-
     grm = np.zeros((n_samples, n_samples), dtype="float32")
-    pbar = ProgressAdapter(total=n_snps, desc="GRM (streaming)")
+    pbar = ProgressAdapter(
+        total=n_snps,
+        desc="GRM (streaming)",
+        emit_done=False,
+        force_animate=True,
+    )
+    stream_t0 = time.monotonic()
     process = psutil.Process()
 
     varsum = 0.0
@@ -142,6 +143,7 @@ def build_grm_streaming(
     # Force progress bar to 100%, even if some SNPs were filtered in Rust
     pbar.finish()
     pbar.close()
+    stream_elapsed = max(0.0, time.monotonic() - stream_t0)
 
     if eff_m == 0:
         raise RuntimeError("No SNPs remained after filtering; GRM is empty.")
@@ -154,8 +156,11 @@ def build_grm_streaming(
     else:  # method == 2
         grm = (grm + grm.T) / (2 * eff_m)
 
-    logger.info(f"GRM construction finished. Effective SNPs: {eff_m}")
-    logger.info(f"GRM shape: {grm.shape}")
+    log_success(
+        logger,
+        f"GRM (Effective SNPs: {eff_m}) ...Finished [{format_elapsed(stream_elapsed)}]",
+        force_color=True,
+    )
     return grm, eff_m
 
 
@@ -317,7 +322,6 @@ def main(log: bool = True):
         if args.mmap_limit else None
     )
 
-    t_loading = time.time()
     grm, eff_m = build_grm_streaming(
         genofile=gfile,
         n_samples=n_samples,
@@ -328,10 +332,6 @@ def main(log: bool = True):
         chunk_size=chunk_size,
         mmap_window_mb=mmap_window_mb,
         logger=logger,
-    )
-    log_success(
-        logger,
-        f"GRM calculation completed in {round(time.time() - t_loading, 3)} seconds",
     )
 
     # ------------------------------------------------------------------

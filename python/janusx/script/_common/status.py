@@ -31,6 +31,10 @@ _LOADING_PREFIXES = (
     "loading ",
     "inspecting ",
     "loaded ",
+    "running ",
+    "computing ",
+    "building ",
+    "calculating ",
 )
 _COMPLETION_TOKENS = (
     "...finished",

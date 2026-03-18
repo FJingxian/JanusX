@@ -4373,3 +4373,718 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+enum PackedGeneticModel {
+    Add,
+    Dom,
+    Rec,
+    Het,
+}
+
+impl PackedGeneticModel {
+    fn parse(text: &str) -> PyResult<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "add" => Ok(Self::Add),
+            "dom" => Ok(Self::Dom),
+            "rec" => Ok(Self::Rec),
+            "het" => Ok(Self::Het),
+            _ => Err(PyRuntimeError::new_err(
+                "model must be one of: add, dom, rec, het",
+            )),
+        }
+    }
+
+    #[inline]
+    fn apply(self, g: f64) -> f64 {
+        match self {
+            Self::Add => g,
+            Self::Dom => {
+                if g > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Rec => {
+                if (g - 2.0).abs() < 1e-6 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Het => {
+                if (g - 1.0).abs() < 1e-6 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+struct PackedNullEval {
+    lbd: f64,
+    ml: f64,
+    reml: f64,
+    log_det_v: f64,
+    v1_inv: Vec<f64>,
+    base_a: Vec<f64>,
+    base_b: Vec<f64>,
+}
+
+fn fastlmm_null_eval_packed(
+    log10_lbd: f64,
+    s: &[f64],
+    u1tx: &[f64],
+    u2tx: &[f64],
+    u1ty: &[f64],
+    u2ty: &[f64],
+    u2_xtx: &[f64],
+    u2_xty: &[f64],
+    k: usize,
+    n: usize,
+    p: usize,
+    c_reml: f64,
+    c_ml: f64,
+) -> Option<PackedNullEval> {
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return None;
+    }
+    let v2_inv = 1.0 / lbd;
+
+    let mut v1_inv = vec![0.0_f64; k];
+    let mut log_det_v = 0.0_f64;
+    for i in 0..k {
+        let v1 = s[i] + lbd;
+        if !v1.is_finite() || v1 <= 0.0 {
+            return None;
+        }
+        v1_inv[i] = 1.0 / v1;
+        log_det_v += v1.ln();
+    }
+    log_det_v += ((n - k) as f64) * lbd.ln();
+
+    let mut base_a = vec![0.0_f64; p * p];
+    for r in 0..p {
+        for c in 0..=r {
+            base_a[r * p + c] = v2_inv * u2_xtx[r * p + c];
+        }
+    }
+    for i in 0..k {
+        let vi = v1_inv[i];
+        let base = i * p;
+        for r in 0..p {
+            let xir = u1tx[base + r];
+            for c in 0..=r {
+                base_a[r * p + c] += vi * xir * u1tx[base + c];
+            }
+        }
+    }
+    for r in 0..p {
+        for c in 0..r {
+            let vrc = base_a[r * p + c];
+            base_a[c * p + r] = vrc;
+        }
+    }
+
+    let mut base_b = vec![0.0_f64; p];
+    for r in 0..p {
+        base_b[r] = v2_inv * u2_xty[r];
+    }
+    for i in 0..k {
+        let vi = v1_inv[i];
+        let yi = u1ty[i];
+        let base = i * p;
+        for r in 0..p {
+            base_b[r] += vi * u1tx[base + r] * yi;
+        }
+    }
+
+    let mut chol_a = base_a.clone();
+    let ridge = 1e-6_f64;
+    for i in 0..p {
+        chol_a[i * p + i] += ridge;
+    }
+    if cholesky_inplace(&mut chol_a, p).is_none() {
+        return None;
+    }
+    let log_det_xtv = cholesky_logdet(&chol_a, p);
+
+    let mut beta = vec![0.0_f64; p];
+    cholesky_solve_into(&chol_a, p, &base_b, &mut beta);
+
+    let mut r1_sum = 0.0_f64;
+    for i in 0..k {
+        let mut xb = 0.0_f64;
+        let base = i * p;
+        for r in 0..p {
+            xb += u1tx[base + r] * beta[r];
+        }
+        let ri = u1ty[i] - xb;
+        r1_sum += v1_inv[i] * ri * ri;
+    }
+
+    let mut r2_sum = 0.0_f64;
+    for i in 0..n {
+        let mut xb = 0.0_f64;
+        let base = i * p;
+        for r in 0..p {
+            xb += u2tx[base + r] * beta[r];
+        }
+        let ri = u2ty[i] - xb;
+        r2_sum += ri * ri;
+    }
+
+    let rtv_invr = r1_sum + v2_inv * r2_sum;
+    if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+        return None;
+    }
+
+    let n_f = n as f64;
+    let n_minus_p_f = (n - p) as f64;
+    let total_reml = n_minus_p_f * rtv_invr.ln() + log_det_v + log_det_xtv;
+    let reml = c_reml - 0.5 * total_reml;
+
+    let total_ml = n_f * rtv_invr.ln() + log_det_v;
+    let ml = c_ml - 0.5 * total_ml;
+
+    Some(PackedNullEval {
+        lbd,
+        ml,
+        reml,
+        log_det_v,
+        v1_inv,
+        base_a,
+        base_b,
+    })
+}
+
+struct PackedFastlmmScratch {
+    g: Vec<f64>,
+    u1: Vec<f64>,
+    u2: Vec<f64>,
+    xtv_inv_x: Vec<f64>,
+    xtv_inv_y: Vec<f64>,
+    beta: Vec<f64>,
+    rhs: Vec<f64>,
+    work: Vec<f64>,
+    u1_xtsnp: Vec<f64>,
+    u2_xtsnp: Vec<f64>,
+}
+
+impl PackedFastlmmScratch {
+    fn new(n: usize, k: usize, p: usize) -> Self {
+        let dim = p + 1;
+        Self {
+            g: vec![0.0; n],
+            u1: vec![0.0; k],
+            u2: vec![0.0; n],
+            xtv_inv_x: vec![0.0; dim * dim],
+            xtv_inv_y: vec![0.0; dim],
+            beta: vec![0.0; dim],
+            rhs: vec![0.0; dim],
+            work: vec![0.0; dim],
+            u1_xtsnp: vec![0.0; p],
+            u2_xtsnp: vec![0.0; p],
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    u,
+    s,
+    y,
+    x=None,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    max_iter=50,
+    tol=1e-2,
+    threads=0,
+    model="add"
+))]
+pub fn fastlmm_assoc_packed_f32<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    u: PyReadonlyArray2<'py, f32>,
+    s: PyReadonlyArray1<'py, f32>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: Option<PyReadonlyArray2<'py, f64>>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    model: &str,
+) -> PyResult<(f64, f64, f64, Bound<'py, PyArray2<f64>>)> {
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    let gm = PackedGeneticModel::parse(model)?;
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip.len()
+        )));
+    }
+    if row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        )));
+    }
+
+    let y = y.as_slice()?;
+    let n = y.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        let sidx_slice = sidx.as_slice()?;
+        if sidx_slice.len() != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "sample_indices length mismatch: got {}, expected {n}",
+                sidx_slice.len()
+            )));
+        }
+        parse_index_vec_i64(sidx_slice, n_samples, "sample_indices")?
+    } else {
+        if n != n_samples {
+            return Err(PyRuntimeError::new_err(format!(
+                "len(y)={} must equal n_samples={} when sample_indices is not provided",
+                n, n_samples
+            )));
+        }
+        (0..n).collect()
+    };
+
+    let u_arr = u.as_array();
+    if u_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("u must be 2D (n_samples, k)"));
+    }
+    let (u_n, k_full) = (u_arr.shape()[0], u_arr.shape()[1]);
+    if u_n != n_samples {
+        return Err(PyRuntimeError::new_err(format!(
+            "u row count mismatch: got {u_n}, expected {n_samples}"
+        )));
+    }
+    if k_full == 0 {
+        return Err(PyRuntimeError::new_err("u must have at least 1 component"));
+    }
+
+    let s_f32 = s.as_slice()?;
+    if s_f32.len() != k_full {
+        return Err(PyRuntimeError::new_err(format!(
+            "s length mismatch: got {}, expected {k_full}",
+            s_f32.len()
+        )));
+    }
+    let k = k_full.min(n.saturating_sub(1));
+    if k == 0 {
+        return Err(PyRuntimeError::new_err(
+            "effective rank is 0 after accounting for sample size",
+        ));
+    }
+    let s_vec: Vec<f64> = s_f32[..k].iter().map(|&v| v as f64).collect();
+
+    let p0 = match &x {
+        Some(xarr) => {
+            let xa = xarr.as_array();
+            if xa.ndim() != 2 {
+                return Err(PyRuntimeError::new_err("x must be 2D (n, p0)"));
+            }
+            let xr = xa.shape()[0];
+            let xc = xa.shape()[1];
+            if xr != n {
+                return Err(PyRuntimeError::new_err(format!(
+                    "x row count mismatch: got {xr}, expected {n}"
+                )));
+            }
+            xc
+        }
+        None => 0usize,
+    };
+    let p = p0 + 1;
+    if n <= p {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p for null model: n={n}, p={p}"
+        )));
+    }
+    if n <= p + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n must be > p+1 for SNP tests: n={n}, p={p}"
+        )));
+    }
+
+    let u_slice: &[f32] = u
+        .as_slice()
+        .map_err(|_| PyRuntimeError::new_err("u must be contiguous (C-order)"))?;
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let x_slice_opt: Option<&[f64]> = match &x {
+        Some(xarr) => Some(
+            xarr.as_slice()
+                .map_err(|_| PyRuntimeError::new_err("x must be contiguous (C-order)"))?,
+        ),
+        None => None,
+    };
+
+    let mut x_full = vec![0.0_f64; n * p];
+    for i in 0..n {
+        x_full[i * p] = 1.0;
+    }
+    if let Some(x_slice) = x_slice_opt {
+        for i in 0..n {
+            let src = &x_slice[i * p0..(i + 1) * p0];
+            let dst = &mut x_full[i * p + 1..(i + 1) * p];
+            dst.copy_from_slice(src);
+        }
+    }
+
+    let mut u_sub = vec![0.0_f32; n * k];
+    for (i, &sid) in sample_idx.iter().enumerate() {
+        let src = &u_slice[sid * k_full..sid * k_full + k];
+        let dst = &mut u_sub[i * k..(i + 1) * k];
+        dst.copy_from_slice(src);
+    }
+
+    let mut u1ty = vec![0.0_f64; k];
+    let mut u1tx = vec![0.0_f64; k * p];
+    for i in 0..n {
+        let yi = y[i];
+        let ub = i * k;
+        let xb = i * p;
+        for r in 0..k {
+            let ur = u_sub[ub + r] as f64;
+            u1ty[r] += ur * yi;
+            for c in 0..p {
+                u1tx[r * p + c] += ur * x_full[xb + c];
+            }
+        }
+    }
+
+    let mut u2ty = vec![0.0_f64; n];
+    let mut u2tx = vec![0.0_f64; n * p];
+    for i in 0..n {
+        let ub = i * k;
+        let xb = i * p;
+        let mut y_proj = 0.0_f64;
+        for r in 0..k {
+            y_proj += (u_sub[ub + r] as f64) * u1ty[r];
+        }
+        u2ty[i] = y[i] - y_proj;
+
+        for c in 0..p {
+            let mut x_proj = 0.0_f64;
+            for r in 0..k {
+                x_proj += (u_sub[ub + r] as f64) * u1tx[r * p + c];
+            }
+            u2tx[xb + c] = x_full[xb + c] - x_proj;
+        }
+    }
+
+    let (u2_xtx, u2_xty) = precompute_u2_base_fastlmm(&u2tx, &u2ty, n, p);
+
+    let n_f = n as f64;
+    let n_minus_p_f = (n - p) as f64;
+    let c_reml = n_minus_p_f * (n_minus_p_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+
+    let (best_log10, _best_cost) = brent_minimize(
+        |x0| match fastlmm_null_eval_packed(
+            x0,
+            &s_vec,
+            &u1tx,
+            &u2tx,
+            &u1ty,
+            &u2ty,
+            &u2_xtx,
+            &u2_xty,
+            k,
+            n,
+            p,
+            c_reml,
+            c_ml,
+        ) {
+            Some(v) if v.reml.is_finite() => -v.reml,
+            _ => 1e100,
+        },
+        low,
+        high,
+        tol,
+        max_iter,
+    );
+
+    let best = fastlmm_null_eval_packed(
+        best_log10,
+        &s_vec,
+        &u1tx,
+        &u2tx,
+        &u1ty,
+        &u2ty,
+        &u2_xtx,
+        &u2_xty,
+        k,
+        n,
+        p,
+        c_reml,
+        c_ml,
+    )
+    .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at optimum"))?;
+
+    let lbd = best.lbd;
+    let ml0 = best.ml;
+    let reml0 = best.reml;
+    let log_det_v = best.log_det_v;
+    let v1_inv = best.v1_inv;
+    let base_a = best.base_a;
+    let base_b = best.base_b;
+    let v2_inv = 1.0 / lbd;
+
+    let df = (n as isize) - (p as isize) - 1;
+    let df_f = df as f64;
+    if df <= 0 {
+        return Err(PyRuntimeError::new_err("invalid df <= 0 in packed fastlmm"));
+    }
+
+    let out_cols = 4usize;
+    let out = PyArray2::<f64>::zeros(py, [m, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
+    };
+
+    let pool = get_cached_pool(threads)?;
+
+    py.detach(|| {
+        let mut run = || {
+            out_slice
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || PackedFastlmmScratch::new(n, k, p),
+                    |scr, (idx, out_row)| {
+                        let row =
+                            &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip[idx];
+                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+
+                        let mut sum_g = 0.0_f64;
+                        for (j, &sid) in sample_idx.iter().enumerate() {
+                            let b = row[sid >> 2];
+                            let code = (b >> ((sid & 3) * 2)) & 0b11;
+                            let mut gv = match code {
+                                0b00 => 0.0_f64,
+                                0b10 => 1.0_f64,
+                                0b11 => 2.0_f64,
+                                _ => mean_g,
+                            };
+                            if flip && code != 0b01 {
+                                gv = 2.0_f64 - gv;
+                            }
+                            gv = gm.apply(gv);
+                            scr.g[j] = gv;
+                            sum_g += gv;
+                        }
+                        let g_mean = sum_g / (n as f64);
+                        for j in 0..n {
+                            scr.g[j] -= g_mean;
+                        }
+
+                        scr.u1.fill(0.0);
+                        for i in 0..n {
+                            let gi = scr.g[i];
+                            let ub = i * k;
+                            for r in 0..k {
+                                scr.u1[r] += gi * (u_sub[ub + r] as f64);
+                            }
+                        }
+
+                        for i in 0..n {
+                            let ub = i * k;
+                            let mut proj = 0.0_f64;
+                            for r in 0..k {
+                                proj += scr.u1[r] * (u_sub[ub + r] as f64);
+                            }
+                            scr.u2[i] = scr.g[i] - proj;
+                        }
+
+                        scr.u1_xtsnp.fill(0.0);
+                        scr.u2_xtsnp.fill(0.0);
+
+                        let mut u1_snp_snp = 0.0_f64;
+                        let mut u1_snp_ty = 0.0_f64;
+                        for i in 0..k {
+                            let gi = scr.u1[i];
+                            let vi = v1_inv[i];
+                            u1_snp_snp += vi * gi * gi;
+                            u1_snp_ty += vi * gi * u1ty[i];
+                            let base = i * p;
+                            for r in 0..p {
+                                scr.u1_xtsnp[r] += vi * u1tx[base + r] * gi;
+                            }
+                        }
+
+                        let mut u2_snp_snp = 0.0_f64;
+                        let mut u2_snp_ty = 0.0_f64;
+                        for i in 0..n {
+                            let gi = scr.u2[i];
+                            u2_snp_snp += gi * gi;
+                            u2_snp_ty += gi * u2ty[i];
+                            let base = i * p;
+                            for r in 0..p {
+                                scr.u2_xtsnp[r] += u2tx[base + r] * gi;
+                            }
+                        }
+
+                        let dim = p + 1;
+                        scr.xtv_inv_x.fill(0.0);
+                        scr.xtv_inv_y.fill(0.0);
+                        for r in 0..p {
+                            for c in 0..p {
+                                scr.xtv_inv_x[r * dim + c] = base_a[r * p + c];
+                            }
+                            scr.xtv_inv_y[r] = base_b[r];
+                        }
+                        for r in 0..p {
+                            let cross = scr.u1_xtsnp[r] + v2_inv * scr.u2_xtsnp[r];
+                            scr.xtv_inv_x[p * dim + r] = cross;
+                            scr.xtv_inv_x[r * dim + p] = cross;
+                        }
+                        scr.xtv_inv_x[p * dim + p] = u1_snp_snp + v2_inv * u2_snp_snp;
+                        scr.xtv_inv_y[p] = u1_snp_ty + v2_inv * u2_snp_ty;
+
+                        let ridge = 1e-6_f64;
+                        for r in 0..dim {
+                            scr.xtv_inv_x[r * dim + r] += ridge;
+                        }
+
+                        if cholesky_inplace(&mut scr.xtv_inv_x, dim).is_none() {
+                            out_row[0] = f64::NAN;
+                            out_row[1] = f64::NAN;
+                            out_row[2] = f64::NAN;
+                            out_row[3] = 1.0;
+                            return;
+                        }
+                        cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.xtv_inv_y, &mut scr.beta);
+
+                        let mut r1_sum = 0.0_f64;
+                        for i in 0..k {
+                            let mut xb = 0.0_f64;
+                            let base = i * p;
+                            for r in 0..p {
+                                xb += u1tx[base + r] * scr.beta[r];
+                            }
+                            xb += scr.u1[i] * scr.beta[p];
+                            let ri = u1ty[i] - xb;
+                            r1_sum += v1_inv[i] * ri * ri;
+                        }
+
+                        let mut r2_sum = 0.0_f64;
+                        for i in 0..n {
+                            let mut xb = 0.0_f64;
+                            let base = i * p;
+                            for r in 0..p {
+                                xb += u2tx[base + r] * scr.beta[r];
+                            }
+                            xb += scr.u2[i] * scr.beta[p];
+                            let ri = u2ty[i] - xb;
+                            r2_sum += ri * ri;
+                        }
+
+                        let rtv_invr = r1_sum + v2_inv * r2_sum;
+                        if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                            out_row[0] = scr.beta[p];
+                            out_row[1] = f64::NAN;
+                            out_row[2] = f64::NAN;
+                            out_row[3] = 1.0;
+                            return;
+                        }
+
+                        let sigma2 = rtv_invr / df_f;
+                        if !sigma2.is_finite() || sigma2 <= 0.0 {
+                            out_row[0] = scr.beta[p];
+                            out_row[1] = f64::NAN;
+                            out_row[2] = f64::NAN;
+                            out_row[3] = 1.0;
+                            return;
+                        }
+
+                        scr.rhs.fill(0.0);
+                        scr.rhs[p] = 1.0;
+                        cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.rhs, &mut scr.work);
+                        let var_beta = sigma2 * scr.work[p];
+                        let se = if var_beta.is_finite() && var_beta > 0.0 {
+                            var_beta.sqrt()
+                        } else {
+                            f64::NAN
+                        };
+                        let beta = scr.beta[p];
+                        let pval = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                            let z = (beta / se).abs();
+                            (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
+                        let mut stat = if ml.is_finite() { 2.0 * (ml - ml0) } else { 0.0 };
+                        if !stat.is_finite() || stat < 0.0 {
+                            stat = 0.0;
+                        }
+                        let plrt = chi2_sf_df1(stat);
+
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        out_row[2] = pval;
+                        out_row[3] = plrt;
+                    },
+                );
+        };
+
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    });
+
+    Ok((lbd, ml0, reml0, out))
+}
+

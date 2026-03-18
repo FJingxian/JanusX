@@ -12,11 +12,13 @@ use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::gfcore::{process_snp_row, read_bim, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::rsvd::rsvd_packed_subset;
 
 const EPS64: f64 = 1e-5;
 const EPS32: f32 = 1e-5;
@@ -352,6 +354,23 @@ fn compute_at_omega_packed(
                 },
             );
         out[block_start * kp..(block_start + block_len) * kp].copy_from_slice(&blk);
+    }
+    Ok(out)
+}
+
+fn parse_index_vec_i64(src: &[i64], n_total: usize, name: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::with_capacity(src.len());
+    for (i, &v) in src.iter().enumerate() {
+        if v < 0 {
+            return Err(format!("{name}[{i}] is negative: {v}"));
+        }
+        let u = usize::try_from(v).map_err(|_| format!("{name}[{i}] overflow: {v}"))?;
+        if u >= n_total {
+            return Err(format!(
+                "{name}[{i}] out of range: {u} >= {n_total}"
+            ));
+        }
+        out.push(u);
     }
     Ok(out)
 }
@@ -988,6 +1007,121 @@ pub fn admx_rsvd_stream_sample<'py>(
     eval_slice.copy_from_slice(&eigvals);
     evec_slice.copy_from_slice(&eigvecs_sample);
     Ok((eval_arr, evec_arr))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    k,
+    sample_indices=None,
+    seed=42,
+    power=5,
+    tol=1e-1
+))]
+pub fn admx_rsvd_packed_subset<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    k: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    seed: u64,
+    power: usize,
+    tol: f32,
+) -> PyResult<(
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+)> {
+    if k == 0 {
+        return Err(PyRuntimeError::new_err("k must be > 0"));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+    if m == 0 {
+        return Err(PyRuntimeError::new_err("packed matrix has zero SNP rows"));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        let sidx_slice = sidx.as_slice()?;
+        parse_index_vec_i64(sidx_slice, n_samples, "sample_indices")
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s0) => Cow::Borrowed(s0),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let tile_cols = rsvd_tile_cols_env();
+    let (eigvals, eigvecs_sample, row_freq, row_flip, k_eff) = rsvd_packed_subset(
+        &packed_flat,
+        m,
+        bytes_per_snp,
+        &sample_idx,
+        k,
+        seed,
+        power,
+        tol,
+        tile_cols,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+
+    let eval_arr = PyArray1::<f32>::zeros(py, [k_eff], false).into_bound();
+    let evec_arr = PyArray2::<f32>::zeros(py, [n, k_eff], false).into_bound();
+    let maf_arr = PyArray1::<f32>::zeros(py, [m], false).into_bound();
+    let flip_arr = PyArray1::<bool>::zeros(py, [m], false).into_bound();
+
+    let eval_slice = unsafe {
+        eval_arr
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("eigvals output not contiguous"))?
+    };
+    let evec_slice = unsafe {
+        evec_arr
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("sample eigvecs output not contiguous"))?
+    };
+    let maf_slice = unsafe {
+        maf_arr
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("row maf output not contiguous"))?
+    };
+    let flip_slice = unsafe {
+        flip_arr
+            .as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("row flip output not contiguous"))?
+    };
+
+    eval_slice.copy_from_slice(&eigvals);
+    evec_slice.copy_from_slice(&eigvecs_sample);
+    maf_slice.copy_from_slice(&row_freq);
+    flip_slice.copy_from_slice(&row_flip);
+    Ok((eval_arr, evec_arr, maf_arr, flip_arr))
 }
 
 fn loglikelihood_f32_impl(g: &ArrayView2<'_, u8>, p: &[f32], q: &[f32], n: usize, k: usize) -> f64 {

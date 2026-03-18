@@ -37,6 +37,78 @@ def _sanitize_pvalues(values) -> np.ndarray:
     return np.clip(arr, _PVALUE_EPS, 1.0)
 
 
+def _integer_tick_values(
+    ymin: float,
+    ymax: float,
+    *,
+    max_ticks: int = 7,
+) -> np.ndarray:
+    """
+    Build integer y-tick locations within the current axis limits.
+    """
+    lo = float(min(ymin, ymax))
+    hi = float(max(ymin, ymax))
+    if (not np.isfinite(lo)) or (not np.isfinite(hi)):
+        return np.asarray([], dtype=np.float64)
+    if hi < lo:
+        lo, hi = hi, lo
+
+    start = int(np.ceil(lo - 1e-12))
+    stop = int(np.floor(hi + 1e-12))
+    if stop < start:
+        center = int(np.round((lo + hi) * 0.5))
+        if (center < lo - 1e-12) or (center > hi + 1e-12):
+            return np.asarray([], dtype=np.float64)
+        return np.asarray([float(center)], dtype=np.float64)
+
+    tick_cap = max(1, int(max_ticks))
+    count = int(stop - start + 1)
+    if count <= tick_cap:
+        step = 1
+    else:
+        step = int(np.ceil(float(count - 1) / float(max(1, tick_cap - 1))))
+
+    ticks = np.arange(start, stop + 1, step, dtype=np.float64)
+    if ticks.size == 0 or ticks[0] != float(start):
+        ticks = np.insert(ticks, 0, float(start))
+    if ticks[-1] != float(stop):
+        ticks = np.append(ticks, float(stop))
+    return np.unique(ticks.astype(np.float64, copy=False))
+
+
+def apply_integer_yticks(
+    ax: plt.Axes,
+    *,
+    ticks: Union[np.ndarray, list[float], None] = None,
+    max_ticks: int = 7,
+) -> np.ndarray:
+    """
+    Force y-axis ticks to integer values while preserving current limits.
+    """
+    y0, y1 = ax.get_ylim()
+    lo = float(min(y0, y1))
+    hi = float(max(y0, y1))
+
+    if ticks is None:
+        tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
+    else:
+        tick_values = np.asarray(ticks, dtype=np.float64).reshape(-1)
+        tick_values = tick_values[np.isfinite(tick_values)]
+        tick_values = tick_values[
+            (tick_values >= lo - 1e-12) & (tick_values <= hi + 1e-12)
+        ]
+        tick_values = np.unique(np.round(tick_values).astype(np.int64)).astype(np.float64)
+        if tick_values.size == 0:
+            tick_values = _integer_tick_values(lo, hi, max_ticks=max_ticks)
+
+    if tick_values.size > 0:
+        labels = [str(int(round(float(v)))) for v in tick_values]
+        ax.set_yticks(tick_values)
+        ax.set_yticklabels(labels)
+        ax.set_ylim(y0, y1)
+    return tick_values
+
+
 class GWASPLOT:
     """
     Lightweight helper for GWAS visualization (Manhattan & QQ plots).
@@ -352,6 +424,7 @@ class GWASPLOT:
         ax.set_ylim([base_ymin, top])
         ax.set_xlabel("Chromosome")
         ax.set_ylabel("-log10(p-value)")
+        apply_integer_yticks(ax)
         return ax
 
     # ------------------------------------------------------------------
@@ -558,4 +631,5 @@ class GWASPLOT:
 
         ax.set_xlabel("Expected -log10(p-value)")
         ax.set_ylabel("Observed -log10(p-value)")
+        apply_integer_yticks(ax)
         return ax

@@ -39,6 +39,7 @@ Citation
 
 import os
 import io
+import math
 import time
 import socket
 import argparse
@@ -78,7 +79,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
 import psutil
-from janusx.bioplotkit import GWASPLOT
+from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 from janusx.gfreader import (
     load_genotype_chunks,
     load_bed_2bit_packed,
@@ -87,6 +88,7 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP.QK2 import QK
 from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
+from janusx import janusx as jxrs
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
 from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
@@ -143,6 +145,11 @@ def _section(logger:logging.Logger, title: str) -> None:
     logger.info("=" * _SECTION_WIDTH)
     logger.info(title)
     logger.info("=" * _SECTION_WIDTH)
+
+
+def _phase_split(logger: logging.Logger) -> None:
+    """Visual separator between loading stage and compute stage."""
+    logger.info("-" * _SECTION_WIDTH)
 
 
 def _format_progress_metric(
@@ -243,6 +250,9 @@ def _emit_gwas_summary(
 
     out_rows: list[list[str]] = []
     for r in _ordered_gwas_summary_rows(rows):
+        model_text = str(r.get("model", "")).strip()
+        if model_text.lower() in {"lowranklmm", "lrlmm"}:
+            model_text = "LrLMM"
         pve_raw = r.get("pve", None)
         pve_text = "NA"
         try:
@@ -255,7 +265,7 @@ def _emit_gwas_summary(
         out_rows.append(
             [
                 str(r.get("phenotype", "")),
-                str(r.get("model", "")),
+                model_text,
                 f"{int(r.get('nidv', 0))}",
                 f"{int(r.get('eff_snp', 0))}",
                 pve_text,
@@ -282,8 +292,11 @@ def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
         "LM": 0,
         "LMM": 1,
         "FastLMM": 2,
-        "Farm": 3,
-        "FarmCPU": 3,
+        "LowRankLMM": 3,
+        "LrLMM": 3,
+        "LRLMM": 3,
+        "Farm": 4,
+        "FarmCPU": 4,
     }
     return (order.get(model, 99), model.lower())
 
@@ -602,6 +615,7 @@ def fastplot(
             rasterized=True,
             s=scatter_size,
         )
+        manh_yticks = apply_integer_yticks(axes["B"])
         snp_n = int(results.shape[0])
         if snp_n >= 1_000_000:
             snp_val = snp_n / 1_000_000.0
@@ -636,6 +650,7 @@ def fastplot(
             axes["C"].set_xlim(qq_left, x_upper)
         else:
             axes["C"].set_xlim(qq_left, qq_left + 1.0)
+        apply_integer_yticks(axes["C"], ticks=manh_yticks)
 
         fig.tight_layout()
         fig.savefig(outpdf, transparent=False, facecolor="white")
@@ -1190,11 +1205,6 @@ def _load_site_covariates(
         ordered_rows.append(picked_rows[pool[0]])
 
     cov = np.vstack(ordered_rows).astype("float32", copy=False).T
-    _log_info(
-        logger,
-        f"Loaded SNP-site covariates: {len(site_specs)} site(s), shape={cov.shape}",
-        use_spinner=use_spinner,
-    )
     return cov
 
 
@@ -1235,7 +1245,7 @@ def _load_covariates_for_models(
                 task.fail(f"Loading covariate from {src} ...Failed")
                 raise
             task.complete(
-                f"Loading covariate from {src} (n={cov_i.shape[0]}, ncov={cov_i.shape[1]})"
+                f"Loading covariate from {src} (n={cov_i.shape[0]}, ncov={cov_i.shape[1]}) ...Finished"
             )
         parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype="float32"), src))
 
@@ -1257,7 +1267,7 @@ def _load_covariates_for_models(
                     task.fail(f"Loading covariate from {token} ...Failed")
                     raise
                 task.complete(
-                    f"Loading covariate from {token} (n={cov_site.shape[0]}, ncov={cov_site.shape[1]})"
+                    f"Loading covariate from {token} (n={cov_site.shape[0]}, ncov={cov_site.shape[1]}) ...Finished"
                 )
             parts.append((np.asarray(sample_ids, dtype=str), cov_site, token))
 
@@ -2198,7 +2208,7 @@ def load_or_build_q_with_cache(
                         task.fail(f"Loading Q matrix from {src} ...Failed")
                         raise
                     task.complete(
-                        f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]})"
+                        f"Loading Q matrix from {src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
                     )
             else:
                 if grm is None:
@@ -2521,12 +2531,6 @@ def prepare_streaming_context(
             logger.error(f"Covariate IDs (first 5): {list(cov_ids[:5])}")
         raise ValueError("No overlapping samples across genotype/phenotype/GRM/Q/cov.")
 
-    logger.info(
-        f"geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
-        f"grm={'NA' if grm_ids is None else len(grm_ids)}, "
-        f"q={'NA' if q_ids is None else len(q_ids)}, "
-        f"cov={'NA' if cov_ids is None else len(cov_ids)} -> {len(common_ids)}"
-    )
     for wmsg in _dedupe_cache_warning_messages(deferred_cache_warnings):
         logger.warning(wmsg)
 
@@ -2561,6 +2565,468 @@ def prepare_streaming_context(
         cov_all = cov_all[cov_idx]
 
     return pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, stream_genofile
+
+
+def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
+    p = str(path_or_prefix).strip()
+    if p == "":
+        return None
+    low = p.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        p = p[:-4]
+    if all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam")):
+        return p
+    return None
+
+
+def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
+    out: list[tuple[str, int, str, str]] = []
+    bim_path = f"{prefix}.bim"
+    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
+        for ln, line in enumerate(fh, start=1):
+            s = line.strip()
+            if s == "":
+                continue
+            toks = s.split()
+            if len(toks) < 6:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
+            chrom = str(toks[0])
+            try:
+                pos = int(float(toks[3]))
+            except Exception as e:
+                raise ValueError(f"Invalid BIM POS at {bim_path}:{ln}") from e
+            a0 = str(toks[4])
+            a1 = str(toks[5])
+            out.append((chrom, pos, a0, a1))
+    return out
+
+
+def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
+    n = max(1, int(n_samples))
+    if rank_opt is None or int(rank_opt) <= 0:
+        return max(1, int(math.sqrt(n)))
+    return max(1, min(int(rank_opt), n))
+
+
+def run_lrlmm_packed(
+    *,
+    rank_opt: Union[int, None],
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    chunk_size: int,
+    mmap_limit: bool,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+    prepared_cache: Union[dict[str, object], None] = None,
+) -> None:
+    if not hasattr(jxrs, "admx_rsvd_packed_subset"):
+        raise RuntimeError(
+            "Rust extension is missing admx_rsvd_packed_subset. Rebuild/install JanusX extension first."
+        )
+    if not hasattr(jxrs, "fastlmm_assoc_packed_f32"):
+        raise RuntimeError(
+            "Rust extension is missing fastlmm_assoc_packed_f32. Rebuild/install JanusX extension first."
+        )
+
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        cache_guess = _gwas_cache_prefix_with_params(
+            genofile,
+            maf=float(maf_threshold),
+            geno=float(max_missing_rate),
+            snps_only=bool(snps_only),
+        )
+        prefix = _as_plink_prefix(cache_guess)
+    if prefix is None:
+        raise ValueError(
+            "LRLMM requires PLINK BED input (prefix with .bed/.bim/.fam). "
+            f"Resolved genotype is not PLINK: {genofile}"
+        )
+
+    if genetic_model.lower() != "add":
+        raise ValueError("LRLMM currently supports additive coding only (--model add).")
+
+    use_prepared = isinstance(prepared_cache, dict)
+    # Keep live spinner feedback for long RSVD/GWAS stages even in prepared/full mode,
+    # but suppress extra per-step "Finished" lines to avoid duplicated terminal output.
+    show_internal_status = bool(use_spinner)
+    emit_internal_done = bool(use_spinner) and (not bool(use_prepared))
+    if use_prepared:
+        pheno_obj = prepared_cache.get("pheno")
+        if not isinstance(pheno_obj, pd.DataFrame):
+            raise ValueError("prepared_cache['pheno'] must be a pandas DataFrame.")
+        pheno = pheno_obj
+
+        famid_obj = prepared_cache.get("famid")
+        if famid_obj is None:
+            raise ValueError("prepared_cache['famid'] is missing.")
+        ids = np.asarray(famid_obj, dtype=str)
+        sample_map = np.arange(ids.shape[0], dtype=np.int64)
+
+        q_obj = prepared_cache.get("qmatrix")
+        if q_obj is None:
+            raise ValueError("prepared_cache['qmatrix'] is missing.")
+        qmatrix = np.asarray(q_obj, dtype="float32")
+        cov_all = None
+
+        packed_obj = prepared_cache.get("packed_ctx")
+        if not isinstance(packed_obj, dict):
+            raise ValueError(
+                "prepared_cache['packed_ctx'] is missing. "
+                "LowRankLMM requires packed BED genotype."
+            )
+        packed = np.ascontiguousarray(np.asarray(packed_obj["packed"], dtype=np.uint8))
+        miss = np.ascontiguousarray(
+            np.asarray(packed_obj["missing_rate"], dtype=np.float32).reshape(-1)
+        )
+        maf = np.ascontiguousarray(
+            np.asarray(packed_obj["maf"], dtype=np.float32).reshape(-1)
+        )
+        packed_n = int(packed_obj["n_samples"])
+        if packed_n != int(ids.shape[0]):
+            raise ValueError(
+                f"prepared packed n_samples={packed_n} does not match famid={ids.shape[0]}"
+            )
+        if packed.shape[0] != maf.shape[0] or packed.shape[0] != miss.shape[0]:
+            raise ValueError("Prepared packed BED arrays have inconsistent SNP dimensions.")
+
+        ref_alt_obj = prepared_cache.get("ref_alt")
+        if isinstance(ref_alt_obj, pd.DataFrame) and all(
+            c in ref_alt_obj.columns for c in ("chrom", "pos", "allele0", "allele1")
+        ):
+            ref_alt_df = ref_alt_obj.reset_index(drop=True)
+            if int(ref_alt_df.shape[0]) != int(packed.shape[0]):
+                raise ValueError(
+                    "prepared ref_alt row count does not match packed SNP count."
+                )
+            sites_all = list(
+                zip(
+                    ref_alt_df["chrom"].astype(str).tolist(),
+                    pd.to_numeric(ref_alt_df["pos"], errors="coerce").fillna(0).astype(int).tolist(),
+                    ref_alt_df["allele0"].astype(str).tolist(),
+                    ref_alt_df["allele1"].astype(str).tolist(),
+                )
+            )
+        else:
+            sites_all = _read_bim_sites(prefix)
+            if len(sites_all) != int(packed.shape[0]):
+                raise ValueError(
+                    f"BIM row count mismatch with packed BED: bim={len(sites_all)}, packed={packed.shape[0]}"
+                )
+    else:
+        full_ids, _ = inspect_genotype_file(
+            prefix,
+            snps_only=False,
+            maf=0.0,
+            missing_rate=1.0,
+            het=0.0,
+        )
+        full_ids = np.asarray(full_ids, dtype=str)
+        id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+        try:
+            sample_map = np.asarray(
+                [id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)],
+                dtype=np.int64,
+            )
+        except KeyError as e:
+            raise ValueError(
+                "Some aligned sample IDs are not present in packed BED sample order."
+            ) from e
+
+        packed_t0 = time.monotonic()
+        with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
+            try:
+                packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(prefix)
+            except Exception:
+                task.fail("Loading packed BED genotype ...Failed")
+                raise
+            task.complete("Loading packed BED genotype ...Finished")
+        packed_t = max(time.monotonic() - packed_t0, 0.0)
+        _log_model_line(
+            logger,
+            "LowRankLMM",
+            f"Loaded packed BED [{format_elapsed(packed_t)}]",
+            use_spinner=bool(use_spinner),
+        )
+
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+        miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+        maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+        packed_n = int(packed_n)
+        if packed_n <= 0:
+            raise ValueError("Packed BED reported invalid sample count.")
+        if packed.shape[0] != maf.shape[0] or packed.shape[0] != miss.shape[0]:
+            raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+
+        sites_all = _read_bim_sites(prefix)
+        if len(sites_all) != int(packed.shape[0]):
+            raise ValueError(
+                f"BIM row count mismatch with packed BED: bim={len(sites_all)}, packed={packed.shape[0]}"
+            )
+
+        keep = (maf >= float(maf_threshold)) & (miss <= float(max_missing_rate))
+        if bool(snps_only):
+            snp_mask = np.asarray(
+                [
+                    (len(str(a0)) == 1 and len(str(a1)) == 1)
+                    for (_c, _p, a0, a1) in sites_all
+                ],
+                dtype=bool,
+            )
+            keep &= snp_mask
+        if not np.any(keep):
+            raise ValueError("No SNP remains after LRLMM packed-bed filtering.")
+        if not np.all(keep):
+            packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+            miss = np.ascontiguousarray(miss[keep], dtype=np.float32)
+            maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
+            sites_all = [s for s, k in zip(sites_all, keep) if bool(k)]
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    trait_iter = list(pheno.columns) if trait_names is None else [t for t in trait_names if t in pheno.columns]
+    multi_trait_mode = len(trait_iter) > 1
+
+    for trait_idx, pname in enumerate(trait_iter):
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        pheno_sub = pheno[pname].dropna()
+        sameidx = np.isin(ids, pheno_sub.index)
+        n_idv = int(np.sum(sameidx))
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        trait_ids = np.asarray(ids[sameidx], dtype=str)
+        y_vec = np.ascontiguousarray(pheno_sub.loc[trait_ids].values, dtype=np.float64)
+        x_cov = qmatrix[sameidx]
+        if cov_all is not None:
+            x_cov = np.concatenate([x_cov, cov_all[sameidx]], axis=1)
+        x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
+        x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
+        sample_idx_trait = np.ascontiguousarray(sample_map[sameidx], dtype=np.int64)
+
+        rank_trait = _resolve_lrlmm_rank(rank_opt, int(n_idv))
+        rsvd_t0 = time.monotonic()
+        with CliStatus(
+            f"Running RSVD (rank={rank_trait})...",
+            enabled=show_internal_status,
+        ) as task:
+            try:
+                s_raw, u_sub_raw, maf_trait_raw, row_flip_raw = jxrs.admx_rsvd_packed_subset(
+                    packed,
+                    int(packed_n),
+                    int(rank_trait),
+                    sample_idx_trait,
+                    42,
+                    5,
+                    1e-1,
+                )
+            except Exception:
+                task.fail("Running RSVD ...Failed")
+                raise
+            if emit_internal_done:
+                task.complete(f"Running RSVD (rank={rank_trait}) ...Finished")
+        rsvd_secs = max(time.monotonic() - rsvd_t0, 0.0)
+
+        s_trait = np.ascontiguousarray(np.asarray(s_raw, dtype=np.float32).reshape(-1))
+        u_sub = np.ascontiguousarray(np.asarray(u_sub_raw, dtype=np.float32))
+        maf_trait = np.ascontiguousarray(np.asarray(maf_trait_raw, dtype=np.float32).reshape(-1))
+        row_flip_trait = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1)
+        )
+        if u_sub.ndim != 2 or u_sub.shape[0] != int(n_idv) or u_sub.shape[1] != int(s_trait.shape[0]):
+            raise ValueError(
+                f"Trait RSVD output shape mismatch: u={u_sub.shape}, s={s_trait.shape}, n={n_idv}"
+            )
+        if maf_trait.shape[0] != packed.shape[0] or row_flip_trait.shape[0] != packed.shape[0]:
+            raise ValueError(
+                "Trait RSVD row statistics length mismatch with packed SNP rows."
+            )
+        u_trait = np.zeros((int(packed_n), int(s_trait.shape[0])), dtype=np.float32)
+        u_trait[sample_idx_trait, :] = u_sub
+        _log_model_line(
+            logger,
+            "LowRankLMM",
+            f"RSVD rank={int(s_trait.shape[0])} [{format_elapsed(rsvd_secs)}]",
+            use_spinner=bool(use_spinner),
+        )
+
+        with CliStatus("Running LowRankLMM GWAS...", enabled=show_internal_status) as task:
+            try:
+                lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip_trait,
+                    maf_trait,
+                    u_trait,
+                    s_trait,
+                    y_vec,
+                    x_arg,
+                    sample_idx_trait,
+                    -5.0,
+                    5.0,
+                    50,
+                    1e-2,
+                    int(threads),
+                    "add",
+                )
+            except Exception:
+                task.fail("Running LowRankLMM GWAS ...Failed")
+                raise
+            if emit_internal_done:
+                task.complete("Running LowRankLMM GWAS ...Finished")
+
+        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
+            raise ValueError(
+                f"Unexpected LowRankLMM result shape: {res.shape}, expected ({len(sites_all)}, >=3)"
+            )
+
+        pve = None
+        try:
+            vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
+            lbd_v = float(lbd)
+            if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
+                pve = vg / (vg + lbd_v)
+        except Exception:
+            pve = None
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+        _log_model_line(
+            logger,
+            "LowRankLMM",
+            f"rank={int(s_trait.shape[0])}; lambda={float(lbd):.4g}",
+            use_spinner=bool(use_spinner),
+        )
+
+        chrom = [str(c) for (c, _p, _a0, _a1) in sites_all]
+        pos = [int(p) for (_c, p, _a0, _a1) in sites_all]
+        a0 = [str(v) for (_c, _p, v, _a1) in sites_all]
+        a1 = [str(v) for (_c, _p, _a0, v) in sites_all]
+
+        res_df = pd.DataFrame(
+            {
+                "chrom": chrom,
+                "pos": pos,
+                "allele0": a0,
+                "allele1": a1,
+                "maf": np.asarray(maf_trait, dtype=np.float32),
+                "beta": np.asarray(res[:, 0], dtype=np.float64),
+                "se": np.asarray(res[:, 1], dtype=np.float64),
+                "pwald": np.asarray(res[:, 2], dtype=np.float64),
+            }
+        )
+        if res.shape[1] > 3:
+            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+
+        out_tsv = f"{outprefix}.{pname}.{genetic_model}.lrlmm.tsv"
+        viz_secs = 0.0
+        if plot:
+            viz_t0 = time.time()
+            fastplot(
+                res_df[["chrom", "pos", "pwald"]],
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{outprefix}.{pname}.{genetic_model}.lrlmm.svg",
+            )
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        cast_map: dict[str, object] = {"pwald": "object", "pos": int}
+        if "plrt" in res_df.columns:
+            cast_map["plrt"] = "object"
+        res_df = res_df.astype(cast_map)
+        res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+        if "plrt" in res_df.columns:
+            res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
+        res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        saved_paths.append(str(out_tsv).replace("//", "/"))
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+        _log_model_line(
+            logger,
+            "LowRankLMM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LowRankLMM",
+            f"Results saved to {str(out_tsv).replace('//', '/')}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(sites_all))
+        eff_snp_by_trait[pname] = eff_snp
+        gwas_secs = wall + rsvd_secs
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "LrLMM",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": (float(pve) if pve is not None else None),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(gwas_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv).replace("//", "/"),
+            }
+        )
+
+        done_times = [format_elapsed(wall)]
+        done_times.insert(0, format_elapsed(rsvd_secs))
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            f"LowRankLMM ...Finished [{'/'.join(done_times)}]",
+            use_spinner=bool(use_spinner),
+        )
+        if multi_trait_mode:
+            logger.info("")
 
 
 def run_chunked_gwas_lmm_lm(
@@ -3903,7 +4369,7 @@ def build_qmatrix_farmcpu(
                         ) if bool(mmap_limit) else None,
                         threads=max(1, int(threads)),
                         logger=logger,
-                        use_spinner=bool(use_spinner and (not quiet_terminal)),
+                        use_spinner=bool(use_spinner),
                         snps_only=bool(snps_only),
                     )
                     grm = np.asarray(grm, dtype="float32")
@@ -3941,7 +4407,7 @@ def build_qmatrix_farmcpu(
                 q_src = _basename_only(q_path)
                 with CliStatus(
                     f"Loading Q matrix from {q_src}...",
-                    enabled=bool(use_spinner and (not quiet_terminal)),
+                    enabled=bool(use_spinner),
                 ) as task:
                     qmatrix = np.loadtxt(q_path, dtype="float32", delimiter="\t")
                     if qmatrix.ndim == 1:
@@ -3950,7 +4416,9 @@ def build_qmatrix_farmcpu(
                         raise ValueError(
                             f"PCA cache shape mismatch: expected ({n},{q_int}), got {qmatrix.shape}"
                         )
-                    task.complete(f"Loading Q matrix from {q_src}")
+                    task.complete(
+                        f"Loading Q matrix from {q_src} (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) ...Finished"
+                    )
             else:
                 _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
                 grm = _load_or_build_grm_cache_for_pca()
@@ -3971,7 +4439,7 @@ def build_qmatrix_farmcpu(
             chunk_size=int(chunk_size),
             logger=logger,
             context="FarmCPU",
-            use_spinner=bool(use_spinner and (not quiet_terminal)),
+            use_spinner=bool(use_spinner),
             snps_only=bool(snps_only),
         )
         if cov_arr is not None:
@@ -4008,6 +4476,8 @@ def run_farmcpu_fullmem(
     saved_paths: Union[list[str], None] = None,
     trait_names: Union[list[str], None] = None,
     farmcpu_cache: Union[dict[str, object], None] = None,
+    prepare_only: bool = False,
+    emit_trait_header: bool = True,
 ) -> dict[str, object]:
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).
@@ -4151,11 +4621,20 @@ def run_farmcpu_fullmem(
         geno = None
         packed_ctx: Union[dict[str, object], None] = None
 
+        packed_prefix = _as_plink_prefix(gfile)
+        if packed_prefix is None:
+            cache_guess = _gwas_cache_prefix_with_params(
+                gfile,
+                maf=float(args.maf),
+                geno=float(args.geno),
+                snps_only=bool(snps_only),
+                logger=logger,
+            )
+            packed_prefix = _as_plink_prefix(cache_guess)
+
         can_use_packed = (
             bool(getattr(args, "model", "add") == "add")
-            and os.path.isfile(f"{gfile}.bed")
-            and os.path.isfile(f"{gfile}.bim")
-            and os.path.isfile(f"{gfile}.fam")
+            and packed_prefix is not None
         )
         if can_use_packed:
             packed_load_t0 = time.monotonic()
@@ -4165,7 +4644,9 @@ def run_farmcpu_fullmem(
             )
             with packed_status as task:
                 try:
-                    packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(gfile)
+                    packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(
+                        str(packed_prefix)
+                    )
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
                     raise
@@ -4191,7 +4672,7 @@ def run_farmcpu_fullmem(
                 keep &= miss_arr <= miss_thr
 
             ref_alt, keep_final = _load_bim_ref_alt_filtered(
-                gfile,
+                str(packed_prefix),
                 keep,
                 snps_only_mode=bool(snps_only),
             )
@@ -4258,7 +4739,7 @@ def run_farmcpu_fullmem(
             ref_alt["pos"] = pd.to_numeric(ref_alt["pos"], errors="coerce").fillna(0).astype(int)
 
         t_loaded = time.time() - t_loading
-        if not bool(context_prepared):
+        if (not bool(context_prepared)) and (not bool(prepare_only)):
             ns_loaded = int(ref_alt.shape[0])
             _rich_success(
                 logger,
@@ -4299,7 +4780,7 @@ def run_farmcpu_fullmem(
             logger=logger,
             sample_ids=famid.astype(str),
             use_spinner=use_spinner,
-            quiet_terminal=bool(context_prepared),
+            quiet_terminal=bool(context_prepared or prepare_only),
             snps_only=bool(snps_only),
             n_snps_hint=int(ref_alt.shape[0]),
             threads=int(args.thread),
@@ -4352,6 +4833,9 @@ def run_farmcpu_fullmem(
         ref_alt = farmcpu_cache["ref_alt"]  # type: ignore[assignment]
         qmatrix = np.asarray(farmcpu_cache["qmatrix"], dtype="float32")
 
+    if bool(prepare_only):
+        return farmcpu_cache if farmcpu_cache is not None else {}
+
     process = psutil.Process()
     n_cores = detect_effective_threads()
     if summary_rows is None:
@@ -4387,14 +4871,15 @@ def run_farmcpu_fullmem(
             maf = np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1)
             eff_snp = int(maf.shape[0])
 
-        _emit_trait_header(
-            logger,
-            phename,
-            n_idv,
-            pve=None,
-            use_spinner=bool(use_spinner),
-            width=60,
-        )
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                phename,
+                n_idv,
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
 
         cpu_t0 = process.cpu_times()
         t0 = time.time()
@@ -4402,7 +4887,11 @@ def run_farmcpu_fullmem(
         peak_rss = process.memory_info().rss
         farm_iter = 20
         farm_label = f"FarmCPU-{phename} (n={n_idv})"
-        farm_pbar = _ProgressAdapter(total=farm_iter, desc=farm_label)
+        farm_pbar = _ProgressAdapter(
+            total=farm_iter,
+            desc=farm_label,
+            force_animate=bool(use_spinner),
+        )
         farm_state = {"done": 0}
 
         def _farmcpu_progress(done: int, total: int) -> None:
@@ -4500,6 +4989,8 @@ def run_farmcpu_fullmem(
         if args.plot:
             farm_times.append(format_elapsed(viz_secs))
         farm_done_msg = f"FarmCPU ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"
+        if (not bool(emit_trait_header)) and multi_trait_mode:
+            farm_done_msg = f"FarmCPU({phename}) ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"
         _rich_success(logger, farm_done_msg, use_spinner=use_spinner)
         if multi_trait_mode:
             logger.info("")
@@ -4560,6 +5051,13 @@ def parse_args():
         help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
+        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=None, type=int, metavar="RANK",
+        help=(
+            "Run low-rank LMM (packed BED + RSVD + Rust FaST GWAS). "
+            "Optional RANK; default is floor(sqrt(n_samples))."
+        ),
+    )
+    models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
@@ -4569,7 +5067,7 @@ def parse_args():
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for streaming LM/LMM/FastLMM (default: %(default)s).",
+        help="Genetic effect coding model for streaming LM/LMM/FastLMM/LRLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -4630,7 +5128,7 @@ def parse_args():
     )
     optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=100_000,
-        help="Number of SNPs per chunk for streaming LMM/LM "
+        help="Number of SNPs per chunk for streaming LMM/LM and RSVD mmap sizing "
              "(affects GRM and GWAS; default: %(default)s).",
     )
     optional_group.add_argument(
@@ -4725,6 +5223,11 @@ def main(log: bool = True):
             model_tokens.append("LMM")
         if args.fastlmm:
             model_tokens.append("fastLMM")
+        if args.lrlmm is not None:
+            if int(args.lrlmm) > 0:
+                model_tokens.append(f"LRLMM(rank={int(args.lrlmm)})")
+            else:
+                model_tokens.append("LRLMM(rank=sqrt(n))")
         if args.lm:
             model_tokens.append("LM")
         if args.farmcpu:
@@ -4743,6 +5246,10 @@ def main(log: bool = True):
             ("Miss threshold", args.geno),
             ("Chunk size", args.chunksize),
         ]
+        if args.lrlmm is not None:
+            cfg_rows.append(
+                ("LRLMM rank", int(args.lrlmm) if int(args.lrlmm) > 0 else "sqrt(n)")
+            )
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
         if args.cov:
@@ -4782,14 +5289,17 @@ def main(log: bool = True):
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or (args.lrlmm is not None) or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, -lrlmm, and/or -farmcpu."
         )
+        raise SystemExit(1)
+    if (args.lrlmm is not None) and args.model != "add":
+        logger.error("LRLMM currently supports additive coding only (--model add).")
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM; "
+            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM/LRLMM; "
             "FarmCPU keeps additive coding."
         )
 
@@ -4808,7 +5318,7 @@ def main(log: bool = True):
 
         stream_selected = bool(args.lmm or args.lm or args.fastlmm)
         if stream_selected:
-            _section(logger, "Metadata preparation")
+            _section(logger, "Streaming task")
             _log_file_only(
                 logger,
                 logging.INFO,
@@ -4833,9 +5343,9 @@ def main(log: bool = True):
                 use_spinner=use_spinner,
                 snps_only=bool(args.snps_only),
             )
-            logger.info("")
+            _phase_split(logger)
         else:
-            if args.farmcpu:
+            if args.farmcpu and (args.lrlmm is None):
                 pheno = _load_phenotype_with_status(
                     args.pheno,
                     args.ncol,
@@ -4851,6 +5361,7 @@ def main(log: bool = True):
             stream_models.append("fastlmm")
         if args.lm:
             stream_models.append("lm")
+        has_lrlmm = bool(args.lrlmm is not None)
         has_farmcpu = bool(args.farmcpu)
 
         trait_order = list(pheno.columns) if pheno is not None else []
@@ -4864,8 +5375,6 @@ def main(log: bool = True):
         else:
             for idx0, trait_name in enumerate(trait_order):
                 trait_col_map[str(trait_name)] = int(idx0)
-        if len(stream_models) > 0:
-            _section(logger, "Streaming task")
 
         # -------------------------------
         # 1) Streaming models first
@@ -4938,30 +5447,87 @@ def main(log: bool = True):
                     logger.info("")
 
         # -------------------------------
-        # 2) FarmCPU full-memory last
+        # 2) Full genotype task (LowRankLMM / FarmCPU)
         # -------------------------------
-        if has_farmcpu:
+        if has_lrlmm or has_farmcpu:
             if len(stream_models) > 0:
                 logger.info("")
             _section(logger, "Full genotype task")
             context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
-            _ = run_farmcpu_fullmem(
-                args=args,
-                gfile=gfile,
-                prefix=prefix,
-                logger=logger,
-                pheno_preloaded=pheno,  # Reuse phenotype loaded in streaming stage.
-                ids_preloaded=ids,
-                n_snps_preloaded=n_snps,
-                qmatrix_preloaded=qmatrix,
-                cov_preloaded=cov_all,
-                use_spinner=use_spinner,
-                context_prepared=context_prepared,
-                summary_rows=gwas_summary_rows,
-                saved_paths=saved_result_paths,
-                trait_names=[str(t) for t in trait_order],
-                farmcpu_cache=None,
-            )
+
+            shared_full_cache: Union[dict[str, object], None] = None
+            if has_lrlmm:
+                shared_full_cache = run_farmcpu_fullmem(
+                    args=args,
+                    gfile=gfile,
+                    prefix=prefix,
+                    logger=logger,
+                    pheno_preloaded=pheno,
+                    ids_preloaded=ids,
+                    n_snps_preloaded=n_snps,
+                    qmatrix_preloaded=qmatrix,
+                    cov_preloaded=cov_all,
+                    use_spinner=use_spinner,
+                    context_prepared=context_prepared,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                    farmcpu_cache=None,
+                    prepare_only=True,
+                    emit_trait_header=True,
+                )
+                if len(trait_order) == 0 and isinstance(shared_full_cache, dict):
+                    pheno_cache = shared_full_cache.get("pheno")
+                    if isinstance(pheno_cache, pd.DataFrame):
+                        trait_order = [str(t) for t in list(pheno_cache.columns)]
+                        trait_col_map = {str(t): int(i) for i, t in enumerate(trait_order)}
+
+                _phase_split(logger)
+                run_lrlmm_packed(
+                    rank_opt=args.lrlmm,
+                    genofile=gfile,
+                    pheno=pheno if pheno is not None else pd.DataFrame(),
+                    ids=ids if ids is not None else np.asarray([], dtype=str),
+                    outprefix=outprefix,
+                    maf_threshold=args.maf,
+                    max_missing_rate=args.geno,
+                    genetic_model=args.model,
+                    chunk_size=args.chunksize,
+                    mmap_limit=args.mmap_limit,
+                    qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
+                    cov_all=cov_all,
+                    plot=args.plot,
+                    threads=args.thread,
+                    logger=logger,
+                    use_spinner=use_spinner,
+                    snps_only=bool(args.snps_only),
+                    eff_snp_by_trait=eff_snp_by_trait,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                    emit_trait_header=True,
+                    prepared_cache=shared_full_cache,
+                )
+
+            if has_farmcpu:
+                _ = run_farmcpu_fullmem(
+                    args=args,
+                    gfile=gfile,
+                    prefix=prefix,
+                    logger=logger,
+                    pheno_preloaded=pheno,
+                    ids_preloaded=ids,
+                    n_snps_preloaded=n_snps,
+                    qmatrix_preloaded=qmatrix,
+                    cov_preloaded=cov_all,
+                    use_spinner=use_spinner,
+                    context_prepared=context_prepared,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                    farmcpu_cache=shared_full_cache,
+                    emit_trait_header=(not has_lrlmm),
+                )
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:
@@ -5010,10 +5576,12 @@ def main(log: bool = True):
                 "models": {
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
+                    "lrlmm": bool(args.lrlmm is not None),
                     "lm": bool(args.lm),
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),
+                "lrlmm_rank": (None if args.lrlmm is None else int(args.lrlmm)),
                 "snps_only": bool(args.snps_only),
                 "maf": float(args.maf),
                 "geno": float(args.geno),

@@ -55,7 +55,7 @@ for key in ["MPLBACKEND"]:
 
 import matplotlib as mpl
 mpl.use("Agg")
-from janusx.bioplotkit import GWASPLOT, LDblock
+from janusx.bioplotkit import GWASPLOT, LDblock, apply_integer_yticks
 from janusx.bioplotkit.geneplot import draw_gene_structure_records
 from janusx.gfreader import load_genotype_chunks
 
@@ -2287,7 +2287,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax.set_ylabel("")
                 return (
                     ax.get_ylim(),
-                    np.asarray(ax.get_yticks(), dtype=float),
+                    np.asarray([], dtype=float),
                     float(manh_fontsize_target),
                     ax.get_xlim(),
                 )
@@ -2425,10 +2425,11 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             if hide_axis_labels:
                 ax.set_xlabel("")
                 ax.set_ylabel("")
+            manh_tick_values = apply_integer_yticks(ax)
 
             return (
                 ax.get_ylim(),
-                np.asarray(ax.get_yticks(), dtype=float),
+                np.asarray(manh_tick_values, dtype=float),
                 float(manh_fontsize_target),
                 ax.get_xlim(),
             )
@@ -2520,13 +2521,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         x_upper = qq_left + 1.0
                     ax2.set_xlim(qq_left, x_upper)
                     if manh_yticks is not None and manh_ylim is not None:
-                        y0, y1 = ax2.get_ylim()
-                        lo, hi = (y0, y1) if y0 <= y1 else (y1, y0)
-                        yticks = [
-                            float(t) for t in manh_yticks
-                            if (t >= lo - 1e-12) and (t <= hi + 1e-12)
-                        ]
-                        ax2.set_yticks(yticks)
+                        apply_integer_yticks(ax2, ticks=manh_yticks)
+                    else:
+                        apply_integer_yticks(ax2)
                     if manh_fontsize is not None:
                         ax2.xaxis.label.set_size(manh_fontsize)
                         ax2.yaxis.label.set_size(manh_fontsize)
@@ -3387,6 +3384,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     manh_height_in = None
     manh_fontsize: Optional[float] = None
     manh_ylim_pair: Optional[tuple[float, float]] = None
+    manh_yticks_pair: Optional[np.ndarray] = None
     manh_xlim_pair: Optional[tuple[float, float]] = None
     manh_axes_bounds: Optional[tuple[float, float, float, float]] = None
 
@@ -3487,6 +3485,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         if not (hi > lo):
             hi = lo + max(1e-9, abs(lo) * 1e-9)
         ax.set_ylim(lo, hi)
+        manh_yticks_pair = apply_integer_yticks(ax)
         _yy0, _yy1 = ax.get_ylim()
         manh_ylim_pair = (float(_yy0), float(_yy1))
         manh_xlim_pair = (float(ax.get_xlim()[0]), float(ax.get_xlim()[1]))
@@ -3555,6 +3554,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         x_upper = max(float(x_right), qq_left + 1.0)
         ax.set_xlim(qq_left, x_upper)
         ax.margins(x=0.0)
+        if manh_yticks_pair is not None:
+            apply_integer_yticks(ax, ticks=manh_yticks_pair)
+        else:
+            apply_integer_yticks(ax)
         line_left, line_right = ax.get_xlim()
         ax.plot([line_left, line_right], [line_left, line_right], lw=1.0, color="black")
         ax.set_xlabel("Expected -log10(p-value)")

@@ -45,6 +45,8 @@ Main capabilities:
 - `fastq2vcf` and `fastq2count` are launcher-only (`jx`)
 - launcher-only flags (`-update/-upgrade/-list/-clean/-uninstall`) are not available in `jxpy`
 
+---
+
 ## Installation
 
 ### Option A: launcher install (recommended for end users)
@@ -78,6 +80,8 @@ pip install janusx
 ```
 
 - If you only need a turnkey CLI environment with pipeline tooling, prefer launcher install.
+
+---
 
 ## Quick start
 
@@ -141,9 +145,9 @@ Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
 
 ```bash
 jx <module> -h
-# or
-jxpy <module> -h
 ```
+
+---
 
 ## Module map
 
@@ -152,12 +156,12 @@ jxpy <module> -h
 - `grm`
 - `pca`
 - `gwas`
-- `postgwas`
+- `postgwas` (Visualization, `manh` `qq` `ldblock`)
 
 **Genomic Selection (GS)**:
 
 - `gs`
-- `reml`
+- `reml` (Estimation of broaden heritability and blup values)
 
 **[GARFIELD](https://github.com/heroalone/Garfield)**:
 
@@ -166,22 +170,24 @@ jxpy <module> -h
 
 **Bulk Segregation Analysis (BSA)**:
 
-- `postbsa`
+- `postbsa` (Visualization, after BSA pipeline)
 
 **Pipeline and utility**:
 
 - `fastq2count` (RNAseq pipeline, launcher-only)
 - `fastq2vcf` (BSA/Reseq pipeline, launcher-only)
-- `adamixture` (Based on [AI-sandbox](https://github.com/AI-sandbox/ADAMIXTURE.git))
-- `hybrid`
-- `gformat`
-- `gmerge`
-- `webui`
+- `adamixture` (Based on [ADAMIXTURE](https://github.com/AI-sandbox/ADAMIXTURE.git))
+- `hybrid` (Generate F1 genotype base on Parents)
+- `gformat` (Conversion between genotype data formats)
+- `gmerge` (Merge genotype between samples)
+- `webui` (Visualization, beta version)
 
 **Benchmark**:
 
 - `sim`
 - `simulation`
+
+---
 
 ## Citation
 
@@ -196,7 +202,9 @@ jxpy <module> -h
   journal = {bioRxiv}
 }
 ```
+---
+
 
 ## License
 
-This project is licensed under GNU Affero General Public License v3.0 (AGPL-3.0-or-later). See [LICENSE](./LICENSE).
+This project is licensed under **GNU Affero General Public License v3.0** (AGPL-3.0-or-later). See [LICENSE](./LICENSE).

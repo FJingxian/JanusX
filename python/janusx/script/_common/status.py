@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 from itertools import cycle
 from shutil import get_terminal_size
@@ -25,6 +26,7 @@ _SPINNER_FALLBACKS = ("line", "dots", "simpleDots", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
+_CYAN = "\033[36m"
 _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
 _LOADING_PREFIXES = (
@@ -32,6 +34,7 @@ _LOADING_PREFIXES = (
     "inspecting ",
     "loaded ",
     "running ",
+    "waiting ",
     "computing ",
     "building ",
     "calculating ",
@@ -330,6 +333,60 @@ def warn_deprecated_alias_usage(
     return False
 
 
+def _animate_plain_process(
+    desc: str,
+    timeout: float,
+    show_elapsed: bool,
+    start_ts: float,
+    stop_evt,
+    parent_pid: int,
+    use_color: bool,
+) -> None:
+    """
+    Process-based spinner loop.
+
+    Runs in a child process so animation/elapsed can keep updating even when
+    the parent process is blocked inside a long C/Rust call that holds GIL.
+    """
+    idx = 0
+    desc_text = str(desc)
+    while True:
+        try:
+            if bool(stop_evt.is_set()):
+                break
+        except Exception:
+            break
+        if int(parent_pid) > 0:
+            alive = True
+            try:
+                import psutil  # type: ignore
+
+                alive = bool(psutil.pid_exists(int(parent_pid)))
+            except Exception:
+                try:
+                    os.kill(int(parent_pid), 0)
+                except Exception:
+                    alive = False
+            if not alive:
+                break
+        frame = _SPINNER_FRAMES[idx % len(_SPINNER_FRAMES)]
+        idx += 1
+        elapsed = max(0.0, float(monotonic() - float(start_ts)))
+        if bool(show_elapsed):
+            body = f"{desc_text} [{format_elapsed(elapsed)}]"
+        else:
+            body = f"{desc_text}"
+        if bool(use_color) and (stdout_is_tty() or bool(use_color)):
+            line = f"\r{_CYAN}{frame}{_RESET} {body}"
+        else:
+            line = f"\r{frame} {body}"
+        try:
+            _safe_print(line, flush=True, end="")
+        except Exception:
+            break
+        sleep(max(float(timeout), spinner_refresh_interval(elapsed)))
+
+
 class CliStatus:
     """CLI status helper with rich-first spinner and plain fallback."""
 
@@ -340,15 +397,19 @@ class CliStatus:
         enabled: bool = True,
         timeout: float = 0.08,
         show_elapsed: bool = True,
+        use_process: bool = False,
     ) -> None:
         self.desc = str(desc)
         self.enabled = bool(enabled)
         self.timeout = float(timeout)
         self.show_elapsed = bool(show_elapsed)
+        self.use_process = bool(use_process)
         self._animate = bool(self.enabled and should_animate_status(self.desc))
         self._backend = "none"
         self._done = False
         self._thread: Optional[Thread] = None
+        self._proc = None
+        self._proc_stop_evt = None
         self._plain_done = False
         self._status_cm = None
         self._console = None
@@ -358,7 +419,12 @@ class CliStatus:
         for frame in cycle(_SPINNER_FRAMES):
             if self._plain_done:
                 break
-            _safe_print(f"\r{frame} {self._running_line()}", flush=True, end="")
+            body = self._running_line()
+            if self.enabled and (stdout_is_tty() or self.enabled):
+                line = f"\r{_CYAN}{frame}{_RESET} {body}"
+            else:
+                line = f"\r{frame} {body}"
+            _safe_print(line, flush=True, end="")
             sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
     def _animate_rich(self) -> None:
@@ -376,6 +442,37 @@ class CliStatus:
         if not self._animate:
             self._backend = "none"
             return self
+
+        if self.use_process:
+            try:
+                main_mod = sys.modules.get("__main__")
+                main_file = getattr(main_mod, "__file__", "")
+                main_file_s = str(main_file or "").strip()
+                # Windows spawn cannot bootstrap safely from `<stdin>` / `<string>`.
+                if (main_file_s != "") and (not main_file_s.startswith("<")):
+                    import multiprocessing as mp
+
+                    ctx = mp.get_context("spawn")
+                    self._proc_stop_evt = ctx.Event()
+                    self._proc = ctx.Process(
+                        target=_animate_plain_process,
+                        args=(
+                            self.desc,
+                            float(self.timeout),
+                            bool(self.show_elapsed),
+                            float(self._start_ts),
+                            self._proc_stop_evt,
+                            int(os.getpid()),
+                            bool(self.enabled),
+                        ),
+                        daemon=True,
+                    )
+                    self._proc.start()
+                    self._backend = "process"
+                    return self
+            except Exception:
+                self._proc = None
+                self._proc_stop_evt = None
 
         if _HAS_RICH and stdout_is_tty():
             try:
@@ -410,12 +507,30 @@ class CliStatus:
             self._thread.join(timeout=self.timeout * 4)
             self._thread = None
 
+        if self._backend == "process":
+            try:
+                if self._proc_stop_evt is not None:
+                    self._proc_stop_evt.set()
+            except Exception:
+                pass
+            try:
+                if self._proc is not None:
+                    self._proc.join(timeout=max(0.5, self.timeout * 8))
+                    if self._proc.is_alive():
+                        self._proc.terminate()
+                        self._proc.join(timeout=max(0.5, self.timeout * 8))
+            except Exception:
+                pass
+            finally:
+                self._proc = None
+                self._proc_stop_evt = None
+
         if self._backend == "rich" and self._status_cm is not None:
             self._status_cm.__exit__(None, None, None)
             self._status_cm = None
             return
 
-        if self._backend == "plain":
+        if self._backend in ("plain", "process"):
             cols = get_terminal_size((80, 20)).columns
             _safe_print("\r" + " " * cols, end="", flush=True)
             _safe_print("\r", end="", flush=True)

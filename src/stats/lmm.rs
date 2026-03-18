@@ -520,7 +520,7 @@ fn fast_reml_beta_se(
 #[pyfunction]
 #[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter=50, tol=1e-2, model="add"))]
 pub fn fastlmm_reml_null_f32<'py>(
-    _py: Python<'py>,
+    py: Python<'py>,
     s: PyReadonlyArray1<'py, f64>,
     u1tx: PyReadonlyArray2<'py, f64>,
     u2tx: PyReadonlyArray2<'py, f64>,
@@ -595,17 +595,20 @@ pub fn fastlmm_reml_null_f32<'py>(
     let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
 
     let mut scratch = FastLmmScratch::new(k, p1);
-    let (best_log10, best_cost) = brent_minimize(
-        |log10_lbd| fast_reml_cost(log10_lbd, &data, None, &mut scratch, n_minus_p_f, c_const),
-        low,
-        high,
-        tol,
-        max_iter,
-    );
+    let (best_log10, best_cost, ml) = py.detach(|| {
+        let (best_log10, best_cost) = brent_minimize(
+            |log10_lbd| fast_reml_cost(log10_lbd, &data, None, &mut scratch, n_minus_p_f, c_const),
+            low,
+            high,
+            tol,
+            max_iter,
+        );
+        let ml = fast_ml_loglike(best_log10, &data, None, &mut scratch, n_f, c_ml);
+        (best_log10, best_cost, ml)
+    });
 
     let lbd = 10.0_f64.powf(best_log10);
     let reml = -best_cost;
-    let ml = fast_ml_loglike(best_log10, &data, None, &mut scratch, n_f, c_ml);
     Ok((lbd, ml, reml))
 }
 

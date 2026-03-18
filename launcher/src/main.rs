@@ -4938,7 +4938,7 @@ fn format_elapsed(d: Duration) -> String {
     format!("{h}h{m:02}m")
 }
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
 
 pub(crate) fn spinner_refresh_interval(elapsed: Duration) -> Duration {
     if elapsed < Duration::from_secs(60) {
@@ -6249,9 +6249,9 @@ mod tests {
 
     #[test]
     fn spinner_frame_changes_follow_refresh_step() {
-        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(0)), "⠋");
-        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(50)), "⠋");
-        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(100)), "⠙");
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(0)), "/");
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(50)), "/");
+        assert_eq!(spinner_frame_for_elapsed(Duration::from_millis(100)), "-");
 
         let frame_60_100 = spinner_frame_for_elapsed(Duration::from_millis(60_100));
         let frame_60_900 = spinner_frame_for_elapsed(Duration::from_millis(60_900));

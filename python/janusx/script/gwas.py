@@ -54,6 +54,7 @@ from datetime import datetime
 from typing import Union, Optional
 import uuid
 from contextlib import contextmanager
+from contextlib import nullcontext
 
 from janusx.pyBLUP.QK2 import GRM
 from janusx.pyBLUP.stream_grm import (
@@ -120,6 +121,11 @@ from ._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
 )
+
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    _threadpool_limits = None
 from ._common.colspec import parse_zero_based_index_specs
 
 try:
@@ -371,6 +377,38 @@ def _log_info(logger: logging.Logger, message: str, *, use_spinner: bool = False
         logger.info(str(message))
 
 
+def _emit_plain_info_line(
+    logger: logging.Logger,
+    message: str,
+    *,
+    use_spinner: bool = False,
+) -> None:
+    """
+    Emit a plain (non-success-styled) info line.
+    In spinner mode we print to terminal and also keep file logging.
+    """
+    msg = str(message)
+    if use_spinner:
+        _log_file_only(logger, logging.INFO, msg)
+        print(msg, flush=True)
+    else:
+        logger.info(msg)
+
+
+def _emit_warning_line(
+    logger: logging.Logger,
+    message: str,
+    *,
+    use_spinner: bool = False,
+) -> None:
+    msg = str(message)
+    if use_spinner or stdout_is_tty():
+        _log_file_only(logger, logging.WARNING, msg)
+        print_warning(msg, force_color=bool(use_spinner))
+    else:
+        logger.warning(msg)
+
+
 def _log_model_line(
     logger: logging.Logger,
     model_label: str,
@@ -423,6 +461,8 @@ class _ProgressAdapter:
         self._tick = 0
         self._memory_text = ""
         self._memory_until_tick = 0
+        self._hb_stop = threading.Event()
+        self._hb_thread: Optional[threading.Thread] = None
 
         if self._animate and rich_progress_available():
             try:
@@ -458,6 +498,23 @@ class _ProgressAdapter:
                            "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             )
             self._backend = "tqdm"
+
+        if self._animate and self._backend in {"rich", "tqdm"}:
+            self._hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self._hb_thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self._hb_stop.wait(0.2):
+            if self._backend == "rich" and self._progress is not None and self._task_id is not None:
+                try:
+                    self._progress.update(self._task_id, metric=self._metric_text())
+                except Exception:
+                    return
+            elif self._backend == "tqdm" and self._tqdm is not None:
+                try:
+                    self._tqdm.refresh()
+                except Exception:
+                    return
 
     def _metric_text(self) -> str:
         show_mem = bool(
@@ -532,6 +589,13 @@ class _ProgressAdapter:
         success_style: bool = True,
     ) -> None:
         elapsed = format_elapsed(time.monotonic() - self._start_ts)
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            try:
+                self._hb_thread.join(timeout=0.5)
+            except Exception:
+                pass
+            self._hb_thread = None
         if self._backend == "rich" and self._progress is not None:
             self._progress.stop()
             self._progress = None
@@ -545,6 +609,57 @@ class _ProgressAdapter:
                 print_success(msg, force_color=True)
             else:
                 print(msg, flush=True)
+
+
+def _start_indeterminate_progress_bar(
+    desc: str,
+    *,
+    enabled: bool,
+    interval_s: float = 0.2,
+    total_ticks: int = 80,
+    cap_ratio: float = 0.95,
+) -> Optional[tuple[_ProgressAdapter, threading.Event, threading.Thread]]:
+    if not bool(enabled):
+        return None
+    total = max(20, int(total_ticks))
+    cap = max(1, min(total - 1, int(total * float(cap_ratio))))
+    pbar = _ProgressAdapter(total=total, desc=str(desc), force_animate=True)
+    done = {"n": 0}
+    stop_evt = threading.Event()
+
+    def _runner() -> None:
+        wait_s = max(0.05, float(interval_s))
+        while not stop_evt.wait(wait_s):
+            if done["n"] < cap:
+                pbar.update(1)
+                done["n"] += 1
+
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    return pbar, stop_evt, th
+
+
+def _stop_indeterminate_progress_bar(
+    handle: Optional[tuple[_ProgressAdapter, threading.Event, threading.Thread]],
+    *,
+    success: bool,
+) -> None:
+    if handle is None:
+        return
+    pbar, stop_evt, th = handle
+    stop_evt.set()
+    try:
+        th.join(timeout=1.0)
+    except Exception:
+        pass
+    if bool(success):
+        try:
+            pbar.finish()
+            # Give terminal renderer one short cycle to paint 100% before closing.
+            time.sleep(0.08)
+        except Exception:
+            pass
+    pbar.close(show_done=False)
 
 
 def fastplot(
@@ -2533,6 +2648,18 @@ def prepare_streaming_context(
 
     for wmsg in _dedupe_cache_warning_messages(deferred_cache_warnings):
         logger.warning(wmsg)
+    grm_n: Union[int, str] = "NA" if grm_ids is None else int(len(grm_ids))
+    q_has_pc = bool(np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0)
+    q_n: Union[int, str] = "NA" if (q_ids is None or (not q_has_pc)) else int(len(q_ids))
+    cov_n: Union[int, str] = "NA" if cov_ids is None else int(len(cov_ids))
+    _emit_plain_info_line(
+        logger,
+        (
+            f"geno={len(geno_ids)}, pheno={len(pheno_ids)}, "
+            f"grm={grm_n}, q={q_n}, cov={cov_n} -> {len(common_ids)}"
+        ),
+        use_spinner=use_spinner,
+    )
 
     # index maps
     geno_index = {sid: i for i, sid in enumerate(geno_ids)}
@@ -2608,6 +2735,97 @@ def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
     return max(1, min(int(rank_opt), n))
 
 
+def _resolve_stream_scan_chunk_size(
+    chunk_size: int,
+    n_snps_hint: int,
+    *,
+    use_spinner: bool,
+) -> int:
+    """
+    Resolve effective streaming scan chunk size.
+
+    Respect user-provided chunk size strictly.
+    """
+    _ = int(max(1, int(n_snps_hint)))
+    _ = bool(use_spinner)
+    return max(1, int(chunk_size))
+
+
+def _status_stage_thread_budget(threads: int) -> int:
+    """
+    Reserve one logical core for UI/status refresh when possible.
+    """
+    t = max(1, int(threads))
+    return max(1, t - 1) if t > 1 else 1
+
+
+@contextmanager
+def _native_thread_limit_ctx(limit: int):
+    """
+    Limit BLAS/OpenMP threadpools during long linear algebra stages.
+    """
+    lim = max(1, int(limit))
+    if _threadpool_limits is None:
+        yield
+        return
+    with _threadpool_limits(limits=lim):
+        yield
+
+
+def _calibrate_lrlmm_spectrum(
+    eigvals: np.ndarray,
+    n_samples: int,
+) -> tuple[np.ndarray, float, float, float, float]:
+    """
+    Default LowRankLMM spectrum calibration (always enabled):
+      1) low-rank + diagonal closure: K ~= Ur*Lr*Ur^T + tau*I
+      2) trace matching to full-rank scale (target trace ~= n_samples)
+
+    Returns
+    -------
+    s_cal : np.ndarray[float32]
+        Calibrated leading eigenvalues (length r).
+    tau_cal : float
+        Diagonal closure term after trace calibration.
+    scale : float
+        Multiplicative scale used in trace matching.
+    raw_trace : float
+        Sum of raw leading eigenvalues before calibration.
+    target_trace : float
+        Target trace used for matching.
+    """
+    n = max(1, int(n_samples))
+    target_trace = float(n)
+
+    s = np.asarray(eigvals, dtype=np.float64).reshape(-1)
+    if s.size == 0:
+        return (
+            np.asarray([], dtype=np.float32),
+            0.0,
+            1.0,
+            0.0,
+            target_trace,
+        )
+    s[~np.isfinite(s)] = 0.0
+    s = np.maximum(s, 0.0)
+
+    raw_trace = float(np.sum(s))
+    tau = 0.0
+    if raw_trace < target_trace:
+        tau = (target_trace - raw_trace) / float(n)
+
+    trace_with_tau = raw_trace + tau * float(n)
+    scale = 1.0
+    if np.isfinite(trace_with_tau) and trace_with_tau > 0.0:
+        scale = target_trace / trace_with_tau
+        if (not np.isfinite(scale)) or scale <= 0.0:
+            scale = 1.0
+
+    s_cal = np.ascontiguousarray((s * scale).astype(np.float32, copy=False))
+    tau_cal = float(tau * scale)
+    return s_cal, tau_cal, float(scale), raw_trace, target_trace
+
+
 def run_lrlmm_packed(
     *,
     rank_opt: Union[int, None],
@@ -2634,9 +2852,9 @@ def run_lrlmm_packed(
     emit_trait_header: bool = True,
     prepared_cache: Union[dict[str, object], None] = None,
 ) -> None:
-    if not hasattr(jxrs, "admx_rsvd_packed_subset"):
+    if not hasattr(jxrs, "rsvd_packed_subset"):
         raise RuntimeError(
-            "Rust extension is missing admx_rsvd_packed_subset. Rebuild/install JanusX extension first."
+            "Rust extension is missing rsvd_packed_subset. Rebuild/install JanusX extension first."
         )
     if not hasattr(jxrs, "fastlmm_assoc_packed_f32"):
         raise RuntimeError(
@@ -2662,10 +2880,8 @@ def run_lrlmm_packed(
         raise ValueError("LRLMM currently supports additive coding only (--model add).")
 
     use_prepared = isinstance(prepared_cache, dict)
-    # Keep live spinner feedback for long RSVD/GWAS stages even in prepared/full mode,
-    # but suppress extra per-step "Finished" lines to avoid duplicated terminal output.
+    # Keep live progress feedback for long RSVD/GWAS stages (including prepared/full mode).
     show_internal_status = bool(use_spinner)
-    emit_internal_done = bool(use_spinner) and (not bool(use_prepared))
     if use_prepared:
         pheno_obj = prepared_cache.get("pheno")
         if not isinstance(pheno_obj, pd.DataFrame):
@@ -2825,6 +3041,16 @@ def run_lrlmm_packed(
                 logger.info("")
             continue
 
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
         trait_ids = np.asarray(ids[sameidx], dtype=str)
         y_vec = np.ascontiguousarray(pheno_sub.loc[trait_ids].values, dtype=np.float64)
         x_cov = qmatrix[sameidx]
@@ -2836,12 +3062,19 @@ def run_lrlmm_packed(
 
         rank_trait = _resolve_lrlmm_rank(rank_opt, int(n_idv))
         rsvd_t0 = time.monotonic()
+        rsvd_threads = _status_stage_thread_budget(int(threads))
+        if hasattr(jxrs, "admx_set_threads"):
+            try:
+                jxrs.admx_set_threads(int(rsvd_threads))
+            except Exception:
+                pass
         with CliStatus(
-            f"Running RSVD (rank={rank_trait})...",
+            f"Running LowRankLMM Random-SVD (rank={rank_trait})...",
             enabled=show_internal_status,
+            use_process=True,
         ) as task:
             try:
-                s_raw, u_sub_raw, maf_trait_raw, row_flip_raw = jxrs.admx_rsvd_packed_subset(
+                s_raw, u_sub_raw, maf_trait_raw, row_flip_raw = jxrs.rsvd_packed_subset(
                     packed,
                     int(packed_n),
                     int(rank_trait),
@@ -2851,10 +3084,8 @@ def run_lrlmm_packed(
                     1e-1,
                 )
             except Exception:
-                task.fail("Running RSVD ...Failed")
+                task.fail("LowRankLMM Random-SVD ...Failed")
                 raise
-            if emit_internal_done:
-                task.complete(f"Running RSVD (rank={rank_trait}) ...Finished")
         rsvd_secs = max(time.monotonic() - rsvd_t0, 0.0)
 
         s_trait = np.ascontiguousarray(np.asarray(s_raw, dtype=np.float32).reshape(-1))
@@ -2871,6 +3102,19 @@ def run_lrlmm_packed(
             raise ValueError(
                 "Trait RSVD row statistics length mismatch with packed SNP rows."
             )
+        s_trait, tau_trait, trace_scale, raw_trace, target_trace = _calibrate_lrlmm_spectrum(
+            s_trait,
+            int(n_idv),
+        )
+        _log_file_only(
+            logger,
+            logging.INFO,
+            (
+                f"LowRankLMM spectrum calibration ({pname}): "
+                f"trace_raw={raw_trace:.6g}, trace_target={target_trace:.6g}, "
+                f"tau={tau_trait:.6g}, scale={trace_scale:.6g}"
+            ),
+        )
         u_trait = np.zeros((int(packed_n), int(s_trait.shape[0])), dtype=np.float32)
         u_trait[sample_idx_trait, :] = u_sub
         _log_model_line(
@@ -2880,7 +3124,52 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
         )
 
-        with CliStatus("Running LowRankLMM GWAS...", enabled=show_internal_status) as task:
+        gwas_t0 = time.monotonic()
+        gwas_total = int(len(sites_all))
+        gwas_last_done = 0
+        gwas_pbar: Optional[_ProgressAdapter] = None
+        if show_internal_status:
+            gwas_pbar = _ProgressAdapter(
+                total=max(1, gwas_total),
+                desc="LrLMM",
+                force_animate=True,
+            )
+
+        def _lrlmm_progress(done: int, total: int) -> None:
+            nonlocal gwas_last_done, gwas_total, gwas_pbar
+            if gwas_pbar is None:
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t > 0 and t != gwas_total and gwas_last_done == 0:
+                try:
+                    gwas_pbar.close(show_done=False)
+                except Exception:
+                    pass
+                gwas_total = int(max(1, t))
+                gwas_pbar = _ProgressAdapter(
+                    total=gwas_total,
+                    desc="LrLMM",
+                    force_animate=True,
+                )
+                gwas_last_done = 0
+            d = int(max(0, min(d, max(1, gwas_total))))
+            step = int(max(0, d - gwas_last_done))
+            if step > 0 and gwas_pbar is not None:
+                gwas_pbar.update(step)
+                gwas_last_done = d
+
+        gwas_ok = False
+        try:
+            progress_kwargs: dict[str, object] = {}
+            if gwas_pbar is not None:
+                progress_kwargs = {
+                    "progress_callback": _lrlmm_progress,
+                    "progress_every": int(max(1, int(chunk_size))),
+                }
             try:
                 lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
                     packed,
@@ -2896,14 +3185,70 @@ def run_lrlmm_packed(
                     5.0,
                     50,
                     1e-2,
+                    float(tau_trait),
                     int(threads),
                     "add",
+                    **progress_kwargs,
                 )
-            except Exception:
-                task.fail("Running LowRankLMM GWAS ...Failed")
-                raise
-            if emit_internal_done:
-                task.complete("Running LowRankLMM GWAS ...Finished")
+            except TypeError as e:
+                # Backward compatibility with older compiled extensions
+                # that do not expose `progress_*` and/or `tau`.
+                emsg = str(e).lower()
+                if ("argument" not in emsg) and ("positional" not in emsg) and ("keyword" not in emsg):
+                    raise
+                try:
+                    lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
+                        packed,
+                        int(packed_n),
+                        row_flip_trait,
+                        maf_trait,
+                        u_trait,
+                        s_trait,
+                        y_vec,
+                        x_arg,
+                        sample_idx_trait,
+                        -5.0,
+                        5.0,
+                        50,
+                        1e-2,
+                        float(tau_trait),
+                        int(threads),
+                        "add",
+                    )
+                except TypeError as e2:
+                    emsg2 = str(e2).lower()
+                    if ("argument" not in emsg2) and ("positional" not in emsg2) and ("keyword" not in emsg2):
+                        raise
+                    lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
+                        packed,
+                        int(packed_n),
+                        row_flip_trait,
+                        maf_trait,
+                        u_trait,
+                        s_trait,
+                        y_vec,
+                        x_arg,
+                        sample_idx_trait,
+                        -5.0,
+                        5.0,
+                        50,
+                        1e-2,
+                        int(threads),
+                        "add",
+                    )
+            gwas_ok = True
+        finally:
+            if gwas_pbar is not None:
+                try:
+                    if gwas_ok:
+                        if int(gwas_last_done) < int(max(1, gwas_total)):
+                            gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
+                        gwas_pbar.finish()
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+                gwas_pbar.close(show_done=False)
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
 
         res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
         if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
@@ -2913,22 +3258,16 @@ def run_lrlmm_packed(
 
         pve = None
         try:
-            vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
+            vg = float(
+                (np.sum(np.asarray(s_trait, dtype=np.float64)) + float(tau_trait) * float(n_idv))
+                / float(max(1, n_idv))
+            )
             lbd_v = float(lbd)
             if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
                 pve = vg / (vg + lbd_v)
         except Exception:
             pve = None
 
-        if bool(emit_trait_header):
-            _emit_trait_header(
-                logger,
-                str(pname),
-                int(n_idv),
-                pve=None,
-                use_spinner=bool(use_spinner),
-                width=60,
-            )
         _log_model_line(
             logger,
             "LowRankLMM",
@@ -2956,7 +3295,13 @@ def run_lrlmm_packed(
         if res.shape[1] > 3:
             res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
 
-        out_tsv = f"{outprefix}.{pname}.{genetic_model}.lrlmm.tsv"
+        gm_tag = str(genetic_model).lower()
+        if gm_tag == "add":
+            out_tsv = f"{outprefix}.{pname}.lrlmm.tsv"
+            out_svg = f"{outprefix}.{pname}.lrlmm.svg"
+        else:
+            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lrlmm.tsv"
+            out_svg = f"{outprefix}.{pname}.{gm_tag}.lrlmm.svg"
         viz_secs = 0.0
         if plot:
             viz_t0 = time.time()
@@ -2964,7 +3309,7 @@ def run_lrlmm_packed(
                 res_df[["chrom", "pos", "pwald"]],
                 y_vec,
                 xlabel=str(pname),
-                outpdf=f"{outprefix}.{pname}.{genetic_model}.lrlmm.svg",
+                outpdf=out_svg,
             )
             viz_secs = max(time.time() - viz_t0, 0.0)
 
@@ -3000,7 +3345,7 @@ def run_lrlmm_packed(
 
         eff_snp = int(len(sites_all))
         eff_snp_by_trait[pname] = eff_snp
-        gwas_secs = wall + rsvd_secs
+        compute_secs = rsvd_secs + gwas_secs
         summary_rows.append(
             {
                 "phenotype": str(pname),
@@ -3010,14 +3355,13 @@ def run_lrlmm_packed(
                 "pve": (float(pve) if pve is not None else None),
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
-                "gwas_time_s": float(gwas_secs),
+                "gwas_time_s": float(compute_secs),
                 "viz_time_s": float(viz_secs),
                 "result_file": str(out_tsv).replace("//", "/"),
             }
         )
 
-        done_times = [format_elapsed(wall)]
-        done_times.insert(0, format_elapsed(rsvd_secs))
+        done_times = [format_elapsed(rsvd_secs), format_elapsed(gwas_secs)]
         if plot:
             done_times.append(format_elapsed(viz_secs))
         _rich_success(
@@ -3025,6 +3369,12 @@ def run_lrlmm_packed(
             f"LowRankLMM ...Finished [{'/'.join(done_times)}]",
             use_spinner=bool(use_spinner),
         )
+        if pve is not None and np.isfinite(float(pve)):
+            _emit_plain_info_line(
+                logger,
+                f"pve={float(pve):.3f} (from LrLMM)",
+                use_spinner=bool(use_spinner),
+            )
         if multi_trait_mode:
             logger.info("")
 
@@ -3162,6 +3512,16 @@ def run_chunked_gwas_lmm_lm(
                 logger.info("")  # single blank line between traits
             continue
 
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                pname,
+                n_idv,
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
         trait_ids = np.asarray(ids[sameidx], dtype=str)
         y_vec = pheno_sub.loc[trait_ids].values
         # Build covariate matrix X_cov for this trait
@@ -3169,7 +3529,11 @@ def run_chunked_gwas_lmm_lm(
         if cov_all is not None:
             X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
 
-        model_chunk_size = int(max(1, chunk_size))
+        model_chunk_size = _resolve_stream_scan_chunk_size(
+            int(chunk_size),
+            int(n_snps),
+            use_spinner=bool(use_spinner),
+        )
 
         header_pve: Optional[float] = None
         init_log_message: Optional[str] = None
@@ -3181,8 +3545,20 @@ def run_chunked_gwas_lmm_lm(
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
             Ksub = grm[np.ix_(sameidx, sameidx)]
             evd_t0 = time.monotonic()
-            with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
-                mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+            evd_label = "LMM" if model_key == "lmm" else "FastLMM"
+            evd_desc = f"{evd_label} Eigen-Decomposition"
+            with CliStatus(
+                f"Running {evd_desc}...",
+                enabled=bool(use_spinner),
+                use_process=True,
+            ) as task:
+                try:
+                    stage_threads = _status_stage_thread_budget(int(threads))
+                    with _native_thread_limit_ctx(stage_threads):
+                        mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
+                except Exception:
+                    task.fail(f"{evd_desc} ...Failed")
+                    raise
             try:
                 pve_tmp = float(mod.pve)
                 if np.isfinite(pve_tmp):
@@ -3204,16 +3580,6 @@ def run_chunked_gwas_lmm_lm(
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             init_log_message = "streaming scan initialized"
-
-        if bool(emit_trait_header):
-            _emit_trait_header(
-                logger,
-                pname,
-                n_idv,
-                pve=header_pve,
-                use_spinner=bool(use_spinner),
-                width=60,
-            )
         if init_log_message is not None:
             _log_model_line(
                 logger,
@@ -3256,7 +3622,17 @@ def run_chunked_gwas_lmm_lm(
         scan_t0 = time.time()
         pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
         pbar_desc = f"{effective_model_label}"
-        pbar = _ProgressAdapter(total=pbar_total, desc=pbar_desc, force_animate=True)
+        pbar: Optional[_ProgressAdapter] = None
+        scan_warmup_task: Optional[CliStatus] = None
+        scan_warmup_active = False
+        if bool(use_spinner):
+            scan_warmup_task = CliStatus(
+                "Waiting for LMM GWAS",
+                enabled=True,
+                use_process=True,
+            )
+            scan_warmup_task.__enter__()
+            scan_warmup_active = True
 
         inflight: dict[
             int,
@@ -3351,7 +3727,7 @@ def run_chunked_gwas_lmm_lm(
             return text, has_plrt, int(rows.shape[0])
 
         def _drain_completed(*, wait_for_one: bool) -> None:
-            nonlocal done_snps, peak_rss
+            nonlocal done_snps, peak_rss, pbar, scan_warmup_active, scan_warmup_task
             if len(inflight) == 0:
                 return
             futures = [x[0] for x in inflight.values()]
@@ -3379,13 +3755,26 @@ def run_chunked_gwas_lmm_lm(
                 )
                 writer.append(chunk_text, has_plrt=has_plrt, rows=n_rows)
                 done_snps += int(m_chunk)
+                if pbar is None:
+                    if scan_warmup_active and scan_warmup_task is not None:
+                        try:
+                            scan_warmup_task.__exit__(None, None, None)
+                        except Exception:
+                            pass
+                        scan_warmup_active = False
+                    pbar = _ProgressAdapter(
+                        total=pbar_total,
+                        desc=pbar_desc,
+                        force_animate=True,
+                    )
                 pbar.update(int(m_chunk))
 
                 mem_info = process.memory_info()
                 peak_rss = max(peak_rss, mem_info.rss)
                 if done_snps % (10 * model_chunk_size) == 0:
                     mem_gb = mem_info.rss / 1024**3
-                    pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
+                    if pbar is not None:
+                        pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
 
         ex = cf.ThreadPoolExecutor(max_workers=workers)
         try:
@@ -3455,7 +3844,8 @@ def run_chunked_gwas_lmm_lm(
             writer.flush()
             wrote_header = bool(writer.wrote_header)
             has_results = int(writer.rows_written) > 0
-            pbar.finish()
+            if pbar is not None:
+                pbar.finish()
         except KeyboardInterrupt:
             interrupted = True
             for fut, _m, _info, _maf in inflight.values():
@@ -3466,7 +3856,14 @@ def run_chunked_gwas_lmm_lm(
             raise
         finally:
             # Always stop renderer first, then tear down workers.
-            pbar.close(show_done=False)
+            if scan_warmup_active and scan_warmup_task is not None:
+                try:
+                    scan_warmup_task.__exit__(None, None, None)
+                except Exception:
+                    pass
+                scan_warmup_active = False
+            if pbar is not None:
+                pbar.close(show_done=False)
             ex.shutdown(wait=False, cancel_futures=True)
             if interrupted and os.path.exists(tmp_tsv):
                 try:
@@ -3565,6 +3962,12 @@ def run_chunked_gwas_lmm_lm(
             time_parts.append(format_elapsed(viz_secs))
         done_msg = f"{effective_model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
+        if header_pve is not None and np.isfinite(float(header_pve)):
+            _emit_plain_info_line(
+                logger,
+                f"pve={float(header_pve):.3f} (from {effective_model_label})",
+                use_spinner=bool(use_spinner),
+            )
         if multi_trait_mode:
             logger.info("")  # ensure blank line between traits
 
@@ -3632,6 +4035,14 @@ def run_chunked_gwas_streaming_shared(
     X_cov = qmatrix[sameidx]
     if cov_all is not None:
         X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
+    _emit_trait_header(
+        logger,
+        pname,
+        n_idv,
+        pve=None,
+        use_spinner=bool(use_spinner),
+        width=60,
+    )
 
     def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
         m = model.lower()
@@ -3824,8 +4235,19 @@ def run_chunked_gwas_streaming_shared(
             else:
                 if shared_ksub is None:
                     shared_ksub = grm[np.ix_(sameidx, sameidx)]
-                with CliStatus("Eigen-Decomposition...", enabled=bool(use_spinner)):
-                    mod = ModelCls(y=y_vec, X=X_cov, kinship=shared_ksub)
+                evd_desc = f"{model_label} Eigen-Decomposition"
+                with CliStatus(
+                    f"Running {evd_desc}...",
+                    enabled=bool(use_spinner),
+                    use_process=True,
+                ) as task:
+                    try:
+                        stage_threads = _status_stage_thread_budget(int(threads))
+                        with _native_thread_limit_ctx(stage_threads):
+                            mod = ModelCls(y=y_vec, X=X_cov, kinship=shared_ksub)
+                    except Exception:
+                        task.fail(f"{evd_desc} ...Failed")
+                        raise
                 evd_secs = max(time.monotonic() - init_t0, 0.0)
                 evd_elapsed = format_elapsed(evd_secs)
                 ctx["evd_secs"] = float(evd_secs)
@@ -3879,27 +4301,6 @@ def run_chunked_gwas_streaming_shared(
         ctx["mod"] = mod
         model_ctxs.append(ctx)
 
-    header_pve: Optional[float] = None
-    for ctx in model_ctxs:
-        if str(ctx.get("model_key", "")) in {"lmm", "fastlmm"}:
-            mod_obj = ctx.get("mod")
-            if mod_obj is not None and hasattr(mod_obj, "pve"):
-                try:
-                    pve_tmp = float(getattr(mod_obj, "pve"))
-                    if np.isfinite(pve_tmp):
-                        header_pve = pve_tmp
-                        break
-                except Exception:
-                    pass
-
-    _emit_trait_header(
-        logger,
-        pname,
-        n_idv,
-        pve=header_pve,
-        use_spinner=bool(use_spinner),
-        width=60,
-    )
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
     use_rich_multi = bool(
         use_spinner
@@ -3907,34 +4308,60 @@ def run_chunked_gwas_streaming_shared(
         and rich_progress_available()
     )
     rich_progress = None
-    if use_rich_multi:
-        rich_progress = build_rich_progress(
-            description_template="[green]{task.description:<8}",
-            show_remaining=False,
-            show_percentage=False,
-            field_templates=["{task.fields[metric]}"],
-            bar_width=_GWAS_PROGRESS_BAR_WIDTH,
-            finished_text=" ",
-            transient=True,
+    progress_started = False
+    shared_warmup_task: Optional[CliStatus] = None
+    shared_warmup_active = False
+    if bool(use_spinner):
+        shared_warmup_task = CliStatus(
+            "Waiting for LMM GWAS",
+            enabled=True,
+            use_process=True,
         )
-        if rich_progress is not None:
-            rich_progress.start()
-            for ctx in model_ctxs:
-                tid = rich_progress.add_task(
-                    str(ctx["model_label"]),
-                    total=pbar_total,
-                    metric=_format_progress_metric(0, pbar_total, None),
-                )
-                ctx["task_id"] = int(tid)
-        else:
-            use_rich_multi = False
-    if not use_rich_multi:
-        for ctx in model_ctxs:
-            ctx["pbar"] = _ProgressAdapter(
-                total=pbar_total,
-                desc=str(ctx["model_label"]),
-                force_animate=True,
+        shared_warmup_task.__enter__()
+        shared_warmup_active = True
+
+    def _ensure_shared_progress_started() -> None:
+        nonlocal rich_progress, use_rich_multi, progress_started
+        nonlocal shared_warmup_task, shared_warmup_active
+        if progress_started:
+            return
+        if shared_warmup_active and shared_warmup_task is not None:
+            try:
+                shared_warmup_task.__exit__(None, None, None)
+            except Exception:
+                pass
+            shared_warmup_active = False
+        if use_rich_multi:
+            rich_progress = build_rich_progress(
+                description_template="[green]{task.description:<8}",
+                show_remaining=False,
+                show_percentage=False,
+                field_templates=["{task.fields[metric]}"],
+                bar_width=_GWAS_PROGRESS_BAR_WIDTH,
+                finished_text=" ",
+                transient=True,
             )
+            if rich_progress is not None:
+                rich_progress.start()
+                for ctx in model_ctxs:
+                    tid = rich_progress.add_task(
+                        str(ctx["model_label"]),
+                        total=pbar_total,
+                        metric=_format_progress_metric(0, pbar_total, None),
+                    )
+                    ctx["task_id"] = int(tid)
+            else:
+                use_rich_multi = False
+
+        if not use_rich_multi:
+            for ctx in model_ctxs:
+                if ctx.get("pbar") is None:
+                    ctx["pbar"] = _ProgressAdapter(
+                        total=pbar_total,
+                        desc=str(ctx["model_label"]),
+                        force_animate=True,
+                    )
+        progress_started = True
 
     def _metric_text(ctx: dict[str, object]) -> str:
         mem_text = ""
@@ -3958,6 +4385,7 @@ def run_chunked_gwas_streaming_shared(
             ctx["memory_text"] = str(mem_text).replace(" ", "")
             ctx["memory_until_tick"] = tick + 5
         metric = _metric_text(ctx)
+        _ensure_shared_progress_started()
         if use_rich_multi and rich_progress is not None:
             rich_progress.update(int(ctx["task_id"]), advance=int(m_chunk), metric=metric)
         else:
@@ -3967,8 +4395,13 @@ def run_chunked_gwas_streaming_shared(
                 if mem_text is not None:
                     pbar_obj.set_postfix(memory=str(mem_text))
 
+    model_chunk_size = _resolve_stream_scan_chunk_size(
+        int(chunk_size),
+        int(n_snps),
+        use_spinner=bool(use_spinner),
+    )
     mmap_window_mb = (
-        auto_mmap_window_mb(genofile, len(ids), n_snps, chunk_size)
+        auto_mmap_window_mb(genofile, len(ids), n_snps, model_chunk_size)
         if mmap_limit else None
     )
     sample_sub = trait_ids
@@ -3984,7 +4417,7 @@ def run_chunked_gwas_streaming_shared(
     try:
         chunk_iter = load_genotype_chunks(
             genofile,
-            chunk_size,
+            model_chunk_size,
             maf_threshold,
             max_missing_rate,
             model=genetic_model,
@@ -4066,23 +4499,30 @@ def run_chunked_gwas_streaming_shared(
                 ctx["has_results"] = int(writer.rows_written) > 0
 
         first_done = 0
-        for ctx in model_ctxs:
-            first_done = first_done or int(ctx.get("done_snps", 0))
-            if use_rich_multi and rich_progress is not None:
-                rich_progress.update(
-                    int(ctx["task_id"]),
-                    completed=pbar_total,
-                    metric=_metric_text(ctx),
-                )
-            else:
-                pbar_obj = ctx.get("pbar")
-                if pbar_obj is not None:
-                    pbar_obj.finish()
+        if progress_started:
+            for ctx in model_ctxs:
+                first_done = first_done or int(ctx.get("done_snps", 0))
+                if use_rich_multi and rich_progress is not None:
+                    rich_progress.update(
+                        int(ctx["task_id"]),
+                        completed=pbar_total,
+                        metric=_metric_text(ctx),
+                    )
+                else:
+                    pbar_obj = ctx.get("pbar")
+                    if pbar_obj is not None:
+                        pbar_obj.finish()
     except KeyboardInterrupt:
         interrupted = True
         raise
     finally:
         # Always stop any active progress renderer on Ctrl+C / errors.
+        if shared_warmup_active and shared_warmup_task is not None:
+            try:
+                shared_warmup_task.__exit__(None, None, None)
+            except Exception:
+                pass
+            shared_warmup_active = False
         if rich_progress is not None:
             try:
                 rich_progress.stop()
@@ -4215,6 +4655,34 @@ def run_chunked_gwas_streaming_shared(
             time_parts.append(format_elapsed(viz_secs))
         done_msg = f"{model_label} ...Finished [{'/'.join(time_parts)}]"
         _rich_success(logger, done_msg, use_spinner=use_spinner)
+
+    trait_pve_val: Optional[float] = None
+    trait_pve_src: Optional[str] = None
+    for prefer_key in ("lmm", "fastlmm"):
+        for ctx in model_ctxs:
+            if str(ctx.get("model_key", "")) != prefer_key:
+                continue
+            mod_obj = ctx.get("mod")
+            if mod_obj is None or (not hasattr(mod_obj, "pve")):
+                continue
+            try:
+                pve_tmp = float(getattr(mod_obj, "pve"))
+            except Exception:
+                continue
+            if np.isfinite(pve_tmp):
+                trait_pve_val = float(pve_tmp)
+                trait_pve_src = str(ctx.get("model_label", "")).strip() or (
+                    "LMM" if prefer_key == "lmm" else "FastLMM"
+                )
+                break
+        if trait_pve_val is not None:
+            break
+    if trait_pve_val is not None and trait_pve_src is not None:
+        _emit_plain_info_line(
+            logger,
+            f"pve={trait_pve_val:.3f} (from {trait_pve_src})",
+            use_spinner=bool(use_spinner),
+        )
 
 
 # ======================================================================
@@ -4394,6 +4862,11 @@ def build_qmatrix_farmcpu(
 
     if q_int == 0:
         qmatrix = np.zeros((n, 0), dtype="float32")
+        _emit_warning_line(
+            logger,
+            "PC dimension set to 0; using empty Q matrix.",
+            use_spinner=bool(use_spinner),
+        )
     else:
         q_path = _pca_cache_path(gfile_prefix, mgrm="1", qdim=int(q_int))
         with _cache_lock(q_path):
@@ -4455,6 +4928,12 @@ def build_qmatrix_farmcpu(
                     "FarmCPU covariate sample order does not match genotype sample order after alignment."
                 )
             qmatrix = np.concatenate([qmatrix, cov_arr], axis=1)
+    else:
+        _emit_warning_line(
+            logger,
+            "Loading covariates (streaming) ...Skipped (none)",
+            use_spinner=bool(use_spinner),
+        )
 
     _farm_log(f"Q matrix (FarmCPU) shape: {qmatrix.shape}")
     return qmatrix
@@ -4787,17 +5266,20 @@ def run_farmcpu_fullmem(
             mmap_limit=bool(args.mmap_limit),
         )
 
-        if bool(context_prepared):
-            cov_n = "NA"
-            if len(_normalize_cov_inputs(cov)) > 0:
-                cov_n = int(famid.shape[0])
-            geno_n = int(famid.shape[0]) if geno is None else int(geno.shape[1])
-            _log_file_only(
-                logger,
-                logging.INFO,
-                f"geno={geno_n}, pheno={pheno.shape[0]}, "
-                f"q={qmatrix.shape[0]}, cov={cov_n} -> {famid.shape[0]}"
-            )
+        cov_n: Union[int, str] = "NA"
+        if len(_normalize_cov_inputs(cov)) > 0:
+            cov_n = int(famid.shape[0])
+        geno_n = int(famid.shape[0]) if geno is None else int(geno.shape[1])
+        pheno_ids_set = set(np.asarray(pheno.index, dtype=str))
+        common_n = int(sum(1 for sid in np.asarray(famid, dtype=str) if sid in pheno_ids_set))
+        q_n: Union[int, str] = (
+            int(qmatrix.shape[0]) if (np.asarray(qmatrix).ndim == 2 and int(qmatrix.shape[1]) > 0) else "NA"
+        )
+        _emit_plain_info_line(
+            logger,
+            f"geno={geno_n}, pheno={pheno.shape[0]}, q={q_n}, cov={cov_n} -> {common_n}",
+            use_spinner=bool(use_spinner),
+        )
         farmcpu_cache = {
             "pheno": pheno,
             "famid": famid,
@@ -5051,10 +5533,10 @@ def parse_args():
         help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
-        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=None, type=int, metavar="RANK",
+        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=100, type=int, metavar="RANK",
         help=(
             "Run low-rank LMM (packed BED + RSVD + Rust FaST GWAS). "
-            "Optional RANK; default is floor(sqrt(n_samples))."
+            "Optional RANK; default is %(default)s."
         ),
     )
     models_group.add_argument(
@@ -5127,7 +5609,7 @@ def parse_args():
              "Sites with het rate outside [het, 1-het] are removed (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-chunksize", "--chunksize", type=int, default=100_000,
+        "-chunksize", "--chunksize", type=int, default=10_000,
         help="Number of SNPs per chunk for streaming LMM/LM and RSVD mmap sizing "
              "(affects GRM and GWAS; default: %(default)s).",
     )
@@ -5542,11 +6024,10 @@ def main(log: bool = True):
             logger.info("")
             saved_body = "\n".join([f"  {p}" for p in ordered_result_paths])
             _rich_success(logger, f"Results saved:\n{saved_body}")
-        _rich_success(logger, f"Log saved in {str(log_path).replace('//', '/')}")
+        # _rich_success(logger, f"  {str(log_path).replace('//', '/')}")
 
     except KeyboardInterrupt:
         run_status = "failed"
-        run_error = "Interrupted by user (Ctrl+C)"
         logger.info("Interrupted by user (Ctrl+C).")
         # On Windows, worker threads/native kernels can continue briefly after
         # KeyboardInterrupt. Force-exit the Python process to prevent lingering
@@ -5618,7 +6099,7 @@ def main(log: bool = True):
     lt = time.localtime()
     endinfo = (
         f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
-        f"  {lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
     _rich_success(logger, endinfo)

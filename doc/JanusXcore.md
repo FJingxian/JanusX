@@ -1,257 +1,280 @@
-# JanusX Core (Python API Usage)
+# JanusX Core API Guide
 
-Version baseline: `v1.0.13`  
-Python package: `janusx`
+Version baseline: `v1.0.13`
 
-This document focuses on **Python package calling patterns** only (import + code usage).  
-CLI details are intentionally omitted.
+This document focuses on Python package usage (`janusx`) and core APIs.
+CLI behavior is documented separately in `doc/JanusXcli.md`.
 
-## 1. Install and Import
+## 1. Install and runtime requirements
+
+## 1.1 Install
 
 ```bash
 pip install janusx
-# or in repo root:
+# or from source repository
 pip install -e .
 ```
 
-Recommended Python imports:
+## 1.2 Runtime note about extension module
+
+Core compute and IO acceleration depend on the compiled extension module:
+
+- `janusx.janusx` (PyO3 Rust extension)
+
+If you run from source tree without building/installing the extension, imports that depend on Rust kernels will fail.
+
+## 2. Public module map
+
+Main Python-facing modules:
+
+- `janusx.gfreader`
+- `janusx.pyBLUP`
+- `janusx.adamixture`
+- `janusx.bioplotkit`
+- `janusx.gtools`
+
+Typical imports:
 
 ```python
 from janusx.gfreader import (
     inspect_genotype_file,
     load_genotype_chunks,
     save_genotype_streaming,
+    set_genotype_cache_dir,
+    load_bed_2bit_packed,
 )
 
 from janusx.pyBLUP import (
-    build_streaming_grm_from_chunks,
+    GRM,
+    QK,
     LM,
     LMM,
     FastLMM,
-    BLUP,      # marker-matrix BLUP (mlm.BLUP)
+    farmcpu,
+    BLUP,
     MLGS,
+    build_streaming_grm_from_chunks,
 )
 
-from janusx.pyBLUP.blup import BLUP as REMLBLUP  # multi-random-effect REML-BLUP
-
+from janusx.adamixture import ADAMixtureConfig, train_adamixture, rsvd_streaming
 from janusx.bioplotkit import GWASPLOT, LDblock, PCSHOW, plot_haplotype
 from janusx.gtools import gffreader, readanno, GFFQuery
 ```
 
-## 2. Core Data Conventions
+## 3. Data conventions
 
-### 2.1 Genotype input types
+Genotype layout in core kernels is SNP-major:
 
-Supported by `inspect_genotype_file()` / `load_genotype_chunks()`:
+- `M.shape == (m_snps, n_samples)`
 
-```text
-VCF:   *.vcf / *.vcf.gz
-HMP:   *.hmp / *.hmp.gz
-PLINK: prefix + .bed/.bim/.fam
-FILE:  prefix/path + .npy/.txt/.tsv/.csv, with sibling .id
-```
+Phenotype/covariate layout is sample-major:
 
-For FILE/prefix mode:
+- `y.shape == (n_samples,)` or `(n_samples, 1)`
+- `X.shape == (n_samples, p)`
 
-```text
-required: prefix.id + one matrix file (prefix.npy or prefix.txt/tsv/csv)
-optional: prefix.site or prefix.bim
-```
+Always align phenotype/covariates to genotype sample order returned by `inspect_genotype_file()`.
 
-### 2.2 Matrix shape
+## 4. `janusx.gfreader` API
 
-Most JanusX core genotype APIs use **SNP-major** shape:
-
-```text
-M.shape = (m_snps, n_samples)
-```
-
-Phenotype/covariate side uses sample-major:
-
-```text
-y.shape = (n_samples,) or (n_samples, 1)
-X.shape = (n_samples, p)
-```
-
-## 3. Genotype Streaming (`janusx.gfreader`)
-
-### 3.1 Inspect input quickly
+## 4.1 Inspect genotype metadata
 
 ```python
-geno_path = "example/mouse_hs1940.vcf.gz"
-sample_ids, n_sites = inspect_genotype_file(geno_path, snps_only=True)
+sample_ids, n_sites = inspect_genotype_file("example/mouse_hs1940.vcf.gz")
 print(len(sample_ids), n_sites)
 ```
 
-### 3.2 Iterate SNP chunks
+Supported inputs:
+
+- VCF (`.vcf/.vcf.gz`)
+- HMP (`.hmp/.hmp.gz`)
+- PLINK prefix
+- FILE mode (`prefix.npy/.txt/.tsv/.csv` with `prefix.id`)
+
+## 4.2 Stream genotype chunks
 
 ```python
 for geno_chunk, sites in load_genotype_chunks(
-    geno_path,
+    "example/mouse_hs1940.vcf.gz",
     chunk_size=50_000,
     maf=0.02,
     missing_rate=0.05,
     impute=True,
-    model="add",           # add/dom/rec/het
+    model="add",        # add/dom/rec/het
     snps_only=True,
 ):
-    # geno_chunk: (m_chunk, n_samples), float32
-    # sites: list[SiteInfo], fields: chrom, pos, ref_allele, alt_allele
     print(geno_chunk.shape, sites[0].chrom, sites[0].pos)
     break
 ```
 
-### 3.3 Stream write / format conversion
+`sites` elements are `SiteInfo` records from Rust extension.
+
+## 4.3 Stream output writing / conversion
 
 ```python
-sample_ids, n_sites = inspect_genotype_file(geno_path)
-chunks = load_genotype_chunks(geno_path, chunk_size=50_000, maf=0.0, missing_rate=1.0)
+sample_ids, n_sites = inspect_genotype_file("example/mouse_hs1940.vcf.gz")
+chunks = load_genotype_chunks("example/mouse_hs1940.vcf.gz", chunk_size=50_000)
 
-# fmt in {"plink", "vcf", "hmp"}; auto-infer supported
 save_genotype_streaming(
-    out="out/panel",          # plink prefix
+    out="out/panel",
     sample_ids=sample_ids,
     chunks=chunks,
-    fmt="plink",
+    fmt="plink",          # plink/vcf/hmp/auto
     total_snps=n_sites,
 )
 ```
 
-## 4. GWAS Kernels from Python (`janusx.pyBLUP`)
+## 4.4 Cache controls
 
-### 4.1 Build GRM from stream
+Set cache directory explicitly:
 
 ```python
-import numpy as np
+set_genotype_cache_dir("/path/to/cache")
+```
 
-sample_ids, _ = inspect_genotype_file(geno_path)
-chunks = load_genotype_chunks(geno_path, chunk_size=100_000, maf=0.02, missing_rate=0.05)
+Environment variable equivalent:
 
-K, stats = build_streaming_grm_from_chunks(
-    chunks,
-    n_samples=len(sample_ids),
-    method=1,  # 1=centered, 2=standardized
-)
+- `JANUSX_CACHE_DIR`
+
+## 4.5 BED packed access
+
+For PLINK-focused low-memory workflows:
+
+```python
+packed, miss_rate, maf, std_denom, n_samples = load_bed_2bit_packed("geno_prefix")
+```
+
+## 5. `janusx.pyBLUP` API
+
+## 5.1 Build GRM from streamed chunks
+
+```python
+from janusx.pyBLUP import build_streaming_grm_from_chunks
+
+sample_ids, _ = inspect_genotype_file("example/mouse_hs1940.vcf.gz")
+chunks = load_genotype_chunks("example/mouse_hs1940.vcf.gz", chunk_size=100_000)
+K, stats = build_streaming_grm_from_chunks(chunks, n_samples=len(sample_ids), method=1)
 print(K.shape, stats.eff_m)
 ```
 
-### 4.2 LM/LMM/FastLMM chunk scan
+## 5.2 Association models (`LM`, `LMM`, `FastLMM`)
 
 ```python
 import numpy as np
-import pandas as pd
+from janusx.pyBLUP import LM, LMM, FastLMM
 
-# y must align to sample order in genotype
-# y: (n,1), X: (n,p)
 y = np.random.randn(len(sample_ids), 1)
 X = None
 
-# LM
 lm = LM(y, X)
-
-# LMM/FastLMM require kinship
 lmm = LMM(y, X, kinship=K.copy())
 flmm = FastLMM(y, X, kinship=K.copy())
 
-rows = []
-for geno_chunk, sites in load_genotype_chunks(geno_path, chunk_size=50_000, maf=0.02, missing_rate=0.05):
-    out = lmm.gwas(geno_chunk, threads=8)  # columns: beta, se, pwald, plrt
-    rows.append(pd.DataFrame({
-        "CHR": [s.chrom for s in sites],
-        "BP": [s.pos for s in sites],
-        "beta": out[:, 0],
-        "se": out[:, 1],
-        "P": out[:, 2],
-    }))
-
-res = pd.concat(rows, ignore_index=True)
+for geno_chunk, sites in load_genotype_chunks("example/mouse_hs1940.vcf.gz", chunk_size=20_000):
+    out = lmm.gwas(geno_chunk, threads=8)
+    # out columns include beta/se/pwald/plrt depending on method
+    break
 ```
 
-## 5. Genomic Selection APIs
-
-### 5.1 Marker-matrix BLUP (`janusx.pyBLUP.BLUP`)
+## 5.3 FarmCPU
 
 ```python
-import numpy as np
-from janusx.pyBLUP import BLUP
+from janusx.pyBLUP import farmcpu
 
-# M: (m_snps, n_samples)
-M_train = np.random.randint(0, 3, size=(5000, 300)).astype(float)
-y_train = np.random.randn(300, 1)
-
-model = BLUP(y=y_train, M=M_train, cov=None, kinship=1, log=False)
-
-M_test = np.random.randint(0, 3, size=(5000, 80)).astype(float)
-y_pred = model.predict(M_test)
-print(y_pred.shape)
+# M: SNP-major genotype, y: phenotype, chrlist/poslist aligned to SNP rows
+res = farmcpu(y=y, M=M, X=None, chrlist=chr_list, poslist=pos_list, threads=8)
 ```
 
-### 5.2 MLGS (`RF/ET/GBDT/XGB/SVM/ENET`)
+## 5.4 BLUP and MLGS
+
+Marker-matrix BLUP (`janusx.pyBLUP.BLUP`):
+
+```python
+from janusx.pyBLUP import BLUP
+
+model = BLUP(y=y_train, M=M_train, cov=None, kinship=1, log=False)
+y_pred = model.predict(M_test)
+```
+
+Machine-learning GS (`janusx.pyBLUP.MLGS`):
 
 ```python
 from janusx.pyBLUP import MLGS
 
-ml = MLGS(
-    y=y_train,
-    M=M_train,
-    method="rf",      # rf/et/gbdt/xgb/svm/enet
-    cv=3,
-    n_jobs=8,
-    fit_on_init=True,
-)
-
-pred = ml.predict(M_test)
-print(pred.shape)
+ml = MLGS(y=y_train, M=M_train, method="rf", cv=3, n_jobs=8, fit_on_init=True)
+y_pred = ml.predict(M_test)
 ```
 
-### 5.3 Multi-random-effect REML-BLUP (`janusx.pyBLUP.blup.BLUP`)
+## 5.5 Multi-random-effect REML BLUP
+
+Use `janusx.pyBLUP.blup.BLUP` for multi-term REML model fitting:
 
 ```python
-import numpy as np
 from janusx.pyBLUP.blup import BLUP as REMLBLUP
 
-n = 200
-y = np.random.randn(n, 1)
-X = np.random.randn(n, 2)  # fixed effects (intercept auto-added)
-
-# Example random terms
-Z_id = np.eye(n)
-K_add = np.random.randn(n, n)
-K_add = (K_add + K_add.T) / 2
-K_add += np.eye(n) * 1e-3
-
-m = REMLBLUP(
-    y=y,
-    X=X,
-    Z=[Z_id],
-    G=[K_add],
-    maxiter=100,
-    progress=False,
-)
-
-print("beta:", m.beta.ravel())
-print("theta:", m.theta)  # variance components + residual
-print("var:", m.var)      # scaled variance components
+m = REMLBLUP(y=y, X=X, Z=[Z1], G=[K1], maxiter=100, progress=False)
+print(m.beta.ravel())
+print(m.theta)
+print(m.var)
 ```
 
-## 6. Plotting APIs (`janusx.bioplotkit`)
+## 6. `janusx.adamixture` API
 
-### 6.1 Manhattan + QQ
+## 6.1 Streaming RSVD
+
+```python
+from janusx.adamixture import rsvd_streaming
+
+eigvals, eigvecs = rsvd_streaming(
+    "geno.vcf.gz",
+    k=8,
+    seed=42,
+    power=5,
+    tol=1e-1,
+    snps_only=True,
+    maf=0.02,
+    missing_rate=0.05,
+)
+```
+
+## 6.2 Full ADAMixture training
+
+```python
+import logging
+from janusx.adamixture import ADAMixtureConfig, train_adamixture
+
+logger = logging.getLogger("admx")
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
+
+cfg = ADAMixtureConfig(
+    genotype_path="geno.vcf.gz",
+    k=8,
+    outdir="out",
+    prefix="cohort",
+    threads=8,
+    solver="adam-em",   # auto/adam/adam-em
+    max_iter=500,
+)
+
+P, Q, m, n = train_adamixture(cfg, logger)
+```
+
+## 7. `janusx.bioplotkit` API
+
+## 7.1 Manhattan + QQ
 
 ```python
 import matplotlib.pyplot as plt
 from janusx.bioplotkit import GWASPLOT
 
-# df must contain chromosome/position/p-value columns
-plotter = GWASPLOT(df=res, chr="CHR", pos="BP", pvalue="P", compression=True)
-
+plotter = GWASPLOT(df=res_df, chr="CHR", pos="BP", pvalue="P", compression=True)
 fig, axes = plt.subplots(2, 1, figsize=(10, 8))
 plotter.manhattan(ax=axes[0], threshold=5e-8)
 plotter.qq(ax=axes[1], ci=95)
 plt.tight_layout()
 ```
 
-### 6.2 LD block
+## 7.2 LD block
 
 ```python
 import numpy as np
@@ -261,70 +284,53 @@ from janusx.bioplotkit import LDblock
 C = np.corrcoef(np.random.randn(200, 80))
 fig, ax = plt.subplots(figsize=(6, 4))
 LDblock(C, ax=ax, cmap="Greys")
-plt.show()
 ```
 
-### 6.3 PCA scatter
+## 7.3 PCA scatter
 
 ```python
 from janusx.bioplotkit import PCSHOW
 
-# pc_df example columns: PC1, PC2, group
 pc = PCSHOW(pc_df)
-fig, ax = plt.subplots(figsize=(6, 5))
-pc.pcplot(x="PC1", y="PC2", group="group", ax=ax)
+pc.pcplot(x="PC1", y="PC2", group="group")
 ```
 
-### 6.4 Haplotype plot
+## 7.4 Haplotype plot
 
 ```python
 from janusx.bioplotkit import plot_haplotype
 
-# phenotype: DataFrame (sample index + one phenotype column)
-# genotype: DataFrame or chunk iterator from load_genotype_chunks
 ax, summary = plot_haplotype(
     phenotype=pheno_df,
     genotype=geno_df_or_chunks,
-    draw_bar=True,
-    draw_matrix=True,
-    draw_letters=True,
+    mode="continuous",
     min_haplotype_n=30,
-    mode="continuous",  # or "binomial"
 )
-print(summary.head())
 ```
 
-## 7. Annotation Readers (`janusx.gtools`)
+## 8. `janusx.gtools` API
+
+## 8.1 Read and query annotation
 
 ```python
 from janusx.gtools import gffreader, readanno, GFFQuery
 
-# Parse GFF/GFF3
 gff = gffreader("Zea_mays.gff3.gz", attr=["ID", "Name"])
-
-# Indexed range query
 q = GFFQuery(gff)
-genes = q.query_bimrange("1:2000000-2500000", features=["gene"], attr=["ID", "Name"])
-
-# Convert to JanusX unified annotation schema
+subset = q.query_bimrange("1:2.0-2.5", features=["gene"], attr=["ID", "Name"])
 anno = readanno("Zea_mays.gff3.gz")
 ```
 
-## 8. Practical Tips
+`query_bimrange` uses Mb range strings (`chr:start-end` or `chr:start:end`).
 
-1. Keep genotype as **SNP-major** `(m, n)` for pyBLUP kernels.
-2. Always align phenotype/covariates to `inspect_genotype_file()` sample order.
-3. For shared/HPC paths, set cache dir explicitly:
+## 9. Practical guidance
 
-```python
-import os
-os.environ["JANUSX_CACHE_DIR"] = "/path/to/writable_cache"
-```
+- Keep genotype matrix SNP-major for pyBLUP/association kernels.
+- Align all phenotype/covariate rows to genotype sample order before modeling.
+- Use chunked loading for large inputs (`load_genotype_chunks`).
+- Set `JANUSX_CACHE_DIR` to a writable fast path on shared/HPC systems.
 
-4. For `-file` style numeric genotype input, ensure sidecar `.id` exists.
-5. Prefer chunked processing (`load_genotype_chunks`) for large cohorts.
+## 10. Related docs
 
-## 9. Related Docs
-
-1. CLI documentation: `doc/JanusXcli.md`
-2. Project overview: `README.md`
+- CLI guide: `doc/JanusXcli.md`
+- Project overview: `README.md`

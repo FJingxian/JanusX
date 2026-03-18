@@ -5120,7 +5120,10 @@ fn print_cli_help() {
         width,
     );
     println!();
-    println!("  {}", style_blue("GARFIELD:"));
+    println!(
+        "  {}",
+        style_blue("Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):")
+    );
     print_help_entry(
         4,
         "garfield",

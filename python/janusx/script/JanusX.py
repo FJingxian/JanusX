@@ -7,8 +7,9 @@ Usage:
 Options:
     -h, --help             Show this help message
     -v, --version          Show version/build information
-    -update, --update      Update JanusX: `jx --update [latest] [--verbose]`
-    -clean, --clean        Clear GWAS history DB, or `jx --clean <load_id>` to remove one loaded file record
+    Note: launcher-only flags are not supported in jxpy:
+          -update/-clean/-list/-upgrade/-uninstall
+          Please use launcher command: `jx ...`
 
 Modules:
     Genome-wide Association Studies (GWAS):
@@ -21,7 +22,7 @@ Modules:
     gs            Genomic prediction and model-based selection
     reml          Estimate heritability/effect components by REML-BLUP
 
-    GARFIELD:
+    Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):
     garfield      Random-forest based marker-trait association
     postgarfield  Summarize and visualize GARFIELD outputs
 
@@ -43,13 +44,10 @@ Modules:
 import sys
 import subprocess
 import importlib
-import os
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
-from ._common.gwas_history import remove_loaded_file_by_id
 from ._common.interrupt import install_interrupt_handlers, force_exit
-from ._common.pathcheck import safe_expanduser, safe_home, safe_resolve
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -100,6 +98,17 @@ _MODULE_NAMES = [
     "garfield", "grm", "pca", "gs", "reml",
     "sim", "simulation", "adamixture", "gformat", "gmerge", "hybrid", "webui",
 ]
+_LAUNCHER_ONLY_FLAGS = {
+    "-update", "--update",
+    "-clean", "--clean",
+    "-list", "--list",
+    "-upgrade", "--upgrade",
+    "-uninstall", "--uninstall",
+}
+_LAUNCHER_ONLY_MODULES = {
+    "fastq2vcf",
+    "fastq2count",
+}
 
 def _load_script_module(name: str):
     return importlib.import_module(f"janusx.script.{name}")
@@ -110,45 +119,6 @@ def _print_help() -> None:
         print(__doc__.strip())
 
 
-def _resolve_runtime_home() -> Path:
-    env_home = os.environ.get("JX_HOME", "").strip()
-    if env_home:
-        return safe_resolve(safe_expanduser(env_home))
-    home = safe_home()
-    p1 = safe_resolve(home / "JanusX" / ".janusx")
-    p2 = safe_resolve(home / ".janusx")
-    return p1 if p1.exists() else p2
-
-
-def _clean_history_db() -> None:
-    target = _resolve_runtime_home() / "janusx_tasks.db"
-    removed = []
-    if target.exists():
-        try:
-            target.unlink()
-            removed.append(str(target))
-        except Exception as e:
-            print(f"Error: failed to remove {target}: {e}")
-            return
-    if len(removed) == 0:
-        print("GWAS history DB already clean.")
-    else:
-        print("GWAS history DB cleaned.")
-        for p in removed:
-            print(f"  removed {p}")
-    print("A new history DB will be created automatically on next `jx gwas`.")
-
-
-def _clean_loaded_by_id(load_id: str) -> None:
-    out = remove_loaded_file_by_id(load_id)
-    print(f"Removed load id: {out.get('id','')}")
-    print(f"  type: {out.get('type','')}  name: {out.get('name','')}")
-    for p in out.get("removed_paths", []):
-        print(f"  removed {p}")
-    for p in out.get("failed_paths", []):
-        print(f"  failed {p}")
-
-
 def main():
     install_interrupt_handlers()
     if len(sys.argv) > 1:
@@ -157,25 +127,18 @@ def main():
         elif sys.argv[1] == '-v' or sys.argv[1] == '--version':
             print(__logo__)
             print(__version__)
-        elif sys.argv[1] == '-update' or sys.argv[1] == '--update':
+        elif sys.argv[1] in _LAUNCHER_ONLY_FLAGS:
             print(__logo__)
-            sys.argv[0] = "jx --update"
-            del sys.argv[1]
-            _load_script_module("update").main()
-        elif sys.argv[1] == '-clean' or sys.argv[1] == '--clean':
-            print(__logo__)
-            clean_args = sys.argv[2:]
-            if len(clean_args) == 0:
-                _clean_history_db()
-            elif len(clean_args) == 1:
-                _clean_loaded_by_id(clean_args[0])
-            else:
-                print("Usage: jx --clean [<load_id>]")
+            launcher_cmd = "jx " + " ".join(sys.argv[1:])
+            print(f"Error: `{sys.argv[1]}` is launcher-only and not available in `jxpy`.")
+            print(f"Please use launcher command: `{launcher_cmd}`")
         else:
             module_name = sys.argv[1]
-            if module_name == "fastq2vcf":
-                print("Error: Python fastq2vcf has been retired.")
-                print("Please run launcher command: `jx fastq2vcf ...`")
+            if module_name in _LAUNCHER_ONLY_MODULES:
+                print(__logo__)
+                launcher_cmd = "jx " + " ".join(sys.argv[1:])
+                print(f"Error: module `{module_name}` is launcher-only and not available in `jxpy`.")
+                print(f"Please use launcher command: `{launcher_cmd}`")
                 return
             if module_name in _MODULE_NAMES:
                 # Keep argparse usage as "jx <module> ..."

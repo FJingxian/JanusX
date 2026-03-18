@@ -48,11 +48,6 @@ const DLC_TOOL_ENTRIES: [(&str, &str); 14] = [
     ("samtools", "BAM/CRAM processing"),
     ("tabix", "BGZF indexing and queries"),
 ];
-const JANUSX_SIF_MIRROR_URL: &str =
-    "https://gh-proxy.org/https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
-const JANUSX_SIF_ORIGIN_URL: &str =
-    "https://github.com/FJingxian/JanusX/releases/download/v1.0.10/janusxext.sif";
-const JANUSX_SIF_URLS: [&str; 2] = [JANUSX_SIF_MIRROR_URL, JANUSX_SIF_ORIGIN_URL];
 const MICROMAMBA_BIN_MIRROR_URL: &str = "https://gh-proxy.org/https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64";
 const MICROMAMBA_BIN_ORIGIN_URL: &str =
     "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64";
@@ -694,13 +689,12 @@ fn route_backend_name(runtime_mode: &str) -> &'static str {
         "env" | "local" => "env",
         "conda" => "conda",
         "docker" => "docker",
-        "singularity" => "sif",
         _ => "none",
     }
 }
 
 fn should_force_container_binding(runtime_mode: &str) -> bool {
-    matches!(runtime_mode, "docker" | "singularity")
+    matches!(runtime_mode, "docker")
 }
 
 fn runtime_signature(record: &RuntimeRecord) -> String {
@@ -730,7 +724,7 @@ fn validate_cached_locator(backend: &str, locator: &str) -> bool {
         return false;
     }
     match backend {
-        "host" | "env" | "sif" => Path::new(loc).exists(),
+        "host" | "env" => Path::new(loc).exists(),
         "conda" => {
             let (_, path) = parse_conda_locator(loc);
             !path.is_empty() && Path::new(path).exists()
@@ -916,14 +910,6 @@ fn runtime_binding_for_tool(
                 Some(("docker".to_string(), image))
             }
         }
-        "singularity" => {
-            let sif = record.sif_path.trim().to_string();
-            if sif.is_empty() {
-                None
-            } else {
-                Some(("sif".to_string(), sif))
-            }
-        }
         _ => None,
     }
 }
@@ -1016,13 +1002,6 @@ fn build_tool_command_from_preferred_binding(
             let cmd = build_tool_command(tool, args, &route_record, runtime_home)?;
             Ok(Some(cmd))
         }
-        "sif" => {
-            let mut route_record = record.clone();
-            route_record.runtime_mode = "singularity".to_string();
-            route_record.sif_path = entry.locator.clone();
-            let cmd = build_tool_command(tool, args, &route_record, runtime_home)?;
-            Ok(Some(cmd))
-        }
         _ => Ok(None),
     }
 }
@@ -1053,7 +1032,6 @@ fn probe_tool_locators_parallel(
     } else {
         false
     };
-    let sif_path = record.sif_path.trim().to_string();
     let backend = route_backend_name(&mode).to_string();
 
     let mut handles: Vec<(String, thread::JoinHandle<ToolLocatorStatus>)> = Vec::new();
@@ -1064,7 +1042,6 @@ fn probe_tool_locators_parallel(
         let conda_env_c = conda_env.clone();
         let docker_image_c = docker_image.clone();
         let docker_ready_c = docker_ready_once;
-        let sif_path_c = sif_path.clone();
         let backend_c = backend.clone();
         handles.push((
             tool_name.clone(),
@@ -1094,14 +1071,6 @@ fn probe_tool_locators_parallel(
                     route: format!("{backend_c}:{docker_image_c}"),
                     ready: docker_ready_c,
                 },
-                "singularity" => {
-                    let ready = !sif_path_c.is_empty() && Path::new(&sif_path_c).exists();
-                    ToolLocatorStatus {
-                        tool: tool_name,
-                        route: format!("{backend_c}:{sif_path_c}"),
-                        ready,
-                    }
-                }
                 _ => ToolLocatorStatus {
                     tool: tool_name,
                     route: "none:-".to_string(),
@@ -1194,10 +1163,6 @@ fn collect_build_method_status() -> Vec<MethodStatus> {
     } else {
         false
     };
-    let singularity_ready = match find_bin("singularity") {
-        Some(bin) => singularity_runtime_ready(&bin).0,
-        None => false,
-    };
 
     if !linux {
         let checks = vec![("docker", has_docker), ("daemon", docker_daemon)];
@@ -1230,13 +1195,6 @@ fn collect_build_method_status() -> Vec<MethodStatus> {
             name: "docker",
             builder_id: 3,
             checks: vec![("docker", has_docker), ("daemon", docker_daemon)],
-            selectable: false,
-        },
-        MethodStatus {
-            id: 4,
-            name: "singularity",
-            builder_id: 4,
-            checks: vec![("Linux", linux), ("singularity", singularity_ready)],
             selectable: false,
         },
     ];
@@ -1336,7 +1294,6 @@ fn build_runtime(method_id: i32, runtime_home: &Path) -> Result<RuntimeRecord, S
         1 => build_env_runtime(runtime_home),
         2 => build_conda_runtime(runtime_home),
         3 => build_docker_runtime(runtime_home),
-        4 => build_singularity_runtime(runtime_home),
         _ => Err("Unknown build method.".to_string()),
     }
 }
@@ -1346,7 +1303,6 @@ fn runtime_mode_matches_builder(runtime_mode: &str, builder_id: i32) -> bool {
         1 => matches!(runtime_mode, "env" | "local"),
         2 => runtime_mode == "conda",
         3 => runtime_mode == "docker",
-        4 => runtime_mode == "singularity",
         _ => false,
     }
 }
@@ -1611,16 +1567,6 @@ fn cleanup_previous_runtime(record: &RuntimeRecord, runtime_home: &Path) -> Resu
                     ],
                     false,
                 );
-            }
-        }
-        "singularity" => {
-            let sif = record.sif_path.trim();
-            if !sif.is_empty() {
-                let p = PathBuf::from(sif);
-                if p.exists() {
-                    fs::remove_file(&p)
-                        .map_err(|e| format!("Failed to remove old SIF {}: {e}", p.display()))?;
-                }
             }
         }
         "env" | "local" => {}
@@ -1908,82 +1854,6 @@ fn build_docker_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
     })
 }
 
-fn build_singularity_runtime(runtime_home: &Path) -> Result<RuntimeRecord, String> {
-    if !cfg!(target_os = "linux") {
-        return Err("singularity method is Linux only.".to_string());
-    }
-    let Some(singularity_bin) = find_bin("singularity") else {
-        return Err("singularity command not found in PATH".to_string());
-    };
-    let (ready, detail) = singularity_runtime_ready(&singularity_bin);
-    if !ready {
-        return Err(format!("Singularity runtime is not usable: {detail}"));
-    }
-    let sif_dir = runtime_home.join("dlc").join("singularity");
-    fs::create_dir_all(&sif_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", sif_dir.display()))?;
-    let sif_path = sif_dir.join("janusxext.sif");
-    if !sif_path.exists() {
-        print!("Download JanusX Singularity Image (~800MB)? [y/N/path.sif]: ");
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("Failed to read input: {e}"))?;
-        let input = line.trim();
-        if input.is_empty() || input.eq_ignore_ascii_case("n") {
-            return Err("No SIF provided.".to_string());
-        }
-        let tmp_path = sif_dir.join("janusxext.tmp.sif");
-        if input.eq_ignore_ascii_case("y") {
-            download_with_fallback("download SIF", &JANUSX_SIF_URLS, &tmp_path)?;
-        } else {
-            let src = PathBuf::from(input);
-            if !src.exists() {
-                return Err(format!("SIF path not found: {}", src.display()));
-            }
-            fs::copy(&src, &tmp_path).map_err(|e| {
-                format!(
-                    "Failed to copy SIF {} -> {}: {e}",
-                    src.display(),
-                    tmp_path.display()
-                )
-            })?;
-        }
-        fs::rename(&tmp_path, &sif_path).map_err(|e| {
-            format!(
-                "Failed to move {} -> {}: {e}",
-                tmp_path.display(),
-                sif_path.display()
-            )
-        })?;
-    }
-    let verify_prefix = vec![
-        singularity_bin.to_string_lossy().to_string(),
-        "exec".to_string(),
-        sif_path.to_string_lossy().to_string(),
-    ];
-    let missing = missing_tools_in_prefixed_runtime(&verify_prefix)?;
-    if !missing.is_empty() {
-        return Err(format!(
-            "Singularity image is missing required tools: {}",
-            missing.join(", ")
-        ));
-    }
-    Ok(RuntimeRecord {
-        method_id: 4,
-        runtime_mode: "singularity".to_string(),
-        image_tag: String::new(),
-        conda_env: String::new(),
-        sif_path: sif_path.to_string_lossy().to_string(),
-        installed_tools: REQUIRED_TOOLS.iter().map(|x| (*x).to_string()).collect(),
-        status: "ok".to_string(),
-        updated_at: now_utc_epoch(),
-    })
-}
-
 fn build_tool_command(
     tool: &str,
     args: &[String],
@@ -2102,28 +1972,10 @@ fn build_tool_command(
             }
             Ok(cmd)
         }
-        "singularity" => {
-            let Some(singularity_bin) = find_bin("singularity") else {
-                return Err("singularity command not found in PATH.".to_string());
-            };
-            let (ready, detail) = singularity_runtime_ready(&singularity_bin);
-            if !ready {
-                return Err(format!("Singularity runtime is not usable: {detail}"));
-            }
-            let sif = PathBuf::from(record.sif_path.trim());
-            if !sif.exists() {
-                return Err(
-                    "Saved singularity runtime is invalid. Please run `jx -update dlc`."
-                        .to_string(),
-                );
-            }
-            let mut cmd = Command::new(singularity_bin);
-            cmd.arg("exec").arg(sif).arg(tool).args(args);
-            if tool == "beagle" {
-                apply_beagle_exec_env(&mut cmd, args);
-            }
-            Ok(cmd)
-        }
+        "singularity" => Err(
+            "DLC runtime mode `singularity` is no longer supported. Please run `jx -update dlc` and rebuild with env/conda/docker."
+                .to_string(),
+        ),
         _ => Err("Unknown DLC runtime mode. Please run `jx -update dlc`.".to_string()),
     }
 }
@@ -2350,24 +2202,10 @@ fn missing_tools_for_record(
             prefix.push(image.to_string());
             missing_tools_in_prefixed_runtime(&prefix)
         }
-        "singularity" => {
-            let Some(singularity_bin) = find_bin("singularity") else {
-                return Err("singularity command not found in PATH.".to_string());
-            };
-            let (ready, detail) = singularity_runtime_ready(&singularity_bin);
-            if !ready {
-                return Err(format!("Singularity runtime is not usable: {detail}"));
-            }
-            let sif = record.sif_path.trim();
-            if sif.is_empty() {
-                return Err("Saved singularity runtime is invalid.".to_string());
-            }
-            missing_tools_in_prefixed_runtime(&[
-                singularity_bin.to_string_lossy().to_string(),
-                "exec".to_string(),
-                sif.to_string(),
-            ])
-        }
+        "singularity" => Err(
+            "DLC runtime mode `singularity` is no longer supported. Please run `jx -update dlc` and rebuild with env/conda/docker."
+                .to_string(),
+        ),
         _ => Err("Unknown DLC runtime mode.".to_string()),
     }
 }
@@ -4379,34 +4217,6 @@ fn docker_daemon_running() -> (bool, String) {
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if err.is_empty() {
         (false, "docker daemon unavailable".to_string())
-    } else {
-        (false, err)
-    }
-}
-
-fn singularity_runtime_ready(singularity_bin: &Path) -> (bool, String) {
-    let out = Command::new(singularity_bin)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output();
-    let Ok(out) = out else {
-        return (false, "failed to call singularity --version".to_string());
-    };
-    if out.status.success() {
-        return (true, String::new());
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if err.contains("singularity.conf") {
-        return (
-            false,
-            "missing singularity configuration file (e.g. /etc/singularity/singularity.conf)"
-                .to_string(),
-        );
-    }
-    if err.is_empty() {
-        (false, "singularity runtime unavailable".to_string())
     } else {
         (false, err)
     }

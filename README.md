@@ -1,45 +1,57 @@
 # JanusX
 
-[CLI Doc](./doc/JanusXcli.md) | [Core API Doc](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
-![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
+[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
 
-Joint Association and Novel Utility for Selection (JanusX) is a high-performance toolkit for quantitative genetics. It combines Rust-accelerated kernels (PyO3) with Python CLI workflows for GWAS, genomic selection (GS), post-analysis visualization, and variant-processing pipelines.
+![Python](https://img.shields.io/badge/Python-3.9+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 
 ## Overview
+
+JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic selection toolkit that combines:
+
+- Rust-accelerated kernels (PyO3 extension)
+- Python analysis modules
+- A Rust launcher (`jx`) for runtime/toolchain management and pipeline orchestration
 
 ```text
        _                      __   __
       | |                     \ \ / /
-      | | __ _ _ __  _   _ ___ \ V / 
-  _   | |/ _` | '_ \| | | / __| > <  
- | |__| | (_| | | | | |_| \__ \/ . \ 
+      | | __ _ _ __  _   _ ___ \ V /
+  _   | |/ _` | '_ \| | | / __| > <
+ | |__| | (_| | | | | |_| \__ \/ . \
   \____/ \__,_|_| |_|\__,_|___/_/ \_\ Tools for GWAS and GS
   ---------------------------------------------------------
 ```
 
-- Unified CLI entry: `jx`
-- Core GWAS models: `LM`, `LMM`, `FarmCPU`
-- Core GS models: `GBLUP`, `rrBLUP`, `BayesA`, `BayesB`, `BayesCpi`
-- Streaming genotype reader for VCF/PLINK/TXT with low-memory workflows
-- Integrated post-analysis tools: `postgwas`, `postbsa`, `postgarfield`
-- Additional utilities: `grm`, `pca`, `gmerge`, `fastq2vcf`, `fastq2count`, `sim`, `simulation`
+Main capabilities:
 
-****
+- GWAS: `LM`, `LMM`, `FastLMM`, `LRLMM`, `FarmCPU`
+- Genomic selection: `GBLUP`, `adBLUP`, `rrBLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Streaming genotype IO for VCF/HMP/PLINK/TXT/NPY
+- Post-analysis workflows: `postgwas`, `postgarfield`, `postbsa`
+- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `hybrid`, `adamixture`, `webui`, `sim`, `simulation`
+- Launcher pipelines: `fastq2vcf`, `fastq2count`
+
+---
+
+## `jx` & `jxpy`
+
+**JanusX provides two command entry styles**:
+
+- `jx` (Rust launcher): manages runtime/update/toolchain and supports all launcher modules
+- `jxpy` (Python package entry): runs Python-side modules directly
+
+**Practical difference**:
+
+- `fastq2vcf` and `fastq2count` are launcher-only (`jx`)
+- launcher-only flags (`-update/-upgrade/-list/-clean/-uninstall`) are not available in `jxpy`
 
 ## Installation
 
-Requirements:
+### Option A: launcher install (recommended for end users)
 
-- Supported OS: Linux / macOS / Windows
-- Internet access for first-time runtime setup and updates
-- Python/Rust are **not** required for normal end-user installation via launcher installer
+Download installer assets from [Releases](https://github.com/FJingxian/JanusX/releases):
 
-### Release Launcher Install (required)
-
-Download the installer asset from GitHub Releases:
-<https://github.com/FJingxian/JanusX/releases>
-
-Unzip, and then run installer:
+Then run installer:
 
 ```bash
 # Linux
@@ -49,19 +61,27 @@ Unzip, and then run installer:
 ./JanusX-vX.Y.Z-darwin-universal.command
 ```
 
-On Windows, run the `.exe` installer directly.
+On Windows, double click or run the `.exe` installer.
 
-### Upgrade after a new release
+After install:
 
 ```bash
-jx -upgrade
+jx -v
+jx -list module
 ```
 
-****
+### Option B: Python package install (API-first / development)
 
-## Quick Start
+```bash
+pip install janusx
+# command entry: jxpy (version>=3.14) or jx (version<3.14)
+```
 
-### GWAS
+- If you only need a turnkey CLI environment with pipeline tooling, prefer launcher install.
+
+## Quick start
+
+### 1) GWAS
 
 ```bash
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
@@ -71,25 +91,21 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o t
   <img src="./doc/mouse_hs1940.test0.add.lmm.svg" alt="overview" />
 </p>
 
-### Post-GWAS
+### 2) Post-GWAS
 
 ```bash
-jx postgwas -gwasfile test/mouse_hs1940.test0.lmm.tsv -manh -qq -thr 1e-6 -o testpost
+jx postgwas -gwasfile test/mouse_hs1940.test0.add.lmm.tsv -manh -qq -thr 1e-6 -o testpost
 ```
 
 <p align="center">
   <img src="./doc/ldblock.png" alt="ldblock" />
 </p>
 
-### Genomic Selection
+### 3) Genomic selection
 
 ```bash
 jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -o testgs
 ```
-
-<p align="center">
-  <img src="./doc/mouse_hs1940.test0.gs.XGB.svg" alt="gsoverview" />
-</p>
 
 ```text
 * Genomic Selection for trait: test0
@@ -115,53 +131,57 @@ Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
    1 ENET          0.720     0.704  0.514  0.517      0.274
 ```
 
-More usage in [CLI doc](./doc/JanusXcli.md).
+<p align="center">
+  <img src="./doc/mouse_hs1940.test0.gs.XGB.svg" alt="gsoverview" />
+</p>
 
-****
+**See full usages in [CLI Guide](./doc/JanusXcli.md).**
 
-## CLI Modules
-
-### Genome-wide Association Studies (GWAS)
-
-- `grm`: build genomic relationship matrix from genotype (`-vcf` or `-bfile`)
-- `pca`: PCA for population structure from genotype, GRM prefix, or existing PCA prefix
-- `gwas`: run genome-wide association analysis (`LM`, `LMM`, `fastLMM`, `FarmCPU`)
-- `postgwas`: post-process GWAS results (Manhattan/QQ/annotation/merge/LD views)
-
-### Genomic Selection (GS)
-
-- `gs`: genomic prediction and model-based selection
-
-### GARFIELD
-
-- `garfield`: random-forest based marker-trait association
-- `postgarfield`: summarize and visualize GARFIELD outputs
-
-### Bulk Segregation Analysis (BSA)
-
-- `postbsa`: post-process and visualize BSA results
-
-### Pipeline and Utility
-
-- `fastq2count`: RNA-seq pipeline from FASTQ to gene count/FPKM/TPM
-- `fastq2vcf`: variant-calling pipeline from FASTQ to VCF
-- `hybrid`: build pairwise hybrid genotype matrix from parent lists
-- `gformat`: convert genotype files across plink/vcf/hmp/txt/npy
-- `gmerge`: merge genotype/variant datasets
-- `webui`: start JanusX web UI
-
-### Benchmark
-
-- `sim`: quick simulation workflow
-- `simulation`: extended simulation and benchmarking workflow
-
-For full options, run:
+### 4) Get module help
 
 ```bash
 jx <module> -h
+# or
+jxpy <module> -h
 ```
 
-****
+## Module map
+
+**Genome-wide Association Studies (GWAS)**:
+
+- `grm`
+- `pca`
+- `gwas`
+- `postgwas`
+
+**Genomic Selection (GS)**:
+
+- `gs`
+- `reml`
+
+**[GARFIELD](https://github.com/heroalone/Garfield)**:
+
+- `garfield`
+- `postgarfield`
+
+**Bulk Segregation Analysis (BSA)**:
+
+- `postbsa`
+
+**Pipeline and utility**:
+
+- `fastq2count` (RNAseq pipeline, launcher-only)
+- `fastq2vcf` (BSA/Reseq pipeline, launcher-only)
+- `adamixture` (Based on [AI-sandbox](https://github.com/AI-sandbox/ADAMIXTURE.git))
+- `hybrid`
+- `gformat`
+- `gmerge`
+- `webui`
+
+**Benchmark**:
+
+- `sim`
+- `simulation`
 
 ## Citation
 
@@ -179,6 +199,4 @@ jx <module> -h
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-or-later).
-
-See the [LICENSE](./LICENSE) file for details.
+This project is licensed under GNU Affero General Public License v3.0 (AGPL-3.0-or-later). See [LICENSE](./LICENSE).

@@ -5992,84 +5992,157 @@ def main(log: bool = True):
                         trait_col_map = {str(t): int(i) for i, t in enumerate(trait_order)}
 
                 _phase_split(logger)
-                run_lrlmm_packed(
-                    rank_opt=args.lrlmm,
-                    genofile=gfile,
-                    pheno=pheno if pheno is not None else pd.DataFrame(),
-                    ids=ids if ids is not None else np.asarray([], dtype=str),
-                    outprefix=outprefix,
-                    maf_threshold=args.maf,
-                    max_missing_rate=args.geno,
-                    genetic_model=args.model,
-                    chunk_size=args.chunksize,
-                    mmap_limit=args.mmap_limit,
-                    qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
-                    cov_all=cov_all,
-                    plot=args.plot,
-                    threads=args.thread,
-                    logger=logger,
-                    use_spinner=use_spinner,
-                    snps_only=bool(args.snps_only),
-                    eff_snp_by_trait=eff_snp_by_trait,
-                    summary_rows=gwas_summary_rows,
-                    saved_paths=saved_result_paths,
-                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                    emit_trait_header=True,
-                    prepared_cache=shared_full_cache,
-                )
+            trait_names_full = [str(t) for t in trait_order] if len(trait_order) > 0 else None
 
-            if has_farmcpu:
-                _ = run_farmcpu_fullmem(
-                    args=args,
-                    gfile=gfile,
-                    prefix=prefix,
-                    logger=logger,
-                    pheno_preloaded=pheno,
-                    ids_preloaded=ids,
-                    n_snps_preloaded=n_snps,
-                    qmatrix_preloaded=qmatrix,
-                    cov_preloaded=cov_all,
-                    use_spinner=use_spinner,
-                    context_prepared=context_prepared,
-                    summary_rows=gwas_summary_rows,
-                    saved_paths=saved_result_paths,
-                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                    farmcpu_cache=shared_full_cache,
-                    emit_trait_header=(not has_lrlmm),
-                )
-
-            # Print LrLMM PVE after all full-task methods finish (e.g., after FarmCPU).
-            if has_lrlmm:
-                pve_lines: list[tuple[str, float]] = []
-                seen_trait: set[str] = set()
-                for row in gwas_summary_rows[full_task_summary_start:]:
+            def _emit_lrlmm_pve_for_trait(trait_name: str) -> None:
+                for row in reversed(gwas_summary_rows):
                     if str(row.get("model", "")).strip().lower() != "lrlmm":
                         continue
-                    trait_name = str(row.get("phenotype", "")).strip()
-                    if trait_name in seen_trait:
+                    if str(row.get("phenotype", "")).strip() != str(trait_name):
                         continue
                     pve_raw = row.get("pve")
                     try:
                         pve_val = float(pve_raw) if pve_raw is not None else float("nan")
                     except Exception:
                         pve_val = float("nan")
-                    if not np.isfinite(pve_val):
-                        continue
-                    seen_trait.add(trait_name)
-                    pve_lines.append((trait_name, pve_val))
-                if len(pve_lines) == 1:
-                    _emit_plain_info_line(
-                        logger,
-                        f"pve={pve_lines[0][1]:.3f} (from LrLMM)",
-                        use_spinner=bool(use_spinner),
-                    )
-                elif len(pve_lines) > 1:
-                    for tname, pve_val in pve_lines:
+                    if np.isfinite(pve_val):
                         _emit_plain_info_line(
                             logger,
-                            f"{tname}: pve={pve_val:.3f} (from LrLMM)",
+                            f"pve={pve_val:.3f} (from LrLMM)",
                             use_spinner=bool(use_spinner),
                         )
+                    return
+
+            # For multi-trait full task, keep per-trait output grouped:
+            # trait header -> LrLMM -> FarmCPU -> pve
+            if has_lrlmm and has_farmcpu and trait_names_full is not None:
+                for trait_idx, tname in enumerate(trait_names_full):
+                    run_lrlmm_packed(
+                        rank_opt=args.lrlmm,
+                        genofile=gfile,
+                        pheno=pheno if pheno is not None else pd.DataFrame(),
+                        ids=ids if ids is not None else np.asarray([], dtype=str),
+                        outprefix=outprefix,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        genetic_model=args.model,
+                        chunk_size=args.chunksize,
+                        mmap_limit=args.mmap_limit,
+                        qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
+                        cov_all=cov_all,
+                        plot=args.plot,
+                        threads=args.thread,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(tname)],
+                        emit_trait_header=True,
+                        prepared_cache=shared_full_cache,
+                    )
+                    _ = run_farmcpu_fullmem(
+                        args=args,
+                        gfile=gfile,
+                        prefix=prefix,
+                        logger=logger,
+                        pheno_preloaded=pheno,
+                        ids_preloaded=ids,
+                        n_snps_preloaded=n_snps,
+                        qmatrix_preloaded=qmatrix,
+                        cov_preloaded=cov_all,
+                        use_spinner=use_spinner,
+                        context_prepared=context_prepared,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(tname)],
+                        farmcpu_cache=shared_full_cache,
+                        emit_trait_header=False,
+                    )
+                    _emit_lrlmm_pve_for_trait(str(tname))
+                    if trait_idx < len(trait_names_full) - 1:
+                        logger.info("")
+            else:
+                if has_lrlmm:
+                    run_lrlmm_packed(
+                        rank_opt=args.lrlmm,
+                        genofile=gfile,
+                        pheno=pheno if pheno is not None else pd.DataFrame(),
+                        ids=ids if ids is not None else np.asarray([], dtype=str),
+                        outprefix=outprefix,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        genetic_model=args.model,
+                        chunk_size=args.chunksize,
+                        mmap_limit=args.mmap_limit,
+                        qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
+                        cov_all=cov_all,
+                        plot=args.plot,
+                        threads=args.thread,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=trait_names_full,
+                        emit_trait_header=True,
+                        prepared_cache=shared_full_cache,
+                    )
+
+                if has_farmcpu:
+                    _ = run_farmcpu_fullmem(
+                        args=args,
+                        gfile=gfile,
+                        prefix=prefix,
+                        logger=logger,
+                        pheno_preloaded=pheno,
+                        ids_preloaded=ids,
+                        n_snps_preloaded=n_snps,
+                        qmatrix_preloaded=qmatrix,
+                        cov_preloaded=cov_all,
+                        use_spinner=use_spinner,
+                        context_prepared=context_prepared,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=trait_names_full,
+                        farmcpu_cache=shared_full_cache,
+                        emit_trait_header=(not has_lrlmm),
+                    )
+
+                # Print LrLMM PVE after all full-task methods finish.
+                if has_lrlmm:
+                    pve_lines: list[tuple[str, float]] = []
+                    seen_trait: set[str] = set()
+                    for row in gwas_summary_rows[full_task_summary_start:]:
+                        if str(row.get("model", "")).strip().lower() != "lrlmm":
+                            continue
+                        trait_name = str(row.get("phenotype", "")).strip()
+                        if trait_name in seen_trait:
+                            continue
+                        pve_raw = row.get("pve")
+                        try:
+                            pve_val = float(pve_raw) if pve_raw is not None else float("nan")
+                        except Exception:
+                            pve_val = float("nan")
+                        if not np.isfinite(pve_val):
+                            continue
+                        seen_trait.add(trait_name)
+                        pve_lines.append((trait_name, pve_val))
+                    if len(pve_lines) == 1:
+                        _emit_plain_info_line(
+                            logger,
+                            f"pve={pve_lines[0][1]:.3f} (from LrLMM)",
+                            use_spinner=bool(use_spinner),
+                        )
+                    elif len(pve_lines) > 1:
+                        for tname, pve_val in pve_lines:
+                            _emit_plain_info_line(
+                                logger,
+                                f"{tname}: pve={pve_val:.3f} (from LrLMM)",
+                                use_spinner=bool(use_spinner),
+                            )
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:

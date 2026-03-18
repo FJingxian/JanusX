@@ -522,7 +522,7 @@ def getLogicgate(
             return None
     else:
         idx = np.argsort(Imp)[::-1][:topk]
-    # 0/1/2 â†?0/1
+    # 0/1/2 ->0/1
     Mchoice = (M[idx] / 2).astype(int).T
 
     resdict = logreg(Mchoice, y, response=response, tags=sites[idx])

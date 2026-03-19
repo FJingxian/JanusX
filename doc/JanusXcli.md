@@ -1,6 +1,6 @@
 # JanusX CLI Guide
 
-Version baseline: `v1.0.13`
+Version baseline: `v1.0.14`
 
 ## 1. Scope and entrypoints
 
@@ -91,11 +91,31 @@ Most model modules support one of:
 
 Required sidecar:
 
+- `prefix.txt` (numeric matrix)
+
+```text
+1	1	2
+1	1	0
+1	0	0
+```
+
 - `prefix.id` (sample IDs in matrix column order)
+
+```text
+idv1
+idv2
+idv3
+```
 
 Optional sidecar:
 
 - `prefix.site` or `prefix.bim` (recommended for format conversion, LD, export)
+
+```text
+1	3197400	G	A
+1	3407393	A	G
+1	3492195	G	A
+```
 
 ### 3.3 Matrix orientation
 
@@ -112,6 +132,13 @@ Expected by major modules:
 - remaining columns: traits/covariates
 
 Delimiter is auto-detected in many modules.
+
+```text
+	test0	test1	test2	test3
+x	0.224	0.224	NA	1.0
+1	-0.974	-0.974	NA	0.0
+2	0.195	0.195	NA	1.0
+```
 
 ### 3.5 Trait selector `-n`
 
@@ -217,6 +244,15 @@ Other key options:
 - covariate file (ID in first column)
 - single-site token (`chr:pos` or `chr:start:end` where start=end)
 
+```text
+x	0.017407173	-0.0069945143
+1	0.004649966	0.039312065
+2	0.012239488	-0.02688213
+3	0.010048621	-0.0106722545
+4	0.017356979	-0.0052547506
+5	0.012380351	-0.012446985
+```
+
 More options:
 
 - `-snps-only`
@@ -300,6 +336,7 @@ REML-BLUP mixed model for variance components and BLUP outputs.
 Examples:
 
 ```bash
+# example/rice6048.reml.tsv
 jx reml -file test.reml.txt -n 3 -rh 0 -rh 1 -rh 2 -o out -prefix reml
 jx reml -file test.reml.txt -n trait1 -f sex -r family
 ```

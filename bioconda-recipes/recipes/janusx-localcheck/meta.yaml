@@ -1,5 +1,5 @@
 ﻿{% set name = "janusx" %}
-{% set version = "1.0.14" %}
+{% set version = "1.0.15" %}
 
 package:
   name: {{ name|lower }}
@@ -71,4 +71,3 @@ extra:
     - doi:10.64898/2026.01.20.700366
   recipe-maintainers:
     - FJingxian
-

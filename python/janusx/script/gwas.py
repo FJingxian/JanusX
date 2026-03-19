@@ -5559,10 +5559,11 @@ def parse_args():
         help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
-        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=100, type=int, metavar="RANK",
+        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=None, type=int, metavar="RANK",
         help=(
             "Run low-rank LMM (packed BED + RSVD + Rust FaST GWAS). "
-            "Optional RANK; default is %(default)s."
+            "Optional RANK; if omitted after the flag, use sqrt(n). "
+            "Disabled unless explicitly requested."
         ),
     )
     models_group.add_argument(

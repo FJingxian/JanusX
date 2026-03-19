@@ -6,9 +6,9 @@ package:
   version: {{ version }}
 
 source:
-  url: https://github.com/FJingxian/JanusX/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 9d7cfedaff0dcfe8b251b97f224fc65bade609837818f404767244759331edc1
-  md5: 33cf306c6d96d02f9b287185591c82fb
+  url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz
+  sha256: 41251b8c87b6571f52c0f976dfbd9194448082ffd70f777e947caf4c23c15fc1
+  md5: de7593060fa4a6e35cfe8c4b7aaf92cd
 
 build:
   number: 0

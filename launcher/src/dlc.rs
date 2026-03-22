@@ -662,10 +662,16 @@ pub(crate) fn run_dlc_tool(
             "DLC runtime does not contain `{tool}`. Please run `jx -update dlc`."
         ));
     }
+    let args_owned = if tool == "iqtree" {
+        normalize_iqtree_args(args)
+    } else {
+        args.to_vec()
+    };
+    let args_ref = args_owned.as_slice();
 
     let mut cmd = if let Some(bound) = build_tool_command_from_preferred_binding(
         tool,
-        args,
+        args_ref,
         &record,
         runtime_home,
         &python,
@@ -673,7 +679,7 @@ pub(crate) fn run_dlc_tool(
     )? {
         bound
     } else {
-        build_tool_command(tool, args, &record, runtime_home)?
+        build_tool_command(tool, args_ref, &record, runtime_home)?
     };
     let status = cmd
         .stdin(Stdio::inherit())
@@ -750,6 +756,26 @@ fn tool_command_candidates(tool: &str) -> Vec<String> {
     if tool == "iqtree" {
         out.push("iqtree2".to_string());
     }
+    out
+}
+
+fn iqtree_has_seqtype_arg(args: &[String]) -> bool {
+    args.iter().any(|x| {
+        x == "--seqtype"
+            || x == "-st"
+            || x.starts_with("--seqtype=")
+            || (x.starts_with("-st") && x.len() > 3)
+    })
+}
+
+fn normalize_iqtree_args(args: &[String]) -> Vec<String> {
+    if iqtree_has_seqtype_arg(args) {
+        return args.to_vec();
+    }
+    let mut out = Vec::with_capacity(args.len() + 2);
+    out.extend_from_slice(args);
+    out.push("--seqtype".to_string());
+    out.push("DNA".to_string());
     out
 }
 
@@ -1967,6 +1993,22 @@ fn build_tool_command(
                     shell.push_str(&shell_quote(arg));
                 }
                 cmd.arg("bash").arg("-lc").arg(shell);
+            } else if tool == "iqtree" {
+                // IQ-TREE package names vary by distro/image (`iqtree` vs `iqtree2`).
+                // Resolve at runtime inside container so `jx iqtree` stays stable.
+                let shell = "if command -v iqtree >/dev/null 2>&1; then \
+                                 exec iqtree \"$@\"; \
+                             elif command -v iqtree2 >/dev/null 2>&1; then \
+                                 exec iqtree2 \"$@\"; \
+                             else \
+                                 echo \"iqtree executable not found in container PATH\" >&2; \
+                                 exit 127; \
+                             fi";
+                cmd.arg("bash")
+                    .arg("-lc")
+                    .arg(shell)
+                    .arg("jx-iqtree")
+                    .args(args);
             } else {
                 cmd.arg(tool).args(args);
             }
@@ -2239,7 +2281,14 @@ fn env_runtime_micromamba_bin(runtime_home: &Path) -> PathBuf {
 }
 
 fn env_runtime_tool_path(runtime_home: &Path, tool: &str) -> PathBuf {
-    env_runtime_bin_dir(runtime_home).join(tool)
+    let bin_dir = env_runtime_bin_dir(runtime_home);
+    for cand in tool_command_candidates(tool) {
+        let p = bin_dir.join(&cand);
+        if p.exists() && p.is_file() {
+            return p;
+        }
+    }
+    bin_dir.join(tool)
 }
 
 fn missing_host_tools() -> Vec<String> {

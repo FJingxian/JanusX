@@ -16,6 +16,8 @@ mod bsa;
 mod lmm;
 #[path = "stats/logreg.rs"]
 mod logreg;
+#[path = "stats/tree.rs"]
+mod tree;
 
 // io
 #[path = "io/gfcore.rs"]
@@ -63,6 +65,13 @@ use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use logreg::fit_best_and_not_py;
+use tree::{
+    geno_chunk_to_alignment_u8,
+    geno_chunk_to_alignment_u8_siteinfo,
+    geno_chunk_to_alignment_u8_sites,
+    ml_newick_from_alignment_u8,
+    nj_newick_from_alignment_u8,
+};
 // ============================================================
 // PyO3 module exports
 // ============================================================
@@ -139,5 +148,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
+    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8, m)?)?;
+    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;
+    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_sites, m)?)?;
+    m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
+    m.add_function(wrap_pyfunction!(ml_newick_from_alignment_u8, m)?)?;
     Ok(())
 }

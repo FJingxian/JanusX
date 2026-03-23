@@ -5,7 +5,29 @@ from typing import Dict, Hashable, List, Sequence, Union, Optional
 import numpy as np
 import pandas as pd
 from scipy import stats
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from janusx._optional_deps import format_missing_dependency_message
+
+try:
+    from statsmodels.stats.multicomp import pairwise_tukeyhsd
+    _HAS_STATSMODELS = True
+    _STATSMODELS_IMPORT_ERROR: Exception | None = None
+except Exception as _statsmodels_exc:
+    pairwise_tukeyhsd = None  # type: ignore[assignment]
+    _HAS_STATSMODELS = False
+    _STATSMODELS_IMPORT_ERROR = _statsmodels_exc
+
+
+def _require_statsmodels() -> None:
+    if _HAS_STATSMODELS:
+        return
+    raise ImportError(
+        format_missing_dependency_message(
+            "statsmodels is required for Tukey HSD multiple-comparison tests.",
+            packages=("statsmodels",),
+            extra="stats",
+            original_error=_STATSMODELS_IMPORT_ERROR,
+        )
+    ) from _STATSMODELS_IMPORT_ERROR
 
 
 def _normalize_input(
@@ -45,6 +67,7 @@ def _tukey_significance_matrix(df: pd.DataFrame, alpha: float = 0.05) -> pd.Data
     Return a symmetric boolean matrix:
     sig.loc[g1, g2] == True means g1 and g2 are significantly different.
     """
+    _require_statsmodels()
     groups = list(pd.unique(df["group"]))
     sig = pd.DataFrame(False, index=groups, columns=groups, dtype=bool)
 

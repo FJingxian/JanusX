@@ -12,7 +12,10 @@ from janusx.garfield.garfield2 import (
     main_inmemory as garfield_main_inmemory,
     main_inmemory_packed as garfield_main_inmemory_packed,
     window as garfield_window,
+    _HAS_SKLEARN as _GARFIELD_HAS_SKLEARN,
+    _SKLEARN_IMPORT_ERROR as _GARFIELD_SKLEARN_IMPORT_ERROR,
 )
+from janusx._optional_deps import format_missing_dependency_message
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
 from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.gtools.reader import readanno
@@ -374,6 +377,15 @@ def main() -> None:
         parser.error(
             "the following arguments are required: "
             "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+        )
+    if not _GARFIELD_HAS_SKLEARN:
+        parser.error(
+            format_missing_dependency_message(
+                "scikit-learn is required for GARFIELD.",
+                packages=("scikit-learn",),
+                extra="ml",
+                original_error=_GARFIELD_SKLEARN_IMPORT_ERROR,
+            )
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))

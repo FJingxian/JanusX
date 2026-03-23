@@ -8,13 +8,35 @@ from typing import Any, Optional
 
 import numpy as np
 from joblib import Parallel, delayed, parallel_backend
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import ElasticNet
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.model_selection import KFold, ParameterSampler
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVR
+from janusx._optional_deps import format_missing_dependency_message
+
+try:
+    from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
+    from sklearn.linear_model import ElasticNet
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.model_selection import KFold, ParameterSampler
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVR
+
+    _HAS_SKLEARN = True
+    _SKLEARN_IMPORT_ERROR: Exception | None = None
+except Exception as _sklearn_exc:  # pragma: no cover - optional dependency path
+    ExtraTreesRegressor = None  # type: ignore[assignment]
+    HistGradientBoostingRegressor = None  # type: ignore[assignment]
+    RandomForestRegressor = None  # type: ignore[assignment]
+    ElasticNet = None  # type: ignore[assignment]
+    KFold = None  # type: ignore[assignment]
+    ParameterSampler = None  # type: ignore[assignment]
+    Pipeline = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
+    SVR = None  # type: ignore[assignment]
+
+    class ConvergenceWarning(UserWarning):  # type: ignore[no-redef]
+        pass
+
+    _HAS_SKLEARN = False
+    _SKLEARN_IMPORT_ERROR = _sklearn_exc
 
 try:
     from threadpoolctl import threadpool_limits
@@ -30,6 +52,19 @@ except Exception as _xgb_exc:  # pragma: no cover - optional dependency
     XGBRegressor = None  # type: ignore[assignment]
     _HAS_XGBOOST = False
     _XGBOOST_IMPORT_ERROR = _xgb_exc
+
+
+def _require_sklearn(requirement: str) -> None:
+    if _HAS_SKLEARN:
+        return
+    raise ImportError(
+        format_missing_dependency_message(
+            requirement,
+            packages=("scikit-learn",),
+            extra="ml",
+            original_error=_SKLEARN_IMPORT_ERROR,
+        )
+    ) from _SKLEARN_IMPORT_ERROR
 
 
 ScoreName = typing.Literal["pearson", "r2", "neg_rmse"]
@@ -224,6 +259,9 @@ class MLGS:
         progress_callback: typing.Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.method = str(method)
+        _require_sklearn(
+            "scikit-learn is required for MLGS models (RF/ET/GBDT/SVM/ENET/XGB)."
+        )
         self.seed = 0 if seed is None else int(seed)
         self.cv = max(2, int(cv))
         self.scoring = scoring
@@ -500,8 +538,12 @@ class MLGS:
         if self.method == "xgb":
             if not _HAS_XGBOOST or XGBRegressor is None:
                 raise ImportError(
-                    "XGBoost is unavailable for method='xgb'. "
-                    f"Original import error: {_XGBOOST_IMPORT_ERROR}"
+                    format_missing_dependency_message(
+                        "XGBoost is required for method='xgb'.",
+                        packages=("xgboost",),
+                        extra="ml",
+                        original_error=_XGBOOST_IMPORT_ERROR,
+                    )
                 )
             base = dict(
                 objective="reg:squarederror",
@@ -1167,4 +1209,10 @@ class MLGS:
         return self.predict(M, cov=cov)
 
 
-__all__ = ["MLGS"]
+__all__ = [
+    "MLGS",
+    "_HAS_SKLEARN",
+    "_SKLEARN_IMPORT_ERROR",
+    "_HAS_XGBOOST",
+    "_XGBOOST_IMPORT_ERROR",
+]

@@ -5,16 +5,11 @@ description = "A Suite of Genotyping Tools for Genome-Wide Association Study and
 requires-python = ">=3.9"
 dependencies = [
     "numpy", "scipy",
-    "scikit-learn","xgboost",
     "pandas<3.0",
     "matplotlib",
     "psutil",
-    "statsmodels",
     "rich", "tqdm", "rich-argparse",
-    # "dynamicTreeCut",
     "joblib>=1.5",
-    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
-    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
 ]
 authors = [
   {name = "Jingxian FU", email = "827888724@qq.com"},
@@ -22,6 +17,30 @@ authors = [
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
 keywords = ["GWAS", "GS", "REML", "PCA"]
+
+[project.optional-dependencies]
+ml = [
+    "scikit-learn",
+    "xgboost",
+]
+stats = [
+    "statsmodels",
+]
+wgcna = [
+    "dynamicTreeCut",
+]
+sparse = [
+    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+]
+full = [
+    "scikit-learn",
+    "xgboost",
+    "statsmodels",
+    "dynamicTreeCut",
+    "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+    "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
+]
 
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

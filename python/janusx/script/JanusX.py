@@ -45,9 +45,11 @@ Modules:
 import sys
 import subprocess
 import importlib
+import os
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
+from janusx._optional_deps import format_missing_dependency_for_module
 from ._common.interrupt import install_interrupt_handlers, force_exit
 try:
     v = version("janusx")
@@ -122,6 +124,10 @@ def _print_help() -> None:
 
 def main():
     install_interrupt_handlers()
+    if str(os.environ.get("JANUSX_ENTRYPOINT", "")).strip() == "":
+        prog = Path(sys.argv[0]).name.lower() if len(sys.argv) > 0 else ""
+        if prog.startswith("jxpy"):
+            os.environ["JANUSX_ENTRYPOINT"] = "jxpy"
     if len(sys.argv) > 1:
         if sys.argv[1] == '-h' or sys.argv[1] == '--help':
             _print_help()
@@ -147,6 +153,17 @@ def main():
                 del sys.argv[1]
                 try:
                     _load_script_module(module_name).main()  # Process of target module
+                except ModuleNotFoundError as exc:
+                    msg = format_missing_dependency_for_module(
+                        exc.name,
+                        f"Missing optional dependency required by `jx {module_name}`.",
+                        original_error=exc,
+                    )
+                    if msg is None:
+                        raise
+                    print(__logo__)
+                    print(f"Error: {msg}")
+                    raise SystemExit(1)
                 except KeyboardInterrupt:
                     force_exit(130, "Interrupted by user (Ctrl+C).")
             elif module_name not in _MODULE_NAMES:

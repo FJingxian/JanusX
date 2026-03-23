@@ -4190,6 +4190,7 @@ fn strip_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {
 
 fn run_python_janusx(python: &Path, args: &[String]) -> Result<i32, String> {
     let status = Command::new(python)
+        .env("JANUSX_ENTRYPOINT", "jx")
         .arg("-m")
         .arg("janusx.script.JanusX")
         .args(args)

@@ -1,8 +1,17 @@
 from typing import Any
 import pandas as pd
-from sklearn.inspection import permutation_importance
-from sklearn.ensemble import RandomForestRegressor
 import numpy as np
+from janusx._optional_deps import format_missing_dependency_message
+try:
+    from sklearn.inspection import permutation_importance
+    from sklearn.ensemble import RandomForestRegressor
+    _HAS_SKLEARN = True
+    _SKLEARN_IMPORT_ERROR: Exception | None = None
+except Exception as _sklearn_exc:
+    permutation_importance = None  # type: ignore[assignment]
+    RandomForestRegressor = None  # type: ignore[assignment]
+    _HAS_SKLEARN = False
+    _SKLEARN_IMPORT_ERROR = _sklearn_exc
 from janusx.gfreader import load_genotype_chunks
 from janusx.pyBLUP.assoc import SUPER
 from janusx.garfield.logreg import logreg
@@ -15,6 +24,15 @@ def getLogicgate(y: np.ndarray, M: np.ndarray,
     通过随机森林 + permutation importance + 逻辑回归
     在一段基因型矩阵中寻找逻辑组合 (xcombine)
     '''
+    if not _HAS_SKLEARN:
+        raise ImportError(
+            format_missing_dependency_message(
+                "scikit-learn is required for GARFIELD.",
+                packages=("scikit-learn",),
+                extra="ml",
+                original_error=_SKLEARN_IMPORT_ERROR,
+            )
+        ) from _SKLEARN_IMPORT_ERROR
     if sites is not None:
         sites = np.array([f'{i.chrom}_{i.pos}' for i in sites])
     else:

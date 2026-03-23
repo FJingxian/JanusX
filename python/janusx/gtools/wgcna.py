@@ -20,6 +20,7 @@ from typing import Literal, List, Union
 from scipy.stats import linregress
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage
+from janusx._optional_deps import format_missing_dependency_message
 
 try:
     from rich.progress import track as rich_track
@@ -286,7 +287,11 @@ def cluster(
     """
     if _cutree_hybrid is None:
         raise ImportError(
-            "dynamicTreeCut is required for cluster(). Please install dynamicTreeCut."
+            format_missing_dependency_message(
+                "dynamicTreeCut is required for cluster().",
+                packages=("dynamicTreeCut",),
+                extra="wgcna",
+            )
         )
 
     tom = np.asarray(tom, dtype=np.float32)

@@ -87,14 +87,24 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
-from sklearn.model_selection import KFold
+try:
+    from sklearn.model_selection import KFold
+except Exception:
+    KFold = None  # type: ignore[assignment]
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
+from janusx._optional_deps import format_missing_dependency_message
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
-from janusx.pyBLUP.ml import MLGS, _HAS_XGBOOST, _XGBOOST_IMPORT_ERROR
+from janusx.pyBLUP.ml import (
+    MLGS,
+    _HAS_SKLEARN,
+    _SKLEARN_IMPORT_ERROR,
+    _HAS_XGBOOST,
+    _XGBOOST_IMPORT_ERROR,
+)
 try:
     from janusx.pyBLUP.blup import BLUP as KernelBLUP, Gmatrix
     _HAS_ADBLUP_PY = True
@@ -345,6 +355,8 @@ def build_cv_splits(
         raise ValueError(f"CV folds ({n_splits}) cannot exceed sample size ({n_samples}).")
 
     try:
+        if KFold is None:
+            raise ImportError("sklearn.model_selection.KFold is unavailable")
         splitter = KFold(
             n_splits=n_splits,
             shuffle=True,
@@ -1825,19 +1837,47 @@ def main(log: bool = True) -> None:
             "--GBLUP/--adBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET."
         )
         raise SystemExit(1)
-    if args.adBLUP and (not _HAS_ADBLUP_PY):
-        logger.error(
-            "adBLUP (JAX backend) is unavailable. "
+    ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
+
+    if ("adBLUP" in methods) and (not _HAS_ADBLUP_PY):
+        methods = [m for m in methods if m != "adBLUP"]
+        logger.warning(
+            "Skip model adBLUP because backend dependency is unavailable. "
             f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
         )
-        raise SystemExit(1)
-    if args.XGB and (not _HAS_XGBOOST):
+
+    if any(m in ml_methods for m in methods) and (not _HAS_SKLEARN):
+        skipped_ml = [m for m in methods if m in ml_methods]
+        methods = [m for m in methods if m not in ml_methods]
+        logger.warning(
+            format_missing_dependency_message(
+                "Skip ML models (RF/ET/GBDT/SVM/ENET/XGB) because scikit-learn is unavailable.",
+                packages=("scikit-learn",),
+                extra="ml",
+                original_error=_SKLEARN_IMPORT_ERROR,
+            )
+        )
+        logger.warning("Skipped models: " + ", ".join(skipped_ml))
+
+    if ("XGB" in methods) and (not _HAS_XGBOOST):
+        methods = [m for m in methods if m != "XGB"]
+        logger.warning(
+            format_missing_dependency_message(
+                "Skip model XGB because xgboost could not be imported.",
+                packages=("xgboost",),
+                extra="ml",
+                original_error=_XGBOOST_IMPORT_ERROR,
+            )
+        )
+
+    if len(methods) == 0:
         logger.error(
-            "XGB is unavailable because xgboost could not be imported. "
-            f"Original import error: {_XGBOOST_IMPORT_ERROR}"
+            "All selected models were skipped due to missing optional dependencies."
         )
         raise SystemExit(1)
-    if args.adBLUP and args.pcd:
+
+    logger.info("Effective models: " + ", ".join(methods))
+    if ("adBLUP" in methods) and args.pcd:
         logger.info("Note: --pcd is ignored for adBLUP.")
 
     # ------------------------------------------------------------------
@@ -1858,15 +1898,15 @@ def main(log: bool = True) -> None:
         task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
 
     samples = sample_ids
-    need_std_geno = bool(args.GBLUP or args.rrBLUP or args.BayesA or args.BayesB or args.BayesCpi)
-    need_raw_geno = bool(args.adBLUP or args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET)
+    need_std_geno = bool(any(m in {"GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
+    need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
     geno_raw = (
         np.asarray(geno, dtype=np.float32, copy=need_std_geno)
         if need_raw_geno
         else None
     )
-    geno_add_raw = geno_raw if args.adBLUP else None
-    geno_ml_raw = geno_raw if (args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET) else None
+    geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+    geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
     if need_std_geno:
         geno = (geno - geno.mean(axis=1, keepdims=True)) / (
             geno.std(axis=1, keepdims=True) + 1e-6
@@ -1906,12 +1946,12 @@ def main(log: bool = True) -> None:
         test_snp_add = None
         train_snp_ml = None
         test_snp_ml = None
-        if args.adBLUP:
+        if "adBLUP" in methods:
             if geno_add_raw is None:
                 raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
             train_snp_add = geno_add_raw[:, trainmask]
             test_snp_add = geno_add_raw[:, testmask]
-        if args.RF or args.ET or args.GBDT or args.XGB or args.SVM or args.ENET:
+        if any(m in ml_methods for m in methods):
             if geno_ml_raw is None:
                 raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
             train_snp_ml = geno_ml_raw[:, trainmask]

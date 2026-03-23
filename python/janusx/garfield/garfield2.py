@@ -5,7 +5,16 @@ from typing import Any, List, Literal, Tuple, Union, Optional
 from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from janusx._optional_deps import format_missing_dependency_message
+try:
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+    _HAS_SKLEARN = True
+    _SKLEARN_IMPORT_ERROR: Exception | None = None
+except Exception as _sklearn_exc:
+    GradientBoostingRegressor = None  # type: ignore[assignment]
+    RandomForestRegressor = None  # type: ignore[assignment]
+    _HAS_SKLEARN = False
+    _SKLEARN_IMPORT_ERROR = _sklearn_exc
 from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
@@ -27,6 +36,19 @@ _TQDM_SPINNER_FRAMES: tuple[str, ...] = ("/", "-", "\\", "|")
 _TQDM_REFRESH_SECONDS = 0.3
 _TQDM_GREEN = "\033[32m"
 _TQDM_RESET = "\033[0m"
+
+
+def _require_sklearn(context: str) -> None:
+    if _HAS_SKLEARN:
+        return
+    raise ImportError(
+        format_missing_dependency_message(
+            f"scikit-learn is required for {context}.",
+            packages=("scikit-learn",),
+            extra="ml",
+            original_error=_SKLEARN_IMPORT_ERROR,
+        )
+    ) from _SKLEARN_IMPORT_ERROR
 
 
 class _TqdmSpinnerAdapter:
@@ -434,6 +456,7 @@ def getLogicgate(
     Find logic combinations (xcombine) in a genotype block using
     random forest + permutation importance + logistic regression.
     """
+    _require_sklearn("GARFIELD core models (rf/gbdt)")
     if sites is not None:
         if len(sites) == 0:
             sites = np.arange(M.shape[0])

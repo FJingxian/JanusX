@@ -611,10 +611,6 @@ impl LowerTriDist {
         })
     }
 
-    fn new(n: usize) -> Result<Self, String> {
-        Self::with_capacity(n)
-    }
-
     #[inline]
     fn capacity(&self) -> usize {
         self.cap
@@ -6808,29 +6804,6 @@ fn best_pair_top_hits(
     }
 }
 
-#[inline]
-fn best_partner_for_row(
-    active: &[usize],
-    dist: &[Vec<f64>],
-    r: &[f64],
-    m: f64,
-    i: usize,
-) -> (f64, usize) {
-    let mut best_q = f64::INFINITY;
-    let mut best_j = i;
-    for &j in active {
-        if j == i {
-            continue;
-        }
-        let q = (m - 2.0) * dist[i][j] - r[i] - r[j];
-        if q < best_q {
-            best_q = q;
-            best_j = j;
-        }
-    }
-    (best_q, best_j)
-}
-
 fn ensure_row_sorted_with_extras(
     i: usize,
     active: &[usize],
@@ -6953,57 +6926,6 @@ fn eval_row_best_q_with_pruning(
         }
     }
     (best_q, best_j)
-}
-
-#[inline]
-fn nearest_by_dist_for_node(dist: &[Vec<f64>], i: usize, active: &[usize]) -> (usize, f64) {
-    let mut best_j = i;
-    let mut best_d = f64::INFINITY;
-    for &j in active {
-        if j == i {
-            continue;
-        }
-        let d = dist[i][j];
-        if d.is_finite() && d < best_d {
-            best_d = d;
-            best_j = j;
-        }
-    }
-    (best_j, best_d)
-}
-
-fn init_nearest_by_dist(
-    dist: &[Vec<f64>],
-    active: &[usize],
-    pool: Option<&ThreadPool>,
-) -> (Vec<usize>, Vec<f64>) {
-    let mut nearest = vec![usize::MAX; dist.len()];
-    let mut nearest_d = vec![f64::INFINITY; dist.len()];
-    if active.len() < 2 {
-        return (nearest, nearest_d);
-    }
-    if let Some(p) = pool {
-        let rows: Vec<(usize, usize, f64)> = p.install(|| {
-            active
-                .par_iter()
-                .map(|&i| {
-                    let (j, d) = nearest_by_dist_for_node(dist, i, active);
-                    (i, j, d)
-                })
-                .collect()
-        });
-        for (i, j, d) in rows {
-            nearest[i] = j;
-            nearest_d[i] = d;
-        }
-    } else {
-        for &i in active {
-            let (j, d) = nearest_by_dist_for_node(dist, i, active);
-            nearest[i] = j;
-            nearest_d[i] = d;
-        }
-    }
-    (nearest, nearest_d)
 }
 
 fn convert_geno_to_alignment_u8(

@@ -1,6 +1,6 @@
 use nalgebra::{DMatrix, SymmetricEigen};
 use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyKeyboardInterrupt;
@@ -17,7 +17,7 @@ const _INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
 #[inline]
 fn _check_ctrlc() -> Result<(), String> {
-    Python::with_gil(|py| py.check_signals())
+    Python::attach(|py| py.check_signals())
         .map_err(|_| _INTERRUPTED_MSG.to_string())
 }
 
@@ -552,7 +552,6 @@ pub fn rsvd_packed_subset(
         tile_cols,
     )?;
     let (mut q, _) = qr_normalize_mgs(&y, n, kp)?;
-    let mut s_y = spectral_proxy_from_columns(&y, n, kp);
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
@@ -604,7 +603,7 @@ pub fn rsvd_packed_subset(
             q = q_new;
             q_is_qr = !used_lu;
         }
-        s_y = spectral_proxy_from_columns(&y, n, kp);
+        let s_y = spectral_proxy_from_columns(&y, n, kp);
 
         if it > 0 {
             let mut max_rel = 0.0_f32;

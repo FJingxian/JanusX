@@ -10,7 +10,6 @@ use pyo3::Bound;
 use pyo3::BoundObject;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -3202,7 +3201,7 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
     py.detach(|| {
         let mut rot_buf = vec![0.0_f32; block_rows * n];
 
-        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
             out_block
                 .par_chunks_mut(out_cols)
                 .enumerate()
@@ -3311,12 +3310,7 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
 
 #[inline]
 fn dot_loop(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut s = 0.0;
-    for i in 0..a.len() {
-        s += a[i] * b[i];
-    }
-    s
+    dot_loop_simd(a, b)
 }
 
 #[inline]
@@ -3341,27 +3335,6 @@ fn dot_loop_unrolled(a: &[f64], b: &[f64]) -> f64 {
         i += 1;
     }
     s
-}
-
-#[inline]
-fn axpy_scaled_unrolled(y: &mut [f64], x: &[f64], alpha: f64) {
-    debug_assert_eq!(y.len(), x.len());
-    if alpha == 0.0 {
-        return;
-    }
-    let n = y.len();
-    let mut i = 0usize;
-    while i + 3 < n {
-        y[i] += x[i] * alpha;
-        y[i + 1] += x[i + 1] * alpha;
-        y[i + 2] += x[i + 2] * alpha;
-        y[i + 3] += x[i + 3] * alpha;
-        i += 4;
-    }
-    while i < n {
-        y[i] += x[i] * alpha;
-        i += 1;
-    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3392,30 +3365,6 @@ unsafe fn dot_loop_avx2(a: &[f64], b: &[f64]) -> f64 {
     s
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn axpy_scaled_avx2(y: &mut [f64], x: &[f64], alpha: f64) {
-    use std::arch::x86_64::{
-        _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_set1_pd, _mm256_storeu_pd,
-    };
-
-    debug_assert_eq!(y.len(), x.len());
-    let n = y.len();
-    let mut i = 0usize;
-    let a = _mm256_set1_pd(alpha);
-    while i + 4 <= n {
-        let vy = unsafe { _mm256_loadu_pd(y.as_ptr().add(i)) };
-        let vx = unsafe { _mm256_loadu_pd(x.as_ptr().add(i)) };
-        let out = _mm256_add_pd(vy, _mm256_mul_pd(vx, a));
-        unsafe { _mm256_storeu_pd(y.as_mut_ptr().add(i), out) };
-        i += 4;
-    }
-    while i < n {
-        y[i] += x[i] * alpha;
-        i += 1;
-    }
-}
-
 #[cfg(target_arch = "aarch64")]
 unsafe fn dot_loop_neon(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::aarch64::{
@@ -3442,29 +3391,6 @@ unsafe fn dot_loop_neon(a: &[f64], b: &[f64]) -> f64 {
     s
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn axpy_scaled_neon(y: &mut [f64], x: &[f64], alpha: f64) {
-    use std::arch::aarch64::{
-        vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64,
-    };
-
-    debug_assert_eq!(y.len(), x.len());
-    let n = y.len();
-    let mut i = 0usize;
-    let a = vdupq_n_f64(alpha);
-    while i + 2 <= n {
-        let vy = unsafe { vld1q_f64(y.as_ptr().add(i)) };
-        let vx = unsafe { vld1q_f64(x.as_ptr().add(i)) };
-        let out = vaddq_f64(vy, vmulq_f64(vx, a));
-        unsafe { vst1q_f64(y.as_mut_ptr().add(i), out) };
-        i += 2;
-    }
-    while i < n {
-        y[i] += x[i] * alpha;
-        i += 1;
-    }
-}
-
 #[inline]
 fn dot_loop_simd(a: &[f64], b: &[f64]) -> f64 {
     #[cfg(target_arch = "x86_64")]
@@ -3479,31 +3405,6 @@ fn dot_loop_simd(a: &[f64], b: &[f64]) -> f64 {
     }
     #[allow(unreachable_code)]
     dot_loop_unrolled(a, b)
-}
-
-#[inline]
-fn axpy_scaled_simd(y: &mut [f64], x: &[f64], alpha: f64) {
-    if alpha == 0.0 {
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                axpy_scaled_avx2(y, x, alpha);
-            }
-            return;
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            axpy_scaled_neon(y, x, alpha);
-        }
-        return;
-    }
-    #[allow(unreachable_code)]
-    axpy_scaled_unrolled(y, x, alpha)
 }
 
 struct AssocScratch {
@@ -3879,7 +3780,7 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
     py.detach(|| {
         let mut rot_buf = vec![0.0_f32; block_rows * n];
 
-        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
             out_block
                 .par_chunks_mut(out_cols)
                 .enumerate()
@@ -4639,7 +4540,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     tau: f64,
     threads: usize,
     model: &str,
-    progress_callback: Option<PyObject>,
+    progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<(f64, f64, f64, Bound<'py, PyArray2<f64>>)> {
     if low >= high {
@@ -5121,13 +5022,13 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
             let done = row_end;
             if let Some(cb) = progress_callback.as_ref() {
-                Python::with_gil(|py2| -> PyResult<()> {
+                Python::attach(|py2| -> PyResult<()> {
                     py2.check_signals()?;
                     cb.call1(py2, (done, m))?;
                     Ok(())
                 })?;
             } else {
-                Python::with_gil(|py2| py2.check_signals())?;
+                Python::attach(|py2| py2.check_signals())?;
             }
         }
         Ok(())
@@ -5135,4 +5036,3 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
     Ok((lbd, ml0, reml0, out))
 }
-

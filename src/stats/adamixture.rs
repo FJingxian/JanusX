@@ -12,7 +12,6 @@ use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -700,7 +699,6 @@ pub fn admx_rsvd_stream<'py>(
     }
     .map_err(PyRuntimeError::new_err)?;
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
-    let mut s_y = vec![0.0_f32; kp];
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
@@ -720,9 +718,8 @@ pub fn admx_rsvd_stream<'py>(
         for idx in 0..(n * kp) {
             y[idx] -= alpha * q[idx];
         }
-        let (q_new, s_new, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+        let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
         q = q_new;
-        s_y = s_new;
 
         if it > 0 {
             let mut max_rel = 0.0_f32;
@@ -893,7 +890,6 @@ pub fn admx_rsvd_stream_sample<'py>(
     }
     .map_err(PyRuntimeError::new_err)?;
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
-    let mut s_y = vec![0.0_f32; kp];
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
@@ -913,9 +909,8 @@ pub fn admx_rsvd_stream_sample<'py>(
         for idx in 0..(n * kp) {
             y[idx] -= alpha * q[idx];
         }
-        let (q_new, s_new, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+        let (q_new, s_y, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
         q = q_new;
-        s_y = s_new;
 
         if it > 0 {
             let mut max_rel = 0.0_f32;

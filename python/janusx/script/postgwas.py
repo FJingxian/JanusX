@@ -620,7 +620,7 @@ def _resolve_merge_series_colors(
     return colors
 
 
-def _natural_tokens(text: str) -> list[tuple[int, object]]:
+def _natural_tokens(text: str) -> tuple[tuple[int, object], ...]:
     tokens: list[tuple[int, object]] = []
     for part in re.split(r"(\d+)", text):
         if not part:
@@ -629,7 +629,8 @@ def _natural_tokens(text: str) -> list[tuple[int, object]]:
             tokens.append((0, int(part)))
         else:
             tokens.append((1, part.lower()))
-    return tokens
+    # Keep sort tokens hashable so they can be used safely in pandas sort keys.
+    return tuple(tokens)
 
 
 def _chrom_sort_key(label: object) -> tuple[int, object]:

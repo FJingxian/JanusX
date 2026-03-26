@@ -477,24 +477,88 @@ jobs:
         shell: bash
         run: |
           git clone "https://x-access-token:${BIOCONDA_PAT}@github.com/${BIOCONDA_FORK}.git" bioconda-recipes
+          cd bioconda-recipes
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/bioconda/bioconda-recipes.git || true
+          git fetch upstream master --depth=1 || true
+          if git show-ref --verify --quiet refs/remotes/upstream/master; then
+            git checkout -B "${BIOCONDA_BRANCH}" upstream/master
+          elif git show-ref --verify --quiet refs/remotes/origin/master; then
+            git checkout -B "${BIOCONDA_BRANCH}" origin/master
+          elif git show-ref --verify --quiet refs/remotes/origin/main; then
+            git checkout -B "${BIOCONDA_BRANCH}" origin/main
+          else
+            git checkout -B "${BIOCONDA_BRANCH}"
+          fi
 
       - name: Update recipe
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           python - <<'PY'
-          import os, re
+          import os
+          from pathlib import Path
+          from textwrap import dedent
+
           version = os.environ["VERSION"]
           sha = os.environ["SHA256"]
           md5 = os.environ["MD5"]
-          path = "bioconda-recipes/recipes/janusx/meta.yaml"
-          text = open(path, "r", encoding="utf-8").read()
-          text = re.sub(r'^\\{\\% set version = ".*" \\%\\}$', f'{{% set version = "{version}" %}}', text, flags=re.M)
-          text = re.sub(r'^  url: .*$', '  url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz', text, flags=re.M)
-          text = re.sub(r'^  sha256: .*$', f'  sha256: {sha}', text, flags=re.M)
-          text = re.sub(r'^  md5: .*$', f'  md5: {md5}', text, flags=re.M)
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(text)
+          path = Path("bioconda-recipes/recipes/janusx/meta.yaml")
+          path.parent.mkdir(parents=True, exist_ok=True)
+
+          text = dedent(f"""\
+          {{% set version = "{version}" %}}
+
+          package:
+            name: janusx
+            version: {{{{ version }}}}
+
+          source:
+            url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{{{ version }}}}.tar.gz
+            sha256: {sha}
+            md5: {md5}
+
+          build:
+            number: 0
+            script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
+
+          requirements:
+            host:
+              - python
+              - pip
+              - maturin >=1.7,<2
+              - setuptools
+            run:
+              - python
+              - numpy
+              - scipy
+              - pandas <3.0
+              - matplotlib
+              - psutil
+              - rich
+              - tqdm
+              - rich-argparse
+              - joblib >=1.5
+
+          test:
+            imports:
+              - janusx
+            commands:
+              - jxpy -h
+
+          about:
+            home: https://github.com/FJingxian/JanusX
+            summary: A suite of genotyping tools for genome-wide association study and genomic selection
+            license: MIT
+            license_file: LICENSE
+
+          extra:
+            recipe-maintainers:
+              - FJingxian
+          """)
+
+          path.write_text(text, encoding="utf-8")
           PY
         env:
           SHA256: ${{ steps.sdist_hash.outputs.sha256 }}
@@ -505,9 +569,6 @@ jobs:
         shell: bash
         run: |
           cd bioconda-recipes
-          git checkout -B "${BIOCONDA_BRANCH}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add recipes/janusx/meta.yaml
           git commit -m "Update janusx to ${VERSION}" || {
             echo "No changes to commit."

@@ -523,12 +523,13 @@ jobs:
             script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
 
           requirements:
+            build:
+              - {{{{ compiler('rust') }}}}
             host:
               - python
               - pip
               - maturin >=1.7,<2
               - setuptools
-              - {{{{ compiler('rust') }}}}
             run:
               - python >=3.9
               - numpy

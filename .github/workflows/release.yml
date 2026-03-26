@@ -582,19 +582,55 @@ jobs:
           GH_TOKEN: ${{ secrets.BIOCONDA_PAT }}
         run: |
           OWNER="${BIOCONDA_FORK%%/*}"
-          pr=$(gh pr list --repo bioconda/bioconda-recipes --head "${OWNER}:${BIOCONDA_BRANCH}" --state open --json number -q '.[0].number')
+          pr="$(gh pr list \
+            --repo bioconda/bioconda-recipes \
+            --search "is:open head:${OWNER}:${BIOCONDA_BRANCH}" \
+            --state open \
+            --json number \
+            -q '.[0].number')"
+
           if [[ -z "${pr}" ]]; then
-            gh pr create \
-              --repo bioconda/bioconda-recipes \
-              --head "${OWNER}:${BIOCONDA_BRANCH}" \
-              --base master \
-              --title "Update janusx to ${VERSION}" \
-              --body "Automated update from JanusX release workflow."
-          else
+            set +e
+            create_out="$(
+              gh pr create \
+                --repo bioconda/bioconda-recipes \
+                --head "${OWNER}:${BIOCONDA_BRANCH}" \
+                --base master \
+                --title "Update janusx to ${VERSION}" \
+                --body "Automated update from JanusX release workflow." 2>&1
+            )"
+            rc=$?
+            set -e
+
+            if [[ $rc -ne 0 ]]; then
+              if echo "$create_out" | grep -qi "already exists"; then
+                echo "[INFO] PR already exists; resolving existing PR number."
+                pr="$(gh pr list \
+                  --repo bioconda/bioconda-recipes \
+                  --search "is:open head:${BIOCONDA_BRANCH}" \
+                  --state open \
+                  --json number \
+                  -q '.[0].number')"
+                [[ -n "${pr}" ]] || {
+                  echo "[WARN] Existing PR detected but number lookup failed."
+                  echo "$create_out"
+                  exit 0
+                }
+              else
+                echo "$create_out"
+                exit $rc
+              fi
+            else
+              echo "$create_out"
+              pr="$(printf '%s\n' "$create_out" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p' | tail -n1)"
+            fi
+          fi
+
+          if [[ -n "${pr}" ]]; then
             gh pr comment \
               --repo bioconda/bioconda-recipes \
               --body "Updated janusx to ${VERSION} via automated release workflow." \
-              "${pr}"
+              "${pr}" || true
           fi
 
   publish-installers:

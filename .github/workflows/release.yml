@@ -467,8 +467,8 @@ jobs:
           md5 = hashlib.md5(data).hexdigest()
           out = os.environ["GITHUB_OUTPUT"]
           with open(out, "a", encoding="utf-8") as f:
-              f.write(f"sha256={sha}\\n")
-              f.write(f"md5={md5}\\n")
+              f.write(f"sha256={sha}\n")
+              f.write(f"md5={md5}\n")
           PY
         id: sdist_hash
 
@@ -502,7 +502,6 @@ jobs:
 
           version = os.environ["VERSION"]
           sha = os.environ["SHA256"]
-          md5 = os.environ["MD5"]
           path = Path("bioconda-recipes/recipes/janusx/meta.yaml")
           path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -516,10 +515,11 @@ jobs:
           source:
             url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{{{ version }}}}.tar.gz
             sha256: {sha}
-            md5: {md5}
 
           build:
             number: 0
+            run_exports:
+              - {{{{ pin_subpackage('janusx', max_pin='x') }}}}
             script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
 
           requirements:
@@ -528,12 +528,13 @@ jobs:
               - pip
               - maturin >=1.7,<2
               - setuptools
+              - {{{{ compiler('rust') }}}}
             run:
-              - python
+              - python >=3.9
               - numpy
               - scipy
               - pandas <3.0
-              - matplotlib
+              - matplotlib-base
               - psutil
               - rich
               - tqdm
@@ -561,7 +562,6 @@ jobs:
           PY
         env:
           SHA256: ${{ steps.sdist_hash.outputs.sha256 }}
-          MD5: ${{ steps.sdist_hash.outputs.md5 }}
 
       - name: Commit and push
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}

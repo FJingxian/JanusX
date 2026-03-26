@@ -559,18 +559,20 @@ Behavior notes:
 
 ### 4.15 `sim`
 
-Quick synthetic generator (legacy positional interface).
+Quick synthetic generator (supports unrelated/family/mixed sample structures).
 
 Usage:
 
 ```bash
 jx sim <nsnp_k> <n_individuals> <outprefix>
+jx sim <nsnp_k> <n_individuals> <outprefix> -structure mixed -chunksize 10000
 ```
 
 Example:
 
 ```bash
 jx sim 10 500 demo/test
+jx sim 250 2500 demo/sim_250k_2500 -structure mixed -chunksize 10000 -seed 1
 ```
 
 Semantics:
@@ -578,6 +580,18 @@ Semantics:
 - `nsnp_k`: SNP count in thousands (`10` -> about 10,000 SNPs)
 - second arg: number of individuals
 - third arg: output prefix
+- optional structure controls:
+  - `-structure {unrelated,family,mixed}` (default: `unrelated`)
+  - family layout is auto-configured internally:
+  - for `mixed`, target family fraction is fixed to `0.8`
+  - family block size is fixed to `4` (2 parents + 2 offspring)
+  - if family samples exist, `<prefix>.family.tsv` is written automatically
+- optional streaming controls:
+  - `-chunksize` (if unset, auto-tuned from sample size)
+- MAF controls:
+  - `-maf-high` (upper bound; lower bound is fixed to `0.02`)
+- phenotype controls:
+  - `-pve`, `-ve`, `-trait-name`, `-na-rate`
 
 ### 4.16 `simulation`
 

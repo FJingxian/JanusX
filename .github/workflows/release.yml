@@ -409,8 +409,21 @@ jobs:
     env:
       BIOCONDA_FORK: FJingxian/bioconda-recipes
       BIOCONDA_BRANCH: update-janusx
+      BIOCONDA_PAT: ${{ secrets.BIOCONDA_PAT }}
     steps:
+      - name: Check Bioconda token
+        id: bioconda_gate
+        shell: bash
+        run: |
+          if [[ -z "${BIOCONDA_PAT:-}" ]]; then
+            echo "::warning::BIOCONDA_PAT secret is not set. Skipping Bioconda PR update."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve release version
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           TAG="${{ github.event.inputs.ref || github.ref_name }}"
@@ -422,6 +435,7 @@ jobs:
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Wait for PyPI sdist
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           python - <<'PY'
@@ -441,6 +455,7 @@ jobs:
           PY
 
       - name: Compute sdist hashes
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           python - <<'PY'
@@ -458,17 +473,13 @@ jobs:
         id: sdist_hash
 
       - name: Checkout bioconda fork
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
-        env:
-          BIOCONDA_PAT: ${{ secrets.BIOCONDA_PAT }}
         run: |
-          if [[ -z "${BIOCONDA_PAT:-}" ]]; then
-            echo "BIOCONDA_PAT secret is not set."
-            exit 1
-          fi
           git clone "https://x-access-token:${BIOCONDA_PAT}@github.com/${BIOCONDA_FORK}.git" bioconda-recipes
 
       - name: Update recipe
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           python - <<'PY'
@@ -490,6 +501,7 @@ jobs:
           MD5: ${{ steps.sdist_hash.outputs.md5 }}
 
       - name: Commit and push
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           cd bioconda-recipes
@@ -504,6 +516,7 @@ jobs:
           git push origin "${BIOCONDA_BRANCH}" --force-with-lease
 
       - name: Create or update PR
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.BIOCONDA_PAT }}

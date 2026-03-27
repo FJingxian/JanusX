@@ -236,9 +236,10 @@ fn bayesb_core_impl(
         let c1 = -0.5 * inv_var_e;
 
         for j in 0..p {
+            let m_j = &m[j * n..(j + 1) * n];
             let mut xe = 0.0;
             for i in 0..n {
-                xe += r[i] * m[j * n + i];
+                xe += r[i] * m_j[i];
             }
             let b = beta[j];
             let d_old = d[j];
@@ -260,16 +261,16 @@ fn bayesb_core_impl(
                 if new_d > d_old {
                     let delta = -b;
                     for i in 0..n {
-                        r[i] += delta * m[j * n + i];
+                        r[i] += delta * m_j[i];
                     }
-                    xe = 0.0;
-                    for i in 0..n {
-                        xe += r[i] * m[j * n + i];
-                    }
+                    // After r <- r - b * m_j, update xe = <r, m_j> algebraically.
+                    // This is equivalent to recomputing the full dot product, but avoids
+                    // an extra O(n) pass on every 0->1 indicator switch.
+                    xe -= b * x2[j];
                 } else {
                     let delta = b;
                     for i in 0..n {
-                        r[i] += delta * m[j * n + i];
+                        r[i] += delta * m_j[i];
                     }
                 }
             }
@@ -286,7 +287,7 @@ fn bayesb_core_impl(
 
                 let delta = b - tmp;
                 for i in 0..n {
-                    r[i] += delta * m[j * n + i];
+                    r[i] += delta * m_j[i];
                 }
                 beta[j] = tmp;
             }
@@ -535,9 +536,10 @@ fn bayescpi_core_impl(
         let c1 = -0.5 * inv_var_e;
 
         for j in 0..p {
+            let m_j = &m[j * n..(j + 1) * n];
             let mut xe = 0.0;
             for i in 0..n {
-                xe += r[i] * m[j * n + i];
+                xe += r[i] * m_j[i];
             }
             let b = beta[j];
             let d_old = d[j];
@@ -559,16 +561,15 @@ fn bayescpi_core_impl(
                 if new_d > d_old {
                     let delta = -b;
                     for i in 0..n {
-                        r[i] += delta * m[j * n + i];
+                        r[i] += delta * m_j[i];
                     }
-                    xe = 0.0;
-                    for i in 0..n {
-                        xe += r[i] * m[j * n + i];
-                    }
+                    // After r <- r - b * m_j, update xe = <r, m_j> algebraically.
+                    // This avoids an extra O(n) dot-product pass when toggling 0->1.
+                    xe -= b * x2[j];
                 } else {
                     let delta = b;
                     for i in 0..n {
-                        r[i] += delta * m[j * n + i];
+                        r[i] += delta * m_j[i];
                     }
                 }
             }
@@ -585,7 +586,7 @@ fn bayescpi_core_impl(
 
                 let delta = b - tmp;
                 for i in 0..n {
-                    r[i] += delta * m[j * n + i];
+                    r[i] += delta * m_j[i];
                 }
                 beta[j] = tmp;
             }

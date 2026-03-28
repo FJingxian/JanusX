@@ -1477,7 +1477,7 @@ def farmcpu(
     rem_jobs: Optional[int] = None,
     sample_indices: Optional[np.ndarray] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
-    return_info: bool = False,
+    return_info: Union[bool, str] = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
     """
     FarmCPU GWAS (Fixed and random model Circulating Probability Unification).
@@ -1538,9 +1538,12 @@ def farmcpu(
     progress_cb : callable or None
         Optional callback receiving `(done_iter, total_iter)` to report
         FarmCPU iteration progress to external UIs (e.g. Rich progress bars).
-    return_info : bool, default False
-        If True, return `(out, info)` where `info` includes summary metadata
-        such as the final pseudo-QTN count.
+    return_info : bool or str, default False
+        Controls optional metadata return:
+          - False: return only `out`
+          - True: return `(out, info)` with summary metadata
+          - "trace": return `(out, info)` and include per-iteration trace under
+            `info["trace"]` for debugging/analysis.
 
     Returns
     -------
@@ -1548,7 +1551,7 @@ def farmcpu(
         Columns: beta, se, p (final iteration).
         P-values for selected QTNs are replaced by their covariate-min p-values.
     (out, info) : tuple, optional
-        Returned when `return_info=True`.
+        Returned when `return_info` requests metadata (e.g., `True` or `"trace"`).
         `info["n_pseudo_qtn"]` is the number of final pseudo-QTNs.
     """
     threads = cpu_count() if threads == -1 else int(threads)
@@ -1614,7 +1617,30 @@ def farmcpu(
     # Add intercept
     X = np.concatenate([np.ones((y.shape[0], 1)), X], axis=1) if X is not None else np.ones((y.shape[0], 1))
 
+    if isinstance(return_info, str):
+        mode = return_info.strip().lower()
+        if mode in ("", "0", "false", "off", "no", "none"):
+            need_info = False
+            collect_trace = False
+        elif mode in ("1", "true", "on", "yes", "summary"):
+            need_info = True
+            collect_trace = False
+        elif mode in ("trace", "full", "debug"):
+            need_info = True
+            collect_trace = True
+        else:
+            raise ValueError(
+                "return_info must be bool or one of: "
+                "'summary' / 'trace' / 'full' / 'debug' / "
+                "'true' / 'false'"
+            )
+    else:
+        need_info = bool(return_info)
+        collect_trace = False
+
     QTNidx = np.array([], dtype=int)
+    qtn_threshold_eff = float(threshold / m)
+    trace_records: list[Dict[str, Any]] = []
 
     for i_iter in range(int(iter)):
         if QTNidx.size > 0:
@@ -1645,6 +1671,18 @@ def farmcpu(
 
         # Stop if no SNP passes threshold
         if np.sum(FEMp <= threshold / m) == 0:
+            if collect_trace:
+                trace_records.append(
+                    {
+                        "iter": int(i_iter + 1),
+                        "status": "stop_no_signal",
+                        "opt_bin_size": None,
+                        "opt_n_qtn_grid": None,
+                        "n_candidate_leads": int(QTNidx.size),
+                        "n_pseudo_qtn": int(QTNidx.size),
+                        "qtn_idx": [int(x) for x in np.asarray(QTNidx, dtype=np.int64).tolist()],
+                    }
+                )
             if progress_cb is not None:
                 progress_cb(i_iter + 1, int(iter))
             break
@@ -1724,12 +1762,25 @@ def farmcpu(
 
         optcombidx = int(np.argmin([l for l, _idx in REMresult]))
         opt_lead = np.asarray(REMresult[optcombidx][1], dtype=int)
-        QTNidx_pre = np.unique(np.concatenate([opt_lead, QTNidx]))
-        if use_rust_packed_super:
+        opt_sz, opt_n = combine_list[optcombidx]
+        qtnidx_union_pre_super = np.unique(np.concatenate([opt_lead, QTNidx]))
+        # Apply p-threshold gate on the unioned pseudo-QTN candidates.
+        # From the second iteration onward, retain previously selected
+        # pseudo-QTNs even when their current p-values exceed the threshold.
+        if qtnidx_union_pre_super.size > 0 and i_iter >= 1:
+            qtn_p = np.asarray(FEMp[qtnidx_union_pre_super], dtype=np.float64)
+            qmask = np.isfinite(qtn_p) & (qtn_p < qtn_threshold_eff)
+            if QTNidx.size > 0:
+                qmask = qmask | np.isin(qtnidx_union_pre_super, QTNidx)
+            qtnidx_union_pre_super = qtnidx_union_pre_super[qmask]
+        if qtnidx_union_pre_super.size == 0:
+            QTNidx_pre = np.array([], dtype=int)
+            keep = np.array([], dtype=np.bool_)
+        elif use_rust_packed_super:
             keep = np.asarray(
                 _farmcpu_super_packed(
-                    np.ascontiguousarray(QTNidx_pre, dtype=np.int64),
-                    np.ascontiguousarray(FEMp[QTNidx_pre], dtype=np.float64),
+                    np.ascontiguousarray(qtnidx_union_pre_super, dtype=np.int64),
+                    np.ascontiguousarray(FEMp[qtnidx_union_pre_super], dtype=np.float64),
                     M_work["packed"],
                     int(M_work["n_samples"]),
                     M_work["row_flip"],
@@ -1741,8 +1792,8 @@ def farmcpu(
         elif use_rust_dense_super:
             keep = np.asarray(
                 _farmcpu_super_dense(
-                    np.ascontiguousarray(QTNidx_pre, dtype=np.int64),
-                    np.ascontiguousarray(FEMp[QTNidx_pre], dtype=np.float64),
+                    np.ascontiguousarray(qtnidx_union_pre_super, dtype=np.int64),
+                    np.ascontiguousarray(FEMp[qtnidx_union_pre_super], dtype=np.float64),
                     M_work,
                 ),
                 dtype=np.bool_,
@@ -1750,11 +1801,41 @@ def farmcpu(
         else:
             corr_rows = _select_snp_rows(
                 M_work,
-                QTNidx_pre,
+                qtnidx_union_pre_super,
                 sample_indices=packed_sample_idx,
             )
-            keep = SUPER(np.corrcoef(corr_rows), FEMp[QTNidx_pre])
-        QTNidx_pre = QTNidx_pre[keep]
+            keep = SUPER(np.corrcoef(corr_rows), FEMp[qtnidx_union_pre_super])
+        if qtnidx_union_pre_super.size > 0:
+            QTNidx_pre = qtnidx_union_pre_super[keep]
+        if collect_trace:
+            rem_grid = []
+            for (grid_sz, grid_n), (grid_score, grid_leadidx) in zip(combine_list, REMresult):
+                rem_grid.append(
+                    {
+                        "bin_size": float(grid_sz),
+                        "n_qtn_grid": int(grid_n),
+                        "score": float(grid_score),
+                        "lead_idx": [int(x) for x in np.asarray(grid_leadidx, dtype=np.int64).tolist()],
+                    }
+                )
+            trace_records.append(
+                {
+                    "iter": int(i_iter + 1),
+                    "status": "converged_no_change" if np.array_equal(QTNidx_pre, QTNidx) else "updated",
+                    "opt_bin_size": float(opt_sz),
+                    "opt_n_qtn_grid": int(opt_n),
+                    "n_candidate_leads": int(opt_lead.size),
+                    "n_pseudo_qtn": int(QTNidx_pre.size),
+                    "qtn_threshold": float(qtn_threshold_eff),
+                    "opt_lead_idx": [int(x) for x in np.asarray(opt_lead, dtype=np.int64).tolist()],
+                    "qtn_idx_before_super": [
+                        int(x) for x in np.asarray(qtnidx_union_pre_super, dtype=np.int64).tolist()
+                    ],
+                    "super_keep_mask": [bool(x) for x in np.asarray(keep, dtype=np.bool_).tolist()],
+                    "qtn_idx": [int(x) for x in np.asarray(QTNidx_pre, dtype=np.int64).tolist()],
+                    "rem_grid": rem_grid,
+                }
+            )
 
         if np.array_equal(QTNidx_pre, QTNidx):
             if progress_cb is not None:
@@ -1815,7 +1896,9 @@ def farmcpu(
             beta_se[qidx, 1] = full[j, base + 1]
 
     out = np.concatenate([beta_se, p.reshape(-1, 1)], axis=1)
-    if return_info:
-        return out, {"n_pseudo_qtn": int(QTNidx.size)}
+    if need_info:
+        info: Dict[str, Any] = {"n_pseudo_qtn": int(QTNidx.size)}
+        if collect_trace:
+            info["trace"] = trace_records
+        return out, info
     return out
-

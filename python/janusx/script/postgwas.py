@@ -417,7 +417,7 @@ def _parse_rgb_triplet(token: str) -> str:
     return mcolors.to_hex([rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0])
 
 
-def _parse_custom_pallete(text: str) -> list[str]:
+def _parse_custom_palette(text: str) -> list[str]:
     colors: list[str] = []
     for token in text.split(";"):
         tok = token.strip()
@@ -430,15 +430,15 @@ def _parse_custom_pallete(text: str) -> list[str]:
             colors.append(mcolors.to_hex(mcolors.to_rgba(tok)))
         except ValueError as e:
             raise ValueError(
-                f"Invalid --pallete color token: {tok}. "
+                f"Invalid --palette color token: {tok}. "
                 "Use #RRGGBB or (R,G,B)."
             ) from e
     if len(colors) == 0:
-        raise ValueError("Invalid --pallete: empty color list.")
+        raise ValueError("Invalid --palette: empty color list.")
     return colors
 
 
-def _expand_single_pallete_color(base_color: str) -> list[str]:
+def _expand_single_palette_color(base_color: str) -> list[str]:
     """
     Expand one color to two colors by grayscale(lightness) direction.
     - dark input  -> generate a darker mate
@@ -460,9 +460,9 @@ def _expand_single_pallete_color(base_color: str) -> list[str]:
     return [light, dark]
 
 
-def _parse_pallete_spec(value: object) -> Optional[Tuple[str, Any]]:
+def _parse_palette_spec(value: object) -> Optional[Tuple[str, Any]]:
     """
-    Parse --pallete into:
+    Parse --palette into:
       - ("cmap", "<matplotlib cmap name>")
       - ("list", ["#hex1", "#hex2", ...])
       - None (use default black/grey)
@@ -471,9 +471,9 @@ def _parse_pallete_spec(value: object) -> Optional[Tuple[str, Any]]:
         return None
     text = str(value).strip()
     if text == "":
-        raise ValueError("Invalid --pallete: value is empty.")
+        raise ValueError("Invalid --palette: value is empty.")
     if ";" in text:
-        return ("list", _parse_custom_pallete(text))
+        return ("list", _parse_custom_palette(text))
     try:
         plt.get_cmap(text)
         return ("cmap", text)
@@ -485,7 +485,7 @@ def _parse_pallete_spec(value: object) -> Optional[Tuple[str, Any]]:
             return ("list", [mcolors.to_hex(mcolors.to_rgba(text))])
         except ValueError as e:
             raise ValueError(
-                f"Invalid --pallete: {text}. "
+                f"Invalid --palette: {text}. "
                 "Use a cmap name (e.g. tab10) or ';'-separated colors."
             ) from e
 
@@ -521,7 +521,7 @@ def _resolve_two_color_style(
     if mode == "list":
         colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
         if len(colors) == 1:
-            colors = _expand_single_pallete_color(colors[0])
+            colors = _expand_single_palette_color(colors[0])
         elif len(colors) != 2:
             return None
     elif mode == "cmap":
@@ -2261,10 +2261,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         pending_manh_path: Optional[str] = None
 
         plot_colors = None
-        two_color_style = _resolve_two_color_style(args.pallete_spec)
+        two_color_style = _resolve_two_color_style(args.palette_spec)
         if plotmodel is not None:
             plot_colors = _manhattan_colors_for_subset(
-                args.pallete_spec,
+                args.palette_spec,
                 full_chr_labels,
                 df[chr_col].drop_duplicates().tolist(),
             )
@@ -3228,8 +3228,8 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     chr_col, pos_col, p_col = args.chr, args.pos, args.pvalue
     logger.info("* Visualizing merged Manhattan plot...")
 
-    series_colors = _resolve_merge_series_colors(args.pallete_spec, len(files))
-    two_color_style = _resolve_two_color_style(args.pallete_spec)
+    series_colors = _resolve_merge_series_colors(args.palette_spec, len(files))
+    two_color_style = _resolve_two_color_style(args.palette_spec)
 
     frames_raw: list[pd.DataFrame] = []
     chrom_sets: list[tuple[int, str, set[str]]] = []
@@ -4088,7 +4088,7 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-pallete", "--pallete", type=str, default=None,
+        "-palette", "--palette", "-pallete", "--pallete", dest="palette", type=str, default=None,
         help=(
             "Manhattan color palette (QQ keeps black/grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
@@ -4192,7 +4192,7 @@ def main():
         raise SystemExit(1)
 
     try:
-        args.pallete_spec = _parse_pallete_spec(args.pallete)
+        args.palette_spec = _parse_palette_spec(args.palette)
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
@@ -4361,16 +4361,16 @@ def main():
         or args.ldblock_ratio is not None
     ):
         if args.merge_mode:
-            if args.pallete_spec is None:
+            if args.palette_spec is None:
                 merge_default_cmap = "tab10" if len(args.merge_files) <= 10 else "tab20"
                 manh_pal_text = f"default ({merge_default_cmap})"
                 qq_pal_text = f"default ({merge_default_cmap})"
             else:
-                manh_pal_text = str(args.pallete)
-                qq_pal_text = str(args.pallete)
+                manh_pal_text = str(args.palette)
+                qq_pal_text = str(args.palette)
         else:
             manh_pal_text = (
-                "default (black/grey)" if args.pallete_spec is None else str(args.pallete)
+                "default (black/grey)" if args.palette_spec is None else str(args.palette)
             )
             qq_pal_text = "default (black/grey)"
         if args.disable_compression:
@@ -4384,11 +4384,11 @@ def main():
             comp_text = "on"
         manh_text = (
             f"ratio={args.manh_ratio if args.manh_ratio is not None else 'off'}, "
-            f"pallete={manh_pal_text}, "
+            f"palette={manh_pal_text}, "
             f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
             f"compression={comp_text}"
         )
-        qq_text = f"auto, pallete={qq_pal_text}"
+        qq_text = f"auto, palette={qq_pal_text}"
         vis_rows = [
             ("Manhattan", manh_text),
             ("QQ", qq_text),

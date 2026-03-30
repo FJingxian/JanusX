@@ -243,14 +243,50 @@ jobs:
           path: ${{ env.PACKAGED_FILE }}
 
   build-wheels:
-    name: Build wheels (${{ matrix.os }} / py${{ matrix.python-version }})
+    name: Build wheels (${{ matrix.label }})
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # abi3 wheel (cp39-abi3) covers CPython 3.9-3.14 on each platform/arch.
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            platform: linux
+            python-version: "3.9"
+            manylinux: "2014"
+            interpreter: /opt/python/cp39-cp39/bin/python
+            target: x86_64-unknown-linux-gnu
+          - label: linux-aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            python-version: "3.9"
+            manylinux: "2014"
+            interpreter: /opt/python/cp39-cp39/bin/python
+            target: aarch64-unknown-linux-gnu
+          - label: macos-x86_64
+            runner: macos-13
+            platform: macos
+            python-version: "3.9"
+            target: x86_64-apple-darwin
+          - label: macos-arm64
+            runner: macos-14
+            platform: macos
+            python-version: "3.9"
+            target: aarch64-apple-darwin
+          - label: windows-x86_64
+            runner: windows-latest
+            platform: windows
+            python-version: "3.9"
+            target: x86_64-pc-windows-msvc
+          # Build Windows ARM64 wheel via cross-target on windows-latest.
+          # If your org has native ARM runners, you can switch runner to windows-11-arm.
+          - label: windows-arm64
+            runner: windows-latest
+            platform: windows
+            python-version: "3.9"
+            target: aarch64-pc-windows-msvc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -272,46 +308,41 @@ jobs:
           command -v python >/dev/null 2>&1 || PY=python3
           $PY scripts/sync_version_from_tag.py "$REF"
 
-      - name: Set up Python
-        if: runner.os != 'Linux'
+      - name: Set up Python (non-Linux)
+        if: ${{ matrix.platform != 'linux' }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up Rust
-        if: runner.os != 'Linux'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install build tools
-        if: runner.os != 'Linux'
+        if: ${{ matrix.platform != 'linux' }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4
 
-      - name: Set Python tag (Linux)
-        if: runner.os == 'Linux'
-        run: echo "PY_TAG=${PYTHON_VERSION/./}" >> $GITHUB_ENV
-        env:
-          PYTHON_VERSION: ${{ matrix.python-version }}
-
       - name: Build wheels (Linux)
-        if: runner.os == 'Linux'
+        if: ${{ matrix.platform == 'linux' }}
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --interpreter /opt/python/cp${{ env.PY_TAG }}-cp${{ env.PY_TAG }}/bin/python
-          manylinux: ${{ (matrix.python-version == '3.13' || matrix.python-version == '3.14') && '2_28' || '2014' }}
+          args: --release --out dist --target ${{ matrix.target }} --interpreter ${{ matrix.interpreter }}
+          manylinux: ${{ matrix.manylinux }}
           python-version: ${{ matrix.python-version }}
 
       - name: Build wheels (macOS/Windows)
-        if: runner.os != 'Linux'
+        if: ${{ matrix.platform != 'linux' }}
         run: |
-          maturin build --release --out dist --interpreter python
+          maturin build --release --out dist --target ${{ matrix.target }} --interpreter python
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: wheels-${{ matrix.label }}
           path: dist/*.whl
 
   build-sdist:

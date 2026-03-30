@@ -240,7 +240,7 @@ def main() -> None:
         help="Annotation window around SNPs in Kb (postgwas).",
     )
     optional_group.add_argument(
-        "-pallete", "--pallete", type=str, default=None,
+        "-palette", "--palette", "-pallete", "--pallete", dest="palette", type=str, default=None,
         help=(
             "Manhattan color palette (QQ keeps black/grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
@@ -446,8 +446,8 @@ def main() -> None:
             cmd.extend(["-a", args.anno])
         if args.annobroaden is not None:
             cmd.extend(["-ab", str(args.annobroaden)])
-        if args.pallete is not None:
-            cmd.extend(["-pallete", args.pallete])
+        if args.palette is not None:
+            cmd.extend(["-palette", args.palette])
 
         _run_subprocess(cmd, logger, "Running postgwas")
 

@@ -8,7 +8,7 @@ name = "janusx"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module"] }
+pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py39"] }
 numpy = "0.27.1"
 csv = "1.4.0"
 flate2 = "1.1.8"

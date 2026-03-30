@@ -64,6 +64,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["svg.hashsalt"] = "hello"
 
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 import numpy as np
 import pandas as pd
 
@@ -83,9 +84,11 @@ DEFAULT_MIN_GQ = 90
 DEFAULT_REF_ALLELE_FREQ = 0.2
 DEFAULT_DEPTH_DIFFERENCE = 150
 DEFAULT_ED_POWER = 4
+DEFAULT_CI_LEVELS = (95.0,)
 DEFAULT_SNPIDX_SCATTER_MAX_POINTS_PER_CHR = 5000
 DEFAULT_RICH_ACTIVE_TASKS = 5
 DEFAULT_MIN_CONTIG_LOCI = 500
+DEFAULT_CHR_BICOLOR = ("#2ca25f", "#fd8d3c")
 SUBPLOT_HEIGHT = 4.5
 
 
@@ -150,6 +153,136 @@ def parse_total_dp(value: str) -> tuple[int, int]:
     raise argparse.ArgumentTypeError(
         "total depth range must be like 30:300, 30-300 or 30,300"
     )
+
+
+def parse_ci_percentile(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid CI percentile: {value}") from exc
+    if not (0.0 < parsed < 100.0):
+        raise argparse.ArgumentTypeError("CI percentile must be within (0, 100).")
+    return parsed
+
+
+def _parse_rgb_triplet(token: str) -> str:
+    text = token.strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        raise ValueError(f"Invalid RGB tuple token: {token}")
+    parts = [p.strip() for p in text[1:-1].split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"RGB tuple must have 3 values: {token}")
+    try:
+        rgb = [int(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(f"RGB tuple must be integers: {token}") from e
+    if any(v < 0 or v > 255 for v in rgb):
+        raise ValueError(f"RGB tuple values must be in [0, 255]: {token}")
+    return mcolors.to_hex([rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0])
+
+
+def _parse_custom_palette(text: str) -> list[str]:
+    colors: list[str] = []
+    for token in text.split(";"):
+        tok = token.strip()
+        if tok == "":
+            continue
+        if tok.startswith("(") and tok.endswith(")"):
+            colors.append(_parse_rgb_triplet(tok))
+            continue
+        try:
+            colors.append(mcolors.to_hex(mcolors.to_rgba(tok)))
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid --palette color token: {tok}. "
+                "Use #RRGGBB or (R,G,B)."
+            ) from e
+    if len(colors) == 0:
+        raise ValueError("Invalid --palette: empty color list.")
+    return colors
+
+
+def _blend_hex_color(c1: str, c2: str, ratio_to_c2: float) -> str:
+    t = float(np.clip(float(ratio_to_c2), 0.0, 1.0))
+    rgb1 = np.asarray(mcolors.to_rgb(c1), dtype=float)
+    rgb2 = np.asarray(mcolors.to_rgb(c2), dtype=float)
+    out = (1.0 - t) * rgb1 + t * rgb2
+    return mcolors.to_hex(out)
+
+
+def _relative_luminance(color: str) -> float:
+    r, g, b = mcolors.to_rgb(color)
+    return float(0.2126 * r + 0.7152 * g + 0.0722 * b)
+
+
+def _expand_single_palette_color(base_color: str) -> list[str]:
+    base = mcolors.to_hex(mcolors.to_rgba(base_color))
+    gray = _relative_luminance(base)
+    if gray < 0.5:
+        light = _blend_hex_color(base, "#ffffff", 0.85)
+        dark = _blend_hex_color(base, "#000000", 0.35)
+    else:
+        light = _blend_hex_color(base, "#ffffff", 0.35)
+        dark = _blend_hex_color(base, "#000000", 0.85)
+    return [light, dark]
+
+
+def _parse_palette_spec(value: object) -> Optional[tuple[str, Any]]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("Invalid --palette: value is empty.")
+    if ";" in text:
+        return ("list", _parse_custom_palette(text))
+    try:
+        plt.get_cmap(text)
+        return ("cmap", text)
+    except ValueError:
+        if text.startswith("(") and text.endswith(")"):
+            return ("list", [_parse_rgb_triplet(text)])
+        try:
+            return ("list", [mcolors.to_hex(mcolors.to_rgba(text))])
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid --palette: {text}. "
+                "Use a cmap name (e.g. tab10) or ';'-separated colors."
+            ) from e
+
+
+def _resolve_chr_colors(
+    palette_spec: Optional[tuple[str, Any]],
+    n_chr: int,
+) -> list[str]:
+    if n_chr <= 0:
+        return []
+    if palette_spec is None:
+        defaults = [mcolors.to_hex(c) for c in DEFAULT_CHR_BICOLOR]
+        return [defaults[i % len(defaults)] for i in range(n_chr)]
+
+    mode, payload = palette_spec
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 0:
+            defaults = [mcolors.to_hex(c) for c in DEFAULT_CHR_BICOLOR]
+            return [defaults[i % len(defaults)] for i in range(n_chr)]
+        if len(colors) == 1:
+            colors = _expand_single_palette_color(colors[0])
+        return [colors[i % len(colors)] for i in range(n_chr)]
+
+    cmap_name = str(payload).strip()
+    cmap = plt.get_cmap(cmap_name)
+    if int(getattr(cmap, "N", 256)) <= 32:
+        bins = max(1, int(cmap.N))
+        return [mcolors.to_hex(cmap(i % bins)) for i in range(n_chr)]
+    return [mcolors.to_hex(cmap(i / max(1, n_chr - 1))) for i in range(n_chr)]
+
+
+def _fmt_percentile(p: float) -> str:
+    v = float(p)
+    if np.isclose(v, round(v)):
+        return str(int(round(v)))
+    return f"{v:g}"
 
 
 def _log_filter_stage(
@@ -1228,6 +1361,8 @@ def plot_bsa(
     subplot_ratio: float,
     ed_power: int,
     window_mb: float,
+    ci_levels: list[float],
+    palette_spec: Optional[tuple[str, Any]],
     logger: logging.Logger,
 ) -> None:
     if raw_df.empty:
@@ -1280,30 +1415,56 @@ def plot_bsa(
         for chr_id, chr_df in smooth_df.groupby("chr", sort=False)
     }
 
-    ed_threshold_90 = np.nanpercentile(raw_df["ED_power"], 90)
-    ed_threshold_95 = np.nanpercentile(raw_df["ED_power"], 95)
-    delta_95 = np.nanpercentile(raw_df[deltaindex_name], 95)
-    delta_90 = np.nanpercentile(raw_df[deltaindex_name], 90)
-    delta_10 = np.nanpercentile(raw_df[deltaindex_name], 10)
-    delta_5 = np.nanpercentile(raw_df[deltaindex_name], 5)
+    ci_levels = sorted({float(x) for x in ci_levels if 0.0 < float(x) < 100.0})
+    if len(ci_levels) == 0:
+        ci_levels = [float(DEFAULT_CI_LEVELS[0])]
+    max_ci = float(max(ci_levels))
 
-    finite_gprime = smooth_df["Gprime"].replace([-np.inf, np.inf], np.nan).dropna().to_numpy(dtype=float)
-    gprime_threshold_90 = np.nan
-    gprime_threshold_95 = np.nan
-    if finite_gprime.size > 0:
-        gprime_threshold_90 = np.nanpercentile(finite_gprime, 90)
-        gprime_threshold_95 = np.nanpercentile(finite_gprime, 95)
+    ed_thresholds: dict[float, float] = {
+        ci: float(np.nanpercentile(raw_df["ED_power"], ci)) for ci in ci_levels
+    }
+    delta_upper_thresholds: dict[float, float] = {
+        ci: float(np.nanpercentile(raw_df[deltaindex_name], ci)) for ci in ci_levels
+    }
+    delta_lower_thresholds: dict[float, float] = {
+        ci: float(np.nanpercentile(raw_df[deltaindex_name], 100.0 - ci)) for ci in ci_levels
+    }
 
-    logger.info(f"Threshold of ED^{ed_power} (90,95): {ed_threshold_90:.4f}, {ed_threshold_95:.4f}")
-    logger.info(f"Threshold of Delta-SNPindex (5,95): {delta_5:.4f}, {delta_95:.4f}")
-    logger.info(f"Threshold of Delta-SNPindex (10,90): {delta_10:.4f}, {delta_90:.4f}")
-    if np.isfinite(gprime_threshold_90):
-        logger.info(f"Threshold of Gprime (90,95): {gprime_threshold_90:.4f}, {gprime_threshold_95:.4f}")
-    else:
-        logger.info("Threshold of Gprime (90,95): NA, NA")
+    finite_gprime = (
+        smooth_df["Gprime"]
+        .replace([-np.inf, np.inf], np.nan)
+        .dropna()
+        .to_numpy(dtype=float)
+    )
+    gprime_thresholds: dict[float, float] = {}
+    for ci in ci_levels:
+        if finite_gprime.size > 0:
+            gprime_thresholds[ci] = float(np.nanpercentile(finite_gprime, ci))
+        else:
+            gprime_thresholds[ci] = float("nan")
+
+    logger.info(
+        "Threshold-region filtering uses max CI percentile: "
+        f"P{_fmt_percentile(max_ci)}"
+    )
+    for ci in ci_levels:
+        ci_txt = _fmt_percentile(ci)
+        low_txt = _fmt_percentile(100.0 - ci)
+        logger.info(f"Threshold of ED^{ed_power} (P{ci_txt}): {ed_thresholds[ci]:.4f}")
+        logger.info(
+            f"Threshold of Delta-SNPindex (P{low_txt},P{ci_txt}): "
+            f"{delta_lower_thresholds[ci]:.4f}, {delta_upper_thresholds[ci]:.4f}"
+        )
+        if np.isfinite(gprime_thresholds[ci]):
+            logger.info(f"Threshold of Gprime (P{ci_txt}): {gprime_thresholds[ci]:.4f}")
+        else:
+            logger.info(f"Threshold of Gprime (P{ci_txt}): NA")
 
     window_half = int(window_mb * 1e6 / 2.0)
     above_threshold = []
+    ed_cut = ed_thresholds[max_ci]
+    delta_upper_cut = delta_upper_thresholds[max_ci]
+    delta_lower_cut = delta_lower_thresholds[max_ci]
     for chr_id in chr_list:
         chr_smooth = smooth_groups.get(chr_id)
         if chr_smooth is None or chr_smooth.empty:
@@ -1312,9 +1473,9 @@ def plot_bsa(
             np.isfinite(chr_smooth["ED_power"])
             & np.isfinite(chr_smooth[deltaindex_name])
             & (
-                (chr_smooth["ED_power"] >= ed_threshold_90)
-                | (chr_smooth[deltaindex_name] >= delta_90)
-                | (chr_smooth[deltaindex_name] <= delta_10)
+                (chr_smooth["ED_power"] >= ed_cut)
+                | (chr_smooth[deltaindex_name] >= delta_upper_cut)
+                | (chr_smooth[deltaindex_name] <= delta_lower_cut)
             )
         )
         for center_raw, ed_val, delta_val in zip(
@@ -1322,7 +1483,7 @@ def plot_bsa(
             chr_smooth.loc[threshold_mask, "ED_power"].to_numpy(dtype=float),
             chr_smooth.loc[threshold_mask, deltaindex_name].to_numpy(dtype=float),
         ):
-            direction = "upper" if delta_val >= delta_90 else "lower"
+            direction = "upper" if delta_val >= delta_upper_cut else "lower"
             center = int(center_raw)
             above_threshold.append(
                 [chr_id, center - window_half, center + window_half, ed_val, delta_val, direction]
@@ -1349,6 +1510,7 @@ def plot_bsa(
         3, 1, figsize=figure_size_from_ratio(3, subplot_ratio), dpi=300, sharex=True
     )
 
+    chr_colors = _resolve_chr_colors(palette_spec, len(chr_list))
     plotted = False
     scatter_total = 0
     scatter_kept = 0
@@ -1358,7 +1520,7 @@ def plot_bsa(
         if chr_raw is None or chr_raw.empty or chr_smooth is None or chr_smooth.empty:
             continue
         plotted = True
-        color = "green" if idx % 2 == 0 else "orange"
+        color = chr_colors[idx % len(chr_colors)] if len(chr_colors) > 0 else "black"
         chr_raw_scatter = downsample_scatter_points(chr_raw)
         scatter_total += chr_raw.shape[0]
         scatter_kept += chr_raw_scatter.shape[0]
@@ -1417,16 +1579,15 @@ def plot_bsa(
     fig_snp.align_labels()
     fig_snp.tight_layout()
 
+    ci_line_colors = [mcolors.to_hex(plt.get_cmap("tab10")(i % 10)) for i in range(len(ci_levels))]
     ax_delta.axhline(y=0, color="grey", linestyle="dashed", linewidth=1)
-    ax_delta.axhline(y=delta_95, color="blue", linewidth=0.8)
-    ax_delta.axhline(y=delta_5, color="blue", linewidth=0.8)
-    ax_delta.axhline(y=delta_90, color="yellow", linewidth=0.8)
-    ax_delta.axhline(y=delta_10, color="yellow", linewidth=0.8)
-    ax_ed.axhline(y=ed_threshold_90, color="yellow", linewidth=0.8)
-    ax_ed.axhline(y=ed_threshold_95, color="blue", linewidth=0.8)
-    if np.isfinite(gprime_threshold_90):
-        ax_gprime.axhline(y=gprime_threshold_90, color="yellow", linewidth=0.8)
-        ax_gprime.axhline(y=gprime_threshold_95, color="blue", linewidth=0.8)
+    for idx, ci in enumerate(ci_levels):
+        line_color = ci_line_colors[idx]
+        ax_delta.axhline(y=delta_upper_thresholds[ci], color=line_color, linewidth=0.9, alpha=0.95)
+        ax_delta.axhline(y=delta_lower_thresholds[ci], color=line_color, linewidth=0.9, alpha=0.95)
+        ax_ed.axhline(y=ed_thresholds[ci], color=line_color, linewidth=0.9, alpha=0.95)
+        if np.isfinite(gprime_thresholds[ci]):
+            ax_gprime.axhline(y=gprime_thresholds[ci], color=line_color, linewidth=0.9, alpha=0.95)
     ax_delta.set_ylabel(f"Delta SNP-index ({bulk2_short}-{bulk1_short})", fontsize=14, fontweight="bold")
     ax_ed.set_ylabel(f"ED^{ed_power}", fontsize=14, fontweight="bold")
     ax_gprime.set_ylabel("Gprime", fontsize=14, fontweight="bold")
@@ -1568,6 +1729,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Power used for ED thresholding and smoothing (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-ci",
+        "--ci",
+        dest="ci",
+        action="append",
+        type=parse_ci_percentile,
+        default=None,
+        help=(
+            "Percentile threshold line(s) for Delta-SNPindex/ED/Gprime. "
+            "Can be provided multiple times, e.g. -ci 95 -ci 99 "
+            "(default: 95). Filtering of threshold regions uses the maximum CI value."
+        ),
+    )
+    optional_group.add_argument(
+        "-palette",
+        "--palette",
+        type=str,
+        default=None,
+        help=(
+            "Chromosome color palette. Supports cmap names (e.g. tab10, tab20) "
+            "or ';'-separated colors (e.g. #1f77b4;#ff7f0e). "
+            "A single color is auto-expanded to a two-color style."
+        ),
+    )
+    optional_group.add_argument(
         "-o",
         "--out",
         type=str,
@@ -1605,6 +1790,11 @@ def main() -> None:
         raise ValueError("--ref-allele-freq must be within [0, 0.5].")
     if args.step is None:
         args.step = args.window * DEFAULT_STEP_RATIO
+    if args.ci is None or len(args.ci) == 0:
+        args.ci = [float(DEFAULT_CI_LEVELS[0])]
+    args.ci = sorted({float(v) for v in args.ci if 0.0 < float(v) < 100.0})
+    if len(args.ci) == 0:
+        args.ci = [float(DEFAULT_CI_LEVELS[0])]
 
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
@@ -1644,6 +1834,11 @@ def main() -> None:
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    try:
+        args.palette_spec = _parse_palette_spec(args.palette)
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
 
     if len(input_files) == 0:
         logger.error(f"No input BSA table matched: {input_hint}")
@@ -1679,6 +1874,8 @@ def main() -> None:
                     ("Ref allele freq", args.ref_allele_freq),
                     ("Depth difference", args.depth_difference),
                     ("ED power", args.ed_power),
+                    ("CI percentiles", ",".join(_fmt_percentile(v) for v in args.ci)),
+                    ("Palette", str(args.palette) if args.palette is not None else "default bicolor"),
                 ],
             )
         ],
@@ -1805,6 +2002,8 @@ def main() -> None:
                     subplot_ratio=args.ratio,
                     ed_power=args.ed_power,
                     window_mb=args.window,
+                    ci_levels=args.ci,
+                    palette_spec=args.palette_spec,
                     logger=logger,
                 )
             except Exception:

@@ -76,7 +76,7 @@ jx -list module
 
 ```bash
 pip install janusx
-# command entry: jxpy (version>=3.14) or jx (version<3.14)
+# command entry: jxpy (version>=1.0.14) or jx (version<1.0.14)
 ```
 
 - If you only need a turnkey CLI environment with pipeline tooling, prefer launcher install.

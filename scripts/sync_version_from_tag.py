@@ -7,6 +7,8 @@ Files synced:
   - pyproject.toml
   - Cargo.toml
   - launcher/Cargo.toml
+  - bioconda-recipes/recipes/janusx/meta.yaml
+  - bioconda-recipes/recipes/janusx-localcheck/meta.yaml
 
 Usage:
   python scripts/sync_version_from_tag.py v1.2.3
@@ -27,6 +29,8 @@ PYPROJECT = ROOT / "pyproject.toml"
 CARGO = ROOT / "Cargo.toml"
 LAUNCHER_CARGO = ROOT / "launcher" / "Cargo.toml"
 JANUSX_CLI = ROOT / "python" / "janusx" / "script" / "JanusX.py"
+BIOCONDA_META = ROOT / "bioconda-recipes" / "recipes" / "janusx" / "meta.yaml"
+BIOCONDA_LOCALCHECK_META = ROOT / "bioconda-recipes" / "recipes" / "janusx-localcheck" / "meta.yaml"
 
 
 def _normalize_tag(tag: str) -> str:
@@ -79,6 +83,20 @@ def _replace_build_date_fallback(path: Path, build_date: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def _replace_recipe_version(path: Path, new_version: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Recipe file not found: {path}")
+    text = path.read_text(encoding="utf-8").lstrip("\ufeff")
+    pattern = r'(\{%\s*set\s+version\s*=\s*")[^"]*("\s*%\})'
+    updated, n = re.subn(pattern, rf"\g<1>{new_version}\2", text, count=1)
+    if n != 1:
+        raise ValueError(
+            f"Cannot find top-level Jinja version declaration in {path}. "
+            "Expected: {% set version = \"...\" %}"
+        )
+    path.write_text(updated, encoding="utf-8")
+
+
 def _git_head_date() -> str:
     try:
         out = subprocess.check_output(
@@ -105,10 +123,14 @@ def main(argv: list[str] | None = None) -> int:
     _replace_section_version(CARGO, "package", version)
     _replace_section_version(LAUNCHER_CARGO, "package", version)
     _replace_build_date_fallback(JANUSX_CLI, build_date)
+    _replace_recipe_version(BIOCONDA_META, version)
+    _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)
     print(
         "Synchronized version/build date:\n"
         f"  version    = {version}\n"
-        f"  build_date = {build_date}"
+        f"  build_date = {build_date}\n"
+        f"  bioconda   = {BIOCONDA_META.relative_to(ROOT)}\n"
+        f"  localcheck = {BIOCONDA_LOCALCHECK_META.relative_to(ROOT)}"
     )
     return 0
 

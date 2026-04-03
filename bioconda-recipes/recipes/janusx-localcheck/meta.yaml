@@ -1,5 +1,5 @@
-﻿{% set name = "janusx" %}
-{% set version = "1.0.15" %}
+{% set name = "janusx" %}
+{% set version = "1.0.17" %}
 
 package:
   name: {{ name|lower }}
@@ -11,11 +11,10 @@ source:
 build:
   number: 0
   skip: true  # [py<39]
-  run_exports:
-    - {{ pin_subpackage(name, max_pin="x.x") }}
 
 requirements:
   build:
+    - {{ stdlib('c') }}
     - {{ compiler('c') }}
     - {{ compiler('rust') }}
     - cargo-bundle-licenses

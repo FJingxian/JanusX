@@ -549,12 +549,11 @@ jobs:
 
           build:
             number: 0
-            run_exports:
-              - {{{{ pin_subpackage('janusx', max_pin='x') }}}}
             script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
 
           requirements:
             build:
+              - {{{{ compiler('c') }}}}
               - {{{{ compiler('rust') }}}}
             host:
               - python
@@ -582,7 +581,7 @@ jobs:
           about:
             home: https://github.com/FJingxian/JanusX
             summary: A suite of genotyping tools for genome-wide association study and genomic selection
-            license: MIT
+            license: AGPL-3.0-or-later
             license_file: LICENSE
 
           extra:
@@ -747,13 +746,13 @@ jobs:
       - name: Commit and push changes
         shell: bash
         run: |
-          if git diff --quiet -- pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py; then
+          if git diff --quiet -- pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml; then
             echo "No version/build-date changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py
+          git add pyproject.toml Cargo.toml launcher/Cargo.toml python/janusx/script/JanusX.py bioconda-recipes/recipes/janusx/meta.yaml bioconda-recipes/recipes/janusx-localcheck/meta.yaml
           git commit -m "chore(release): sync version from ${GITHUB_REF_NAME}"
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin HEAD:"${{ github.event.repository.default_branch }}"

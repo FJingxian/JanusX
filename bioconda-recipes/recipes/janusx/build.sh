@@ -7,12 +7,15 @@ export CARGO_INCREMENTAL=0
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-1}"
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export CARGO_NET_RETRY="${CARGO_NET_RETRY:-6}"
+export CARGO_HTTP_TIMEOUT="${CARGO_HTTP_TIMEOUT:-900}"
+export CARGO_HTTP_LOW_SPEED_LIMIT="${CARGO_HTTP_LOW_SPEED_LIMIT:-1}"
+export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
 
 # Isolate Cargo config from host/global ~/.cargo to avoid accidental mirror overrides
 # (for example stale rsproxy settings on shared HPC nodes).
 export HOME="${PWD}/.home"
 mkdir -p "${HOME}"
-export CARGO_HOME="${PWD}/.cargo-home"
+export CARGO_HOME="${JANUSX_CARGO_HOME:-${PWD}/.cargo-home}"
 mkdir -p "${CARGO_HOME}"
 mkdir -p "${PWD}/.cargo"
 
@@ -37,7 +40,6 @@ git-fetch-with-cli = true
 retry = ${CARGO_NET_RETRY}
 offline = true
 EOF
-  cp "${PWD}/.cargo/config" "${PWD}/.cargo/config.toml"
 
   cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
@@ -72,7 +74,6 @@ registry = "${JANUSX_CARGO_REGISTRY}"
 git-fetch-with-cli = true
 retry = ${CARGO_NET_RETRY}
 EOF
-  cp "${PWD}/.cargo/config" "${PWD}/.cargo/config.toml"
 
   cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
@@ -91,6 +92,9 @@ echo "[build.sh] cargo: $(cargo --version || true)"
 echo "[build.sh] HOME=${HOME}"
 echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
 echo "[build.sh] JANUSX_CARGO_REGISTRY=${JANUSX_CARGO_REGISTRY:-}"
+echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
+echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
+echo "[build.sh] CARGO_HTTP_MULTIPLEXING=${CARGO_HTTP_MULTIPLEXING}"
 echo "[build.sh] project cargo config:"
 cat "${PWD}/.cargo/config"
 

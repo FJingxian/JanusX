@@ -11,10 +11,11 @@ source:
 build:
   number: 0
   skip: true  # [py<39]
+  run_exports:
+    - janusx >=1.0.17,<1.1
 
 requirements:
   build:
-    - {{ stdlib('c') }}
     - {{ compiler('c') }}
     - {{ compiler('rust') }}
     - cargo-bundle-licenses
@@ -33,58 +34,6 @@ requirements:
     - tqdm
     - rich-argparse
     - joblib >=1.5
-
-outputs:
-  - name: janusx-ml
-    build:
-      number: 0
-      noarch: generic
-    requirements:
-      run:
-        - janusx =={{ version }}
-        - scikit-learn
-        - xgboost
-    about:
-      summary: Optional ML dependencies for JanusX (scikit-learn, xgboost)
-
-  - name: janusx-stats
-    build:
-      number: 0
-      noarch: generic
-    requirements:
-      run:
-        - janusx =={{ version }}
-        - statsmodels
-    about:
-      summary: Optional statistical post-analysis dependency for JanusX (statsmodels)
-
-  - name: janusx-sparse
-    build:
-      number: 0
-      noarch: generic
-      skip: true  # [not (linux and x86_64)]
-    requirements:
-      run:
-        - janusx =={{ version }}
-        - mkl
-        - pypardiso
-    about:
-      summary: Optional sparse linear solver dependencies for JanusX (mkl, pypardiso)
-
-  - name: janusx-full
-    build:
-      number: 0
-      noarch: generic
-    requirements:
-      run:
-        - janusx =={{ version }}
-        - scikit-learn
-        - xgboost
-        - statsmodels
-        - mkl  # [linux and x86_64]
-        - pypardiso  # [linux and x86_64]
-    about:
-      summary: Full optional dependency bundle for JanusX
 
 test:
   requires:
@@ -106,11 +55,9 @@ about:
     management, `fastq2vcf`, and `fastq2count`) are intentionally excluded
     from this package scope.
 
-    Optional dependency bundles are provided as separate subpackages:
-      - janusx-ml      (scikit-learn, xgboost)
-      - janusx-stats   (statsmodels)
-      - janusx-sparse  (mkl, pypardiso; linux x86_64)
-      - janusx-full    (all optional bundles)
+    This recipe focuses on the core runtime only. Optional third-party
+    packages (for example scikit-learn, xgboost, statsmodels, pypardiso)
+    should be installed by users on demand according to their workflow.
 
     Note:
       - The Python package `dynamicTreeCut` currently has no conda package in

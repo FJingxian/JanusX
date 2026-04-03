@@ -1,0 +1,50 @@
+name: Bioconda CI
+
+on:
+  pull_request:
+    paths:
+      - "bioconda-recipes/**"
+      - "scripts/sync_version_from_tag.py"
+      - ".github/workflows/bioconda-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint janusx recipe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run bioconda-utils lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint /bin/bash \
+            -e XDG_CACHE_HOME=/tmp \
+            -v "$PWD/bioconda-recipes:/work" \
+            quay.io/bioconda/bioconda-utils-build-env-cos7:latest \
+            -lc "export PATH=/opt/conda/bin:\$PATH; cd /work && /opt/conda/bin/bioconda-utils lint recipes config.yml --packages janusx --full-report"
+
+  build-core:
+    name: Build core recipe (janusx)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build janusx on cos7 build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint /bin/bash \
+            -e XDG_CACHE_HOME=/tmp \
+            -e CARGO_BUILD_JOBS=1 \
+            -e CARGO_INCREMENTAL=0 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
+            -v "$PWD/bioconda-recipes:/work" \
+            quay.io/bioconda/bioconda-utils-build-env-cos7:latest \
+            -lc "export PATH=/opt/conda/bin:\$PATH; cd /work && /opt/conda/bin/bioconda-utils build recipes config.yml --packages janusx --force --disable-live-logs"

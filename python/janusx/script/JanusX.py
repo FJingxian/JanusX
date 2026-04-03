@@ -30,7 +30,8 @@ Modules:
     postbsa       Post-process and visualize BSA results
 
     Pipeline and utility:
-    fastq2vcf     Variant-calling pipeline from FASTQ to VCF (launcher-only)
+    fastq2vcf     Variant-calling pipeline from FASTQ to VCF
+    fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` Rust ML v1)
     adamixture    ADAMIXTURE ancestry inference
     hybrid        Build pairwise hybrid genotype matrix from parent lists
@@ -101,6 +102,7 @@ _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
     "sim", "simulation", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "fastq2vcf", "fastq2count",
 ]
 _LAUNCHER_ONLY_FLAGS = {
     "-update", "--update",
@@ -109,10 +111,7 @@ _LAUNCHER_ONLY_FLAGS = {
     "-upgrade", "--upgrade",
     "-uninstall", "--uninstall",
 }
-_LAUNCHER_ONLY_MODULES = {
-    "fastq2vcf",
-    "fastq2count",
-}
+_LAUNCHER_ONLY_MODULES = set()
 
 def _load_script_module(name: str):
     return importlib.import_module(f"janusx.script.{name}")
@@ -248,7 +247,8 @@ def _print_cli_help() -> None:
     print()
 
     print(f"  {_style_blue('Pipeline and utility:')}")
-    _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF (launcher-only)", 12, width)
+    _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF", 12, width)
+    _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
     _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` Rust ML v1)", 12, width)
     _print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width)
     _print_help_entry(4, "hybrid", "Build pairwise hybrid genotype matrix from parent lists", 12, width)
@@ -296,7 +296,9 @@ def main():
                 sys.argv[0] = f"jx {module_name}"
                 del sys.argv[1]
                 try:
-                    _load_script_module(module_name).main()  # Process of target module
+                    result = _load_script_module(module_name).main()  # Process of target module
+                    if isinstance(result, int):
+                        raise SystemExit(result)
                 except ModuleNotFoundError as exc:
                     msg = format_missing_dependency_for_module(
                         exc.name,

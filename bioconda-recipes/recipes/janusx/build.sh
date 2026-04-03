@@ -10,6 +10,8 @@ export CARGO_NET_RETRY="${CARGO_NET_RETRY:-6}"
 
 # Isolate Cargo config from host/global ~/.cargo to avoid accidental mirror overrides
 # (for example stale rsproxy settings on shared HPC nodes).
+export HOME="${PWD}/.home"
+mkdir -p "${HOME}"
 export CARGO_HOME="${PWD}/.cargo-home"
 mkdir -p "${CARGO_HOME}"
 mkdir -p "${PWD}/.cargo"
@@ -23,7 +25,7 @@ unset CARGO_REGISTRIES_RSPROXY_INDEX || true
 
 if [[ -d "${PWD}/vendor" ]]; then
   # Project-local config has higher priority than parent-directory ~/.cargo config.
-  cat > "${PWD}/.cargo/config.toml" <<EOF
+  cat > "${PWD}/.cargo/config" <<EOF
 [source.crates-io]
 replace-with = "vendored-sources"
 
@@ -35,6 +37,7 @@ git-fetch-with-cli = true
 retry = ${CARGO_NET_RETRY}
 offline = true
 EOF
+  cp "${PWD}/.cargo/config" "${PWD}/.cargo/config.toml"
 
   cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
@@ -50,17 +53,23 @@ offline = true
 EOF
 else
   : "${JANUSX_CARGO_REGISTRY:=sparse+https://index.crates.io/}"
+  export CARGO_REGISTRIES_CRATES_IO_INDEX="${JANUSX_CARGO_REGISTRY}"
 
   # Force crates.io index at project level; avoid defining a second alias source
   # that points to crates-io itself (Cargo treats that as duplicate source).
-  cat > "${PWD}/.cargo/config.toml" <<EOF
+  cat > "${PWD}/.cargo/config" <<EOF
 [source.crates-io]
 registry = "${JANUSX_CARGO_REGISTRY}"
+
+[registries.crates-io]
+index = "${JANUSX_CARGO_REGISTRY}"
+protocol = "sparse"
 
 [net]
 git-fetch-with-cli = true
 retry = ${CARGO_NET_RETRY}
 EOF
+  cp "${PWD}/.cargo/config" "${PWD}/.cargo/config.toml"
 
   cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
@@ -71,6 +80,12 @@ git-fetch-with-cli = true
 retry = 6
 EOF
 fi
+
+echo "[build.sh] cargo: $(cargo --version || true)"
+echo "[build.sh] HOME=${HOME}"
+echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
+echo "[build.sh] project cargo config:"
+cat "${PWD}/.cargo/config"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
 python -m pip install . \

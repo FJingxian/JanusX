@@ -52,7 +52,7 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRY:=sparse+https://mirrors.ustc.edu.cn/crates.io-index/}"
+  : "${JANUSX_CARGO_REGISTRY:=https://mirrors.ustc.edu.cn/crates.io-index}"
   if [[ "${JANUSX_CARGO_REGISTRY}" == *"index.crates.io"* ]]; then
     # Avoid Cargo duplicate-source error when alias source points to canonical crates-io.
     JANUSX_CARGO_REGISTRY="https://github.com/rust-lang/crates.io-index"
@@ -90,6 +90,7 @@ fi
 echo "[build.sh] cargo: $(cargo --version || true)"
 echo "[build.sh] HOME=${HOME}"
 echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
+echo "[build.sh] JANUSX_CARGO_REGISTRY=${JANUSX_CARGO_REGISTRY:-}"
 echo "[build.sh] project cargo config:"
 cat "${PWD}/.cargo/config"
 

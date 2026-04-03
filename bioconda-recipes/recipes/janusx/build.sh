@@ -52,18 +52,21 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRY:=sparse+https://index.crates.io/}"
+  : "${JANUSX_CARGO_REGISTRY:=sparse+https://mirrors.ustc.edu.cn/crates.io-index/}"
+  if [[ "${JANUSX_CARGO_REGISTRY}" == *"index.crates.io"* ]]; then
+    # Avoid Cargo duplicate-source error when alias source points to canonical crates-io.
+    JANUSX_CARGO_REGISTRY="https://github.com/rust-lang/crates.io-index"
+  fi
   export CARGO_REGISTRIES_CRATES_IO_INDEX="${JANUSX_CARGO_REGISTRY}"
 
-  # Force crates.io index at project level; avoid defining a second alias source
-  # that points to crates-io itself (Cargo treats that as duplicate source).
+  # Explicitly override any parent replace-with (such as rsproxy) by setting
+  # crates-io -> janusx-registry at project scope.
   cat > "${PWD}/.cargo/config" <<EOF
 [source.crates-io]
-registry = "${JANUSX_CARGO_REGISTRY}"
+replace-with = "janusx-registry"
 
-[registries.crates-io]
-index = "${JANUSX_CARGO_REGISTRY}"
-protocol = "sparse"
+[source.janusx-registry]
+registry = "${JANUSX_CARGO_REGISTRY}"
 
 [net]
 git-fetch-with-cli = true
@@ -73,6 +76,9 @@ EOF
 
   cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
+replace-with = "janusx-registry"
+
+[source.janusx-registry]
 registry = "${JANUSX_CARGO_REGISTRY}"
 
 [net]

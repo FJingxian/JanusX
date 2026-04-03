@@ -837,48 +837,12 @@ fn check_and_handle_existing_jx_in_path() -> Result<(), String> {
         return Ok(());
     }
 
-    eprintln!("Warning: detected existing `jx` in PATH:");
+    eprintln!("Warning: detected existing `jx` in PATH (kept as-is):");
     for p in &found {
         eprintln!("  {}", p.display());
     }
-
-    loop {
-        print!("Delete existing `jx` and continue? [y/n]: ");
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("Failed to flush stdout: {e}"))?;
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("Failed to read input: {e}"))?;
-        let v = line.trim();
-        if v.eq_ignore_ascii_case("n") {
-            return Err("Installer cancelled.".to_string());
-        }
-        if v.eq_ignore_ascii_case("y") {
-            let mut failed: Vec<String> = Vec::new();
-            let mut cleaned_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-            for p in &found {
-                if let Err(e) = std::fs::remove_file(p) {
-                    failed.push(format!("{} ({e})", p.display()));
-                }
-                if let Some(parent) = p.parent() {
-                    let parent_buf = parent.to_path_buf();
-                    if cleaned_dirs.insert(parent_buf.clone()) {
-                        cleanup_generated_artifacts_in_install_dir(&parent_buf, &mut failed);
-                    }
-                }
-            }
-            if !failed.is_empty() {
-                return Err(format!(
-                    "Failed to delete existing `jx` executable(s):\n{}",
-                    failed.join("\n")
-                ));
-            }
-            println!("Existing `jx` removed from PATH locations.");
-            return Ok(());
-        }
-    }
+    eprintln!("Installer will not delete existing `jx`; continuing setup.");
+    Ok(())
 }
 
 fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut Vec<String>) {
@@ -6128,16 +6092,9 @@ fn print_dim_block(text: &str) {
 }
 
 fn remove_conflicting_jx_entrypoints(python: &Path) {
-    let Some(dir) = python.parent() else {
-        return;
-    };
-    let candidates = ["jx", "jx.exe", "jx-script.py", "jx.cmd", "jx.bat"];
-    for name in candidates {
-        let p = dir.join(name);
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
+    // Keep environment-provided `jx` entrypoints intact.
+    // Launcher install/update should not delete user-managed wrappers.
+    let _ = python;
 }
 
 fn ensure_git_available() -> Result<(), String> {

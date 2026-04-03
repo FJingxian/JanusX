@@ -46,6 +46,7 @@ import sys
 import subprocess
 import importlib
 import os
+import textwrap
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
@@ -116,10 +117,153 @@ _LAUNCHER_ONLY_MODULES = {
 def _load_script_module(name: str):
     return importlib.import_module(f"janusx.script.{name}")
 
-def _print_help() -> None:
+
+def _supports_color() -> bool:
+    """Match launcher behavior: color only when stdout is a terminal."""
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _style_green(text: str) -> str:
+    if _supports_color():
+        return f"\033[32m{text}\033[0m"
+    return text
+
+
+def _style_yellow(text: str) -> str:
+    if _supports_color():
+        return f"\033[33m{text}\033[0m"
+    return text
+
+
+def _style_blue(text: str) -> str:
+    if _supports_color():
+        return f"\033[34m{text}\033[0m"
+    return text
+
+
+def _style_orange(text: str) -> str:
+    if _supports_color():
+        return f"\033[38;5;208m{text}\033[0m"
+    return text
+
+
+def _style_white(text: str) -> str:
+    if _supports_color():
+        return f"\033[37m{text}\033[0m"
+    return text
+
+
+def _help_line_width() -> int:
+    cols = 100
+    val = str(os.environ.get("COLUMNS", "")).strip()
+    if val.isdigit():
+        try:
+            parsed = int(val)
+            if parsed > 0:
+                cols = parsed
+        except Exception:
+            pass
+    return max(48, min(160, cols - 2))
+
+
+def _wrap_help_text(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return [text]
+    wrapped = textwrap.wrap(
+        text,
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    return wrapped if wrapped else [""]
+
+
+def _print_help_entry(indent: int, key: str, desc: str, key_width: int, total_width: int) -> None:
+    lead = " " * indent
+    min_desc_width = 20
+    key_padded = f"{key:<{key_width}}"
+    min_total = indent + key_width + 2 + min_desc_width
+    if total_width <= min_total:
+        print(f"{lead}{_style_green(key)}")
+        for line in _wrap_help_text(desc, max(min_desc_width, total_width - indent - 2)):
+            print(f"{lead}  {_style_white(line)}")
+        return
+
+    desc_width = total_width - indent - key_width - 2
+    wrapped = _wrap_help_text(desc, desc_width)
+    if not wrapped:
+        print(f"{lead}{_style_green(key_padded)}")
+        return
+
+    print(f"{lead}{_style_green(key_padded)}  {_style_white(wrapped[0])}")
+    pad = " " * key_width
+    for line in wrapped[1:]:
+        print(f"{lead}{pad}  {_style_white(line)}")
+
+
+def _print_cli_help() -> None:
+    width = _help_line_width()
     print(__logo__)
-    if __doc__:
-        print(__doc__.strip())
+    print(_style_orange("Usage:"))
+    print(f"  {_style_green('jx [flags]')}")
+    print(f"  {_style_green('jx [module] -h')}")
+    print()
+
+    print(_style_orange("Flags:"))
+    _print_help_entry(2, "-h, --help", "Show this help message", 16, width)
+    _print_help_entry(2, "-v, --version", "Show version/build information", 16, width)
+    print()
+    print(f"  {_style_blue('Launcher-only flags (use `jx`):')}")
+    _print_help_entry(
+        4,
+        "-update/-clean/-list/-upgrade/-uninstall",
+        "Not available in `jxpy`; please use launcher command `jx ...`.",
+        40,
+        width,
+    )
+    print()
+
+    print(_style_orange("Modules:"))
+    print(f"  {_style_blue('Genome-wide Association Studies (GWAS):')}")
+    _print_help_entry(4, "grm", "Build genomic relationship matrix", 12, width)
+    _print_help_entry(4, "pca", "Principal component analysis for population structure", 12, width)
+    _print_help_entry(4, "gwas", "Run genome-wide association analysis", 12, width)
+    _print_help_entry(4, "postgwas", "Post-process GWAS results and downstream plots", 12, width)
+    print()
+
+    print(f"  {_style_blue('Genomic Selection (GS):')}")
+    _print_help_entry(4, "gs", "Genomic prediction and model-based selection", 12, width)
+    _print_help_entry(4, "reml", "Estimate heritability/effect components by REML-BLUP", 12, width)
+    print()
+
+    print(
+        f"  {_style_blue('Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):')}"
+    )
+    _print_help_entry(4, "garfield", "Random-forest based marker-trait association", 12, width)
+    _print_help_entry(4, "postgarfield", "Summarize and visualize GARFIELD outputs", 12, width)
+    print()
+
+    print(f"  {_style_blue('Bulk Segregation Analysis (BSA):')}")
+    _print_help_entry(4, "postbsa", "Post-process and visualize BSA results", 12, width)
+    print()
+
+    print(f"  {_style_blue('Pipeline and utility:')}")
+    _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF (launcher-only)", 12, width)
+    _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` Rust ML v1)", 12, width)
+    _print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width)
+    _print_help_entry(4, "hybrid", "Build pairwise hybrid genotype matrix from parent lists", 12, width)
+    _print_help_entry(4, "gformat", "Convert genotype files across plink/vcf/txt/npy", 12, width)
+    _print_help_entry(4, "gmerge", "Merge genotype/variant tables", 12, width)
+    _print_help_entry(4, "webui", "Start JanusX web UI (postgwas first)", 12, width)
+    print()
+
+    print(f"  {_style_blue('Benchmark:')}")
+    _print_help_entry(4, "sim", "Quick simulation workflow", 12, width)
+    _print_help_entry(4, "simulation", "Extended simulation and benchmarking workflow", 12, width)
+
+
+def _print_help() -> None:
+    _print_cli_help()
 
 
 def main():
@@ -137,15 +281,15 @@ def main():
         elif sys.argv[1] in _LAUNCHER_ONLY_FLAGS:
             print(__logo__)
             launcher_cmd = "jx " + " ".join(sys.argv[1:])
-            print(f"Error: `{sys.argv[1]}` is launcher-only and not available in `jxpy`.")
-            print(f"Please use launcher command: `{launcher_cmd}`")
+            print(_style_yellow(f"Error: `{sys.argv[1]}` is launcher-only and not available in `jxpy`."))
+            print(_style_yellow(f"Please use launcher command: `{launcher_cmd}`"))
         else:
             module_name = sys.argv[1]
             if module_name in _LAUNCHER_ONLY_MODULES:
                 print(__logo__)
                 launcher_cmd = "jx " + " ".join(sys.argv[1:])
-                print(f"Error: module `{module_name}` is launcher-only and not available in `jxpy`.")
-                print(f"Please use launcher command: `{launcher_cmd}`")
+                print(_style_yellow(f"Error: module `{module_name}` is launcher-only and not available in `jxpy`."))
+                print(_style_yellow(f"Please use launcher command: `{launcher_cmd}`"))
                 return
             if module_name in _MODULE_NAMES:
                 # Keep argparse usage as "jx <module> ..."
@@ -167,7 +311,7 @@ def main():
                 except KeyboardInterrupt:
                     force_exit(130, "Interrupted by user (Ctrl+C).")
             elif module_name not in _MODULE_NAMES:
-                print(f"Unknown module: {sys.argv[1]}")
+                print(_style_yellow(f"Unknown module: {sys.argv[1]}"))
                 _print_help()
     else:
         _print_help()

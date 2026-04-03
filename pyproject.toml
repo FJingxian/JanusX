@@ -58,3 +58,4 @@ python-source = "python"
 
 [project.scripts]
 jxpy = "janusx.script.JanusX:main"
+jx = "janusx.script.JanusX:main"

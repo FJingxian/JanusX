@@ -51,12 +51,10 @@ EOF
 else
   : "${JANUSX_CARGO_REGISTRY:=sparse+https://index.crates.io/}"
 
-  # Force direct crates.io (or user-provided mirror) at project level to override rsproxy.
+  # Force crates.io index at project level; avoid defining a second alias source
+  # that points to crates-io itself (Cargo treats that as duplicate source).
   cat > "${PWD}/.cargo/config.toml" <<EOF
 [source.crates-io]
-replace-with = "janusx-direct-crates-io"
-
-[source.janusx-direct-crates-io]
 registry = "${JANUSX_CARGO_REGISTRY}"
 
 [net]

@@ -15,7 +15,10 @@ export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
 # (for example stale rsproxy settings on shared HPC nodes).
 export HOME="${PWD}/.home"
 mkdir -p "${HOME}"
-export CARGO_HOME="${JANUSX_CARGO_HOME:-${PWD}/.cargo-home}"
+if [[ -n "${JANUSX_CARGO_HOME:-}" ]]; then
+  echo "[build.sh] ignore JANUSX_CARGO_HOME=${JANUSX_CARGO_HOME} to keep Cargo config isolated"
+fi
+export CARGO_HOME="${PWD}/.cargo-home"
 mkdir -p "${CARGO_HOME}"
 mkdir -p "${PWD}/.cargo"
 

@@ -12,7 +12,6 @@ build:
   number: 0
   skip: true  # [py<39]
   script_env:
-    - JANUSX_CARGO_HOME
     - JANUSX_CARGO_REGISTRY
     - JANUSX_CARGO_REGISTRIES
     - JANUSX_CARGO_PROBE

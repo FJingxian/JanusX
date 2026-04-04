@@ -11,6 +11,16 @@ source:
 build:
   number: 0
   skip: true  # [py<39]
+  script_env:
+    - JANUSX_CARGO_HOME
+    - JANUSX_CARGO_REGISTRY
+    - JANUSX_CARGO_REGISTRIES
+    - JANUSX_CARGO_PROBE
+    - JANUSX_CARGO_PROBE_TIMEOUT
+    - CARGO_HTTP_TIMEOUT
+    - CARGO_HTTP_LOW_SPEED_LIMIT
+    - CARGO_HTTP_MULTIPLEXING
+    - CARGO_NET_RETRY
   run_exports:
     - janusx >=1.0.17,<1.1
 

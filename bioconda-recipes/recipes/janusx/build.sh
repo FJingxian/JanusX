@@ -54,8 +54,8 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRIES:=https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/}"
-  : "${JANUSX_CARGO_PROBE:=1}"
+  : "${JANUSX_CARGO_REGISTRIES:=sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index}"
+  : "${JANUSX_CARGO_PROBE:=0}"
   : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
 
   if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
@@ -131,9 +131,8 @@ PY
   fi
 
   if [[ -z "${selected_registry}" ]]; then
-    echo "[build.sh][ERROR] no reachable Cargo registry and crate download endpoint"
-    echo "[build.sh][ERROR] set JANUSX_CARGO_REGISTRY manually or vendor crates into ./vendor"
-    exit 2
+    selected_registry="${JANUSX_CARGO_REGISTRY:-${JANUSX_CARGO_REGISTRIES%% *}}"
+    echo "[build.sh][WARN] probe did not find reachable endpoint; fallback to: ${selected_registry}"
   fi
 
   JANUSX_CARGO_REGISTRY="${selected_registry}"

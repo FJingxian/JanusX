@@ -54,16 +54,114 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRY:=https://mirrors.ustc.edu.cn/crates.io-index}"
-  if [[ "${JANUSX_CARGO_REGISTRY}" == *"index.crates.io"* ]]; then
-    # Avoid Cargo duplicate-source error when alias source points to canonical crates-io.
-    JANUSX_CARGO_REGISTRY="https://github.com/rust-lang/crates.io-index"
+  : "${JANUSX_CARGO_REGISTRIES:=https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/}"
+  : "${JANUSX_CARGO_PROBE:=1}"
+  : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
+
+  if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
+    JANUSX_CARGO_REGISTRIES="${JANUSX_CARGO_REGISTRY} ${JANUSX_CARGO_REGISTRIES}"
   fi
+
+  selected_registry=""
+  selected_dl=""
+
+  if [[ "${JANUSX_CARGO_PROBE}" == "1" ]]; then
+    while IFS= read -r candidate; do
+      [[ -n "${candidate}" ]] || continue
+      probe_output="$(python - "${candidate}" "${JANUSX_CARGO_PROBE_TIMEOUT}" <<'PY'
+import json
+import sys
+import urllib.request
+
+candidate = sys.argv[1].strip()
+timeout = float(sys.argv[2])
+index_url = candidate
+if index_url.startswith("sparse+"):
+    index_url = index_url[len("sparse+"):]
+index_url = index_url.rstrip("/")
+cfg_url = f"{index_url}/config.json"
+
+try:
+    req = urllib.request.Request(cfg_url, headers={"User-Agent": "janusx-cargo-probe/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        cfg = json.loads(resp.read().decode("utf-8", errors="replace"))
+except Exception:
+    raise SystemExit(2)
+
+dl = (cfg.get("dl") or "").rstrip("/")
+if not dl:
+    raise SystemExit(3)
+
+probe_url = f"{dl}/adler2/2.0.1/download"
+try:
+    req = urllib.request.Request(
+        probe_url,
+        headers={"User-Agent": "janusx-cargo-probe/1"},
+        method="HEAD",
+    )
+    with urllib.request.urlopen(req, timeout=timeout):
+        pass
+except Exception:
+    try:
+        req = urllib.request.Request(
+            probe_url,
+            headers={"User-Agent": "janusx-cargo-probe/1"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1)
+    except Exception:
+        raise SystemExit(4)
+
+print(f"OK\t{candidate}\t{dl}")
+PY
+      )" || {
+        echo "[build.sh] skip unreachable cargo registry: ${candidate}"
+        continue
+      }
+
+      IFS=$'\t' read -r probe_status probe_registry probe_dl <<< "${probe_output}" || true
+      if [[ "${probe_status}" == "OK" && -n "${probe_registry}" ]]; then
+        selected_registry="${probe_registry}"
+        selected_dl="${probe_dl:-}"
+        break
+      fi
+    done < <(printf '%s\n' ${JANUSX_CARGO_REGISTRIES})
+  else
+    selected_registry="${JANUSX_CARGO_REGISTRY:-${JANUSX_CARGO_REGISTRIES%% *}}"
+  fi
+
+  if [[ -z "${selected_registry}" ]]; then
+    echo "[build.sh][ERROR] no reachable Cargo registry and crate download endpoint"
+    echo "[build.sh][ERROR] set JANUSX_CARGO_REGISTRY manually or vendor crates into ./vendor"
+    exit 2
+  fi
+
+  JANUSX_CARGO_REGISTRY="${selected_registry}"
   export CARGO_REGISTRIES_CRATES_IO_INDEX="${JANUSX_CARGO_REGISTRY}"
 
-  # Explicitly override any parent replace-with (such as rsproxy) by setting
-  # crates-io -> janusx-registry at project scope.
-  cat > "${PWD}/.cargo/config" <<EOF
+  if [[ "${JANUSX_CARGO_REGISTRY}" == *"index.crates.io"* ]]; then
+    # Use crates-io directly (sparse) to avoid duplicate-source conflict.
+    cat > "${PWD}/.cargo/config" <<EOF
+[source.crates-io]
+registry = "sparse+https://index.crates.io/"
+
+[net]
+git-fetch-with-cli = true
+retry = ${CARGO_NET_RETRY}
+EOF
+
+    cat > "${CARGO_HOME}/config.toml" <<EOF
+[source.crates-io]
+registry = "sparse+https://index.crates.io/"
+
+[net]
+git-fetch-with-cli = true
+retry = 6
+EOF
+  else
+    # Explicitly override any parent replace-with (such as rsproxy) by setting
+    # crates-io -> janusx-registry at project scope.
+    cat > "${PWD}/.cargo/config" <<EOF
 [source.crates-io]
 replace-with = "janusx-registry"
 
@@ -75,7 +173,7 @@ git-fetch-with-cli = true
 retry = ${CARGO_NET_RETRY}
 EOF
 
-  cat > "${CARGO_HOME}/config.toml" <<EOF
+    cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
 replace-with = "janusx-registry"
 
@@ -86,12 +184,15 @@ registry = "${JANUSX_CARGO_REGISTRY}"
 git-fetch-with-cli = true
 retry = 6
 EOF
+  fi
 fi
 
 echo "[build.sh] cargo: $(cargo --version || true)"
 echo "[build.sh] HOME=${HOME}"
 echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
 echo "[build.sh] JANUSX_CARGO_REGISTRY=${JANUSX_CARGO_REGISTRY:-}"
+echo "[build.sh] JANUSX_CARGO_REGISTRIES=${JANUSX_CARGO_REGISTRIES:-}"
+echo "[build.sh] selected registry dl=${selected_dl:-unknown}"
 echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
 echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
 echo "[build.sh] CARGO_HTTP_MULTIPLEXING=${CARGO_HTTP_MULTIPLEXING}"

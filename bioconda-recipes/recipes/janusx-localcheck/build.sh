@@ -21,6 +21,7 @@ fi
 export CARGO_HOME="${PWD}/.cargo-home"
 mkdir -p "${CARGO_HOME}"
 mkdir -p "${PWD}/.cargo"
+project_cargo_config="${PWD}/.cargo/config.toml"
 
 # Remove mirror/env overrides inherited from parent shell/session.
 unset CARGO_REGISTRIES_CRATES_IO_INDEX || true
@@ -31,7 +32,7 @@ unset CARGO_REGISTRIES_RSPROXY_INDEX || true
 
 if [[ -d "${PWD}/vendor" ]]; then
   # Project-local config has higher priority than parent-directory ~/.cargo config.
-  cat > "${PWD}/.cargo/config" <<EOF
+  cat > "${project_cargo_config}" <<EOF
 [source.crates-io]
 replace-with = "vendored-sources"
 
@@ -142,10 +143,15 @@ PY
   export CARGO_REGISTRIES_CRATES_IO_INDEX="${JANUSX_CARGO_REGISTRY}"
 
   if [[ "${JANUSX_CARGO_REGISTRY}" == *"index.crates.io"* ]]; then
-    # Use crates-io directly (sparse) to avoid duplicate-source conflict.
-    cat > "${PWD}/.cargo/config" <<EOF
+    # Override any inherited crates-io -> rsproxy replacement explicitly.
+    # Use :443 to avoid Cargo's duplicate-source detection on canonical crates-io.
+    janusx_direct_registry="sparse+https://index.crates.io:443/"
+    cat > "${project_cargo_config}" <<EOF
 [source.crates-io]
-registry = "sparse+https://index.crates.io/"
+replace-with = "janusx-registry"
+
+[source.janusx-registry]
+registry = "${janusx_direct_registry}"
 
 [net]
 git-fetch-with-cli = true
@@ -154,7 +160,10 @@ EOF
 
     cat > "${CARGO_HOME}/config.toml" <<EOF
 [source.crates-io]
-registry = "sparse+https://index.crates.io/"
+replace-with = "janusx-registry"
+
+[source.janusx-registry]
+registry = "${janusx_direct_registry}"
 
 [net]
 git-fetch-with-cli = true
@@ -163,7 +172,7 @@ EOF
   else
     # Explicitly override any parent replace-with (such as rsproxy) by setting
     # crates-io -> janusx-registry at project scope.
-    cat > "${PWD}/.cargo/config" <<EOF
+    cat > "${project_cargo_config}" <<EOF
 [source.crates-io]
 replace-with = "janusx-registry"
 
@@ -199,7 +208,7 @@ echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
 echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
 echo "[build.sh] CARGO_HTTP_MULTIPLEXING=${CARGO_HTTP_MULTIPLEXING}"
 echo "[build.sh] project cargo config:"
-cat "${PWD}/.cargo/config"
+cat "${project_cargo_config}"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
 python -m pip install . \

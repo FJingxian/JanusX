@@ -18,10 +18,19 @@ build:
     - JANUSX_CARGO_REGISTRIES
     - JANUSX_CARGO_PROBE
     - JANUSX_CARGO_PROBE_TIMEOUT
+    - JANUSX_CARGO_PROBE_STRICT
     - CARGO_HTTP_TIMEOUT
     - CARGO_HTTP_LOW_SPEED_LIMIT
     - CARGO_HTTP_MULTIPLEXING
     - CARGO_NET_RETRY
+    - HTTP_PROXY
+    - HTTPS_PROXY
+    - ALL_PROXY
+    - NO_PROXY
+    - http_proxy
+    - https_proxy
+    - all_proxy
+    - no_proxy
   run_exports:
     - janusx >=1.0.17,<1.1
 

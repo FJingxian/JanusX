@@ -61,6 +61,7 @@ else
   : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
   : "${JANUSX_CARGO_PROBE:=1}"
   : "${JANUSX_CARGO_PROBE_TIMEOUT:=10}"
+  : "${JANUSX_CARGO_PROBE_STRICT:=1}"
 
   if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
     JANUSX_CARGO_REGISTRIES="${JANUSX_CARGO_REGISTRY} ${JANUSX_CARGO_REGISTRIES}"
@@ -135,6 +136,11 @@ PY
   fi
 
   if [[ -z "${selected_registry}" ]]; then
+    if [[ "${JANUSX_CARGO_PROBE}" == "1" && "${JANUSX_CARGO_PROBE_STRICT}" == "1" ]]; then
+      echo "[build.sh][ERROR] no reachable cargo registry from: ${JANUSX_CARGO_REGISTRIES}"
+      echo "[build.sh][ERROR] configure HTTP(S)_PROXY/ALL_PROXY or set JANUSX_CARGO_PROBE_STRICT=0 to force fallback"
+      exit 28
+    fi
     selected_registry="${JANUSX_CARGO_REGISTRY:-${JANUSX_CARGO_REGISTRIES%% *}}"
     echo "[build.sh][WARN] probe did not find reachable endpoint; fallback to: ${selected_registry}"
   fi
@@ -207,6 +213,16 @@ echo "[build.sh] selected registry dl=${selected_dl:-unknown}"
 echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
 echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
 echo "[build.sh] CARGO_HTTP_MULTIPLEXING=${CARGO_HTTP_MULTIPLEXING}"
+if [[ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]]; then
+  echo "[build.sh] HTTPS proxy: set"
+else
+  echo "[build.sh] HTTPS proxy: unset"
+fi
+if [[ -n "${ALL_PROXY:-${all_proxy:-}}" ]]; then
+  echo "[build.sh] ALL proxy: set"
+else
+  echo "[build.sh] ALL proxy: unset"
+fi
 echo "[build.sh] project cargo config:"
 cat "${project_cargo_config}"
 

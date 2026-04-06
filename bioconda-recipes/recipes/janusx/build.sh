@@ -60,8 +60,8 @@ EOF
 else
   : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
   : "${JANUSX_CARGO_PROBE:=1}"
-  : "${JANUSX_CARGO_PROBE_TIMEOUT:=10}"
-  : "${JANUSX_CARGO_PROBE_STRICT:=1}"
+  : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
+  : "${JANUSX_CARGO_PROBE_STRICT:=0}"
 
   if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
     JANUSX_CARGO_REGISTRIES="${JANUSX_CARGO_REGISTRY} ${JANUSX_CARGO_REGISTRIES}"
@@ -140,6 +140,10 @@ PY
       echo "[build.sh][ERROR] no reachable cargo registry from: ${JANUSX_CARGO_REGISTRIES}"
       echo "[build.sh][ERROR] configure HTTP(S)_PROXY/ALL_PROXY or set JANUSX_CARGO_PROBE_STRICT=0 to force fallback"
       exit 28
+    fi
+    if [[ "${JANUSX_CARGO_PROBE}" == "1" ]]; then
+      echo "[build.sh][WARN] probe found no reachable endpoint within timeout=${JANUSX_CARGO_PROBE_TIMEOUT}s"
+      echo "[build.sh][WARN] falling back to first registry candidate (set JANUSX_CARGO_PROBE_STRICT=1 to fail-fast)"
     fi
     selected_registry="${JANUSX_CARGO_REGISTRY:-${JANUSX_CARGO_REGISTRIES%% *}}"
     echo "[build.sh][WARN] probe did not find reachable endpoint; fallback to: ${selected_registry}"

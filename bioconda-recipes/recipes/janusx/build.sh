@@ -10,6 +10,44 @@ export CARGO_NET_RETRY="${CARGO_NET_RETRY:-6}"
 export CARGO_HTTP_TIMEOUT="${CARGO_HTTP_TIMEOUT:-900}"
 export CARGO_HTTP_LOW_SPEED_LIMIT="${CARGO_HTTP_LOW_SPEED_LIMIT:-1}"
 export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
+: "${JANUSX_NET_MODE:=auto}"
+
+if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
+  # Force no-proxy direct networking for environments without local proxy.
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY || true
+  unset http_proxy https_proxy all_proxy no_proxy || true
+  unset CARGO_HTTP_PROXY || true
+  if [[ -z "${JANUSX_CARGO_REGISTRY:-}" ]]; then
+    JANUSX_CARGO_REGISTRIES="sparse+https://index.crates.io/"
+  fi
+  echo "[build.sh] network mode: direct"
+else
+  echo "[build.sh] network mode: ${JANUSX_NET_MODE}"
+fi
+
+# Reuse git proxy settings automatically when proxy environment variables are
+# absent (common on shared HPC login/build nodes).
+if [[ "${JANUSX_NET_MODE}" != "direct" && -z "${HTTPS_PROXY:-${https_proxy:-}}" && -z "${HTTP_PROXY:-${http_proxy:-}}" && -z "${ALL_PROXY:-${all_proxy:-}}" ]]; then
+  git_proxy="$(git config --global --get https.proxy 2>/dev/null || true)"
+  if [[ -z "${git_proxy}" ]]; then
+    git_proxy="$(git config --global --get http.proxy 2>/dev/null || true)"
+  fi
+  if [[ -n "${git_proxy}" ]]; then
+    export HTTPS_PROXY="${git_proxy}"
+    export HTTP_PROXY="${git_proxy}"
+    export https_proxy="${git_proxy}"
+    export http_proxy="${git_proxy}"
+    if [[ "${git_proxy}" == socks5* || "${git_proxy}" == socks4* ]]; then
+      export ALL_PROXY="${git_proxy}"
+      export all_proxy="${git_proxy}"
+    fi
+    echo "[build.sh] bootstrap proxy from git config"
+  fi
+fi
+
+if [[ "${JANUSX_NET_MODE}" != "direct" && -z "${CARGO_HTTP_PROXY:-}" && -n "${HTTPS_PROXY:-${https_proxy:-}}" ]]; then
+  export CARGO_HTTP_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
+fi
 
 # Isolate Cargo config from host/global ~/.cargo to avoid accidental mirror overrides
 # (for example stale rsproxy settings on shared HPC nodes).
@@ -58,14 +96,40 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
+  if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
+    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/}"
+  else
+    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
+  fi
   : "${JANUSX_CARGO_PROBE:=1}"
   : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
   : "${JANUSX_CARGO_PROBE_STRICT:=0}"
 
+  if [[ "${JANUSX_CARGO_PROBE_TIMEOUT}" =~ ^[0-9]+$ ]] && (( JANUSX_CARGO_PROBE_TIMEOUT < 20 )); then
+    echo "[build.sh][WARN] JANUSX_CARGO_PROBE_TIMEOUT=${JANUSX_CARGO_PROBE_TIMEOUT} is too small, bump to 20"
+    JANUSX_CARGO_PROBE_TIMEOUT=20
+  fi
+
   if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
     JANUSX_CARGO_REGISTRIES="${JANUSX_CARGO_REGISTRY} ${JANUSX_CARGO_REGISTRIES}"
   fi
+
+  pick_fallback_registry() {
+    local candidate
+    for candidate in ${JANUSX_CARGO_REGISTRIES}; do
+      if [[ "${candidate}" == *"index.crates.io"* ]]; then
+        echo "${candidate}"
+        return
+      fi
+    done
+    for candidate in ${JANUSX_CARGO_REGISTRIES}; do
+      if [[ "${candidate}" == *"rsproxy.cn"* ]]; then
+        echo "${candidate}"
+        return
+      fi
+    done
+    echo "${JANUSX_CARGO_REGISTRIES%% *}"
+  }
 
   selected_registry=""
   selected_dl=""
@@ -143,9 +207,9 @@ PY
     fi
     if [[ "${JANUSX_CARGO_PROBE}" == "1" ]]; then
       echo "[build.sh][WARN] probe found no reachable endpoint within timeout=${JANUSX_CARGO_PROBE_TIMEOUT}s"
-      echo "[build.sh][WARN] falling back to first registry candidate (set JANUSX_CARGO_PROBE_STRICT=1 to fail-fast)"
+      echo "[build.sh][WARN] falling back to preferred registry candidate (set JANUSX_CARGO_PROBE_STRICT=1 to fail-fast)"
     fi
-    selected_registry="${JANUSX_CARGO_REGISTRY:-${JANUSX_CARGO_REGISTRIES%% *}}"
+    selected_registry="${JANUSX_CARGO_REGISTRY:-$(pick_fallback_registry)}"
     echo "[build.sh][WARN] probe did not find reachable endpoint; fallback to: ${selected_registry}"
   fi
 
@@ -211,12 +275,18 @@ fi
 echo "[build.sh] cargo: $(cargo --version || true)"
 echo "[build.sh] HOME=${HOME}"
 echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
+echo "[build.sh] JANUSX_NET_MODE=${JANUSX_NET_MODE}"
 echo "[build.sh] JANUSX_CARGO_REGISTRY=${JANUSX_CARGO_REGISTRY:-}"
 echo "[build.sh] JANUSX_CARGO_REGISTRIES=${JANUSX_CARGO_REGISTRIES:-}"
 echo "[build.sh] selected registry dl=${selected_dl:-unknown}"
 echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
 echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
 echo "[build.sh] CARGO_HTTP_MULTIPLEXING=${CARGO_HTTP_MULTIPLEXING}"
+if [[ -n "${CARGO_HTTP_PROXY:-}" ]]; then
+  echo "[build.sh] CARGO_HTTP_PROXY: set"
+else
+  echo "[build.sh] CARGO_HTTP_PROXY: unset"
+fi
 if [[ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]]; then
   echo "[build.sh] HTTPS proxy: set"
 else

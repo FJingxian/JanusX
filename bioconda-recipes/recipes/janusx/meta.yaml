@@ -14,6 +14,7 @@ build:
   number: 0
   skip: true  # [win or py<39]
   script_env:
+    - JANUSX_NET_MODE
     - JANUSX_CARGO_REGISTRY
     - JANUSX_CARGO_REGISTRIES
     - JANUSX_CARGO_PROBE

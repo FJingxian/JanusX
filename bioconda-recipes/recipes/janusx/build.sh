@@ -58,9 +58,9 @@ retry = 6
 offline = true
 EOF
 else
-  : "${JANUSX_CARGO_REGISTRIES:=sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index}"
-  : "${JANUSX_CARGO_PROBE:=0}"
-  : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
+  : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
+  : "${JANUSX_CARGO_PROBE:=1}"
+  : "${JANUSX_CARGO_PROBE_TIMEOUT:=10}"
 
   if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
     JANUSX_CARGO_REGISTRIES="${JANUSX_CARGO_REGISTRY} ${JANUSX_CARGO_REGISTRIES}"

@@ -17,8 +17,8 @@ if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
   unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY || true
   unset http_proxy https_proxy all_proxy no_proxy || true
   unset CARGO_HTTP_PROXY || true
-  if [[ -z "${JANUSX_CARGO_REGISTRY:-}" ]]; then
-    JANUSX_CARGO_REGISTRIES="sparse+https://index.crates.io/"
+  if [[ -z "${JANUSX_CARGO_REGISTRY:-}" && -z "${JANUSX_CARGO_REGISTRIES:-}" ]]; then
+    JANUSX_CARGO_REGISTRIES="sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index"
   fi
   echo "[build.sh] network mode: direct"
 else
@@ -97,7 +97,7 @@ offline = true
 EOF
 else
   if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
-    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/}"
+    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index}"
   else
     : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
   fi
@@ -116,6 +116,23 @@ else
 
   pick_fallback_registry() {
     local candidate
+    if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
+      for candidate in ${JANUSX_CARGO_REGISTRIES}; do
+        if [[ "${candidate}" == *"rsproxy.cn"* ]]; then
+          echo "${candidate}"
+          return
+        fi
+      done
+      for candidate in ${JANUSX_CARGO_REGISTRIES}; do
+        if [[ "${candidate}" == *"index.crates.io"* ]]; then
+          echo "${candidate}"
+          return
+        fi
+      done
+      echo "${JANUSX_CARGO_REGISTRIES%% *}"
+      return
+    fi
+
     for candidate in ${JANUSX_CARGO_REGISTRIES}; do
       if [[ "${candidate}" == *"index.crates.io"* ]]; then
         echo "${candidate}"

@@ -32,11 +32,12 @@ build:
     - all_proxy
     - no_proxy
   run_exports:
-    - janusx >=1.0.17,<1.1
+    - {{ pin_subpackage('janusx', max_pin='x') }}
 
 requirements:
   build:
     - {{ compiler('c') }}
+    - {{ stdlib('c') }}
     - {{ compiler('rust') }}
     - cargo-bundle-licenses
   host:

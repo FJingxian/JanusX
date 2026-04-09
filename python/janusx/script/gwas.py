@@ -5443,9 +5443,11 @@ def run_farmcpu_fullmem(
         if isinstance(farm_out, tuple):
             res, _farm_info = farm_out
             n_pseudo_qtn = int(_farm_info.get("n_pseudo_qtn", 0))
+            qtn_idx_raw = _farm_info.get("qtn_idx", [])
         else:
             res = farm_out
             n_pseudo_qtn = 0
+            qtn_idx_raw = []
         gwas_secs = max(time.time() - gwas_t0, 0.0)
         res_df = pd.DataFrame(res, columns=["beta", "se", "pwald"])
         res_df['maf'] = maf
@@ -5496,6 +5498,30 @@ def run_farmcpu_fullmem(
         res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
         res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
         saved_paths.append(str(out_tsv))
+
+        # Save final pseudo-QTN SNP list selected by FarmCPU.
+        qtn_idx_list: list[int] = []
+        try:
+            for x in np.asarray(qtn_idx_raw, dtype=np.int64).tolist():
+                xi = int(x)
+                if 0 <= xi < int(res_df.shape[0]):
+                    qtn_idx_list.append(xi)
+        except Exception:
+            qtn_idx_list = []
+        if len(qtn_idx_list) > 0:
+            seen_qtn: set[int] = set()
+            qtn_idx_list = [x for x in qtn_idx_list if not (x in seen_qtn or seen_qtn.add(x))]
+            pseudo_df = res_df.iloc[qtn_idx_list, :].copy().reset_index(drop=True)
+            pseudo_df.insert(0, "qtn_index", qtn_idx_list)
+            pseudo_df.insert(
+                1,
+                "SNP",
+                pseudo_df["chrom"].astype(str).str.strip() + "_" + pseudo_df["pos"].astype(int).astype(str),
+            )
+            pseudo_tsv = os.path.join(outfolder, f"{prefix}.{phename}.farmcpu.pseudo_snp.tsv")
+            pseudo_df.to_csv(pseudo_tsv, sep="\t", index=False)
+            saved_paths.append(str(pseudo_tsv))
+
         _log_model_line(
             logger,
             "FarmCPU",

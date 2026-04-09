@@ -23,6 +23,7 @@ Key features:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
 import os
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -560,13 +562,82 @@ def _resolve_align_runtime(
 
 
 def _find_repo_root() -> Path:
-    # .../python/janusx/script/benchmark.py -> repo root
-    return Path(__file__).resolve().parents[3]
+    here = Path(__file__).resolve()
+    # Prefer a parent that actually contains the R runner in source tree.
+    for base in [here.parent, *here.parents]:
+        if (base / "build" / "gwasx86" / "run_gwas_r_method.R").exists():
+            return base
+    # Fallback: nearest parent with pyproject.toml (source checkout).
+    for base in [here.parent, *here.parents]:
+        if (base / "pyproject.toml").exists():
+            return base
+    # Last resort: keep historical behavior.
+    return here.parents[3]
 
 
 def _resolve_runner_script() -> Path:
-    runner = _find_repo_root() / "build" / "gwasx86" / "run_gwas_r_method.R"
-    return runner
+    override = str(os.environ.get("JANUSX_R_RUNNER", "")).strip()
+    if override:
+        return Path(safe_expanduser(override))
+
+    here = Path(__file__).resolve()
+    env_prefix = Path(sys.prefix).resolve()
+    exe_prefix = Path(sys.executable).resolve().parent.parent
+    cwd = Path.cwd().resolve()
+    candidates = [
+        # Source checkout path.
+        _find_repo_root() / "build" / "gwasx86" / "run_gwas_r_method.R",
+        # Common conda/pip install layouts.
+        here.parents[3] / "build" / "gwasx86" / "run_gwas_r_method.R",
+        env_prefix / "build" / "gwasx86" / "run_gwas_r_method.R",
+        exe_prefix / "build" / "gwasx86" / "run_gwas_r_method.R",
+        # Common local clone layouts.
+        Path.home() / "github" / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
+        Path.home() / "script" / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
+        Path.home() / "JanusX" / "build" / "gwasx86" / "run_gwas_r_method.R",
+        # Legacy/flat fallback near benchmark.py.
+        here.parent / "run_gwas_r_method.R",
+    ]
+    # Try cwd ancestors as lightweight autodiscovery.
+    for base in [cwd, *cwd.parents[:4]]:
+        candidates.append(base / "build" / "gwasx86" / "run_gwas_r_method.R")
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    # Last fallback: download official runner into user cache.
+    cache_dir = Path(safe_expanduser("~/.cache/janusx"))
+    cache_runner = cache_dir / "run_gwas_r_method.R"
+    urls: list[str] = []
+    try:
+        ver = str(importlib.metadata.version("janusx")).strip()
+    except Exception:
+        ver = ""
+    if ver:
+        urls.append(f"https://raw.githubusercontent.com/FJingxian/JanusX/v{ver}/build/gwasx86/run_gwas_r_method.R")
+    urls.extend(
+        [
+            "https://raw.githubusercontent.com/FJingxian/JanusX/main/build/gwasx86/run_gwas_r_method.R",
+            "https://raw.githubusercontent.com/FJingxian/JanusX/master/build/gwasx86/run_gwas_r_method.R",
+        ]
+    )
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "janusx-benchmark/1"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+            if "run_gapit" not in content or "run_rmvp" not in content:
+                continue
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = cache_runner.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(cache_runner)
+            return cache_runner
+        except Exception:
+            continue
+
+    return candidates[0]
 
 
 def _is_executable_file(path: Path) -> bool:

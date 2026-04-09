@@ -1897,7 +1897,10 @@ def farmcpu(
 
     out = np.concatenate([beta_se, p.reshape(-1, 1)], axis=1)
     if need_info:
-        info: Dict[str, Any] = {"n_pseudo_qtn": int(QTNidx.size)}
+        info: Dict[str, Any] = {
+            "n_pseudo_qtn": int(QTNidx.size),
+            "qtn_idx": [int(x) for x in np.asarray(QTNidx, dtype=np.int64).tolist()],
+        }
         if collect_trace:
             info["trace"] = trace_records
         return out, info

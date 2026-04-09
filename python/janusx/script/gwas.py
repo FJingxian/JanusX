@@ -5393,7 +5393,12 @@ def run_farmcpu_fullmem(
         t0 = time.time()
         gwas_t0 = time.time()
         peak_rss = process.memory_info().rss
-        farm_iter = 20
+        farm_iter = max(1, int(getattr(args, "farmcpu_iter", 20)))
+        farm_threshold = float(getattr(args, "farmcpu_threshold", 0.05))
+        farm_qtn_bound_raw = getattr(args, "farmcpu_qtn_bound", None)
+        farm_qtn_bound = None if farm_qtn_bound_raw is None else int(farm_qtn_bound_raw)
+        farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))
+        farm_szbin = [float(x) for x in getattr(args, "farmcpu_bin_size", [5e5, 5e6, 5e7])]
         farm_label = f"FarmCPU-{phename} (n={n_idv})"
         farm_pbar = _ProgressAdapter(
             total=farm_iter,
@@ -5422,6 +5427,10 @@ def run_farmcpu_fullmem(
                 chrlist=ref_alt["chrom"].values,
                 poslist=ref_alt["pos"].values,
                 iter=farm_iter,
+                threshold=farm_threshold,
+                QTNbound=farm_qtn_bound,
+                nbin=farm_nbin,
+                szbin=farm_szbin,
                 threads=args.thread,
                 sample_indices=sample_idx_arg,
                 progress_cb=_farmcpu_progress,
@@ -5509,7 +5518,32 @@ def run_farmcpu_fullmem(
 # CLI
 # ======================================================================
 
-def parse_args():
+
+def _parse_float_csv(raw: str, *, label: str) -> list[float]:
+    vals: list[float] = []
+    for part in str(raw).split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            v = float(s)
+        except Exception as e:
+            raise ValueError(f"{label}: invalid numeric value '{s}'.") from e
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"{label}: values must be finite and > 0.")
+        vals.append(float(v))
+    if len(vals) == 0:
+        raise ValueError(f"{label}: at least one value is required.")
+    return vals
+
+
+def _dev_help_requested(argv: Optional[list[str]] = None) -> bool:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return ("-dev" in tokens) or ("--dev" in tokens)
+
+
+def parse_args(argv: Optional[list[str]] = None):
+    show_dev_help = _dev_help_requested(argv)
     parser = CliArgumentParser(
         prog="jx gwas",
         formatter_class=cli_help_formatter(),
@@ -5517,7 +5551,11 @@ def parse_args():
             "jx gwas -vcf example.vcf.gz -p pheno.tsv -lmm",
             "jx gwas -hmp example.hmp.gz -p pheno.tsv -lmm",
             "jx gwas -bfile example_prefix -p pheno.tsv -lm",
+            "jx gwas -h -dev",
         ]),
+    )
+    parser.add_argument(
+        "-dev", "--dev", action="store_true", default=False, help=argparse.SUPPRESS
     )
 
     required_group = parser.add_argument_group("Required arguments")
@@ -5636,6 +5674,41 @@ def parse_args():
              "Sites with het rate outside [het, 1-het] are removed (default: %(default)s).",
     )
     optional_group.add_argument(
+        "--farmcpu-iter", type=int, default=20,
+        help=(
+            "FarmCPU max iterations (default: %(default)s)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "--farmcpu-threshold", type=float, default=0.05,
+        help=(
+            "FarmCPU global threshold (effective per-marker threshold is threshold/m; default: %(default)s)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "--farmcpu-qtn-bound", type=int, default=None,
+        help=(
+            "Optional FarmCPU QTNbound override (default: auto)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "--farmcpu-nbin", type=int, default=5,
+        help=(
+            "FarmCPU nbin denominator for candidate grid (default: %(default)s)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "--farmcpu-bin-size", type=str, default="500000,5000000,50000000",
+        help=(
+            "FarmCPU szbin CSV (default: %(default)s)."
+            if show_dev_help else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=10_000,
         help="Number of SNPs per chunk for streaming LMM/LM and RSVD mmap sizing "
              "(affects GRM and GWAS; default: %(default)s).",
@@ -5657,7 +5730,7 @@ def parse_args():
         help="Prefix for output files (default: %(default)s).",
     )
 
-    args, extras = parser.parse_known_args()
+    args, extras = parser.parse_known_args(argv)
     has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
@@ -5680,6 +5753,21 @@ def parse_args():
         parser.error(str(e))
     try:
         args.qcov = str(_parse_qcov_dim(args.qcov))
+    except ValueError as e:
+        parser.error(str(e))
+    if int(args.farmcpu_iter) < 1:
+        parser.error("--farmcpu-iter must be >= 1.")
+    if not np.isfinite(float(args.farmcpu_threshold)) or float(args.farmcpu_threshold) <= 0:
+        parser.error("--farmcpu-threshold must be a finite value > 0.")
+    if int(args.farmcpu_nbin) < 1:
+        parser.error("--farmcpu-nbin must be >= 1.")
+    if args.farmcpu_qtn_bound is not None and int(args.farmcpu_qtn_bound) < 1:
+        parser.error("--farmcpu-qtn-bound must be >= 1.")
+    try:
+        args.farmcpu_bin_size = _parse_float_csv(
+            args.farmcpu_bin_size,
+            label="--farmcpu-bin-size",
+        )
     except ValueError as e:
         parser.error(str(e))
     return args
@@ -5761,6 +5849,16 @@ def main(log: bool = True):
             )
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
+        if args.farmcpu:
+            cfg_rows.extend(
+                [
+                    ("FarmCPU iter", int(args.farmcpu_iter)),
+                    ("FarmCPU threshold", float(args.farmcpu_threshold)),
+                    ("FarmCPU nbin", int(args.farmcpu_nbin)),
+                    ("FarmCPU QTNbound", "auto" if args.farmcpu_qtn_bound is None else int(args.farmcpu_qtn_bound)),
+                    ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
+                ]
+            )
         if args.cov:
             cfg_rows.append(("Covariates", "; ".join(args.cov)))
         emit_cli_configuration(

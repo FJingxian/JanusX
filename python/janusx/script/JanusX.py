@@ -42,6 +42,7 @@ Modules:
     Benchmark:
     sim           Quick simulation workflow
     simulation    Extended simulation and benchmarking workflow
+    benchmark     FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)
 '''
 import sys
 import subprocess
@@ -101,7 +102,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
-    "sim", "simulation", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "benchmark", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count",
 ]
 _LAUNCHER_ONLY_FLAGS = {
@@ -260,6 +261,7 @@ def _print_cli_help() -> None:
     print(f"  {_style_blue('Benchmark:')}")
     _print_help_entry(4, "sim", "Quick simulation workflow", 12, width)
     _print_help_entry(4, "simulation", "Extended simulation and benchmarking workflow", 12, width)
+    _print_help_entry(4, "benchmark", "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)", 12, width)
 
 
 def _print_help() -> None:

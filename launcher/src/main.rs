@@ -36,7 +36,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 19] = [
+const KNOWN_MODULES: [&str; 20] = [
     "grm",
     "pca",
     "gwas",
@@ -56,8 +56,9 @@ const KNOWN_MODULES: [&str; 19] = [
     "webui",
     "sim",
     "simulation",
+    "benchmark",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 19] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 20] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -94,6 +95,10 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 19] = [
     (
         "simulation",
         "Extended simulation and benchmarking workflow",
+    ),
+    (
+        "benchmark",
+        "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)",
     ),
 ];
 const MIN_PYTHON_MAJOR: u32 = 3;
@@ -5170,6 +5175,13 @@ fn print_cli_help() {
         4,
         "simulation",
         "Extended simulation and benchmarking workflow",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "benchmark",
+        "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)",
         12,
         width,
     );

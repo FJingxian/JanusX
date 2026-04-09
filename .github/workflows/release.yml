@@ -336,8 +336,16 @@ jobs:
 
       - name: Build wheels (macOS/Windows)
         if: ${{ matrix.platform != 'linux' }}
+        shell: bash
         run: |
-          maturin build --release --out dist --target ${{ matrix.target }} --interpreter python
+          if [[ "${{ matrix.label }}" == "windows-arm64" ]]; then
+            # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
+            export PYO3_CROSS=1
+            export PYO3_CROSS_PYTHON_VERSION=3.9
+            maturin build --release --out dist --target ${{ matrix.target }}
+          else
+            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python
+          fi
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

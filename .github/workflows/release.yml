@@ -266,7 +266,7 @@ jobs:
             interpreter: /opt/python/cp39-cp39/bin/python
             target: aarch64-unknown-linux-gnu
           - label: macos-x86_64
-            runner: macos-13
+            runner: macos-15-intel
             platform: macos
             python-version: "3.9"
             target: x86_64-apple-darwin

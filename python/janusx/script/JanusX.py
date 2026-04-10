@@ -59,7 +59,7 @@ try:
 except PackageNotFoundError:
     v = "0.0.0"
 
-__BUILD_DATE_FALLBACK__ = "2026-04-09"
+__BUILD_DATE_FALLBACK__ = "2026-04-10"
 
 
 def _build_date() -> str:

@@ -529,7 +529,7 @@ def _resolve_align_runtime(
     if mode not in {"legacy", "manuscript"}:
         mode = "manuscript"
 
-    # Fixed rMVP defaults for reproducible benchmark behavior.
+    # Fixed rMVP defaults for reproducible/high-consistency benchmark behavior.
     rmvp_engine = "mvp"
     rmvp_vc_method = "BRENT"
     rmvp_method_bin = "FaST-LMM"
@@ -1231,6 +1231,7 @@ def _run_kernel_r(
         raise FileNotFoundError(f"R runner not found: {runner}")
 
     env = os.environ.copy()
+    rmvp_force_rebuild = "1" if (kernel == "rmvp" and (not bool(getattr(args, "rmvp_reuse_cache", False)))) else "0"
     env.update(
         {
             "JX_RUNNER": str(runner),
@@ -1258,6 +1259,7 @@ def _run_kernel_r(
             "JX_INNER_LOG": str(inner_log),
             "JX_META_FILE": str(meta_file),
             "JX_RSCRIPT_BIN": "",
+            "RMVP_FORCE_REBUILD": rmvp_force_rebuild,
         }
     )
 
@@ -1645,6 +1647,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=False,
         help=("Keep temporary files." if show_dev_help else argparse.SUPPRESS),
     )
+    advanced_group.add_argument(
+        "--rmvp-reuse-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Reuse existing rMVP preprocessing cache (default: rebuild each run for consistency)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
 
     if any(
         (tk == "-trait") or tk.startswith("-trait=") or (tk == "--trait") or tk.startswith("--trait=")
@@ -1835,6 +1847,8 @@ def main() -> None:
         "align_mode": str(align_runtime.mode),
         "rmvp_engine": str(align_runtime.rmvp_engine),
         "rmvp_vc_method": str(align_runtime.rmvp_vc_method),
+        "rmvp_reuse_cache": bool(args.rmvp_reuse_cache),
+        "rmvp_force_rebuild": (not bool(args.rmvp_reuse_cache)),
         "rmvp_method_bin": str(align_runtime.rmvp_method_bin),
         "gapit_method_bin": str(align_runtime.gapit_method_bin),
         "force_pseudo_qtn_cap": (None if args.force_pseudo_qtn_cap is None else int(args.force_pseudo_qtn_cap)),

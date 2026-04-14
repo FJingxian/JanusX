@@ -62,6 +62,7 @@ import argparse
 import sys
 import re
 import math
+import gc
 from collections import OrderedDict
 import multiprocessing as mp
 import queue as queue_mod
@@ -94,7 +95,7 @@ except Exception:
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx._optional_deps import format_missing_dependency_message
-from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
+from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, load_bed_2bit_packed
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
 from janusx.pyBLUP.bayes import BAYES
@@ -158,6 +159,14 @@ _ML_METHOD_MAP: dict[str, str] = {
     "SVM": "svm",
     "ENET": "enet",
 }
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    v = str(os.getenv(name, default)).strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+_GS_DEBUG_STAGE = _env_truthy("JX_GS_DEBUG_STAGE", "0")
 
 
 def _parse_positive_env_int(name: str) -> int | None:
@@ -394,6 +403,15 @@ def _apply_optional_pca(
     return vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
 
 
+def _looks_like_packed_payload(obj: typing.Any) -> bool:
+    return (
+        isinstance(obj, dict)
+        and ("packed" in obj)
+        and ("n_samples" in obj)
+        and ("maf" in obj)
+    )
+
+
 def _tune_ml_method_once(
     method: str,
     Y: np.ndarray,
@@ -439,12 +457,15 @@ def _tune_ml_method_once(
 
 def GSapi(
     Y: np.ndarray,
-    Xtrain: np.ndarray,
-    Xtest: np.ndarray,
+    Xtrain: typing.Any,
+    Xtest: typing.Any,
     method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
     ml_fixed_params: dict[str, typing.Any] | None = None,
+    need_train_pred: bool = True,
+    packed_train_indices: np.ndarray | None = None,
+    packed_test_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -464,6 +485,8 @@ def GSapi(
         PCA is computed on the concatenated matrix [Xtrain, Xtest].
     n_jobs : int, optional
         Thread count for ML models. Non-ML models currently ignore this setting.
+    need_train_pred : bool, optional
+        If False, skip generating train-set predictions when the caller does not need them.
 
     Returns
     -------
@@ -475,7 +498,16 @@ def GSapi(
         Variance-component PVE/h2 for mixed models and Bayes models,
         or predictive PVE (inner-CV R2) for ML models.
     """
-    Xtrain, Xtest = _apply_optional_pca(Xtrain, Xtest, enabled=PCAdec)
+    is_packed_input = _looks_like_packed_payload(Xtrain) or _looks_like_packed_payload(Xtest)
+    if is_packed_input:
+        if PCAdec:
+            raise ValueError("PCAdec is not supported with packed genotype payloads.")
+    else:
+        Xtrain, Xtest = _apply_optional_pca(
+            np.asarray(Xtrain),
+            np.asarray(Xtest),
+            enabled=PCAdec,
+        )
 
     # Multi-kernel additive+dominance BLUP (pyBLUP/JAX backend)
     if method == "adBLUP":
@@ -500,7 +532,10 @@ def GSapi(
         Ghet_train = Gmatrix(ghet_train)
         model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
 
-        yhat_train = model.predict(G=[Gadd_train, Ghet_train])
+        if need_train_pred:
+            yhat_train = model.predict(G=[Gadd_train, Ghet_train])
+        else:
+            yhat_train = np.zeros((0, 1), dtype=float)
         n_train = int(gadd_train.shape[1])
         if int(gadd_test.shape[1]) > 0:
             gadd_all = np.concatenate([gadd_train, gadd_test], axis=1)
@@ -527,13 +562,59 @@ def GSapi(
     # Linear mixed models
     if method in ("GBLUP", "rrBLUP"):
         kinship = 1 if method == "GBLUP" else None
-        model = MLMBLUP(Y.reshape(-1, 1), Xtrain, kinship=kinship)
-        return model.predict(Xtrain), model.predict(Xtest), model.pve
+        if _GS_DEBUG_STAGE:
+            t_fit = time.time()
+            n_train_dbg = int(
+                packed_train_indices.shape[0]
+                if (packed_train_indices is not None)
+                else (Xtrain.shape[1] if not is_packed_input else int(Y.shape[0]))
+            )
+            n_test_dbg = int(
+                packed_test_indices.shape[0]
+                if (packed_test_indices is not None)
+                else (Xtest.shape[1] if not is_packed_input else 0)
+            )
+            n_snp_dbg = int(
+                Xtrain["packed"].shape[0]
+                if _looks_like_packed_payload(Xtrain)
+                else Xtrain.shape[0]
+            )
+            print(
+                f"[GS-DEBUG] GSapi start method={method} "
+                f"n_train={n_train_dbg} n_test={n_test_dbg} n_snp={n_snp_dbg}",
+                flush=True,
+            )
+        model = MLMBLUP(
+            Y.reshape(-1, 1),
+            Xtrain,
+            kinship=kinship,
+            sample_indices=packed_train_indices,
+        )
+        if _GS_DEBUG_STAGE:
+            print(
+                f"[GS-DEBUG] GSapi model_fit_done method={method} "
+                f"elapsed={time.time() - t_fit:.3f}s",
+                flush=True,
+            )
+            t_pred = time.time()
+        if need_train_pred:
+            pred_train = model.predict(Xtrain, sample_indices=packed_train_indices)
+        else:
+            pred_train = np.zeros((0, 1), dtype=float)
+        pred_test = model.predict(Xtest, sample_indices=packed_test_indices)
+        if _GS_DEBUG_STAGE:
+            print(
+                f"[GS-DEBUG] GSapi predict_done method={method} "
+                f"elapsed={time.time() - t_pred:.3f}s",
+                flush=True,
+            )
+        return pred_train, pred_test, model.pve
 
     if method in ("BayesA", "BayesB", "BayesCpi"):
         model = BAYES(Y.reshape(-1, 1), Xtrain, method=method)
         pve = model.pve
-        return model.predict(Xtrain), model.predict(Xtest), pve
+        train_pred = model.predict(Xtrain) if need_train_pred else np.zeros((0, 1), dtype=float)
+        return train_pred, model.predict(Xtest), pve
 
     if method in _ML_METHOD_MAP:
         model = MLGS(
@@ -564,8 +645,8 @@ def GSapi(
 def _run_method_task(
     method: str,
     train_pheno: np.ndarray,
-    train_snp: np.ndarray,
-    test_snp: np.ndarray,
+    train_snp: np.ndarray | None,
+    test_snp: np.ndarray | None,
     train_snp_add: np.ndarray | None,
     test_snp_add: np.ndarray | None,
     train_snp_ml: np.ndarray | None,
@@ -574,6 +655,9 @@ def _run_method_task(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     strict_cv: bool,
+    packed_ctx: dict[str, typing.Any] | None = None,
+    train_sample_indices: np.ndarray | None = None,
+    test_sample_indices: np.ndarray | None = None,
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
     search_progress_hook: typing.Any = None,
@@ -599,7 +683,17 @@ def _run_method_task(
     if cv_splits is not None:
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
             t_fold = time.time()
-            if method == "adBLUP":
+            fold_train_idx_arg = None
+            fold_test_idx_arg = None
+            if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
+                if train_sample_indices is None:
+                    raise ValueError("Packed LMM requires train sample indices.")
+                fold_train = packed_ctx
+                fold_test = packed_ctx
+                fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[train_idx], dtype=np.int64)
+                fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[test_idx], dtype=np.int64)
+                fold_pca = False
+            elif method == "adBLUP":
                 if train_snp_add is None:
                     raise ValueError(f"{method} requires additive raw genotype matrix.")
                 fold_train = train_snp_add[:, train_idx]
@@ -623,6 +717,8 @@ def _run_method_task(
                 PCAdec=fold_pca,
                 n_jobs=n_jobs,
                 ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
+                packed_train_indices=fold_train_idx_arg,
+                packed_test_indices=fold_test_idx_arg,
             )
             if ml_tuning_cache is not None:
                 pve = float(ml_tuning_cache.get("pve", np.nan))
@@ -652,7 +748,17 @@ def _run_method_task(
                 best_test = ttest
                 best_train = ttrain
 
-    if method == "adBLUP":
+    final_train_idx_arg = None
+    final_test_idx_arg = None
+    if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
+        if train_sample_indices is None or test_sample_indices is None:
+            raise ValueError("Packed LMM requires train/test sample indices.")
+        final_train = packed_ctx
+        final_test = packed_ctx
+        final_pca = False
+        final_train_idx_arg = np.ascontiguousarray(train_sample_indices, dtype=np.int64)
+        final_test_idx_arg = np.ascontiguousarray(test_sample_indices, dtype=np.int64)
+    elif method == "adBLUP":
         if train_snp_add is None or test_snp_add is None:
             raise ValueError(f"{method} requires additive raw genotype matrices.")
         final_train = train_snp_add
@@ -677,6 +783,9 @@ def _run_method_task(
         PCAdec=final_pca,
         n_jobs=n_jobs,
         ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
+        need_train_pred=False,
+        packed_train_indices=final_train_idx_arg,
+        packed_test_indices=final_test_idx_arg,
     )
     if ml_tuning_cache is not None:
         pve_final = float(ml_tuning_cache.get("pve", np.nan))
@@ -693,8 +802,8 @@ def _run_method_task(
 def _run_methods_parallel(
     methods: list[str],
     train_pheno: np.ndarray,
-    train_snp: np.ndarray,
-    test_snp: np.ndarray,
+    train_snp: np.ndarray | None,
+    test_snp: np.ndarray | None,
     train_snp_add: np.ndarray | None,
     test_snp_add: np.ndarray | None,
     train_snp_ml: np.ndarray | None,
@@ -703,6 +812,9 @@ def _run_methods_parallel(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     strict_cv: bool,
+    packed_ctx: dict[str, typing.Any] | None = None,
+    train_sample_indices: np.ndarray | None = None,
+    test_sample_indices: np.ndarray | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -864,6 +976,9 @@ def _run_methods_parallel(
                             cv_splits,
                             model_n_jobs,
                             strict_cv,
+                            packed_ctx=packed_ctx,
+                            train_sample_indices=train_sample_indices,
+                            test_sample_indices=test_sample_indices,
                             progress_queue=None,
                             progress_hook=_cv_hook,
                             search_progress_hook=_search_hook,
@@ -1045,6 +1160,9 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         strict_cv,
+                        packed_ctx=packed_ctx,
+                        train_sample_indices=train_sample_indices,
+                        test_sample_indices=test_sample_indices,
                         progress_queue=None,
                         progress_hook=(_cv_hook if enable_tqdm_progress else None),
                         search_progress_hook=(_search_hook if enable_tqdm_progress else None),
@@ -1108,6 +1226,9 @@ def _run_methods_parallel(
                     cv_splits,
                     model_n_jobs,
                     strict_cv,
+                    packed_ctx,
+                    train_sample_indices,
+                    test_sample_indices,
                     None,
                 ): m
                 for m in methods
@@ -1185,6 +1306,9 @@ def _run_methods_parallel(
                             cv_splits,
                             model_n_jobs,
                             strict_cv,
+                            packed_ctx,
+                            train_sample_indices,
+                            test_sample_indices,
                             prog_q,
                         ): m
                         for m in methods
@@ -1273,6 +1397,9 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         strict_cv,
+                        packed_ctx,
+                        train_sample_indices,
+                        test_sample_indices,
                         prog_q,
                     ): m
                     for m in methods
@@ -1317,6 +1444,9 @@ def _run_methods_parallel(
                     cv_splits,
                     model_n_jobs,
                     strict_cv,
+                    packed_ctx,
+                    train_sample_indices,
+                    test_sample_indices,
                     None,
                 ): m
                 for m in methods
@@ -1367,6 +1497,56 @@ def _load_genotype_with_rust_gfreader(
 
     geno = np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
     return np.asarray(sample_ids, dtype=str), geno
+
+
+def _load_plink_packed_for_lmm(
+    genotype_prefix: str,
+    *,
+    maf: float,
+    missing_rate: float,
+) -> tuple[np.ndarray, dict[str, typing.Any]]:
+    """
+    Load PLINK BED in packed format for low-memory LMM/GBLUP.
+
+    Returns
+    -------
+    sample_ids : np.ndarray[str], shape (n_samples,)
+    packed_ctx : dict
+        Keys: packed(uint8), missing_rate(float32), maf(float32), n_samples(int)
+    """
+    sample_ids, _ = inspect_genotype_file(str(genotype_prefix))
+    packed_raw, miss_raw, maf_raw, _std_raw, n_samples = load_bed_2bit_packed(str(genotype_prefix))
+    packed_n = int(n_samples)
+    sample_ids_arr = np.asarray(sample_ids, dtype=str)
+    if packed_n != int(sample_ids_arr.shape[0]):
+        raise ValueError(
+            f"Packed sample size mismatch: packed n={packed_n}, expected {sample_ids_arr.shape[0]}"
+        )
+    miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+    maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+    keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
+    maf_thr = float(maf)
+    if maf_thr > 0.0:
+        keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+    miss_thr = float(missing_rate)
+    if miss_thr < 1.0:
+        keep &= miss_arr <= miss_thr
+    if not np.any(keep):
+        raise ValueError(
+            "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+    if not np.all(keep):
+        packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+        miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
+        maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
+    packed_ctx = {
+        "packed": packed,
+        "missing_rate": miss_arr,
+        "maf": maf_arr,
+        "n_samples": int(packed_n),
+    }
+    return sample_ids_arr, packed_ctx
 
 
 # ======================================================================
@@ -1884,51 +2064,133 @@ def main(log: bool = True) -> None:
     # Load genotype
     # ------------------------------------------------------------------
     gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
-    with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
-        try:
-            sample_ids, geno = _load_genotype_with_rust_gfreader(
-                gfile,
-                maf=args.maf,
-                missing_rate=args.geno,
-            )
-        except Exception:
-            task.fail(f"Loading genotype from {gsrc} ...Failed")
-            raise
-        m, n = geno.shape
-        task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
-
-    samples = sample_ids
-    # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
-    # so we skip global z-score standardization here to avoid redundant work.
-    need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
-    need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
-    geno_raw = (
-        np.asarray(geno, dtype=np.float32, copy=need_std_geno)
-        if need_raw_geno
-        else None
+    use_packed_lmm = bool(
+        args.bfile
+        and len(methods) > 0
+        and all(m in {"GBLUP", "rrBLUP"} for m in methods)
     )
-    geno_add_raw = geno_raw if ("adBLUP" in methods) else None
-    geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
-    if need_std_geno:
-        geno = (geno - geno.mean(axis=1, keepdims=True)) / (
-            geno.std(axis=1, keepdims=True) + 1e-6
-        )  # standardization for marker-effect models
+    packed_lmm_ctx: dict[str, typing.Any] | None = None
+    if use_packed_lmm:
+        with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
+            try:
+                sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
+                    str(gfile),
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
+                )
+            except Exception:
+                task.fail(f"Loading genotype from {gsrc} ...Failed")
+                raise
+            n = int(sample_ids.shape[0])
+            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        samples = sample_ids
+        geno = None
+        geno_raw = None
+        geno_add_raw = None
+        geno_ml_raw = None
+    else:
+        with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
+            try:
+                sample_ids, geno = _load_genotype_with_rust_gfreader(
+                    gfile,
+                    maf=args.maf,
+                    missing_rate=args.geno,
+                )
+            except Exception:
+                task.fail(f"Loading genotype from {gsrc} ...Failed")
+                raise
+            m, n = geno.shape
+            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
+
+        samples = sample_ids
+        # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
+        # so we skip global z-score standardization here to avoid redundant work.
+        need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
+        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        geno_raw = (
+            np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+            if need_raw_geno
+            else None
+        )
+        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
+        if need_std_geno:
+            geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+                geno.std(axis=1, keepdims=True) + 1e-6
+            )  # standardization for marker-effect models
 
     # ------------------------------------------------------------------
     # Genomic Selection for each phenotype
     # ------------------------------------------------------------------
+    single_trait_mode = (pheno.shape[1] == 1)
     for trait_name in pheno.columns:
         logger.info("*" * 60)
         t_trait = time.time()
+        if _GS_DEBUG_STAGE:
+            logger.info(f"[GS-DEBUG][{trait_name}] stage=trait_start")
 
+        t_stage = time.time()
         p = pheno[trait_name]
         namark = p.isna()
-        trainmask = np.isin(samples, p.index[~namark])
-        testmask = ~trainmask
+        if _GS_DEBUG_STAGE:
+            logger.info(
+                f"[GS-DEBUG][{trait_name}] stage=build_na_mask "
+                f"elapsed={time.time() - t_stage:.3f}s"
+            )
 
-        train_snp = geno[:, trainmask]
+        t_stage = time.time()
+        train_id_set = set(p.index[~namark])
+        trainmask = np.fromiter((x in train_id_set for x in samples), dtype=bool, count=len(samples))
+        testmask = ~trainmask
+        if _GS_DEBUG_STAGE:
+            logger.info(
+                f"[GS-DEBUG][{trait_name}] stage=build_train_test_mask "
+                f"train={int(np.sum(trainmask))} test={int(np.sum(testmask))} "
+                f"elapsed={time.time() - t_stage:.3f}s"
+            )
+
+        train_sample_idx = np.flatnonzero(trainmask).astype(np.int64, copy=False)
+        test_sample_idx = np.flatnonzero(testmask).astype(np.int64, copy=False)
+        train_snp = None
+        test_snp = None
+        train_snp_add = None
+        test_snp_add = None
+        train_snp_ml = None
+        test_snp_ml = None
+        if use_packed_lmm:
+            if _GS_DEBUG_STAGE:
+                logger.info(
+                    f"[GS-DEBUG][{trait_name}] stage=build_sample_indices "
+                    f"train={int(train_sample_idx.shape[0])} test={int(test_sample_idx.shape[0])}"
+                )
+        else:
+            t_stage = time.time()
+            assert geno is not None
+            train_snp = geno[:, trainmask]
+            if _GS_DEBUG_STAGE:
+                logger.info(
+                    f"[GS-DEBUG][{trait_name}] stage=slice_train_snp "
+                    f"shape={train_snp.shape} bytes={int(train_snp.nbytes)} "
+                    f"elapsed={time.time() - t_stage:.3f}s"
+                )
+
+        t_stage = time.time()
         train_pheno = p.loc[samples[trainmask]].values.reshape(-1, 1)
-        logger.info(f"* Genomic Selection for trait: {trait_name}\nTrain size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {train_snp.shape[0]}")
+        if _GS_DEBUG_STAGE:
+            logger.info(
+                f"[GS-DEBUG][{trait_name}] stage=align_train_pheno "
+                f"shape={train_pheno.shape} elapsed={time.time() - t_stage:.3f}s"
+            )
+        eff_snp = (
+            int(packed_lmm_ctx["packed"].shape[0])
+            if (use_packed_lmm and packed_lmm_ctx is not None)
+            else int(train_snp.shape[0] if train_snp is not None else 0)
+        )
+        logger.info(
+            f"* Genomic Selection for trait: {trait_name}\n"
+            f"Train size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {eff_snp}"
+        )
 
         if train_pheno.size == 0:
             logger.warning(f"No non-missing phenotypes for trait {trait_name}; skipped.")
@@ -1938,26 +2200,42 @@ def main(log: bool = True) -> None:
         cv_splits = None
         if args.cv is not None:
             cv_splits = build_cv_splits(
-                n_samples=train_snp.shape[1],
+                n_samples=int(train_sample_idx.shape[0]),
                 n_splits=int(args.cv),
                 seed=42,
             )
 
-        test_snp = geno[:, testmask]
-        train_snp_add = None
-        test_snp_add = None
-        train_snp_ml = None
-        test_snp_ml = None
-        if "adBLUP" in methods:
-            if geno_add_raw is None:
-                raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
-            train_snp_add = geno_add_raw[:, trainmask]
-            test_snp_add = geno_add_raw[:, testmask]
-        if any(m in ml_methods for m in methods):
-            if geno_ml_raw is None:
-                raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
-            train_snp_ml = geno_ml_raw[:, trainmask]
-            test_snp_ml = geno_ml_raw[:, testmask]
+        if not use_packed_lmm:
+            t_stage = time.time()
+            assert geno is not None
+            test_snp = geno[:, testmask]
+            if _GS_DEBUG_STAGE:
+                logger.info(
+                    f"[GS-DEBUG][{trait_name}] stage=slice_test_snp "
+                    f"shape={test_snp.shape} bytes={int(test_snp.nbytes)} "
+                    f"elapsed={time.time() - t_stage:.3f}s"
+                )
+            if "adBLUP" in methods:
+                if geno_add_raw is None:
+                    raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
+                train_snp_add = geno_add_raw[:, trainmask]
+                test_snp_add = geno_add_raw[:, testmask]
+            if any(m in ml_methods for m in methods):
+                if geno_ml_raw is None:
+                    raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
+                train_snp_ml = geno_ml_raw[:, trainmask]
+                test_snp_ml = geno_ml_raw[:, testmask]
+        if single_trait_mode and (not use_packed_lmm):
+            # In single-trait runs, release full matrices once train/test views are materialized.
+            # This avoids carrying an extra full-genotype buffer through model fitting.
+            geno = np.empty((0, 0), dtype=np.float32)
+            geno_raw = None
+            geno_add_raw = None
+            geno_ml_raw = None
+            gc.collect()
+            if _GS_DEBUG_STAGE:
+                logger.info(f"[GS-DEBUG][{trait_name}] stage=release_full_geno done=1")
+        t_stage = time.time()
         method_results = _run_methods_parallel(
             methods=methods,
             train_pheno=train_pheno,
@@ -1971,7 +2249,15 @@ def main(log: bool = True) -> None:
             cv_splits=cv_splits,
             n_jobs=int(max(1, args.thread)),
             strict_cv=bool(args.strict_cv),
+            packed_ctx=packed_lmm_ctx,
+            train_sample_indices=train_sample_idx,
+            test_sample_indices=test_sample_idx,
         )
+        if _GS_DEBUG_STAGE:
+            logger.info(
+                f"[GS-DEBUG][{trait_name}] stage=run_methods_parallel "
+                f"elapsed={time.time() - t_stage:.3f}s"
+            )
         method_result_map = {str(x["method"]): x for x in method_results}
 
         if args.cv is not None:

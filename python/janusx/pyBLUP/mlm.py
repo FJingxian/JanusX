@@ -32,7 +32,12 @@ class BLUP:
         """
         self.log = log
         self.y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
-        self.M = np.asarray(M, dtype=np.float64)
+        # Keep marker matrix in float32 by default to avoid a full float64 copy.
+        self.M = np.asarray(M)
+        if not np.issubdtype(self.M.dtype, np.floating):
+            self.M = self.M.astype(np.float32, copy=False)
+        elif self.M.dtype != np.float32:
+            self.M = self.M.astype(np.float32, copy=False)
         if self.M.ndim != 2:
             raise ValueError("M must be a 2D array with shape (m, n).")
         if self.M.shape[1] != self.y.shape[0]:
@@ -47,11 +52,16 @@ class BLUP:
                 raise ValueError(
                     f"cov rows must match len(y). Got cov.shape={cov.shape}, len(y)={self.y.shape[0]}"
                 )
-        Z = Z if Z is not None else np.eye(self.y.shape[0], dtype=np.float64)  # Design matrix or I matrix
-        if self.M.shape[1] != Z.shape[1]:
-            raise ValueError(
-                f"M.shape[1] must equal Z.shape[1]. Got M.shape={self.M.shape}, Z.shape={Z.shape}"
-            )
+        # Represent default random-effect design as implicit identity.
+        z_is_identity = Z is None
+        if not z_is_identity:
+            Z = np.asarray(Z, dtype=np.float64)
+            if Z.ndim != 2:
+                raise ValueError("Z must be a 2D array.")
+            if Z.shape[0] != self.y.shape[0] or Z.shape[1] != self.y.shape[0]:
+                raise ValueError(
+                    f"Z must be square with shape (n, n). Got Z.shape={Z.shape}, n={self.y.shape[0]}"
+                )
         self.X = (
             np.concatenate([np.ones((self.y.shape[0], 1)), cov], axis=1)
             if cov is not None
@@ -62,35 +72,84 @@ class BLUP:
         self.kinship = kinship  # control method to calculate kinship matrix
         self._m_mean = None
         self._m_var_sum = None
+        self._pred_chunk_size = 32_768
+        self._alpha_sum = None
+        self._m_alpha = None
+        self._mean_sq = None
+        self._mean_malpha = None
+        self._g_eps = 1e-6
+        self._implicit_kinship_fast = False
         usefastlmm = self.M.shape[0] < self.n  # use FaST-LMM if num of snp less than num of samples
         if self.kinship is not None:
-            self._m_mean = np.mean(self.M, axis=1, dtype=np.float64, keepdims=True)
-            m_var = np.var(self.M, axis=1, dtype=np.float64, keepdims=True)
-            self._m_var_sum = float(np.sum(m_var, dtype=np.float64))
+            self._m_mean = np.mean(self.M, axis=1, dtype=np.float32, keepdims=True)
+            m_var = np.var(self.M, axis=1, dtype=np.float32, keepdims=True)
+            self._m_var_sum = float(np.sum(m_var, dtype=np.float32))
             if self._m_var_sum <= 0.0:
                 self._m_var_sum = 1e-12
-            self.G = GRM(self.M, log=self.log) + 1e-6 * np.eye(self.n)  # Add regular item
-            self.Z = Z
+            if usefastlmm and z_is_identity:
+                # Low-rank kinship path:
+                # avoid explicit n x n G and recover u/alpha from SVD spectrum.
+                self._implicit_kinship_fast = True
+                self.G = None
+                self.Z = None
+            else:
+                self.G = GRM(self.M, log=self.log).astype(np.float32, copy=False)
+                self.G += np.float32(self._g_eps) * np.eye(self.n, dtype=np.float32)  # Add regular item
+                self.Z = np.eye(self.n, dtype=np.float64) if z_is_identity else Z
         else:
-            self.G = np.eye(self.M.shape[0])
-            self.Z = Z @ self.M.T
+            self.G = np.eye(self.M.shape[0], dtype=np.float32)
+            self.Z = self.M.T if z_is_identity else Z @ self.M.T
         # Simplify inverse matrix
         if usefastlmm:
-            self.Dh, self.S, _ = (
-                np.linalg.svd(Z @ self.M.T, full_matrices=False) if Z is not None else np.linalg.svd(self.M.T)
-            )
-            self.S = self.S * self.S
+            if self.kinship is None:
+                # kinship-free model uses ZM^T as random-effect design.
+                fast_input = self.Z
+            elif self._implicit_kinship_fast:
+                # For default Z=I, avoid materializing an n x n identity matrix.
+                fast_input = self.M.T
+            else:
+                fast_input = self.M.T if z_is_identity else (Z @ self.M.T)
+            u, svals, vh = np.linalg.svd(fast_input, full_matrices=False)
+            self.Dh = u.T
+            self.S = svals.astype(np.float64, copy=False) ** 2
         else:
-            self.S, self.Dh = np.linalg.eigh(self.Z @ self.G @ self.Z.T)
-        self.Dh = self.Dh.T
+            if self.kinship is not None and z_is_identity:
+                self.S, eigvec = np.linalg.eigh(self.G)
+            else:
+                self.S, eigvec = np.linalg.eigh(self.Z @ self.G @ self.Z.T)
+            self.Dh = eigvec.T
         self.X = self.Dh @ self.X
         self.y = self.Dh @ self.y
-        self.Z = self.Dh @ self.Z
+        if usefastlmm and self.kinship is None:
+            # Dh @ (ZM^T) = diag(s) @ Vh from SVD: avoids one extra large GEMM.
+            self.Z = svals[:, None] * vh
+        elif self.kinship is not None and z_is_identity:
+            self.Z = self.Dh
+        else:
+            self.Z = self.Dh @ self.Z
         result = minimize_scalar(lambda lbd: -self._REML(10**(lbd)), bounds=(-6, 6), method='bounded')  # minimize REML
         lbd = 10 ** result.x
         self._REML(lbd)
-        self.u = self.G @ self.Z.T @ (self.V_inv.ravel() * self.r.T).T
-        self.alpha = np.linalg.solve(self.G, self.u) if self.kinship is not None else None
+        if self.kinship is not None and self._implicit_kinship_fast:
+            # In FaST low-rank mode:
+            #   alpha = U * diag(1/(s^2+lambda)) * r_rot = Dh.T @ (V_inv * r)
+            #   u     = U * diag(s^2 + eps) * alpha_rot
+            vr = (self.V_inv.ravel() * self.r.T).T
+            spectral = (self.S + self._g_eps).reshape(-1, 1)
+            self.alpha = self.Dh.T @ vr
+            self.u = self.Dh.T @ (spectral * vr)
+        else:
+            self.u = self.G @ self.Z.T @ (self.V_inv.ravel() * self.r.T).T
+            self.alpha = np.linalg.solve(self.G, self.u) if self.kinship is not None else None
+        if self.kinship is not None and self.alpha is not None:
+            # Cache compact terms for prediction:
+            # cross(M_new, M_train) @ alpha without materializing cross kernel.
+            self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
+            self._m_alpha = self.M @ self.alpha
+            self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0]) if self._m_mean is not None else None
+            self._mean_malpha = (
+                float((self._m_mean.T @ self._m_alpha)[0, 0]) if self._m_mean is not None else None
+            )
         sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2
         if self.kinship is None:
@@ -133,8 +192,42 @@ class BLUP:
         cross += float((self._m_mean.T @ self._m_mean)[0, 0])
         return cross / self._m_var_sum
 
+    def _cross_grm_times_alpha(self, M_new: np.ndarray) -> np.ndarray:
+        """
+        Compute cross_GRM(M_new, M_train) @ alpha in chunks without building
+        the full n_new x n_train cross kernel matrix.
+        """
+        if (
+            self._m_mean is None
+            or self._m_var_sum is None
+            or self._m_alpha is None
+            or self._alpha_sum is None
+            or self._mean_sq is None
+            or self._mean_malpha is None
+        ):
+            raise RuntimeError("cross GRM compact terms are not initialized.")
+        n_new = M_new.shape[1]
+        out = np.empty((n_new, 1), dtype=np.float64)
+        step = max(1, int(self._pred_chunk_size))
+        # Formula:
+        # cross @ alpha =
+        # [M_new^T(M alpha) - (M_new^T m_mean) * sum(alpha)
+        #  - (m_mean^T M alpha) + (m_mean^T m_mean) * sum(alpha)] / var_sum
+        for st in range(0, n_new, step):
+            ed = min(st + step, n_new)
+            blk = M_new[:, st:ed]
+            term1 = blk.T @ self._m_alpha
+            term2 = blk.T @ self._m_mean
+            out[st:ed] = (
+                term1
+                - term2 * self._alpha_sum
+                - self._mean_malpha
+                + self._mean_sq * self._alpha_sum
+            ) / self._m_var_sum
+        return out
+
     def predict(self, M: np.ndarray, cov: Union[np.ndarray, None] = None):
-        M = np.asarray(M, dtype=np.float64)
+        M = np.asarray(M, dtype=np.float32)
         if M.ndim != 2:
             raise ValueError("M must be a 2D array with shape (m, n_new).")
         if M.shape[0] != self.M.shape[0]:
@@ -155,7 +248,7 @@ class BLUP:
             else np.ones((M.shape[1], 1))
         )
         if self.kinship is not None:
-            G_cross = self._cross_grm(M)
-            return X @ self.beta + G_cross @ self.alpha
+            rand_eff = self._cross_grm_times_alpha(M)
+            return X @ self.beta + rand_eff
         else:
             return X @ self.beta + M.T @ self.u

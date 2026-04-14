@@ -1898,7 +1898,9 @@ def main(log: bool = True) -> None:
         task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
 
     samples = sample_ids
-    need_std_geno = bool(any(m in {"GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
+    # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
+    # so we skip global z-score standardization here to avoid redundant work.
+    need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
     need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
     geno_raw = (
         np.asarray(geno, dtype=np.float32, copy=need_std_geno)

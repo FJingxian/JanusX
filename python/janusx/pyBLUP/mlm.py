@@ -245,8 +245,16 @@ def _symmetric_eigh_full(
     overwrite_a: bool,
     lowmem: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if (not lowmem) or (_scipy_eigh is None):
+    if _scipy_eigh is None:
         return np.linalg.eigh(a)
+    if not lowmem:
+        return _scipy_eigh(
+            a,
+            lower=True,
+            overwrite_a=overwrite_a,
+            check_finite=False,
+            driver="evd",
+        )
     return _scipy_eigh(
         a,
         lower=True,
@@ -471,7 +479,7 @@ class BLUP:
                 )
             eigvals, eigvec = _symmetric_eigh_full(
                 gram,
-                overwrite_a=(gram_mode == "lowmem"),
+                overwrite_a=True,
                 lowmem=(gram_mode == "lowmem"),
             )
             max_eval = float(eigvals[-1]) if eigvals.size > 0 else 0.0
@@ -768,7 +776,7 @@ class BLUP:
             )
         eigvals, eigvec = _symmetric_eigh_full(
             gram,
-            overwrite_a=(gram_mode == "lowmem"),
+            overwrite_a=True,
             lowmem=(gram_mode == "lowmem"),
         )
         max_eval = float(eigvals[-1]) if eigvals.size > 0 else 0.0
@@ -778,8 +786,7 @@ class BLUP:
             raise RuntimeError("Numerically singular marker matrix in packed FaST mode.")
         eigvals = eigvals[keep_start:]
         eigvec = eigvec[:, keep_start:]
-        if gram_mode == "lowmem":
-            del gram
+        del gram
         svals = np.sqrt(eigvals.astype(np.float64, copy=False))
         inv_s = 1.0 / svals
         self.S = svals ** 2
@@ -828,11 +835,7 @@ class BLUP:
                 self.alpha[st:ed] = blk64.T @ q_alpha
                 self.u[st:ed] = blk64.T @ q_u
             self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
-            if gram_mode == "lowmem":
-                self._m_alpha = self._fast_v @ (self._fast_svals[:, None] * rhs)
-            else:
-                self._m_alpha = gram @ q_alpha
-                del gram
+            self._m_alpha = self._fast_v @ (self._fast_svals[:, None] * rhs)
             self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0])
             self._mean_malpha = float((self._m_mean.T @ self._m_alpha)[0, 0])
             var_g = float((self.rTV_invr / (self.n - self.p)) * np.mean(self.S))

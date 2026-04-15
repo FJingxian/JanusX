@@ -462,6 +462,7 @@ def GSapi(
     method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
+    force_fast: bool = False,
     ml_fixed_params: dict[str, typing.Any] | None = None,
     need_train_pred: bool = True,
     packed_train_indices: np.ndarray | None = None,
@@ -581,7 +582,8 @@ def GSapi(
             )
             print(
                 f"[GS-DEBUG] GSapi start method={method} "
-                f"n_train={n_train_dbg} n_test={n_test_dbg} n_snp={n_snp_dbg}",
+                f"n_train={n_train_dbg} n_test={n_test_dbg} n_snp={n_snp_dbg} "
+                f"force_fast={int(bool(force_fast))}",
                 flush=True,
             )
         model = MLMBLUP(
@@ -589,6 +591,7 @@ def GSapi(
             Xtrain,
             kinship=kinship,
             sample_indices=packed_train_indices,
+            force_fast=bool(force_fast),
         )
         if _GS_DEBUG_STAGE:
             print(
@@ -655,6 +658,7 @@ def _run_method_task(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     strict_cv: bool,
+    force_fast: bool,
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
@@ -716,6 +720,7 @@ def _run_method_task(
                 method=method,
                 PCAdec=fold_pca,
                 n_jobs=n_jobs,
+                force_fast=force_fast,
                 ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
                 packed_train_indices=fold_train_idx_arg,
                 packed_test_indices=fold_test_idx_arg,
@@ -782,6 +787,7 @@ def _run_method_task(
         method=method,
         PCAdec=final_pca,
         n_jobs=n_jobs,
+        force_fast=force_fast,
         ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
         need_train_pred=False,
         packed_train_indices=final_train_idx_arg,
@@ -812,6 +818,7 @@ def _run_methods_parallel(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     strict_cv: bool,
+    force_fast: bool = False,
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
@@ -976,6 +983,7 @@ def _run_methods_parallel(
                             cv_splits,
                             model_n_jobs,
                             strict_cv,
+                            force_fast,
                             packed_ctx=packed_ctx,
                             train_sample_indices=train_sample_indices,
                             test_sample_indices=test_sample_indices,
@@ -1160,6 +1168,7 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         strict_cv,
+                        force_fast,
                         packed_ctx=packed_ctx,
                         train_sample_indices=train_sample_indices,
                         test_sample_indices=test_sample_indices,
@@ -1226,6 +1235,7 @@ def _run_methods_parallel(
                     cv_splits,
                     model_n_jobs,
                     strict_cv,
+                    force_fast,
                     packed_ctx,
                     train_sample_indices,
                     test_sample_indices,
@@ -1306,6 +1316,7 @@ def _run_methods_parallel(
                             cv_splits,
                             model_n_jobs,
                             strict_cv,
+                            force_fast,
                             packed_ctx,
                             train_sample_indices,
                             test_sample_indices,
@@ -1397,6 +1408,7 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         strict_cv,
+                        force_fast,
                         packed_ctx,
                         train_sample_indices,
                         test_sample_indices,
@@ -1444,6 +1456,7 @@ def _run_methods_parallel(
                     cv_splits,
                     model_n_jobs,
                     strict_cv,
+                    force_fast,
                     packed_ctx,
                     train_sample_indices,
                     test_sample_indices,
@@ -1764,6 +1777,12 @@ def main(log: bool = True) -> None:
              "By default, ML methods tune once per trait and reuse best params across outer folds.",
     )
     optional_group.add_argument(
+        "-force-fast", "--force-fast",
+        action="store_true",
+        default=False,
+        help="Force pyBLUP LMM Gram strategy to fast mode and never use lowmem auto-switch.",
+    )
+    optional_group.add_argument(
         "-o", "--out",
         type=str,
         default=".",
@@ -1909,6 +1928,7 @@ def main(log: bool = True) -> None:
                 ("Missing rate", args.geno),
                 ("Threads", f"{args.thread} ({detected_threads} available)"),
                 ("Strict CV", args.strict_cv),
+                ("Force fast Gram", args.force_fast),
             ]
         )
         emit_cli_configuration(
@@ -2249,6 +2269,7 @@ def main(log: bool = True) -> None:
             cv_splits=cv_splits,
             n_jobs=int(max(1, args.thread)),
             strict_cv=bool(args.strict_cv),
+            force_fast=bool(args.force_fast),
             packed_ctx=packed_lmm_ctx,
             train_sample_indices=train_sample_idx,
             test_sample_indices=test_sample_idx,

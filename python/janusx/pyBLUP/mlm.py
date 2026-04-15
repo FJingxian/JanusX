@@ -391,6 +391,7 @@ def _choose_gram_strategy(
     m: int,
     block_cols: int,
     resident_bytes: int,
+    force_fast: bool = False,
 ) -> tuple[str, Optional[int], int, int]:
     mode = _env_choice("JX_MLM_GRAM_MODE", "auto", {"auto", "fast", "lowmem"})
     mem_limit = _detect_memory_limit_bytes()
@@ -400,6 +401,8 @@ def _choose_gram_strategy(
         resident_bytes=int(resident_bytes),
     )
     auto_dim = _auto_strategy_dim(int(n), int(m))
+    if bool(force_fast):
+        return "fast", mem_limit, est_fast_peak, auto_dim
     if mode == "fast":
         return "fast", mem_limit, est_fast_peak, auto_dim
     if mode == "lowmem":
@@ -419,6 +422,7 @@ class BLUP:
         kinship: Literal[None, 1] = None,
         log: bool = False,
         sample_indices: Union[np.ndarray, None] = None,
+        force_fast: bool = False,
     ):
         """
         Fast solution of the mixed linear model via Brent's method.
@@ -439,6 +443,7 @@ class BLUP:
         self.log = log
         self._debug_stage = _env_truthy("JX_MLM_DEBUG_STAGE", "0")
         self._reml_calls = 0
+        self._force_fast = bool(force_fast)
         t_init = time.time()
         self.y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
         self._packed_ctx = _coerce_bed_packed_ctx(M)
@@ -571,6 +576,7 @@ class BLUP:
                 m=int(self.M.shape[0]),
                 block_cols=0,
                 resident_bytes=int(self.M.nbytes),
+                force_fast=self._force_fast,
             )
             if self._debug_stage:
                 print(
@@ -763,6 +769,7 @@ class BLUP:
             m=m,
             block_cols=min(step, n_train),
             resident_bytes=int(self._packed_ctx["packed"].nbytes),
+            force_fast=self._force_fast,
         )
         gram = np.zeros(
             (m, m),

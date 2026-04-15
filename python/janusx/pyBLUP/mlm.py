@@ -31,11 +31,6 @@ try:
 except Exception:
     _bed_packed_decode_stats_f64 = None
 
-try:
-    from janusx.janusx import bed_packed_fit_stats_f64 as _bed_packed_fit_stats_f64
-except Exception:
-    _bed_packed_fit_stats_f64 = None
-
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
@@ -664,7 +659,7 @@ class BLUP:
         packed_agg_mode = _env_choice(
             "JX_MLM_PACKED_AGG_MODE",
             "auto",
-            {"auto", "python", "rust", "rust_decode", "rust_full"},
+            {"auto", "python", "rust", "rust_decode"},
         )
         if packed_agg_mode == "rust":
             packed_agg_mode = "rust_decode"
@@ -673,18 +668,9 @@ class BLUP:
             and (_bed_packed_decode_stats_f64 is not None)
             and (packed_agg_mode in {"auto", "rust_decode"})
         )
-        use_rust_packed_full = bool(
-            (gram_mode == "fast")
-            and (_bed_packed_fit_stats_f64 is not None)
-            and (packed_agg_mode == "rust_full")
-        )
         if packed_agg_mode == "rust_decode" and _bed_packed_decode_stats_f64 is None:
             raise RuntimeError(
                 "JX_MLM_PACKED_AGG_MODE=rust_decode requires Rust extension function bed_packed_decode_stats_f64."
-            )
-        if packed_agg_mode == "rust_full" and _bed_packed_fit_stats_f64 is None:
-            raise RuntimeError(
-                "JX_MLM_PACKED_AGG_MODE=rust_full requires Rust extension function bed_packed_fit_stats_f64."
             )
         if self._debug_stage:
             print(
@@ -694,27 +680,10 @@ class BLUP:
                 flush=True,
             )
             print(
-                f"[MLM-DEBUG] packed_agg mode={('rust_full' if use_rust_packed_full else ('rust_decode' if use_rust_packed_decode else 'python'))}",
+                f"[MLM-DEBUG] packed_agg mode={('rust_decode' if use_rust_packed_decode else 'python')}",
                 flush=True,
             )
-        if use_rust_packed_full:
-            sum_rows_raw, sq_sum_rows_raw, mx_raw, my_raw, gram_raw = _bed_packed_fit_stats_f64(
-                self._packed_ctx["packed"],
-                int(self._packed_ctx["n_samples"]),
-                self._packed_ctx["row_flip"],
-                self._packed_ctx["maf"],
-                self._packed_sample_indices,
-                self.X,
-                self.y,
-                sample_block=step,
-                threads=0,
-            )
-            sum_rows = np.asarray(sum_rows_raw, dtype=np.float64).reshape(m, 1)
-            sq_sum_rows = np.asarray(sq_sum_rows_raw, dtype=np.float64).reshape(m, 1)
-            mx = np.asarray(mx_raw, dtype=np.float64)
-            my = np.asarray(my_raw, dtype=np.float64)
-            gram = np.asarray(gram_raw, dtype=np.float64, order="C")
-        elif use_rust_packed_decode:
+        if use_rust_packed_decode:
             for st in range(0, n_train, step):
                 ed = min(st + step, n_train)
                 sidx_blk = np.ascontiguousarray(self._packed_sample_indices[st:ed], dtype=np.int64)

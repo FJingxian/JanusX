@@ -3,6 +3,18 @@ import os
 import time
 import numpy as np
 from scipy.optimize import minimize_scalar
+try:
+    from scipy.linalg.blas import dgemm as _blas_dgemm
+except Exception:
+    _blas_dgemm = None
+try:
+    from scipy.linalg.blas import dsyrk as _blas_dsyrk
+except Exception:
+    _blas_dsyrk = None
+try:
+    from scipy.linalg import eigh as _scipy_eigh
+except Exception:
+    _scipy_eigh = None
 from .QK2 import GRM
 
 try:
@@ -13,6 +25,11 @@ try:
 except Exception:
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
+
+try:
+    from janusx.janusx import bed_packed_fit_stats_f64 as _bed_packed_fit_stats_f64
+except Exception:
+    _bed_packed_fit_stats_f64 = None
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -27,6 +44,51 @@ def _env_positive_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
     return max(1, v)
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = str(os.getenv(name, str(default))).strip()
+    try:
+        v = float(raw)
+    except Exception:
+        return float(default)
+    return max(float(np.finfo(np.float64).eps), v)
+
+
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    raw = str(os.getenv(name, default)).strip().lower()
+    return raw if raw in choices else str(default).strip().lower()
+
+
+def _detect_memory_limit_bytes() -> Optional[int]:
+    cgroup_paths = (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+    for path in cgroup_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+        except Exception:
+            continue
+        if raw == "" or raw.lower() == "max":
+            continue
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        # Skip sentinel-style "unlimited" values.
+        if val > 0 and val < (1 << 60):
+            return val
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total = pages * page_size
+        if total > 0:
+            return total
+    except Exception:
+        return None
+    return None
 
 
 def _coerce_bed_packed_ctx(M: Any) -> Optional[dict[str, Any]]:
@@ -130,6 +192,103 @@ def _decode_packed_rows_f32(
         sample_indices,
     )
     return np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
+
+
+def _gram_rankk_update(
+    gram: np.ndarray,
+    blk64: np.ndarray,
+    *,
+    lowmem: bool,
+) -> np.ndarray:
+    if (not lowmem) or (_blas_dgemm is None):
+        if lowmem and (_blas_dsyrk is not None):
+            return _blas_dsyrk(
+                alpha=1.0,
+                a=blk64,
+                beta=1.0,
+                c=gram,
+                lower=1,
+                trans=0,
+                overwrite_c=1,
+            )
+        gram += blk64 @ blk64.T
+        return gram
+    if _blas_dsyrk is not None:
+        return _blas_dsyrk(
+            alpha=1.0,
+            a=blk64,
+            beta=1.0,
+            c=gram,
+            lower=1,
+            trans=0,
+            overwrite_c=1,
+        )
+    return _blas_dgemm(
+        alpha=1.0,
+        a=blk64,
+        b=blk64,
+        beta=1.0,
+        c=gram,
+        trans_b=1,
+        overwrite_c=1,
+    )
+
+
+def _symmetric_eigh_full(
+    a: np.ndarray,
+    *,
+    overwrite_a: bool,
+    lowmem: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if (not lowmem) or (_scipy_eigh is None):
+        return np.linalg.eigh(a)
+    return _scipy_eigh(
+        a,
+        lower=True,
+        overwrite_a=overwrite_a,
+        check_finite=False,
+        driver="evr",
+    )
+
+
+def _estimate_fast_gram_peak_bytes(
+    *,
+    m: int,
+    block_cols: int,
+    resident_bytes: int,
+) -> int:
+    gram_bytes = int(m) * int(m) * np.dtype(np.float64).itemsize
+    blk_f32_bytes = int(m) * int(block_cols) * np.dtype(np.float32).itemsize
+    blk_f64_bytes = int(m) * int(block_cols) * np.dtype(np.float64).itemsize
+    # Conservative estimate for the legacy fast path:
+    # resident payload + gram itself + one full m x m temporary product +
+    # eigendecomposition workspace/eigenvector footprint (~2x gram).
+    return int(resident_bytes) + blk_f32_bytes + blk_f64_bytes + (4 * gram_bytes)
+
+
+def _choose_gram_strategy(
+    *,
+    m: int,
+    block_cols: int,
+    resident_bytes: int,
+) -> tuple[str, Optional[int], int]:
+    mode = _env_choice("JX_MLM_GRAM_MODE", "auto", {"auto", "fast", "lowmem"})
+    mem_limit = _detect_memory_limit_bytes()
+    est_fast_peak = _estimate_fast_gram_peak_bytes(
+        m=int(m),
+        block_cols=int(block_cols),
+        resident_bytes=int(resident_bytes),
+    )
+    if mode == "fast":
+        return "fast", mem_limit, est_fast_peak
+    if mode == "lowmem":
+        return "lowmem", mem_limit, est_fast_peak
+    frac = _env_positive_float("JX_MLM_GRAM_FAST_MEM_FRAC", 0.45)
+    if mem_limit is not None and mem_limit > 0:
+        budget = int(mem_limit * frac)
+        return ("fast" if est_fast_peak <= budget else "lowmem"), mem_limit, est_fast_peak
+    fallback_m = _env_positive_int("JX_MLM_GRAM_FAST_MAX_M", 20_000)
+    return ("fast" if int(m) <= fallback_m else "lowmem"), mem_limit, est_fast_peak
 
 
 class BLUP:
@@ -289,12 +448,27 @@ class BLUP:
             # This avoids materializing U of size n x m for large n.
             t_svd = time.time()
             gram = self.M @ self.M.T
+            gram_mode, mem_limit, est_fast_peak = _choose_gram_strategy(
+                m=int(self.M.shape[0]),
+                block_cols=0,
+                resident_bytes=int(self.M.nbytes),
+            )
             if self._debug_stage:
                 print(
                     f"[MLM-DEBUG] fast_gram_start shape={gram.shape} dtype={gram.dtype}",
                     flush=True,
                 )
-            eigvals, eigvec = np.linalg.eigh(gram)
+                print(
+                    f"[MLM-DEBUG] fast_gram_mode mode={gram_mode} "
+                    f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
+                    f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                    flush=True,
+                )
+            eigvals, eigvec = _symmetric_eigh_full(
+                gram,
+                overwrite_a=(gram_mode == "lowmem"),
+                lowmem=(gram_mode == "lowmem"),
+            )
             max_eval = float(eigvals[-1]) if eigvals.size > 0 else 0.0
             tol = np.finfo(np.float64).eps * max(1.0, max_eval) * max(1, self.M.shape[0])
             keep_start = int(np.searchsorted(eigvals, tol, side="right"))
@@ -302,6 +476,7 @@ class BLUP:
                 raise RuntimeError("Numerically singular marker matrix in FaST mode (all eigenvalues dropped).")
             eigvals = eigvals[keep_start:]
             eigvec = eigvec[:, keep_start:]
+            del gram
             svals = np.sqrt(eigvals.astype(np.float64, copy=False))
             inv_s = 1.0 / svals
             mx = self.M @ self.X
@@ -461,19 +636,75 @@ class BLUP:
         sq_sum_rows = np.zeros((m, 1), dtype=np.float64)
         mx = np.zeros((m, self.p), dtype=np.float64)
         my = np.zeros((m, 1), dtype=np.float64)
-        gram = np.zeros((m, m), dtype=np.float64)
         n_train = int(self._packed_sample_indices.shape[0])
         step = max(1, int(self._packed_sample_chunk))
-        for st in range(0, n_train, step):
-            ed = min(st + step, n_train)
-            sidx_blk = np.ascontiguousarray(self._packed_sample_indices[st:ed], dtype=np.int64)
-            blk = _decode_packed_rows_f32(self._packed_ctx, self._packed_all_rows, sidx_blk)
-            blk64 = np.asarray(blk, dtype=np.float64)
-            sum_rows += np.sum(blk64, axis=1, keepdims=True)
-            sq_sum_rows += np.sum(blk64 * blk64, axis=1, keepdims=True)
-            mx += blk64 @ self.X[st:ed, :]
-            my += blk64 @ self.y[st:ed, :]
-            gram += blk64 @ blk64.T
+        gram_mode, mem_limit, est_fast_peak = _choose_gram_strategy(
+            m=m,
+            block_cols=min(step, n_train),
+            resident_bytes=int(self._packed_ctx["packed"].nbytes),
+        )
+        gram = np.zeros(
+            (m, m),
+            dtype=np.float64,
+            order=("F" if gram_mode == "lowmem" else "C"),
+        )
+        packed_agg_mode = _env_choice("JX_MLM_PACKED_AGG_MODE", "auto", {"auto", "python", "rust"})
+        use_rust_packed_agg = bool(
+            (gram_mode == "fast")
+            and (_bed_packed_fit_stats_f64 is not None)
+            and (packed_agg_mode != "python")
+        )
+        if packed_agg_mode == "rust" and _bed_packed_fit_stats_f64 is None:
+            raise RuntimeError(
+                "JX_MLM_PACKED_AGG_MODE=rust requires Rust extension function bed_packed_fit_stats_f64."
+            )
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] fast_gram_mode mode={gram_mode} "
+                f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
+                f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                flush=True,
+            )
+            print(
+                f"[MLM-DEBUG] packed_agg mode={'rust' if use_rust_packed_agg else 'python'}",
+                flush=True,
+            )
+        if use_rust_packed_agg:
+            sum_rows_raw, sq_sum_rows_raw, mx_raw, my_raw, gram_raw = _bed_packed_fit_stats_f64(
+                self._packed_ctx["packed"],
+                int(self._packed_ctx["n_samples"]),
+                self._packed_ctx["row_flip"],
+                self._packed_ctx["maf"],
+                self._packed_sample_indices,
+                self.X,
+                self.y,
+                sample_block=step,
+                threads=0,
+            )
+            sum_rows = np.asarray(sum_rows_raw, dtype=np.float64).reshape(m, 1)
+            sq_sum_rows = np.asarray(sq_sum_rows_raw, dtype=np.float64).reshape(m, 1)
+            mx = np.asarray(mx_raw, dtype=np.float64)
+            my = np.asarray(my_raw, dtype=np.float64)
+            gram = np.asarray(gram_raw, dtype=np.float64, order="C")
+        else:
+            for st in range(0, n_train, step):
+                ed = min(st + step, n_train)
+                sidx_blk = np.ascontiguousarray(self._packed_sample_indices[st:ed], dtype=np.int64)
+                blk = _decode_packed_rows_f32(self._packed_ctx, self._packed_all_rows, sidx_blk)
+                blk64 = (
+                    np.asfortranarray(blk, dtype=np.float64)
+                    if gram_mode == "lowmem"
+                    else np.asarray(blk, dtype=np.float64)
+                )
+                sum_rows += np.sum(blk64, axis=1, keepdims=True)
+                sq_sum_rows += np.sum(blk64 * blk64, axis=1, keepdims=True)
+                mx += blk64 @ self.X[st:ed, :]
+                my += blk64 @ self.y[st:ed, :]
+                gram = _gram_rankk_update(
+                    gram,
+                    blk64,
+                    lowmem=(gram_mode == "lowmem"),
+                )
 
         self._m_mean = sum_rows / float(self.n)
         m_var = sq_sum_rows / float(self.n) - self._m_mean * self._m_mean
@@ -497,7 +728,11 @@ class BLUP:
                 f"[MLM-DEBUG] fast_gram_start shape={gram.shape} dtype={gram.dtype}",
                 flush=True,
             )
-        eigvals, eigvec = np.linalg.eigh(gram)
+        eigvals, eigvec = _symmetric_eigh_full(
+            gram,
+            overwrite_a=(gram_mode == "lowmem"),
+            lowmem=(gram_mode == "lowmem"),
+        )
         max_eval = float(eigvals[-1]) if eigvals.size > 0 else 0.0
         tol = np.finfo(np.float64).eps * max(1.0, max_eval) * max(1, m)
         keep_start = int(np.searchsorted(eigvals, tol, side="right"))
@@ -505,6 +740,8 @@ class BLUP:
             raise RuntimeError("Numerically singular marker matrix in packed FaST mode.")
         eigvals = eigvals[keep_start:]
         eigvec = eigvec[:, keep_start:]
+        if gram_mode == "lowmem":
+            del gram
         svals = np.sqrt(eigvals.astype(np.float64, copy=False))
         inv_s = 1.0 / svals
         self.S = svals ** 2
@@ -553,7 +790,11 @@ class BLUP:
                 self.alpha[st:ed] = blk64.T @ q_alpha
                 self.u[st:ed] = blk64.T @ q_u
             self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
-            self._m_alpha = gram @ q_alpha
+            if gram_mode == "lowmem":
+                self._m_alpha = self._fast_v @ (self._fast_svals[:, None] * rhs)
+            else:
+                self._m_alpha = gram @ q_alpha
+                del gram
             self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0])
             self._mean_malpha = float((self._m_mean.T @ self._m_alpha)[0, 0])
             var_g = float((self.rTV_invr / (self.n - self.p)) * np.mean(self.S))
@@ -752,13 +993,6 @@ class BLUP:
                 int(packed_ctx["n_samples"]),
                 n_target,
             )
-            if self._packed_ctx is None:
-                dense_rows = _decode_packed_rows_f32(
-                    packed_ctx,
-                    np.arange(int(packed_ctx["packed"].shape[0]), dtype=np.int64),
-                    sidx,
-                )
-                return self.predict(dense_rows, cov=cov)
             if cov is not None:
                 cov = np.asarray(cov, dtype=np.float64)
                 if cov.ndim == 1:
@@ -772,6 +1006,9 @@ class BLUP:
                 if cov is not None
                 else np.ones((sidx.shape[0], 1))
             )
+            # Keep packed prediction chunked even when the model itself was fitted
+            # from a dense training matrix. This avoids materializing the full
+            # packed test set as a temporary dense matrix during prediction.
             if self.kinship is not None:
                 rand_eff = self._cross_grm_times_alpha_packed(packed_ctx, sidx)
                 out = X @ self.beta + rand_eff

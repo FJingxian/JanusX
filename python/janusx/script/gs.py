@@ -1139,7 +1139,7 @@ def _run_methods_parallel(
                 _ensure_cv_bar()
 
             method_status = (
-                CliStatus(f"Loading {m}...", enabled=True)
+                CliStatus(f"Loading {m}...", enabled=True, use_process=True)
                 if enable_method_spinner
                 else None
             )

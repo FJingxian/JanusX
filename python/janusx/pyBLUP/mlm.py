@@ -4,6 +4,10 @@ import time
 import numpy as np
 from scipy.optimize import minimize_scalar
 try:
+    import psutil as _psutil
+except Exception:
+    _psutil = None
+try:
     from scipy.linalg.blas import dgemm as _blas_dgemm
 except Exception:
     _blas_dgemm = None
@@ -60,7 +64,94 @@ def _env_choice(name: str, default: str, choices: set[str]) -> str:
     return raw if raw in choices else str(default).strip().lower()
 
 
+def _parse_mem_bytes(raw: str) -> Optional[int]:
+    s = str(raw).strip().lower()
+    if s == "" or s in {"0", "none", "unlimited"}:
+        return None
+    mult = 1
+    units = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+    }
+    for suf, fac in units.items():
+        if s.endswith(suf):
+            mult = fac
+            s = s[: -len(suf)].strip()
+            break
+    try:
+        val = float(s)
+    except Exception:
+        return None
+    out = int(val * mult)
+    return out if (out > 0 and out < (1 << 60)) else None
+
+
+def _detect_scheduler_memory_limit_bytes() -> Optional[int]:
+    candidates: list[int] = []
+    for name in (
+        "SLURM_MEM_PER_NODE",
+        "SBATCH_MEM_PER_NODE",
+        "LSB_MAX_MEM",
+        "MEMORY_LIMIT_IN_MB",
+    ):
+        raw = os.getenv(name, "").strip()
+        if raw == "":
+            continue
+        val = _parse_mem_bytes(raw)
+        if val is None:
+            try:
+                val = int(float(raw) * 1024**2)
+            except Exception:
+                val = None
+        if val is not None:
+            candidates.append(val)
+
+    mem_per_cpu_raw = os.getenv("SLURM_MEM_PER_CPU", "").strip()
+    if mem_per_cpu_raw != "":
+        mem_per_cpu = _parse_mem_bytes(mem_per_cpu_raw)
+        if mem_per_cpu is None:
+            try:
+                mem_per_cpu = int(float(mem_per_cpu_raw) * 1024**2)
+            except Exception:
+                mem_per_cpu = None
+        if mem_per_cpu is not None:
+            cpu_raw = (
+                os.getenv("SLURM_CPUS_PER_TASK", "").strip()
+                or os.getenv("OMP_NUM_THREADS", "").strip()
+                or os.getenv("SLURM_CPUS_ON_NODE", "").strip()
+            )
+            try:
+                cpu_n = max(1, int(cpu_raw))
+            except Exception:
+                cpu_n = 1
+            candidates.append(int(mem_per_cpu) * int(cpu_n))
+
+    for name in (
+        "PBS_RESOURCE_LIST_MEM",
+        "PBS_RESOURCE_LIST_PMEM",
+        "PBS_RESOURCE_LIST_VMEM",
+    ):
+        raw = os.getenv(name, "").strip()
+        if raw == "":
+            continue
+        val = _parse_mem_bytes(raw)
+        if val is not None:
+            candidates.append(val)
+
+    return int(min(candidates)) if len(candidates) > 0 else None
+
+
 def _detect_memory_limit_bytes() -> Optional[int]:
+    candidates: list[int] = []
+    sched_limit = _detect_scheduler_memory_limit_bytes()
+    if sched_limit is not None:
+        candidates.append(int(sched_limit))
     cgroup_paths = (
         "/sys/fs/cgroup/memory.max",
         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
@@ -79,16 +170,25 @@ def _detect_memory_limit_bytes() -> Optional[int]:
             continue
         # Skip sentinel-style "unlimited" values.
         if val > 0 and val < (1 << 60):
-            return val
+            candidates.append(val)
+    if _psutil is not None:
+        try:
+            total = int(_psutil.virtual_memory().total)
+            if total > 0 and total < (1 << 60):
+                candidates.append(total)
+        except Exception:
+            pass
     try:
         pages = int(os.sysconf("SC_PHYS_PAGES"))
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         total = pages * page_size
-        if total > 0:
-            return total
+        if total > 0 and total < (1 << 60):
+            candidates.append(total)
     except Exception:
+        pass
+    if len(candidates) == 0:
         return None
-    return None
+    return int(min(candidates))
 
 
 def _coerce_bed_packed_ctx(M: Any) -> Optional[dict[str, Any]]:
@@ -291,12 +391,14 @@ def _choose_gram_strategy(
         return "fast", mem_limit, est_fast_peak
     if mode == "lowmem":
         return "lowmem", mem_limit, est_fast_peak
+    fast_max_m = _env_positive_int("JX_MLM_GRAM_FAST_MAX_M", 20_000)
+    if int(m) > fast_max_m:
+        return "lowmem", mem_limit, est_fast_peak
     frac = _env_positive_float("JX_MLM_GRAM_FAST_MEM_FRAC", 0.45)
     if mem_limit is not None and mem_limit > 0:
         budget = int(mem_limit * frac)
         return ("fast" if est_fast_peak <= budget else "lowmem"), mem_limit, est_fast_peak
-    fallback_m = _env_positive_int("JX_MLM_GRAM_FAST_MAX_M", 20_000)
-    return ("fast" if int(m) <= fallback_m else "lowmem"), mem_limit, est_fast_peak
+    return "fast", mem_limit, est_fast_peak
 
 
 class BLUP:

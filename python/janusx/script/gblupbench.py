@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-GBLUP benchmark launcher for JanusX / sommer / rrBLUP.
+GBLUP benchmark launcher for JanusX / sommer / rrBLUP / BLUPF90 / BLUPF90-APY / HIBLUP.
 
 Key features:
-  - One-command benchmark for three engines:
+  - One-command benchmark for multiple engines:
       * janusx (Python BLUP backend)
       * sommer (R package)
       * rrblup (R package rrBLUP)
+      * blupf90 / blupf90apy (external BLUPF90 family)
+      * hiblup (external HIBLUP)
   - Unified data filtering / trait selection / CV splits across engines.
   - Per-sample out-of-fold prediction tables for each engine.
   - Automatic pairwise prediction comparison when multiple engines are selected.
@@ -18,6 +20,8 @@ Key features:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
@@ -25,6 +29,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,11 +55,16 @@ from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
 from janusx.script._common.threads import detect_effective_threads  # noqa: E402
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.colspec import parse_zero_based_index_specs  # noqa: E402
+from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
 from janusx.script.gs import build_cv_splits  # noqa: E402
 
 
 _SUMMARY_TAG = "gblupbench"
+_DEFAULT_ENGINES_RUN = "janusx,sommer,rrblup"
+_DEFAULT_ENGINES_CHECK_ALL = "janusx,sommer,rrblup,blupf90,blupf90apy,hiblup"
+_ENGINE_LIST_TEXT = "janusx,sommer,rrblup,blupf90,blupf90apy,hiblup"
+_PREGSF90_APY_MODE_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -126,6 +137,32 @@ def _safe_float(v: Any, default: float = math.nan) -> float:
     except Exception:
         return float(default)
     return x
+
+
+def _nanmean_or_nan(values: Any) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    mask = np.isfinite(arr)
+    if int(np.sum(mask)) == 0:
+        return math.nan
+    return float(np.mean(arr[mask]))
+
+
+def _safe_int_token(v: Any) -> Optional[int]:
+    s = str(v).strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except Exception:
+        pass
+    try:
+        x = float(s)
+    except Exception:
+        return None
+    if not math.isfinite(x):
+        return None
+    xr = int(round(x))
+    return xr if abs(x - float(xr)) < 1e-8 else None
 
 
 def _parse_elapsed_text(text: str) -> float:
@@ -302,6 +339,8 @@ def _normalize_engine_token(token: str) -> str:
         return "rrblup"
     if t in {"blupf90", "blup90", "f90"}:
         return "blupf90"
+    if t in {"blupf90apy", "blup90apy", "f90apy", "ssblupapy", "ssgblupapy"}:
+        return "blupf90apy"
     if t in {"hiblup", "hib", "hbl"}:
         return "hiblup"
     return ""
@@ -319,6 +358,14 @@ def _parse_engines(raw: str) -> list[str]:
     return out
 
 
+def _option_seen(tokens: list[str], names: set[str]) -> bool:
+    for tk in tokens:
+        head = str(tk).split("=", 1)[0].strip()
+        if head in names:
+            return True
+    return False
+
+
 def _dev_help_requested(argv: Optional[list[str]] = None) -> bool:
     tokens = list(sys.argv[1:] if argv is None else argv)
     return ("-dev" in tokens) or ("--dev" in tokens)
@@ -330,12 +377,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = CliArgumentParser(
         prog="jx gblupbench",
         formatter_class=cli_help_formatter(),
-        description="Benchmark GBLUP engines: JanusX / sommer / rrBLUP / BLUPF90 / HIBLUP.",
+        description="Benchmark GBLUP engines: JanusX / sommer / rrBLUP / BLUPF90 / BLUPF90-APY / HIBLUP.",
         epilog=minimal_help_epilog(
             [
                 "jx gblupbench -bfile example_prefix -p pheno.tsv -n 0",
                 "jx gblupbench -vcf example.vcf.gz -p pheno.tsv -n 0 --engines janusx,sommer,rrblup",
-                "jx gblupbench -bfile example_prefix -p pheno.tsv -n 0 --engines janusx,sommer,rrblup,blupf90,hiblup",
+                "jx gblupbench -bfile example_prefix -p pheno.tsv -n 0 --engines janusx,sommer,rrblup,blupf90,blupf90apy,hiblup",
                 "jx gblupbench -h -dev",
             ]
         ),
@@ -385,17 +432,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     optional_group.add_argument("--seed", default=42, type=int, help="Random seed (default: %(default)s).")
     optional_group.add_argument(
         "--engines",
-        default="janusx,sommer,rrblup",
+        default=_DEFAULT_ENGINES_RUN,
         type=str,
-        help="Comma list: janusx,sommer,rrblup,blupf90,hiblup.",
+        help=f"Comma list: {_ENGINE_LIST_TEXT}.",
     )
     optional_group.add_argument(
         "--check",
         action="store_true",
         default=False,
         help=(
-            "Only check environment dependencies for selected engines, then exit. "
-            "In this mode, genotype/pheno inputs are optional."
+            "Check selected engines and run a small end-to-end smoke test generated by `jx sim`, then exit. "
+            "In this mode, genotype/pheno inputs are optional. "
+            "If --engines is omitted, all engines are checked."
         ),
     )
 
@@ -416,6 +464,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args, extras = p.parse_known_args(argv)
     if len(extras) > 0:
         p.error("unrecognized arguments: " + " ".join(extras))
+    args._engines_explicit = _option_seen(tokens, {"--engines"})
 
     has_genotype = bool(args.bfile or args.vcf or args.hmp or args.file)
     has_pheno = bool(args.pheno)
@@ -535,6 +584,93 @@ def _ensure_blupf90() -> Optional[str]:
     return _resolve_bin(["blupf90", "airemlf90", "remlf90"], "JX_GBLUPBENCH_BLUPF90_BIN")
 
 
+def _detect_pregsf90_apy_mode(pregsf90_bin: str) -> str:
+    override = str(os.environ.get("JX_GBLUPBENCH_APY_MODE", "auto")).strip().lower()
+    if override in {"legacy", "modern"}:
+        return override
+
+    key = str(Path(str(pregsf90_bin)).expanduser())
+    cached = _PREGSF90_APY_MODE_CACHE.get(key)
+    if cached in {"legacy", "modern"}:
+        return str(cached)
+
+    mode = "modern"
+    try:
+        proc = subprocess.run(
+            [str(pregsf90_bin), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        txt = str(proc.stdout or "").strip()
+        m = re.search(r"(?i)(?:pregsf90|blupf90\+)\s*(?:ver\.?\s*)?([0-9]+(?:\.[0-9]+)?)", txt)
+        if m is not None:
+            try:
+                ver = float(str(m.group(1)))
+                if math.isfinite(ver) and ver < 2.0:
+                    mode = "legacy"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    _PREGSF90_APY_MODE_CACHE[key] = mode
+    return mode
+
+
+def _build_apy_option_lines(*, n_levels: int, apy_mode: str, apy_type: int = 2) -> list[str]:
+    raw = str(os.environ.get("JX_GBLUPBENCH_APY_OPTION", "")).strip()
+    if raw != "":
+        return [raw if raw.lower().startswith("option ") else f"OPTION {raw}"]
+
+    if str(apy_mode).strip().lower() == "legacy":
+        raw_pos = str(os.environ.get("JX_GBLUPBENCH_APY_POS", "")).strip()
+        try:
+            pos = max(1, int(raw_pos)) if raw_pos != "" else 1
+        except Exception:
+            pos = 1
+
+        cond = str(os.environ.get("JX_GBLUPBENCH_APY_CONDITION", "")).strip()
+        if cond == "":
+            raw_core = str(os.environ.get("JX_GBLUPBENCH_APY_CORE_N", "")).strip()
+            if raw_core == "":
+                # Heuristic default core size:
+                # - for small/medium datasets, sqrt(n) can be too small and harms agreement,
+                #   so use ~30% core (at least 100);
+                # - for larger datasets, keep sqrt(n)-style growth.
+                nlv = max(1, int(n_levels))
+                if nlv <= 5000:
+                    core_n = int(round(0.30 * float(nlv)))
+                    core_n = max(100, core_n)
+                else:
+                    core_n = int(round(math.sqrt(float(nlv))))
+                    core_n = max(200, core_n)
+            else:
+                try:
+                    core_n = int(raw_core)
+                except Exception:
+                    nlv = max(1, int(n_levels))
+                    if nlv <= 5000:
+                        core_n = int(round(0.30 * float(nlv)))
+                        core_n = max(100, core_n)
+                    else:
+                        core_n = int(round(math.sqrt(float(nlv))))
+                        core_n = max(200, core_n)
+            core_n = max(1, min(int(n_levels) - 1, int(core_n)))
+            cond = f"core.le.{core_n}"
+
+        apy_type_i = 2
+        try:
+            apy_type_i = max(1, int(apy_type))
+        except Exception:
+            apy_type_i = 2
+        return [f"OPTION apy {int(apy_type_i)} {int(pos)} {cond}"]
+
+    return ["OPTION apy 2"]
+
+
 def _check_r_package(rscript: str, pkg: str) -> tuple[bool, str]:
     expr = (
         "ok <- requireNamespace('" + pkg + "', quietly=TRUE);"
@@ -589,14 +725,21 @@ def _collect_env_checks(engines: list[str]) -> list[EnvCheck]:
             )
         )
 
-    if "blupf90" in engines:
+    if any(e in {"blupf90", "blupf90apy"} for e in engines):
         pregs_bin = _ensure_pregsf90()
         blup_bin = _ensure_blupf90()
         checks.append(
             EnvCheck(
                 "BLUPF90:pregs",
                 pregs_bin is not None,
-                f"OK: {pregs_bin}" if pregs_bin is not None else "preGSf90 not found in PATH",
+                (
+                    f"OK: {pregs_bin}"
+                    if pregs_bin is not None
+                    else (
+                        "preGSf90/pregsf90/preGSf90+ not found in PATH "
+                        "(or set JX_GBLUPBENCH_PREGSF90_BIN)"
+                    )
+                ),
             )
         )
         checks.append(
@@ -613,12 +756,175 @@ def _collect_env_checks(engines: list[str]) -> list[EnvCheck]:
     return checks
 
 
+def _run_smoke_checks_with_sim(engines: list[str]) -> list[EnvCheck]:
+    checks: list[EnvCheck] = []
+    if len(engines) == 0:
+        return checks
+
+    py_root = str(Path(__file__).resolve().parents[2])
+    env = os.environ.copy()
+    env["PYTHONPATH"] = py_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+    with tempfile.TemporaryDirectory(prefix="jx_gblupbench_check_") as td:
+        td_path = Path(td)
+        sim_prefix = td_path / "sim" / "tiny"
+        sim_prefix.parent.mkdir(parents=True, exist_ok=True)
+        sim_gen_log = td_path / "sim_generation.log"
+        try:
+            # Tiny yet non-trivial dataset for end-to-end engine smoke checks.
+            # nsnp_k=1 -> 1,000 SNPs; n=32; no NA for deterministic CV behavior.
+            sim_out = io.StringIO()
+            sim_err = io.StringIO()
+            with contextlib.redirect_stdout(sim_out), contextlib.redirect_stderr(sim_err):
+                sim_mod.main(
+                    [
+                        "1",
+                        "32",
+                        str(sim_prefix),
+                        "--chunk-size",
+                        "256",
+                        "--seed",
+                        "2026",
+                        "--na-rate",
+                        "0.0",
+                        "--pve",
+                        "0.3",
+                        "--ve",
+                        "1.0",
+                        "--trait-name",
+                        "test",
+                        "--structure",
+                        "unrelated",
+                    ]
+                )
+            sim_gen_log.write_text(sim_out.getvalue() + sim_err.getvalue(), encoding="utf-8")
+        except Exception as e:
+            detail = f"sim dataset generation failed: {e}"
+            if sim_gen_log.exists():
+                detail = f"{detail} (log: {sim_gen_log})"
+            checks.append(EnvCheck("SMOKE:sim", False, detail))
+            for engine in engines:
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, "skipped (sim failed)"))
+            return checks
+
+        pheno = Path(f"{sim_prefix}.pheno.txt")
+        if not pheno.exists():
+            checks.append(EnvCheck("SMOKE:sim", False, f"sim output missing: {pheno}"))
+            for engine in engines:
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, "skipped (sim output missing)"))
+            return checks
+        checks.append(EnvCheck("SMOKE:sim", True, f"dataset ready: {sim_prefix}"))
+
+        out_dir = td_path / "bench"
+        prefix = "check_smoke"
+        smoke_log = td_path / "smoke.log"
+        smoke_time = td_path / "smoke.time"
+        cmd = [
+            sys.executable,
+            "-m",
+            "janusx.script.gblupbench",
+            "--bfile",
+            str(sim_prefix),
+            "--pheno",
+            str(pheno),
+            "--engines",
+            ",".join(engines),
+            "--out",
+            str(out_dir),
+            "--prefix",
+            prefix,
+            "--cv",
+            "2",
+            "--seed",
+            "2026",
+            "--thread",
+            "1",
+            "--chunksize",
+            "256",
+            "--maf",
+            "0.0",
+            "--geno",
+            "1.0",
+            "--keep-temp",
+        ]
+        rc, _elapsed, _rss = _run_timed(
+            cmd,
+            log_file=smoke_log,
+            time_file=smoke_time,
+            env=env,
+            cwd=td_path,
+        )
+
+        summary_tsv = out_dir / f"{prefix}.gblup_bench" / "summary" / f"{prefix}.{_SUMMARY_TAG}.tsv"
+        if not summary_tsv.exists():
+            tail = ""
+            try:
+                lines = smoke_log.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if len(lines) > 0:
+                    tail = " | ".join(lines[-3:])
+            except Exception:
+                tail = ""
+            detail = f"smoke summary missing (exit={rc})"
+            if tail:
+                detail = f"{detail}: {tail}"
+            for engine in engines:
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, detail))
+            return checks
+
+        try:
+            df = pd.read_csv(summary_tsv, sep="\t")
+        except Exception as e:
+            for engine in engines:
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, f"failed to parse smoke summary: {e}"))
+            return checks
+
+        for engine in engines:
+            dfe = df[df["engine"].astype(str) == str(engine)]
+            if dfe.shape[0] == 0:
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, "engine missing in smoke summary"))
+                continue
+            row = dfe.iloc[0]
+            status = str(row.get("status", "")).strip().lower()
+            note = str(row.get("note", "")).strip()
+            elapsed_sec = _safe_float(row.get("elapsed_sec"), math.nan)
+            if status == "ok":
+                elapsed_text = "NA" if not math.isfinite(elapsed_sec) else f"{elapsed_sec:.3f}s"
+                checks.append(EnvCheck(f"SMOKE:{engine}", True, f"run ok ({elapsed_text})"))
+            else:
+                detail = note if note else f"status={status or 'unknown'}"
+                checks.append(EnvCheck(f"SMOKE:{engine}", False, detail))
+    return checks
+
+
 def _print_env_checks(engines: list[str], checks: list[EnvCheck]) -> bool:
     print(f"[CHECK] engines: {','.join(engines)}")
     ok_all = True
+    comp_w = max(12, max((len(str(c.component)) for c in checks), default=12))
+    status_w = 4
+    term_cols = int(shutil.get_terminal_size((120, 20)).columns)
     for c in checks:
         st = "OK" if c.ok else "FAIL"
-        print(f"  - {c.component:<12} {st:<4} {c.detail}")
+        detail = str(c.detail).strip()
+        if detail.upper().startswith("OK:"):
+            detail = detail.split(":", 1)[1].strip()
+        elif c.ok and detail.upper() == "OK":
+            detail = "available"
+        prefix = f"  - {str(c.component):<{comp_w}} {st:<{status_w}} "
+        width = max(16, term_cols - len(prefix))
+        wrapped = textwrap.wrap(
+            detail if detail != "" else "-",
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        if len(wrapped) == 0:
+            wrapped = ["-"]
+        print(f"{prefix}{wrapped[0]}")
+        cont = " " * len(prefix)
+        for line in wrapped[1:]:
+            print(f"{cont}{line}")
         if not c.ok:
             ok_all = False
     return ok_all
@@ -1233,6 +1539,23 @@ def _save_prediction_artifacts(
     rows: list[EngineRunResult],
 ) -> dict[str, str]:
     out: dict[str, str] = {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Remove stale artifacts from previous runs under the same prefix so that
+    # summary/compare files always reflect the current invocation.
+    stale_paths = [
+        out_dir / f"{prefix}.{_SUMMARY_TAG}.predictions.tsv",
+        out_dir / f"{prefix}.{_SUMMARY_TAG}.predictions.wide.tsv",
+        out_dir / f"{prefix}.{_SUMMARY_TAG}.pred.compare.samples.tsv",
+        out_dir / f"{prefix}.{_SUMMARY_TAG}.pred.compare.tsv",
+        out_dir / f"{prefix}.{_SUMMARY_TAG}.pred.compare.md",
+    ]
+    for p in stale_paths:
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
     frames: list[pd.DataFrame] = []
     engine_order: list[str] = []
     seen: set[str] = set()
@@ -1251,7 +1574,6 @@ def _save_prediction_artifacts(
     if len(frames) == 0:
         return out
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     long_df = pd.concat(frames, ignore_index=True, sort=False)
 
     for col, default in (
@@ -1630,10 +1952,10 @@ def _build_external_engine_result(
         "status": "ok",
         "engine": engine,
         "folds": int(fold_df.shape[0]),
-        "mean_r2": float(np.nanmean(fold_df["r2"].to_numpy(dtype=float))),
-        "mean_pearson": float(np.nanmean(fold_df["pearson"].to_numpy(dtype=float))),
-        "mean_spearman": float(np.nanmean(fold_df["spearman"].to_numpy(dtype=float))),
-        "mean_pve": float(np.nanmean(fold_df["pve"].to_numpy(dtype=float))),
+        "mean_r2": _nanmean_or_nan(fold_df["r2"].to_numpy(dtype=float)),
+        "mean_pearson": _nanmean_or_nan(fold_df["pearson"].to_numpy(dtype=float)),
+        "mean_spearman": _nanmean_or_nan(fold_df["spearman"].to_numpy(dtype=float)),
+        "mean_pve": _nanmean_or_nan(fold_df["pve"].to_numpy(dtype=float)),
         "prediction_rows": int(pred_df.shape[0]),
         "prediction_file": str(pred_file),
     }
@@ -1897,7 +2219,26 @@ def _run_engine_hiblup(
         gebv_col = _choose_hiblup_gebv_column(rand_df)
         rand_df = rand_df[[id_col, gebv_col]].rename(columns={id_col: "sample_id", gebv_col: "gebv"})
         rand_df["sample_id"] = rand_df["sample_id"].astype(str)
-        beta0 = _parse_hiblup_beta(beta_file, float(np.nanmean(y[fold != fd])))
+        train_mu = float(np.nanmean(y[fold != fd]))
+        train_sd = float(np.nanstd(y[fold != fd]))
+        beta0_raw = _parse_hiblup_beta(beta_file, train_mu)
+        beta0 = float(beta0_raw)
+        # Some HIBLUP versions/output layouts may expose a fixed-effect value that
+        # is not the prediction intercept expected here. Guard against obvious offset.
+        if math.isfinite(train_sd) and train_sd > 0:
+            if abs(float(beta0_raw) - train_mu) > max(5.0 * float(train_sd), 5.0):
+                beta0 = float(train_mu)
+        # Prefer fold-local calibration from training data when available:
+        # beta = mean(y_train - gebv_train), making y_pred comparable across engines.
+        train_df_for_cal = pd.DataFrame({"sample_id": ids[fold != fd], "y_train": y[fold != fd]})
+        cal_df = train_df_for_cal.merge(rand_df, on="sample_id", how="left")
+        cal_y = pd.to_numeric(cal_df.get("y_train"), errors="coerce")
+        cal_g = pd.to_numeric(cal_df.get("gebv"), errors="coerce")
+        cal_mask = cal_y.notna() & cal_g.notna()
+        if int(cal_mask.sum()) >= 3:
+            beta_cal = _nanmean_or_nan((cal_y[cal_mask] - cal_g[cal_mask]).to_numpy(dtype=float))
+            if math.isfinite(beta_cal):
+                beta0 = float(beta_cal)
         pve_fold = _parse_hiblup_pve(vars_file)
 
         test_df = pd.DataFrame({"sample_id": ids[fold == fd], "y_true": y[fold == fd]})
@@ -1972,8 +2313,10 @@ def _run_engine_blupf90(
     meta_json: Path,
     pregsf90_bin: str,
     blupf90_bin: str,
+    engine: str = "blupf90",
+    use_apy: bool = False,
 ) -> EngineRunResult:
-    engine = "blupf90"
+    engine = str(engine).strip().lower() or "blupf90"
     run_dir = bench_dir / "runs" / engine
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1990,10 +2333,11 @@ def _run_engine_blupf90(
     geno = np.fromfile(str(meta["geno_bin"]), dtype=np.float32).reshape((m, n))
     numeric_ids = np.arange(1, int(ids.shape[0]) + 1, dtype=np.int64)
     id_map = {str(orig): int(iid) for orig, iid in zip(ids, numeric_ids)}
+    n_levels = int(numeric_ids.shape[0])
 
-    snp_file = (run_dir / "geno.snp.txt").resolve()
-    snp_xref = (run_dir / "geno.snp_xref.txt").resolve()
-    ped_file = (run_dir / "ped.txt").resolve()
+    snp_file = run_dir / "geno.snp.txt"
+    snp_xref = run_dir / "geno.snp_xref.txt"
+    ped_file = run_dir / "ped.txt"
     if not snp_file.exists():
         _write_blupf90_fixed_snp_file(snp_file, numeric_ids, geno)
     if not snp_xref.exists():
@@ -2011,13 +2355,61 @@ def _run_engine_blupf90(
     pred_frames: list[pd.DataFrame] = []
     note = ""
 
+    # Keep thread fairness across engines by default:
+    # BLUPF90 follows --thread unless explicitly overridden.
+    # (Override via JX_GBLUPBENCH_BLUPF90_THREADS.)
+    blup_env = os.environ.copy()
+    raw_thr = str(os.environ.get("JX_GBLUPBENCH_BLUPF90_THREADS", "")).strip()
+    if raw_thr == "":
+        try:
+            blup_threads = max(1, int(args.thread))
+        except Exception:
+            blup_threads = 1
+    else:
+        try:
+            blup_threads = max(1, int(raw_thr))
+        except Exception:
+            blup_threads = max(1, int(args.thread))
+    thr_text = str(int(blup_threads))
+    thread_keys = (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    )
+    for key in thread_keys:
+        blup_env[key] = thr_text
+    # Avoid Intel OpenMP warning:
+    # "OMP_PROC_BIND ignored because KMP_AFFINITY has been defined"
+    blup_env.pop("KMP_AFFINITY", None)
+    blup_env.setdefault("OMP_PROC_BIND", "false")
+
+    conda_prefix = str(blup_env.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix != "":
+        conda_lib = str((Path(conda_prefix) / "lib").resolve())
+        old_ld = str(blup_env.get("LD_LIBRARY_PATH", ""))
+        blup_env["LD_LIBRARY_PATH"] = (
+            f"{conda_lib}:{old_ld}" if old_ld.strip() != "" else conda_lib
+        )
+
+    apy_mode = _detect_pregsf90_apy_mode(pregsf90_bin) if use_apy else "modern"
+    apy_type = 2
+    apy_use_noa22 = str(os.environ.get("JX_GBLUPBENCH_APY_NOA22", "1")).strip().lower() not in {"0", "false", "no"}
+    apy_alpha_beta = str(os.environ.get("JX_GBLUPBENCH_APY_ALPHABETA", "0.95 0.05")).strip()
+    if apy_alpha_beta == "":
+        apy_alpha_beta = "0.95 0.05"
+    pregs_env = dict(blup_env)
+    pregs_single_thread = False
+
     fold_ids = sorted(int(x) for x in np.unique(fold) if int(x) > 0)
     for fd in fold_ids:
         fold_dir = run_dir / f"fold{fd}"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        data_file = (fold_dir / "data.txt").resolve()
-        pregs_par = (fold_dir / "pregs.par").resolve()
-        blup_par = (fold_dir / "blup.par").resolve()
+        data_file = fold_dir / "data.txt"
+        pregs_par = fold_dir / "pregs.par"
+        blup_par = fold_dir / "blup.par"
         ped_ref = os.path.relpath(str(ped_file), str(fold_dir))
         snp_ref = os.path.relpath(str(snp_file), str(fold_dir))
         xref_ref = os.path.relpath(str(snp_xref), str(fold_dir))
@@ -2027,43 +2419,56 @@ def _run_engine_blupf90(
                 pheno_val = "-999" if int(fv) == int(fd) else f"{float(yv):.12g}"
                 fh.write(f"{id_map[str(sid)]} 1 {pheno_val} 1\n")
 
-        pregs_par.write_text(
-            "\n".join(
-                [
-                    "DATAFILE",
-                    data_file.name,
-                    "NUMBER_OF_TRAITS",
-                    "1",
-                    "NUMBER_OF_EFFECTS",
-                    "2",
-                    "OBSERVATION(S)",
-                    "3",
-                    "WEIGHT(S)",
-                    "4",
-                    "EFFECTS:",
-                    "2 1 cross",
-                    "1 0 cross",
-                    "RANDOM_RESIDUAL VALUES",
-                    "1.0",
-                    "RANDOM_GROUP",
-                    "2",
-                    "RANDOM_TYPE",
-                    "add_animal",
-                    "FILE",
-                    ped_ref,
-                    "(CO)VARIANCES",
-                    "1.0",
-                    f"OPTION SNP_file {snp_ref} {xref_ref}",
-                    "OPTION no_quality_control",
-                    "OPTION AlphaBeta 0.95 0.05",
-                    "OPTION tunedG 0",
-                    "OPTION saveAscii",
-                    "OPTION saveGimA22iRen",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        def _write_pregs_par(current_apy_mode: str, include_noa22: bool) -> None:
+            apy_lines: list[str] = []
+            if use_apy:
+                apy_lines.extend(
+                    _build_apy_option_lines(n_levels=n_levels, apy_mode=current_apy_mode, apy_type=apy_type)
+                )
+                if include_noa22:
+                    apy_lines.append("OPTION noA22directinv")
+
+            pregs_par.write_text(
+                "\n".join(
+                    [
+                        "DATAFILE",
+                        data_file.name,
+                        "NUMBER_OF_TRAITS",
+                        "1",
+                        "NUMBER_OF_EFFECTS",
+                        "2",
+                        "OBSERVATION(S)",
+                        "3",
+                        "WEIGHT(S)",
+                        "4",
+                        "EFFECTS:",
+                        "2 1 cross",
+                        f"1 {n_levels} cross",
+                        "RANDOM_RESIDUAL VALUES",
+                        "1.0",
+                        "RANDOM_GROUP",
+                        "2",
+                        "RANDOM_TYPE",
+                        "add_animal",
+                        "FILE",
+                        ped_ref,
+                        "(CO)VARIANCES",
+                        "1.0",
+                        f"OPTION SNP_file {snp_ref} {xref_ref}",
+                        "OPTION no_quality_control",
+                        *apy_lines,
+                        f"OPTION AlphaBeta {apy_alpha_beta}",
+                        "OPTION tunedG 0",
+                        "OPTION saveAscii",
+                        "OPTION saveGInverse",
+                        "OPTION saveGimA22iRen",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+        _write_pregs_par(apy_mode, apy_use_noa22)
 
         blup_par.write_text(
             "\n".join(
@@ -2080,7 +2485,7 @@ def _run_engine_blupf90(
                     "4",
                     "EFFECTS:",
                     "2 1 cross",
-                    "1 0 cross",
+                    f"1 {n_levels} cross",
                     "RANDOM_RESIDUAL VALUES",
                     "1.0",
                     "RANDOM_GROUP",
@@ -2091,6 +2496,7 @@ def _run_engine_blupf90(
                     "GimA22i_Ren.txt",
                     "(CO)VARIANCES",
                     "1.0",
+                    "OPTION missing -999",
                     "",
                 ]
             ),
@@ -2105,20 +2511,143 @@ def _run_engine_blupf90(
             log_file=log_file,
             time_file=pregs_time,
             cwd=fold_dir,
+            env=pregs_env,
         )
         if math.isfinite(elapsed1):
             total_elapsed += float(elapsed1)
         if math.isfinite(rss1):
             max_rss = float(rss1) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1))
+        if use_apy:
+            # Compatibility fallback for older preGSf90 APY syntax.
+            # Try switching to legacy APY syntax and/or removing noA22directinv when unsupported.
+            for _ in range(5):
+                try:
+                    tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:])
+                except Exception:
+                    tail = ""
+
+                retry_needed = False
+                if (apy_mode != "legacy") and ("ERROR: OPTION Apy has 3 arguments" in tail):
+                    apy_mode = "legacy"
+                    retry_needed = True
+                elif apy_use_noa22 and ('ERROR: The "noA22directinv" option is not supported in this program.' in tail):
+                    apy_use_noa22 = False
+                    retry_needed = True
+                elif (
+                    use_apy
+                    and (apy_mode == "legacy")
+                    and (int(apy_type) == 2)
+                    and ('ERROR: "OPTION apy 2" must be combined with "OPTION noA22directinv".' in tail)
+                    and (not apy_use_noa22)
+                ):
+                    # Some legacy preGSf90 builds simultaneously reject noA22directinv for APY2,
+                    # but require it for APY2. Fall back to legacy APY type 1.
+                    apy_type = 1
+                    retry_needed = True
+                elif ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
+                    # APY2 can be unstable on some preGSf90 builds.
+                    # Fall back to a safer APY setup.
+                    if int(apy_type) != 1:
+                        apy_type = 1
+                        retry_needed = True
+                    if apy_alpha_beta.strip() != "1.0 0.0":
+                        apy_alpha_beta = "1.0 0.0"
+                        retry_needed = True
+                    if not pregs_single_thread:
+                        pregs_single_thread = True
+                        for key in thread_keys:
+                            pregs_env[key] = "1"
+                        retry_needed = True
+
+                if not retry_needed:
+                    break
+
+                _write_pregs_par(apy_mode, apy_use_noa22)
+                rc1b, elapsed1b, rss1b = _run_tool_with_parfile_fallback(
+                    pregsf90_bin,
+                    pregs_par,
+                    log_file=log_file,
+                    time_file=pregs_time,
+                    cwd=fold_dir,
+                    env=pregs_env,
+                )
+                if math.isfinite(elapsed1b):
+                    total_elapsed += float(elapsed1b)
+                if math.isfinite(rss1b):
+                    max_rss = float(rss1b) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1b))
+                rc1 = int(rc1b)
+
         if rc1 != 0:
             note = f"preGSf90 failed on fold {fd} (exit={rc1})."
+            if use_apy:
+                try:
+                    tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:])
+                    if "ERROR: OPTION Apy has 3 arguments" in tail:
+                        note = (
+                            f"{note} Current preGSf90 requires legacy APY syntax. "
+                            "Set JX_GBLUPBENCH_APY_MODE=legacy or upgrade preGSf90."
+                        )
+                    if 'ERROR: The "noA22directinv" option is not supported in this program.' in tail:
+                        note = (
+                            f"{note} Current preGSf90 does not support noA22directinv. "
+                            "Set JX_GBLUPBENCH_APY_NOA22=0 or upgrade preGSf90."
+                        )
+                    if 'ERROR: "OPTION apy 2" must be combined with "OPTION noA22directinv".' in tail:
+                        note = (
+                            f"{note} Current preGSf90 reports incompatible APY2/noA22directinv requirements. "
+                            "Try legacy APY type 1 by setting JX_GBLUPBENCH_APY_OPTION='apy 1 1 core.le.100'."
+                        )
+                    if ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
+                        note = (
+                            f"{note} preGSf90 APY crashed (SIGSEGV). "
+                            "Try JX_GBLUPBENCH_APY_OPTION='apy 1 1 core.le.100' and JX_GBLUPBENCH_BLUPF90_THREADS=1, "
+                            "or upgrade preGSf90."
+                        )
+                    if "No core (or noncore) animals found" in tail:
+                        note = (
+                            f"{note} APY core/non-core groups were not formed; "
+                            "check pedigree/content or add APY-specific preGSf90 options (e.g. snpapy)."
+                        )
+                except Exception:
+                    pass
             break
 
-        gi_file = fold_dir / "GimA22i_Ren.txt"
-        if not gi_file.exists():
-            gi_file = fold_dir / "GimA22i_ren.txt"
-        if not gi_file.exists():
-            note = f"preGSf90 fold {fd} did not produce GimA22i_Ren.txt/GimA22i_ren.txt."
+        gi_candidates = [
+            fold_dir / "Gi",
+            fold_dir / "Gi.txt",
+            fold_dir / "Gi_ren.txt",
+            fold_dir / "Gi_ren",
+            fold_dir / "ApyGi",
+            fold_dir / "ApyGi_ren.txt",
+            fold_dir / "GimA22i_Ren.txt",
+            fold_dir / "GimA22i_ren.txt",
+        ]
+        gi_file = next((p for p in gi_candidates if p.exists()), None)
+        if gi_file is None:
+            note = (
+                f"preGSf90 fold {fd} did not produce expected inverse matrix file "
+                "(Gi/ApyGi/GimA22i variants)."
+            )
+            if use_apy:
+                try:
+                    tail_lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:]
+                    tail = "\n".join(tail_lines)
+                    if "ERROR: OPTION Apy has 3 arguments" in tail:
+                        note = (
+                            f"{note} Current preGSf90 expects legacy APY syntax with 3 arguments; "
+                            "please upgrade preGSf90 or provide APY options compatible with your version."
+                        )
+                    elif 'ERROR: The "noA22directinv" option is not supported in this program.' in tail:
+                        note = (
+                            f"{note} Current preGSf90 does not support noA22directinv for APY; "
+                            "please upgrade BLUPF90 tools."
+                        )
+                    elif "ERROR:" in tail:
+                        err_line = next((ln.strip() for ln in reversed(tail_lines) if "ERROR:" in ln), "")
+                        if err_line:
+                            note = f"{note} {err_line}"
+                except Exception:
+                    pass
             break
 
         blup_par.write_text(
@@ -2136,7 +2665,7 @@ def _run_engine_blupf90(
                     "4",
                     "EFFECTS:",
                     "2 1 cross",
-                    "1 0 cross",
+                    f"1 {n_levels} cross",
                     "RANDOM_RESIDUAL VALUES",
                     "1.0",
                     "RANDOM_GROUP",
@@ -2147,6 +2676,7 @@ def _run_engine_blupf90(
                     gi_file.name,
                     "(CO)VARIANCES",
                     "1.0",
+                    "OPTION missing -999",
                     "",
                 ]
             ),
@@ -2159,6 +2689,7 @@ def _run_engine_blupf90(
             log_file=log_file,
             time_file=solver_time,
             cwd=fold_dir,
+            env=blup_env,
         )
         if math.isfinite(elapsed2):
             total_elapsed += float(elapsed2)
@@ -2166,6 +2697,15 @@ def _run_engine_blupf90(
             max_rss = float(rss2) if not math.isfinite(max_rss) else max(float(max_rss), float(rss2))
         if rc2 != 0:
             note = f"{Path(blupf90_bin).name} failed on fold {fd} (exit={rc2})."
+            try:
+                tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-80:])
+                if ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
+                    note = (
+                        f"{note} SIGSEGV detected; retry with "
+                        "JX_GBLUPBENCH_BLUPF90_THREADS=1 and ensure CONDA_PREFIX/lib in LD_LIBRARY_PATH."
+                    )
+            except Exception:
+                pass
             break
 
         sol_file = fold_dir / "solutions"
@@ -2174,20 +2714,42 @@ def _run_engine_blupf90(
             break
 
         intercept = float(np.nanmean(y[fold != fd]))
-        sol_map: dict[str, float] = {}
+        sol_map: dict[int, float] = {}
         for line in sol_file.read_text(encoding="utf-8", errors="ignore").splitlines():
             parts = line.split()
             if len(parts) < 4:
                 continue
-            effect, level, trait = str(parts[0]), str(parts[1]), str(parts[2])
             value = _safe_float(parts[3], math.nan)
-            if effect == "1" and level == "1" and trait == "1" and math.isfinite(value):
-                intercept = float(value)
-            elif effect == "2" and trait == "1" and math.isfinite(value):
-                sol_map[level] = float(value)
+            if not math.isfinite(value):
+                continue
+            a = _safe_int_token(parts[0])
+            b = _safe_int_token(parts[1])
+            c = _safe_int_token(parts[2])
+            if a is None or b is None or c is None:
+                continue
+            # BLUPF90 `solutions` column order may vary by build/configuration.
+            # Try common layouts:
+            #   1) effect, level, trait, value
+            #   2) trait, effect, level, value
+            #   3) effect, trait, level, value
+            candidates = (
+                (a, b, c),
+                (b, c, a),
+                (a, c, b),
+            )
+            for effect_i, level_i, trait_i in candidates:
+                if trait_i != 1:
+                    continue
+                if effect_i == 1 and level_i == 1:
+                    intercept = float(value)
+                elif effect_i == 2 and (1 <= int(level_i) <= int(n_levels)):
+                    sol_map[int(level_i)] = float(value)
+                else:
+                    continue
+                break
 
         test_ids = ids[fold == fd]
-        gebv = np.asarray([sol_map.get(str(id_map[str(sid)]), math.nan) for sid in test_ids], dtype=float)
+        gebv = np.asarray([sol_map.get(int(id_map[str(sid)]), math.nan) for sid in test_ids], dtype=float)
         if np.any(~np.isfinite(gebv)):
             note = f"BLUPF90 fold {fd} missing breeding values for one or more test samples."
             break
@@ -2324,12 +2886,16 @@ def _save_summary(out_dir: Path, prefix: str, rows: list[EngineRunResult], cfg: 
 def main() -> None:
     args = parse_args()
 
-    engines = _parse_engines(args.engines)
+    engines_raw = str(args.engines)
+    if bool(args.check) and (not bool(getattr(args, "_engines_explicit", False))):
+        engines_raw = _DEFAULT_ENGINES_CHECK_ALL
+    engines = _parse_engines(engines_raw)
     if len(engines) == 0:
-        raise ValueError("No valid engines selected. Use --engines janusx,sommer,rrblup,blupf90,hiblup")
+        raise ValueError(f"No valid engines selected. Use --engines {_ENGINE_LIST_TEXT}")
 
     if args.check:
         checks = _collect_env_checks(engines)
+        checks.extend(_run_smoke_checks_with_sim(engines))
         ok = _print_env_checks(engines, checks)
         raise SystemExit(0 if ok else 1)
 
@@ -2430,7 +2996,7 @@ def main() -> None:
             rows.append(rr)
             continue
 
-        if engine == "blupf90":
+        if engine in {"blupf90", "blupf90apy"}:
             if (pregsf90_bin is None) or (blupf90_bin is None):
                 rows.append(
                     EngineRunResult(
@@ -2459,6 +3025,8 @@ def main() -> None:
                 meta_json=Path(data_info["meta_json"]),
                 pregsf90_bin=pregsf90_bin,
                 blupf90_bin=blupf90_bin,
+                engine=engine,
+                use_apy=(engine == "blupf90apy"),
             )
             rows.append(rr)
             continue

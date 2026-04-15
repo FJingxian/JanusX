@@ -2116,6 +2116,111 @@ def _parse_hiblup_pve(vars_path: Path) -> float:
     return _safe_float(df[h2_col].iloc[0], math.nan) if int(df.shape[0]) > 0 else math.nan
 
 
+def _extract_gs_cv_mean_pve(log_text: str, method: str = "GBLUP") -> float:
+    """
+    Parse JanusX `gs` CLI log and extract mean h2/PVE for a target method from
+    the CV table:
+      Fold  Method  Pearsonr  Spearmanr  R2  h2/PVE  time(secs)
+    """
+    lines = str(log_text or "").splitlines()
+    target = str(method).strip().lower()
+    latest_values: list[float] = []
+
+    for i, line in enumerate(lines):
+        low = str(line).strip().lower()
+        if ("fold" not in low) or ("method" not in low) or ("h2/pve" not in low):
+            continue
+
+        values: list[float] = []
+        saw_rows = False
+        for raw in lines[i + 1 :]:
+            s = str(raw).strip()
+            if s == "":
+                if saw_rows:
+                    break
+                continue
+            if set(s) <= {"-"}:
+                continue
+            parts = s.split()
+            if len(parts) < 7:
+                if saw_rows:
+                    break
+                continue
+            fold_i = _safe_int_token(parts[0])
+            if fold_i is None:
+                if saw_rows:
+                    break
+                continue
+            saw_rows = True
+            method_i = str(parts[1]).strip().lower()
+            if method_i != target:
+                continue
+            pve_i = _safe_float(parts[5], math.nan)
+            if math.isfinite(pve_i):
+                values.append(float(pve_i))
+        if len(values) > 0:
+            latest_values = values
+
+    if len(latest_values) == 0:
+        return math.nan
+    return _nanmean_or_nan(np.asarray(latest_values, dtype=float))
+
+
+def _extract_gs_cv_rows(log_text: str, method: str = "GBLUP") -> list[dict[str, float | int]]:
+    """
+    Parse JanusX `gs` CLI log and extract per-fold rows for a target method from
+    the CV table:
+      Fold  Method  Pearsonr  Spearmanr  R2  h2/PVE  time(secs)
+    """
+    lines = str(log_text or "").splitlines()
+    target = str(method).strip().lower()
+    latest_rows: list[dict[str, float | int]] = []
+
+    for i, line in enumerate(lines):
+        low = str(line).strip().lower()
+        if ("fold" not in low) or ("method" not in low) or ("h2/pve" not in low):
+            continue
+
+        rows: list[dict[str, float | int]] = []
+        saw_rows = False
+        for raw in lines[i + 1 :]:
+            s = str(raw).strip()
+            if s == "":
+                if saw_rows:
+                    break
+                continue
+            if set(s) <= {"-"}:
+                continue
+            parts = s.split()
+            if len(parts) < 7:
+                if saw_rows:
+                    break
+                continue
+            fold_i = _safe_int_token(parts[0])
+            if fold_i is None:
+                if saw_rows:
+                    break
+                continue
+            saw_rows = True
+            method_i = str(parts[1]).strip().lower()
+            if method_i != target:
+                continue
+            rows.append(
+                {
+                    "fold": int(fold_i),
+                    "pearson": _safe_float(parts[2], math.nan),
+                    "spearman": _safe_float(parts[3], math.nan),
+                    "r2": _safe_float(parts[4], math.nan),
+                    "pve": _safe_float(parts[5], math.nan),
+                    "time_sec": _safe_float(parts[6], math.nan),
+                }
+            )
+        if len(rows) > 0:
+            latest_rows = rows
+
+    return latest_rows
+
+
 def _build_external_engine_result(
     *,
     engine: str,
@@ -2196,7 +2301,7 @@ def _run_engine_janusx(
     meta_json: Path,
 ) -> EngineRunResult:
     engine = "janusx"
-    run_dir = bench_dir / "runs" / engine
+    run_dir = (bench_dir / "runs" / engine).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = run_dir / f"{engine}.log"
@@ -2206,148 +2311,62 @@ def _run_engine_janusx(
     sample_df = pd.read_csv(str(meta["sample_tsv"]), sep="\t")
     ids = sample_df["id"].astype(str).to_numpy()
     y = sample_df["y"].to_numpy(dtype=float)
-    fold = sample_df["fold"].to_numpy(dtype=int)
     bfile = str(meta["filtered_plink_prefix"])
     env = os.environ.copy()
     py_root = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = py_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    fold_rows: list[dict[str, Any]] = []
-    pred_frames: list[pd.DataFrame] = []
-    total_elapsed = 0.0
-    max_rss = math.nan
     note = ""
 
-    fold_ids = sorted(int(x) for x in np.unique(fold) if int(x) > 0)
-    for i, fd in enumerate(fold_ids, start=1):
-        fold_dir = run_dir / f"fold{fd}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
+    pheno_file = (run_dir / "pheno.full.tsv").resolve()
+    pd.DataFrame({"id": ids, "PHENO": y}).to_csv(
+        pheno_file,
+        sep="\t",
+        index=False,
+        na_rep="NA",
+    )
 
-        pheno_file = (fold_dir / "pheno.tsv").resolve()
-        y_fold = np.asarray(y, dtype=float).copy()
-        y_fold[fold == fd] = np.nan
-        pd.DataFrame({"id": ids, "PHENO": y_fold}).to_csv(
-            pheno_file,
-            sep="\t",
-            index=False,
-            na_rep="NA",
-        )
-
-        fold_prefix = f"gs_fold{fd}"
-        attempt_time = run_dir / f"{engine}.fold{fd}.time"
-        cmd = [
-            sys.executable,
-            "-m",
-            "janusx.script.gs",
-            "-bfile",
-            str(bfile),
-            "-p",
-            str(pheno_file),
-            "-GBLUP",
-            "-force-fast",
-            "-o",
-            str(fold_dir),
-            "-prefix",
-            fold_prefix,
-            "-t",
-            str(int(args.thread)),
-            "-maf",
-            "0.0",
-            "-geno",
-            "1.0",
-        ]
-        rc, elapsed, rss = _run_timed(
-            cmd,
-            log_file=log_file,
-            time_file=attempt_time,
-            env=env,
-            cwd=fold_dir,
-            append_log=(i > 1),
-            limit_mem_gb=args.limit_mem,
-        )
-        if math.isfinite(elapsed):
-            total_elapsed += float(elapsed)
-        if math.isfinite(rss):
-            max_rss = float(rss) if not math.isfinite(max_rss) else max(float(max_rss), float(rss))
-        if rc != 0:
-            note = f"gs -GBLUP failed on fold {fd} (exit={rc})."
-            if int(rc) == 137 and args.limit_mem is not None:
-                note = f"gs -GBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
-            break
-
-        pred_path = fold_dir / f"{fold_prefix}.PHENO.gs.tsv"
-        if not pred_path.exists():
-            note = f"gs -GBLUP fold {fd} prediction output missing: {pred_path.name}"
-            break
-        pred_raw = _read_table_guess(pred_path)
-        if int(pred_raw.shape[1]) < 2:
-            note = f"gs -GBLUP fold {fd} prediction table malformed."
-            break
-
-        id_col = "Unnamed: 0" if "Unnamed: 0" in pred_raw.columns else str(pred_raw.columns[0])
-        if "GBLUP" in pred_raw.columns:
-            pred_col = "GBLUP"
-        else:
-            pred_col = str([c for c in pred_raw.columns if str(c) != str(id_col)][0])
-        pred_tbl = (
-            pred_raw[[id_col, pred_col]]
-            .rename(columns={id_col: "sample_id", pred_col: "y_pred"})
-            .copy()
-        )
-        pred_tbl["sample_id"] = pred_tbl["sample_id"].astype(str).str.strip()
-        pred_tbl["y_pred"] = pd.to_numeric(pred_tbl["y_pred"], errors="coerce")
-
-        test_df = pd.DataFrame({"sample_id": ids[fold == fd], "y_true": y[fold == fd]})
-        pred_df = test_df.merge(pred_tbl, on="sample_id", how="left")
-        if pred_df["y_pred"].isna().any():
-            note = f"gs -GBLUP fold {fd} missing predictions for one or more test samples."
-            break
-
-        intercept = float(np.nanmean(y[fold != fd]))
-        pred_df["engine"] = engine
-        pred_df["fold"] = int(fd)
-        pred_df["intercept"] = float(intercept)
-        pred_df["gebv"] = pd.to_numeric(pred_df["y_pred"], errors="coerce") - float(intercept)
-        pred_df["pve_fold"] = math.nan
-        pred_df["n_train"] = int(np.sum(fold != fd))
-        pred_df["n_test"] = int(np.sum(fold == fd))
-
-        r2, pear, spear = _safe_prediction_metrics(pred_df["y_true"], pred_df["y_pred"])
-        fold_rows.append(
-            {
-                "fold": int(fd),
-                "n_train": int(np.sum(fold != fd)),
-                "n_test": int(np.sum(fold == fd)),
-                "r2": float(r2),
-                "pearson": float(pear),
-                "spearman": float(spear),
-                "pve": math.nan,
-            }
-        )
-        pred_frames.append(
-            pred_df[
-                [
-                    "engine",
-                    "sample_id",
-                    "fold",
-                    "y_true",
-                    "y_pred",
-                    "gebv",
-                    "intercept",
-                    "pve_fold",
-                    "n_train",
-                    "n_test",
-                ]
-            ].copy()
-        )
-
-    _write_time_summary(time_file, total_elapsed, max_rss)
-    if note:
+    fold_prefix = "gs_cv"
+    cmd = [
+        sys.executable,
+        "-m",
+        "janusx.script.gs",
+        "-bfile",
+        str(bfile),
+        "-p",
+        str(pheno_file),
+        "-GBLUP",
+        "-force-fast",
+        "-o",
+        str(run_dir),
+        "-prefix",
+        fold_prefix,
+        "-cv",
+        str(int(args.cv)),
+        "-t",
+        str(int(args.thread)),
+        "-maf",
+        "0.0",
+        "-geno",
+        "1.0",
+    ]
+    rc, elapsed, rss = _run_timed(
+        cmd,
+        log_file=log_file,
+        time_file=time_file,
+        env=env,
+        cwd=run_dir,
+        limit_mem_gb=args.limit_mem,
+    )
+    if rc != 0:
+        note = f"gs -GBLUP failed (exit={rc})."
+        if int(rc) == 137 and args.limit_mem is not None:
+            note = f"gs -GBLUP failed: memory limit exceeded ({float(args.limit_mem):g} GB)."
         return EngineRunResult(
             engine=engine,
             status="fail",
             exit_code=1,
-            elapsed_sec=float(total_elapsed),
-            peak_rss_kb=float(max_rss),
+            elapsed_sec=float(elapsed),
+            peak_rss_kb=float(rss),
             mean_r2=math.nan,
             mean_pearson=math.nan,
             mean_spearman=math.nan,
@@ -2361,16 +2380,95 @@ def _run_engine_janusx(
             note=note,
         )
 
-    return _build_external_engine_result(
+    log_text = ""
+    try:
+        log_text = log_file.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        log_text = ""
+    gs_rows = _extract_gs_cv_rows(log_text, method="GBLUP")
+    if len(gs_rows) == 0:
+        note = "Failed to parse GS CV fold metrics from log."
+        return EngineRunResult(
+            engine=engine,
+            status="fail",
+            exit_code=1,
+            elapsed_sec=float(elapsed),
+            peak_rss_kb=float(rss),
+            mean_r2=math.nan,
+            mean_pearson=math.nan,
+            mean_spearman=math.nan,
+            mean_pve=math.nan,
+            folds=0,
+            fold_file="",
+            prediction_file="",
+            result_json="",
+            log_file=str(log_file),
+            time_file=str(time_file),
+            note=note,
+        )
+
+    fold_size_map: dict[int, tuple[int, int]] = {}
+    try:
+        cv_splits = build_cv_splits(
+            n_samples=int(y.shape[0]),
+            n_splits=int(args.cv),
+            seed=42,
+        )
+        for i, (test_idx, train_idx) in enumerate(cv_splits, start=1):
+            fold_size_map[int(i)] = (int(np.asarray(train_idx).shape[0]), int(np.asarray(test_idx).shape[0]))
+    except Exception:
+        fold_size_map = {}
+
+    fold_rows: list[dict[str, Any]] = []
+    for rec in gs_rows:
+        fd = int(rec["fold"])
+        n_train, n_test = fold_size_map.get(fd, (0, 0))
+        fold_rows.append(
+            {
+                "fold": fd,
+                "n_train": int(n_train),
+                "n_test": int(n_test),
+                "r2": _safe_float(rec.get("r2"), math.nan),
+                "pearson": _safe_float(rec.get("pearson"), math.nan),
+                "spearman": _safe_float(rec.get("spearman"), math.nan),
+                "pve": _safe_float(rec.get("pve"), math.nan),
+            }
+        )
+    fold_df = pd.DataFrame(fold_rows).sort_values("fold", kind="stable").reset_index(drop=True)
+
+    fold_file = run_dir / f"{args.prefix}.{engine}.folds.tsv"
+    result_json = run_dir / f"{args.prefix}.{engine}.result.json"
+    fold_df.to_csv(fold_file, sep="\t", index=False)
+    result = {
+        "status": "ok",
+        "engine": engine,
+        "folds": int(fold_df.shape[0]),
+        "mean_r2": _nanmean_or_nan(fold_df["r2"].to_numpy(dtype=float)),
+        "mean_pearson": _nanmean_or_nan(fold_df["pearson"].to_numpy(dtype=float)),
+        "mean_spearman": _nanmean_or_nan(fold_df["spearman"].to_numpy(dtype=float)),
+        "mean_pve": _nanmean_or_nan(fold_df["pve"].to_numpy(dtype=float)),
+        "prediction_rows": 0,
+        "prediction_file": "",
+    }
+    result_json.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    return EngineRunResult(
         engine=engine,
-        args=args,
-        run_dir=run_dir,
-        elapsed=total_elapsed,
-        rss=max_rss,
-        fold_df=pd.DataFrame(fold_rows),
-        pred_df=pd.concat(pred_frames, ignore_index=True),
-        log_file=log_file,
-        time_file=time_file,
+        status="ok",
+        exit_code=0,
+        elapsed_sec=float(elapsed),
+        peak_rss_kb=float(rss),
+        mean_r2=_safe_float(result.get("mean_r2"), math.nan),
+        mean_pearson=_safe_float(result.get("mean_pearson"), math.nan),
+        mean_spearman=_safe_float(result.get("mean_spearman"), math.nan),
+        mean_pve=_safe_float(result.get("mean_pve"), math.nan),
+        folds=int(_safe_float(result.get("folds"), 0)),
+        fold_file=str(fold_file),
+        prediction_file="",
+        result_json=str(result_json),
+        log_file=str(log_file),
+        time_file=str(time_file),
+        note="single-run gs -cv mode (fold metrics parsed from log; no OOF prediction table)",
     )
 
 

@@ -1,4 +1,4 @@
-from typing import Union, Literal, Any, Optional
+from typing import Union, Any, Optional
 import os
 import time
 import numpy as np
@@ -62,6 +62,31 @@ def _env_positive_float(name: str, default: float) -> float:
 def _env_choice(name: str, default: str, choices: set[str]) -> str:
     raw = str(os.getenv(name, default)).strip().lower()
     return raw if raw in choices else str(default).strip().lower()
+
+
+def _normalize_kinship_flag(kinship: Any) -> Optional[int]:
+    # Backward-compatible normalization:
+    # - 0 / False / "0" / "false" => rrBLUP mode (kinship=None)
+    # - 1 / True  / "1" / "true"  => GBLUP mode (kinship=1)
+    if kinship is None:
+        return None
+    if isinstance(kinship, (bool, np.bool_)):
+        return 1 if bool(kinship) else None
+    if isinstance(kinship, str):
+        s = kinship.strip().lower()
+        if s in {"", "none", "null", "na", "nan", "0", "false", "no", "off"}:
+            return None
+        if s in {"1", "true", "yes", "on"}:
+            return 1
+    try:
+        k = int(kinship)
+    except Exception as exc:
+        raise ValueError("kinship must be one of {None, 0, 1}.") from exc
+    if k == 0:
+        return None
+    if k == 1:
+        return 1
+    raise ValueError(f"Unsupported kinship value: {kinship!r}. Expected one of {{None, 0, 1}}.")
 
 
 def _parse_mem_bytes(raw: str) -> Optional[int]:
@@ -419,7 +444,7 @@ class BLUP:
         M: Any,
         cov: Union[np.ndarray, None] = None,
         Z: Union[np.ndarray, None] = None,
-        kinship: Literal[None, 1] = None,
+        kinship: Any = None,
         log: bool = False,
         sample_indices: Union[np.ndarray, None] = None,
         force_fast: bool = False,
@@ -437,8 +462,8 @@ class BLUP:
             Fixed-effect design matrix of shape (n, p).
         Z : np.ndarray, optional
             Random-effect design matrix of shape (n, q).
-        kinship : {None, 1}
-            Kinship specification; None disables kinship.
+        kinship : {None, 0, 1}
+            Kinship specification; 0/None disables kinship, 1 enables GBLUP kinship.
         """
         self.log = log
         self._debug_stage = _env_truthy("JX_MLM_DEBUG_STAGE", "0")
@@ -476,7 +501,7 @@ class BLUP:
         )  # Design matrix of 1st vector
         self.n = self.X.shape[0]
         self.p = self.X.shape[1]
-        self.kinship = kinship  # control method to calculate kinship matrix
+        self.kinship = _normalize_kinship_flag(kinship)  # control method to calculate kinship matrix
         self._m_mean = None
         self._m_var_sum = None
         self._pred_chunk_size = 32_768
@@ -491,26 +516,13 @@ class BLUP:
         self._fast_svals = None
         self._fast_projected = False
         if self._packed_ctx is not None:
-            m_packed = int(self._packed_ctx["packed"].shape[0])
-            if m_packed < self.n:
-                self._fit_with_packed(
-                    Z=Z,
-                    z_is_identity=z_is_identity,
-                    sample_indices=sample_indices,
-                    t_init=t_init,
-                )
-                return
-            # Fallback: decode selected samples to dense and reuse the generic path.
-            sidx_dense = _normalize_sample_indices(
-                sample_indices,
-                int(self._packed_ctx["n_samples"]),
-                int(self.n),
+            self._fit_with_packed(
+                Z=Z,
+                z_is_identity=z_is_identity,
+                sample_indices=sample_indices,
+                t_init=t_init,
             )
-            all_rows_dense = np.arange(m_packed, dtype=np.int64)
-            self.M = _decode_packed_rows_f32(self._packed_ctx, all_rows_dense, sidx_dense)
-            self._packed_ctx = None
-            self._packed_sample_indices = None
-            self._packed_all_rows = None
+            return
 
         # Keep marker matrix in float32 by default to avoid a full float64 copy.
         if self.M is None:
@@ -749,9 +761,11 @@ class BLUP:
         self._packed_all_rows = np.arange(m, dtype=np.int64)
         usefastlmm = m < self.n
         if not usefastlmm:
-            raise ValueError(
-                f"Packed BLUP requires m < n for low-rank FaST mode. Got m={m}, n={self.n}."
-            )
+            if self.kinship is None:
+                self._fit_with_packed_explicit_marker(t_init=t_init)
+            else:
+                self._fit_with_packed_explicit_kinship(t_init=t_init)
+            return
         if self._debug_stage:
             print(
                 f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast={usefastlmm}",
@@ -948,6 +962,297 @@ class BLUP:
 
         sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2
+        self.pve = var_g / (var_g + sigma_e2)
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] fit_done pve={self.pve:.6f} elapsed={time.time() - t_init:.3f}s",
+                flush=True,
+            )
+
+    def _fit_with_packed_explicit_kinship(
+        self,
+        *,
+        t_init: float,
+    ) -> None:
+        if self._packed_ctx is None or self._packed_sample_indices is None:
+            raise RuntimeError("Internal error: packed context or sample indices are missing.")
+        if self.kinship is None:
+            raise ValueError("Packed explicit-kinship fit requires kinship != None.")
+
+        m = int(self._packed_ctx["packed"].shape[0])
+        row_step = max(1, int(_env_positive_int("JX_MLM_PACKED_ROW_CHUNK", 2048)))
+
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast=0",
+                flush=True,
+            )
+
+        t_k = time.time()
+        gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
+            n=int(self.n),
+            m=int(self.n),
+            block_cols=min(int(self.n), row_step),
+            resident_bytes=int(self._packed_ctx["packed"].nbytes),
+            force_fast=self._force_fast,
+        )
+        gram = np.zeros(
+            (self.n, self.n),
+            dtype=np.float64,
+            order=("F" if gram_mode == "lowmem" else "C"),
+        )
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] packed_grm_mode mode={gram_mode} "
+                f"auto_dim={auto_dim} "
+                f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
+                f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                flush=True,
+            )
+        sum_rows = np.zeros((m, 1), dtype=np.float64)
+        # Accumulate centering terms on-the-fly so we can build GRM in one decode pass.
+        # mu_proj = M^T * mu, mu_sq_sum = sum(mu_i^2), var_sum = sum(var_i).
+        mu_proj = np.zeros((self.n, 1), dtype=np.float64)
+        mu_sq_sum = 0.0
+        var_sum = 0.0
+
+        # Single pass over SNP rows:
+        # 1) accumulate raw Gram: M^T M
+        # 2) accumulate row means/variances
+        # 3) accumulate centering correction terms (M^T mu, sum(mu_i^2))
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.arange(st, ed, dtype=np.int64)
+            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            blk64 = np.asarray(blk, dtype=np.float64)
+            row_sum_blk = np.sum(blk64, axis=1, keepdims=True)
+            sum_rows[st:ed, :] = row_sum_blk
+            mu_blk = row_sum_blk / float(self.n)
+            sq_mean_blk = np.sum(blk64 * blk64, axis=1, keepdims=True) / float(self.n)
+            m_var_blk = sq_mean_blk - mu_blk * mu_blk
+            np.maximum(m_var_blk, 0.0, out=m_var_blk)
+            var_sum += float(np.sum(m_var_blk, dtype=np.float64))
+            blk_t = (
+                np.asfortranarray(blk64.T)
+                if gram_mode == "lowmem"
+                else np.asarray(blk64.T, dtype=np.float64)
+            )
+            gram = _gram_rankk_update(
+                gram,
+                blk_t,
+                lowmem=(gram_mode == "lowmem"),
+            )
+            mu_proj += blk_t @ mu_blk
+            mu_sq_sum += float(np.sum(mu_blk * mu_blk, dtype=np.float64))
+
+        self._m_mean = sum_rows / float(self.n)
+        self._m_var_sum = float(var_sum)
+        if self._m_var_sum <= 0.0:
+            self._m_var_sum = 1e-12
+        # Centering correction:
+        # M_c^T M_c = M^T M - (M^T mu) 1^T - 1 (M^T mu)^T + (mu^T mu) 11^T
+        # Use broadcasting to avoid allocating 11^T.
+        gram -= mu_proj
+        gram -= mu_proj.T
+        gram += float(mu_sq_sum)
+        gram /= float(self._m_var_sum)
+
+        self._implicit_kinship_fast = False
+        self._fast_v = None
+        self._fast_inv_s = None
+        self._fast_svals = None
+        self._fast_projected = False
+
+        self.G = np.asarray(gram, dtype=np.float32)
+        del gram
+        self.G += np.float32(self._g_eps) * np.eye(self.n, dtype=np.float32)
+        self.Z = np.eye(self.n, dtype=np.float64)
+
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] kinship_prep_done implicit_fast={self._implicit_kinship_fast} "
+                f"elapsed={time.time() - t_k:.3f}s",
+                flush=True,
+            )
+
+        t_eig = time.time()
+        self.S, eigvec = np.linalg.eigh(self.G)
+        self.Dh = eigvec.T
+        self.X = self.Dh @ self.X
+        self.y = self.Dh @ self.y
+        self.Z = self.Dh
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] eigh_done rank={self.S.shape[0]} elapsed={time.time() - t_eig:.3f}s",
+                flush=True,
+            )
+
+        t_opt = time.time()
+        if self._debug_stage:
+            print("[MLM-DEBUG] reml_opt_start", flush=True)
+        result = minimize_scalar(
+            lambda lbd: -self._REML(10 ** (lbd)),
+            bounds=(-6, 6),
+            method="bounded",
+        )
+        lbd = 10 ** result.x
+        self._REML(lbd)
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] reml_opt_done calls={self._reml_calls} "
+                f"lambda={lbd:.6g} elapsed={time.time() - t_opt:.3f}s",
+                flush=True,
+            )
+
+        rhs = (self.V_inv.ravel() * self.r.ravel()).reshape(-1, 1)
+        self.u = self.G @ self.Z.T @ rhs
+        self.alpha = np.linalg.solve(self.G, self.u)
+
+        self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
+        self._m_alpha = np.zeros((m, 1), dtype=np.float64)
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.arange(st, ed, dtype=np.int64)
+            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            blk64 = np.asarray(blk, dtype=np.float64)
+            self._m_alpha[st:ed, :] = blk64 @ self.alpha
+        self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0])
+        self._mean_malpha = float((self._m_mean.T @ self._m_alpha)[0, 0])
+
+        sigma_g2 = self.rTV_invr / (self.n - self.p)
+        sigma_e2 = lbd * sigma_g2
+        var_g = float(sigma_g2 * float(np.mean(self.S)))
+        self.pve = var_g / (var_g + sigma_e2)
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] fit_done pve={self.pve:.6f} elapsed={time.time() - t_init:.3f}s",
+                flush=True,
+            )
+
+    def _fit_with_packed_explicit_marker(
+        self,
+        *,
+        t_init: float,
+    ) -> None:
+        if self._packed_ctx is None or self._packed_sample_indices is None:
+            raise RuntimeError("Internal error: packed context or sample indices are missing.")
+        if self.kinship is not None:
+            raise ValueError("Packed explicit-marker fit requires kinship=None.")
+
+        m = int(self._packed_ctx["packed"].shape[0])
+        row_step = max(1, int(_env_positive_int("JX_MLM_PACKED_ROW_CHUNK", 2048)))
+
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast=0",
+                flush=True,
+            )
+
+        t_k = time.time()
+        gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
+            n=int(self.n),
+            m=int(self.n),
+            block_cols=min(int(self.n), row_step),
+            resident_bytes=int(self._packed_ctx["packed"].nbytes),
+            force_fast=self._force_fast,
+        )
+        gram = np.zeros(
+            (self.n, self.n),
+            dtype=np.float64,
+            order=("F" if gram_mode == "lowmem" else "C"),
+        )
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] packed_zzt_mode mode={gram_mode} "
+                f"auto_dim={auto_dim} "
+                f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
+                f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                flush=True,
+            )
+
+        # Build ZZT = M^T M directly in row chunks without materializing dense M.
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.arange(st, ed, dtype=np.int64)
+            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            blk_t = (
+                np.asfortranarray(np.asarray(blk, dtype=np.float64).T)
+                if gram_mode == "lowmem"
+                else np.asarray(blk, dtype=np.float64).T
+            )
+            gram = _gram_rankk_update(
+                gram,
+                blk_t,
+                lowmem=(gram_mode == "lowmem"),
+            )
+
+        self._implicit_kinship_fast = False
+        self._fast_v = None
+        self._fast_inv_s = None
+        self._fast_svals = None
+        self._fast_projected = False
+        self.G = None
+        self.Z = None
+        self._m_mean = None
+        self._m_var_sum = None
+        self._alpha_sum = None
+        self._m_alpha = None
+        self._mean_sq = None
+        self._mean_malpha = None
+
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] kinship_prep_done implicit_fast={self._implicit_kinship_fast} "
+                f"elapsed={time.time() - t_k:.3f}s",
+                flush=True,
+            )
+
+        t_eig = time.time()
+        self.S, eigvec = _symmetric_eigh_full(
+            gram,
+            overwrite_a=True,
+            lowmem=(gram_mode == "lowmem"),
+        )
+        self.Dh = eigvec.T
+        self.X = self.Dh @ self.X
+        self.y = self.Dh @ self.y
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] eigh_done rank={self.S.shape[0]} elapsed={time.time() - t_eig:.3f}s",
+                flush=True,
+            )
+
+        t_opt = time.time()
+        if self._debug_stage:
+            print("[MLM-DEBUG] reml_opt_start", flush=True)
+        result = minimize_scalar(
+            lambda lbd: -self._REML(10 ** (lbd)),
+            bounds=(-6, 6),
+            method="bounded",
+        )
+        lbd = 10 ** result.x
+        self._REML(lbd)
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] reml_opt_done calls={self._reml_calls} "
+                f"lambda={lbd:.6g} elapsed={time.time() - t_opt:.3f}s",
+                flush=True,
+            )
+
+        rhs = (self.V_inv.ravel() * self.r.ravel()).reshape(-1, 1)
+        q = eigvec @ rhs
+        self.u = np.zeros((m, 1), dtype=np.float64)
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.arange(st, ed, dtype=np.int64)
+            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            self.u[st:ed, :] = np.asarray(blk, dtype=np.float64) @ q
+        self.alpha = None
+
+        sigma_g2 = self.rTV_invr / (self.n - self.p)
+        sigma_e2 = lbd * sigma_g2
+        g = eigvec @ (self.S.reshape(-1, 1) * rhs)
+        var_g = float(np.var(g, ddof=1))
         self.pve = var_g / (var_g + sigma_e2)
         if self._debug_stage:
             print(

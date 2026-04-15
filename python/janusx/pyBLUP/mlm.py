@@ -374,12 +374,19 @@ def _estimate_fast_gram_peak_bytes(
     return int(resident_bytes) + blk_f32_bytes + blk_f64_bytes + (4 * gram_bytes)
 
 
+def _auto_strategy_dim(n: int, m: int) -> int:
+    n_i = int(n)
+    m_i = int(m)
+    return m_i if n_i < m_i else n_i
+
+
 def _choose_gram_strategy(
     *,
+    n: int,
     m: int,
     block_cols: int,
     resident_bytes: int,
-) -> tuple[str, Optional[int], int]:
+) -> tuple[str, Optional[int], int, int]:
     mode = _env_choice("JX_MLM_GRAM_MODE", "auto", {"auto", "fast", "lowmem"})
     mem_limit = _detect_memory_limit_bytes()
     est_fast_peak = _estimate_fast_gram_peak_bytes(
@@ -387,18 +394,14 @@ def _choose_gram_strategy(
         block_cols=int(block_cols),
         resident_bytes=int(resident_bytes),
     )
+    auto_dim = _auto_strategy_dim(int(n), int(m))
     if mode == "fast":
-        return "fast", mem_limit, est_fast_peak
+        return "fast", mem_limit, est_fast_peak, auto_dim
     if mode == "lowmem":
-        return "lowmem", mem_limit, est_fast_peak
-    fast_max_m = _env_positive_int("JX_MLM_GRAM_FAST_MAX_M", 20_000)
-    if int(m) > fast_max_m:
-        return "lowmem", mem_limit, est_fast_peak
-    frac = _env_positive_float("JX_MLM_GRAM_FAST_MEM_FRAC", 0.45)
-    if mem_limit is not None and mem_limit > 0:
-        budget = int(mem_limit * frac)
-        return ("fast" if est_fast_peak <= budget else "lowmem"), mem_limit, est_fast_peak
-    return "fast", mem_limit, est_fast_peak
+        return "lowmem", mem_limit, est_fast_peak, auto_dim
+    fast_max_dim = _env_positive_int("JX_MLM_GRAM_FAST_MAX_DIM", 20_000)
+    chosen = "fast" if int(auto_dim) < int(fast_max_dim) else "lowmem"
+    return chosen, mem_limit, est_fast_peak, auto_dim
 
 
 class BLUP:
@@ -558,7 +561,8 @@ class BLUP:
             # This avoids materializing U of size n x m for large n.
             t_svd = time.time()
             gram = self.M @ self.M.T
-            gram_mode, mem_limit, est_fast_peak = _choose_gram_strategy(
+            gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
+                n=int(self.n),
                 m=int(self.M.shape[0]),
                 block_cols=0,
                 resident_bytes=int(self.M.nbytes),
@@ -570,6 +574,7 @@ class BLUP:
                 )
                 print(
                     f"[MLM-DEBUG] fast_gram_mode mode={gram_mode} "
+                    f"auto_dim={auto_dim} "
                     f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
                     f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
                     flush=True,
@@ -748,7 +753,8 @@ class BLUP:
         my = np.zeros((m, 1), dtype=np.float64)
         n_train = int(self._packed_sample_indices.shape[0])
         step = max(1, int(self._packed_sample_chunk))
-        gram_mode, mem_limit, est_fast_peak = _choose_gram_strategy(
+        gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
+            n=int(self.n),
             m=m,
             block_cols=min(step, n_train),
             resident_bytes=int(self._packed_ctx["packed"].nbytes),
@@ -777,6 +783,7 @@ class BLUP:
         if self._debug_stage:
             print(
                 f"[MLM-DEBUG] fast_gram_mode mode={gram_mode} "
+                f"auto_dim={auto_dim} "
                 f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
                 f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
                 flush=True,

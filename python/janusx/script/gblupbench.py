@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+try:
+    import resource
+except Exception:  # pragma: no cover
+    resource = None  # type: ignore[assignment]
 
 import numpy as np
 import pandas as pd
@@ -184,20 +190,29 @@ def _parse_elapsed_text(text: str) -> float:
 
 
 def _detect_time_tool() -> list[str]:
+    def _supports(time_bin: str, flag: str) -> bool:
+        try:
+            rc = subprocess.run(
+                [str(time_bin), str(flag), "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                text=False,
+            ).returncode
+        except Exception:
+            return False
+        return int(rc) == 0
+
     gtime = shutil.which("gtime")
-    if gtime:
+    if gtime and _supports(gtime, "-v"):
         return [gtime, "-v"]
-    if Path("/usr/bin/time").exists():
-        rc = subprocess.run(
-            ["/usr/bin/time", "-v", "true"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            text=False,
-        ).returncode
-        if rc == 0:
-            return ["/usr/bin/time", "-v"]
-        return ["/usr/bin/time", "-l"]
+
+    sys_time = Path("/usr/bin/time")
+    if sys_time.exists():
+        if _supports(str(sys_time), "-v"):
+            return [str(sys_time), "-v"]
+        if _supports(str(sys_time), "-l"):
+            return [str(sys_time), "-l"]
     return []
 
 
@@ -229,6 +244,95 @@ def _parse_time_file(path: Path) -> tuple[float, float]:
     return elapsed, rss
 
 
+def _memory_limit_kb(limit_mem_gb: Optional[float]) -> float:
+    if limit_mem_gb is None:
+        return math.nan
+    try:
+        gb = float(limit_mem_gb)
+    except Exception:
+        return math.nan
+    if (not math.isfinite(gb)) or gb <= 0:
+        return math.nan
+    return float(gb * 1024.0 * 1024.0)
+
+
+def _proc_tree_rss_kb(root_pid: int) -> float:
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,rss="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return math.nan
+    if proc.returncode != 0:
+        return math.nan
+
+    children: dict[int, list[int]] = {}
+    rss_kb: dict[int, float] = {}
+    for raw in str(proc.stdout or "").splitlines():
+        parts = raw.strip().split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            rss = float(parts[2])
+        except Exception:
+            continue
+        rss_kb[pid] = rss
+        children.setdefault(ppid, []).append(pid)
+
+    total = 0.0
+    stack = [int(root_pid)]
+    seen: set[int] = set()
+    while len(stack) > 0:
+        pid = int(stack.pop())
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += float(rss_kb.get(pid, 0.0))
+        stack.extend(children.get(pid, []))
+    return float(total)
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(int(proc.pid), signal.SIGKILL)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _build_memory_limit_preexec(limit_kb: float) -> Optional[Any]:
+    if resource is None:
+        return None
+    if not math.isfinite(limit_kb) or limit_kb <= 0:
+        return None
+    limit_bytes = int(float(limit_kb) * 1024.0)
+    if limit_bytes <= 0:
+        return None
+
+    def _preexec() -> None:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        except Exception:
+            pass
+        if hasattr(resource, "RLIMIT_RSS"):
+            try:
+                resource.setrlimit(resource.RLIMIT_RSS, (limit_bytes, limit_bytes))
+            except Exception:
+                pass
+
+    return _preexec
+
+
 def _run_timed(
     cmd: list[str],
     *,
@@ -238,34 +342,105 @@ def _run_timed(
     cwd: Optional[Path] = None,
     input_text: Optional[str] = None,
     append_log: bool = False,
+    limit_mem_gb: Optional[float] = None,
 ) -> tuple[int, float, float]:
     """Returns: (exit_code, elapsed_sec, peak_rss_kb)."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     time_file.parent.mkdir(parents=True, exist_ok=True)
     time_tool = _detect_time_tool()
+    limit_kb = _memory_limit_kb(limit_mem_gb)
+    use_mem_limit = math.isfinite(limit_kb) and (float(limit_kb) > 0.0)
     t0 = time.time()
+    rc_final = 1
+    runtime_peak_rss_kb = math.nan
     with log_file.open(("a" if append_log else "w"), encoding="utf-8") as lf:
         if time_tool:
             full = [*time_tool, "-o", str(time_file.resolve()), *cmd]
         else:
             full = list(cmd)
-        proc = subprocess.run(
-            full,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            cwd=str(cwd) if cwd is not None else None,
-            env=env,
-            check=False,
-            text=True,
-            input=input_text,
-        )
+        if not use_mem_limit:
+            proc = subprocess.run(
+                full,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                cwd=str(cwd) if cwd is not None else None,
+                env=env,
+                check=False,
+                text=True,
+                input=input_text,
+            )
+            rc_final = int(proc.returncode)
+        else:
+            popen_kw: dict[str, Any] = {
+                "stdout": lf,
+                "stderr": subprocess.STDOUT,
+                "cwd": (str(cwd) if cwd is not None else None),
+                "env": env,
+                "text": True,
+                "start_new_session": True,
+            }
+            preexec = _build_memory_limit_preexec(limit_kb)
+            if preexec is not None:
+                popen_kw["preexec_fn"] = preexec
+            if input_text is not None:
+                popen_kw["stdin"] = subprocess.PIPE
+            proc = subprocess.Popen(full, **popen_kw)
+            if input_text is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(str(input_text))
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            mem_killed = False
+            while True:
+                rss_now = _proc_tree_rss_kb(int(proc.pid))
+                if math.isfinite(rss_now):
+                    runtime_peak_rss_kb = (
+                        float(rss_now)
+                        if not math.isfinite(runtime_peak_rss_kb)
+                        else max(float(runtime_peak_rss_kb), float(rss_now))
+                    )
+                rc_poll = proc.poll()
+                if rc_poll is not None:
+                    rc_final = int(rc_poll)
+                    break
+                if math.isfinite(rss_now) and float(rss_now) > float(limit_kb):
+                    mem_killed = True
+                    try:
+                        lf.write(
+                            (
+                                "\n[gblupbench] memory limit exceeded: "
+                                f"{float(rss_now) / 1024.0 / 1024.0:.6f} GB > "
+                                f"{float(limit_mem_gb):.6f} GB; killing process tree.\n"
+                            )
+                        )
+                        lf.flush()
+                    except Exception:
+                        pass
+                    _kill_process_group(proc)
+                    try:
+                        rc_final = int(proc.wait(timeout=3))
+                    except Exception:
+                        rc_final = 137
+                    break
+                time.sleep(0.2)
+            if mem_killed:
+                rc_final = 137
     wall = max(time.time() - t0, 0.0)
     if not time_tool:
+        rss_txt = "NA"
+        if math.isfinite(runtime_peak_rss_kb):
+            rss_txt = f"{float(runtime_peak_rss_kb):.0f}"
         time_file.write_text(
             "\n".join(
                 [
                     f"Elapsed (wall clock) time (h:mm:ss or m:ss): {wall:.6f}",
-                    "Maximum resident set size (kbytes): NA",
+                    f"Maximum resident set size (kbytes): {rss_txt}",
                 ]
             )
             + "\n",
@@ -274,7 +449,22 @@ def _run_timed(
     elapsed, rss = _parse_time_file(time_file)
     if not math.isfinite(elapsed):
         elapsed = wall
-    return int(proc.returncode), float(elapsed), float(rss)
+    if math.isfinite(runtime_peak_rss_kb):
+        rss = float(runtime_peak_rss_kb) if not math.isfinite(rss) else max(float(rss), float(runtime_peak_rss_kb))
+    if use_mem_limit and math.isfinite(rss) and float(rss) > float(limit_kb):
+        rc_final = 137
+        try:
+            with log_file.open("a", encoding="utf-8") as lf:
+                lf.write(
+                    (
+                        "\n[gblupbench] memory limit exceeded (post-check): "
+                        f"{float(rss) / 1024.0 / 1024.0:.6f} GB > "
+                        f"{float(limit_mem_gb):.6f} GB.\n"
+                    )
+                )
+        except Exception:
+            pass
+    return int(rc_final), float(elapsed), float(rss)
 
 
 def _read_table_guess(path: Path) -> pd.DataFrame:
@@ -428,6 +618,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     optional_group.add_argument("-geno", "--geno", default=0.05, type=float, help="Missing-rate filter (default: %(default)s).")
     optional_group.add_argument("-chunksize", "--chunksize", default=50_000, type=int, help="Genotype chunk size.")
     optional_group.add_argument("-t", "--thread", default=detect_effective_threads(), type=int, help="Threads.")
+    optional_group.add_argument(
+        "-limit-mem",
+        "--limit-mem",
+        default=None,
+        type=float,
+        help=(
+            "Per-command memory limit in GB. "
+            "When exceeded, the running benchmark subprocess is killed and marked as failed."
+        ),
+    )
     optional_group.add_argument("--cv", default=5, type=int, help="CV folds (default: %(default)s).")
     optional_group.add_argument("--seed", default=42, type=int, help="Random seed (default: %(default)s).")
     optional_group.add_argument(
@@ -495,6 +695,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("--thread must be >= 1.")
     if int(args.chunksize) < 1:
         p.error("--chunksize must be >= 1.")
+    if args.limit_mem is not None:
+        try:
+            lm = float(args.limit_mem)
+        except Exception:
+            p.error("--limit-mem must be a positive number in GB.")
+        if (not math.isfinite(lm)) or (lm <= 0.0):
+            p.error("--limit-mem must be > 0 (GB).")
     return args
 
 
@@ -1800,6 +2007,7 @@ def _run_tool_with_parfile_fallback(
     time_file: Path,
     cwd: Path,
     env: Optional[dict[str, str]] = None,
+    limit_mem_gb: Optional[float] = None,
 ) -> tuple[int, float, float]:
     attempts = [
         ([tool_bin, str(parfile.name)], None),
@@ -1826,6 +2034,7 @@ def _run_tool_with_parfile_fallback(
             env=env,
             input_text=input_text,
             append_log=(idx > 1),
+            limit_mem_gb=limit_mem_gb,
         )
         if math.isfinite(elapsed):
             total_elapsed += float(elapsed)
@@ -1985,78 +2194,183 @@ def _run_engine_janusx(
     args: argparse.Namespace,
     bench_dir: Path,
     meta_json: Path,
-    py_script: Path,
 ) -> EngineRunResult:
     engine = "janusx"
     run_dir = bench_dir / "runs" / engine
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    result_json = run_dir / f"{args.prefix}.{engine}.result.json"
-    fold_file = run_dir / f"{args.prefix}.{engine}.folds.tsv"
-    pred_file = run_dir / f"{args.prefix}.{engine}.predictions.tsv"
     log_file = run_dir / f"{engine}.log"
     time_file = run_dir / f"{engine}.time"
 
-    cmd = [
-        sys.executable,
-        str(py_script),
-        "--meta",
-        str(meta_json),
-        "--out",
-        str(result_json),
-        "--fold-out",
-        str(fold_file),
-        "--pred-out",
-        str(pred_file),
-    ]
-
+    meta = json.loads(Path(meta_json).read_text(encoding="utf-8"))
+    sample_df = pd.read_csv(str(meta["sample_tsv"]), sep="\t")
+    ids = sample_df["id"].astype(str).to_numpy()
+    y = sample_df["y"].to_numpy(dtype=float)
+    fold = sample_df["fold"].to_numpy(dtype=int)
+    bfile = str(meta["filtered_plink_prefix"])
     env = os.environ.copy()
     py_root = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = py_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    fold_rows: list[dict[str, Any]] = []
+    pred_frames: list[pd.DataFrame] = []
+    total_elapsed = 0.0
+    max_rss = math.nan
+    note = ""
 
-    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file, env=env)
-    data = _load_result_json(result_json)
+    fold_ids = sorted(int(x) for x in np.unique(fold) if int(x) > 0)
+    for i, fd in enumerate(fold_ids, start=1):
+        fold_dir = run_dir / f"fold{fd}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
 
-    if rc == 0 and str(data.get("status", "")).lower() == "ok":
-        return EngineRunResult(
-            engine=engine,
-            status="ok",
-            exit_code=rc,
-            elapsed_sec=float(elapsed),
-            peak_rss_kb=float(rss),
-            mean_r2=_safe_float(data.get("mean_r2"), math.nan),
-            mean_pearson=_safe_float(data.get("mean_pearson"), math.nan),
-            mean_spearman=_safe_float(data.get("mean_spearman"), math.nan),
-            mean_pve=_safe_float(data.get("mean_pve"), math.nan),
-            folds=int(_safe_float(data.get("folds"), 0)),
-            fold_file=str(fold_file) if fold_file.exists() else "",
-            prediction_file=str(pred_file) if pred_file.exists() else "",
-            result_json=str(result_json) if result_json.exists() else "",
-            log_file=str(log_file),
-            time_file=str(time_file),
-            note="",
+        pheno_file = (fold_dir / "pheno.tsv").resolve()
+        y_fold = np.asarray(y, dtype=float).copy()
+        y_fold[fold == fd] = np.nan
+        pd.DataFrame({"id": ids, "PHENO": y_fold}).to_csv(
+            pheno_file,
+            sep="\t",
+            index=False,
+            na_rep="NA",
         )
 
-    note = str(data.get("error", "")).strip()
-    if not note:
-        note = f"engine failed (exit={rc})"
-    return EngineRunResult(
+        fold_prefix = f"gs_fold{fd}"
+        attempt_time = run_dir / f"{engine}.fold{fd}.time"
+        cmd = [
+            sys.executable,
+            "-m",
+            "janusx.script.gs",
+            "-bfile",
+            str(bfile),
+            "-p",
+            str(pheno_file),
+            "-GBLUP",
+            "-force-fast",
+            "-o",
+            str(fold_dir),
+            "-prefix",
+            fold_prefix,
+            "-t",
+            str(int(args.thread)),
+            "-maf",
+            "0.0",
+            "-geno",
+            "1.0",
+        ]
+        rc, elapsed, rss = _run_timed(
+            cmd,
+            log_file=log_file,
+            time_file=attempt_time,
+            env=env,
+            cwd=fold_dir,
+            append_log=(i > 1),
+            limit_mem_gb=args.limit_mem,
+        )
+        if math.isfinite(elapsed):
+            total_elapsed += float(elapsed)
+        if math.isfinite(rss):
+            max_rss = float(rss) if not math.isfinite(max_rss) else max(float(max_rss), float(rss))
+        if rc != 0:
+            note = f"gs -GBLUP failed on fold {fd} (exit={rc})."
+            if int(rc) == 137 and args.limit_mem is not None:
+                note = f"gs -GBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
+            break
+
+        pred_path = fold_dir / f"{fold_prefix}.PHENO.gs.tsv"
+        if not pred_path.exists():
+            note = f"gs -GBLUP fold {fd} prediction output missing: {pred_path.name}"
+            break
+        pred_raw = _read_table_guess(pred_path)
+        if int(pred_raw.shape[1]) < 2:
+            note = f"gs -GBLUP fold {fd} prediction table malformed."
+            break
+
+        id_col = "Unnamed: 0" if "Unnamed: 0" in pred_raw.columns else str(pred_raw.columns[0])
+        if "GBLUP" in pred_raw.columns:
+            pred_col = "GBLUP"
+        else:
+            pred_col = str([c for c in pred_raw.columns if str(c) != str(id_col)][0])
+        pred_tbl = (
+            pred_raw[[id_col, pred_col]]
+            .rename(columns={id_col: "sample_id", pred_col: "y_pred"})
+            .copy()
+        )
+        pred_tbl["sample_id"] = pred_tbl["sample_id"].astype(str).str.strip()
+        pred_tbl["y_pred"] = pd.to_numeric(pred_tbl["y_pred"], errors="coerce")
+
+        test_df = pd.DataFrame({"sample_id": ids[fold == fd], "y_true": y[fold == fd]})
+        pred_df = test_df.merge(pred_tbl, on="sample_id", how="left")
+        if pred_df["y_pred"].isna().any():
+            note = f"gs -GBLUP fold {fd} missing predictions for one or more test samples."
+            break
+
+        intercept = float(np.nanmean(y[fold != fd]))
+        pred_df["engine"] = engine
+        pred_df["fold"] = int(fd)
+        pred_df["intercept"] = float(intercept)
+        pred_df["gebv"] = pd.to_numeric(pred_df["y_pred"], errors="coerce") - float(intercept)
+        pred_df["pve_fold"] = math.nan
+        pred_df["n_train"] = int(np.sum(fold != fd))
+        pred_df["n_test"] = int(np.sum(fold == fd))
+
+        r2, pear, spear = _safe_prediction_metrics(pred_df["y_true"], pred_df["y_pred"])
+        fold_rows.append(
+            {
+                "fold": int(fd),
+                "n_train": int(np.sum(fold != fd)),
+                "n_test": int(np.sum(fold == fd)),
+                "r2": float(r2),
+                "pearson": float(pear),
+                "spearman": float(spear),
+                "pve": math.nan,
+            }
+        )
+        pred_frames.append(
+            pred_df[
+                [
+                    "engine",
+                    "sample_id",
+                    "fold",
+                    "y_true",
+                    "y_pred",
+                    "gebv",
+                    "intercept",
+                    "pve_fold",
+                    "n_train",
+                    "n_test",
+                ]
+            ].copy()
+        )
+
+    _write_time_summary(time_file, total_elapsed, max_rss)
+    if note:
+        return EngineRunResult(
+            engine=engine,
+            status="fail",
+            exit_code=1,
+            elapsed_sec=float(total_elapsed),
+            peak_rss_kb=float(max_rss),
+            mean_r2=math.nan,
+            mean_pearson=math.nan,
+            mean_spearman=math.nan,
+            mean_pve=math.nan,
+            folds=0,
+            fold_file="",
+            prediction_file="",
+            result_json="",
+            log_file=str(log_file),
+            time_file=str(time_file),
+            note=note,
+        )
+
+    return _build_external_engine_result(
         engine=engine,
-        status="fail",
-        exit_code=rc,
-        elapsed_sec=float(elapsed),
-        peak_rss_kb=float(rss),
-        mean_r2=math.nan,
-        mean_pearson=math.nan,
-        mean_spearman=math.nan,
-        mean_pve=math.nan,
-        folds=0,
-        fold_file="",
-        prediction_file=str(pred_file) if pred_file.exists() else "",
-        result_json=str(result_json) if result_json.exists() else "",
-        log_file=str(log_file),
-        time_file=str(time_file),
-        note=note,
+        args=args,
+        run_dir=run_dir,
+        elapsed=total_elapsed,
+        rss=max_rss,
+        fold_df=pd.DataFrame(fold_rows),
+        pred_df=pd.concat(pred_frames, ignore_index=True),
+        log_file=log_file,
+        time_file=time_file,
     )
 
 
@@ -2093,7 +2407,12 @@ def _run_engine_r(
         str(pred_file),
     ]
 
-    rc, elapsed, rss = _run_timed(cmd, log_file=log_file, time_file=time_file)
+    rc, elapsed, rss = _run_timed(
+        cmd,
+        log_file=log_file,
+        time_file=time_file,
+        limit_mem_gb=args.limit_mem,
+    )
     data = _load_result_json(result_json)
 
     if rc == 0 and str(data.get("status", "")).lower() == "ok":
@@ -2119,6 +2438,8 @@ def _run_engine_r(
     note = str(data.get("error", "")).strip()
     if not note:
         note = f"engine failed (exit={rc})"
+    if int(rc) == 137 and args.limit_mem is not None:
+        note = f"engine failed: memory limit exceeded ({float(args.limit_mem):g} GB)"
     return EngineRunResult(
         engine=engine,
         status="fail",
@@ -2202,6 +2523,7 @@ def _run_engine_hiblup(
             time_file=attempt_time,
             cwd=fold_dir,
             append_log=(i > 1),
+            limit_mem_gb=args.limit_mem,
         )
         if math.isfinite(elapsed):
             total_elapsed += float(elapsed)
@@ -2209,6 +2531,8 @@ def _run_engine_hiblup(
             max_rss = float(rss) if not math.isfinite(max_rss) else max(float(max_rss), float(rss))
         if rc != 0:
             note = f"HIBLUP failed on fold {fd} (exit={rc})."
+            if int(rc) == 137 and args.limit_mem is not None:
+                note = f"HIBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
             break
         if not rand_file.exists():
             note = f"HIBLUP fold {fd} did not produce {rand_file.name}."
@@ -2512,6 +2836,7 @@ def _run_engine_blupf90(
             time_file=pregs_time,
             cwd=fold_dir,
             env=pregs_env,
+            limit_mem_gb=args.limit_mem,
         )
         if math.isfinite(elapsed1):
             total_elapsed += float(elapsed1)
@@ -2570,6 +2895,7 @@ def _run_engine_blupf90(
                     time_file=pregs_time,
                     cwd=fold_dir,
                     env=pregs_env,
+                    limit_mem_gb=args.limit_mem,
                 )
                 if math.isfinite(elapsed1b):
                     total_elapsed += float(elapsed1b)
@@ -2579,6 +2905,8 @@ def _run_engine_blupf90(
 
         if rc1 != 0:
             note = f"preGSf90 failed on fold {fd} (exit={rc1})."
+            if int(rc1) == 137 and args.limit_mem is not None:
+                note = f"preGSf90 failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
             if use_apy:
                 try:
                     tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:])
@@ -2690,6 +3018,7 @@ def _run_engine_blupf90(
             time_file=solver_time,
             cwd=fold_dir,
             env=blup_env,
+            limit_mem_gb=args.limit_mem,
         )
         if math.isfinite(elapsed2):
             total_elapsed += float(elapsed2)
@@ -2697,6 +3026,11 @@ def _run_engine_blupf90(
             max_rss = float(rss2) if not math.isfinite(max_rss) else max(float(max_rss), float(rss2))
         if rc2 != 0:
             note = f"{Path(blupf90_bin).name} failed on fold {fd} (exit={rc2})."
+            if int(rc2) == 137 and args.limit_mem is not None:
+                note = (
+                    f"{Path(blupf90_bin).name} failed on fold {fd}: "
+                    f"memory limit exceeded ({float(args.limit_mem):g} GB)."
+                )
             try:
                 tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-80:])
                 if ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
@@ -2908,10 +3242,9 @@ def main() -> None:
 
     tmp_dir = bench_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    py_script = tmp_dir / "gblup_janusx_engine.py"
     r_script = tmp_dir / "gblup_r_engine.R"
-    _build_python_engine_script(py_script)
-    _build_r_engine_script(r_script)
+    if any(e in {"sommer", "rrblup"} for e in engines):
+        _build_r_engine_script(r_script)
 
     rscript_bin = _ensure_rscript()
     hiblup_bin = _ensure_hiblup()
@@ -2925,7 +3258,6 @@ def main() -> None:
                 args=args,
                 bench_dir=bench_dir,
                 meta_json=Path(data_info["meta_json"]),
-                py_script=py_script,
             )
             rows.append(rr)
             continue
@@ -3040,6 +3372,7 @@ def main() -> None:
         "geno": float(args.geno),
         "chunksize": int(args.chunksize),
         "threads": int(args.thread),
+        "limit_mem_gb": (None if args.limit_mem is None else float(args.limit_mem)),
         "cv": int(args.cv),
         "seed": int(args.seed),
         "n_samples": int(data_info["meta"]["n"]),
@@ -3052,7 +3385,7 @@ def main() -> None:
     _save_summary(bench_dir / "summary", args.prefix, rows, cfg)
 
     if not args.keep_temp:
-        for p in [py_script, r_script]:
+        for p in [r_script]:
             try:
                 if p.exists():
                     p.unlink()

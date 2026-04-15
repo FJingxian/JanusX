@@ -454,20 +454,73 @@ def _ensure_rscript() -> Optional[str]:
     return r if r else None
 
 
+def _is_executable_file(path: Path) -> bool:
+    try:
+        pp = path.expanduser().resolve()
+        return pp.is_file() and os.access(str(pp), os.X_OK)
+    except Exception:
+        return False
+
+
+def _iter_probe_names(default_names: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in default_names:
+        name = str(raw).strip()
+        if name == "":
+            continue
+        variants = [name]
+        if not name.endswith("+"):
+            variants.append(f"{name}+")
+        if not name.lower().endswith(".exe"):
+            variants.append(f"{name}.exe")
+        for cand in variants:
+            key = cand.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cand)
+    return out
+
+
 def _resolve_bin(default_names: list[str], env_name: str) -> Optional[str]:
     override = str(os.environ.get(env_name, "")).strip()
     if override:
         found = shutil.which(override)
-        return found if found else (override if Path(override).exists() else None)
-    for name in default_names:
+        if found:
+            return found
+        override_path = Path(override)
+        if _is_executable_file(override_path):
+            return str(override_path.expanduser().resolve())
+        return None
+
+    probe_names = _iter_probe_names(default_names)
+    for name in probe_names:
         found = shutil.which(name)
         if found:
             return found
+
+    # Case-insensitive PATH scan fallback for tools shipped with unusual casing.
+    path_raw = str(os.environ.get("PATH", "")).strip()
+    if path_raw != "":
+        wanted = {name.lower() for name in probe_names}
+        for folder in path_raw.split(os.pathsep):
+            root = Path(folder).expanduser()
+            if (not root.exists()) or (not root.is_dir()):
+                continue
+            try:
+                for entry in root.iterdir():
+                    if entry.name.lower() not in wanted:
+                        continue
+                    if _is_executable_file(entry):
+                        return str(entry.resolve())
+            except Exception:
+                continue
     return None
 
 
 def _ensure_hiblup() -> Optional[str]:
-    return _resolve_bin(["hiblup", "HIBLUP"], "JX_GBLUPBENCH_HIBLUP_BIN")
+    return _resolve_bin(["hiblup", "HIBLUP", "hiblup-cli"], "JX_GBLUPBENCH_HIBLUP_BIN")
 
 
 def _ensure_pregsf90() -> Optional[str]:
@@ -479,7 +532,7 @@ def _ensure_renumf90() -> Optional[str]:
 
 
 def _ensure_blupf90() -> Optional[str]:
-    return _resolve_bin(["blupf90", "airemlf90"], "JX_GBLUPBENCH_BLUPF90_BIN")
+    return _resolve_bin(["blupf90", "airemlf90", "remlf90"], "JX_GBLUPBENCH_BLUPF90_BIN")
 
 
 def _check_r_package(rscript: str, pkg: str) -> tuple[bool, str]:
@@ -550,7 +603,11 @@ def _collect_env_checks(engines: list[str]) -> list[EnvCheck]:
             EnvCheck(
                 "BLUPF90:solver",
                 blup_bin is not None,
-                f"OK: {blup_bin}" if blup_bin is not None else "airemlf90/blupf90 not found in PATH",
+                (
+                    f"OK: {blup_bin}"
+                    if blup_bin is not None
+                    else "blupf90/airemlf90/remlf90 not found in PATH"
+                ),
             )
         )
     return checks
@@ -2392,7 +2449,7 @@ def main() -> None:
                         result_json="",
                         log_file="",
                         time_file="",
-                        note="preGSf90 and/or airemlf90/blupf90 not found in PATH",
+                        note="preGSf90 and/or blupf90/airemlf90/remlf90 not found in PATH",
                     )
                 )
                 continue

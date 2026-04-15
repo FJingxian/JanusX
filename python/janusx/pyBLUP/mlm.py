@@ -377,7 +377,12 @@ def _estimate_fast_gram_peak_bytes(
 def _auto_strategy_dim(n: int, m: int) -> int:
     n_i = int(n)
     m_i = int(m)
-    return m_i if n_i < m_i else n_i
+    # Auto mode should follow the tighter axis of the projected problem:
+    # lowmem only when the smaller effective dimension is large.
+    # Equivalent rule:
+    #   (n < m and n > threshold) or (n > m and m > threshold).
+    # i.e. min(n, m) > threshold.
+    return n_i if n_i < m_i else m_i
 
 
 def _choose_gram_strategy(
@@ -399,8 +404,8 @@ def _choose_gram_strategy(
         return "fast", mem_limit, est_fast_peak, auto_dim
     if mode == "lowmem":
         return "lowmem", mem_limit, est_fast_peak, auto_dim
-    fast_max_dim = _env_positive_int("JX_MLM_GRAM_FAST_MAX_DIM", 20_000)
-    chosen = "fast" if int(auto_dim) < int(fast_max_dim) else "lowmem"
+    fast_max_dim = _env_positive_int("JX_MLM_GRAM_FAST_MAX_DIM", 30_000)
+    chosen = "fast" if int(auto_dim) <= int(fast_max_dim) else "lowmem"
     return chosen, mem_limit, est_fast_peak, auto_dim
 
 
@@ -772,8 +777,7 @@ class BLUP:
         if packed_agg_mode == "rust":
             packed_agg_mode = "rust_decode"
         use_rust_packed_decode = bool(
-            (gram_mode == "fast")
-            and (_bed_packed_decode_stats_f64 is not None)
+            (_bed_packed_decode_stats_f64 is not None)
             and (packed_agg_mode in {"auto", "rust_decode"})
         )
         if packed_agg_mode == "rust_decode" and _bed_packed_decode_stats_f64 is None:
@@ -805,11 +809,17 @@ class BLUP:
                     threads=0,
                 )
                 blk64 = np.asarray(blk64_raw, dtype=np.float64)
+                if gram_mode == "lowmem":
+                    blk64 = np.asfortranarray(blk64)
                 sum_rows += np.asarray(sum_rows_raw, dtype=np.float64).reshape(m, 1)
                 sq_sum_rows += np.asarray(sq_sum_rows_raw, dtype=np.float64).reshape(m, 1)
                 mx += blk64 @ self.X[st:ed, :]
                 my += blk64 @ self.y[st:ed, :]
-                gram = _gram_rankk_update(gram, blk64, lowmem=False)
+                gram = _gram_rankk_update(
+                    gram,
+                    blk64,
+                    lowmem=(gram_mode == "lowmem"),
+                )
         else:
             for st in range(0, n_train, step):
                 ed = min(st + step, n_train)

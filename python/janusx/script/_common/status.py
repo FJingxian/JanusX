@@ -22,6 +22,7 @@ except Exception:
 
 _SPINNER_NAME = "janusx_ascii"
 _SPINNER_FRAMES = ["/", "-", "\\", "|"]
+_SPINNER_REFRESH_SEC = 0.1
 _SPINNER_FALLBACKS = ("line", "dots", "simpleDots", "bouncingBar")
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
@@ -153,10 +154,9 @@ def format_elapsed(seconds: Optional[float]) -> str:
 
 
 def spinner_refresh_interval(seconds: Optional[float]) -> float:
-    s = float(max(0.0, float(seconds or 0.0)))
-    if s < 60.0:
-        return 0.1
-    return 1.0
+    _ = seconds
+    # Keep spinner animation cadence independent from elapsed-time formatting.
+    return float(_SPINNER_REFRESH_SEC)
 
 
 def ensure_rich_spinner_registered() -> None:

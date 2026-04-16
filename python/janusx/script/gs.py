@@ -412,6 +412,45 @@ def _looks_like_packed_payload(obj: typing.Any) -> bool:
     )
 
 
+def _normalize_train_pred_indices(
+    train_pred_indices: np.ndarray | None,
+    n_train: int,
+) -> np.ndarray | None:
+    if train_pred_indices is None:
+        return None
+    idx = np.asarray(train_pred_indices, dtype=np.int64).reshape(-1)
+    if int(idx.size) == 0:
+        return np.zeros((0,), dtype=np.int64)
+    if np.any(idx < 0) or np.any(idx >= int(n_train)):
+        raise ValueError(
+            f"train prediction indices out of range: valid [0, {int(n_train) - 1}]"
+        )
+    return np.ascontiguousarray(idx, dtype=np.int64)
+
+
+def _resolve_train_pred_local_indices(
+    n_train_fold: int,
+    limit_predtrain: int | None,
+    fold_id: int,
+) -> np.ndarray | None:
+    if limit_predtrain is None:
+        return None
+    limit_i = int(limit_predtrain)
+    if limit_i <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if limit_i >= int(n_train_fold):
+        return None
+    # Deterministic fold-local subsampling so all methods are compared on
+    # the same train-prediction subset.
+    rng = np.random.default_rng(4242 + int(fold_id))
+    picked = np.asarray(
+        rng.choice(int(n_train_fold), size=int(limit_i), replace=False),
+        dtype=np.int64,
+    )
+    picked.sort()
+    return np.ascontiguousarray(picked, dtype=np.int64)
+
+
 def _tune_ml_method_once(
     method: str,
     Y: np.ndarray,
@@ -467,6 +506,7 @@ def GSapi(
     need_train_pred: bool = True,
     packed_train_indices: np.ndarray | None = None,
     packed_test_indices: np.ndarray | None = None,
+    train_pred_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -488,6 +528,9 @@ def GSapi(
         Thread count for ML models. Non-ML models currently ignore this setting.
     need_train_pred : bool, optional
         If False, skip generating train-set predictions when the caller does not need them.
+    train_pred_indices : np.ndarray, optional
+        Optional local indices (relative to Xtrain columns) used for train-set
+        prediction. When provided, only these training samples are predicted.
 
     Returns
     -------
@@ -499,6 +542,10 @@ def GSapi(
         Variance-component PVE/h2 for mixed models and Bayes models,
         or predictive PVE (inner-CV R2) for ML models.
     """
+    train_pred_idx = _normalize_train_pred_indices(
+        train_pred_indices,
+        int(Y.reshape(-1).shape[0]),
+    )
     is_packed_input = _looks_like_packed_payload(Xtrain) or _looks_like_packed_payload(Xtest)
     if is_packed_input:
         if PCAdec:
@@ -601,7 +648,21 @@ def GSapi(
             )
             t_pred = time.time()
         if need_train_pred:
-            pred_train = model.predict(Xtrain, sample_indices=packed_train_indices)
+            if train_pred_idx is None:
+                pred_train = model.predict(Xtrain, sample_indices=packed_train_indices)
+            elif int(train_pred_idx.size) == 0:
+                pred_train = np.zeros((0, 1), dtype=float)
+            else:
+                if is_packed_input:
+                    base_indices = (
+                        np.arange(int(Y.reshape(-1).shape[0]), dtype=np.int64)
+                        if packed_train_indices is None
+                        else np.asarray(packed_train_indices, dtype=np.int64).reshape(-1)
+                    )
+                    picked_indices = np.ascontiguousarray(base_indices[train_pred_idx], dtype=np.int64)
+                    pred_train = model.predict(Xtrain, sample_indices=picked_indices)
+                else:
+                    pred_train = model.predict(np.asarray(Xtrain)[:, train_pred_idx])
         else:
             pred_train = np.zeros((0, 1), dtype=float)
         pred_test = model.predict(Xtest, sample_indices=packed_test_indices)
@@ -616,8 +677,20 @@ def GSapi(
     if method in ("BayesA", "BayesB", "BayesCpi"):
         model = BAYES(Y.reshape(-1, 1), Xtrain, method=method)
         pve = model.pve
-        train_pred = model.predict(Xtrain) if need_train_pred else np.zeros((0, 1), dtype=float)
-        return train_pred, model.predict(Xtest), pve
+        if need_train_pred:
+            if train_pred_idx is None:
+                train_pred = model.predict(Xtrain)
+            elif int(train_pred_idx.size) == 0:
+                train_pred = np.zeros((0, 1), dtype=float)
+            else:
+                train_pred = model.predict(np.asarray(Xtrain)[:, train_pred_idx])
+        else:
+            train_pred = np.zeros((0, 1), dtype=float)
+        return (
+            np.asarray(train_pred, dtype=float).reshape(-1, 1),
+            np.asarray(model.predict(Xtest), dtype=float).reshape(-1, 1),
+            pve,
+        )
 
     if method in _ML_METHOD_MAP:
         model = MLGS(
@@ -627,12 +700,22 @@ def GSapi(
             seed=42,
             cv=_mlgs_inner_cv(int(Y.shape[0])),
             n_jobs=max(1, int(n_jobs)),
-            fit_on_init=False if ml_fixed_params is not None else True,
+            fit_on_init=False,
             verbose=False,
         )
         if ml_fixed_params is not None:
             model.fit_with_params(ml_fixed_params)
-        yhat_train = model.fit_predict()
+        else:
+            model.fit()
+        if need_train_pred:
+            if train_pred_idx is None:
+                yhat_train = model.predict(Xtrain)
+            elif int(train_pred_idx.size) == 0:
+                yhat_train = np.zeros((0, 1), dtype=float)
+            else:
+                yhat_train = model.predict(np.asarray(Xtrain)[:, train_pred_idx])
+        else:
+            yhat_train = np.zeros((0, 1), dtype=float)
         if int(Xtest.shape[1]) > 0:
             yhat_test = model.predict(Xtest)
         else:
@@ -640,7 +723,11 @@ def GSapi(
         pve = float(
             (model.best_metrics_ or {}).get("r2", np.nan)
         )
-        return yhat_train, yhat_test, pve
+        return (
+            np.asarray(yhat_train, dtype=float).reshape(-1, 1),
+            np.asarray(yhat_test, dtype=float).reshape(-1, 1),
+            pve,
+        )
 
     raise ValueError(f"Unsupported GS method: {method}")
 
@@ -665,6 +752,7 @@ def _run_method_task(
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
     search_progress_hook: typing.Any = None,
+    limit_predtrain: int | None = None,
 ) -> dict[str, typing.Any]:
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     best_test = None
@@ -689,6 +777,14 @@ def _run_method_task(
             t_fold = time.time()
             fold_train_idx_arg = None
             fold_test_idx_arg = None
+            fold_train_pred_local_idx: np.ndarray | None = _resolve_train_pred_local_indices(
+                n_train_fold=int(np.asarray(train_idx).shape[0]),
+                limit_predtrain=limit_predtrain,
+                fold_id=int(fold_id),
+            )
+            need_fold_train_pred = bool(
+                (fold_train_pred_local_idx is None) or (int(fold_train_pred_local_idx.size) > 0)
+            )
             if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
                 if train_sample_indices is None:
                     raise ValueError("Packed LMM requires train sample indices.")
@@ -722,13 +818,20 @@ def _run_method_task(
                 n_jobs=n_jobs,
                 force_fast=force_fast,
                 ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
+                need_train_pred=need_fold_train_pred,
                 packed_train_indices=fold_train_idx_arg,
                 packed_test_indices=fold_test_idx_arg,
+                train_pred_indices=fold_train_pred_local_idx,
             )
             if ml_tuning_cache is not None:
                 pve = float(ml_tuning_cache.get("pve", np.nan))
             ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
-            ttrain = np.concatenate([train_pheno[train_idx], yhat_train], axis=1)
+            ttrain = None
+            if need_fold_train_pred:
+                y_train_fold = train_pheno[train_idx]
+                if fold_train_pred_local_idx is not None:
+                    y_train_fold = y_train_fold[fold_train_pred_local_idx]
+                ttrain = np.concatenate([y_train_fold, yhat_train], axis=1)
 
             ss_res = np.sum((ttest[:, 0] - ttest[:, 1]) ** 2)
             ss_tot = np.sum((ttest[:, 0] - ttest[:, 0].mean()) ** 2)
@@ -822,6 +925,7 @@ def _run_methods_parallel(
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
+    limit_predtrain: int | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -990,6 +1094,7 @@ def _run_methods_parallel(
                             progress_queue=None,
                             progress_hook=_cv_hook,
                             search_progress_hook=_search_hook,
+                            limit_predtrain=limit_predtrain,
                         )
                     except Exception:
                         _close_search_task()
@@ -1175,6 +1280,7 @@ def _run_methods_parallel(
                         progress_queue=None,
                         progress_hook=(_cv_hook if enable_tqdm_progress else None),
                         search_progress_hook=(_search_hook if enable_tqdm_progress else None),
+                        limit_predtrain=limit_predtrain,
                     )
                 except Exception:
                     _close_search_bar()
@@ -1240,6 +1346,9 @@ def _run_methods_parallel(
                     train_sample_indices,
                     test_sample_indices,
                     None,
+                    None,
+                    None,
+                    limit_predtrain,
                 ): m
                 for m in methods
             }
@@ -1321,6 +1430,9 @@ def _run_methods_parallel(
                             train_sample_indices,
                             test_sample_indices,
                             prog_q,
+                            None,
+                            None,
+                            limit_predtrain,
                         ): m
                         for m in methods
                     }
@@ -1413,6 +1525,9 @@ def _run_methods_parallel(
                         train_sample_indices,
                         test_sample_indices,
                         prog_q,
+                        None,
+                        None,
+                        limit_predtrain,
                     ): m
                     for m in methods
                 }
@@ -1461,6 +1576,9 @@ def _run_methods_parallel(
                     train_sample_indices,
                     test_sample_indices,
                     None,
+                    None,
+                    None,
+                    limit_predtrain,
                 ): m
                 for m in methods
             }
@@ -1770,6 +1888,17 @@ def main(log: bool = True) -> None:
         help="Number of CPU threads (default: %(default)s).",
     )
     optional_group.add_argument(
+        "-limit-predtrain", "--limit-predtrain",
+        "-limit-train", "--limit-train",
+        type=int,
+        default=None,
+        dest="limit_predtrain",
+        help=(
+            "Limit train-set predictions per outer CV fold for diagnostics. "
+            "Use 0 to disable fold train predictions; default predicts all training samples."
+        ),
+    )
+    optional_group.add_argument(
         "-strict-cv", "--strict-cv",
         action="store_true",
         default=False,
@@ -1814,6 +1943,8 @@ def main(log: bool = True) -> None:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
+    if (args.limit_predtrain is not None) and (int(args.limit_predtrain) < 0):
+        parser.error("--limit-predtrain/--limit-train must be >= 0.")
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
@@ -1927,6 +2058,7 @@ def main(log: bool = True) -> None:
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
                 ("Threads", f"{args.thread} ({detected_threads} available)"),
+                ("Limit train-pred", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
                 ("Strict CV", args.strict_cv),
                 ("Force fast Gram", args.force_fast),
             ]
@@ -2273,6 +2405,7 @@ def main(log: bool = True) -> None:
             packed_ctx=packed_lmm_ctx,
             train_sample_indices=train_sample_idx,
             test_sample_indices=test_sample_idx,
+            limit_predtrain=args.limit_predtrain,
         )
         if _GS_DEBUG_STAGE:
             logger.info(

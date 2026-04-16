@@ -631,6 +631,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     optional_group.add_argument("--cv", default=5, type=int, help="CV folds (default: %(default)s).")
     optional_group.add_argument("--seed", default=42, type=int, help="Random seed (default: %(default)s).")
     optional_group.add_argument(
+        "-limit-predtrain",
+        "--limit-predtrain",
+        "-limit-train",
+        "--limit-train",
+        default=0,
+        type=int,
+        dest="limit_predtrain",
+        help=(
+            "Forward to JanusX gs engine only: cap train-set predictions per CV fold "
+            "(0 disables fold train predictions; default: %(default)s)."
+        ),
+    )
+    optional_group.add_argument(
         "--engines",
         default=_DEFAULT_ENGINES_RUN,
         type=str,
@@ -702,6 +715,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             p.error("--limit-mem must be a positive number in GB.")
         if (not math.isfinite(lm)) or (lm <= 0.0):
             p.error("--limit-mem must be > 0 (GB).")
+    if int(args.limit_predtrain) < 0:
+        p.error("--limit-predtrain/--limit-train must be >= 0.")
     return args
 
 
@@ -2342,6 +2357,8 @@ def _run_engine_janusx(
         fold_prefix,
         "-cv",
         str(int(args.cv)),
+        "--limit-predtrain",
+        str(int(args.limit_predtrain)),
         "-t",
         str(int(args.thread)),
         "-maf",
@@ -3472,6 +3489,7 @@ def main() -> None:
         "threads": int(args.thread),
         "limit_mem_gb": (None if args.limit_mem is None else float(args.limit_mem)),
         "cv": int(args.cv),
+        "limit_predtrain": int(args.limit_predtrain),
         "seed": int(args.seed),
         "n_samples": int(data_info["meta"]["n"]),
         "n_snps": int(data_info["meta"]["m"]),

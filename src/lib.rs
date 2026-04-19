@@ -4,8 +4,6 @@ use pyo3::Bound;
 // stats
 #[path = "stats/adamixture.rs"]
 mod admixture;
-#[path = "stats/rsvd.rs"]
-mod rsvd;
 #[path = "stats/assoc.rs"]
 mod assoc;
 #[path = "stats/bayes.rs"]
@@ -16,6 +14,8 @@ mod bsa;
 mod lmm;
 #[path = "stats/logreg.rs"]
 mod logreg;
+#[path = "stats/rsvd.rs"]
+mod rsvd;
 #[path = "stats/tree.rs"]
 mod tree;
 
@@ -46,14 +46,14 @@ use admixture::{
     admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
     admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
-use rsvd::py_rsvd_packed_subset;
 use assoc::{
-    ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32,
-    bed_packed_decode_stats_f64, bed_packed_row_flip_mask,
-    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
-    fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, lmm_assoc_chunk_f32,
-    lmm_assoc_chunk_from_snp_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32,
-    lmm_reml_null_f32, ml_loglike_null_f32,
+    ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
+    bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, farmcpu_rem_dense,
+    farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed, fastlmm_assoc_chunk_f32,
+    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_f32,
+    grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
+    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
+    packed_malpha_f64,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use bsa::preprocess_bsa;
@@ -66,12 +66,10 @@ use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use logreg::fit_best_and_not_py;
+use rsvd::py_rsvd_packed_subset;
 use tree::{
-    geno_chunk_to_alignment_u8,
-    geno_chunk_to_alignment_u8_siteinfo,
-    geno_chunk_to_alignment_u8_sites,
-    ml_newick_from_alignment_u8,
-    nj_newick_from_alignment_u8,
+    geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
+    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
 };
 // ============================================================
 // PyO3 module exports
@@ -102,6 +100,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;

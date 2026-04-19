@@ -267,6 +267,113 @@ def detect_effective_threads() -> int:
     return max(1, int(detected))
 
 
+_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _parse_nonnegative_int(raw: object) -> int | None:
+    try:
+        v = int(str(raw).strip())
+    except Exception:
+        return None
+    return v if v >= 0 else None
+
+
+def _split_runtime_threads(total_threads: int, policy: str) -> tuple[int, int, str]:
+    total = max(1, int(total_threads))
+    p = str(policy).strip().lower()
+    if p not in {"auto", "blas", "balanced", "split", "rust"}:
+        p = "auto"
+    if p == "auto":
+        # Auto heuristic: favor BLAS on small/medium cores, split on larger hosts.
+        p = "blas" if total <= 4 else ("balanced" if total <= 12 else "split")
+    if p == "blas":
+        return total, 1, p
+    if p == "rust":
+        return 1, total, p
+    if p == "split":
+        rust_threads = max(1, total // 2)
+        blas_threads = max(1, total - rust_threads)
+        return blas_threads, rust_threads, p
+    # balanced
+    rust_threads = max(1, total // 3)
+    blas_threads = max(1, total - rust_threads)
+    return blas_threads, rust_threads, p
+
+
+def configure_thread_runtime(
+    *,
+    total_threads: int,
+    methods: list[str],
+    logger: logging.Logger | None = None,
+) -> dict[str, object]:
+    enabled = _env_truthy("JX_THREAD_COORDINATE", "1")
+    # Default to rust-priority runtime split for better stability on large packed-BED workloads.
+    policy_raw = str(os.getenv("JX_THREAD_POLICY", "rust")).strip().lower() or "rust"
+    explicit_blas = _parse_nonnegative_int(os.getenv("JX_MLM_BLAS_THREADS", "").strip())
+    explicit_rust = _parse_nonnegative_int(os.getenv("JX_MLM_RUST_THREADS", "").strip())
+    gblup_only = bool(len(methods) > 0 and all(m in {"GBLUP", "rrBLUP"} for m in methods))
+
+    plan: dict[str, object] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": "",
+        "policy": policy_raw,
+        "blas_threads": max(1, int(total_threads)),
+        "rust_threads": 0,
+        "explicit": bool((explicit_blas is not None) or (explicit_rust is not None)),
+    }
+    if not enabled:
+        plan["reason"] = "disabled_by_env"
+        return plan
+    if (not gblup_only) and (not bool(plan["explicit"])):
+        plan["reason"] = "skipped_non_gblup_mixed_models"
+        return plan
+
+    if (explicit_blas is not None) or (explicit_rust is not None):
+        # Keep explicit overrides predictable: missing side falls back to `--thread`.
+        blas_threads = explicit_blas if explicit_blas is not None else int(total_threads)
+        rust_threads = explicit_rust if explicit_rust is not None else int(total_threads)
+        policy_used = "manual"
+    else:
+        blas_threads, rust_threads, policy_used = _split_runtime_threads(
+            int(total_threads), str(policy_raw)
+        )
+
+    max_threads = max(1, int(total_threads))
+    blas_threads = min(max_threads, max(1, int(blas_threads)))
+    rust_threads = min(max_threads, max(1, int(rust_threads)))
+
+    text_blas = str(int(blas_threads))
+    text_rust = str(int(rust_threads))
+    for key in _THREAD_ENV_KEYS:
+        os.environ[key] = text_blas
+    os.environ["JX_MLM_BLAS_THREADS"] = text_blas
+    os.environ["JX_MLM_RUST_THREADS"] = text_rust
+    os.environ["RAYON_NUM_THREADS"] = text_rust
+    os.environ["JX_THREADS"] = str(max_threads)
+
+    plan["policy"] = policy_used
+    plan["blas_threads"] = int(blas_threads)
+    plan["rust_threads"] = int(rust_threads)
+    plan["applied"] = True
+    plan["reason"] = "ok"
+
+    if logger is not None:
+        logger.info(
+            "Thread runtime coordination: "
+            f"policy={plan['policy']}, total={max_threads}, "
+            f"blas={int(blas_threads)}, rust={int(rust_threads)}."
+        )
+    return plan
+
+
 def _sniff_sep(path: str) -> str:
     """
     Fast delimiter sniffing for phenotype tables.
@@ -2207,6 +2314,17 @@ def main(log: bool = True) -> None:
             "All selected models were skipped due to missing optional dependencies."
         )
         raise SystemExit(1)
+
+    thread_plan = configure_thread_runtime(
+        total_threads=int(args.thread),
+        methods=methods,
+        logger=logger,
+    )
+    if not bool(thread_plan.get("applied", False)):
+        logger.info(
+            "Thread runtime coordination: "
+            f"skipped ({str(thread_plan.get('reason', 'unknown'))})."
+        )
 
     logger.info("Effective models: " + ", ".join(methods))
     if ("adBLUP" in methods) and args.pcd:

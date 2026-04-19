@@ -34,6 +34,7 @@ import numpy as np
 import psutil
 from janusx.gfreader import (
     load_genotype_chunks,
+    load_bed_2bit_packed,
     inspect_genotype_file,
     auto_mmap_window_mb,
 )
@@ -52,6 +53,15 @@ from ._common.progress import ProgressAdapter
 from ._common.status import format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
+
+try:
+    from janusx.janusx import (
+        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
+        grm_packed_f32 as _grm_packed_f32,
+    )
+except Exception:
+    _bed_packed_row_flip_mask = None
+    _grm_packed_f32 = None
 
 
 def build_grm_streaming(
@@ -160,6 +170,97 @@ def build_grm_streaming(
     log_success(
         logger,
         f"GRM (Effective SNPs: {eff_m}) ...Finished [{format_elapsed(stream_elapsed)}]",
+        force_color=True,
+    )
+    return grm, eff_m
+
+
+def build_grm_packed_bed(
+    genofile: str,
+    n_samples: int,
+    n_snps: int,
+    method: int,
+    maf_threshold: float,
+    max_missing_rate: float,
+    chunk_size: int,
+    logger,
+) -> tuple[np.ndarray, int]:
+    if (_grm_packed_f32 is None) or (_bed_packed_row_flip_mask is None):
+        raise RuntimeError(
+            "Packed GRM kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_packed_f32` and `bed_packed_row_flip_mask`."
+        )
+
+    pbar = ProgressAdapter(
+        total=n_snps,
+        desc="GRM (packed-bed)",
+        emit_done=False,
+        force_animate=True,
+    )
+    stream_t0 = time.monotonic()
+    process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(chunk_size))
+    last_done = 0
+
+    def _progress_cb(done: int, _total: int) -> None:
+        nonlocal last_done
+        d = int(done)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f} GB")
+
+    try:
+        packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(genofile)
+        if int(packed_n) != int(n_samples):
+            raise RuntimeError(
+                f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
+            )
+        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+        miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+        maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+        keep = np.ones(maf.shape[0], dtype=np.bool_)
+        maf_thr = float(maf_threshold)
+        if maf_thr > 0.0:
+            keep &= (maf >= maf_thr) & (maf <= (1.0 - maf_thr))
+        keep &= (miss <= float(max_missing_rate))
+        if not np.any(keep):
+            raise RuntimeError("No SNPs remained after packed BED filtering; GRM is empty.")
+        if not bool(np.all(keep)):
+            packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+            maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
+        eff_m = int(packed.shape[0])
+        row_flip = np.ascontiguousarray(
+            np.asarray(_bed_packed_row_flip_mask(packed, int(n_samples)), dtype=np.bool_).reshape(-1)
+        )
+        grm = np.ascontiguousarray(
+            np.asarray(
+                _grm_packed_f32(
+                    packed,
+                    int(n_samples),
+                    row_flip,
+                    maf,
+                    sample_indices=None,
+                    method=int(method),
+                    block_cols=max(1, int(chunk_size)),
+                    threads=0,
+                    progress_callback=_progress_cb,
+                    progress_every=max(1, int(chunk_size)),
+                ),
+                dtype=np.float32,
+            )
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
+
+    stream_elapsed = max(0.0, time.monotonic() - stream_t0)
+    log_success(
+        logger,
+        f"GRM (Effective SNPs: {eff_m}, packed-bed kernel) ...Finished "
+        f"[{format_elapsed(stream_elapsed)}]",
         force_color=True,
     )
     return grm, eff_m
@@ -323,17 +424,54 @@ def main(log: bool = True):
         if args.mmap_limit else None
     )
 
-    grm, eff_m = build_grm_streaming(
-        genofile=gfile,
-        n_samples=n_samples,
-        n_snps=n_snps,
-        method=args.method,
-        maf_threshold=maf_threshold,
-        max_missing_rate=max_missing_rate,
-        chunk_size=chunk_size,
-        mmap_window_mb=mmap_window_mb,
-        logger=logger,
+    use_packed_kernel = bool(
+        bool(args.bfile)
+        and (_grm_packed_f32 is not None)
+        and (_bed_packed_row_flip_mask is not None)
     )
+    if use_packed_kernel:
+        logger.info("GRM backend: packed BED kernel (Rust grm_packed_f32).")
+        try:
+            grm, eff_m = build_grm_packed_bed(
+                genofile=gfile,
+                n_samples=n_samples,
+                n_snps=n_snps,
+                method=args.method,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                chunk_size=chunk_size,
+                logger=logger,
+            )
+        except Exception as ex:
+            logger.warning(
+                "Packed GRM kernel failed; fallback to streaming backend. "
+                f"reason={ex}"
+            )
+            grm, eff_m = build_grm_streaming(
+                genofile=gfile,
+                n_samples=n_samples,
+                n_snps=n_snps,
+                method=args.method,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                chunk_size=chunk_size,
+                mmap_window_mb=mmap_window_mb,
+                logger=logger,
+            )
+    else:
+        if bool(args.bfile):
+            logger.info("Packed GRM kernel unavailable; fallback to streaming dense-chunk backend.")
+        grm, eff_m = build_grm_streaming(
+            genofile=gfile,
+            n_samples=n_samples,
+            n_snps=n_snps,
+            method=args.method,
+            maf_threshold=maf_threshold,
+            max_missing_rate=max_missing_rate,
+            chunk_size=chunk_size,
+            mmap_window_mb=mmap_window_mb,
+            logger=logger,
+        )
 
     # ------------------------------------------------------------------
     # Save results

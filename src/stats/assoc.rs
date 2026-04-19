@@ -1,5 +1,5 @@
-use nalgebra::{DMatrix, DVector};
 use matrixmultiply::sgemm;
+use nalgebra::{DMatrix, DVector};
 use numpy::ndarray::{Array1, Array2};
 use numpy::PyArray1;
 use numpy::PyReadonlyArray3;
@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::brent::brent_minimize;
 use crate::linalg::{
@@ -32,8 +32,7 @@ const _INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
 #[inline]
 fn _check_ctrlc() -> Result<(), String> {
-    Python::attach(|py| py.check_signals())
-        .map_err(|_| _INTERRUPTED_MSG.to_string())
+    Python::attach(|py| py.check_signals()).map_err(|_| _INTERRUPTED_MSG.to_string())
 }
 
 #[inline]
@@ -283,11 +282,257 @@ fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
     }
 }
 
-fn parse_index_vec_i64(
-    indices: &[i64],
-    upper_bound: usize,
-    label: &str,
-) -> PyResult<Vec<usize>> {
+struct PackedByteLut {
+    nonmiss: [u8; 256],
+    alt_sum: [u8; 256],
+    code4: [[u8; 4]; 256],
+}
+
+fn packed_byte_lut() -> &'static PackedByteLut {
+    static LUT: OnceLock<PackedByteLut> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut nonmiss = [0u8; 256];
+        let mut alt_sum = [0u8; 256];
+        let mut code4 = [[0u8; 4]; 256];
+        for b in 0u16..=255 {
+            let byte = b as u8;
+            let mut nm = 0u8;
+            let mut alt = 0u8;
+            let mut codes = [0u8; 4];
+            for lane in 0..4usize {
+                let code = (byte >> (lane * 2)) & 0b11;
+                codes[lane] = code;
+                match code {
+                    0b00 => {
+                        nm += 1;
+                    }
+                    0b10 => {
+                        nm += 1;
+                        alt += 1;
+                    }
+                    0b11 => {
+                        nm += 1;
+                        alt += 2;
+                    }
+                    _ => {}
+                }
+            }
+            let idx = byte as usize;
+            nonmiss[idx] = nm;
+            alt_sum[idx] = alt;
+            code4[idx] = codes;
+        }
+        PackedByteLut {
+            nonmiss,
+            alt_sum,
+            code4,
+        }
+    })
+}
+
+#[inline]
+fn is_identity_indices(sample_idx: &[usize], n_samples: usize) -> bool {
+    if sample_idx.len() != n_samples {
+        return false;
+    }
+    sample_idx.iter().enumerate().all(|(i, &v)| i == v)
+}
+
+#[inline]
+fn decode_row_centered_full_lut(
+    row: &[u8],
+    n_samples: usize,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut col = 0usize;
+    for &b in row.iter().take(full_bytes) {
+        let codes = &code4_lut[b as usize];
+        out_row[col] = value_lut[codes[0] as usize];
+        out_row[col + 1] = value_lut[codes[1] as usize];
+        out_row[col + 2] = value_lut[codes[2] as usize];
+        out_row[col + 3] = value_lut[codes[3] as usize];
+        col += 4;
+    }
+    if rem > 0 {
+        let codes = &code4_lut[row[full_bytes] as usize];
+        for lane in 0..rem {
+            out_row[col + lane] = value_lut[codes[lane] as usize];
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+type CblasInt = std::os::raw::c_int;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const CBLAS_COL_MAJOR: CblasInt = 102;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const CBLAS_NO_TRANS: CblasInt = 111;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const CBLAS_TRANS: CblasInt = 112;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[link(name = "blas")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "libopenblas")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn grm_rankk_update_cblas(
+    grm: &mut [f32],
+    block: &[f32],
+    cur_rows: usize,
+    n: usize,
+    copy_rhs: bool,
+    beta_zero_accum: bool,
+) {
+    let rhs_owned = if copy_rhs {
+        Some(block.to_vec())
+    } else {
+        None
+    };
+    let rhs_ptr = match rhs_owned.as_ref() {
+        Some(v) => v.as_ptr(),
+        None => block.as_ptr(),
+    };
+    if beta_zero_accum {
+        let mut tmp = vec![0.0_f32; n * n];
+        unsafe {
+            // `block` is row-major (cur_rows, n), which is layout-equivalent to
+            // a column-major matrix with shape (n, cur_rows). Use col-major GEMM
+            // to compute: tmp = block^T @ block == A @ A^T.
+            cblas_sgemm(
+                CBLAS_COL_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                n as CblasInt,
+                n as CblasInt,
+                cur_rows as CblasInt,
+                1.0,
+                block.as_ptr(),
+                n as CblasInt,
+                rhs_ptr,
+                n as CblasInt,
+                0.0,
+                tmp.as_mut_ptr(),
+                n as CblasInt,
+            );
+        }
+        for (g, t) in grm.iter_mut().zip(tmp.iter()) {
+            *g += *t;
+        }
+    } else {
+        unsafe {
+            cblas_sgemm(
+                CBLAS_COL_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                n as CblasInt,
+                n as CblasInt,
+                cur_rows as CblasInt,
+                1.0,
+                block.as_ptr(),
+                n as CblasInt,
+                rhs_ptr,
+                n as CblasInt,
+                1.0,
+                grm.as_mut_ptr(),
+                n as CblasInt,
+            );
+        }
+    }
+}
+
+#[inline]
+fn grm_rankk_update(
+    grm: &mut [f32],
+    block: &[f32],
+    cur_rows: usize,
+    n: usize,
+    cblas_copy_rhs: bool,
+    cblas_beta_zero_accum: bool,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        grm_rankk_update_cblas(
+            grm,
+            block,
+            cur_rows,
+            n,
+            cblas_copy_rhs,
+            cblas_beta_zero_accum,
+        );
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (grm, block, cur_rows, n, cblas_copy_rhs, cblas_beta_zero_accum);
+        Err("Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM.".to_string())
+    }
+}
+
+fn parse_index_vec_i64(indices: &[i64], upper_bound: usize, label: &str) -> PyResult<Vec<usize>> {
     let mut out = Vec::with_capacity(indices.len());
     for (i, &v) in indices.iter().enumerate() {
         if v < 0 {
@@ -315,7 +560,9 @@ pub fn bed_packed_row_flip_mask<'py>(
 ) -> PyResult<Bound<'py, PyArray1<bool>>> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -332,6 +579,9 @@ pub fn bed_packed_row_flip_mask<'py>(
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
+    let byte_lut = packed_byte_lut();
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
 
     let out = PyArray1::<bool>::zeros(py, [m], false).into_bound();
     let out_slice = unsafe {
@@ -339,36 +589,44 @@ pub fn bed_packed_row_flip_mask<'py>(
             .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
     };
 
-    out_slice.par_iter_mut().enumerate().for_each(|(row_idx, dst)| {
-        let row =
-            &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-        let mut alt_sum = 0.0_f64;
-        let mut non_missing = 0usize;
-        for l in 0..n_samples {
-            let b = row[l >> 2];
-            let code = (b >> ((l & 3) * 2)) & 0b11;
-            match code {
-                0b00 => {
-                    non_missing += 1;
-                }
-                0b10 => {
-                    non_missing += 1;
-                    alt_sum += 1.0;
-                }
-                0b11 => {
-                    non_missing += 1;
-                    alt_sum += 2.0;
-                }
-                _ => {}
+    out_slice
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(row_idx, dst)| {
+            let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+            let mut alt_sum = 0usize;
+            let mut non_missing = 0usize;
+            for &b in row.iter().take(full_bytes) {
+                let idx = b as usize;
+                non_missing += byte_lut.nonmiss[idx] as usize;
+                alt_sum += byte_lut.alt_sum[idx] as usize;
             }
-        }
-        if non_missing == 0 {
-            *dst = false;
-        } else {
-            let p = alt_sum / (2.0 * non_missing as f64);
-            *dst = p > 0.5;
-        }
-    });
+            if rem > 0 {
+                let codes = &byte_lut.code4[row[full_bytes] as usize];
+                for &code in codes.iter().take(rem) {
+                    match code {
+                        0b00 => {
+                            non_missing += 1;
+                        }
+                        0b10 => {
+                            non_missing += 1;
+                            alt_sum += 1;
+                        }
+                        0b11 => {
+                            non_missing += 1;
+                            alt_sum += 2;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if non_missing == 0 {
+                *dst = false;
+            } else {
+                let p = (alt_sum as f64) / (2.0 * non_missing as f64);
+                *dst = p > 0.5;
+            }
+        });
 
     Ok(out)
 }
@@ -393,7 +651,9 @@ pub fn bed_packed_decode_rows_f32<'py>(
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -442,8 +702,7 @@ pub fn bed_packed_decode_rows_f32<'py>(
         .enumerate()
         .for_each(|(i_row, out_row)| {
             let src_row = row_idx[i_row];
-            let row =
-                &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
+            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             let flip = row_flip[src_row];
             let mean_g = (2.0_f32 * row_maf[src_row]).max(0.0);
             for (j, &sidx) in sample_idx.iter().enumerate() {
@@ -495,7 +754,9 @@ pub fn bed_packed_decode_stats_f64<'py>(
 )> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -599,6 +860,1189 @@ pub fn bed_packed_decode_stats_f64<'py>(
 
 #[pyfunction]
 #[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices,
+    m_alpha,
+    m_mean,
+    alpha_sum,
+    mean_sq,
+    mean_malpha,
+    m_var_sum,
+    block_rows=4096,
+    threads=0
+))]
+pub fn cross_grm_times_alpha_packed_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    m_alpha: PyReadonlyArray1<'py, f64>,
+    m_mean: PyReadonlyArray1<'py, f64>,
+    alpha_sum: f64,
+    mean_sq: f64,
+    mean_malpha: f64,
+    m_var_sum: f64,
+    block_rows: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if !(m_var_sum.is_finite() && m_var_sum > 0.0) {
+        return Err(PyRuntimeError::new_err(
+            "m_var_sum must be finite and > 0 for compact cross-GRM prediction",
+        ));
+    }
+    if !(alpha_sum.is_finite() && mean_sq.is_finite() && mean_malpha.is_finite()) {
+        return Err(PyRuntimeError::new_err(
+            "alpha_sum/mean_sq/mean_malpha must be finite",
+        ));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let m_alpha_vec: Cow<[f64]> = match m_alpha.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(m_alpha.as_array().iter().copied().collect()),
+    };
+    let m_mean_vec: Cow<[f64]> = match m_mean.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(m_mean.as_array().iter().copied().collect()),
+    };
+    if m_alpha_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "m_alpha length mismatch: got {}, expected {m}",
+            m_alpha_vec.len()
+        )));
+    }
+    if m_mean_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "m_mean length mismatch: got {}, expected {m}",
+            m_mean_vec.len()
+        )));
+    }
+
+    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+
+    let row_step = block_rows.max(1).min(m.max(1));
+    let byte_lut = packed_byte_lut();
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let m_alpha_f32: Vec<f32> = m_alpha_vec.iter().map(|&v| v as f32).collect();
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let m_mean_f32: Vec<f32> = m_mean_vec.iter().map(|&v| v as f32).collect();
+
+    let (term1, term2) = py
+        .detach(|| -> Result<(Vec<f64>, Vec<f64>), String> {
+            let mut term1 = vec![0.0_f64; n_out];
+            let mut term2 = vec![0.0_f64; n_out];
+            let mut block = vec![0.0_f32; row_step * n_out];
+            let mut tick = 0usize;
+
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let mut tmp1 = vec![0.0_f32; n_out];
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let mut tmp2 = vec![0.0_f32; n_out];
+
+            let mut run = || -> Result<(), String> {
+                for st in (0..m).step_by(row_step) {
+                    let ed = (st + row_step).min(m);
+                    let cur_rows = ed - st;
+                    let blk_slice = &mut block[..cur_rows * n_out];
+
+                    if full_sample_fast {
+                        blk_slice
+                            .par_chunks_mut(n_out)
+                            .enumerate()
+                            .for_each(|(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let mean_g = 2.0_f32 * row_maf_vec[row_idx];
+                                let value_lut = if row_flip_vec[row_idx] {
+                                    [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
+                                } else {
+                                    [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
+                                };
+                                decode_row_centered_full_lut(
+                                    row,
+                                    n_samples,
+                                    &byte_lut.code4,
+                                    &value_lut,
+                                    out_row,
+                                );
+                            });
+                    } else {
+                        blk_slice
+                            .par_chunks_mut(n_out)
+                            .enumerate()
+                            .for_each(|(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[row_idx];
+                                let mean_g = 2.0_f32 * row_maf_vec[row_idx];
+                                for (j, &sid) in sample_idx.iter().enumerate() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g,
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    out_row[j] = gv;
+                                }
+                            });
+                    }
+
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    {
+                        let alpha_blk = &m_alpha_f32[st..ed];
+                        let mean_blk = &m_mean_f32[st..ed];
+                        unsafe {
+                            // `blk_slice` is row-major (cur_rows, n_out), which is layout-equivalent
+                            // to col-major (n_out, cur_rows). Compute tmp = blk^T @ vec.
+                            cblas_sgemm(
+                                CBLAS_COL_MAJOR,
+                                CBLAS_NO_TRANS,
+                                CBLAS_NO_TRANS,
+                                n_out as CblasInt,
+                                1 as CblasInt,
+                                cur_rows as CblasInt,
+                                1.0,
+                                blk_slice.as_ptr(),
+                                n_out as CblasInt,
+                                alpha_blk.as_ptr(),
+                                cur_rows as CblasInt,
+                                0.0,
+                                tmp1.as_mut_ptr(),
+                                n_out as CblasInt,
+                            );
+                            cblas_sgemm(
+                                CBLAS_COL_MAJOR,
+                                CBLAS_NO_TRANS,
+                                CBLAS_NO_TRANS,
+                                n_out as CblasInt,
+                                1 as CblasInt,
+                                cur_rows as CblasInt,
+                                1.0,
+                                blk_slice.as_ptr(),
+                                n_out as CblasInt,
+                                mean_blk.as_ptr(),
+                                cur_rows as CblasInt,
+                                0.0,
+                                tmp2.as_mut_ptr(),
+                                n_out as CblasInt,
+                            );
+                        }
+                        for j in 0..n_out {
+                            term1[j] += tmp1[j] as f64;
+                            term2[j] += tmp2[j] as f64;
+                        }
+                    }
+
+                    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                    {
+                        let alpha_blk = &m_alpha_vec[st..ed];
+                        let mean_blk = &m_mean_vec[st..ed];
+                        for j in 0..n_out {
+                            let mut acc1 = 0.0_f64;
+                            let mut acc2 = 0.0_f64;
+                            for r in 0..cur_rows {
+                                let gv = blk_slice[r * n_out + j] as f64;
+                                acc1 += gv * alpha_blk[r];
+                                acc2 += gv * mean_blk[r];
+                            }
+                            term1[j] += acc1;
+                            term2[j] += acc2;
+                        }
+                    }
+
+                    tick += cur_rows;
+                    if tick >= row_step.saturating_mul(64).max(1) {
+                        _check_ctrlc()?;
+                        tick = 0;
+                    }
+                }
+                Ok(())
+            };
+
+            if let Some(tp) = &pool {
+                tp.install(run)?;
+            } else {
+                run()?;
+            }
+            Ok((term1, term2))
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let const_term = mean_sq * alpha_sum - mean_malpha;
+    let inv_var = 1.0_f64 / m_var_sum;
+    let mut out = vec![0.0_f64; n_out];
+    for j in 0..n_out {
+        out[j] = (term1[j] - term2[j] * alpha_sum + const_term) * inv_var;
+    }
+
+    let out_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n_out, 1), out)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok(out_arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices,
+    alpha,
+    block_rows=4096,
+    threads=0
+))]
+pub fn packed_malpha_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    alpha: PyReadonlyArray1<'py, f64>,
+    block_rows: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let alpha_vec: Cow<[f64]> = match alpha.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(alpha.as_array().iter().copied().collect()),
+    };
+    if alpha_vec.len() != n_out {
+        return Err(PyRuntimeError::new_err(format!(
+            "alpha length mismatch: got {}, expected {} (len(sample_indices))",
+            alpha_vec.len(),
+            n_out
+        )));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let row_step = block_rows.max(1).min(m.max(1));
+    let byte_lut = packed_byte_lut();
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let alpha_f32: Vec<f32> = alpha_vec.iter().map(|&v| v as f32).collect();
+
+    let out = py
+        .detach(|| -> Result<Vec<f64>, String> {
+            let mut out = vec![0.0_f64; m];
+            let mut block = vec![0.0_f32; row_step * n_out];
+            let mut tick = 0usize;
+
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let mut tmp = vec![0.0_f32; row_step];
+
+            let mut run = || -> Result<(), String> {
+                for st in (0..m).step_by(row_step) {
+                    let ed = (st + row_step).min(m);
+                    let cur_rows = ed - st;
+                    let blk_slice = &mut block[..cur_rows * n_out];
+
+                    if full_sample_fast {
+                        blk_slice
+                            .par_chunks_mut(n_out)
+                            .enumerate()
+                            .for_each(|(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let mean_g = 2.0_f32 * row_maf_vec[row_idx];
+                                let value_lut = if row_flip_vec[row_idx] {
+                                    [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
+                                } else {
+                                    [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
+                                };
+                                decode_row_centered_full_lut(
+                                    row,
+                                    n_samples,
+                                    &byte_lut.code4,
+                                    &value_lut,
+                                    out_row,
+                                );
+                            });
+                    } else {
+                        blk_slice
+                            .par_chunks_mut(n_out)
+                            .enumerate()
+                            .for_each(|(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[row_idx];
+                                let mean_g = 2.0_f32 * row_maf_vec[row_idx];
+                                for (j, &sid) in sample_idx.iter().enumerate() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g,
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    out_row[j] = gv;
+                                }
+                            });
+                    }
+
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    {
+                        let out_blk = &mut out[st..ed];
+                        let tmp_blk = &mut tmp[..cur_rows];
+                        unsafe {
+                            // `blk_slice` is row-major (cur_rows, n_out), layout-equivalent to
+                            // col-major (n_out, cur_rows). We need:
+                            // out_blk = blk_slice @ alpha
+                            // -> out_blk(col-major cur_rows x 1) = A^T (cur_rows x n_out) * alpha (n_out x 1)
+                            cblas_sgemm(
+                                CBLAS_COL_MAJOR,
+                                CBLAS_TRANS,
+                                CBLAS_NO_TRANS,
+                                cur_rows as CblasInt,
+                                1 as CblasInt,
+                                n_out as CblasInt,
+                                1.0,
+                                blk_slice.as_ptr(),
+                                n_out as CblasInt,
+                                alpha_f32.as_ptr(),
+                                n_out as CblasInt,
+                                0.0,
+                                tmp_blk.as_mut_ptr(),
+                                cur_rows as CblasInt,
+                            );
+                        }
+                        for i in 0..cur_rows {
+                            out_blk[i] = tmp_blk[i] as f64;
+                        }
+                    }
+
+                    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                    {
+                        let out_blk = &mut out[st..ed];
+                        for r in 0..cur_rows {
+                            let mut acc = 0.0_f64;
+                            let row = &blk_slice[r * n_out..(r + 1) * n_out];
+                            for j in 0..n_out {
+                                acc += row[j] as f64 * alpha_vec[j];
+                            }
+                            out_blk[r] = acc;
+                        }
+                    }
+
+                    tick += cur_rows;
+                    if tick >= row_step.saturating_mul(64).max(1) {
+                        _check_ctrlc()?;
+                        tick = 0;
+                    }
+                }
+                Ok(())
+            };
+
+            if let Some(tp) = &pool {
+                tp.install(run)?;
+            } else {
+                run()?;
+            }
+            Ok(out)
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let out_arr = PyArray1::from_owned_array(py, Array1::from_vec(out)).into_bound();
+    Ok(out_arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    method=1,
+    block_cols=2048,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_packed_f32<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if method != 1 && method != 2 {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+        )));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let varsum_full = if method == 1 && full_sample_fast {
+        let mut acc = 0.0_f64;
+        for &maf in row_maf_vec.iter() {
+            let p = maf as f64;
+            let v = 2.0_f64 * p * (1.0_f64 - p);
+            if v.is_finite() && v > 0.0 {
+                acc += v;
+            }
+        }
+        if !(acc.is_finite() && acc > 0.0) {
+            return Err(PyRuntimeError::new_err(
+                "invalid centered GRM denominator: sum(2p(1-p)) <= 0",
+            ));
+        }
+        acc
+    } else {
+        0.0_f64
+    };
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let row_step = block_cols.max(1).min(m.max(1));
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
+        // Default ON: avoids observed diagonal drift for very large SNP blocks.
+        .unwrap_or(true);
+
+    let grm_vec = py
+        .detach(move || -> Result<Vec<f32>, String> {
+            let mut grm = vec![0.0_f32; n * n];
+            let mut block = vec![0.0_f32; row_step * n];
+            let mut varsum_acc = varsum_full;
+            let eps = 1e-12_f32;
+            let byte_lut = packed_byte_lut();
+
+            for row_start in (0..m).step_by(row_step) {
+                let row_end = (row_start + row_step).min(m);
+                let cur_rows = row_end - row_start;
+                let cur_block = &mut block[..cur_rows * n];
+                let mut block_varsum = vec![0.0_f64; cur_rows];
+
+                let mut decode_run = || {
+                    cur_block
+                        .par_chunks_mut(n)
+                        .zip(block_varsum.par_iter_mut())
+                        .enumerate()
+                        .for_each(|(off, (out_row, row_varsum_dst))| {
+                            let idx = row_start + off;
+                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                            let flip = row_flip_vec[idx];
+                            let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                            let default_mean_g = 2.0_f32 * p;
+                            if full_sample_fast {
+                                let mean_g = default_mean_g;
+                                let var = 2.0_f32 * p * (1.0_f32 - p);
+                                let std_scale = if method == 2 {
+                                    if var > eps {
+                                        1.0_f32 / var.sqrt()
+                                    } else {
+                                        0.0_f32
+                                    }
+                                } else {
+                                    1.0_f32
+                                };
+                                let value_lut: [f32; 4] = if flip {
+                                    [
+                                        (2.0_f32 - mean_g) * std_scale,
+                                        0.0_f32, // missing -> mean imputation => centered 0
+                                        (1.0_f32 - mean_g) * std_scale,
+                                        (0.0_f32 - mean_g) * std_scale,
+                                    ]
+                                } else {
+                                    [
+                                        (0.0_f32 - mean_g) * std_scale,
+                                        0.0_f32, // missing -> mean imputation => centered 0
+                                        (1.0_f32 - mean_g) * std_scale,
+                                        (2.0_f32 - mean_g) * std_scale,
+                                    ]
+                                };
+                                decode_row_centered_full_lut(
+                                    row,
+                                    n_samples,
+                                    &byte_lut.code4,
+                                    &value_lut,
+                                    out_row,
+                                );
+                            } else {
+                                let mut obs_n: usize = 0;
+                                let mut obs_sum = 0.0_f64;
+                                let mut obs_sq = 0.0_f64;
+                                for &sid in sample_idx.iter() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let Some(mut gv) = decode_plink_bed_hardcall(code) else {
+                                        continue;
+                                    };
+                                    if flip {
+                                        gv = 2.0_f64 - gv;
+                                    }
+                                    obs_n += 1;
+                                    obs_sum += gv;
+                                    obs_sq += gv * gv;
+                                }
+
+                                let (mean_g, var_centered, var_standardized) = if obs_n > 0 {
+                                    let mean = obs_sum / obs_n as f64;
+                                    let p_sub = (0.5_f64 * mean).clamp(0.0, 1.0);
+                                    let v_std = (2.0_f64 * p_sub * (1.0_f64 - p_sub)).max(0.0);
+                                    let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
+                                    // Match subset semantics with mean-imputed rows:
+                                    // missing entries are imputed to row mean, so they contribute
+                                    // zero centered variance across all selected samples.
+                                    let v_center = (ss / n as f64).max(0.0);
+                                    (mean as f32, v_center as f32, v_std as f32)
+                                } else {
+                                    (default_mean_g, 0.0_f32, 0.0_f32)
+                                };
+                                if method == 1 {
+                                    *row_varsum_dst = var_centered as f64;
+                                }
+                                let std_scale = if method == 2 {
+                                    if var_standardized > eps {
+                                        1.0_f32 / var_standardized.sqrt()
+                                    } else {
+                                        0.0_f32
+                                    }
+                                } else {
+                                    1.0_f32
+                                };
+                                for (j, &sid) in sample_idx.iter().enumerate() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g, // mean-impute missing within selected samples
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    out_row[j] = (gv - mean_g) * std_scale;
+                                }
+                            }
+                        });
+                };
+
+                if let Some(tp) = &pool {
+                    tp.install(&mut decode_run);
+                } else {
+                    decode_run();
+                }
+
+                grm_rankk_update(
+                    &mut grm,
+                    cur_block,
+                    cur_rows,
+                    n,
+                    cblas_copy_rhs,
+                    cblas_beta_zero_accum,
+                )?;
+                if method == 1 && !full_sample_fast {
+                    varsum_acc += block_varsum.iter().sum::<f64>();
+                }
+
+                let done = row_end;
+                if (done % notify_step == 0) || (done == m) {
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done, m))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+
+            let scale = if method == 1 {
+                if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+                    return Err("invalid centered GRM denominator in subset path".to_string());
+                }
+                varsum_acc as f32
+            } else {
+                m as f32
+            };
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err("invalid GRM scale factor".to_string());
+            }
+            let inv_scale = 1.0_f32 / scale;
+            for i in 0..n {
+                let ii = i * n + i;
+                grm[ii] *= inv_scale;
+                for j in 0..i {
+                    let idx_ij = i * n + j;
+                    let idx_ji = j * n + i;
+                    let v = 0.5_f32 * (grm[idx_ij] + grm[idx_ji]) * inv_scale;
+                    grm[idx_ij] = v;
+                    grm[idx_ji] = v;
+                }
+            }
+            Ok(grm)
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let grm_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), grm_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok(grm_arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    method=1,
+    block_cols=2048,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_packed_f32_with_stats<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+)> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if method != 1 && method != 2 {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+        )));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let varsum_full = if method == 1 && full_sample_fast {
+        let mut acc = 0.0_f64;
+        for &maf in row_maf_vec.iter() {
+            let p = maf as f64;
+            let v = 2.0_f64 * p * (1.0_f64 - p);
+            if v.is_finite() && v > 0.0 {
+                acc += v;
+            }
+        }
+        if !(acc.is_finite() && acc > 0.0) {
+            return Err(PyRuntimeError::new_err(
+                "invalid centered GRM denominator: sum(2p(1-p)) <= 0",
+            ));
+        }
+        acc
+    } else {
+        0.0_f64
+    };
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let row_step = block_cols.max(1).min(m.max(1));
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
+        // Default ON: avoids observed diagonal drift for very large SNP blocks.
+        .unwrap_or(true);
+
+    let (grm_vec, row_sum_vec, varsum_ret) = py
+        .detach(move || -> Result<(Vec<f32>, Vec<f64>, f64), String> {
+            let mut grm = vec![0.0_f32; n * n];
+            let mut block = vec![0.0_f32; row_step * n];
+            let mut varsum_acc = varsum_full;
+            let eps = 1e-12_f32;
+            let byte_lut = packed_byte_lut();
+            let mut row_sum_all = vec![0.0_f64; m];
+
+            for row_start in (0..m).step_by(row_step) {
+                let row_end = (row_start + row_step).min(m);
+                let cur_rows = row_end - row_start;
+                let cur_block = &mut block[..cur_rows * n];
+                let mut block_varsum = vec![0.0_f64; cur_rows];
+                let mut block_rowsum = vec![0.0_f64; cur_rows];
+
+                let mut decode_run = || {
+                    if full_sample_fast {
+                        cur_block
+                            .par_chunks_mut(n)
+                            .zip(block_varsum.par_iter_mut())
+                            .zip(block_rowsum.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                                let idx = row_start + off;
+                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[idx];
+                                let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                                let mean_g = 2.0_f32 * p;
+                                let var = 2.0_f32 * p * (1.0_f32 - p);
+                                let std_scale = if method == 2 {
+                                    if var > eps {
+                                        1.0_f32 / var.sqrt()
+                                    } else {
+                                        0.0_f32
+                                    }
+                                } else {
+                                    1.0_f32
+                                };
+                                let value_lut: [f32; 4] = if flip {
+                                    [
+                                        (2.0_f32 - mean_g) * std_scale,
+                                        0.0_f32, // missing -> mean imputation => centered 0
+                                        (1.0_f32 - mean_g) * std_scale,
+                                        (0.0_f32 - mean_g) * std_scale,
+                                    ]
+                                } else {
+                                    [
+                                        (0.0_f32 - mean_g) * std_scale,
+                                        0.0_f32, // missing -> mean imputation => centered 0
+                                        (1.0_f32 - mean_g) * std_scale,
+                                        (2.0_f32 - mean_g) * std_scale,
+                                    ]
+                                };
+                                decode_row_centered_full_lut(
+                                    row,
+                                    n_samples,
+                                    &byte_lut.code4,
+                                    &value_lut,
+                                    out_row,
+                                );
+                                if method == 1 {
+                                    *row_varsum_dst = var as f64;
+                                }
+                                *row_sum_dst = (mean_g as f64) * (n as f64);
+                            });
+                    } else {
+                        cur_block
+                            .par_chunks_mut(n)
+                            .zip(block_varsum.par_iter_mut())
+                            .zip(block_rowsum.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                                let idx = row_start + off;
+                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[idx];
+                                let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                                let default_mean_g = 2.0_f32 * p;
+
+                                let mut obs_n: usize = 0;
+                                let mut obs_sum = 0.0_f64;
+                                let mut obs_sq = 0.0_f64;
+                                for &sid in sample_idx.iter() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let Some(mut gv) = decode_plink_bed_hardcall(code) else {
+                                        continue;
+                                    };
+                                    if flip {
+                                        gv = 2.0_f64 - gv;
+                                    }
+                                    obs_n += 1;
+                                    obs_sum += gv;
+                                    obs_sq += gv * gv;
+                                }
+
+                                let (mean_g, var_centered, var_standardized) = if obs_n > 0 {
+                                    let mean = obs_sum / obs_n as f64;
+                                    let p_sub = (0.5_f64 * mean).clamp(0.0, 1.0);
+                                    let v_std = (2.0_f64 * p_sub * (1.0_f64 - p_sub)).max(0.0);
+                                    let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
+                                    let v_center = (ss / n as f64).max(0.0);
+                                    (mean as f32, v_center as f32, v_std as f32)
+                                } else {
+                                    (default_mean_g, 0.0_f32, 0.0_f32)
+                                };
+
+                                if method == 1 {
+                                    *row_varsum_dst = var_centered as f64;
+                                }
+                                *row_sum_dst = (mean_g as f64) * (n as f64);
+
+                                let std_scale = if method == 2 {
+                                    if var_standardized > eps {
+                                        1.0_f32 / var_standardized.sqrt()
+                                    } else {
+                                        0.0_f32
+                                    }
+                                } else {
+                                    1.0_f32
+                                };
+                                for (j, &sid) in sample_idx.iter().enumerate() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g, // mean-impute missing within selected samples
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    out_row[j] = (gv - mean_g) * std_scale;
+                                }
+                            });
+                    }
+                };
+
+                if let Some(tp) = &pool {
+                    tp.install(&mut decode_run);
+                } else {
+                    decode_run();
+                }
+
+                grm_rankk_update(
+                    &mut grm,
+                    cur_block,
+                    cur_rows,
+                    n,
+                    cblas_copy_rhs,
+                    cblas_beta_zero_accum,
+                )?;
+                if method == 1 && !full_sample_fast {
+                    varsum_acc += block_varsum.iter().sum::<f64>();
+                }
+                row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
+
+                let done = row_end;
+                if (done % notify_step == 0) || (done == m) {
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done, m))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+
+            let scale = if method == 1 {
+                if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+                    return Err("invalid centered GRM denominator in subset path".to_string());
+                }
+                varsum_acc as f32
+            } else {
+                m as f32
+            };
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err("invalid GRM scale factor".to_string());
+            }
+            let inv_scale = 1.0_f32 / scale;
+            for i in 0..n {
+                let ii = i * n + i;
+                grm[ii] *= inv_scale;
+                for j in 0..i {
+                    let idx_ij = i * n + j;
+                    let idx_ji = j * n + i;
+                    let v = 0.5_f32 * (grm[idx_ij] + grm[idx_ji]) * inv_scale;
+                    grm[idx_ij] = v;
+                    grm[idx_ji] = v;
+                }
+            }
+            let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+            Ok((grm, row_sum_all, varsum_ret))
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let grm_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), grm_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let row_sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_sum_vec)).into_bound();
+    Ok((grm_arr, row_sum_arr, varsum_ret))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     y,
     x,
     ixx,
@@ -632,7 +2076,9 @@ pub fn glmf32_packed<'py>(
     let packed_arr = packed.as_array();
 
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     let m = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
@@ -1220,7 +2666,9 @@ pub fn farmcpu_rem_packed(
 
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     let m = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
@@ -1337,7 +2785,9 @@ pub fn farmcpu_super_packed<'py>(
 
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     let m = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
@@ -3253,13 +4703,7 @@ fn rotate_snp_block_with_ut_parallel(
             let rows_here = out_chunk.len() / n;
             let a_start = row_start * n;
             let a_end = a_start + rows_here * n;
-            rotate_snp_block_with_ut(
-                &snp_block[a_start..a_end],
-                rows_here,
-                n,
-                u_t,
-                out_chunk,
-            );
+            rotate_snp_block_with_ut(&snp_block[a_start..a_end], rows_here, n, u_t, out_chunk);
         });
 }
 
@@ -3298,7 +4742,9 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
         return Err(PyRuntimeError::new_err("snp_chunk must be (m_chunk, n)"));
     }
     if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
-        return Err(PyRuntimeError::new_err("u_t must be (n, n) and row-major U^T"));
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
     }
     if low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -3486,8 +4932,7 @@ fn dot_loop_unrolled(a: &[f64], b: &[f64]) -> f64 {
 #[target_feature(enable = "avx2")]
 unsafe fn dot_loop_avx2(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::x86_64::{
-        __m256d, _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_setzero_pd,
-        _mm256_storeu_pd,
+        __m256d, _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_setzero_pd, _mm256_storeu_pd,
     };
 
     debug_assert_eq!(a.len(), b.len());
@@ -3512,9 +4957,7 @@ unsafe fn dot_loop_avx2(a: &[f64], b: &[f64]) -> f64 {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn dot_loop_neon(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::aarch64::{
-        vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64,
-    };
+    use std::arch::aarch64::{vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64};
 
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
@@ -3821,7 +5264,9 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
         return Err(PyRuntimeError::new_err("snp_chunk must be (m, n)"));
     }
     if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
-        return Err(PyRuntimeError::new_err("u_t must be (n, n) and row-major U^T"));
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
     }
     if n <= p_cov + 1 {
         return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
@@ -4704,7 +6149,9 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     let m = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
@@ -4891,20 +6338,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
     let (best_log10, _best_cost) = brent_minimize(
         |x0| match fastlmm_null_eval_packed(
-            x0,
-            tau,
-            &s_vec,
-            &u1tx,
-            &u2tx,
-            &u1ty,
-            &u2ty,
-            &u2_xtx,
-            &u2_xty,
-            k,
-            n,
-            p,
-            c_reml,
-            c_ml,
+            x0, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml, c_ml,
         ) {
             Some(v) if v.reml.is_finite() => -v.reml,
             _ => 1e100,
@@ -4916,19 +6350,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     );
 
     let best = fastlmm_null_eval_packed(
-        best_log10,
-        tau,
-        &s_vec,
-        &u1tx,
-        &u2tx,
-        &u1ty,
-        &u2ty,
-        &u2_xtx,
-        &u2_xty,
-        k,
-        n,
-        p,
-        c_reml,
+        best_log10, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
         c_ml,
     )
     .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at optimum"))?;
@@ -4969,194 +6391,189 @@ pub fn fastlmm_assoc_packed_f32<'py>(
             {
                 let out_blk = &mut out_slice[row_start * out_cols..row_end * out_cols];
                 let mut run_block = || {
-                    out_blk
-                        .par_chunks_mut(out_cols)
-                        .enumerate()
-                        .for_each_init(
-                            || PackedFastlmmScratch::new(n, k, p),
-                            |scr, (off, out_row)| {
-                                let idx = row_start + off;
-                                let row =
-                                    &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                let flip = row_flip[idx];
-                                let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+                    out_blk.par_chunks_mut(out_cols).enumerate().for_each_init(
+                        || PackedFastlmmScratch::new(n, k, p),
+                        |scr, (off, out_row)| {
+                            let idx = row_start + off;
+                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                            let flip = row_flip[idx];
+                            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
 
-                                let mut sum_g = 0.0_f64;
-                                for (j, &sid) in sample_idx.iter().enumerate() {
-                                    let b = row[sid >> 2];
-                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let mut gv = match code {
-                                        0b00 => 0.0_f64,
-                                        0b10 => 1.0_f64,
-                                        0b11 => 2.0_f64,
-                                        _ => mean_g,
-                                    };
-                                    if flip && code != 0b01 {
-                                        gv = 2.0_f64 - gv;
-                                    }
-                                    gv = gm.apply(gv);
-                                    scr.g[j] = gv;
-                                    sum_g += gv;
-                                }
-                                let g_mean = sum_g / (n as f64);
-                                for j in 0..n {
-                                    scr.g[j] -= g_mean;
-                                }
-
-                                scr.u1.fill(0.0);
-                                for i in 0..n {
-                                    let gi = scr.g[i];
-                                    let ub = i * k;
-                                    for r in 0..k {
-                                        scr.u1[r] += gi * (u_sub[ub + r] as f64);
-                                    }
-                                }
-
-                                for i in 0..n {
-                                    let ub = i * k;
-                                    let mut proj = 0.0_f64;
-                                    for r in 0..k {
-                                        proj += scr.u1[r] * (u_sub[ub + r] as f64);
-                                    }
-                                    scr.u2[i] = scr.g[i] - proj;
-                                }
-
-                                scr.u1_xtsnp.fill(0.0);
-                                scr.u2_xtsnp.fill(0.0);
-
-                                let mut u1_snp_snp = 0.0_f64;
-                                let mut u1_snp_ty = 0.0_f64;
-                                for i in 0..k {
-                                    let gi = scr.u1[i];
-                                    let vi = v1_inv[i];
-                                    u1_snp_snp += vi * gi * gi;
-                                    u1_snp_ty += vi * gi * u1ty[i];
-                                    let base = i * p;
-                                    for r in 0..p {
-                                        scr.u1_xtsnp[r] += vi * u1tx[base + r] * gi;
-                                    }
-                                }
-
-                                let mut u2_snp_snp = 0.0_f64;
-                                let mut u2_snp_ty = 0.0_f64;
-                                for i in 0..n {
-                                    let gi = scr.u2[i];
-                                    u2_snp_snp += gi * gi;
-                                    u2_snp_ty += gi * u2ty[i];
-                                    let base = i * p;
-                                    for r in 0..p {
-                                        scr.u2_xtsnp[r] += u2tx[base + r] * gi;
-                                    }
-                                }
-
-                                let dim = p + 1;
-                                scr.xtv_inv_x.fill(0.0);
-                                scr.xtv_inv_y.fill(0.0);
-                                for r in 0..p {
-                                    for c in 0..p {
-                                        scr.xtv_inv_x[r * dim + c] = base_a[r * p + c];
-                                    }
-                                    scr.xtv_inv_y[r] = base_b[r];
-                                }
-                                for r in 0..p {
-                                    let cross = scr.u1_xtsnp[r] + v2_inv * scr.u2_xtsnp[r];
-                                    scr.xtv_inv_x[p * dim + r] = cross;
-                                    scr.xtv_inv_x[r * dim + p] = cross;
-                                }
-                                scr.xtv_inv_x[p * dim + p] = u1_snp_snp + v2_inv * u2_snp_snp;
-                                scr.xtv_inv_y[p] = u1_snp_ty + v2_inv * u2_snp_ty;
-
-                                let ridge = 1e-6_f64;
-                                for r in 0..dim {
-                                    scr.xtv_inv_x[r * dim + r] += ridge;
-                                }
-
-                                if cholesky_inplace(&mut scr.xtv_inv_x, dim).is_none() {
-                                    out_row[0] = f64::NAN;
-                                    out_row[1] = f64::NAN;
-                                    out_row[2] = f64::NAN;
-                                    out_row[3] = 1.0;
-                                    return;
-                                }
-                                cholesky_solve_into(
-                                    &scr.xtv_inv_x,
-                                    dim,
-                                    &scr.xtv_inv_y,
-                                    &mut scr.beta,
-                                );
-
-                                let mut r1_sum = 0.0_f64;
-                                for i in 0..k {
-                                    let mut xb = 0.0_f64;
-                                    let base = i * p;
-                                    for r in 0..p {
-                                        xb += u1tx[base + r] * scr.beta[r];
-                                    }
-                                    xb += scr.u1[i] * scr.beta[p];
-                                    let ri = u1ty[i] - xb;
-                                    r1_sum += v1_inv[i] * ri * ri;
-                                }
-
-                                let mut r2_sum = 0.0_f64;
-                                for i in 0..n {
-                                    let mut xb = 0.0_f64;
-                                    let base = i * p;
-                                    for r in 0..p {
-                                        xb += u2tx[base + r] * scr.beta[r];
-                                    }
-                                    xb += scr.u2[i] * scr.beta[p];
-                                    let ri = u2ty[i] - xb;
-                                    r2_sum += ri * ri;
-                                }
-
-                                let rtv_invr = r1_sum + v2_inv * r2_sum;
-                                if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
-                                    out_row[0] = scr.beta[p];
-                                    out_row[1] = f64::NAN;
-                                    out_row[2] = f64::NAN;
-                                    out_row[3] = 1.0;
-                                    return;
-                                }
-
-                                let sigma2 = rtv_invr / df_f;
-                                if !sigma2.is_finite() || sigma2 <= 0.0 {
-                                    out_row[0] = scr.beta[p];
-                                    out_row[1] = f64::NAN;
-                                    out_row[2] = f64::NAN;
-                                    out_row[3] = 1.0;
-                                    return;
-                                }
-
-                                scr.rhs.fill(0.0);
-                                scr.rhs[p] = 1.0;
-                                cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.rhs, &mut scr.work);
-                                let var_beta = sigma2 * scr.work[p];
-                                let se = if var_beta.is_finite() && var_beta > 0.0 {
-                                    var_beta.sqrt()
-                                } else {
-                                    f64::NAN
+                            let mut sum_g = 0.0_f64;
+                            for (j, &sid) in sample_idx.iter().enumerate() {
+                                let b = row[sid >> 2];
+                                let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                let mut gv = match code {
+                                    0b00 => 0.0_f64,
+                                    0b10 => 1.0_f64,
+                                    0b11 => 2.0_f64,
+                                    _ => mean_g,
                                 };
-                                let beta = scr.beta[p];
-                                let pval = if beta.is_finite() && se.is_finite() && se > 0.0 {
-                                    let z = (beta / se).abs();
-                                    (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
-                                } else {
-                                    1.0
-                                };
-
-                                let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
-                                let mut stat = if ml.is_finite() { 2.0 * (ml - ml0) } else { 0.0 };
-                                if !stat.is_finite() || stat < 0.0 {
-                                    stat = 0.0;
+                                if flip && code != 0b01 {
+                                    gv = 2.0_f64 - gv;
                                 }
-                                let plrt = chi2_sf_df1(stat);
+                                gv = gm.apply(gv);
+                                scr.g[j] = gv;
+                                sum_g += gv;
+                            }
+                            let g_mean = sum_g / (n as f64);
+                            for j in 0..n {
+                                scr.g[j] -= g_mean;
+                            }
 
-                                out_row[0] = beta;
-                                out_row[1] = se;
-                                out_row[2] = pval;
-                                out_row[3] = plrt;
-                            },
-                        );
+                            scr.u1.fill(0.0);
+                            for i in 0..n {
+                                let gi = scr.g[i];
+                                let ub = i * k;
+                                for r in 0..k {
+                                    scr.u1[r] += gi * (u_sub[ub + r] as f64);
+                                }
+                            }
+
+                            for i in 0..n {
+                                let ub = i * k;
+                                let mut proj = 0.0_f64;
+                                for r in 0..k {
+                                    proj += scr.u1[r] * (u_sub[ub + r] as f64);
+                                }
+                                scr.u2[i] = scr.g[i] - proj;
+                            }
+
+                            scr.u1_xtsnp.fill(0.0);
+                            scr.u2_xtsnp.fill(0.0);
+
+                            let mut u1_snp_snp = 0.0_f64;
+                            let mut u1_snp_ty = 0.0_f64;
+                            for i in 0..k {
+                                let gi = scr.u1[i];
+                                let vi = v1_inv[i];
+                                u1_snp_snp += vi * gi * gi;
+                                u1_snp_ty += vi * gi * u1ty[i];
+                                let base = i * p;
+                                for r in 0..p {
+                                    scr.u1_xtsnp[r] += vi * u1tx[base + r] * gi;
+                                }
+                            }
+
+                            let mut u2_snp_snp = 0.0_f64;
+                            let mut u2_snp_ty = 0.0_f64;
+                            for i in 0..n {
+                                let gi = scr.u2[i];
+                                u2_snp_snp += gi * gi;
+                                u2_snp_ty += gi * u2ty[i];
+                                let base = i * p;
+                                for r in 0..p {
+                                    scr.u2_xtsnp[r] += u2tx[base + r] * gi;
+                                }
+                            }
+
+                            let dim = p + 1;
+                            scr.xtv_inv_x.fill(0.0);
+                            scr.xtv_inv_y.fill(0.0);
+                            for r in 0..p {
+                                for c in 0..p {
+                                    scr.xtv_inv_x[r * dim + c] = base_a[r * p + c];
+                                }
+                                scr.xtv_inv_y[r] = base_b[r];
+                            }
+                            for r in 0..p {
+                                let cross = scr.u1_xtsnp[r] + v2_inv * scr.u2_xtsnp[r];
+                                scr.xtv_inv_x[p * dim + r] = cross;
+                                scr.xtv_inv_x[r * dim + p] = cross;
+                            }
+                            scr.xtv_inv_x[p * dim + p] = u1_snp_snp + v2_inv * u2_snp_snp;
+                            scr.xtv_inv_y[p] = u1_snp_ty + v2_inv * u2_snp_ty;
+
+                            let ridge = 1e-6_f64;
+                            for r in 0..dim {
+                                scr.xtv_inv_x[r * dim + r] += ridge;
+                            }
+
+                            if cholesky_inplace(&mut scr.xtv_inv_x, dim).is_none() {
+                                out_row[0] = f64::NAN;
+                                out_row[1] = f64::NAN;
+                                out_row[2] = f64::NAN;
+                                out_row[3] = 1.0;
+                                return;
+                            }
+                            cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.xtv_inv_y, &mut scr.beta);
+
+                            let mut r1_sum = 0.0_f64;
+                            for i in 0..k {
+                                let mut xb = 0.0_f64;
+                                let base = i * p;
+                                for r in 0..p {
+                                    xb += u1tx[base + r] * scr.beta[r];
+                                }
+                                xb += scr.u1[i] * scr.beta[p];
+                                let ri = u1ty[i] - xb;
+                                r1_sum += v1_inv[i] * ri * ri;
+                            }
+
+                            let mut r2_sum = 0.0_f64;
+                            for i in 0..n {
+                                let mut xb = 0.0_f64;
+                                let base = i * p;
+                                for r in 0..p {
+                                    xb += u2tx[base + r] * scr.beta[r];
+                                }
+                                xb += scr.u2[i] * scr.beta[p];
+                                let ri = u2ty[i] - xb;
+                                r2_sum += ri * ri;
+                            }
+
+                            let rtv_invr = r1_sum + v2_inv * r2_sum;
+                            if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                                out_row[0] = scr.beta[p];
+                                out_row[1] = f64::NAN;
+                                out_row[2] = f64::NAN;
+                                out_row[3] = 1.0;
+                                return;
+                            }
+
+                            let sigma2 = rtv_invr / df_f;
+                            if !sigma2.is_finite() || sigma2 <= 0.0 {
+                                out_row[0] = scr.beta[p];
+                                out_row[1] = f64::NAN;
+                                out_row[2] = f64::NAN;
+                                out_row[3] = 1.0;
+                                return;
+                            }
+
+                            scr.rhs.fill(0.0);
+                            scr.rhs[p] = 1.0;
+                            cholesky_solve_into(&scr.xtv_inv_x, dim, &scr.rhs, &mut scr.work);
+                            let var_beta = sigma2 * scr.work[p];
+                            let se = if var_beta.is_finite() && var_beta > 0.0 {
+                                var_beta.sqrt()
+                            } else {
+                                f64::NAN
+                            };
+                            let beta = scr.beta[p];
+                            let pval = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                                let z = (beta / se).abs();
+                                (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                            } else {
+                                1.0
+                            };
+
+                            let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
+                            let mut stat = if ml.is_finite() {
+                                2.0 * (ml - ml0)
+                            } else {
+                                0.0
+                            };
+                            if !stat.is_finite() || stat < 0.0 {
+                                stat = 0.0;
+                            }
+                            let plrt = chi2_sf_df1(stat);
+
+                            out_row[0] = beta;
+                            out_row[1] = se;
+                            out_row[2] = pval;
+                            out_row[3] = plrt;
+                        },
+                    );
                 };
                 if let Some(tp) = &pool {
                     tp.install(run_block);

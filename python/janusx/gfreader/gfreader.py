@@ -1160,7 +1160,7 @@ def load_genotype_chunks(
     It works for:
       - PLINK BED/BIM/FAM (SNP-major, on-disk)
       - VCF / VCF.GZ (converted once to cached PLINK BED/BIM/FAM: ~prefix.*)
-      - HMP / HMP.GZ (streamed directly from HapMap text)
+      - HMP / HMP.GZ (prefer cached PLINK BED/BIM/FAM; fallback direct HMP streaming)
       - Numeric TXT matrix (converted once to cached NPY: ~prefix.npy)
 
     Parameters
@@ -1169,7 +1169,7 @@ def load_genotype_chunks(
         Genotype source.
         - PLINK: prefix without extension, e.g. "data/QC"
         - VCF  : full path, e.g. "data/QC.vcf.gz" (cached as "data/~QC.*")
-        - HMP  : full path, e.g. "data/QC.hmp.gz"
+        - HMP  : full path, e.g. "data/QC.hmp.gz" (prefer cached as "data/~QC.*")
         - TXT  : matrix path, e.g. "data/matrix.txt" (cached as "data/~matrix.npy")
 
     chunk_size : int
@@ -1217,8 +1217,9 @@ def load_genotype_chunks(
     -----
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
-    - VCF/TXT caching itself does not perform maf/missing filtering or imputation.
-      Filters are applied during chunk streaming (Rust for PLINK/VCF, Python for TXT/NPY).
+    - VCF/HMP/TXT caching itself does not perform maf/missing filtering or imputation.
+      Filters are applied during chunk streaming (Rust for PLINK/VCF/HMP-cached path,
+      Python for TXT/NPY and HMP direct fallback path).
     - VCF cache uses parameterized filenames:
       `~prefix.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam`
       with mtime-based stale detection and lock-based concurrent build safety.
@@ -1322,6 +1323,67 @@ def load_genotype_chunks(
     if kind == "hmp":
         if src_path is None:
             raise ValueError("HMP source path not found.")
+
+        # Prefer BED cache for HMP so downstream workloads (e.g. GWAS GRM) can
+        # reuse packed-BED kernels. Keep a direct-HMP fallback for compatibility.
+        try:
+            cache_prefix = _ensure_plink_cache_for_cli_source(
+                prefix,
+                src_path,
+                source_label="HMP",
+                snps_only=bool(snps_only),
+            )
+
+            def _iter_cached_hmp_bed():
+                yield from bed_chunk_reader(
+                    cache_prefix,
+                    chunk_size=chunk_size,
+                    maf=maf,
+                    missing_rate=missing_rate,
+                    impute=impute,
+                    model=model,
+                    het=het,
+                    snp_range=snp_range,
+                    snp_indices=snp_indices,
+                    bim_range=bim_range,
+                    snp_sites=snp_sites,
+                    sample_ids=sample_ids,
+                    sample_indices=sample_indices,
+                    mmap_window_mb=mmap_window_mb,
+                )
+
+            try:
+                yield from _iter_cached_hmp_bed()
+            except Exception as ex:
+                if not _is_likely_broken_plink_cache_error(ex):
+                    raise
+                warnings.warn(
+                    (
+                        f"Detected broken PLINK cache for '{prefix}': {ex}. "
+                        "Removing cache files and rebuilding."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _remove_plink_cache_files(cache_prefix)
+                cache_prefix = _ensure_plink_cache_for_cli_source(
+                    prefix,
+                    src_path,
+                    source_label="HMP",
+                    snps_only=bool(snps_only),
+                )
+                yield from _iter_cached_hmp_bed()
+            return
+        except Exception as ex:
+            warnings.warn(
+                (
+                    "HMP->PLINK cache path is unavailable; "
+                    f"falling back to direct HMP streaming. reason={ex}"
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         mode_flags = int(snp_range is not None) + int(snp_indices is not None) + int(bim_range is not None) + int(snp_sites is not None)
         if mode_flags > 1:
             raise ValueError(
@@ -1476,6 +1538,8 @@ def inspect_genotype_file(
         Number of SNPs in the file.
         - For PLINK BED: exact count from BIM.
         - For VCF     : count from cached PLINK BIM after conversion.
+        - For HMP     : count from cached PLINK BIM when cache path is available;
+                        otherwise direct HMP row count.
         - For TXT     : matrix row count from cached NPY metadata.
 
     Notes
@@ -1483,6 +1547,7 @@ def inspect_genotype_file(
     - sample_ids correspond to:
         * .fam IID column (PLINK)
         * VCF #CHROM header columns (after PLINK cache is created)
+        * HMP sample columns (after PLINK cache is created, or direct HMP reader fallback)
         * TXT header row tokens
     - sample_ids do NOT contain SNP / site information.
     """
@@ -1528,17 +1593,28 @@ def inspect_genotype_file(
     if kind == "hmp":
         if src_path is None:
             raise ValueError("HMP source path not found.")
-        reader = HmpChunkReader(
-            src_path,
-            0.0,
-            1.0,
-            False,
-            None,
-            None,
-            "add",
-            float(het),
-        )
-        return reader.sample_ids, int(count_hmp_snps(src_path))
+        try:
+            cache_prefix = _ensure_plink_cache_for_cli_source(
+                prefix,
+                src_path,
+                source_label="HMP",
+                snps_only=bool(snps_only),
+            )
+            reader = BedChunkReader(cache_prefix, 0.0, 1.0)
+            return reader.sample_ids, reader.n_snps
+        except Exception:
+            # Compatibility fallback: keep direct HMP inspect available.
+            reader = HmpChunkReader(
+                src_path,
+                0.0,
+                1.0,
+                False,
+                None,
+                None,
+                "add",
+                float(het),
+            )
+            return reader.sample_ids, int(count_hmp_snps(src_path))
 
     if kind in ("txt", "npy"):
         txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)

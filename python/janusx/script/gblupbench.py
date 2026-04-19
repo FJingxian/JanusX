@@ -1560,6 +1560,7 @@ def _prepare_dataset(
     args: argparse.Namespace,
     *,
     bench_dir: Path,
+    engines: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     gfile, _auto_prefix = _determine_genotype_source_from_args(args)
     gfile = str(gfile)
@@ -1568,27 +1569,6 @@ def _prepare_dataset(
     ph_map = {str(k): float(v) for k, v in zip(ph["Taxa"].astype(str), ph["PHENO"].astype(float))}
 
     sample_ids, _n_sites = inspect_genotype_file(gfile)
-    chunks = load_genotype_chunks(
-        gfile,
-        chunk_size=int(args.chunksize),
-        maf=float(args.maf),
-        missing_rate=float(args.geno),
-        impute=True,
-    )
-    blocks: list[np.ndarray] = []
-    sites_all: list[Any] = []
-    for geno_chunk, sites in chunks:
-        arr = np.asarray(geno_chunk, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[0] == 0:
-            continue
-        blocks.append(arr)
-        sites_all.extend(list(sites))
-    if len(blocks) == 0:
-        raise ValueError(
-            "No SNPs left after Rust-side filtering. "
-            "Please relax --maf/--geno thresholds."
-        )
-    geno = np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
     sample_ids = np.asarray(sample_ids, dtype=str)
 
     keep_mask = np.fromiter((sid in ph_map for sid in sample_ids), dtype=bool, count=sample_ids.shape[0])
@@ -1600,7 +1580,6 @@ def _prepare_dataset(
 
     ids_used = sample_ids[keep_mask]
     y_used = np.asarray([ph_map[sid] for sid in ids_used], dtype=np.float64)
-    M_used = np.asarray(geno[:, keep_mask], dtype=np.float32)
 
     cv_splits = build_cv_splits(
         n_samples=int(y_used.shape[0]),
@@ -1625,10 +1604,100 @@ def _prepare_dataset(
         }
     ).to_csv(sample_tsv, sep="\t", index=False)
 
+    filtered_plink_prefix = input_dir / "filtered_plink"
+
+    eng_set = {str(e).strip().lower() for e in (engines or []) if str(e).strip() != ""}
+    use_streaming_plink_only = bool(len(eng_set) > 0 and eng_set.issubset({"janusx", "hiblup"}))
+
+    if use_streaming_plink_only:
+        keep_idx = np.flatnonzero(keep_mask).astype(np.int64, copy=False)
+        if keep_idx.size != int(ids_used.shape[0]):
+            raise RuntimeError(
+                f"Sample index mismatch: keep_idx={int(keep_idx.size)} ids_used={int(ids_used.shape[0])}"
+            )
+        stream_chunks = load_genotype_chunks(
+            gfile,
+            chunk_size=int(args.chunksize),
+            maf=float(args.maf),
+            missing_rate=float(args.geno),
+            impute=True,
+            sample_indices=[int(i) for i in keep_idx.tolist()],
+        )
+        n_snps_written = 0
+
+        def _iter_plink_chunks_stream() -> Iterable[tuple[np.ndarray, list[Any]]]:
+            nonlocal n_snps_written
+            for geno_chunk, sites in stream_chunks:
+                arr = np.asarray(geno_chunk, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[0] == 0:
+                    continue
+                if int(arr.shape[1]) != int(ids_used.shape[0]):
+                    raise RuntimeError(
+                        f"Streamed chunk sample mismatch: got {int(arr.shape[1])}, expected {int(ids_used.shape[0])}"
+                    )
+                n_snps_written += int(arr.shape[0])
+                yield arr, list(sites)
+
+        save_genotype_streaming(
+            str(filtered_plink_prefix),
+            list(map(str, ids_used)),
+            _iter_plink_chunks_stream(),
+            fmt="plink",
+            total_snps=None,
+            desc="Writing filtered PLINK benchmark dataset (streaming)",
+        )
+        if int(n_snps_written) <= 0:
+            raise ValueError(
+                "No SNPs left after Rust-side filtering. "
+                "Please relax --maf/--geno thresholds."
+            )
+
+        meta = {
+            "trait": selected_trait,
+            "m": int(n_snps_written),
+            "n": int(ids_used.shape[0]),
+            "cv": int(args.cv),
+            "seed": int(args.seed),
+            "sample_tsv": str(sample_tsv.resolve()),
+            "filtered_plink_prefix": str(filtered_plink_prefix.resolve()),
+            "prep_mode": "streaming_plink_only",
+        }
+        meta_json = input_dir / "dataset.meta.json"
+        meta_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {
+            "gfile": gfile,
+            "trait": selected_trait,
+            "meta": meta,
+            "meta_json": meta_json,
+            "sample_tsv": sample_tsv.resolve(),
+            "geno_bin": None,
+            "filtered_plink_prefix": filtered_plink_prefix.resolve(),
+        }
+
+    chunks = load_genotype_chunks(
+        gfile,
+        chunk_size=int(args.chunksize),
+        maf=float(args.maf),
+        missing_rate=float(args.geno),
+        impute=True,
+    )
+    blocks: list[np.ndarray] = []
+    sites_all: list[Any] = []
+    for geno_chunk, sites in chunks:
+        arr = np.asarray(geno_chunk, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            continue
+        blocks.append(arr)
+        sites_all.extend(list(sites))
+    if len(blocks) == 0:
+        raise ValueError(
+            "No SNPs left after Rust-side filtering. "
+            "Please relax --maf/--geno thresholds."
+        )
+    geno = np.concatenate(blocks, axis=0).astype(np.float32, copy=False)
+    M_used = np.asarray(geno[:, keep_mask], dtype=np.float32)
     geno_bin = input_dir / "geno.f32.bin"
     np.asarray(M_used, dtype=np.float32).tofile(geno_bin)
-
-    filtered_plink_prefix = input_dir / "filtered_plink"
 
     def _iter_plink_chunks() -> Iterable[tuple[np.ndarray, list[Any]]]:
         step = max(1, int(args.chunksize))
@@ -3353,7 +3422,7 @@ def main() -> None:
     bench_dir = out_dir / f"{args.prefix}.gblup_bench"
     bench_dir.mkdir(parents=True, exist_ok=True)
 
-    data_info = _prepare_dataset(args, bench_dir=bench_dir)
+    data_info = _prepare_dataset(args, bench_dir=bench_dir, engines=engines)
 
     tmp_dir = bench_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)

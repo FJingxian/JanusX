@@ -20,7 +20,8 @@ Caching
 -------
   - Genotype/GRM/PCA caches use parameterized filenames (no JSON cache metadata).
   - GRM and PCA caches for streaming LMM/LM runs:
-      * genotype cache: ~{geno_prefix}.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam
+      * genotype cache (VCF): ~{geno_prefix}.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam
+      * genotype cache (HMP): ~{geno_prefix}.bed/.bim/.fam
       * GRM cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.npy (+ .id)
       * PCA cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.pc{q}.txt
   - If genotype directory is not writable, cache falls back to
@@ -906,10 +907,10 @@ def genotype_cache_prefix(
     """
     base = os.path.basename(genofile)
     low = base.lower()
-    if low.endswith(".vcf.gz"):
-        base = base[: -len(".vcf.gz")]
+    if low.endswith(".vcf.gz") or low.endswith(".hmp.gz"):
+        base = base[: -len(".vcf.gz")] if low.endswith(".vcf.gz") else base[: -len(".hmp.gz")]
     else:
-        for ext in (".vcf", ".txt", ".tsv", ".csv", ".npy"):
+        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
@@ -1654,7 +1655,7 @@ def _cache_prefix_tilde(
     het_threshold: float = 0.01,
 ) -> str:
     """
-    Cache prefix used by gfreader for VCF/TXT temporary converted files.
+    Cache prefix used by gfreader for VCF/HMP/TXT temporary converted files.
     """
     return _gwas_cache_prefix_with_params(
         genofile,
@@ -1692,6 +1693,19 @@ def _detect_cache_need(
             cache_mtime = min(os.path.getmtime(p) for p in targets)
             stale = cache_mtime < src_mtime
         return (not all_exist) or stale, "vcf", targets
+
+    if low.endswith(".hmp.gz") or low.endswith(".hmp"):
+        # HMP caching currently uses the non-parameterized PLINK cache prefix (~base)
+        # from gfreader's source-cache path.
+        cprefix = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
+        targets = [f"{cprefix}.bed", f"{cprefix}.bim", f"{cprefix}.fam"]
+        all_exist = all(os.path.isfile(p) for p in targets)
+        stale = False
+        if all_exist and os.path.isfile(genofile):
+            src_mtime = os.path.getmtime(genofile)
+            cache_mtime = min(os.path.getmtime(p) for p in targets)
+            stale = cache_mtime < src_mtime
+        return (not all_exist) or stale, "hmp", targets
 
     file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
     if file_prefix and matrix_path:
@@ -1805,7 +1819,7 @@ def _inspect_genotype_with_status(
         het_threshold=float(het_threshold),
     )
     status_enabled = bool(use_spinner)
-    plain_progress = (not status_enabled) and (cache_kind in {"vcf", "txt"})
+    plain_progress = (not status_enabled) and (cache_kind in {"vcf", "hmp", "txt"})
 
     # For direct PLINK prefixes (no cache-target metadata), inspect directly.
     # For VCF/TXT sources, always run the threaded+monitored path below so that
@@ -1861,7 +1875,7 @@ def _inspect_genotype_with_status(
         executor = None
         done_evt: Union[threading.Event, None] = None
         t: Union[threading.Thread, None] = None
-        use_subproc = cache_kind in {"vcf", "txt"}
+        use_subproc = cache_kind in {"vcf", "hmp", "txt"}
         if use_subproc:
             try:
                 mp_ctx = mp.get_context("spawn")
@@ -1899,8 +1913,16 @@ def _inspect_genotype_with_status(
             t = threading.Thread(target=_worker, daemon=True)
             t.start()
 
-        bim_path = cache_targets[1] if (cache_kind == "vcf" and len(cache_targets) >= 2) else ""
-        bed_path = cache_targets[0] if (cache_kind == "vcf" and len(cache_targets) >= 1) else ""
+        bim_path = (
+            cache_targets[1]
+            if (cache_kind in {"vcf", "hmp"} and len(cache_targets) >= 2)
+            else ""
+        )
+        bed_path = (
+            cache_targets[0]
+            if (cache_kind in {"vcf", "hmp"} and len(cache_targets) >= 1)
+            else ""
+        )
         npy_path = cache_targets[0] if (cache_kind == "txt" and len(cache_targets) >= 1) else ""
         bim_fp = None
         bim_dev_ino: tuple[int, int] = (-1, -1)
@@ -2037,6 +2059,90 @@ def build_grm_streaming(
     """
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
     """
+    packed_prefix = _as_plink_prefix(genofile)
+    has_packed_kernel = bool(
+        hasattr(jxrs, "grm_packed_f32")
+        and hasattr(jxrs, "bed_packed_row_flip_mask")
+    )
+    if packed_prefix is not None and has_packed_kernel:
+        _log_info(logger, f"Building GRM (packed BED + CBLAS), method={method}", use_spinner=use_spinner)
+        pbar = _ProgressAdapter(total=n_snps, desc="GRM (packed-bed)", force_animate=True)
+        process = psutil.Process()
+        mem_tick_span = max(1, 10 * int(chunk_size))
+        last_done = 0
+
+        def _on_packed_progress(done: int, _total: int) -> None:
+            nonlocal last_done
+            d = int(done)
+            if d > last_done:
+                pbar.update(d - last_done)
+                last_done = d
+            if d % mem_tick_span == 0:
+                mem = process.memory_info().rss / 1024**3
+                pbar.set_postfix(memory=f"{mem:.2f}GB")
+
+        try:
+            packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(packed_prefix)
+            if int(packed_n) != int(n_samples):
+                raise RuntimeError(
+                    f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
+                )
+            packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
+            miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+            maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+            keep = np.ones(maf.shape[0], dtype=np.bool_)
+            maf_thr = float(maf_threshold)
+            if maf_thr > 0.0:
+                keep &= (maf >= maf_thr) & (maf <= (1.0 - maf_thr))
+            keep &= (miss <= float(max_missing_rate))
+            if bool(snps_only):
+                snp_mask = _plink_snp_mask(packed_prefix)
+                if snp_mask.shape[0] != keep.shape[0]:
+                    raise RuntimeError(
+                        f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
+                    )
+                keep &= snp_mask
+            if not np.any(keep):
+                raise RuntimeError("No SNPs remained after packed BED filtering; GRM is empty.")
+            if not bool(np.all(keep)):
+                packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+                maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
+            eff_m = int(packed.shape[0])
+            row_flip = np.ascontiguousarray(
+                np.asarray(
+                    jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+                    dtype=np.bool_,
+                ).reshape(-1)
+            )
+            grm = np.ascontiguousarray(
+                np.asarray(
+                    jxrs.grm_packed_f32(
+                        packed,
+                        int(n_samples),
+                        row_flip,
+                        maf,
+                        sample_indices=None,
+                        method=int(method),
+                        block_cols=max(1, int(chunk_size)),
+                        threads=0,
+                        progress_callback=_on_packed_progress,
+                        progress_every=max(1, int(chunk_size)),
+                    ),
+                    dtype=np.float32,
+                )
+            )
+            pbar.finish()
+            _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
+            return grm, eff_m
+        except Exception as ex:
+            _emit_warning_line(
+                logger,
+                f"Packed GRM unavailable/failed; fallback to streaming backend. reason={ex}",
+                use_spinner=bool(use_spinner),
+            )
+        finally:
+            pbar.close(show_done=False)
+
     _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
     pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)", force_animate=True)
     process = psutil.Process()
@@ -2486,11 +2592,26 @@ def prepare_streaming_context(
     )
     stream_genofile = str(genofile)
     genofile_low = str(genofile).lower()
+    cache_candidates: list[str] = []
     if genofile_low.endswith(".vcf") or genofile_low.endswith(".vcf.gz"):
-        if all(os.path.isfile(f"{cache_prefix}.{ext}") for ext in ("bed", "bim", "fam")):
-            # Reuse the parameterized VCF cache prefix across streaming steps.
-            # This avoids creating extra VCF->BED caches with other default filter tags.
-            stream_genofile = str(cache_prefix)
+        # VCF caches are parameterized by maf/missing/snps_only in gfreader.
+        cache_candidates.append(str(cache_prefix))
+    elif genofile_low.endswith(".hmp") or genofile_low.endswith(".hmp.gz"):
+        # HMP source-cache path currently uses non-parameterized '~base' prefix.
+        cache_candidates.append(
+            genotype_cache_prefix(
+                genofile,
+                snps_only=bool(snps_only),
+                logger=logger,
+                warning_collector=deferred_cache_warnings,
+            )
+        )
+        # Keep parameterized candidate for forward compatibility.
+        cache_candidates.append(str(cache_prefix))
+    for cp in cache_candidates:
+        if all(os.path.isfile(f"{cp}.{ext}") for ext in ("bed", "bim", "fam")):
+            stream_genofile = str(cp)
+            break
 
     need_generate_q = False
     if pcdim in np.arange(1, n_samples).astype(str):
@@ -2745,6 +2866,28 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
             a1 = str(toks[5])
             out.append((chrom, pos, a0, a1))
     return out
+
+
+def _is_simple_snp_allele(allele: str) -> bool:
+    a = str(allele).strip().upper()
+    return (len(a) == 1) and (a in {"A", "C", "G", "T"})
+
+
+def _plink_snp_mask(prefix: str) -> np.ndarray:
+    mask: list[bool] = []
+    bim_path = f"{prefix}.bim"
+    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
+        for ln, line in enumerate(fh, start=1):
+            s = line.strip()
+            if s == "":
+                continue
+            toks = s.split()
+            if len(toks) < 6:
+                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
+            a0 = str(toks[4])
+            a1 = str(toks[5])
+            mask.append(_is_simple_snp_allele(a0) and _is_simple_snp_allele(a1))
+    return np.asarray(mask, dtype=np.bool_)
 
 
 def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
@@ -5136,6 +5279,13 @@ def run_farmcpu_fullmem(
                 logger=logger,
             )
             packed_prefix = _as_plink_prefix(cache_guess)
+        if packed_prefix is None:
+            cache_guess_plain = genotype_cache_prefix(
+                gfile,
+                snps_only=bool(snps_only),
+                logger=logger,
+            )
+            packed_prefix = _as_plink_prefix(cache_guess_plain)
 
         can_use_packed = (
             bool(getattr(args, "model", "add") == "add")

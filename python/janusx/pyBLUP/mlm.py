@@ -25,10 +25,18 @@ try:
     from janusx.janusx import (
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
+        cross_grm_times_alpha_packed_f64 as _cross_grm_times_alpha_packed_f64,
+        packed_malpha_f64 as _packed_malpha_f64,
+        grm_packed_f32 as _grm_packed_f32,
+        grm_packed_f32_with_stats as _grm_packed_f32_with_stats,
     )
 except Exception:
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
+    _cross_grm_times_alpha_packed_f64 = None
+    _packed_malpha_f64 = None
+    _grm_packed_f32 = None
+    _grm_packed_f32_with_stats = None
 
 try:
     from janusx.janusx import bed_packed_decode_stats_f64 as _bed_packed_decode_stats_f64
@@ -48,6 +56,15 @@ def _env_positive_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
     return max(1, v)
+
+
+def _env_nonnegative_int(name: str, default: int = 0) -> int:
+    raw = str(os.getenv(name, str(default))).strip()
+    try:
+        v = int(raw)
+    except Exception:
+        return max(0, int(default))
+    return max(0, v)
 
 
 def _env_positive_float(name: str, default: float) -> float:
@@ -469,12 +486,15 @@ class BLUP:
         self._debug_stage = _env_truthy("JX_MLM_DEBUG_STAGE", "0")
         self._reml_calls = 0
         self._force_fast = bool(force_fast)
+        self._eig_floor = _env_positive_float("JX_MLM_EIG_FLOOR", 1e-12)
+        self._reml_v_floor = _env_positive_float("JX_MLM_REML_V_FLOOR", self._eig_floor)
         t_init = time.time()
         self.y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
         self._packed_ctx = _coerce_bed_packed_ctx(M)
         self._packed_sample_indices = None
         self._packed_all_rows = None
         self._packed_sample_chunk = _env_positive_int("JX_MLM_PACKED_SAMPLE_CHUNK", 8192)
+        self._rust_threads = _env_nonnegative_int("JX_MLM_RUST_THREADS", 0)
         self.M = None
         if cov is not None:
             cov = np.asarray(cov, dtype=np.float64)
@@ -544,7 +564,8 @@ class BLUP:
         if self._debug_stage:
             print(
                 f"[MLM-DEBUG] fit_start n={self.n} m={self.M.shape[0]} "
-                f"dtype_M={self.M.dtype} kinship={self.kinship} usefast={usefastlmm}",
+                f"dtype_M={self.M.dtype} kinship={self.kinship} usefast={usefastlmm} "
+                f"rust_threads={int(self._rust_threads)}",
                 flush=True,
             )
         if self.kinship is not None:
@@ -768,7 +789,8 @@ class BLUP:
             return
         if self._debug_stage:
             print(
-                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast={usefastlmm}",
+                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} "
+                f"usefast={usefastlmm} rust_threads={int(self._rust_threads)}",
                 flush=True,
             )
         t_k = time.time()
@@ -827,7 +849,7 @@ class BLUP:
                     self._packed_ctx["row_flip"],
                     self._packed_ctx["maf"],
                     sidx_blk,
-                    threads=0,
+                    threads=int(self._rust_threads),
                 )
                 blk64 = np.asarray(blk64_raw, dtype=np.float64)
                 if gram_mode == "lowmem":
@@ -984,78 +1006,220 @@ class BLUP:
 
         if self._debug_stage:
             print(
-                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast=0",
+                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} "
+                f"usefast=0 rust_threads={int(self._rust_threads)}",
                 flush=True,
             )
 
         t_k = time.time()
-        gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
-            n=int(self.n),
-            m=int(self.n),
-            block_cols=min(int(self.n), row_step),
-            resident_bytes=int(self._packed_ctx["packed"].nbytes),
-            force_fast=self._force_fast,
+        sum_rows = np.zeros((m, 1), dtype=np.float64)
+        var_sum = 0.0
+
+        n_full = int(self._packed_ctx["n_samples"])
+        full_identity = bool(
+            int(self._packed_sample_indices.shape[0]) == n_full
+            and np.array_equal(
+                self._packed_sample_indices,
+                np.arange(n_full, dtype=np.int64),
+            )
         )
-        gram = np.zeros(
-            (self.n, self.n),
-            dtype=np.float64,
-            order=("F" if gram_mode == "lowmem" else "C"),
+        use_rust_grm = bool(
+            (_grm_packed_f32_with_stats is not None) or (_grm_packed_f32 is not None)
+        )
+        use_rust_row_stats = False
+        rust_sample_indices = (
+            None
+            if full_identity
+            else np.ascontiguousarray(self._packed_sample_indices, dtype=np.int64)
+        )
+        rust_backend = (
+            "rust_grm_packed_f32_with_stats"
+            if _grm_packed_f32_with_stats is not None
+            else ("rust_grm_packed_f32" if _grm_packed_f32 is not None else "python_fallback")
         )
         if self._debug_stage:
             print(
-                f"[MLM-DEBUG] packed_grm_mode mode={gram_mode} "
-                f"auto_dim={auto_dim} "
-                f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
-                f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                f"[MLM-DEBUG] packed_grm_backend backend={rust_backend if use_rust_grm else 'python_fallback'} "
+                f"subset={'0' if full_identity else '1'}",
                 flush=True,
             )
-        sum_rows = np.zeros((m, 1), dtype=np.float64)
-        # Accumulate centering terms on-the-fly so we can build GRM in one decode pass.
-        # mu_proj = M^T * mu, mu_sq_sum = sum(mu_i^2), var_sum = sum(var_i).
-        mu_proj = np.zeros((self.n, 1), dtype=np.float64)
-        mu_sq_sum = 0.0
-        var_sum = 0.0
 
-        # Single pass over SNP rows:
-        # 1) accumulate raw Gram: M^T M
-        # 2) accumulate row means/variances
-        # 3) accumulate centering correction terms (M^T mu, sum(mu_i^2))
-        for st in range(0, m, row_step):
-            ed = min(st + row_step, m)
-            ridx = np.arange(st, ed, dtype=np.int64)
-            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
-            blk64 = np.asarray(blk, dtype=np.float64)
-            row_sum_blk = np.sum(blk64, axis=1, keepdims=True)
-            sum_rows[st:ed, :] = row_sum_blk
-            mu_blk = row_sum_blk / float(self.n)
-            sq_mean_blk = np.sum(blk64 * blk64, axis=1, keepdims=True) / float(self.n)
-            m_var_blk = sq_mean_blk - mu_blk * mu_blk
-            np.maximum(m_var_blk, 0.0, out=m_var_blk)
-            var_sum += float(np.sum(m_var_blk, dtype=np.float64))
-            blk_t = (
-                np.asfortranarray(blk64.T)
-                if gram_mode == "lowmem"
-                else np.asarray(blk64.T, dtype=np.float64)
+        if use_rust_grm:
+            try:
+                if _grm_packed_f32_with_stats is not None:
+                    grm_raw, row_sum_raw, var_sum_raw = _grm_packed_f32_with_stats(
+                        self._packed_ctx["packed"],
+                        int(self._packed_ctx["n_samples"]),
+                        self._packed_ctx["row_flip"],
+                        self._packed_ctx["maf"],
+                        sample_indices=rust_sample_indices,
+                        method=1,
+                        block_cols=max(1, row_step),
+                        threads=int(self._rust_threads),
+                        progress_callback=None,
+                        progress_every=0,
+                    )
+                    self.G = np.asarray(grm_raw, dtype=np.float32)
+                    sum_rows = np.ascontiguousarray(
+                        np.asarray(row_sum_raw, dtype=np.float64).reshape(-1, 1),
+                        dtype=np.float64,
+                    )
+                    if int(sum_rows.shape[0]) != int(m):
+                        raise RuntimeError(
+                            f"Rust GRM row_sum length mismatch: got {sum_rows.shape[0]}, expected {m}"
+                        )
+                    var_sum = float(var_sum_raw)
+                    if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
+                        raise RuntimeError(
+                            f"Rust GRM invalid var_sum={var_sum!r}; expected finite > 0"
+                        )
+                    use_rust_row_stats = True
+                    if self._debug_stage:
+                        print(
+                            "[MLM-DEBUG] packed_grm_rowstats source=rust_fused",
+                            flush=True,
+                        )
+                else:
+                    grm_raw = _grm_packed_f32(
+                        self._packed_ctx["packed"],
+                        int(self._packed_ctx["n_samples"]),
+                        self._packed_ctx["row_flip"],
+                        self._packed_ctx["maf"],
+                        sample_indices=rust_sample_indices,
+                        method=1,
+                        block_cols=max(1, row_step),
+                        threads=int(self._rust_threads),
+                        progress_callback=None,
+                        progress_every=0,
+                    )
+                    self.G = np.asarray(grm_raw, dtype=np.float32)
+            except Exception:
+                # Try legacy Rust GRM if stats-enabled variant failed.
+                if (_grm_packed_f32 is not None) and (_grm_packed_f32_with_stats is not None):
+                    try:
+                        grm_raw = _grm_packed_f32(
+                            self._packed_ctx["packed"],
+                            int(self._packed_ctx["n_samples"]),
+                            self._packed_ctx["row_flip"],
+                            self._packed_ctx["maf"],
+                            sample_indices=rust_sample_indices,
+                            method=1,
+                            block_cols=max(1, row_step),
+                            threads=int(self._rust_threads),
+                            progress_callback=None,
+                            progress_every=0,
+                        )
+                        self.G = np.asarray(grm_raw, dtype=np.float32)
+                        use_rust_row_stats = False
+                        rust_backend = "rust_grm_packed_f32"
+                        if self._debug_stage:
+                            print(
+                                "[MLM-DEBUG] packed_grm_backend rust_with_stats_failed -> fallback rust_grm_packed_f32",
+                                flush=True,
+                            )
+                    except Exception:
+                        use_rust_grm = False
+                        if self._debug_stage:
+                            print(
+                                "[MLM-DEBUG] packed_grm_backend rust_failed -> fallback python_fallback",
+                                flush=True,
+                            )
+                else:
+                    use_rust_grm = False
+                    if self._debug_stage:
+                        print(
+                            "[MLM-DEBUG] packed_grm_backend rust_failed -> fallback python_fallback",
+                            flush=True,
+                        )
+
+        if not use_rust_grm:
+            gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
+                n=int(self.n),
+                m=int(self.n),
+                block_cols=min(int(self.n), row_step),
+                resident_bytes=int(self._packed_ctx["packed"].nbytes),
+                force_fast=self._force_fast,
             )
-            gram = _gram_rankk_update(
-                gram,
-                blk_t,
-                lowmem=(gram_mode == "lowmem"),
+            gram = np.zeros(
+                (self.n, self.n),
+                dtype=np.float64,
+                order=("F" if gram_mode == "lowmem" else "C"),
             )
-            mu_proj += blk_t @ mu_blk
-            mu_sq_sum += float(np.sum(mu_blk * mu_blk, dtype=np.float64))
+            if self._debug_stage:
+                print(
+                    f"[MLM-DEBUG] packed_grm_mode mode={gram_mode} "
+                    f"auto_dim={auto_dim} "
+                    f"est_fast_peak_gib={est_fast_peak / 1024**3:.3f} "
+                    f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
+                    flush=True,
+                )
+            # Accumulate centering terms on-the-fly so we can build GRM in one decode pass.
+            # mu_proj = M^T * mu, mu_sq_sum = sum(mu_i^2), var_sum = sum(var_i).
+            mu_proj = np.zeros((self.n, 1), dtype=np.float64)
+            mu_sq_sum = 0.0
+
+            # Single pass over SNP rows:
+            # 1) accumulate raw Gram: M^T M
+            # 2) accumulate row means/variances
+            # 3) accumulate centering correction terms (M^T mu, sum(mu_i^2))
+            for st in range(0, m, row_step):
+                ed = min(st + row_step, m)
+                ridx = np.arange(st, ed, dtype=np.int64)
+                blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+                blk64 = np.asarray(blk, dtype=np.float64)
+                row_sum_blk = np.sum(blk64, axis=1, keepdims=True)
+                sum_rows[st:ed, :] = row_sum_blk
+                mu_blk = row_sum_blk / float(self.n)
+                sq_mean_blk = np.sum(blk64 * blk64, axis=1, keepdims=True) / float(self.n)
+                m_var_blk = sq_mean_blk - mu_blk * mu_blk
+                np.maximum(m_var_blk, 0.0, out=m_var_blk)
+                var_sum += float(np.sum(m_var_blk, dtype=np.float64))
+                blk_t = (
+                    np.asfortranarray(blk64.T)
+                    if gram_mode == "lowmem"
+                    else np.asarray(blk64.T, dtype=np.float64)
+                )
+                gram = _gram_rankk_update(
+                    gram,
+                    blk_t,
+                    lowmem=(gram_mode == "lowmem"),
+                )
+                mu_proj += blk_t @ mu_blk
+                mu_sq_sum += float(np.sum(mu_blk * mu_blk, dtype=np.float64))
+
+            # Centering correction:
+            # M_c^T M_c = M^T M - (M^T mu) 1^T - 1 (M^T mu)^T + (mu^T mu) 11^T
+            # Use broadcasting to avoid allocating 11^T.
+            gram -= mu_proj
+            gram -= mu_proj.T
+            gram += float(mu_sq_sum)
+            self.G = np.asarray(gram / float(max(1e-12, var_sum)), dtype=np.float32)
+            del gram
+
+        # Compute row mean / variance once for compact cross-GRM prediction terms.
+        if use_rust_grm and (not use_rust_row_stats):
+            if self._debug_stage:
+                print(
+                    "[MLM-DEBUG] packed_grm_rowstats source=python_decode_pass",
+                    flush=True,
+                )
+            for st in range(0, m, row_step):
+                ed = min(st + row_step, m)
+                ridx = np.arange(st, ed, dtype=np.int64)
+                blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+                blk64 = np.asarray(blk, dtype=np.float64)
+                row_sum_blk = np.sum(blk64, axis=1, keepdims=True)
+                sum_rows[st:ed, :] = row_sum_blk
+                mu_blk = row_sum_blk / float(self.n)
+                sq_mean_blk = np.sum(blk64 * blk64, axis=1, keepdims=True) / float(self.n)
+                m_var_blk = sq_mean_blk - mu_blk * mu_blk
+                np.maximum(m_var_blk, 0.0, out=m_var_blk)
+                var_sum += float(np.sum(m_var_blk, dtype=np.float64))
 
         self._m_mean = sum_rows / float(self.n)
         self._m_var_sum = float(var_sum)
         if self._m_var_sum <= 0.0:
             self._m_var_sum = 1e-12
-        # Centering correction:
-        # M_c^T M_c = M^T M - (M^T mu) 1^T - 1 (M^T mu)^T + (mu^T mu) 11^T
-        # Use broadcasting to avoid allocating 11^T.
-        gram -= mu_proj
-        gram -= mu_proj.T
-        gram += float(mu_sq_sum)
-        gram /= float(self._m_var_sum)
 
         self._implicit_kinship_fast = False
         self._fast_v = None
@@ -1063,8 +1227,6 @@ class BLUP:
         self._fast_svals = None
         self._fast_projected = False
 
-        self.G = np.asarray(gram, dtype=np.float32)
-        del gram
         self.G += np.float32(self._g_eps) * np.eye(self.n, dtype=np.float32)
         self.Z = np.eye(self.n, dtype=np.float64)
 
@@ -1077,6 +1239,20 @@ class BLUP:
 
         t_eig = time.time()
         self.S, eigvec = np.linalg.eigh(self.G)
+        self.S = np.asarray(self.S, dtype=np.float64)
+        max_eval = float(np.max(self.S)) if self.S.size > 0 else 0.0
+        eig_floor = max(
+            float(self._eig_floor),
+            float(np.finfo(np.float64).eps * max(1.0, max_eval)),
+        )
+        n_clipped = int(np.sum(self.S < eig_floor))
+        if n_clipped > 0:
+            self.S = np.maximum(self.S, eig_floor)
+            if self._debug_stage:
+                print(
+                    f"[MLM-DEBUG] eig_floor_applied n={n_clipped} floor={eig_floor:.3e}",
+                    flush=True,
+                )
         self.Dh = eigvec.T
         self.X = self.Dh @ self.X
         self.y = self.Dh @ self.y
@@ -1109,13 +1285,48 @@ class BLUP:
         self.alpha = np.linalg.solve(self.G, self.u)
 
         self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
-        self._m_alpha = np.zeros((m, 1), dtype=np.float64)
-        for st in range(0, m, row_step):
-            ed = min(st + row_step, m)
-            ridx = np.arange(st, ed, dtype=np.int64)
-            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
-            blk64 = np.asarray(blk, dtype=np.float64)
-            self._m_alpha[st:ed, :] = blk64 @ self.alpha
+        if _packed_malpha_f64 is not None:
+            try:
+                m_alpha_raw = _packed_malpha_f64(
+                    self._packed_ctx["packed"],
+                    int(self._packed_ctx["n_samples"]),
+                    self._packed_ctx["row_flip"],
+                    self._packed_ctx["maf"],
+                    np.ascontiguousarray(self._packed_sample_indices, dtype=np.int64),
+                    np.ascontiguousarray(np.asarray(self.alpha, dtype=np.float64).reshape(-1)),
+                    block_rows=max(1, row_step),
+                    threads=int(self._rust_threads),
+                )
+                self._m_alpha = np.ascontiguousarray(
+                    np.asarray(m_alpha_raw, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                if int(self._m_alpha.shape[0]) != int(m):
+                    raise RuntimeError(
+                        f"Rust packed_malpha length mismatch: got {self._m_alpha.shape[0]}, expected {m}"
+                    )
+                if self._debug_stage:
+                    print("[MLM-DEBUG] packed_malpha source=rust", flush=True)
+            except Exception:
+                self._m_alpha = np.zeros((m, 1), dtype=np.float64)
+                if self._debug_stage:
+                    print("[MLM-DEBUG] packed_malpha rust_failed -> fallback python", flush=True)
+                for st in range(0, m, row_step):
+                    ed = min(st + row_step, m)
+                    ridx = np.arange(st, ed, dtype=np.int64)
+                    blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+                    blk64 = np.asarray(blk, dtype=np.float64)
+                    self._m_alpha[st:ed, :] = blk64 @ self.alpha
+        else:
+            self._m_alpha = np.zeros((m, 1), dtype=np.float64)
+            if self._debug_stage:
+                print("[MLM-DEBUG] packed_malpha source=python", flush=True)
+            for st in range(0, m, row_step):
+                ed = min(st + row_step, m)
+                ridx = np.arange(st, ed, dtype=np.int64)
+                blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+                blk64 = np.asarray(blk, dtype=np.float64)
+                self._m_alpha[st:ed, :] = blk64 @ self.alpha
         self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0])
         self._mean_malpha = float((self._m_mean.T @ self._m_alpha)[0, 0])
 
@@ -1144,7 +1355,8 @@ class BLUP:
 
         if self._debug_stage:
             print(
-                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} usefast=0",
+                f"[MLM-DEBUG] fit_start n={self.n} m={m} dtype_M=packed kinship={self.kinship} "
+                f"usefast=0 rust_threads={int(self._rust_threads)}",
                 flush=True,
             )
 
@@ -1280,15 +1492,47 @@ class BLUP:
                 f"Packed SNP count mismatch: got {packed_ctx['packed'].shape[0]}, expected {m_expect}"
             )
         n_new = int(sample_indices.shape[0])
-        out = np.empty((n_new, 1), dtype=np.float64)
         step = max(1, int(self._packed_sample_chunk))
-        all_rows = np.arange(m_expect, dtype=np.int64)
         if self._debug_stage:
             t_cross = time.time()
             print(
                 f"[MLM-DEBUG] cross_grm_times_alpha_start n_new={n_new} chunk={step}",
                 flush=True,
             )
+
+        if _cross_grm_times_alpha_packed_f64 is not None:
+            try:
+                out_rust = _cross_grm_times_alpha_packed_f64(
+                    packed_ctx["packed"],
+                    int(packed_ctx["n_samples"]),
+                    packed_ctx["row_flip"],
+                    packed_ctx["maf"],
+                    np.ascontiguousarray(sample_indices, dtype=np.int64),
+                    np.ascontiguousarray(np.asarray(self._m_alpha, dtype=np.float64).reshape(-1)),
+                    np.ascontiguousarray(np.asarray(self._m_mean, dtype=np.float64).reshape(-1)),
+                    float(self._alpha_sum),
+                    float(self._mean_sq),
+                    float(self._mean_malpha),
+                    float(self._m_var_sum),
+                    block_rows=max(1, min(4096, m_expect)),
+                    threads=int(self._rust_threads),
+                )
+                out = np.ascontiguousarray(
+                    np.asarray(out_rust, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                if self._debug_stage:
+                    print(
+                        f"[MLM-DEBUG] cross_grm_times_alpha_done elapsed={time.time() - t_cross:.3f}s backend=rust",
+                        flush=True,
+                    )
+                return out
+            except Exception:
+                if self._debug_stage:
+                    print("[MLM-DEBUG] cross_grm_times_alpha_rust_failed -> fallback python", flush=True)
+
+        out = np.empty((n_new, 1), dtype=np.float64)
+        all_rows = np.arange(m_expect, dtype=np.int64)
         for st in range(0, n_new, step):
             ed = min(st + step, n_new)
             sidx_blk = np.ascontiguousarray(sample_indices[st:ed], dtype=np.int64)
@@ -1304,7 +1548,7 @@ class BLUP:
             ) / self._m_var_sum
         if self._debug_stage:
             print(
-                f"[MLM-DEBUG] cross_grm_times_alpha_done elapsed={time.time() - t_cross:.3f}s",
+                f"[MLM-DEBUG] cross_grm_times_alpha_done elapsed={time.time() - t_cross:.3f}s backend=python",
                 flush=True,
             )
         return out
@@ -1337,14 +1581,29 @@ class BLUP:
         self._reml_calls += 1
         n, p_cov = self.X.shape
         p = p_cov
-        V = self.S + lbd
+        v_floor = max(float(self._reml_v_floor), float(np.finfo(np.float64).tiny))
+        V_raw = np.asarray(self.S, dtype=np.float64) + float(lbd)
+        n_v_clipped = int(np.sum(V_raw <= v_floor))
+        V = np.maximum(V_raw, v_floor)
+        if self._debug_stage and n_v_clipped > 0:
+            print(
+                f"[MLM-DEBUG] reml_V_floor_applied n={n_v_clipped} floor={v_floor:.3e} lbd={float(lbd):.3e}",
+                flush=True,
+            )
         V_inv = 1 / V
         X_cov_snp = self.X
         XTV_invX = V_inv * X_cov_snp.T @ X_cov_snp
         XTV_invy = V_inv * X_cov_snp.T @ self.y
         beta = np.linalg.solve(XTV_invX, XTV_invy)
         r = self.y - X_cov_snp @ beta
-        rTV_invr = (V_inv * r.T @ r)[0, 0]
+        rTV_invr = float((V_inv * r.T @ r)[0, 0])
+        if (not np.isfinite(rTV_invr)) or (rTV_invr <= v_floor):
+            if self._debug_stage:
+                print(
+                    f"[MLM-DEBUG] reml_rTV_invr_floor_applied old={rTV_invr!r} floor={v_floor:.3e}",
+                    flush=True,
+                )
+            rTV_invr = float(v_floor)
         log_detV = np.sum(np.log(V))
         _, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
         total_log = (n - p) * np.log(rTV_invr) + log_detV + log_detXTV_invX  # log items

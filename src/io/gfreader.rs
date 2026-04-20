@@ -954,62 +954,68 @@ pub fn load_bed_2bit_packed<'py>(
             let n_samples_f = n_samples as f32;
             let full_bytes = n_samples / 4;
             let rem = n_samples % 4;
+            missing_rate
+                .par_iter_mut()
+                .zip(maf.par_iter_mut())
+                .zip(std_denom.par_iter_mut())
+                .enumerate()
+                .for_each(|(snp_idx, ((miss_dst, maf_dst), std_dst))| {
+                    let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                    let mut non_missing: usize = 0;
+                    let mut alt_sum: usize = 0;
 
-            for snp_idx in 0..n_snps {
-                let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-                let mut non_missing: usize = 0;
-                let mut alt_sum: usize = 0;
-
-                for &byte in row.iter().take(full_bytes) {
-                    for within in 0..4 {
-                        let code = (byte >> (within * 2)) & 0b11;
-                        match code {
-                            0b00 => {
-                                non_missing += 1;
+                    for &byte in row.iter().take(full_bytes) {
+                        for within in 0..4 {
+                            let code = (byte >> (within * 2)) & 0b11;
+                            match code {
+                                0b00 => {
+                                    non_missing += 1;
+                                }
+                                0b10 => {
+                                    non_missing += 1;
+                                    alt_sum += 1;
+                                }
+                                0b11 => {
+                                    non_missing += 1;
+                                    alt_sum += 2;
+                                }
+                                _ => {}
                             }
-                            0b10 => {
-                                non_missing += 1;
-                                alt_sum += 1;
-                            }
-                            0b11 => {
-                                non_missing += 1;
-                                alt_sum += 2;
-                            }
-                            _ => {}
                         }
                     }
-                }
-                if rem > 0 {
-                    let byte = row[full_bytes];
-                    for within in 0..rem {
-                        let code = (byte >> (within * 2)) & 0b11;
-                        match code {
-                            0b00 => {
-                                non_missing += 1;
+                    if rem > 0 {
+                        let byte = row[full_bytes];
+                        for within in 0..rem {
+                            let code = (byte >> (within * 2)) & 0b11;
+                            match code {
+                                0b00 => {
+                                    non_missing += 1;
+                                }
+                                0b10 => {
+                                    non_missing += 1;
+                                    alt_sum += 1;
+                                }
+                                0b11 => {
+                                    non_missing += 1;
+                                    alt_sum += 2;
+                                }
+                                _ => {}
                             }
-                            0b10 => {
-                                non_missing += 1;
-                                alt_sum += 1;
-                            }
-                            0b11 => {
-                                non_missing += 1;
-                                alt_sum += 2;
-                            }
-                            _ => {}
                         }
                     }
-                }
 
-                let miss = 1.0_f32 - (non_missing as f32 / n_samples_f);
-                missing_rate[snp_idx] = miss;
-                if non_missing > 0 {
-                    let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                    let maf_v = p.min(1.0_f32 - p);
-                    maf[snp_idx] = maf_v;
-                    let d = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
-                    std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
-                }
-            }
+                    *miss_dst = 1.0_f32 - (non_missing as f32 / n_samples_f);
+                    if non_missing > 0 {
+                        let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                        let maf_v = p.min(1.0_f32 - p);
+                        *maf_dst = maf_v;
+                        let d = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
+                        *std_dst = if d.is_finite() { d } else { 0.0_f32 };
+                    } else {
+                        *maf_dst = 0.0_f32;
+                        *std_dst = 0.0_f32;
+                    }
+                });
             Ok((
                 packed,
                 missing_rate,

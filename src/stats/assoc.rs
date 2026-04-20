@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::brent::brent_minimize;
 use crate::linalg::{
@@ -42,6 +43,17 @@ fn _map_err_string_to_py(err: String) -> PyErr {
     } else {
         PyRuntimeError::new_err(err)
     }
+}
+
+#[inline]
+fn _env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
+        })
+        .unwrap_or(false)
 }
 
 #[inline]
@@ -479,6 +491,121 @@ fn decode_subset_row_from_full_scratch(
     (var_centered as f64, row_sum)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_grm_block(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    method: usize,
+    eps: f32,
+    code4_lut: &[[u8; 4]; 256],
+    row_start: usize,
+    row_end: usize,
+    n: usize,
+    out_block: &mut [f32],
+    out_varsum: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if out_block.len() < cur_rows.saturating_mul(n) {
+        return Err("decode_grm_block: out_block too small".to_string());
+    }
+    if out_varsum.len() < cur_rows {
+        return Err("decode_grm_block: out_varsum too small".to_string());
+    }
+    let block = &mut out_block[..cur_rows * n];
+    let varsum = &mut out_varsum[..cur_rows];
+
+    let mut decode_run = || {
+        if full_sample_fast {
+            block
+                .par_chunks_mut(n)
+                .zip(varsum.par_iter_mut())
+                .enumerate()
+                .for_each(|(off, (out_row, row_varsum_dst))| {
+                    let idx = row_start + off;
+                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                    let flip = row_flip_vec[idx];
+                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                    let mean_g = 2.0_f32 * p;
+                    let var = 2.0_f32 * p * (1.0_f32 - p);
+                    let std_scale = if method == 2 {
+                        if var > eps {
+                            1.0_f32 / var.sqrt()
+                        } else {
+                            0.0_f32
+                        }
+                    } else {
+                        1.0_f32
+                    };
+                    let value_lut: [f32; 4] = if flip {
+                        [
+                            (2.0_f32 - mean_g) * std_scale,
+                            0.0_f32, // missing -> mean imputation => centered 0
+                            (1.0_f32 - mean_g) * std_scale,
+                            (0.0_f32 - mean_g) * std_scale,
+                        ]
+                    } else {
+                        [
+                            (0.0_f32 - mean_g) * std_scale,
+                            0.0_f32, // missing -> mean imputation => centered 0
+                            (1.0_f32 - mean_g) * std_scale,
+                            (2.0_f32 - mean_g) * std_scale,
+                        ]
+                    };
+                    decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
+                    if method == 1 {
+                        *row_varsum_dst = var as f64;
+                    }
+                });
+        } else {
+            block
+                .par_chunks_mut(n)
+                .zip(varsum.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f32; n_samples],
+                    |full_row, (off, (out_row, row_varsum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip_vec[idx];
+                        let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                        let default_mean_g = 2.0_f32 * p;
+                        let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            flip,
+                            default_mean_g,
+                            method,
+                            eps,
+                            code4_lut,
+                            full_row.as_mut_slice(),
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var_centered;
+                        }
+                    },
+                );
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(&mut decode_run);
+    } else {
+        decode_run();
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 type CblasInt = std::os::raw::c_int;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -488,10 +615,97 @@ const CBLAS_NO_TRANS: CblasInt = 111;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const CBLAS_TRANS: CblasInt = 112;
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SgemmBackend {
+    Accelerate,
+    OpenBlas,
+    Blas,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+static SGEMM_BACKEND: OnceLock<SgemmBackend> = OnceLock::new();
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const HAS_OPENBLAS_BACKEND: bool = cfg!(any(
+    target_os = "windows",
+    all(feature = "blas-openblas", jx_openblas_available)
+));
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const HAS_ACCELERATE_BACKEND: bool = cfg!(target_os = "macos");
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const HAS_BLAS_BACKEND: bool =
+    cfg!(all(target_os = "linux", not(all(feature = "blas-openblas", jx_openblas_available))));
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn default_sgemm_backend() -> SgemmBackend {
+    #[cfg(target_os = "macos")]
+    {
+        if HAS_OPENBLAS_BACKEND {
+            return SgemmBackend::OpenBlas;
+        }
+        return SgemmBackend::Accelerate;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return SgemmBackend::OpenBlas;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if HAS_OPENBLAS_BACKEND {
+            return SgemmBackend::OpenBlas;
+        }
+        return SgemmBackend::Blas;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn resolve_sgemm_backend() -> SgemmBackend {
+    let default_backend = default_sgemm_backend();
+    let req = std::env::var("JX_RUST_BLAS_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+    match req.as_str() {
+        "" | "auto" => default_backend,
+        "openblas" => {
+            if HAS_OPENBLAS_BACKEND {
+                SgemmBackend::OpenBlas
+            } else {
+                default_backend
+            }
+        }
+        "accelerate" => {
+            if HAS_ACCELERATE_BACKEND {
+                SgemmBackend::Accelerate
+            } else {
+                default_backend
+            }
+        }
+        "blas" => {
+            if HAS_BLAS_BACKEND {
+                SgemmBackend::Blas
+            } else {
+                default_backend
+            }
+        }
+        _ => default_backend,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn selected_sgemm_backend() -> SgemmBackend {
+    *SGEMM_BACKEND.get_or_init(resolve_sgemm_backend)
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
-    fn cblas_sgemm(
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_accelerate(
         order: CblasInt,
         transa: CblasInt,
         transb: CblasInt,
@@ -509,10 +723,122 @@ unsafe extern "C" {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    not(all(feature = "blas-openblas", jx_openblas_available))
+))]
 #[link(name = "blas")]
 unsafe extern "C" {
-    fn cblas_sgemm(
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_blas(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    not(jx_openblas_link_openblas0)
+))]
+#[link(name = "openblas")]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    jx_openblas_link_openblas0
+))]
+#[link(name = "openblas.0")]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    not(jx_openblas_link_openblas0)
+))]
+#[link(name = "openblas")]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    jx_openblas_link_openblas0
+))]
+#[link(name = "openblas.0")]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
         order: CblasInt,
         transa: CblasInt,
         transb: CblasInt,
@@ -533,7 +859,8 @@ unsafe extern "C" {
 #[cfg(target_os = "windows")]
 #[link(name = "libopenblas")]
 unsafe extern "C" {
-    fn cblas_sgemm(
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
         order: CblasInt,
         transa: CblasInt,
         transb: CblasInt,
@@ -549,6 +876,105 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: CblasInt,
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn cblas_sgemm_dispatch(
+    order: CblasInt,
+    transa: CblasInt,
+    transb: CblasInt,
+    m: CblasInt,
+    n: CblasInt,
+    k: CblasInt,
+    alpha: f32,
+    a: *const f32,
+    lda: CblasInt,
+    b: *const f32,
+    ldb: CblasInt,
+    beta: f32,
+    c: *mut f32,
+    ldc: CblasInt,
+) {
+    match selected_sgemm_backend() {
+        SgemmBackend::Accelerate => {
+            #[cfg(target_os = "macos")]
+            {
+                cblas_sgemm_accelerate(
+                    order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+                );
+                return;
+            }
+        }
+        SgemmBackend::OpenBlas => {
+            #[cfg(any(
+                target_os = "windows",
+                all(feature = "blas-openblas", jx_openblas_available)
+            ))]
+            {
+                cblas_sgemm_openblas(
+                    order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+                );
+                return;
+            }
+        }
+        SgemmBackend::Blas => {
+            #[cfg(all(
+                target_os = "linux",
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                cblas_sgemm_blas(
+                    order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+                );
+                return;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        cblas_sgemm_accelerate(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    {
+        cblas_sgemm_openblas(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_sgemm_blas(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        cblas_sgemm_openblas(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+}
+
+#[pyfunction]
+pub fn rust_sgemm_backend() -> String {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        match selected_sgemm_backend() {
+            SgemmBackend::Accelerate => "accelerate".to_string(),
+            SgemmBackend::OpenBlas => "openblas".to_string(),
+            SgemmBackend::Blas => "blas".to_string(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unsupported".to_string()
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -576,7 +1002,7 @@ fn grm_rankk_update_cblas(
             // `block` is row-major (cur_rows, n), which is layout-equivalent to
             // a column-major matrix with shape (n, cur_rows). Use col-major GEMM
             // to compute: tmp = block^T @ block == A @ A^T.
-            cblas_sgemm(
+            cblas_sgemm_dispatch(
                 CBLAS_COL_MAJOR,
                 CBLAS_NO_TRANS,
                 CBLAS_TRANS,
@@ -598,7 +1024,7 @@ fn grm_rankk_update_cblas(
         }
     } else {
         unsafe {
-            cblas_sgemm(
+            cblas_sgemm_dispatch(
                 CBLAS_COL_MAJOR,
                 CBLAS_NO_TRANS,
                 CBLAS_TRANS,
@@ -1175,7 +1601,7 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                         unsafe {
                             // `blk_slice` is row-major (cur_rows, n_out), which is layout-equivalent
                             // to col-major (n_out, cur_rows). Compute tmp = blk^T @ vec.
-                            cblas_sgemm(
+                            cblas_sgemm_dispatch(
                                 CBLAS_COL_MAJOR,
                                 CBLAS_NO_TRANS,
                                 CBLAS_NO_TRANS,
@@ -1191,7 +1617,7 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                                 tmp1.as_mut_ptr(),
                                 n_out as CblasInt,
                             );
-                            cblas_sgemm(
+                            cblas_sgemm_dispatch(
                                 CBLAS_COL_MAJOR,
                                 CBLAS_NO_TRANS,
                                 CBLAS_NO_TRANS,
@@ -1434,7 +1860,7 @@ pub fn packed_malpha_f64<'py>(
                             // col-major (n_out, cur_rows). We need:
                             // out_blk = blk_slice @ alpha
                             // -> out_blk(col-major cur_rows x 1) = A^T (cur_rows x n_out) * alpha (n_out x 1)
-                            cblas_sgemm(
+                            cblas_sgemm_dispatch(
                                 CBLAS_COL_MAJOR,
                                 CBLAS_TRANS,
                                 CBLAS_NO_TRANS,
@@ -1609,6 +2035,11 @@ pub fn grm_packed_f32<'py>(
         if full_sample_fast { 0 } else { n_samples },
         threads,
     );
+    let block_target_mb = std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(64.0_f64);
+    let stage_timing = _env_truthy("JX_GRM_PACKED_STAGE_TIMING");
     let notify_step = if progress_every == 0 {
         row_step
     } else {
@@ -1629,120 +2060,236 @@ pub fn grm_packed_f32<'py>(
 
     let grm_vec = py
         .detach(move || -> Result<Vec<f32>, String> {
+            let total_t0 = Instant::now();
+            let mut decode_secs = 0.0_f64;
+            let mut gemm_secs = 0.0_f64;
             let mut grm = vec![0.0_f32; n * n];
-            let mut block = vec![0.0_f32; row_step * n];
             let mut varsum_acc = varsum_full;
             let eps = 1e-12_f32;
             let byte_lut = packed_byte_lut();
 
-            for row_start in (0..m).step_by(row_step) {
-                let row_end = (row_start + row_step).min(m);
-                let cur_rows = row_end - row_start;
-                let cur_block = &mut block[..cur_rows * n];
-                let mut block_varsum = vec![0.0_f64; cur_rows];
+            let mut block_a = vec![0.0_f32; row_step * n];
+            let mut block_b = vec![0.0_f32; row_step * n];
+            let mut varsum_a = vec![0.0_f64; row_step];
+            let mut varsum_b = vec![0.0_f64; row_step];
+            // Default strategy: always use dual-buffer overlap when there is
+            // enough work and more than one thread.
+            let pipeline_overlap = (threads != 1) && (m > row_step);
 
-                let mut decode_run = || {
-                    if full_sample_fast {
-                        cur_block
-                            .par_chunks_mut(n)
-                            .zip(block_varsum.par_iter_mut())
-                            .enumerate()
-                            .for_each(|(off, (out_row, row_varsum_dst))| {
-                                let idx = row_start + off;
-                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                let flip = row_flip_vec[idx];
-                                let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                                let mean_g = 2.0_f32 * p;
-                                let var = 2.0_f32 * p * (1.0_f32 - p);
-                                let std_scale = if method == 2 {
-                                    if var > eps {
-                                        1.0_f32 / var.sqrt()
-                                    } else {
-                                        0.0_f32
-                                    }
-                                } else {
-                                    1.0_f32
-                                };
-                                let value_lut: [f32; 4] = if flip {
-                                    [
-                                        (2.0_f32 - mean_g) * std_scale,
-                                        0.0_f32, // missing -> mean imputation => centered 0
-                                        (1.0_f32 - mean_g) * std_scale,
-                                        (0.0_f32 - mean_g) * std_scale,
-                                    ]
-                                } else {
-                                    [
-                                        (0.0_f32 - mean_g) * std_scale,
-                                        0.0_f32, // missing -> mean imputation => centered 0
-                                        (1.0_f32 - mean_g) * std_scale,
-                                        (2.0_f32 - mean_g) * std_scale,
-                                    ]
-                                };
-                                decode_row_centered_full_lut(
-                                    row,
-                                    n_samples,
-                                    &byte_lut.code4,
-                                    &value_lut,
-                                    out_row,
-                                );
-                                if method == 1 {
-                                    *row_varsum_dst = var as f64;
-                                }
-                            });
-                    } else {
-                        cur_block
-                            .par_chunks_mut(n)
-                            .zip(block_varsum.par_iter_mut())
-                            .enumerate()
-                            .for_each_init(
-                                || vec![0.0_f32; n_samples],
-                                |full_row, (off, (out_row, row_varsum_dst))| {
-                                    let idx = row_start + off;
-                                    let row =
-                                        &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                    let flip = row_flip_vec[idx];
-                                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                                    let default_mean_g = 2.0_f32 * p;
-                                    let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
-                                        row,
+            let mut cur_start = 0usize;
+            let mut cur_end = row_step.min(m);
+            let mut use_a = true;
+            let mut last_notified = 0usize;
+
+            let decode_t0 = Instant::now();
+            decode_grm_block(
+                packed_flat.as_ref(),
+                bytes_per_snp,
+                n_samples,
+                row_flip_vec.as_ref(),
+                row_maf_vec.as_ref(),
+                &sample_idx,
+                full_sample_fast,
+                method,
+                eps,
+                &byte_lut.code4,
+                cur_start,
+                cur_end,
+                n,
+                &mut block_a,
+                &mut varsum_a,
+                pool.as_ref(),
+            )?;
+            decode_secs += decode_t0.elapsed().as_secs_f64();
+
+            loop {
+                let cur_rows = cur_end.saturating_sub(cur_start);
+                if cur_rows == 0 {
+                    break;
+                }
+                let next_start = cur_end;
+                let next_end = (next_start + row_step).min(m);
+                let has_next = next_start < m;
+
+                if pipeline_overlap && has_next {
+                    if use_a {
+                        let (gemm_dt, decode_dt) =
+                            std::thread::scope(|scope| -> Result<(f64, f64), String> {
+                                let decode_handle = scope.spawn(|| {
+                                    let dt0 = Instant::now();
+                                    let r = decode_grm_block(
+                                        packed_flat.as_ref(),
+                                        bytes_per_snp,
                                         n_samples,
+                                        row_flip_vec.as_ref(),
+                                        row_maf_vec.as_ref(),
                                         &sample_idx,
-                                        flip,
-                                        default_mean_g,
+                                        full_sample_fast,
                                         method,
                                         eps,
                                         &byte_lut.code4,
-                                        full_row.as_mut_slice(),
-                                        out_row,
+                                        next_start,
+                                        next_end,
+                                        n,
+                                        &mut block_b,
+                                        &mut varsum_b,
+                                        pool.as_ref(),
                                     );
-                                    if method == 1 {
-                                        *row_varsum_dst = var_centered;
-                                    }
-                                },
-                            );
+                                    (r, dt0.elapsed().as_secs_f64())
+                                });
+
+                                let gt0 = Instant::now();
+                                let gemm_res = grm_rankk_update(
+                                    &mut grm,
+                                    &block_a[..cur_rows * n],
+                                    cur_rows,
+                                    n,
+                                    cblas_copy_rhs,
+                                    cblas_beta_zero_accum,
+                                );
+                                let gemm_dt = gt0.elapsed().as_secs_f64();
+
+                                let (decode_res, decode_dt) = decode_handle
+                                    .join()
+                                    .map_err(|_| "decode worker thread panicked".to_string())?;
+                                gemm_res?;
+                                decode_res?;
+                                Ok((gemm_dt, decode_dt))
+                            })?;
+                        gemm_secs += gemm_dt;
+                        decode_secs += decode_dt;
+                        if method == 1 && !full_sample_fast {
+                            varsum_acc += varsum_a[..cur_rows].iter().sum::<f64>();
+                        }
+                    } else {
+                        let (gemm_dt, decode_dt) =
+                            std::thread::scope(|scope| -> Result<(f64, f64), String> {
+                                let decode_handle = scope.spawn(|| {
+                                    let dt0 = Instant::now();
+                                    let r = decode_grm_block(
+                                        packed_flat.as_ref(),
+                                        bytes_per_snp,
+                                        n_samples,
+                                        row_flip_vec.as_ref(),
+                                        row_maf_vec.as_ref(),
+                                        &sample_idx,
+                                        full_sample_fast,
+                                        method,
+                                        eps,
+                                        &byte_lut.code4,
+                                        next_start,
+                                        next_end,
+                                        n,
+                                        &mut block_a,
+                                        &mut varsum_a,
+                                        pool.as_ref(),
+                                    );
+                                    (r, dt0.elapsed().as_secs_f64())
+                                });
+
+                                let gt0 = Instant::now();
+                                let gemm_res = grm_rankk_update(
+                                    &mut grm,
+                                    &block_b[..cur_rows * n],
+                                    cur_rows,
+                                    n,
+                                    cblas_copy_rhs,
+                                    cblas_beta_zero_accum,
+                                );
+                                let gemm_dt = gt0.elapsed().as_secs_f64();
+
+                                let (decode_res, decode_dt) = decode_handle
+                                    .join()
+                                    .map_err(|_| "decode worker thread panicked".to_string())?;
+                                gemm_res?;
+                                decode_res?;
+                                Ok((gemm_dt, decode_dt))
+                            })?;
+                        gemm_secs += gemm_dt;
+                        decode_secs += decode_dt;
+                        if method == 1 && !full_sample_fast {
+                            varsum_acc += varsum_b[..cur_rows].iter().sum::<f64>();
+                        }
                     }
-                };
-
-                if let Some(tp) = &pool {
-                    tp.install(&mut decode_run);
                 } else {
-                    decode_run();
+                    if use_a {
+                        let gemm_t0 = Instant::now();
+                        grm_rankk_update(
+                            &mut grm,
+                            &block_a[..cur_rows * n],
+                            cur_rows,
+                            n,
+                            cblas_copy_rhs,
+                            cblas_beta_zero_accum,
+                        )?;
+                        gemm_secs += gemm_t0.elapsed().as_secs_f64();
+                        if method == 1 && !full_sample_fast {
+                            varsum_acc += varsum_a[..cur_rows].iter().sum::<f64>();
+                        }
+                        if has_next {
+                            let decode_t0 = Instant::now();
+                            decode_grm_block(
+                                packed_flat.as_ref(),
+                                bytes_per_snp,
+                                n_samples,
+                                row_flip_vec.as_ref(),
+                                row_maf_vec.as_ref(),
+                                &sample_idx,
+                                full_sample_fast,
+                                method,
+                                eps,
+                                &byte_lut.code4,
+                                next_start,
+                                next_end,
+                                n,
+                                &mut block_b,
+                                &mut varsum_b,
+                                pool.as_ref(),
+                            )?;
+                            decode_secs += decode_t0.elapsed().as_secs_f64();
+                        }
+                    } else {
+                        let gemm_t0 = Instant::now();
+                        grm_rankk_update(
+                            &mut grm,
+                            &block_b[..cur_rows * n],
+                            cur_rows,
+                            n,
+                            cblas_copy_rhs,
+                            cblas_beta_zero_accum,
+                        )?;
+                        gemm_secs += gemm_t0.elapsed().as_secs_f64();
+                        if method == 1 && !full_sample_fast {
+                            varsum_acc += varsum_b[..cur_rows].iter().sum::<f64>();
+                        }
+                        if has_next {
+                            let decode_t0 = Instant::now();
+                            decode_grm_block(
+                                packed_flat.as_ref(),
+                                bytes_per_snp,
+                                n_samples,
+                                row_flip_vec.as_ref(),
+                                row_maf_vec.as_ref(),
+                                &sample_idx,
+                                full_sample_fast,
+                                method,
+                                eps,
+                                &byte_lut.code4,
+                                next_start,
+                                next_end,
+                                n,
+                                &mut block_a,
+                                &mut varsum_a,
+                                pool.as_ref(),
+                            )?;
+                            decode_secs += decode_t0.elapsed().as_secs_f64();
+                        }
+                    }
                 }
 
-                grm_rankk_update(
-                    &mut grm,
-                    cur_block,
-                    cur_rows,
-                    n,
-                    cblas_copy_rhs,
-                    cblas_beta_zero_accum,
-                )?;
-                if method == 1 && !full_sample_fast {
-                    varsum_acc += block_varsum.iter().sum::<f64>();
-                }
-
-                let done = row_end;
-                if (done % notify_step == 0) || (done == m) {
+                let done = cur_end;
+                if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
+                    last_notified = done;
                     if let Some(cb) = progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;
@@ -1754,6 +2301,13 @@ pub fn grm_packed_f32<'py>(
                         Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
                     }
                 }
+
+                if !has_next {
+                    break;
+                }
+                cur_start = next_start;
+                cur_end = next_end;
+                use_a = !use_a;
             }
 
             let scale = if method == 1 {
@@ -1779,6 +2333,42 @@ pub fn grm_packed_f32<'py>(
                     grm[idx_ji] = v;
                 }
             }
+            if stage_timing {
+                let total_secs = total_t0.elapsed().as_secs_f64();
+                let stage_sum = decode_secs + gemm_secs;
+                let overlap_secs = (stage_sum - total_secs).max(0.0_f64);
+                let other_secs = if stage_sum <= total_secs {
+                    total_secs - stage_sum
+                } else {
+                    0.0_f64
+                };
+                let to_pct = |x: f64| -> f64 {
+                    if total_secs > 0.0 {
+                        x * 100.0 / total_secs
+                    } else {
+                        0.0
+                    }
+                };
+                eprintln!(
+                    "GRM stage timing: decode={:.3}s ({:.1}%), gemm={:.3}s ({:.1}%), \
+other={:.3}s ({:.1}%), overlap={:.3}s ({:.1}%), total={:.3}s, row_step={}, \
+block_target_mb={:.1}, n_samples={}, full_sample={}, threads={}",
+                    decode_secs,
+                    to_pct(decode_secs),
+                    gemm_secs,
+                    to_pct(gemm_secs),
+                    other_secs,
+                    to_pct(other_secs),
+                    overlap_secs,
+                    to_pct(overlap_secs),
+                    total_secs,
+                    row_step,
+                    block_target_mb,
+                    n,
+                    if full_sample_fast { "yes" } else { "no" },
+                    if threads > 0 { threads } else { rayon::current_num_threads() }
+                );
+            }
             Ok(grm)
         })
         .map_err(_map_err_string_to_py)?;
@@ -1790,6 +2380,141 @@ pub fn grm_packed_f32<'py>(
     )
     .into_bound();
     Ok(grm_arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    method=1,
+    maf_threshold=0.02,
+    max_missing_rate=0.05,
+    block_cols=2048,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn grm_packed_bed_f32<'py>(
+    py: Python<'py>,
+    prefix: String,
+    method: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, usize)> {
+    let (packed_arr, miss_arr, maf_arr, _std_arr, n_samples) =
+        crate::gfreader::load_bed_2bit_packed(py, prefix)?;
+
+    let miss_ro = miss_arr.readonly();
+    let miss_vec: Vec<f32> = match miss_ro.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => miss_ro.as_array().iter().copied().collect(),
+    };
+    let maf_ro = maf_arr.readonly();
+    let maf_vec: Vec<f32> = match maf_ro.as_slice() {
+        Ok(s) => s.to_vec(),
+        Err(_) => maf_ro.as_array().iter().copied().collect(),
+    };
+    if miss_vec.len() != maf_vec.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed BED stat length mismatch: miss={}, maf={}",
+            miss_vec.len(),
+            maf_vec.len()
+        )));
+    }
+    let m_total = maf_vec.len();
+    if m_total == 0 {
+        return Err(PyRuntimeError::new_err(
+            "No SNPs found in packed BED input.",
+        ));
+    }
+
+    let maf_thr = maf_threshold.clamp(0.0, 0.5);
+    let miss_thr = max_missing_rate.clamp(0.0, 1.0);
+    let mut keep_idx: Vec<usize> = Vec::with_capacity(m_total);
+    for i in 0..m_total {
+        let maf_i = maf_vec[i];
+        if maf_i < maf_thr || maf_i > (1.0 - maf_thr) {
+            continue;
+        }
+        if miss_vec[i] > miss_thr {
+            continue;
+        }
+        keep_idx.push(i);
+    }
+    if keep_idx.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "No SNPs remained after packed BED filtering; GRM is empty.",
+        ));
+    }
+    let eff_m = keep_idx.len();
+
+    if eff_m == m_total {
+        let row_flip = bed_packed_row_flip_mask(py, packed_arr.readonly(), n_samples)?;
+        let grm = grm_packed_f32(
+            py,
+            packed_arr.readonly(),
+            n_samples,
+            row_flip.readonly(),
+            maf_arr.readonly(),
+            None,
+            method,
+            block_cols,
+            threads,
+            progress_callback,
+            progress_every,
+        )?;
+        return Ok((grm, eff_m, n_samples));
+    }
+
+    let packed_ro = packed_arr.readonly();
+    let packed_view = packed_ro.as_array();
+    if packed_view.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed BED payload must be 2D (m, bytes_per_snp).",
+        ));
+    }
+    let bytes_per_snp = packed_view.shape()[1];
+    let packed_slice: Cow<[u8]> = match packed_ro.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
+    };
+
+    let mut packed_keep = vec![0_u8; eff_m * bytes_per_snp];
+    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+        let src_off = src_row * bytes_per_snp;
+        let dst_off = dst_row * bytes_per_snp;
+        packed_keep[dst_off..dst_off + bytes_per_snp]
+            .copy_from_slice(&packed_slice[src_off..src_off + bytes_per_snp]);
+    }
+    let maf_keep: Vec<f32> = keep_idx.iter().map(|&i| maf_vec[i]).collect();
+
+    let packed_keep_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((eff_m, bytes_per_snp), packed_keep)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let maf_keep_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
+
+    let row_flip = bed_packed_row_flip_mask(py, packed_keep_arr.readonly(), n_samples)?;
+    let grm = grm_packed_f32(
+        py,
+        packed_keep_arr.readonly(),
+        n_samples,
+        row_flip.readonly(),
+        maf_keep_arr.readonly(),
+        None,
+        method,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+    )?;
+    Ok((grm, eff_m, n_samples))
 }
 
 #[pyfunction]
@@ -1941,6 +2666,7 @@ pub fn grm_packed_f32_with_stats<'py>(
             let byte_lut = packed_byte_lut();
             let mut row_sum_all = vec![0.0_f64; m];
 
+            let mut last_notified = 0usize;
             for row_start in (0..m).step_by(row_step) {
                 let row_end = (row_start + row_step).min(m);
                 let cur_rows = row_end - row_start;
@@ -2054,7 +2780,8 @@ pub fn grm_packed_f32_with_stats<'py>(
                 row_sum_all[row_start..row_end].copy_from_slice(&block_rowsum);
 
                 let done = row_end;
-                if (done % notify_step == 0) || (done == m) {
+                if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
+                    last_notified = done;
                     if let Some(cb) = progress_callback.as_ref() {
                         Python::attach(|py2| -> PyResult<()> {
                             py2.check_signals()?;

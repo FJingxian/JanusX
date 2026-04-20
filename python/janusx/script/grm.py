@@ -34,7 +34,6 @@ import numpy as np
 import psutil
 from janusx.gfreader import (
     load_genotype_chunks,
-    load_bed_2bit_packed,
     inspect_genotype_file,
     auto_mmap_window_mb,
 )
@@ -53,15 +52,19 @@ from ._common.progress import ProgressAdapter
 from ._common.status import format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source as _determine_genotype_source
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 try:
     from janusx.janusx import (
-        bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
-        grm_packed_f32 as _grm_packed_f32,
+        grm_packed_bed_f32 as _grm_packed_bed_f32,
     )
 except Exception:
-    _bed_packed_row_flip_mask = None
-    _grm_packed_f32 = None
+    _grm_packed_bed_f32 = None
 
 
 def build_grm_streaming(
@@ -183,12 +186,15 @@ def build_grm_packed_bed(
     maf_threshold: float,
     max_missing_rate: float,
     chunk_size: int,
+    threads: int,
+    block_target_mb: Union[float, None],
+    stage_timing: bool,
     logger,
 ) -> tuple[np.ndarray, int]:
-    if (_grm_packed_f32 is None) or (_bed_packed_row_flip_mask is None):
+    if _grm_packed_bed_f32 is None:
         raise RuntimeError(
-            "Packed GRM kernel is unavailable. Rebuild JanusX extension to export "
-            "`grm_packed_f32` and `bed_packed_row_flip_mask`."
+            "Packed BED GRM kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_packed_bed_f32`."
         )
 
     pbar = ProgressAdapter(
@@ -212,46 +218,58 @@ def build_grm_packed_bed(
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
+    prev_block_target = os.environ.get("JX_GRM_PACKED_BLOCK_TARGET_MB")
+    prev_stage_timing = os.environ.get("JX_GRM_PACKED_STAGE_TIMING")
+    block_target_set = False
+    stage_timing_set = False
+    if block_target_mb is not None:
+        try:
+            bt = float(block_target_mb)
+        except Exception:
+            logger.warning(
+                f"Invalid --block-target-mb={block_target_mb}; fallback to runtime default."
+            )
+        else:
+            if np.isfinite(bt) and bt > 0:
+                os.environ["JX_GRM_PACKED_BLOCK_TARGET_MB"] = f"{bt:.6g}"
+                block_target_set = True
+            else:
+                logger.warning(
+                    f"Non-positive --block-target-mb={block_target_mb}; fallback to runtime default."
+                )
+    if bool(stage_timing):
+        os.environ["JX_GRM_PACKED_STAGE_TIMING"] = "1"
+        stage_timing_set = True
+
     try:
-        packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(genofile)
-        if int(packed_n) != int(n_samples):
-            raise RuntimeError(
-                f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
+        try:
+            grm_raw, eff_m, packed_n = _grm_packed_bed_f32(
+                str(genofile),
+                method=int(method),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                block_cols=max(1, int(chunk_size)),
+                threads=max(1, int(threads)),
+                progress_callback=_progress_cb,
+                progress_every=max(1, int(chunk_size)),
             )
-        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-        miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-        maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-        keep = np.ones(maf.shape[0], dtype=np.bool_)
-        maf_thr = float(maf_threshold)
-        if maf_thr > 0.0:
-            keep &= (maf >= maf_thr) & (maf <= (1.0 - maf_thr))
-        keep &= (miss <= float(max_missing_rate))
-        if not np.any(keep):
-            raise RuntimeError("No SNPs remained after packed BED filtering; GRM is empty.")
-        if not bool(np.all(keep)):
-            packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
-            maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
-        eff_m = int(packed.shape[0])
-        row_flip = np.ascontiguousarray(
-            np.asarray(_bed_packed_row_flip_mask(packed, int(n_samples)), dtype=np.bool_).reshape(-1)
-        )
-        grm = np.ascontiguousarray(
-            np.asarray(
-                _grm_packed_f32(
-                    packed,
-                    int(n_samples),
-                    row_flip,
-                    maf,
-                    sample_indices=None,
-                    method=int(method),
-                    block_cols=max(1, int(chunk_size)),
-                    threads=0,
-                    progress_callback=_progress_cb,
-                    progress_every=max(1, int(chunk_size)),
-                ),
-                dtype=np.float32,
-            )
-        )
+            if int(packed_n) != int(n_samples):
+                raise RuntimeError(
+                    f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
+                )
+            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+            eff_m = int(eff_m)
+        finally:
+            if block_target_set:
+                if prev_block_target is None:
+                    os.environ.pop("JX_GRM_PACKED_BLOCK_TARGET_MB", None)
+                else:
+                    os.environ["JX_GRM_PACKED_BLOCK_TARGET_MB"] = prev_block_target
+            if stage_timing_set:
+                if prev_stage_timing is None:
+                    os.environ.pop("JX_GRM_PACKED_STAGE_TIMING", None)
+                else:
+                    os.environ["JX_GRM_PACKED_STAGE_TIMING"] = prev_stage_timing
     finally:
         pbar.finish()
         pbar.close()
@@ -310,6 +328,10 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
+        "-t", "--thread", type=int, default=detect_effective_threads(),
+        help="Number of CPU threads (default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-o", "--out", type=str, default=".",
         help="Output directory for results (default: current directory).",
     )
@@ -340,6 +362,19 @@ def main(log: bool = True):
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "--block-target-mb", type=float, default=None,
+        help=(
+            "Target temporary working-set size (MB) for packed-BED GRM auto block tuning. "
+            "Larger values may improve compute utilization at the cost of memory."
+        ),
+    )
+    optional_group.add_argument(
+        "--stage-timing", action="store_true", default=False,
+        help=(
+            "Print packed-BED GRM stage timing breakdown (decode/GEMM/other) from Rust kernel."
+        ),
+    )
+    optional_group.add_argument(
         "-mmap-limit", "--mmap-limit", action="store_true", default=False,
         help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
     )
@@ -349,6 +384,14 @@ def main(log: bool = True):
     )
 
     args = parser.parse_args()
+    detected_threads = detect_effective_threads()
+    requested_threads = int(args.thread)
+    thread_capped = False
+    if int(args.thread) <= 0:
+        args.thread = int(detected_threads)
+    if int(args.thread) > int(detected_threads):
+        thread_capped = True
+        args.thread = int(detected_threads)
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
@@ -372,6 +415,16 @@ def main(log: bool = True):
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.grm.log"
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
 
     if log:
         emit_cli_configuration(
@@ -388,6 +441,9 @@ def main(log: bool = True):
                         ("MAF threshold", args.maf),
                         ("Missing rate", args.geno),
                         ("Chunk size", args.chunksize),
+                        ("Block target MB", "default(64)" if args.block_target_mb is None else args.block_target_mb),
+                        ("Stage timing", args.stage_timing),
+                        ("Threads", f"{args.thread} ({detected_threads} available)"),
                         ("Mmap limit", args.mmap_limit),
                         ("Save as NPY", args.npy),
                     ],
@@ -426,11 +482,14 @@ def main(log: bool = True):
 
     use_packed_kernel = bool(
         bool(args.bfile)
-        and (_grm_packed_f32 is not None)
-        and (_bed_packed_row_flip_mask is not None)
+        and (_grm_packed_bed_f32 is not None)
     )
     if use_packed_kernel:
-        logger.info("GRM backend: packed BED kernel (Rust grm_packed_f32).")
+        logger.info("GRM backend: packed BED kernel (Rust grm_packed_bed_f32).")
+        if args.block_target_mb is not None:
+            logger.info(f"Packed GRM block target override: {float(args.block_target_mb):.6g} MB.")
+        if bool(args.stage_timing):
+            logger.info("Packed GRM stage timing is enabled (decode/GEMM/other).")
         try:
             grm, eff_m = build_grm_packed_bed(
                 genofile=gfile,
@@ -440,6 +499,9 @@ def main(log: bool = True):
                 maf_threshold=maf_threshold,
                 max_missing_rate=max_missing_rate,
                 chunk_size=chunk_size,
+                threads=int(args.thread),
+                block_target_mb=args.block_target_mb,
+                stage_timing=bool(args.stage_timing),
                 logger=logger,
             )
         except Exception as ex:

@@ -2129,7 +2129,7 @@ def build_grm_streaming(
                         sample_indices=None,
                         method=int(method),
                         block_cols=max(1, int(chunk_size)),
-                        threads=0,
+                        threads=int(threads),
                         progress_callback=_on_packed_progress,
                         progress_every=max(1, int(chunk_size)),
                     ),

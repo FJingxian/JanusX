@@ -28,6 +28,7 @@ Type conventions
 from __future__ import annotations
 
 import time
+import os
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
@@ -483,7 +484,19 @@ def lmm_reml_from_snp(
     """
     REML-based LMM scan on raw SNP chunk with Rust-side rotation + association.
     """
-    if _lmm_reml_chunk_from_snp_f32 is None:
+    mode = str(os.environ.get("JX_LMM_FROM_SNP_BACKEND", "auto")).strip().lower()
+    m_chunk = int(np.asarray(snp_chunk).shape[0])
+    n = int(np.asarray(snp_chunk).shape[1])
+    use_py_rotate = False
+    if mode in {"py", "numpy", "python"}:
+        use_py_rotate = True
+    elif mode in {"rust", "native"}:
+        use_py_rotate = False
+    else:
+        # Auto: for large dense chunks, NumPy/BLAS rotation is usually faster.
+        use_py_rotate = (n >= 512) and (m_chunk >= 2048)
+
+    if (_lmm_reml_chunk_from_snp_f32 is None) or use_py_rotate:
         # Backward compatibility: extension not rebuilt yet.
         snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
         u_t = np.ascontiguousarray(u_t, dtype=np.float32)
@@ -914,7 +927,18 @@ def lmm_assoc_fixed_from_snp(
     """
     Fixed-lambda LMM scan on raw SNP chunk with Rust-side rotation + association.
     """
-    if _lmm_assoc_chunk_from_snp_f32 is None:
+    mode = str(os.environ.get("JX_LMM_FROM_SNP_BACKEND", "auto")).strip().lower()
+    m_chunk = int(np.asarray(snp_chunk).shape[0])
+    n = int(np.asarray(snp_chunk).shape[1])
+    use_py_rotate = False
+    if mode in {"py", "numpy", "python"}:
+        use_py_rotate = True
+    elif mode in {"rust", "native"}:
+        use_py_rotate = False
+    else:
+        use_py_rotate = (n >= 512) and (m_chunk >= 2048)
+
+    if (_lmm_assoc_chunk_from_snp_f32 is None) or use_py_rotate:
         # Backward compatibility: extension not rebuilt yet.
         snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
         u_t = np.ascontiguousarray(u_t, dtype=np.float32)

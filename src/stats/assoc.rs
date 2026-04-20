@@ -365,6 +365,120 @@ fn decode_row_centered_full_lut(
     }
 }
 
+#[inline]
+fn adaptive_grm_block_rows(
+    requested_block_rows: usize,
+    m: usize,
+    n_out: usize,
+    subset_full_scratch_len: usize,
+    threads: usize,
+) -> usize {
+    let base = requested_block_rows.max(1).min(m.max(1));
+    let target_mb = std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(64.0_f64);
+    if !(target_mb.is_finite() && target_mb > 0.0) {
+        return base;
+    }
+    let target_bytes = (target_mb * 1024.0_f64 * 1024.0_f64) as usize;
+    if target_bytes == 0 {
+        return base;
+    }
+    let workers = if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+    };
+    let reserve_bytes = subset_full_scratch_len
+        .saturating_mul(4)
+        .saturating_mul(workers.max(1));
+    let row_bytes = n_out.saturating_mul(4).max(1);
+    if reserve_bytes >= target_bytes {
+        return 1;
+    }
+    let cap_rows = ((target_bytes - reserve_bytes) / row_bytes).max(1);
+    base.min(cap_rows)
+}
+
+#[inline]
+fn decode_subset_row_from_full_scratch(
+    row: &[u8],
+    n_samples: usize,
+    sample_idx: &[usize],
+    flip: bool,
+    default_mean_g: f32,
+    method: usize,
+    eps: f32,
+    code4_lut: &[[u8; 4]; 256],
+    full_row: &mut [f32],
+    out_row: &mut [f32],
+) -> (f64, f64) {
+    debug_assert!(full_row.len() >= n_samples);
+    debug_assert_eq!(out_row.len(), sample_idx.len());
+    let n = sample_idx.len();
+
+    // Decode full row once into per-thread scratch:
+    // non-missing => {0,1,2}, missing => -9.
+    let value_lut: [f32; 4] = if flip {
+        [2.0_f32, -9.0_f32, 1.0_f32, 0.0_f32]
+    } else {
+        [0.0_f32, -9.0_f32, 1.0_f32, 2.0_f32]
+    };
+    decode_row_centered_full_lut(
+        row,
+        n_samples,
+        code4_lut,
+        &value_lut,
+        &mut full_row[..n_samples],
+    );
+
+    let mut obs_n: usize = 0;
+    let mut obs_sum = 0.0_f64;
+    let mut obs_sq = 0.0_f64;
+    for (j, &sid) in sample_idx.iter().enumerate() {
+        let gv = full_row[sid];
+        out_row[j] = gv;
+        if gv >= 0.0_f32 {
+            let g = gv as f64;
+            obs_n += 1;
+            obs_sum += g;
+            obs_sq += g * g;
+        }
+    }
+
+    let (mean_g, var_centered, var_standardized) = if obs_n > 0 {
+        let mean = obs_sum / obs_n as f64;
+        let p_sub = (0.5_f64 * mean).clamp(0.0, 1.0);
+        let v_std = (2.0_f64 * p_sub * (1.0_f64 - p_sub)).max(0.0);
+        let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
+        // Match subset semantics with mean-imputation on selected samples.
+        let v_center = (ss / n as f64).max(0.0);
+        (mean as f32, v_center as f32, v_std as f32)
+    } else {
+        (default_mean_g, 0.0_f32, 0.0_f32)
+    };
+
+    let std_scale = if method == 2 {
+        if var_standardized > eps {
+            1.0_f32 / var_standardized.sqrt()
+        } else {
+            0.0_f32
+        }
+    } else {
+        1.0_f32
+    };
+    for v in out_row.iter_mut() {
+        let gv = if *v >= 0.0_f32 { *v } else { mean_g };
+        *v = (gv - mean_g) * std_scale;
+    }
+
+    let row_sum = (mean_g as f64) * (n as f64);
+    (var_centered as f64, row_sum)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 type CblasInt = std::os::raw::c_int;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1488,7 +1602,13 @@ pub fn grm_packed_f32<'py>(
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
     let pool = get_cached_pool(threads)?;
-    let row_step = block_cols.max(1).min(m.max(1));
+    let row_step = adaptive_grm_block_rows(
+        block_cols.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        threads,
+    );
     let notify_step = if progress_every == 0 {
         row_step
     } else {
@@ -1522,18 +1642,17 @@ pub fn grm_packed_f32<'py>(
                 let mut block_varsum = vec![0.0_f64; cur_rows];
 
                 let mut decode_run = || {
-                    cur_block
-                        .par_chunks_mut(n)
-                        .zip(block_varsum.par_iter_mut())
-                        .enumerate()
-                        .for_each(|(off, (out_row, row_varsum_dst))| {
-                            let idx = row_start + off;
-                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let flip = row_flip_vec[idx];
-                            let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                            let default_mean_g = 2.0_f32 * p;
-                            if full_sample_fast {
-                                let mean_g = default_mean_g;
+                    if full_sample_fast {
+                        cur_block
+                            .par_chunks_mut(n)
+                            .zip(block_varsum.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(off, (out_row, row_varsum_dst))| {
+                                let idx = row_start + off;
+                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[idx];
+                                let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                                let mean_g = 2.0_f32 * p;
                                 let var = 2.0_f32 * p * (1.0_f32 - p);
                                 let std_scale = if method == 2 {
                                     if var > eps {
@@ -1566,65 +1685,42 @@ pub fn grm_packed_f32<'py>(
                                     &value_lut,
                                     out_row,
                                 );
-                            } else {
-                                let mut obs_n: usize = 0;
-                                let mut obs_sum = 0.0_f64;
-                                let mut obs_sq = 0.0_f64;
-                                for &sid in sample_idx.iter() {
-                                    let b = row[sid >> 2];
-                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let Some(mut gv) = decode_plink_bed_hardcall(code) else {
-                                        continue;
-                                    };
-                                    if flip {
-                                        gv = 2.0_f64 - gv;
-                                    }
-                                    obs_n += 1;
-                                    obs_sum += gv;
-                                    obs_sq += gv * gv;
-                                }
-
-                                let (mean_g, var_centered, var_standardized) = if obs_n > 0 {
-                                    let mean = obs_sum / obs_n as f64;
-                                    let p_sub = (0.5_f64 * mean).clamp(0.0, 1.0);
-                                    let v_std = (2.0_f64 * p_sub * (1.0_f64 - p_sub)).max(0.0);
-                                    let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
-                                    // Match subset semantics with mean-imputed rows:
-                                    // missing entries are imputed to row mean, so they contribute
-                                    // zero centered variance across all selected samples.
-                                    let v_center = (ss / n as f64).max(0.0);
-                                    (mean as f32, v_center as f32, v_std as f32)
-                                } else {
-                                    (default_mean_g, 0.0_f32, 0.0_f32)
-                                };
                                 if method == 1 {
-                                    *row_varsum_dst = var_centered as f64;
+                                    *row_varsum_dst = var as f64;
                                 }
-                                let std_scale = if method == 2 {
-                                    if var_standardized > eps {
-                                        1.0_f32 / var_standardized.sqrt()
-                                    } else {
-                                        0.0_f32
+                            });
+                    } else {
+                        cur_block
+                            .par_chunks_mut(n)
+                            .zip(block_varsum.par_iter_mut())
+                            .enumerate()
+                            .for_each_init(
+                                || vec![0.0_f32; n_samples],
+                                |full_row, (off, (out_row, row_varsum_dst))| {
+                                    let idx = row_start + off;
+                                    let row =
+                                        &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                    let flip = row_flip_vec[idx];
+                                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                                    let default_mean_g = 2.0_f32 * p;
+                                    let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
+                                        row,
+                                        n_samples,
+                                        &sample_idx,
+                                        flip,
+                                        default_mean_g,
+                                        method,
+                                        eps,
+                                        &byte_lut.code4,
+                                        full_row.as_mut_slice(),
+                                        out_row,
+                                    );
+                                    if method == 1 {
+                                        *row_varsum_dst = var_centered;
                                     }
-                                } else {
-                                    1.0_f32
-                                };
-                                for (j, &sid) in sample_idx.iter().enumerate() {
-                                    let b = row[sid >> 2];
-                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let mut gv = match code {
-                                        0b00 => 0.0_f32,
-                                        0b10 => 1.0_f32,
-                                        0b11 => 2.0_f32,
-                                        _ => mean_g, // mean-impute missing within selected samples
-                                    };
-                                    if flip && code != 0b01 {
-                                        gv = 2.0_f32 - gv;
-                                    }
-                                    out_row[j] = (gv - mean_g) * std_scale;
-                                }
-                            }
-                        });
+                                },
+                            );
+                    }
                 };
 
                 if let Some(tp) = &pool {
@@ -1811,7 +1907,13 @@ pub fn grm_packed_f32_with_stats<'py>(
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
     let pool = get_cached_pool(threads)?;
-    let row_step = block_cols.max(1).min(m.max(1));
+    let row_step = adaptive_grm_block_rows(
+        block_cols.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        threads,
+    );
     let notify_step = if progress_every == 0 {
         row_step
     } else {
@@ -1902,70 +2004,33 @@ pub fn grm_packed_f32_with_stats<'py>(
                             .zip(block_varsum.par_iter_mut())
                             .zip(block_rowsum.par_iter_mut())
                             .enumerate()
-                            .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
-                                let idx = row_start + off;
-                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                                let flip = row_flip_vec[idx];
-                                let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                                let default_mean_g = 2.0_f32 * p;
-
-                                let mut obs_n: usize = 0;
-                                let mut obs_sum = 0.0_f64;
-                                let mut obs_sq = 0.0_f64;
-                                for &sid in sample_idx.iter() {
-                                    let b = row[sid >> 2];
-                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let Some(mut gv) = decode_plink_bed_hardcall(code) else {
-                                        continue;
-                                    };
-                                    if flip {
-                                        gv = 2.0_f64 - gv;
+                            .for_each_init(
+                                || vec![0.0_f32; n_samples],
+                                |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
+                                    let idx = row_start + off;
+                                    let row =
+                                        &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                    let flip = row_flip_vec[idx];
+                                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
+                                    let default_mean_g = 2.0_f32 * p;
+                                    let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                                        row,
+                                        n_samples,
+                                        &sample_idx,
+                                        flip,
+                                        default_mean_g,
+                                        method,
+                                        eps,
+                                        &byte_lut.code4,
+                                        full_row.as_mut_slice(),
+                                        out_row,
+                                    );
+                                    if method == 1 {
+                                        *row_varsum_dst = var_centered;
                                     }
-                                    obs_n += 1;
-                                    obs_sum += gv;
-                                    obs_sq += gv * gv;
-                                }
-
-                                let (mean_g, var_centered, var_standardized) = if obs_n > 0 {
-                                    let mean = obs_sum / obs_n as f64;
-                                    let p_sub = (0.5_f64 * mean).clamp(0.0, 1.0);
-                                    let v_std = (2.0_f64 * p_sub * (1.0_f64 - p_sub)).max(0.0);
-                                    let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
-                                    let v_center = (ss / n as f64).max(0.0);
-                                    (mean as f32, v_center as f32, v_std as f32)
-                                } else {
-                                    (default_mean_g, 0.0_f32, 0.0_f32)
-                                };
-
-                                if method == 1 {
-                                    *row_varsum_dst = var_centered as f64;
-                                }
-                                *row_sum_dst = (mean_g as f64) * (n as f64);
-
-                                let std_scale = if method == 2 {
-                                    if var_standardized > eps {
-                                        1.0_f32 / var_standardized.sqrt()
-                                    } else {
-                                        0.0_f32
-                                    }
-                                } else {
-                                    1.0_f32
-                                };
-                                for (j, &sid) in sample_idx.iter().enumerate() {
-                                    let b = row[sid >> 2];
-                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let mut gv = match code {
-                                        0b00 => 0.0_f32,
-                                        0b10 => 1.0_f32,
-                                        0b11 => 2.0_f32,
-                                        _ => mean_g, // mean-impute missing within selected samples
-                                    };
-                                    if flip && code != 0b01 {
-                                        gv = 2.0_f32 - gv;
-                                    }
-                                    out_row[j] = (gv - mean_g) * std_scale;
-                                }
-                            });
+                                    *row_sum_dst = row_sum;
+                                },
+                            );
                     }
                 };
 

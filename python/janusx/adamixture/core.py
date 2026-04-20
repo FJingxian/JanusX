@@ -80,9 +80,17 @@ def _adam_seed_init(
 
 
 def _set_thread_env(threads: int) -> None:
-    # Rust kernels are parallelized by Rayon; keep BLAS thread count low to avoid oversubscription
-    # and unnecessary memory overhead from multi-threaded BLAS workspaces.
-    th = str(max(1, int(os.environ.get("JANUSX_ADMX_BLAS_THREADS", "1"))))
+    # Default BLAS thread cap follows CLI/runtime threads for consistency.
+    # Explicit override remains available via JANUSX_ADMX_BLAS_THREADS.
+    default_th = max(1, int(threads))
+    try:
+        env_th = int(str(os.environ.get("JANUSX_ADMX_BLAS_THREADS", "")).strip())
+    except Exception:
+        env_th = 0
+    th = str(max(1, int(env_th if env_th > 0 else default_th)))
+    os.environ["JX_THREADS"] = th
+    os.environ["JX_MLM_BLAS_THREADS"] = th
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, int(threads)))
     os.environ["MKL_NUM_THREADS"] = th
     os.environ["MKL_MAX_THREADS"] = th
     os.environ["OMP_NUM_THREADS"] = th

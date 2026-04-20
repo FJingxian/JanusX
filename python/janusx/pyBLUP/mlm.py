@@ -1,4 +1,5 @@
 from typing import Union, Any, Optional
+from contextlib import contextmanager
 import os
 import time
 import numpy as np
@@ -19,6 +20,10 @@ try:
     from scipy.linalg import eigh as _scipy_eigh
 except Exception:
     _scipy_eigh = None
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    _threadpool_limits = None
 from .QK2 import GRM
 
 try:
@@ -79,6 +84,77 @@ def _env_positive_float(name: str, default: float) -> float:
 def _env_choice(name: str, default: str, choices: set[str]) -> str:
     raw = str(os.getenv(name, default)).strip().lower()
     return raw if raw in choices else str(default).strip().lower()
+
+
+_BLAS_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _parse_positive_env_int(name: str) -> Optional[int]:
+    raw = str(os.getenv(name, "")).strip()
+    if raw == "":
+        return None
+    try:
+        v = int(raw)
+    except Exception:
+        return None
+    return v if v > 0 else None
+
+
+def _resolve_eigh_threads() -> int:
+    # Explicit override for edge cases where caller wants an exact value.
+    explicit = _parse_positive_env_int("JX_MLM_EIGH_THREADS")
+    if explicit is not None:
+        return int(explicit)
+    # Prefer total threads coordinated by `gs -t` runtime planner.
+    total = _parse_positive_env_int("JX_THREADS")
+    if total is not None:
+        return int(total)
+    # Fallback to whichever BLAS cap is currently visible.
+    caps = [v for v in (_parse_positive_env_int(k) for k in _BLAS_THREAD_ENV_KEYS) if v is not None]
+    if len(caps) > 0:
+        return int(min(caps))
+    return max(1, int(os.cpu_count() or 1))
+
+
+@contextmanager
+def _force_full_blas_threads_for_eigh():
+    """
+    Temporarily pin BLAS thread count during eigh to the full `-t` budget.
+    This keeps eigendecomposition throughput independent from Rayon split settings.
+    """
+    if not _env_truthy("JX_MLM_EIGH_USE_ALL_THREADS", "1"):
+        yield
+        return
+
+    n_thr = max(1, int(_resolve_eigh_threads()))
+    thr_text = str(int(n_thr))
+
+    old_env: dict[str, Optional[str]] = {}
+    for key in _BLAS_THREAD_ENV_KEYS:
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = thr_text
+    old_env["JX_MLM_BLAS_THREADS"] = os.environ.get("JX_MLM_BLAS_THREADS")
+    os.environ["JX_MLM_BLAS_THREADS"] = thr_text
+
+    try:
+        if _threadpool_limits is not None:
+            with _threadpool_limits(limits=int(n_thr), user_api="blas"):
+                yield
+        else:
+            yield
+    finally:
+        for key, old_val in old_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_val
 
 
 def _normalize_kinship_flag(kinship: Any) -> Optional[int]:
@@ -382,23 +458,24 @@ def _symmetric_eigh_full(
     overwrite_a: bool,
     lowmem: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if _scipy_eigh is None:
-        return np.linalg.eigh(a)
-    if not lowmem:
+    with _force_full_blas_threads_for_eigh():
+        if _scipy_eigh is None:
+            return np.linalg.eigh(a)
+        if not lowmem:
+            return _scipy_eigh(
+                a,
+                lower=True,
+                overwrite_a=overwrite_a,
+                check_finite=False,
+                driver="evd",
+            )
         return _scipy_eigh(
             a,
             lower=True,
             overwrite_a=overwrite_a,
             check_finite=False,
-            driver="evd",
+            driver="evr",
         )
-    return _scipy_eigh(
-        a,
-        lower=True,
-        overwrite_a=overwrite_a,
-        check_finite=False,
-        driver="evr",
-    )
 
 
 def _estimate_fast_gram_peak_bytes(
@@ -679,12 +756,13 @@ class BLUP:
                 )
         else:
             t_eig = time.time()
-            if self.kinship is not None and z_is_identity:
-                self.S, eigvec = np.linalg.eigh(self.G)
-            elif self.kinship is None:
-                self.S, eigvec = np.linalg.eigh(self.Z @ self.Z.T)
-            else:
-                self.S, eigvec = np.linalg.eigh(self.Z @ self.G @ self.Z.T)
+            with _force_full_blas_threads_for_eigh():
+                if self.kinship is not None and z_is_identity:
+                    self.S, eigvec = np.linalg.eigh(self.G)
+                elif self.kinship is None:
+                    self.S, eigvec = np.linalg.eigh(self.Z @ self.Z.T)
+                else:
+                    self.S, eigvec = np.linalg.eigh(self.Z @ self.G @ self.Z.T)
             self.Dh = eigvec.T
             if self._debug_stage:
                 print(
@@ -1238,7 +1316,8 @@ class BLUP:
             )
 
         t_eig = time.time()
-        self.S, eigvec = np.linalg.eigh(self.G)
+        with _force_full_blas_threads_for_eigh():
+            self.S, eigvec = np.linalg.eigh(self.G)
         self.S = np.asarray(self.S, dtype=np.float64)
         max_eval = float(np.max(self.S)) if self.S.size > 0 else 0.0
         eig_floor = max(

@@ -83,6 +83,24 @@ pip install janusx
 
 ---
 
+## BLAS backend and threads
+
+- OpenBLAS is available on macOS/Linux/Windows.
+- JanusX now applies `-t/--thread` to BLAS thread env vars (`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, etc.) in major analysis CLIs.
+- For strongest cross-platform numerical/performance consistency, prefer a conda-forge OpenBLAS environment.
+
+Example (OpenBLAS environment):
+
+```bash
+conda create -n jx_openblas -c conda-forge python=3.14 numpy scipy "libblas=*=*openblas"
+conda activate jx_openblas
+```
+
+Default behavior is: prefer OpenBLAS, warn when unavailable, and automatically
+fallback to platform-priority backends.
+
+---
+
 ## Quick start
 
 ### 1) GWAS

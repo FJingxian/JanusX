@@ -113,7 +113,12 @@ from ._common.status import (
     stdout_is_tty,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
-from ._common.threads import detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 from ._common.gwas_history import record_gwas_run
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
@@ -2366,6 +2371,7 @@ def build_pcs_from_grm(
     dim: int,
     logger: logging.Logger,
     *,
+    threads: int = 1,
     use_spinner: bool = False,
 ) -> np.ndarray:
     """
@@ -2374,7 +2380,8 @@ def build_pcs_from_grm(
     if use_spinner:
         with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
             try:
-                _eigval, eigvec = np.linalg.eigh(grm)
+                with _gwas_evd_stage_ctx(int(threads)):
+                    _eigval, eigvec = np.linalg.eigh(grm)
                 pcs = eigvec[:, -dim:]
             except Exception:
                 task.fail(f"Computing top {dim} PCs from GRM ...Failed")
@@ -2387,7 +2394,8 @@ def build_pcs_from_grm(
         return pcs
 
     logger.info(f"Computing top {dim} PCs from GRM...")
-    _eigval, eigvec = np.linalg.eigh(grm)
+    with _gwas_evd_stage_ctx(int(threads)):
+        _eigval, eigvec = np.linalg.eigh(grm)
     pcs = eigvec[:, -dim:]
     logger.info("PC computation finished.")
     return pcs
@@ -2405,6 +2413,7 @@ def load_or_build_q_with_cache(
     max_missing_rate: float,
     het_threshold: float,
     snps_only: bool,
+    threads: int,
     logger,
     use_spinner: bool = False,
 ) -> tuple[np.ndarray, Union[np.ndarray, None]]:
@@ -2456,7 +2465,8 @@ def load_or_build_q_with_cache(
                         "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
                     )
                 pc_calc_t0 = time.monotonic()
-                eigval, eigvec = np.linalg.eigh(grm)
+                with _gwas_evd_stage_ctx(int(threads)):
+                    eigval, eigvec = np.linalg.eigh(grm)
                 qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
                 pc_msg = (
                     f"Calculating PCs from GRM (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
@@ -2678,6 +2688,7 @@ def prepare_streaming_context(
             max_missing_rate=max_missing_rate,
             het_threshold=het_threshold,
             snps_only=bool(snps_only),
+            threads=int(threads),
             logger=logger,
             use_spinner=use_spinner,
         )
@@ -2921,6 +2932,16 @@ def _status_stage_thread_budget(threads: int) -> int:
     return max(1, t - 1) if t > 1 else 1
 
 
+_BLAS_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
 @contextmanager
 def _native_thread_limit_ctx(limit: int):
     """
@@ -2930,7 +2951,73 @@ def _native_thread_limit_ctx(limit: int):
     if _threadpool_limits is None:
         yield
         return
-    with _threadpool_limits(limits=lim):
+    try:
+        with _threadpool_limits(limits=lim, user_api="blas"):
+            yield
+    except TypeError:
+        with _threadpool_limits(limits=lim):
+            yield
+
+
+@contextmanager
+def _thread_env_stage_ctx(
+    *,
+    blas_threads: Union[int, None],
+    rayon_threads: Union[int, None],
+):
+    """
+    Stage-scoped thread policy:
+    - BLAS/OpenMP caps via env + threadpoolctl.
+    - Rayon cap via RAYON_NUM_THREADS env (for kernels using default pool).
+    """
+    updates: dict[str, str] = {}
+    if blas_threads is not None:
+        bt = str(max(1, int(blas_threads)))
+        for key in _BLAS_THREAD_ENV_KEYS:
+            updates[key] = bt
+    if rayon_threads is not None:
+        updates["RAYON_NUM_THREADS"] = str(max(1, int(rayon_threads)))
+
+    old_env: dict[str, Union[str, None]] = {}
+    for key, val in updates.items():
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = str(val)
+
+    try:
+        if blas_threads is not None:
+            with _native_thread_limit_ctx(int(blas_threads)):
+                yield
+        else:
+            yield
+    finally:
+        for key, old_val in old_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(old_val)
+
+
+@contextmanager
+def _gwas_evd_stage_ctx(threads: int):
+    """
+    EVD / heavy dense linear algebra stage:
+    - BLAS uses full `-t`
+    - Rayon is kept minimal to avoid contention.
+    """
+    t = max(1, int(threads))
+    with _thread_env_stage_ctx(blas_threads=t, rayon_threads=1):
+        yield
+
+
+@contextmanager
+def _gwas_scan_stage_ctx(threads: int):
+    """
+    GWAS scan stage (Rust/Rayon kernels):
+    - Rayon uses full `-t`
+    - BLAS pinned to 1 to avoid oversubscription.
+    """
+    t = max(1, int(threads))
+    with _thread_env_stage_ctx(blas_threads=1, rayon_threads=t):
         yield
 
 
@@ -3709,8 +3796,8 @@ def run_chunked_gwas_lmm_lm(
                 use_process=True,
             ) as task:
                 try:
-                    stage_threads = _status_stage_thread_budget(int(threads))
-                    with _native_thread_limit_ctx(stage_threads):
+                    stage_threads = max(1, int(threads))
+                    with _gwas_evd_stage_ctx(stage_threads):
                         mod = ModelCls(y=y_vec, X=X_cov, kinship=Ksub)
                 except Exception:
                     task.fail(f"{evd_desc} ...Failed")
@@ -3765,18 +3852,14 @@ def run_chunked_gwas_lmm_lm(
         scan_threads = int(threads)
         if scan_threads <= 0:
             scan_threads = int(n_cores)
-        if effective_model_key == "fastlmm":
-            # FastLMM is often decode/write bound; prefer one in-flight chunk
-            # so the kernel can use all configured threads.
-            max_inflight = 1
-            workers = 1
-            threads_per_worker = max(1, scan_threads)
-            prefetch_depth = 2 if scan_threads >= 2 else 1
-        else:
-            max_inflight = 2 if scan_threads >= 2 else 1
-            workers = max(1, max_inflight)
-            threads_per_worker = max(1, scan_threads // workers)
-            prefetch_depth = 1
+        # Scan stage policy:
+        # - Rust/Rayon uses full `-t`
+        # - BLAS stays at 1
+        # - Python worker fan-out kept at 1 to avoid nested oversubscription.
+        max_inflight = 1
+        workers = 1
+        threads_per_worker = max(1, scan_threads)
+        prefetch_depth = 2 if scan_threads >= 2 else 1
 
         process.cpu_percent(interval=None)
         scan_t0 = time.time()
@@ -3936,100 +4019,101 @@ def run_chunked_gwas_lmm_lm(
                     if pbar is not None:
                         pbar.set_postfix(memory=f"{mem_gb:.2f}GB")
 
-        ex = cf.ThreadPoolExecutor(max_workers=workers)
-        try:
-            chunk_iter = load_genotype_chunks(
-                genofile,
-                model_chunk_size,
-                maf_threshold,
-                max_missing_rate,
-                model=genetic_model,
-                het=het_threshold,
-                snps_only=bool(snps_only),
-                sample_ids=sample_sub,
-                mmap_window_mb=mmap_window_mb,
-            )
-            for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-                genosub: np.ndarray
-                if genosub.shape[1] != expected_n:
-                    # Backward-compatible fallback: if backend ignored sample_ids and
-                    # returned columns for full aligned IDs, apply sameidx here.
-                    if genosub.shape[1] == int(sameidx.shape[0]):
-                        genosub = genosub[:, sameidx]
-                    else:
-                        raise ValueError(
-                            f"Genotype sample dimension mismatch for trait {pname}: "
-                            f"chunk has {genosub.shape[1]} columns, "
-                            f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
-                        )
-                if genetic_model != "add":
-                    keep_mask = _heter_keep_mask(genosub, het_threshold)
-                    if not np.any(keep_mask):
-                        continue
-                    genosub = genosub[keep_mask]
-                    sites = [s for s, k in zip(sites, keep_mask) if k]
-                m_chunk = genosub.shape[0]
-                if m_chunk == 0:
-                    continue
-
-                info_chunk = [
-                    (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
-                    for s in sites
-                ]
-                if len(info_chunk) == 0:
-                    continue
-
-                geno_model = _apply_genetic_model(genosub, genetic_model)
-                if genetic_model == "add":
-                    maf_chunk = np.mean(genosub, axis=1)
-                    maf_chunk = (maf_chunk / 2).astype(np.float32, copy=False)
-                else:
-                    maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-                # In-place centering avoids one extra (m_chunk, n_samples) allocation.
-                geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
-                geno_center -= np.mean(
-                    geno_center, axis=1, dtype=np.float32, keepdims=True
+        with _gwas_scan_stage_ctx(scan_threads):
+            ex = cf.ThreadPoolExecutor(max_workers=workers)
+            try:
+                chunk_iter = load_genotype_chunks(
+                    genofile,
+                    model_chunk_size,
+                    maf_threshold,
+                    max_missing_rate,
+                    model=genetic_model,
+                    het=het_threshold,
+                    snps_only=bool(snps_only),
+                    sample_ids=sample_sub,
+                    mmap_window_mb=mmap_window_mb,
                 )
-                fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
-                chunk_seq += 1
+                for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
+                    genosub: np.ndarray
+                    if genosub.shape[1] != expected_n:
+                        # Backward-compatible fallback: if backend ignored sample_ids and
+                        # returned columns for full aligned IDs, apply sameidx here.
+                        if genosub.shape[1] == int(sameidx.shape[0]):
+                            genosub = genosub[:, sameidx]
+                        else:
+                            raise ValueError(
+                                f"Genotype sample dimension mismatch for trait {pname}: "
+                                f"chunk has {genosub.shape[1]} columns, "
+                                f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
+                            )
+                    if genetic_model != "add":
+                        keep_mask = _heter_keep_mask(genosub, het_threshold)
+                        if not np.any(keep_mask):
+                            continue
+                        genosub = genosub[keep_mask]
+                        sites = [s for s, k in zip(sites, keep_mask) if k]
+                    m_chunk = genosub.shape[0]
+                    if m_chunk == 0:
+                        continue
 
-                if len(inflight) >= max_inflight:
+                    info_chunk = [
+                        (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
+                        for s in sites
+                    ]
+                    if len(info_chunk) == 0:
+                        continue
+
+                    geno_model = _apply_genetic_model(genosub, genetic_model)
+                    if genetic_model == "add":
+                        maf_chunk = np.mean(genosub, axis=1)
+                        maf_chunk = (maf_chunk / 2).astype(np.float32, copy=False)
+                    else:
+                        maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
+                    # In-place centering avoids one extra (m_chunk, n_samples) allocation.
+                    geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
+                    geno_center -= np.mean(
+                        geno_center, axis=1, dtype=np.float32, keepdims=True
+                    )
+                    fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
+                    inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
+                    chunk_seq += 1
+
+                    if len(inflight) >= max_inflight:
+                        _drain_completed(wait_for_one=True)
+                    else:
+                        _drain_completed(wait_for_one=False)
+
+                while len(inflight) > 0:
                     _drain_completed(wait_for_one=True)
-                else:
-                    _drain_completed(wait_for_one=False)
-
-            while len(inflight) > 0:
-                _drain_completed(wait_for_one=True)
-            writer.flush()
-            wrote_header = bool(writer.wrote_header)
-            has_results = int(writer.rows_written) > 0
-            if pbar is not None:
-                pbar.finish()
-        except KeyboardInterrupt:
-            interrupted = True
-            for fut, _m, _info, _maf in inflight.values():
-                try:
-                    fut.cancel()
-                except Exception:
-                    pass
-            raise
-        finally:
-            # Always stop renderer first, then tear down workers.
-            if scan_warmup_active and scan_warmup_task is not None:
-                try:
-                    scan_warmup_task.__exit__(None, None, None)
-                except Exception:
-                    pass
-                scan_warmup_active = False
-            if pbar is not None:
-                pbar.close(show_done=False)
-            ex.shutdown(wait=False, cancel_futures=True)
-            if interrupted and os.path.exists(tmp_tsv):
-                try:
-                    os.remove(tmp_tsv)
-                except Exception:
-                    pass
+                writer.flush()
+                wrote_header = bool(writer.wrote_header)
+                has_results = int(writer.rows_written) > 0
+                if pbar is not None:
+                    pbar.finish()
+            except KeyboardInterrupt:
+                interrupted = True
+                for fut, _m, _info, _maf in inflight.values():
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                # Always stop renderer first, then tear down workers.
+                if scan_warmup_active and scan_warmup_task is not None:
+                    try:
+                        scan_warmup_task.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    scan_warmup_active = False
+                if pbar is not None:
+                    pbar.close(show_done=False)
+                ex.shutdown(wait=False, cancel_futures=True)
+                if interrupted and os.path.exists(tmp_tsv):
+                    try:
+                        os.remove(tmp_tsv)
+                    except Exception:
+                        pass
 
         cpu_t1 = process.cpu_times()
         t1 = time.time()
@@ -4411,8 +4495,8 @@ def run_chunked_gwas_streaming_shared(
                     use_process=True,
                 ) as task:
                     try:
-                        stage_threads = _status_stage_thread_budget(int(threads))
-                        with _native_thread_limit_ctx(stage_threads):
+                        stage_threads = max(1, int(threads))
+                        with _gwas_evd_stage_ctx(stage_threads):
                             mod = ModelCls(y=y_vec, X=X_cov, kinship=shared_ksub)
                     except Exception:
                         task.fail(f"{evd_desc} ...Failed")
@@ -4583,134 +4667,135 @@ def run_chunked_gwas_streaming_shared(
     prefetch_depth = 2 if scan_threads >= 2 else 1
 
     interrupted = False
-    try:
-        chunk_iter = load_genotype_chunks(
-            genofile,
-            model_chunk_size,
-            maf_threshold,
-            max_missing_rate,
-            model=genetic_model,
-            het=het_threshold,
-            snps_only=bool(snps_only),
-            sample_ids=sample_sub,
-            mmap_window_mb=mmap_window_mb,
-        )
-        for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-            genosub: np.ndarray
-            if genosub.shape[1] != expected_n:
-                if genosub.shape[1] == int(sameidx.shape[0]):
-                    genosub = genosub[:, sameidx]
-                else:
-                    raise ValueError(
-                        f"Genotype sample dimension mismatch for trait {pname}: "
-                        f"chunk has {genosub.shape[1]} columns, "
-                        f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
-                    )
-            if genetic_model != "add":
-                keep_mask = _heter_keep_mask(genosub, het_threshold)
-                if not np.any(keep_mask):
-                    continue
-                genosub = genosub[keep_mask]
-                sites = [s for s, k in zip(sites, keep_mask) if k]
-            m_chunk = int(genosub.shape[0])
-            if m_chunk == 0:
-                continue
-
-            info_chunk = [
-                (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
-                for s in sites
-            ]
-            if len(info_chunk) == 0:
-                continue
-
-            geno_model = _apply_genetic_model(genosub, genetic_model)
-            if genetic_model == "add":
-                maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
-            else:
-                maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-            # In-place centering avoids one extra (m_chunk, n_samples) allocation.
-            geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
-            geno_center -= np.mean(
-                geno_center, axis=1, dtype=np.float32, keepdims=True
+    with _gwas_scan_stage_ctx(scan_threads):
+        try:
+            chunk_iter = load_genotype_chunks(
+                genofile,
+                model_chunk_size,
+                maf_threshold,
+                max_missing_rate,
+                model=genetic_model,
+                het=het_threshold,
+                snps_only=bool(snps_only),
+                sample_ids=sample_sub,
+                mmap_window_mb=mmap_window_mb,
             )
+            for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
+                genosub: np.ndarray
+                if genosub.shape[1] != expected_n:
+                    if genosub.shape[1] == int(sameidx.shape[0]):
+                        genosub = genosub[:, sameidx]
+                    else:
+                        raise ValueError(
+                            f"Genotype sample dimension mismatch for trait {pname}: "
+                            f"chunk has {genosub.shape[1]} columns, "
+                            f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
+                        )
+                if genetic_model != "add":
+                    keep_mask = _heter_keep_mask(genosub, het_threshold)
+                    if not np.any(keep_mask):
+                        continue
+                    genosub = genosub[keep_mask]
+                    sites = [s for s, k in zip(sites, keep_mask) if k]
+                m_chunk = int(genosub.shape[0])
+                if m_chunk == 0:
+                    continue
 
-            for ctx in model_ctxs:
-                cpu_before = process.cpu_times()
-                t0 = time.monotonic()
-                results = ctx["mod"].gwas(geno_center, threads=threads_per_model)
-                elapsed = max(time.monotonic() - t0, 0.0)
-                cpu_after = process.cpu_times()
-                ctx["scan_secs"] = float(ctx["scan_secs"]) + float(elapsed)
-                ctx["cpu_used"] = float(ctx["cpu_used"]) + float(
-                    (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
+                info_chunk = [
+                    (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
+                    for s in sites
+                ]
+                if len(info_chunk) == 0:
+                    continue
+
+                geno_model = _apply_genetic_model(genosub, genetic_model)
+                if genetic_model == "add":
+                    maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
+                else:
+                    maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
+                # In-place centering avoids one extra (m_chunk, n_samples) allocation.
+                geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
+                geno_center -= np.mean(
+                    geno_center, axis=1, dtype=np.float32, keepdims=True
                 )
 
-                chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
-                writer = ctx.get("writer")
-                if writer is None:
-                    raise RuntimeError("Internal error: shared GWAS writer not initialized.")
-                writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
-                ctx["has_results"] = True
-
-                mem_info = process.memory_info()
-                ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
-                done_next = int(ctx["done_snps"]) + m_chunk
-                mem_text = None
-                if done_next % (10 * chunk_size) == 0:
-                    mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
-                _advance_ctx(ctx, m_chunk, mem_text)
-
-        for ctx in model_ctxs:
-            writer = ctx.get("writer")
-            if writer is not None:
-                writer.flush()
-                ctx["wrote_header"] = bool(writer.wrote_header)
-                ctx["has_results"] = int(writer.rows_written) > 0
-
-        first_done = 0
-        if progress_started:
-            for ctx in model_ctxs:
-                first_done = first_done or int(ctx.get("done_snps", 0))
-                if use_rich_multi and rich_progress is not None:
-                    rich_progress.update(
-                        int(ctx["task_id"]),
-                        completed=pbar_total,
-                        metric=_metric_text(ctx),
+                for ctx in model_ctxs:
+                    cpu_before = process.cpu_times()
+                    t0 = time.monotonic()
+                    results = ctx["mod"].gwas(geno_center, threads=threads_per_model)
+                    elapsed = max(time.monotonic() - t0, 0.0)
+                    cpu_after = process.cpu_times()
+                    ctx["scan_secs"] = float(ctx["scan_secs"]) + float(elapsed)
+                    ctx["cpu_used"] = float(ctx["cpu_used"]) + float(
+                        (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
                     )
-                else:
-                    pbar_obj = ctx.get("pbar")
-                    if pbar_obj is not None:
-                        pbar_obj.finish()
-    except KeyboardInterrupt:
-        interrupted = True
-        raise
-    finally:
-        # Always stop any active progress renderer on Ctrl+C / errors.
-        if shared_warmup_active and shared_warmup_task is not None:
-            try:
-                shared_warmup_task.__exit__(None, None, None)
-            except Exception:
-                pass
-            shared_warmup_active = False
-        if rich_progress is not None:
-            try:
-                rich_progress.stop()
-            except Exception:
-                pass
-        for ctx in model_ctxs:
-            pbar_obj = ctx.get("pbar")
-            if pbar_obj is not None:
+
+                    chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
+                    writer = ctx.get("writer")
+                    if writer is None:
+                        raise RuntimeError("Internal error: shared GWAS writer not initialized.")
+                    writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
+                    ctx["has_results"] = True
+
+                    mem_info = process.memory_info()
+                    ctx["peak_rss"] = max(int(ctx["peak_rss"]), int(mem_info.rss))
+                    done_next = int(ctx["done_snps"]) + m_chunk
+                    mem_text = None
+                    if done_next % (10 * chunk_size) == 0:
+                        mem_text = f"{mem_info.rss / 1024**3:.2f}GB"
+                    _advance_ctx(ctx, m_chunk, mem_text)
+
+            for ctx in model_ctxs:
+                writer = ctx.get("writer")
+                if writer is not None:
+                    writer.flush()
+                    ctx["wrote_header"] = bool(writer.wrote_header)
+                    ctx["has_results"] = int(writer.rows_written) > 0
+
+            first_done = 0
+            if progress_started:
+                for ctx in model_ctxs:
+                    first_done = first_done or int(ctx.get("done_snps", 0))
+                    if use_rich_multi and rich_progress is not None:
+                        rich_progress.update(
+                            int(ctx["task_id"]),
+                            completed=pbar_total,
+                            metric=_metric_text(ctx),
+                        )
+                    else:
+                        pbar_obj = ctx.get("pbar")
+                        if pbar_obj is not None:
+                            pbar_obj.finish()
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
+        finally:
+            # Always stop any active progress renderer on Ctrl+C / errors.
+            if shared_warmup_active and shared_warmup_task is not None:
                 try:
-                    pbar_obj.close(show_done=False)
+                    shared_warmup_task.__exit__(None, None, None)
                 except Exception:
                     pass
-            if interrupted:
-                tmp_tsv = str(ctx.get("tmp_tsv", ""))
-                if tmp_tsv and os.path.exists(tmp_tsv):
+                shared_warmup_active = False
+            if rich_progress is not None:
+                try:
+                    rich_progress.stop()
+                except Exception:
+                    pass
+            for ctx in model_ctxs:
+                pbar_obj = ctx.get("pbar")
+                if pbar_obj is not None:
                     try:
-                        os.remove(tmp_tsv)
+                        pbar_obj.close(show_done=False)
                     except Exception:
                         pass
+                if interrupted:
+                    tmp_tsv = str(ctx.get("tmp_tsv", ""))
+                    if tmp_tsv and os.path.exists(tmp_tsv):
+                        try:
+                            os.remove(tmp_tsv)
+                        except Exception:
+                            pass
 
     first_done = 0
     for ctx in model_ctxs:
@@ -5064,7 +5149,8 @@ def build_qmatrix_farmcpu(
             else:
                 _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
                 grm = _load_or_build_grm_cache_for_pca()
-                eigval, eigvec = np.linalg.eigh(grm)
+                with _gwas_evd_stage_ctx(max(1, int(threads))):
+                    eigval, eigvec = np.linalg.eigh(grm)
                 qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
@@ -5986,6 +6072,11 @@ def main(log: bool = True):
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
     gwas_summary_rows: list[dict[str, object]] = []
     saved_result_paths: list[str] = []
     trait_order: list[str] = []

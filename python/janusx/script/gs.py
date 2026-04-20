@@ -138,6 +138,7 @@ from ._common.status import (
 )
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.colspec import parse_zero_based_index_specs
+from ._common.threads import maybe_warn_non_openblas, require_openblas_by_default
 
 try:
     from tqdm.auto import tqdm
@@ -990,21 +991,42 @@ def _run_method_task(
         final_test = test_snp
         final_pca = pca_dec
 
-    _, test_pred, pve_final = GSapi(
-        train_pheno,
-        final_train,
-        final_test,
-        method=method,
-        PCAdec=final_pca,
-        n_jobs=n_jobs,
-        force_fast=force_fast,
-        ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
-        need_train_pred=False,
-        packed_train_indices=final_train_idx_arg,
-        packed_test_indices=final_test_idx_arg,
-    )
-    if ml_tuning_cache is not None:
-        pve_final = float(ml_tuning_cache.get("pve", np.nan))
+    # In CV mode with no external holdout (n_test == 0), the extra final
+    # full-data fit does not contribute to fold metrics and only adds runtime.
+    # Keep default behavior for all other cases.
+    skip_final_fit = False
+    if cv_splits is not None:
+        if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
+            skip_final_fit = bool(final_test_idx_arg is not None and int(final_test_idx_arg.size) == 0)
+        else:
+            skip_final_fit = bool(
+                hasattr(final_test, "shape")
+                and len(getattr(final_test, "shape")) >= 2
+                and int(final_test.shape[1]) == 0
+            )
+
+    if skip_final_fit:
+        test_pred = np.zeros((0, 1), dtype=float)
+        if len(fold_rows) > 0:
+            pve_final = float(np.nanmean([float(r[5]) for r in fold_rows]))
+        else:
+            pve_final = float("nan")
+    else:
+        _, test_pred, pve_final = GSapi(
+            train_pheno,
+            final_train,
+            final_test,
+            method=method,
+            PCAdec=final_pca,
+            n_jobs=n_jobs,
+            force_fast=force_fast,
+            ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
+            need_train_pred=False,
+            packed_train_indices=final_train_idx_arg,
+            packed_test_indices=final_test_idx_arg,
+        )
+        if ml_tuning_cache is not None:
+            pve_final = float(ml_tuning_cache.get("pve", np.nan))
     return {
         "method": method,
         "fold_rows": fold_rows,
@@ -2315,6 +2337,20 @@ def main(log: bool = True) -> None:
         )
         raise SystemExit(1)
 
+    # Runtime-thread default tuning for packed GBLUP:
+    # GS global default policy is rust-priority for stability, but packed-BED
+    # GBLUP/rrBLUP workloads can be BLAS-dominant on many hosts. When users do
+    # not explicitly set a policy, prefer `auto` here to avoid apparent
+    # under-utilization in fit-heavy stages.
+    policy_env_raw = str(os.getenv("JX_THREAD_POLICY", "")).strip()
+    gblup_only_models = bool(len(methods) > 0 and all(m in {"GBLUP", "rrBLUP"} for m in methods))
+    if (policy_env_raw == "") and bool(args.bfile) and gblup_only_models:
+        os.environ["JX_THREAD_POLICY"] = "auto"
+        logger.info(
+            "Thread runtime hint: packed GBLUP/rrBLUP detected; "
+            "using auto policy by default (set JX_THREAD_POLICY to override)."
+        )
+
     thread_plan = configure_thread_runtime(
         total_threads=int(args.thread),
         methods=methods,
@@ -2325,6 +2361,10 @@ def main(log: bool = True) -> None:
             "Thread runtime coordination: "
             f"skipped ({str(thread_plan.get('reason', 'unknown'))})."
         )
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
 
     logger.info("Effective models: " + ", ".join(methods))
     if ("adBLUP" in methods) and args.pcd:

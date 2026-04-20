@@ -42,7 +42,12 @@ from janusx.script._common.pathcheck import (
 )
 from janusx.script._common.status import CliStatus, log_success, warn_deprecated_alias_usage, stdout_is_tty
 from janusx.script._common.colspec import parse_zero_based_index_specs
-from janusx.script._common.threads import detect_effective_threads
+from janusx.script._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 
 def _determine_genotype(args) -> tuple[str, str]:
@@ -302,6 +307,11 @@ def main() -> None:
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
 
     emit_cli_configuration(
         logger,

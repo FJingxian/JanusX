@@ -47,7 +47,12 @@ from ._common.status import (
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.config_render import get_config_color_styles
-from ._common.threads import detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 # Ensure matplotlib uses a non-interactive backend.
 for key in ["MPLBACKEND"]:
@@ -4168,6 +4173,11 @@ def main():
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
 
     # ------------------------------------------------------------------
     # Basic checks and configuration

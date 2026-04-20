@@ -34,7 +34,12 @@ from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.colspec import parse_zero_based_index_specs
-from janusx.script._common.threads import detect_effective_threads
+from janusx.script._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 
 class _GarfieldPhenoLogger:
@@ -421,6 +426,11 @@ def main() -> None:
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
 
     threads = int(args.thread)
     cfg_rows: list[tuple[str, object]] = [

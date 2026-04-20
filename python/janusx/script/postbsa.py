@@ -49,7 +49,12 @@ from ._common.status import (
     should_animate_status,
 )
 from ._common.progress import build_rich_progress, rich_progress_available
-from ._common.threads import detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -1834,6 +1839,11 @@ def main() -> None:
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
     try:
         args.palette_spec = _parse_palette_spec(args.palette)
     except ValueError as e:

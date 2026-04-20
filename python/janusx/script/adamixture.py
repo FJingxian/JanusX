@@ -36,7 +36,12 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
 )
 from ._common.status import CliStatus, log_success, print_failure, print_success, stdout_is_tty
-from ._common.threads import detect_effective_threads
+from ._common.threads import (
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 
 
 def _mute_stdout_info_logs(
@@ -372,6 +377,11 @@ def main() -> None:
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(resolved_threads)}."
         )
+    apply_blas_thread_env(int(resolved_threads))
+    maybe_warn_non_openblas(
+        logger=logger,
+        strict=require_openblas_by_default(),
+    )
     logger.info("")
     use_spinner = stdout_is_tty()
 

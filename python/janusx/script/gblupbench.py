@@ -45,6 +45,11 @@ except Exception:  # pragma: no cover
 import numpy as np
 import pandas as pd
 
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:  # pragma: no cover
+    _threadpool_limits = None  # type: ignore[assignment]
+
 
 def _bootstrap_repo_python_path() -> None:
     if __package__:
@@ -58,11 +63,17 @@ def _bootstrap_repo_python_path() -> None:
 _bootstrap_repo_python_path()
 
 from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
-from janusx.script._common.threads import detect_effective_threads  # noqa: E402
+from janusx.script._common.threads import (  # noqa: E402
+    apply_blas_thread_env,
+    detect_effective_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+)
 from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog  # noqa: E402
 from janusx.script._common.colspec import parse_zero_based_index_specs  # noqa: E402
+from janusx.script._common.status import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
-from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
+from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
 from janusx.script.gs import build_cv_splits  # noqa: E402
 
 
@@ -71,6 +82,14 @@ _DEFAULT_ENGINES_RUN = "janusx,sommer,rrblup"
 _DEFAULT_ENGINES_CHECK_ALL = "janusx,sommer,rrblup,blupf90,blupf90apy,hiblup"
 _ENGINE_LIST_TEXT = "janusx,sommer,rrblup,blupf90,blupf90apy,hiblup"
 _PREGSF90_APY_MODE_CACHE: dict[str, str] = {}
+_BLAS_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
 
 
 @dataclass
@@ -98,6 +117,76 @@ class EnvCheck:
     component: str
     ok: bool
     detail: str
+
+
+@contextlib.contextmanager
+def _native_thread_limit_ctx(limit: int):
+    lim = max(1, int(limit))
+    if _threadpool_limits is None:
+        yield
+        return
+    try:
+        with _threadpool_limits(limits=lim, user_api="blas"):
+            yield
+    except TypeError:
+        with _threadpool_limits(limits=lim):
+            yield
+
+
+@contextlib.contextmanager
+def _thread_env_stage_ctx(
+    *,
+    blas_threads: Optional[int],
+    rayon_threads: Optional[int],
+):
+    updates: dict[str, str] = {}
+    if blas_threads is not None:
+        bt = str(max(1, int(blas_threads)))
+        for key in _BLAS_THREAD_ENV_KEYS:
+            updates[key] = bt
+    if rayon_threads is not None:
+        updates["RAYON_NUM_THREADS"] = str(max(1, int(rayon_threads)))
+
+    old_env: dict[str, Optional[str]] = {}
+    for key, val in updates.items():
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = str(val)
+
+    try:
+        if blas_threads is not None:
+            with _native_thread_limit_ctx(int(blas_threads)):
+                yield
+        else:
+            yield
+    finally:
+        for key, old_val in old_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(old_val)
+
+
+@contextlib.contextmanager
+def _gblupbench_prep_stage_ctx(threads: int):
+    """
+    Preprocessing stage policy:
+    - Rust decode/filter path uses Rayon = --thread
+    - BLAS/OpenMP is pinned to 1 to avoid oversubscription
+    """
+    t = max(1, int(threads))
+    with _thread_env_stage_ctx(blas_threads=1, rayon_threads=t):
+        yield
+
+
+def _status_enabled() -> bool:
+    return bool(stdout_is_tty())
+
+
+def _fold_status_desc(engine: str, fold_idx: int, fold_total: int, fold_id: int, step: str) -> str:
+    return (
+        f"Running {str(engine).upper()} fold {int(fold_idx)}/{int(max(1, fold_total))} "
+        f"(id={int(fold_id)}) [{str(step)}]..."
+    )
 
 
 def _strip_default_prefix_suffix(path: str) -> str:
@@ -1615,37 +1704,71 @@ def _prepare_dataset(
             raise RuntimeError(
                 f"Sample index mismatch: keep_idx={int(keep_idx.size)} ids_used={int(ids_used.shape[0])}"
             )
-        stream_chunks = load_genotype_chunks(
-            gfile,
-            chunk_size=int(args.chunksize),
-            maf=float(args.maf),
-            missing_rate=float(args.geno),
-            impute=True,
-            sample_indices=[int(i) for i in keep_idx.tolist()],
-        )
+        keep_idx_list = [int(i) for i in keep_idx.tolist()]
         n_snps_written = 0
+        prep_mode = "streaming_plink_only"
+        prep_note = ""
 
-        def _iter_plink_chunks_stream() -> Iterable[tuple[np.ndarray, list[Any]]]:
-            nonlocal n_snps_written
-            for geno_chunk, sites in stream_chunks:
-                arr = np.asarray(geno_chunk, dtype=np.float32)
-                if arr.ndim != 2 or arr.shape[0] == 0:
-                    continue
-                if int(arr.shape[1]) != int(ids_used.shape[0]):
-                    raise RuntimeError(
-                        f"Streamed chunk sample mismatch: got {int(arr.shape[1])}, expected {int(ids_used.shape[0])}"
-                    )
-                n_snps_written += int(arr.shape[0])
-                yield arr, list(sites)
+        # Fast path: Rust-side threaded conversion/filtering/writing.
+        # Fallback to Python streaming if current extension build does not
+        # expose the extended convert_genotypes signature yet.
+        try:
+            conv_stats = convert_genotypes(
+                str(gfile),
+                str(filtered_plink_prefix),
+                out_fmt="plink",
+                progress_callback=None,
+                progress_every=0,
+                threads=int(args.thread),
+                snps_only=True,
+                maf=float(args.maf),
+                geno=float(args.geno),
+                impute=True,
+                model="add",
+                het=0.02,
+                sample_ids=None,
+                sample_indices=keep_idx_list,
+            )
+            n_snps_written = int(getattr(conv_stats, "n_sites_written", 0))
+            prep_mode = "rust_convert_plink"
+        except TypeError as ex:
+            prep_note = f"rust_convert_fallback_typeerror: {ex}"
+        except Exception as ex:
+            prep_note = f"rust_convert_fallback_error: {ex}"
 
-        save_genotype_streaming(
-            str(filtered_plink_prefix),
-            list(map(str, ids_used)),
-            _iter_plink_chunks_stream(),
-            fmt="plink",
-            total_snps=None,
-            desc="Writing filtered PLINK benchmark dataset (streaming)",
-        )
+        if int(n_snps_written) <= 0:
+            stream_chunks = load_genotype_chunks(
+                gfile,
+                chunk_size=int(args.chunksize),
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+                impute=True,
+                sample_indices=keep_idx_list,
+            )
+            n_snps_written = 0
+
+            def _iter_plink_chunks_stream() -> Iterable[tuple[np.ndarray, list[Any]]]:
+                nonlocal n_snps_written
+                for geno_chunk, sites in stream_chunks:
+                    arr = np.asarray(geno_chunk, dtype=np.float32)
+                    if arr.ndim != 2 or arr.shape[0] == 0:
+                        continue
+                    if int(arr.shape[1]) != int(ids_used.shape[0]):
+                        raise RuntimeError(
+                            f"Streamed chunk sample mismatch: got {int(arr.shape[1])}, expected {int(ids_used.shape[0])}"
+                        )
+                    n_snps_written += int(arr.shape[0])
+                    yield arr, list(sites)
+
+            save_genotype_streaming(
+                str(filtered_plink_prefix),
+                list(map(str, ids_used)),
+                _iter_plink_chunks_stream(),
+                fmt="plink",
+                total_snps=None,
+                desc="Writing filtered PLINK benchmark dataset (streaming)",
+            )
+            prep_mode = "streaming_plink_only"
         if int(n_snps_written) <= 0:
             raise ValueError(
                 "No SNPs left after Rust-side filtering. "
@@ -1660,8 +1783,10 @@ def _prepare_dataset(
             "seed": int(args.seed),
             "sample_tsv": str(sample_tsv.resolve()),
             "filtered_plink_prefix": str(filtered_plink_prefix.resolve()),
-            "prep_mode": "streaming_plink_only",
+            "prep_mode": str(prep_mode),
         }
+        if str(prep_note).strip() != "":
+            meta["prep_note"] = str(prep_note)
         meta_json = input_dir / "dataset.meta.json"
         meta_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return {
@@ -2399,6 +2524,11 @@ def _run_engine_janusx(
     env = os.environ.copy()
     py_root = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = py_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # Benchmark runs prioritize throughput comparability. The GS default runtime
+    # policy is rust-priority (BLAS=1), which can underutilize CPU on BLAS-heavy
+    # packed GBLUP phases. Use auto split here unless the user explicitly set one.
+    if str(env.get("JX_THREAD_POLICY", "")).strip() == "":
+        env["JX_THREAD_POLICY"] = "auto"
     note = ""
 
     pheno_file = (run_dir / "pheno.full.tsv").resolve()
@@ -2435,63 +2565,75 @@ def _run_engine_janusx(
         "-geno",
         "1.0",
     ]
-    rc, elapsed, rss = _run_timed(
-        cmd,
-        log_file=log_file,
-        time_file=time_file,
-        env=env,
-        cwd=run_dir,
-        limit_mem_gb=args.limit_mem,
-    )
-    if rc != 0:
-        note = f"gs -GBLUP failed (exit={rc})."
-        if int(rc) == 137 and args.limit_mem is not None:
-            note = f"gs -GBLUP failed: memory limit exceeded ({float(args.limit_mem):g} GB)."
-        return EngineRunResult(
-            engine=engine,
-            status="fail",
-            exit_code=1,
-            elapsed_sec=float(elapsed),
-            peak_rss_kb=float(rss),
-            mean_r2=math.nan,
-            mean_pearson=math.nan,
-            mean_spearman=math.nan,
-            mean_pve=math.nan,
-            folds=0,
-            fold_file="",
-            prediction_file="",
-            result_json="",
-            log_file=str(log_file),
-            time_file=str(time_file),
-            note=note,
+    rc = 1
+    elapsed = math.nan
+    rss = math.nan
+    gs_rows: list[dict[str, float | int]] = []
+    with CliStatus(
+        f"Running JANUSX GBLUP CV (folds={int(args.cv)})...",
+        enabled=_status_enabled(),
+    ) as task:
+        rc, elapsed, rss = _run_timed(
+            cmd,
+            log_file=log_file,
+            time_file=time_file,
+            env=env,
+            cwd=run_dir,
+            limit_mem_gb=args.limit_mem,
         )
+        if rc != 0:
+            note = f"gs -GBLUP failed (exit={rc})."
+            if int(rc) == 137 and args.limit_mem is not None:
+                note = f"gs -GBLUP failed: memory limit exceeded ({float(args.limit_mem):g} GB)."
+            task.fail(note)
+            return EngineRunResult(
+                engine=engine,
+                status="fail",
+                exit_code=1,
+                elapsed_sec=float(elapsed),
+                peak_rss_kb=float(rss),
+                mean_r2=math.nan,
+                mean_pearson=math.nan,
+                mean_spearman=math.nan,
+                mean_pve=math.nan,
+                folds=0,
+                fold_file="",
+                prediction_file="",
+                result_json="",
+                log_file=str(log_file),
+                time_file=str(time_file),
+                note=note,
+            )
 
-    log_text = ""
-    try:
-        log_text = log_file.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+        task.desc = "Running JANUSX GBLUP CV [parsing fold metrics]..."
         log_text = ""
-    gs_rows = _extract_gs_cv_rows(log_text, method="GBLUP")
-    if len(gs_rows) == 0:
-        note = "Failed to parse GS CV fold metrics from log."
-        return EngineRunResult(
-            engine=engine,
-            status="fail",
-            exit_code=1,
-            elapsed_sec=float(elapsed),
-            peak_rss_kb=float(rss),
-            mean_r2=math.nan,
-            mean_pearson=math.nan,
-            mean_spearman=math.nan,
-            mean_pve=math.nan,
-            folds=0,
-            fold_file="",
-            prediction_file="",
-            result_json="",
-            log_file=str(log_file),
-            time_file=str(time_file),
-            note=note,
-        )
+        try:
+            log_text = log_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            log_text = ""
+        gs_rows = _extract_gs_cv_rows(log_text, method="GBLUP")
+        if len(gs_rows) == 0:
+            note = "Failed to parse GS CV fold metrics from log."
+            task.fail(note)
+            return EngineRunResult(
+                engine=engine,
+                status="fail",
+                exit_code=1,
+                elapsed_sec=float(elapsed),
+                peak_rss_kb=float(rss),
+                mean_r2=math.nan,
+                mean_pearson=math.nan,
+                mean_spearman=math.nan,
+                mean_pve=math.nan,
+                folds=0,
+                fold_file="",
+                prediction_file="",
+                result_json="",
+                log_file=str(log_file),
+                time_file=str(time_file),
+                note=note,
+            )
+        task.complete("Running JANUSX GBLUP CV ...Finished")
 
     fold_size_map: dict[int, tuple[int, int]] = {}
     try:
@@ -2591,15 +2733,26 @@ def _run_engine_r(
         str(pred_file),
     ]
 
-    rc, elapsed, rss = _run_timed(
-        cmd,
-        log_file=log_file,
-        time_file=time_file,
-        limit_mem_gb=args.limit_mem,
+    rc = 1
+    elapsed = math.nan
+    rss = math.nan
+    run_task = CliStatus(
+        f"Running {str(engine).upper()} CV (folds={int(args.cv)})...",
+        enabled=_status_enabled(),
     )
+    with run_task:
+        rc, elapsed, rss = _run_timed(
+            cmd,
+            log_file=log_file,
+            time_file=time_file,
+            limit_mem_gb=args.limit_mem,
+        )
+        if rc != 0:
+            run_task.fail(f"{str(engine).upper()} run failed (exit={int(rc)}).")
     data = _load_result_json(result_json)
 
     if rc == 0 and str(data.get("status", "")).lower() == "ok":
+        run_task.complete(f"Running {str(engine).upper()} CV ...Finished")
         return EngineRunResult(
             engine=engine,
             status="ok",
@@ -2624,6 +2777,7 @@ def _run_engine_r(
         note = f"engine failed (exit={rc})"
     if int(rc) == 137 and args.limit_mem is not None:
         note = f"engine failed: memory limit exceeded ({float(args.limit_mem):g} GB)"
+    run_task.fail(f"{str(engine).upper()} run failed: {note}")
     return EngineRunResult(
         engine=engine,
         status="fail",
@@ -2672,113 +2826,123 @@ def _run_engine_hiblup(
     note = ""
 
     fold_ids = sorted(int(x) for x in np.unique(fold) if int(x) > 0)
+    fold_total = max(1, int(len(fold_ids)))
     for i, fd in enumerate(fold_ids, start=1):
-        fold_dir = run_dir / f"fold{fd}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        pheno_file = (fold_dir / "pheno.tsv").resolve()
-        out_prefix = (fold_dir / "hiblup").resolve()
-        beta_file = Path(str(out_prefix) + ".beta")
-        vars_file = Path(str(out_prefix) + ".vars")
-        rand_file = Path(str(out_prefix) + ".rand")
+        with CliStatus(
+            _fold_status_desc(engine, i, fold_total, fd, "fit"),
+            enabled=_status_enabled(),
+        ) as fold_task:
+            fold_dir = run_dir / f"fold{fd}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            pheno_file = (fold_dir / "pheno.tsv").resolve()
+            out_prefix = (fold_dir / "hiblup").resolve()
+            beta_file = Path(str(out_prefix) + ".beta")
+            vars_file = Path(str(out_prefix) + ".vars")
+            rand_file = Path(str(out_prefix) + ".rand")
 
-        y_fold = np.asarray(y, dtype=float).copy()
-        y_fold[fold == fd] = np.nan
-        pd.DataFrame({"id": ids, "pheno": y_fold}).to_csv(pheno_file, sep="\t", index=False, na_rep="NA")
+            y_fold = np.asarray(y, dtype=float).copy()
+            y_fold[fold == fd] = np.nan
+            pd.DataFrame({"id": ids, "pheno": y_fold}).to_csv(pheno_file, sep="\t", index=False, na_rep="NA")
 
-        attempt_time = run_dir / f"{engine}.fold{fd}.time"
-        cmd = [
-            str(hiblup_bin),
-            "--single-trait",
-            "--pheno",
-            str(pheno_file),
-            "--pheno-pos",
-            "2",
-            "--bfile",
-            str(bfile),
-            "--add",
-            "--threads",
-            str(int(args.thread)),
-            "--out",
-            str(out_prefix),
-        ]
-        rc, elapsed, rss = _run_timed(
-            cmd,
-            log_file=log_file,
-            time_file=attempt_time,
-            cwd=fold_dir,
-            append_log=(i > 1),
-            limit_mem_gb=args.limit_mem,
-        )
-        if math.isfinite(elapsed):
-            total_elapsed += float(elapsed)
-        if math.isfinite(rss):
-            max_rss = float(rss) if not math.isfinite(max_rss) else max(float(max_rss), float(rss))
-        if rc != 0:
-            note = f"HIBLUP failed on fold {fd} (exit={rc})."
-            if int(rc) == 137 and args.limit_mem is not None:
-                note = f"HIBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
-            break
-        if not rand_file.exists():
-            note = f"HIBLUP fold {fd} did not produce {rand_file.name}."
-            break
+            attempt_time = run_dir / f"{engine}.fold{fd}.time"
+            cmd = [
+                str(hiblup_bin),
+                "--single-trait",
+                "--pheno",
+                str(pheno_file),
+                "--pheno-pos",
+                "2",
+                "--bfile",
+                str(bfile),
+                "--add",
+                "--threads",
+                str(int(args.thread)),
+                "--out",
+                str(out_prefix),
+            ]
+            rc, elapsed, rss = _run_timed(
+                cmd,
+                log_file=log_file,
+                time_file=attempt_time,
+                cwd=fold_dir,
+                append_log=(i > 1),
+                limit_mem_gb=args.limit_mem,
+            )
+            if math.isfinite(elapsed):
+                total_elapsed += float(elapsed)
+            if math.isfinite(rss):
+                max_rss = float(rss) if not math.isfinite(max_rss) else max(float(max_rss), float(rss))
+            if rc != 0:
+                note = f"HIBLUP failed on fold {fd} (exit={rc})."
+                if int(rc) == 137 and args.limit_mem is not None:
+                    note = f"HIBLUP failed on fold {fd}: memory limit exceeded ({float(args.limit_mem):g} GB)."
+                fold_task.fail(note)
+                break
+            if not rand_file.exists():
+                note = f"HIBLUP fold {fd} did not produce {rand_file.name}."
+                fold_task.fail(note)
+                break
 
-        rand_df = _read_table_guess(rand_file)
-        id_col = "ID" if "ID" in rand_df.columns else str(rand_df.columns[0])
-        gebv_col = _choose_hiblup_gebv_column(rand_df)
-        rand_df = rand_df[[id_col, gebv_col]].rename(columns={id_col: "sample_id", gebv_col: "gebv"})
-        rand_df["sample_id"] = rand_df["sample_id"].astype(str)
-        train_mu = float(np.nanmean(y[fold != fd]))
-        train_sd = float(np.nanstd(y[fold != fd]))
-        beta0_raw = _parse_hiblup_beta(beta_file, train_mu)
-        beta0 = float(beta0_raw)
-        # Some HIBLUP versions/output layouts may expose a fixed-effect value that
-        # is not the prediction intercept expected here. Guard against obvious offset.
-        if math.isfinite(train_sd) and train_sd > 0:
-            if abs(float(beta0_raw) - train_mu) > max(5.0 * float(train_sd), 5.0):
-                beta0 = float(train_mu)
-        # Prefer fold-local calibration from training data when available:
-        # beta = mean(y_train - gebv_train), making y_pred comparable across engines.
-        train_df_for_cal = pd.DataFrame({"sample_id": ids[fold != fd], "y_train": y[fold != fd]})
-        cal_df = train_df_for_cal.merge(rand_df, on="sample_id", how="left")
-        cal_y = pd.to_numeric(cal_df.get("y_train"), errors="coerce")
-        cal_g = pd.to_numeric(cal_df.get("gebv"), errors="coerce")
-        cal_mask = cal_y.notna() & cal_g.notna()
-        if int(cal_mask.sum()) >= 3:
-            beta_cal = _nanmean_or_nan((cal_y[cal_mask] - cal_g[cal_mask]).to_numpy(dtype=float))
-            if math.isfinite(beta_cal):
-                beta0 = float(beta_cal)
-        pve_fold = _parse_hiblup_pve(vars_file)
+            fold_task.desc = _fold_status_desc(engine, i, fold_total, fd, "parse")
+            rand_df = _read_table_guess(rand_file)
+            id_col = "ID" if "ID" in rand_df.columns else str(rand_df.columns[0])
+            gebv_col = _choose_hiblup_gebv_column(rand_df)
+            rand_df = rand_df[[id_col, gebv_col]].rename(columns={id_col: "sample_id", gebv_col: "gebv"})
+            rand_df["sample_id"] = rand_df["sample_id"].astype(str)
+            train_mu = float(np.nanmean(y[fold != fd]))
+            train_sd = float(np.nanstd(y[fold != fd]))
+            beta0_raw = _parse_hiblup_beta(beta_file, train_mu)
+            beta0 = float(beta0_raw)
+            # Some HIBLUP versions/output layouts may expose a fixed-effect value that
+            # is not the prediction intercept expected here. Guard against obvious offset.
+            if math.isfinite(train_sd) and train_sd > 0:
+                if abs(float(beta0_raw) - train_mu) > max(5.0 * float(train_sd), 5.0):
+                    beta0 = float(train_mu)
+            # Prefer fold-local calibration from training data when available:
+            # beta = mean(y_train - gebv_train), making y_pred comparable across engines.
+            train_df_for_cal = pd.DataFrame({"sample_id": ids[fold != fd], "y_train": y[fold != fd]})
+            cal_df = train_df_for_cal.merge(rand_df, on="sample_id", how="left")
+            cal_y = pd.to_numeric(cal_df.get("y_train"), errors="coerce")
+            cal_g = pd.to_numeric(cal_df.get("gebv"), errors="coerce")
+            cal_mask = cal_y.notna() & cal_g.notna()
+            if int(cal_mask.sum()) >= 3:
+                beta_cal = _nanmean_or_nan((cal_y[cal_mask] - cal_g[cal_mask]).to_numpy(dtype=float))
+                if math.isfinite(beta_cal):
+                    beta0 = float(beta_cal)
+            pve_fold = _parse_hiblup_pve(vars_file)
 
-        test_df = pd.DataFrame({"sample_id": ids[fold == fd], "y_true": y[fold == fd]})
-        pred_df = test_df.merge(rand_df, on="sample_id", how="left")
-        if pred_df["gebv"].isna().any():
-            note = f"HIBLUP fold {fd} missing breeding values for one or more test samples."
-            break
-        pred_df["engine"] = engine
-        pred_df["fold"] = int(fd)
-        pred_df["intercept"] = float(beta0)
-        pred_df["y_pred"] = float(beta0) + pd.to_numeric(pred_df["gebv"], errors="coerce")
-        pred_df["pve_fold"] = float(pve_fold)
-        pred_df["n_train"] = int(np.sum(fold != fd))
-        pred_df["n_test"] = int(np.sum(fold == fd))
+            test_df = pd.DataFrame({"sample_id": ids[fold == fd], "y_true": y[fold == fd]})
+            pred_df = test_df.merge(rand_df, on="sample_id", how="left")
+            if pred_df["gebv"].isna().any():
+                note = f"HIBLUP fold {fd} missing breeding values for one or more test samples."
+                fold_task.fail(note)
+                break
+            pred_df["engine"] = engine
+            pred_df["fold"] = int(fd)
+            pred_df["intercept"] = float(beta0)
+            pred_df["y_pred"] = float(beta0) + pd.to_numeric(pred_df["gebv"], errors="coerce")
+            pred_df["pve_fold"] = float(pve_fold)
+            pred_df["n_train"] = int(np.sum(fold != fd))
+            pred_df["n_test"] = int(np.sum(fold == fd))
 
-        r2, pear, spear = _safe_prediction_metrics(pred_df["y_true"], pred_df["y_pred"])
-        fold_rows.append(
-            {
-                "fold": int(fd),
-                "n_train": int(np.sum(fold != fd)),
-                "n_test": int(np.sum(fold == fd)),
-                "r2": float(r2),
-                "pearson": float(pear),
-                "spearman": float(spear),
-                "pve": float(pve_fold),
-            }
-        )
-        pred_frames.append(
-            pred_df[
-                ["engine", "sample_id", "fold", "y_true", "y_pred", "gebv", "intercept", "pve_fold", "n_train", "n_test"]
-            ].copy()
-        )
+            r2, pear, spear = _safe_prediction_metrics(pred_df["y_true"], pred_df["y_pred"])
+            fold_rows.append(
+                {
+                    "fold": int(fd),
+                    "n_train": int(np.sum(fold != fd)),
+                    "n_test": int(np.sum(fold == fd)),
+                    "r2": float(r2),
+                    "pearson": float(pear),
+                    "spearman": float(spear),
+                    "pve": float(pve_fold),
+                }
+            )
+            pred_frames.append(
+                pred_df[
+                    ["engine", "sample_id", "fold", "y_true", "y_pred", "gebv", "intercept", "pve_fold", "n_train", "n_test"]
+                ].copy()
+            )
+            fold_task.complete(f"{str(engine).upper()} fold {int(i)}/{int(fold_total)} (id={int(fd)}) ...Finished")
 
     _write_time_summary(time_file, total_elapsed, max_rss)
     if note:
@@ -2912,7 +3076,8 @@ def _run_engine_blupf90(
     pregs_single_thread = False
 
     fold_ids = sorted(int(x) for x in np.unique(fold) if int(x) > 0)
-    for fd in fold_ids:
+    fold_total = max(1, int(len(fold_ids)))
+    for i, fd in enumerate(fold_ids, start=1):
         fold_dir = run_dir / f"fold{fd}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         data_file = fold_dir / "data.txt"
@@ -3013,79 +3178,88 @@ def _run_engine_blupf90(
 
         pregs_time = fold_dir / "pregs.time"
         solver_time = fold_dir / "solver.time"
-        rc1, elapsed1, rss1 = _run_tool_with_parfile_fallback(
-            pregsf90_bin,
-            pregs_par,
-            log_file=log_file,
-            time_file=pregs_time,
-            cwd=fold_dir,
-            env=pregs_env,
-            limit_mem_gb=args.limit_mem,
-        )
-        if math.isfinite(elapsed1):
-            total_elapsed += float(elapsed1)
-        if math.isfinite(rss1):
-            max_rss = float(rss1) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1))
-        if use_apy:
-            # Compatibility fallback for older preGSf90 APY syntax.
-            # Try switching to legacy APY syntax and/or removing noA22directinv when unsupported.
-            for _ in range(5):
-                try:
-                    tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:])
-                except Exception:
-                    tail = ""
+        rc1 = 1
+        with CliStatus(
+            _fold_status_desc(engine, i, fold_total, fd, "preGSf90"),
+            enabled=_status_enabled(),
+        ) as pregs_task:
+            rc1, elapsed1, rss1 = _run_tool_with_parfile_fallback(
+                pregsf90_bin,
+                pregs_par,
+                log_file=log_file,
+                time_file=pregs_time,
+                cwd=fold_dir,
+                env=pregs_env,
+                limit_mem_gb=args.limit_mem,
+            )
+            if math.isfinite(elapsed1):
+                total_elapsed += float(elapsed1)
+            if math.isfinite(rss1):
+                max_rss = float(rss1) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1))
+            if use_apy:
+                # Compatibility fallback for older preGSf90 APY syntax.
+                # Try switching to legacy APY syntax and/or removing noA22directinv when unsupported.
+                for _ in range(5):
+                    try:
+                        tail = "\n".join(log_file.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:])
+                    except Exception:
+                        tail = ""
 
-                retry_needed = False
-                if (apy_mode != "legacy") and ("ERROR: OPTION Apy has 3 arguments" in tail):
-                    apy_mode = "legacy"
-                    retry_needed = True
-                elif apy_use_noa22 and ('ERROR: The "noA22directinv" option is not supported in this program.' in tail):
-                    apy_use_noa22 = False
-                    retry_needed = True
-                elif (
-                    use_apy
-                    and (apy_mode == "legacy")
-                    and (int(apy_type) == 2)
-                    and ('ERROR: "OPTION apy 2" must be combined with "OPTION noA22directinv".' in tail)
-                    and (not apy_use_noa22)
-                ):
-                    # Some legacy preGSf90 builds simultaneously reject noA22directinv for APY2,
-                    # but require it for APY2. Fall back to legacy APY type 1.
-                    apy_type = 1
-                    retry_needed = True
-                elif ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
-                    # APY2 can be unstable on some preGSf90 builds.
-                    # Fall back to a safer APY setup.
-                    if int(apy_type) != 1:
+                    retry_needed = False
+                    if (apy_mode != "legacy") and ("ERROR: OPTION Apy has 3 arguments" in tail):
+                        apy_mode = "legacy"
+                        retry_needed = True
+                    elif apy_use_noa22 and ('ERROR: The "noA22directinv" option is not supported in this program.' in tail):
+                        apy_use_noa22 = False
+                        retry_needed = True
+                    elif (
+                        use_apy
+                        and (apy_mode == "legacy")
+                        and (int(apy_type) == 2)
+                        and ('ERROR: "OPTION apy 2" must be combined with "OPTION noA22directinv".' in tail)
+                        and (not apy_use_noa22)
+                    ):
+                        # Some legacy preGSf90 builds simultaneously reject noA22directinv for APY2,
+                        # but require it for APY2. Fall back to legacy APY type 1.
                         apy_type = 1
                         retry_needed = True
-                    if apy_alpha_beta.strip() != "1.0 0.0":
-                        apy_alpha_beta = "1.0 0.0"
-                        retry_needed = True
-                    if not pregs_single_thread:
-                        pregs_single_thread = True
-                        for key in thread_keys:
-                            pregs_env[key] = "1"
-                        retry_needed = True
+                    elif ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
+                        # APY2 can be unstable on some preGSf90 builds.
+                        # Fall back to a safer APY setup.
+                        if int(apy_type) != 1:
+                            apy_type = 1
+                            retry_needed = True
+                        if apy_alpha_beta.strip() != "1.0 0.0":
+                            apy_alpha_beta = "1.0 0.0"
+                            retry_needed = True
+                        if not pregs_single_thread:
+                            pregs_single_thread = True
+                            for key in thread_keys:
+                                pregs_env[key] = "1"
+                            retry_needed = True
 
-                if not retry_needed:
-                    break
+                    if not retry_needed:
+                        break
 
-                _write_pregs_par(apy_mode, apy_use_noa22)
-                rc1b, elapsed1b, rss1b = _run_tool_with_parfile_fallback(
-                    pregsf90_bin,
-                    pregs_par,
-                    log_file=log_file,
-                    time_file=pregs_time,
-                    cwd=fold_dir,
-                    env=pregs_env,
-                    limit_mem_gb=args.limit_mem,
+                    _write_pregs_par(apy_mode, apy_use_noa22)
+                    rc1b, elapsed1b, rss1b = _run_tool_with_parfile_fallback(
+                        pregsf90_bin,
+                        pregs_par,
+                        log_file=log_file,
+                        time_file=pregs_time,
+                        cwd=fold_dir,
+                        env=pregs_env,
+                        limit_mem_gb=args.limit_mem,
+                    )
+                    if math.isfinite(elapsed1b):
+                        total_elapsed += float(elapsed1b)
+                    if math.isfinite(rss1b):
+                        max_rss = float(rss1b) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1b))
+                    rc1 = int(rc1b)
+            if int(rc1) == 0:
+                pregs_task.complete(
+                    f"{str(engine).upper()} fold {int(i)}/{int(fold_total)} (id={int(fd)}) [preGSf90] ...Finished"
                 )
-                if math.isfinite(elapsed1b):
-                    total_elapsed += float(elapsed1b)
-                if math.isfinite(rss1b):
-                    max_rss = float(rss1b) if not math.isfinite(max_rss) else max(float(max_rss), float(rss1b))
-                rc1 = int(rc1b)
 
         if rc1 != 0:
             note = f"preGSf90 failed on fold {fd} (exit={rc1})."
@@ -3122,6 +3296,7 @@ def _run_engine_blupf90(
                         )
                 except Exception:
                     pass
+            pregs_task.fail(note)
             break
 
         gi_candidates = [
@@ -3195,19 +3370,29 @@ def _run_engine_blupf90(
             encoding="utf-8",
         )
 
-        rc2, elapsed2, rss2 = _run_tool_with_parfile_fallback(
-            blupf90_bin,
-            blup_par,
-            log_file=log_file,
-            time_file=solver_time,
-            cwd=fold_dir,
-            env=blup_env,
-            limit_mem_gb=args.limit_mem,
-        )
-        if math.isfinite(elapsed2):
-            total_elapsed += float(elapsed2)
-        if math.isfinite(rss2):
-            max_rss = float(rss2) if not math.isfinite(max_rss) else max(float(max_rss), float(rss2))
+        rc2 = 1
+        with CliStatus(
+            _fold_status_desc(engine, i, fold_total, fd, Path(blupf90_bin).name),
+            enabled=_status_enabled(),
+        ) as solver_task:
+            rc2, elapsed2, rss2 = _run_tool_with_parfile_fallback(
+                blupf90_bin,
+                blup_par,
+                log_file=log_file,
+                time_file=solver_time,
+                cwd=fold_dir,
+                env=blup_env,
+                limit_mem_gb=args.limit_mem,
+            )
+            if math.isfinite(elapsed2):
+                total_elapsed += float(elapsed2)
+            if math.isfinite(rss2):
+                max_rss = float(rss2) if not math.isfinite(max_rss) else max(float(max_rss), float(rss2))
+            if int(rc2) == 0:
+                solver_task.complete(
+                    f"{str(engine).upper()} fold {int(i)}/{int(fold_total)} "
+                    f"(id={int(fd)}) [{Path(blupf90_bin).name}] ...Finished"
+                )
         if rc2 != 0:
             note = f"{Path(blupf90_bin).name} failed on fold {fd} (exit={rc2})."
             if int(rc2) == 137 and args.limit_mem is not None:
@@ -3224,6 +3409,7 @@ def _run_engine_blupf90(
                     )
             except Exception:
                 pass
+            solver_task.fail(note)
             break
 
         sol_file = fold_dir / "solutions"
@@ -3411,6 +3597,11 @@ def main() -> None:
     if len(engines) == 0:
         raise ValueError(f"No valid engines selected. Use --engines {_ENGINE_LIST_TEXT}")
 
+    # Keep CLI-level thread env aligned with --thread and enforce OpenBLAS policy
+    # consistently across JanusX entrypoints.
+    apply_blas_thread_env(int(args.thread))
+    maybe_warn_non_openblas(strict=require_openblas_by_default())
+
     if args.check:
         checks = _collect_env_checks(engines)
         checks.extend(_run_smoke_checks_with_sim(engines))
@@ -3422,7 +3613,14 @@ def main() -> None:
     bench_dir = out_dir / f"{args.prefix}.gblup_bench"
     bench_dir.mkdir(parents=True, exist_ok=True)
 
-    data_info = _prepare_dataset(args, bench_dir=bench_dir, engines=engines)
+    with CliStatus("Preparing benchmark dataset...", enabled=_status_enabled()) as prep_task:
+        try:
+            with _gblupbench_prep_stage_ctx(int(args.thread)):
+                data_info = _prepare_dataset(args, bench_dir=bench_dir, engines=engines)
+        except Exception:
+            prep_task.fail("Preparing benchmark dataset ...Failed")
+            raise
+        prep_task.complete("Preparing benchmark dataset ...Finished")
 
     tmp_dir = bench_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)

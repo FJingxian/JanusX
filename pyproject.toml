@@ -47,7 +47,7 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
 
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.7,<2", "numpy>=1.23"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -55,6 +55,7 @@ bindings = "pyo3"
 strip = true
 module-name = "janusx.janusx"
 python-source = "python"
+cargo-extra-args = "--locked"
 
 [project.scripts]
 jxpy = "janusx.script.JanusX:main"

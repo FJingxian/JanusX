@@ -12,7 +12,8 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{open_text_maybe_gz, read_bim, read_fam, HmpSnpIter, SiteInfo};
+use crate::gfcore::{open_text_maybe_gz, process_snp_row, read_bim, read_fam, HmpSnpIter, SiteInfo};
+use crate::gfreader::build_sample_selection;
 use crate::vcfout::VcfOut;
 
 // ============================================================
@@ -320,17 +321,21 @@ fn gt_to_dosage(gt: &str) -> f32 {
 }
 
 #[inline]
-fn dosage_to_i8(g: f32) -> i8 {
+fn dosage_to_i8_rounded(g: f32) -> i8 {
     if g < 0.0 {
-        -9
-    } else if (g - 0.0).abs() < 1e-6 {
-        0
-    } else if (g - 1.0).abs() < 1e-6 {
-        1
-    } else if (g - 2.0).abs() < 1e-6 {
-        2
-    } else {
-        -9
+        return -9;
+    }
+    let mut v = g.round() as i32;
+    if v < 0 {
+        v = 0;
+    } else if v > 2 {
+        v = 2;
+    }
+    match v {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => -9,
     }
 }
 
@@ -436,6 +441,31 @@ impl BedSnpIterRaw {
                     _ => -9.0,
                 };
             }
+        }
+        row
+    }
+
+    fn decode_row_selected(&self, snp_idx: usize, sample_indices: &[usize]) -> Vec<f32> {
+        if sample_indices.len() == self.n_samples {
+            return self.decode_row(snp_idx);
+        }
+        let data = &self.mmap[3..];
+        let offset = snp_idx * self.bytes_per_snp;
+        let snp_bytes = &data[offset..offset + self.bytes_per_snp];
+        let mut row: Vec<f32> = vec![-9.0; sample_indices.len()];
+        for (out_i, &samp_idx) in sample_indices.iter().enumerate() {
+            if samp_idx >= self.n_samples {
+                continue;
+            }
+            let byte = snp_bytes[samp_idx >> 2];
+            let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
+            row[out_i] = match code {
+                0b00 => 0.0,
+                0b10 => 1.0,
+                0b11 => 2.0,
+                0b01 => -9.0,
+                _ => -9.0,
+            };
         }
         row
     }
@@ -698,6 +728,7 @@ enum RowOutcome {
     },
     DropMulti,
     DropNonSnp,
+    DropFiltered,
 }
 
 struct PlinkBfileWriter {
@@ -723,7 +754,7 @@ impl PlinkBfileWriter {
         {
             let mut famw = fam;
             for s in samples {
-                writeln!(famw, "{}\t{}\t0\t0\t0\t-9", s.fid, s.iid).map_err(|e| e.to_string())?;
+                writeln!(famw, "{}\t{}\t0\t0\t1\t-9", s.fid, s.iid).map_err(|e| e.to_string())?;
             }
             famw.flush().map_err(|e| e.to_string())?;
             let fam = famw;
@@ -1187,7 +1218,22 @@ pub fn merge_genotypes(
 // Single-input conversion (PyO3)
 // ============================================================
 
-#[pyfunction(signature = (input, out, out_fmt=None, progress_callback=None, progress_every=10000, threads=0, snps_only=true))]
+#[pyfunction(signature = (
+    input,
+    out,
+    out_fmt=None,
+    progress_callback=None,
+    progress_every=10000,
+    threads=0,
+    snps_only=true,
+    maf=0.0,
+    geno=1.0,
+    impute=false,
+    model="add",
+    het=0.02,
+    sample_ids=None,
+    sample_indices=None
+))]
 pub fn convert_genotypes(
     py: Python<'_>,
     input: String,
@@ -1197,14 +1243,52 @@ pub fn convert_genotypes(
     progress_every: usize,
     threads: usize,
     snps_only: bool,
+    maf: f64,
+    geno: f64,
+    impute: bool,
+    model: &str,
+    het: f64,
+    sample_ids: Option<Vec<String>>,
+    sample_indices: Option<Vec<usize>>,
 ) -> PyResult<PyConvertStats> {
+    if !(0.0..=0.5).contains(&maf) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maf must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&geno) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "geno must be within [0, 1]",
+        ));
+    }
+    if !(0.0..=0.5).contains(&het) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "het must be within [0, 0.5]",
+        ));
+    }
+    let model_key = model.trim().to_ascii_lowercase();
+    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "model must be one of: add, dom, rec, het",
+        ));
+    }
+    let apply_het_filter = model_key != "add";
+    let maf_f32 = maf as f32;
+    let geno_f32 = geno as f32;
+    let het_f32 = het as f32;
+
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let mut it = InputIter::new(&input).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-
-    let sample_ids: Vec<String> = it.sample_ids().iter().cloned().collect();
-    let n_samples = it.n_samples();
+    let (selected_indices, selected_sample_ids) = build_sample_selection(
+        it.sample_ids(),
+        sample_ids,
+        sample_indices,
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let n_samples = selected_indices.len();
+    let full_sample_selection = n_samples == it.n_samples();
 
     let mut stats = PyConvertStats {
         input: input.clone(),
@@ -1225,12 +1309,12 @@ pub fn convert_genotypes(
     match fmt {
         OutFmt::Vcf => {
             vcf_w = Some(
-                VcfWriter::new(&out, &sample_ids)
+                VcfWriter::new(&out, &selected_sample_ids)
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
         OutFmt::Plink => {
-            let samples: Vec<SampleKey> = sample_ids
+            let samples: Vec<SampleKey> = selected_sample_ids
                 .iter()
                 .map(|sid| SampleKey {
                     fid: sid.clone(),
@@ -1268,9 +1352,8 @@ pub fn convert_genotypes(
             ));
         };
         let n_sites = bed.sites.len();
-        let data = &bed.mmap[3..];
-        let bytes_per_snp = bed.bytes_per_snp;
         let sites = &bed.sites;
+        let selected_indices_ref = &selected_indices;
         let target_bytes = 16usize * 1024 * 1024;
         let mut chunk_size = target_bytes / n_samples.max(1);
         if chunk_size == 0 {
@@ -1288,47 +1371,48 @@ pub fn convert_genotypes(
                         .into_par_iter()
                         .map(|idx| {
                             let site = sites[idx].clone();
-                            match normalize_biallelic_variant(
+                            let (mut gref, mut galt) = match normalize_biallelic_variant(
                                 &site.ref_allele,
                                 &site.alt_allele,
                                 snps_only,
                             ) {
-                                Some((gref, galt)) => {
-                                    let offset = idx * bytes_per_snp;
-                                    let snp_bytes = &data[offset..offset + bytes_per_snp];
-                                    let mut row: Vec<i8> = vec![-9; n_samples];
-                                    for (byte_idx, byte) in snp_bytes.iter().enumerate() {
-                                        for within in 0..4 {
-                                            let samp_idx = byte_idx * 4 + within;
-                                            if samp_idx >= n_samples {
-                                                break;
-                                            }
-                                            let code = (byte >> (within * 2)) & 0b11;
-                                            row[samp_idx] = match code {
-                                                0b00 => 0,
-                                                0b10 => 1,
-                                                0b11 => 2,
-                                                0b01 => -9,
-                                                _ => -9,
-                                            };
-                                        }
-                                    }
-                                    RowOutcome::Keep {
-                                        site,
-                                        gref,
-                                        galt,
-                                        row_i8: row,
-                                    }
-                                }
+                                Some(x) => x,
                                 None => {
                                     if site.ref_allele.contains(',')
                                         || site.alt_allele.contains(',')
                                     {
-                                        RowOutcome::DropMulti
-                                    } else {
-                                        RowOutcome::DropNonSnp
+                                        return RowOutcome::DropMulti;
                                     }
+                                    return RowOutcome::DropNonSnp;
                                 }
+                            };
+
+                            let mut row_f32 = if full_sample_selection {
+                                bed.decode_row(idx)
+                            } else {
+                                bed.decode_row_selected(idx, selected_indices_ref)
+                            };
+                            let keep = process_snp_row(
+                                &mut row_f32,
+                                &mut gref,
+                                &mut galt,
+                                maf_f32,
+                                geno_f32,
+                                impute,
+                                apply_het_filter,
+                                het_f32,
+                            );
+                            if !keep {
+                                return RowOutcome::DropFiltered;
+                            }
+
+                            let mut row_i8: Vec<i8> = Vec::with_capacity(row_f32.len());
+                            row_i8.extend(row_f32.iter().map(|&g| dosage_to_i8_rounded(g)));
+                            RowOutcome::Keep {
+                                site,
+                                gref,
+                                galt,
+                                row_i8,
                             }
                         })
                         .collect()
@@ -1375,11 +1459,12 @@ pub fn convert_genotypes(
                     RowOutcome::DropNonSnp => {
                         stats.n_sites_dropped_non_snp += 1;
                     }
+                    RowOutcome::DropFiltered => {}
                 }
             }
         }
     } else {
-        let mut row_i8: Vec<i8> = Vec::with_capacity(n_samples);
+        let mut row_i8: Vec<i8> = Vec::with_capacity(n_samples.max(1));
         while let Some((row, site)) = it.next_snp() {
             stats.n_sites_seen += 1;
             if report_progress && stats.n_sites_seen - last_report >= progress_every as u64 {
@@ -1389,7 +1474,7 @@ pub fn convert_genotypes(
                 last_report = stats.n_sites_seen;
             }
 
-            let (gref, galt) =
+            let (mut gref, mut galt) =
                 match normalize_biallelic_variant(&site.ref_allele, &site.alt_allele, snps_only) {
                     Some(x) => x,
                     None => {
@@ -1402,14 +1487,37 @@ pub fn convert_genotypes(
                     }
                 };
 
-            if row.len() != n_samples {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "internal row length mismatch",
-                ));
+            let mut row_sel = if full_sample_selection {
+                row
+            } else {
+                let mut v = Vec::with_capacity(selected_indices.len());
+                for &idx in selected_indices.iter() {
+                    if idx >= row.len() {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "sample index out of range while converting row",
+                        ));
+                    }
+                    v.push(row[idx]);
+                }
+                v
+            };
+
+            let keep = process_snp_row(
+                &mut row_sel,
+                &mut gref,
+                &mut galt,
+                maf_f32,
+                geno_f32,
+                impute,
+                apply_het_filter,
+                het_f32,
+            );
+            if !keep {
+                continue;
             }
 
             row_i8.clear();
-            row_i8.extend(row.iter().map(|&g| dosage_to_i8(g)));
+            row_i8.extend(row_sel.iter().map(|&g| dosage_to_i8_rounded(g)));
 
             match fmt {
                 OutFmt::Vcf => {

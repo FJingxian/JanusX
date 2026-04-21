@@ -36,7 +36,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
-const KNOWN_MODULES: [&str; 20] = [
+const KNOWN_MODULES: [&str; 21] = [
     "grm",
     "pca",
     "gwas",
@@ -48,6 +48,7 @@ const KNOWN_MODULES: [&str; 20] = [
     "postbsa",
     "fastq2count",
     "fastq2vcf",
+    "kmer",
     "adamixture",
     "tree",
     "hybrid",
@@ -58,7 +59,7 @@ const KNOWN_MODULES: [&str; 20] = [
     "simulation",
     "benchmark",
 ];
-const MODULE_LIST_ENTRIES: [(&str, &str); 20] = [
+const MODULE_LIST_ENTRIES: [(&str, &str); 21] = [
     ("grm", "Build genomic relationship matrix"),
     (
         "pca",
@@ -79,6 +80,7 @@ const MODULE_LIST_ENTRIES: [(&str, &str); 20] = [
         "RNA-seq pipeline from FASTQ to gene count/FPKM/TPM",
     ),
     ("fastq2vcf", "Variant-calling pipeline from FASTQ to VCF"),
+    ("kmer", "K-mer counting from FASTQ/FASTA to KMC database"),
     ("adamixture", "ADAMIXTURE ancestry inference"),
     (
         "tree",
@@ -5135,6 +5137,13 @@ fn print_cli_help() {
         4,
         "fastq2vcf",
         "Variant-calling pipeline from FASTQ to VCF",
+        12,
+        width,
+    );
+    print_help_entry(
+        4,
+        "kmer",
+        "K-mer counting from FASTQ/FASTA to KMC database",
         12,
         width,
     );

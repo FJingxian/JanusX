@@ -47,8 +47,9 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
 
 [build-system]
-requires = ["maturin>=1.7,<2", "numpy>=1.23"]
-build-backend = "maturin"
+requires = ["maturin>=1.7,<2", "numpy>=1.23", "pybind11>=2.13.0"]
+build-backend = "build_backend"
+backend-path = ["."]
 
 [tool.maturin]
 bindings = "pyo3"
@@ -56,6 +57,31 @@ strip = true
 module-name = "janusx.janusx"
 python-source = "python"
 cargo-extra-args = "--locked"
+include = [
+    { path = "build_backend.py", format = "sdist" },
+    { path = "python/janusx/native/build_kmc_bind.py", format = "sdist" },
+    { path = "python/janusx/native/kmc_count_bind.cpp", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/kmc_core/*.h", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/kmc_core/*.cpp", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/kmc_api/*.h", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/kmc_api/*.cpp", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/py_kmc_api/libs/pybind11/include/**", format = "sdist" },
+    { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "wheel" },
+    { path = "python/janusx/native/vendor/kmc/kmc_core/*.h", format = "wheel" },
+    { path = "python/janusx/native/vendor/kmc/kmc_core/*.cpp", format = "wheel" },
+    { path = "python/janusx/native/vendor/kmc/kmc_api/*.h", format = "wheel" },
+    { path = "python/janusx/native/vendor/kmc/kmc_api/*.cpp", format = "wheel" },
+    { path = "python/janusx/native/vendor/kmc/py_kmc_api/libs/pybind11/include/**", format = "wheel" },
+]
+exclude = [
+    "python/janusx/native/vendor/kmc/**/*.o",
+    "python/janusx/native/vendor/kmc/**/*.a",
+    "python/janusx/native/vendor/kmc/**/*.so",
+    "python/janusx/native/vendor/kmc/**/*.dylib",
+    "python/janusx/native/vendor/kmc/**/*.dll",
+    "python/janusx/native/vendor/kmc/**/*.lib",
+]
 
 [project.scripts]
 jxpy = "janusx.script.JanusX:main"

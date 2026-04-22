@@ -561,6 +561,7 @@ static py::dict kmc_export_bin_multi(
     const std::string& out_prefix,
     const std::vector<std::string>& sample_ids,
     std::uint64_t max_kmers = 0,
+    double kmerf = 0.2,
     py::object progress_callback = py::none(),
     std::uint64_t progress_every = 200000,
     py::object benchmark_callback = py::none(),
@@ -576,6 +577,9 @@ static py::dict kmc_export_bin_multi(
     }
     if (sample_ids.size() != kmc_prefixes.size()) {
         throw std::runtime_error("sample_ids length must match kmc_prefixes length.");
+    }
+    if (!std::isfinite(kmerf) || kmerf < 0.0 || kmerf > 0.5) {
+        throw std::runtime_error("kmerf must be within [0, 0.5].");
     }
     for (const auto& sid : sample_ids) {
         if (sid.empty()) {
@@ -671,6 +675,8 @@ static py::dict kmc_export_bin_multi(
     const std::string site_path = out_prefix + ".bin.site";
     const std::uint64_t n_samples = static_cast<std::uint64_t>(sample_ids.size());
     const std::size_t row_nbytes = static_cast<std::size_t>((n_samples + 7ULL) / 8ULL);
+    const double keep_min_ratio = kmerf / 10.0;
+    const double keep_max_ratio = 1.0 - keep_min_ratio;
     if (row_nbytes == 0) {
         throw std::runtime_error("Invalid row byte width: zero.");
     }
@@ -1222,6 +1228,7 @@ static py::dict kmc_export_bin_multi(
     }
 
     std::uint64_t written = 0;
+    std::uint64_t filtered_by_kmerf = 0;
     auto emit_progress_if_needed = [&]() {
         if (has_progress && processed_records >= next_progress_emit) {
             progress_callback(processed_records, written, total_input_records);
@@ -1233,6 +1240,11 @@ static py::dict kmc_export_bin_multi(
         if (pipeline_abort) {
             rethrow_pipeline_error();
             throw std::runtime_error("kmerge pipeline aborted.");
+        }
+        const double present_ratio = static_cast<double>(indices.size()) / static_cast<double>(n_samples);
+        if (present_ratio < keep_min_ratio || present_ratio > keep_max_ratio) {
+            ++filtered_by_kmerf;
+            return;
         }
         pending_batch.kmers.push_back(min_kmer.to_string());
         const std::size_t old = pending_batch.rows.size();
@@ -1398,6 +1410,10 @@ static py::dict kmc_export_bin_multi(
     out["benchmark_records"] = benchmark_records_done;
     out["benchmark_budget_records"] = benchmark_budget_total;
     out["merge_strategy"] = strategy_name(selected_strategy);
+    out["kmerf"] = kmerf;
+    out["kmerf_keep_min_ratio"] = keep_min_ratio;
+    out["kmerf_keep_max_ratio"] = keep_max_ratio;
+    out["filtered_by_kmerf"] = filtered_by_kmerf;
     if (std::isfinite(bench_linear_ns)) {
         out["bench_linear_ns_per_record"] = bench_linear_ns;
     }
@@ -1496,6 +1512,7 @@ PYBIND11_MODULE(_kmc_count, m) {
         py::arg("out_prefix"),
         py::arg("sample_ids"),
         py::arg("max_kmers") = 0,
+        py::arg("kmerf") = 0.2,
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 200000,
         py::arg("benchmark_callback") = py::none(),

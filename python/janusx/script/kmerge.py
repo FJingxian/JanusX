@@ -111,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Debug cap for loaded k-mers per sample (0 means no cap).",
     )
     optional.add_argument(
+        "-kmerf",
+        "--kmerf",
+        type=float,
+        default=0.2,
+        help=(
+            "MAF-like presence filter strength in [0, 0.5] (default: 0.2). "
+            "Keep sites with present-ratio n/N in [kmerf/10, 1-kmerf/10], "
+            "e.g. 0.2 keeps [0.02, 0.98]."
+        ),
+    )
+    optional.add_argument(
         "--max-output-sites",
         type=int,
         default=0,
@@ -197,6 +208,9 @@ def main() -> int:
     if len(db_inputs) == 0:
         parser.error("No input KMC database provided.")
     max_kmers = max(0, int(args.max_kmers))
+    kmerf = float(args.kmerf)
+    if not (0.0 <= kmerf <= 0.5):
+        parser.error("-kmerf/--kmerf must be within [0, 0.5].")
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
     threads = max(1, requested_threads)
@@ -246,13 +260,21 @@ def main() -> int:
 
     print(
         f"Running KMC merge: samples={len(db_prefixes)}, fmt=bin, "
-        f"max_kmers={max_kmers if max_kmers > 0 else 'all'}, threads={threads}",
+        f"max_kmers={max_kmers if max_kmers > 0 else 'all'}, "
+        f"kmerf={kmerf:.3f} (keep n/N in [{kmerf/10.0:.3f}, {1.0 - kmerf/10.0:.3f}]), "
+        f"threads={threads}",
         flush=True,
     )
 
     # Single-sample streaming fast path:
     # avoid loading all kmers/counts into Python objects.
     if len(db_prefixes) == 1 and max_kmers == 0:
+        if kmerf > 0.0:
+            print(
+                "Warning: -kmerf/--kmerf is ignored in single-sample export "
+                "(n/N is always 1.0 for present k-mers).",
+                flush=True,
+            )
         sid0 = sample_ids[0]
         pfx0 = db_prefixes[0]
         info0 = run_kmc_db_info(
@@ -414,6 +436,7 @@ def main() -> int:
             out_prefix=out_prefix,
             sample_ids=sample_ids,
             max_kmers=max_kmers,
+            kmerf=kmerf,
             progress_callback=_on_progress,
             progress_every=max(10000, merge_total // 200),
             benchmark_callback=_on_benchmark_progress if benchmark_enabled else None,
@@ -461,6 +484,12 @@ def main() -> int:
             f"Merged union size: {n_sites} k-mers across {len(sample_ids)} samples.",
             flush=True,
         )
+        filtered_sites = export_info.get("filtered_by_kmerf", None)
+        if filtered_sites is not None:
+            print(
+                f"Filtered by kmerf: {int(filtered_sites)} sites removed.",
+                flush=True,
+            )
         print(
             "Output files:\n"
             f"  {str(export_info.get('bin', out_target))}\n"

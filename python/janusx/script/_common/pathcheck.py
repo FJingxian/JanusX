@@ -28,6 +28,8 @@ def format_output_display(
         return f"{prefix_disp} (.npy/.site/.id)"
     if fmt == "txt":
         return f"{prefix_disp} (.txt/.site/.id)"
+    if fmt == "bin":
+        return f"{prefix_disp} (.bin/.bin.site/.bin.id or .bim/.fam)"
     return f"{path_disp} ({fmt})"
 
 
@@ -118,18 +120,24 @@ def ensure_file_input_exists(logger, path: str, label: str = "Genotype file inpu
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
         matrix_candidates = [p]
-        id_candidates = [Path(f"{prefix}.id")]
+        id_candidates = [Path(f"{prefix}.id"), Path(f"{prefix}.fam")]
+    elif low.endswith(".bin"):
+        prefix = Path(str(p)[: -len(".bin")])
+        matrix_candidates = [p]
+        id_candidates = [Path(f"{prefix}.bin.id"), Path(f"{prefix}.id"), Path(f"{prefix}.fam")]
     elif low.endswith((".txt", ".tsv", ".csv")):
         for ext in (".txt", ".tsv", ".csv"):
             if low.endswith(ext):
                 prefix = Path(str(p)[: -len(ext)])
                 break
         matrix_candidates = [p]
-        id_candidates = [Path(f"{prefix}.id")]
+        id_candidates = [Path(f"{prefix}.id"), Path(f"{prefix}.fam")]
     else:
         prefix = p
-        matrix_candidates = [Path(f"{prefix}{ext}") for ext in (".npy", ".txt", ".tsv", ".csv")]
-        id_candidates = [Path(f"{prefix}.id")]
+        matrix_candidates = [
+            Path(f"{prefix}{ext}") for ext in (".npy", ".bin", ".txt", ".tsv", ".csv")
+        ]
+        id_candidates = [Path(f"{prefix}.bin.id"), Path(f"{prefix}.id"), Path(f"{prefix}.fam")]
 
     matrix_found = next((cand for cand in matrix_candidates if cand.is_file()), None)
     id_found = next((cand for cand in id_candidates if cand.is_file()), None)
@@ -155,6 +163,8 @@ def ensure_file_input_site_metadata_exists(
     low = str(p).lower()
     if low.endswith(".npy"):
         prefix = Path(str(p)[: -len(".npy")])
+    elif low.endswith(".bin"):
+        prefix = Path(str(p)[: -len(".bin")])
     elif low.endswith((".txt", ".tsv", ".csv")):
         for ext in (".txt", ".tsv", ".csv"):
             if low.endswith(ext):
@@ -164,6 +174,7 @@ def ensure_file_input_site_metadata_exists(
         prefix = p
 
     site_candidates = [
+        Path(f"{prefix}.bin.site"),
         Path(f"{prefix}.site"),
         Path(f"{prefix}.site.tsv"),
         Path(f"{prefix}.site.txt"),

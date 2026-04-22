@@ -49,3 +49,15 @@ bin
 ~*
 benchmark
 .docker*
+
+# C/C++ / native build artifacts
+*.o
+*.obj
+*.a
+*.la
+*.lo
+*.dll
+*.dylib
+*.so
+*.exe
+*.pdb

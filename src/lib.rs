@@ -69,7 +69,8 @@ use logreg::fit_best_and_not_py;
 use rsvd::py_rsvd_packed_subset;
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
-    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
+    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8,
+    nj_newick_from_alignment_u8, nj_newick_from_distance_matrix,
 };
 // ============================================================
 // PyO3 module exports
@@ -158,6 +159,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_sites, m)?)?;
     m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
+    m.add_function(wrap_pyfunction!(nj_newick_from_distance_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(ml_newick_from_alignment_u8, m)?)?;
     Ok(())
 }

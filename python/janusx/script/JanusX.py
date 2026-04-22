@@ -32,8 +32,11 @@ Modules:
     Pipeline and utility:
     fastq2vcf     Variant-calling pipeline from FASTQ to VCF
     fastq2count   RNA-seq counting pipeline from FASTQ to count matrix
-    kmer          K-mer counting from FASTQ/FASTA to KMC database
+    kmer          K-mer workflow: count(KMC) or tree(WASTER)
+    kmerge        Merge multi-sample KMC databases into genotype matrix
+    view          View .bin/.bin.site as plain text for pipes
     tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` Rust ML v1)
+    treeplot      Visualize Newick/GRM trees with toytree
     adamixture    ADAMIXTURE ancestry inference
     hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
@@ -105,7 +108,7 @@ _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
     "sim", "simulation", "benchmark", "gblupbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
-    "fastq2vcf", "fastq2count", "kmer",
+    "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
 ]
 _LAUNCHER_ONLY_FLAGS = {
     "-update", "--update",
@@ -252,8 +255,11 @@ def _print_cli_help() -> None:
     print(f"  {_style_blue('Pipeline and utility:')}")
     _print_help_entry(4, "fastq2vcf", "Variant-calling pipeline from FASTQ to VCF", 12, width)
     _print_help_entry(4, "fastq2count", "RNA-seq counting pipeline from FASTQ to count matrix", 12, width)
-    _print_help_entry(4, "kmer", "K-mer counting from FASTQ/FASTA to KMC database", 12, width)
+    _print_help_entry(4, "kmer", "K-mer workflow: count(KMC) or tree(WASTER)", 12, width)
+    _print_help_entry(4, "kmerge", "Merge multi-sample KMC databases into genotype matrix", 12, width)
+    _print_help_entry(4, "view", "View .bin/.bin.site as plain text for shell pipes", 12, width)
     _print_help_entry(4, "tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` Rust ML v1)", 12, width)
+    _print_help_entry(4, "treeplot", "Visualize Newick/GRM trees with toytree", 12, width)
     _print_help_entry(4, "adamixture", "ADAMIXTURE ancestry inference", 12, width)
     _print_help_entry(4, "hybrid", "Build pairwise hybrid genotype matrix from parent lists", 12, width)
     _print_help_entry(4, "gformat", "Convert genotype files across plink/vcf/txt/npy", 12, width)

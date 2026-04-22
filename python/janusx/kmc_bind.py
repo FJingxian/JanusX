@@ -12,7 +12,7 @@ import sys
 import sysconfig
 from pathlib import Path
 from types import ModuleType
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 def _default_kmc_source_candidates() -> tuple[str, ...]:
@@ -71,42 +71,66 @@ def _required_pybind_version() -> tuple[int, int, int]:
     return (2, 3, 0)
 
 
-def _ensure_pybind_version_ok(version: tuple[int, int, int], source: str) -> None:
+def _read_pybind_header_version(include_dir: Path) -> tuple[int, int, int]:
+    common_h = include_dir / "pybind11" / "detail" / "common.h"
+    if not common_h.is_file():
+        return (0, 0, 0)
+    txt = common_h.read_text(encoding="utf-8", errors="ignore")
+    m_major = re.search(r"#define\s+PYBIND11_VERSION_MAJOR\s+(\d+)", txt)
+    m_minor = re.search(r"#define\s+PYBIND11_VERSION_MINOR\s+(\d+)", txt)
+    m_patch = re.search(r"#define\s+PYBIND11_VERSION_PATCH\s+(\d+)", txt)
+    major = int(m_major.group(1)) if m_major else 0
+    minor = int(m_minor.group(1)) if m_minor else 0
+    patch = int(m_patch.group(1)) if m_patch else 0
+    return (major, minor, patch)
+
+
+def _warn_pybind_version_if_old(version: tuple[int, int, int], source: str) -> None:
     req = _required_pybind_version()
     if version < req:
-        raise RuntimeError(
-            f"pybind11 from {source} is too old for Python {sys.version_info.major}.{sys.version_info.minor}. "
-            f"Found {version[0]}.{version[1]}.{version[2]}, require >= {req[0]}.{req[1]}.{req[2]}. "
-            "Please install/upgrade pybind11 in current environment, e.g. "
-            "`python -m pip install -U pybind11`."
+        print(
+            f"! Warning: pybind11 from {source} may be too old for Python "
+            f"{sys.version_info.major}.{sys.version_info.minor} "
+            f"(found {version[0]}.{version[1]}.{version[2]}, "
+            f"recommended >= {req[0]}.{req[1]}.{req[2]}). "
+            "Build will continue; if compile fails, install newer pybind11 "
+            "via `python -m pip install -U pybind11`.",
+            file=sys.stderr,
+            flush=True,
         )
 
 
 def _resolve_pybind_include(kmc_src_dir: Path) -> Path:
+    import_err: Optional[Exception] = None
     try:
         import pybind11  # type: ignore
 
-        _ensure_pybind_version_ok(
+        _warn_pybind_version_if_old(
             _parse_version_tuple(getattr(pybind11, "__version__", "")),
             "installed pybind11 package",
         )
         inc = Path(pybind11.get_include())
         if inc.is_dir():
             return inc
-    except Exception:
+    except ModuleNotFoundError:
         pass
+    except Exception as e:
+        # Keep original import failure details; do not mask it as a version issue.
+        import_err = e
+
     vendored = kmc_src_dir / "py_kmc_api" / "libs" / "pybind11" / "include"
     if vendored.is_dir():
-        # KMC may bundle old pybind11 headers; validate against current Python.
-        common_h = vendored / "pybind11" / "detail" / "common.h"
-        if common_h.is_file():
-            txt = common_h.read_text(encoding="utf-8", errors="ignore")
-            m_major = re.search(r"#define\s+PYBIND11_VERSION_MAJOR\s+(\d+)", txt)
-            m_minor = re.search(r"#define\s+PYBIND11_VERSION_MINOR\s+(\d+)", txt)
-            major = int(m_major.group(1)) if m_major else 0
-            minor = int(m_minor.group(1)) if m_minor else 0
-            _ensure_pybind_version_ok((major, minor, 0), "vendored KMC pybind11 headers")
+        _warn_pybind_version_if_old(
+            _read_pybind_header_version(vendored),
+            "vendored KMC pybind11 headers",
+        )
         return vendored
+
+    if import_err is not None:
+        raise RuntimeError(
+            "Failed to import installed pybind11 headers and no vendored fallback was found. "
+            f"Original error: {repr(import_err)}"
+        ) from import_err
     raise FileNotFoundError(
         "pybind11 headers not found. Install pybind11 or provide KMC source with py_kmc_api/libs/pybind11."
     )
@@ -489,5 +513,123 @@ def run_kmc_count(
             counter_max=int(counter_max),
             canonical=bool(canonical),
             input_type=str(input_type),
+        )
+    )
+
+
+def run_kmc_db_info(
+    *,
+    kmc_prefix: str,
+    kmc_src: str | None = None,
+    rebuild_bind: bool = False,
+    verbose_build: bool = False,
+) -> dict:
+    mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild_bind, verbose=verbose_build)
+    return dict(mod.kmc_db_info(kmc_prefix=str(kmc_prefix)))
+
+
+def run_kmc_export_janusx_single(
+    *,
+    kmc_prefix: str,
+    out_prefix: str,
+    sample_id: str,
+    kmc_src: str | None = None,
+    rebuild_bind: bool = False,
+    verbose_build: bool = False,
+) -> dict:
+    mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild_bind, verbose=verbose_build)
+    return dict(
+        mod.kmc_export_janusx_single(
+            kmc_prefix=str(kmc_prefix),
+            out_prefix=str(out_prefix),
+            sample_id=str(sample_id),
+        )
+    )
+
+
+def run_kmc_export_bin_single(
+    *,
+    kmc_prefix: str,
+    out_prefix: str,
+    sample_id: str,
+    progress_callback=None,
+    progress_every: int = 200000,
+    threads: int = 0,
+    kmc_src: str | None = None,
+    rebuild_bind: bool = False,
+    verbose_build: bool = False,
+) -> dict:
+    mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild_bind, verbose=verbose_build)
+    if not hasattr(mod, "kmc_export_bin_single"):
+        raise RuntimeError(
+            "Current _kmc_count binding does not provide kmc_export_bin_single(). "
+            "Please rebuild JanusX KMC extension."
+        )
+    return dict(
+        mod.kmc_export_bin_single(
+            kmc_prefix=str(kmc_prefix),
+            out_prefix=str(out_prefix),
+            sample_id=str(sample_id),
+            progress_callback=progress_callback,
+            progress_every=int(progress_every),
+            threads=int(threads),
+        )
+    )
+
+
+def run_kmc_export_bin_multi(
+    *,
+    kmc_prefixes: list[str],
+    out_prefix: str,
+    sample_ids: list[str],
+    max_kmers: int = 0,
+    progress_callback=None,
+    progress_every: int = 200000,
+    benchmark_callback=None,
+    benchmark_progress_every: int = 5000,
+    benchmark_fraction: float = 0.01,
+    threads: int = 0,
+    kmc_src: str | None = None,
+    rebuild_bind: bool = False,
+    verbose_build: bool = False,
+) -> dict:
+    mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild_bind, verbose=verbose_build)
+    if not hasattr(mod, "kmc_export_bin_multi"):
+        if not bool(rebuild_bind):
+            mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=True, verbose=verbose_build)
+    if not hasattr(mod, "kmc_export_bin_multi"):
+        raise RuntimeError(
+            "Current _kmc_count binding does not provide kmc_export_bin_multi(). "
+            "Please rebuild JanusX KMC extension."
+        )
+    return dict(
+        mod.kmc_export_bin_multi(
+            kmc_prefixes=[str(x) for x in kmc_prefixes],
+            out_prefix=str(out_prefix),
+            sample_ids=[str(x) for x in sample_ids],
+            max_kmers=int(max_kmers),
+            progress_callback=progress_callback,
+            progress_every=int(progress_every),
+            benchmark_callback=benchmark_callback,
+            benchmark_progress_every=int(benchmark_progress_every),
+            benchmark_fraction=float(benchmark_fraction),
+            threads=int(threads),
+        )
+    )
+
+
+def run_kmc_dump_pairs(
+    *,
+    kmc_prefix: str,
+    max_kmers: int = 0,
+    kmc_src: str | None = None,
+    rebuild_bind: bool = False,
+    verbose_build: bool = False,
+) -> dict:
+    mod = load_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild_bind, verbose=verbose_build)
+    return dict(
+        mod.kmc_dump_pairs(
+            kmc_prefix=str(kmc_prefix),
+            max_kmers=int(max_kmers),
         )
     )

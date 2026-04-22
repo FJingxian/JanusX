@@ -8,6 +8,10 @@ use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
 
 const BED_HEADER_LEN: usize = 3;
+const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
+const BIN01_HEADER_LEN: usize = 32;
+const BIN_SITE_MAGIC: &[u8; 8] = b"JXBSITE1";
+const BIN_SITE_HEADER_LEN: usize = 24;
 
 #[inline]
 fn system_page_size() -> usize {
@@ -223,10 +227,17 @@ struct TxtPaths {
     prefix: PathBuf,
     txt_path: Option<PathBuf>,
     npy_path: PathBuf,
+    bin_path: Option<PathBuf>,
     id_path: PathBuf,
     src_site_path: Option<PathBuf>,
     src_bim_path: Option<PathBuf>,
     cache_bim_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxtMatrixKind {
+    NpyF32,
+    Bin01,
 }
 
 fn cache_prefix_path(prefix: &Path) -> PathBuf {
@@ -272,15 +283,32 @@ fn find_txt_with_prefix(prefix: &Path) -> Option<PathBuf> {
 }
 
 fn find_id_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let bin_id = append_suffix(prefix, ".bin.id");
+    if bin_id.exists() {
+        return Some(bin_id);
+    }
     let id = append_suffix(prefix, ".id");
     if id.exists() {
         return Some(id);
+    }
+    let fam = append_suffix(prefix, ".fam");
+    if fam.exists() {
+        return Some(fam);
+    }
+    None
+}
+
+fn find_bin_with_prefix(prefix: &Path) -> Option<PathBuf> {
+    let bin = append_suffix(prefix, ".bin");
+    if bin.exists() {
+        return Some(bin);
     }
     None
 }
 
 fn find_site_with_prefix(prefix: &Path) -> Option<PathBuf> {
     let candidates = [
+        append_suffix(prefix, ".bin.site"),
         append_suffix(prefix, ".site"),
         append_suffix(prefix, ".site.tsv"),
         append_suffix(prefix, ".site.txt"),
@@ -327,12 +355,14 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
                 .or_else(|| find_id_with_prefix(&cache_prefix))
                 .unwrap_or_else(|| append_suffix(&prefix, ".id"));
             let src_site_path = find_site_with_prefix(&prefix);
-            let src_bim_path = find_bim_with_prefix(&prefix);
+            let src_bim_path =
+                find_bim_with_prefix(&prefix).or_else(|| find_bim_with_prefix(&cache_prefix));
             let cache_bim_path = append_suffix(&cache_prefix, ".bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path: Some(input.to_path_buf()),
                 npy_path,
+                bin_path: None,
                 id_path,
                 src_site_path,
                 src_bim_path,
@@ -352,12 +382,42 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
                 .unwrap_or_else(|| append_suffix(&prefix, ".id"));
             let src_site_path =
                 find_site_with_prefix(&prefix).or_else(|| find_site_with_prefix(&cache_prefix));
-            let src_bim_path = find_bim_with_prefix(&prefix);
+            let src_bim_path =
+                find_bim_with_prefix(&prefix).or_else(|| find_bim_with_prefix(&cache_prefix));
             let cache_bim_path = append_suffix(&cache_prefix_path(&prefix), ".bim");
             return Ok(TxtPaths {
                 prefix,
                 txt_path,
                 npy_path: input.to_path_buf(),
+                bin_path: None,
+                id_path,
+                src_site_path,
+                src_bim_path,
+                cache_bim_path,
+            });
+        }
+        if ext == "bin" {
+            if !input.exists() {
+                return Err(format!("BIN file not found: {}", input.display()));
+            }
+            let cache_prefix = input.with_extension("");
+            let prefix = strip_cache_prefix(&cache_prefix).unwrap_or_else(|| cache_prefix.clone());
+            let txt_path =
+                find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&cache_prefix));
+            let id_path = find_id_with_prefix(&prefix)
+                .or_else(|| find_id_with_prefix(&cache_prefix))
+                .unwrap_or_else(|| append_suffix(&prefix, ".id"));
+            let src_site_path =
+                find_site_with_prefix(&prefix).or_else(|| find_site_with_prefix(&cache_prefix));
+            let src_bim_path =
+                find_bim_with_prefix(&prefix).or_else(|| find_bim_with_prefix(&cache_prefix));
+            let cache_bim_path = append_suffix(&cache_prefix_path(&prefix), ".bim");
+            let npy_cache_path = append_suffix(&cache_prefix_path(&prefix), ".npy");
+            return Ok(TxtPaths {
+                prefix,
+                txt_path,
+                npy_path: npy_cache_path,
+                bin_path: Some(input.to_path_buf()),
                 id_path,
                 src_site_path,
                 src_bim_path,
@@ -376,12 +436,14 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
             .unwrap_or_else(|| append_suffix(&prefix, ".id"));
         let src_site_path =
             find_site_with_prefix(&prefix).or_else(|| find_site_with_prefix(&cache_prefix));
-        let src_bim_path = find_bim_with_prefix(&prefix);
+        let src_bim_path =
+            find_bim_with_prefix(&prefix).or_else(|| find_bim_with_prefix(&cache_prefix));
         let cache_bim_path = append_suffix(&cache_prefix, ".bim");
         return Ok(TxtPaths {
             prefix,
             txt_path: Some(input.to_path_buf()),
             npy_path,
+            bin_path: None,
             id_path,
             src_site_path,
             src_bim_path,
@@ -394,6 +456,9 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
     let txt_path = find_txt_with_prefix(&prefix).or_else(|| find_txt_with_prefix(&raw_prefix));
     let cache_prefix = cache_prefix_path(&prefix);
     let npy_path = append_suffix(&cache_prefix, ".npy");
+    let bin_path = find_bin_with_prefix(&prefix)
+        .or_else(|| find_bin_with_prefix(&raw_prefix))
+        .or_else(|| find_bin_with_prefix(&cache_prefix));
     let id_path = find_id_with_prefix(&prefix)
         .or_else(|| find_id_with_prefix(&raw_prefix))
         .or_else(|| find_id_with_prefix(&cache_prefix))
@@ -401,15 +466,18 @@ fn resolve_txt_paths(path_or_prefix: &str) -> Result<TxtPaths, String> {
     let src_site_path = find_site_with_prefix(&prefix)
         .or_else(|| find_site_with_prefix(&raw_prefix))
         .or_else(|| find_site_with_prefix(&cache_prefix));
-    let src_bim_path = find_bim_with_prefix(&prefix);
+    let src_bim_path = find_bim_with_prefix(&prefix)
+        .or_else(|| find_bim_with_prefix(&raw_prefix))
+        .or_else(|| find_bim_with_prefix(&cache_prefix));
     let cache_bim_path = append_suffix(&cache_prefix, ".bim");
-    if !npy_path.exists() && txt_path.is_none() {
+    if !npy_path.exists() && txt_path.is_none() && bin_path.is_none() {
         return Err(format!("text matrix not found: {path_or_prefix}"));
     }
     Ok(TxtPaths {
         prefix,
         txt_path,
         npy_path,
+        bin_path,
         id_path,
         src_site_path,
         src_bim_path,
@@ -422,6 +490,11 @@ fn read_id_file(path: &Path) -> Result<Vec<String>, String> {
     let reader = BufReader::new(file);
     let mut samples = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let is_fam = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("fam"))
+        .unwrap_or(false);
 
     for (line_no, line) in reader.lines().enumerate() {
         let l = line.map_err(|e| format!("{}:{}: {}", path.display(), line_no + 1, e))?;
@@ -429,15 +502,27 @@ fn read_id_file(path: &Path) -> Result<Vec<String>, String> {
         if trimmed.is_empty() {
             continue;
         }
-        let toks = split_line_tokens(trimmed, None);
-        if toks.len() != 1 {
-            return Err(format!(
-                "{}:{}: expected 1 sample ID per line",
-                path.display(),
-                line_no + 1
-            ));
-        }
-        let sid = toks[0].to_string();
+        let sid = if is_fam {
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            if toks.len() < 2 {
+                return Err(format!(
+                    "{}:{}: expected PLINK FAM line with >=2 columns (FID IID ...)",
+                    path.display(),
+                    line_no + 1
+                ));
+            }
+            toks[1].to_string()
+        } else {
+            let toks = split_line_tokens(trimmed, None);
+            if toks.len() != 1 {
+                return Err(format!(
+                    "{}:{}: expected 1 sample ID per line",
+                    path.display(),
+                    line_no + 1
+                ));
+            }
+            toks[0].to_string()
+        };
         if !seen.insert(sid.clone()) {
             return Err(format!("duplicate sample ID in {}: {sid}", path.display()));
         }
@@ -459,7 +544,93 @@ fn infer_text_delimiter(line: &str) -> Option<char> {
     }
 }
 
-fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+#[inline]
+fn decode_base_2bit(code: u8) -> char {
+    match code & 0b11 {
+        0 => 'A',
+        1 => 'T',
+        2 => 'C',
+        _ => 'G',
+    }
+}
+
+fn decode_kmer_2bit(packed: &[u8], klen: usize) -> String {
+    let mut out = String::with_capacity(klen);
+    for i in 0..klen {
+        let byte = packed[i >> 2];
+        let code = (byte >> ((i & 0b11) * 2)) & 0b11;
+        out.push(decode_base_2bit(code));
+    }
+    out
+}
+
+fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut header = [0u8; BIN_SITE_HEADER_LEN];
+    file.read_exact(&mut header).map_err(|e| {
+        format!(
+            "failed to read binary site header {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if &header[0..8] != BIN_SITE_MAGIC {
+        return Err(format!(
+            "invalid binary site magic in {} (expect {:?})",
+            path.display(),
+            BIN_SITE_MAGIC
+        ));
+    }
+    let n_sites_u64 = u64::from_le_bytes(
+        header[8..16]
+            .try_into()
+            .map_err(|_| "invalid binary site n_sites".to_string())?,
+    );
+    let n_sites = usize::try_from(n_sites_u64)
+        .map_err(|_| "binary site n_sites too large for this platform".to_string())?;
+
+    let mut sites = Vec::with_capacity(n_sites);
+    for idx in 0..n_sites {
+        let mut len_buf = [0u8; 2];
+        file.read_exact(&mut len_buf).map_err(|e| {
+            format!(
+                "binary site truncated at record {} in {}: {}",
+                idx + 1,
+                path.display(),
+                e
+            )
+        })?;
+        let klen = u16::from_le_bytes(len_buf) as usize;
+        if klen == 0 {
+            return Err(format!(
+                "invalid zero-length k-mer at record {} in {}",
+                idx + 1,
+                path.display()
+            ));
+        }
+        let nbytes = (klen + 3) / 4;
+        let mut packed = vec![0u8; nbytes];
+        file.read_exact(&mut packed).map_err(|e| {
+            format!(
+                "binary site payload truncated at record {} in {}: {}",
+                idx + 1,
+                path.display(),
+                e
+            )
+        })?;
+        let alt = decode_kmer_2bit(&packed, klen);
+        let pos = i32::try_from(idx + 1).unwrap_or(i32::MAX);
+        sites.push(SiteInfo {
+            chrom: "KMER".to_string(),
+            pos,
+            ref_allele: "N".to_string(),
+            alt_allele: alt,
+        });
+    }
+    Ok(sites)
+}
+
+fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
 
@@ -530,6 +701,15 @@ fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
         return Err(format!("no site rows found in {}", path.display()));
     }
     Ok(sites)
+}
+
+fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+    let mut probe = File::open(path).map_err(|e| e.to_string())?;
+    let mut magic = [0u8; 8];
+    if probe.read_exact(&mut magic).is_ok() && &magic == BIN_SITE_MAGIC {
+        return read_bin_site_file(path);
+    }
+    read_site_file_text(path)
 }
 
 fn default_sites(n_rows: usize) -> Vec<SiteInfo> {
@@ -640,7 +820,7 @@ fn resolve_txt_sites(paths: &TxtPaths, n_snps: usize) -> Result<Vec<SiteInfo>, S
 
 fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
     // Only compare freshness when the original text matrix is available.
-    if paths.txt_path.is_none() {
+    if paths.txt_path.is_none() || paths.bin_path.is_some() {
         return Ok(());
     }
 
@@ -808,6 +988,43 @@ fn parse_npy_f32_header(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
         return Err("NPY data truncated".into());
     }
     Ok((rows, cols, data_offset))
+}
+
+fn parse_bin01_header(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
+    if bytes.len() < BIN01_HEADER_LEN {
+        return Err("BIN file too small".into());
+    }
+    if &bytes[0..8] != BIN01_MAGIC {
+        return Err("invalid BIN magic".into());
+    }
+    let n_snps = u64::from_le_bytes(
+        bytes[8..16]
+            .try_into()
+            .map_err(|_| "invalid BIN header n_snps".to_string())?,
+    );
+    let n_samples = u64::from_le_bytes(
+        bytes[16..24]
+            .try_into()
+            .map_err(|_| "invalid BIN header n_samples".to_string())?,
+    );
+    let n_snps =
+        usize::try_from(n_snps).map_err(|_| "BIN n_snps too large for this platform".to_string())?;
+    let n_samples = usize::try_from(n_samples)
+        .map_err(|_| "BIN n_samples too large for this platform".to_string())?;
+    if n_samples == 0 {
+        return Err("BIN n_samples is zero".into());
+    }
+    let row_bytes = (n_samples + 7) / 8;
+    let data_bytes = n_snps
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "BIN data size overflow".to_string())?;
+    let expected_len = BIN01_HEADER_LEN
+        .checked_add(data_bytes)
+        .ok_or_else(|| "BIN file size overflow".to_string())?;
+    if expected_len > bytes.len() {
+        return Err("BIN payload truncated".into());
+    }
+    Ok((n_snps, n_samples, BIN01_HEADER_LEN))
 }
 
 fn convert_text_matrix_to_npy(
@@ -1769,19 +1986,20 @@ impl HmpSnpIter {
 }
 
 // ======================================================================
-// TXT float32 matrix iterator:
-// - read numeric text matrix in chunks
-// - convert/cache as .npy (float32, C-order)
-// - mmap .npy for row-wise streaming
+// FILE matrix iterator for TXT/NPY/BIN:
+// - TXT: read numeric text matrix in chunks and cache as .npy (float32, C-order)
+// - NPY: mmap float32 matrix directly
+// - BIN: mmap bit-packed 0/1 matrix directly
 // ======================================================================
 pub struct TxtSnpIter {
     #[allow(dead_code)]
     pub path: String,
     #[allow(dead_code)]
-    pub npy_path: String,
+    pub matrix_path: String,
     pub samples: Vec<String>,
     pub sites: Vec<SiteInfo>,
     mmap: Mmap,
+    matrix_kind: TxtMatrixKind,
     data_offset: usize,
     n_samples: usize,
     n_snps: usize,
@@ -1802,13 +2020,22 @@ impl TxtSnpIter {
 
         purge_stale_txt_cache(&paths)?;
 
-        let (n_snps, n_cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
-            ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?
-        } else {
-            let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+        let (matrix_kind, matrix_path, n_snps, n_cols) = if let Some(bin_path) = paths.bin_path.as_ref()
+        {
+            let file = File::open(bin_path).map_err(|e| e.to_string())?;
             let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-            let (rows, cols, _) = parse_npy_f32_header(&mmap[..])?;
-            (rows, cols)
+            let (rows, cols, _) = parse_bin01_header(&mmap[..])?;
+            (TxtMatrixKind::Bin01, bin_path.clone(), rows, cols)
+        } else {
+            let (rows, cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
+                ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?
+            } else {
+                let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+                let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+                let (rows, cols, _) = parse_npy_f32_header(&mmap[..])?;
+                (rows, cols)
+            };
+            (TxtMatrixKind::NpyF32, paths.npy_path.clone(), rows, cols)
         };
         if n_cols != n_samples {
             return Err(format!(
@@ -1818,29 +2045,36 @@ impl TxtSnpIter {
         }
         let sites = resolve_txt_sites(&paths, n_snps)?;
 
-        let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+        let file = File::open(&matrix_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-        let (rows, cols, data_offset) = parse_npy_f32_header(&mmap[..])?;
+        let (rows, cols, data_offset) = match matrix_kind {
+            TxtMatrixKind::NpyF32 => parse_npy_f32_header(&mmap[..])?,
+            TxtMatrixKind::Bin01 => parse_bin01_header(&mmap[..])?,
+        };
         if rows != n_snps || cols != n_samples {
             return Err(format!(
-                "cached NPY shape mismatch for {}: expected ({}, {}), got ({}, {})",
-                paths.npy_path.display(),
+                "cached matrix shape mismatch for {}: expected ({}, {}), got ({}, {})",
+                matrix_path.display(),
                 n_snps,
                 n_samples,
                 rows,
                 cols
             ));
         }
-        let row_bytes = n_samples
-            .checked_mul(4)
-            .ok_or_else(|| "row byte size overflow".to_string())?;
+        let row_bytes = match matrix_kind {
+            TxtMatrixKind::NpyF32 => n_samples
+                .checked_mul(4)
+                .ok_or_else(|| "row byte size overflow".to_string())?,
+            TxtMatrixKind::Bin01 => (n_samples + 7) / 8,
+        };
 
         Ok(Self {
             path: paths.prefix.to_string_lossy().to_string(),
-            npy_path: paths.npy_path.to_string_lossy().to_string(),
+            matrix_path: matrix_path.to_string_lossy().to_string(),
             samples,
             sites,
             mmap,
+            matrix_kind,
             data_offset,
             n_samples,
             n_snps,
@@ -1866,8 +2100,25 @@ impl TxtSnpIter {
     pub fn get_snp_row(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
         let bytes = self.row_bytes(snp_idx)?;
         let mut row = Vec::with_capacity(self.n_samples);
-        for chunk in bytes.chunks_exact(4) {
-            row.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        match self.matrix_kind {
+            TxtMatrixKind::NpyF32 => {
+                for chunk in bytes.chunks_exact(4) {
+                    row.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+            }
+            TxtMatrixKind::Bin01 => {
+                let mut idx: usize = 0;
+                for &b in bytes.iter() {
+                    for bit in 0..8 {
+                        if idx >= self.n_samples {
+                            break;
+                        }
+                        let v = if ((b >> bit) & 1) != 0 { 1.0 } else { 0.0 };
+                        row.push(v);
+                        idx += 1;
+                    }
+                }
+            }
         }
         if row.len() != self.n_samples {
             return None;
@@ -1891,7 +2142,7 @@ impl TxtSnpIter {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bim, TxtSnpIter};
+    use super::{read_bim, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1909,8 +2160,10 @@ mod tests {
     fn txt_iter_defaults_work() {
         let dir = make_temp_dir("txt_default");
         let txt_path = dir.join("geno.txt");
+        let id_path = dir.join("geno.id");
 
-        fs::write(&txt_path, "s1 s2 s3\n0.1 -0.2 0.3\n-0.4 0.5 -0.6\n").unwrap();
+        fs::write(&txt_path, "0.1 -0.2 0.3\n-0.4 0.5 -0.6\n").unwrap();
+        fs::write(&id_path, "s1\ns2\ns3\n").unwrap();
 
         let mut it = TxtSnpIter::new(txt_path.to_str().unwrap(), None).unwrap();
         assert_eq!(it.n_samples(), 3);
@@ -1940,8 +2193,10 @@ mod tests {
     fn txt_iter_reads_header_delim() {
         let dir = make_temp_dir("txt_header_delim");
         let txt_path = dir.join("geno.txt");
+        let id_path = dir.join("geno.id");
 
-        fs::write(&txt_path, "a,b,c\n1,2,3\n4,5,6\n").unwrap();
+        fs::write(&txt_path, "1,2,3\n4,5,6\n").unwrap();
+        fs::write(&id_path, "a\nb\nc\n").unwrap();
 
         let it = TxtSnpIter::new(txt_path.to_str().unwrap(), Some(",")).unwrap();
         assert_eq!(it.n_samples(), 3);
@@ -1961,11 +2216,13 @@ mod tests {
     fn txt_iter_prefers_source_bim_and_writes_cache_bim() {
         let dir = make_temp_dir("txt_bim_cache");
         let txt_path = dir.join("g.txt");
+        let id_path = dir.join("g.id");
         let bim_path = dir.join("g.bim");
         let cache_prefix = dir.join("~g");
         let cache_bim_path = dir.join("~g.bim");
 
-        fs::write(&txt_path, "s1 s2\n0.1 0.2\n0.3 0.4\n").unwrap();
+        fs::write(&txt_path, "0.1 0.2\n0.3 0.4\n").unwrap();
+        fs::write(&id_path, "s1\ns2\n").unwrap();
         fs::write(&bim_path, "2 rsA 0 101 A G\n5 rsB 0 202 C T\n").unwrap();
 
         let it = TxtSnpIter::new(txt_path.to_str().unwrap(), None).unwrap();
@@ -1986,6 +2243,104 @@ mod tests {
         assert_eq!(cached_sites[0].pos, 101);
         assert_eq!(cached_sites[0].ref_allele, "A");
         assert_eq!(cached_sites[0].alt_allele, "G");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn txt_iter_accepts_fam_sidecar() {
+        let dir = make_temp_dir("txt_with_fam");
+        let txt_path = dir.join("geno.txt");
+        let fam_path = dir.join("geno.fam");
+
+        fs::write(&txt_path, "1 0 1\n0 1 0\n").unwrap();
+        fs::write(
+            &fam_path,
+            "F1 S1 0 0 0 -9\nF2 S2 0 0 0 -9\nF3 S3 0 0 0 -9\n",
+        )
+        .unwrap();
+
+        let it = TxtSnpIter::new(txt_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(it.n_samples(), 3);
+        assert_eq!(it.samples, vec!["S1", "S2", "S3"]);
+        assert_eq!(it.sites.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bin_iter_reads_bitpacked_rows() {
+        let dir = make_temp_dir("bin_iter");
+        let bin_path = dir.join("k.bin");
+        let id_path = dir.join("k.id");
+        let bim_path = dir.join("k.bim");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BIN01_MAGIC);
+        bytes.extend_from_slice(&(2u64).to_le_bytes()); // n_snps
+        bytes.extend_from_slice(&(5u64).to_le_bytes()); // n_samples
+        bytes.extend_from_slice(&(0u64).to_le_bytes()); // reserved
+        // row0: [0,1,0,1,1]
+        bytes.push(0b0001_1010);
+        // row1: [1,0,1,0,0]
+        bytes.push(0b0000_0101);
+        fs::write(&bin_path, bytes).unwrap();
+        fs::write(&id_path, "a\nb\nc\nd\ne\n").unwrap();
+        fs::write(&bim_path, "1 rs1 0 1 A K1\n1 rs2 0 2 A K2\n").unwrap();
+
+        let mut it = TxtSnpIter::new(bin_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(it.n_samples(), 5);
+        assert_eq!(it.sites.len(), 2);
+        let (r0, _) = it.next_snp().unwrap();
+        assert_eq!(r0, vec![0.0, 1.0, 0.0, 1.0, 1.0]);
+        let (r1, _) = it.next_snp().unwrap();
+        assert_eq!(r1, vec![1.0, 0.0, 1.0, 0.0, 0.0]);
+        assert!(it.next_snp().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bin_iter_reads_bin_id_and_bin_site() {
+        let dir = make_temp_dir("bin_iter_bin_sidecars");
+        let bin_path = dir.join("k.bin");
+        let id_path = dir.join("k.bin.id");
+        let site_path = dir.join("k.bin.site");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BIN01_MAGIC);
+        bytes.extend_from_slice(&(2u64).to_le_bytes()); // n_snps
+        bytes.extend_from_slice(&(3u64).to_le_bytes()); // n_samples
+        bytes.extend_from_slice(&(0u64).to_le_bytes()); // reserved
+        // row0: [1,0,1]
+        bytes.push(0b0000_0101);
+        // row1: [0,1,0]
+        bytes.push(0b0000_0010);
+        fs::write(&bin_path, bytes).unwrap();
+        fs::write(&id_path, "S1\nS2\nS3\n").unwrap();
+
+        // binary site payload:
+        // header + two kmers: "ATCG", "TGCA"
+        let mut sb: Vec<u8> = Vec::new();
+        sb.extend_from_slice(BIN_SITE_MAGIC);
+        sb.extend_from_slice(&(2u64).to_le_bytes()); // n_sites
+        sb.extend_from_slice(&(0u64).to_le_bytes()); // reserved
+        // "ATCG" => 00,01,10,11 => 0b1110_0100
+        sb.extend_from_slice(&(4u16).to_le_bytes());
+        sb.push(0b1110_0100);
+        // "TGCA" => 01,11,10,00 => 0b0010_1101
+        sb.extend_from_slice(&(4u16).to_le_bytes());
+        sb.push(0b0010_1101);
+        fs::write(&site_path, sb).unwrap();
+
+        let it = TxtSnpIter::new(bin_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(it.n_samples(), 3);
+        assert_eq!(it.samples, vec!["S1", "S2", "S3"]);
+        assert_eq!(it.sites.len(), 2);
+        assert_eq!(it.sites[0].chrom, "KMER");
+        assert_eq!(it.sites[0].pos, 1);
+        assert_eq!(it.sites[0].alt_allele, "ATCG");
+        assert_eq!(it.sites[1].alt_allele, "TGCA");
 
         let _ = fs::remove_dir_all(&dir);
     }

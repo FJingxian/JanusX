@@ -33,11 +33,17 @@ sparse = [
     "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
     "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
 ]
+treeplot = [
+    "toytree",
+    "toyplot",
+]
 full = [
     "scikit-learn",
     "xgboost",
     "statsmodels",
     "dynamicTreeCut",
+    "toytree",
+    "toyplot",
     "mkl; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
     "pypardiso; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and platform_system != 'Darwin'",
 ]

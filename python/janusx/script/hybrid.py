@@ -283,6 +283,7 @@ def _discover_site_path(file_arg: str, matrix_path: str) -> str | None:
     for prefix in _site_prefix_candidates(file_arg, matrix_path):
         candidates.extend(
             [
+                f"{prefix}.bin.site",
                 f"{prefix}.site",
                 f"{prefix}.bim",
                 f"{prefix}.sites.tsv",
@@ -306,6 +307,7 @@ def _discover_site_path(file_arg: str, matrix_path: str) -> str | None:
 def _discover_id_path(file_arg: str, matrix_path: str) -> str:
     candidates: list[str] = []
     for prefix in _site_prefix_candidates(file_arg, matrix_path):
+        candidates.append(f"{prefix}.bin.id")
         candidates.append(f"{prefix}.id")
     seen: set[str] = set()
     for cand in candidates:

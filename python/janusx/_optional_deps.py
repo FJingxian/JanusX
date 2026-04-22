@@ -19,6 +19,8 @@ _OPTIONAL_DEPENDENCIES: dict[str, OptionalDependencySpec] = {
     "statsmodels": OptionalDependencySpec(packages=("statsmodels",), extra="stats"),
     "pypardiso": OptionalDependencySpec(packages=("pypardiso", "mkl"), extra="sparse"),
     "mkl": OptionalDependencySpec(packages=("mkl", "pypardiso"), extra="sparse"),
+    "toytree": OptionalDependencySpec(packages=("toytree", "toyplot"), extra="treeplot"),
+    "toyplot": OptionalDependencySpec(packages=("toyplot", "toytree"), extra="treeplot"),
 }
 
 

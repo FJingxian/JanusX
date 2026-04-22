@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -20,7 +21,7 @@ except Exception:
 
 
 GENOTYPE_TEXT_SUFFIXES: tuple[str, ...] = (".txt", ".tsv", ".csv")
-GENOTYPE_SUFFIXES: tuple[str, ...] = GENOTYPE_TEXT_SUFFIXES + (".npy",)
+GENOTYPE_SUFFIXES: tuple[str, ...] = GENOTYPE_TEXT_SUFFIXES + (".npy", ".bin")
 
 
 def find_duplicates(items: Sequence[str]) -> list[str]:
@@ -50,6 +51,7 @@ def strip_known_suffix(path: str, exts: Sequence[str] | None = None) -> str:
         ".tsv",
         ".csv",
         ".npy",
+        ".bin",
     )
     for ext in known:
         if low.endswith(ext):
@@ -65,7 +67,7 @@ def strip_default_prefix_suffix(name: str) -> str:
     elif low.endswith(".hmp.gz"):
         base = base[: -len(".hmp.gz")]
     else:
-        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
+        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy", ".bin"):
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
@@ -145,6 +147,10 @@ def build_prefix_candidates(
         raw_prefix = strip_known_suffix(str(raw), exts=(".npy",))
         noncache_prefix = str(Path(raw_prefix).parent / Path(raw_prefix).name.lstrip("~"))
         return noncache_prefix, [noncache_prefix, raw_prefix]
+    if raw.suffix.lower() == ".bin":
+        raw_prefix = strip_known_suffix(str(raw), exts=(".bin",))
+        noncache_prefix = str(Path(raw_prefix).parent / Path(raw_prefix).name.lstrip("~"))
+        return noncache_prefix, [noncache_prefix, raw_prefix]
 
     raw_prefix = str(raw)
     cache_prefix = str(raw.parent / f"~{raw.name}")
@@ -154,6 +160,7 @@ def build_prefix_candidates(
 def discover_site_path(prefixes: Sequence[str]) -> str | None:
     for prefix in prefixes:
         for cand in (
+            f"{prefix}.bin.site",
             f"{prefix}.site",
             f"{prefix}.site.tsv",
             f"{prefix}.site.txt",
@@ -169,9 +176,11 @@ def discover_site_path(prefixes: Sequence[str]) -> str | None:
 
 
 def discover_id_sidecar_path(matrix_path: str, prefixes: Sequence[str]) -> str | None:
-    candidates = [f"{matrix_path}.id"]
+    candidates = [f"{matrix_path}.id", f"{matrix_path}.fam"]
     for prefix in prefixes:
+        candidates.append(f"{prefix}.bin.id")
         candidates.append(f"{prefix}.id")
+        candidates.append(f"{prefix}.fam")
 
     seen: set[str] = set()
     for cand in candidates:
@@ -190,7 +199,7 @@ def output_prefix_from_path(path: str) -> str:
         return p[:-7]
     if low.endswith(".hmp.gz"):
         return p[:-7]
-    for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy"):
+    for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy", ".bin"):
         if low.endswith(ext):
             return p[: -len(ext)]
     return p
@@ -214,14 +223,16 @@ def read_id_file(
         logger.warning(f"{label} ID file not found: {path}")
         return None
     src = basename_only(path)
+    use_fam_iid = str(path).lower().endswith(".fam")
 
     def _load_ids() -> np.ndarray | None:
+        usecols = [1] if use_fam_iid else [0]
         try:
             df = pd.read_csv(
                 path,
                 sep=r"\s+",
                 header=None,
-                usecols=[0],
+                usecols=usecols,
                 dtype=str,
                 keep_default_na=False,
             )
@@ -231,7 +242,7 @@ def read_id_file(
                 sep=None,
                 engine="python",
                 header=None,
-                usecols=[0],
+                usecols=usecols,
                 dtype=str,
                 keep_default_na=False,
             )
@@ -240,7 +251,7 @@ def read_id_file(
                 path,
                 sep=r"\s+",
                 header=None,
-                usecols=[0],
+                usecols=usecols,
                 dtype=str,
                 keep_default_na=False,
             )
@@ -308,6 +319,178 @@ def write_site_file(handle, sites: Sequence[SiteInfo]) -> None:
 def write_id_file(path: str, sample_ids: Sequence[str]) -> None:
     with open(path, "w", encoding="utf-8") as fid:
         fid.write("\n".join(map(str, sample_ids)) + "\n")
+
+
+def write_fam_file(path: str, sample_ids: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8") as ffam:
+        for sid in sample_ids:
+            s = str(sid)
+            ffam.write(f"{s}\t{s}\t0\t0\t0\t-9\n")
+
+
+def write_bim_file(path: str, sites: Sequence[SiteInfo]) -> None:
+    with open(path, "w", encoding="utf-8") as fbim:
+        for site in sites:
+            chrom = str(site.chrom)
+            try:
+                pos = int(site.pos)
+            except Exception:
+                pos = 0
+            sid = f"{chrom}_{pos}"
+            ref = str(site.ref_allele)
+            alt = str(site.alt_allele)
+            fbim.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
+
+
+BIN01_MAGIC = b"JXBIN001"
+BIN01_HEADER_SIZE = 32
+BIN_SITE_MAGIC = b"JXBSITE1"
+BIN_SITE_HEADER_SIZE = 24
+
+
+def _encode_base_2bit(ch: int) -> int:
+    # 2-bit mapping for k-mer site encoding:
+    # A=00, T=01, C=10, G=11
+    if ch in (65, 97):  # A/a
+        return 0
+    if ch in (84, 116):  # T/t
+        return 1
+    if ch in (67, 99):  # C/c
+        return 2
+    if ch in (71, 103):  # G/g
+        return 3
+    raise ValueError(f"Unsupported base in k-mer site encoding: {chr(ch)!r}")
+
+
+def _encode_kmer_2bit(seq: str) -> bytes:
+    raw = str(seq).encode("ascii", errors="strict")
+    n = len(raw)
+    out = bytearray((n + 3) // 4)
+    for i, ch in enumerate(raw):
+        code = _encode_base_2bit(int(ch))
+        out[i >> 2] |= (code & 0b11) << ((i & 0b11) * 2)
+    return bytes(out)
+
+
+def _write_bin_site_header(
+    handle,
+    *,
+    n_sites: int,
+    reserved: int = 0,
+) -> None:
+    handle.seek(0)
+    handle.write(BIN_SITE_MAGIC)
+    handle.write(struct.pack("<Q", int(n_sites)))
+    handle.write(struct.pack("<Q", int(reserved)))
+
+
+def write_bin_site_file(handle, sites: Sequence[SiteInfo]) -> None:
+    for site in sites:
+        kmer = str(site.alt_allele)
+        klen = len(kmer)
+        if klen <= 0:
+            raise ValueError("Empty k-mer in site metadata is not allowed for .bin.site output.")
+        if klen > 0xFFFF:
+            raise ValueError(f"k-mer length exceeds u16 limit: {klen}")
+        packed = _encode_kmer_2bit(kmer)
+        handle.write(struct.pack("<H", int(klen)))
+        handle.write(packed)
+
+
+def _write_bin_header(
+    handle,
+    *,
+    n_sites: int,
+    n_samples: int,
+    reserved: int = 0,
+) -> None:
+    handle.seek(0)
+    handle.write(BIN01_MAGIC)
+    handle.write(struct.pack("<Q", int(n_sites)))
+    handle.write(struct.pack("<Q", int(n_samples)))
+    handle.write(struct.pack("<Q", int(reserved)))
+
+
+def write_bin01_output(
+    out_path: str,
+    sample_ids: Sequence[str],
+    chunks: Iterable[tuple[np.ndarray, Sequence[SiteInfo]]],
+    *,
+    total_sites: int,
+    write_plink_sidecars: bool = False,
+) -> None:
+    """
+    Write SNP-major bit-packed 0/1 matrix:
+      - {prefix}.bin : header + packed rows
+      - {prefix}.bin.id  : sample IDs (text)
+      - {prefix}.bin.site: k-mer site metadata (2-bit encoded binary)
+    Optional:
+      - {prefix}.fam / {prefix}.bim when write_plink_sidecars=True
+    """
+    sample_ids = [str(x) for x in sample_ids]
+    n_samples = len(sample_ids)
+    if n_samples <= 0:
+        raise ValueError("sample_ids is empty")
+
+    prefix = output_prefix_from_path(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    write_id_file(f"{prefix}.bin.id", sample_ids)
+    if write_plink_sidecars:
+        write_fam_file(f"{prefix}.fam", sample_ids)
+
+    written = 0
+    packed_cols = (n_samples + 7) // 8
+    progress, task_id, pbar = _open_site_progress("Writing BIN", int(total_sites))
+    with open(out_path, "wb") as fbin, open(f"{prefix}.bin.site", "wb") as fsite:
+        fbim = open(f"{prefix}.bim", "w", encoding="utf-8") if write_plink_sidecars else None
+        try:
+            _write_bin_header(fbin, n_sites=0, n_samples=n_samples, reserved=0)
+            _write_bin_site_header(fsite, n_sites=0, reserved=0)
+            for block, sites in chunks:
+                arr = np.asarray(block, dtype=np.float32)
+                if arr.ndim != 2:
+                    raise ValueError("BIN chunk must be 2D (n_sites, n_samples)")
+                if int(arr.shape[1]) != n_samples:
+                    raise ValueError(
+                        f"BIN chunk sample mismatch: got {arr.shape[1]}, expected {n_samples}"
+                    )
+                bin01 = (arr > 0).astype(np.uint8, copy=False)
+                packed = np.packbits(bin01, axis=1, bitorder="little")
+                if int(packed.shape[1]) != packed_cols:
+                    raise ValueError(
+                        f"BIN packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
+                    )
+                fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
+                write_bin_site_file(fsite, sites)
+                if fbim is not None:
+                    for site in sites:
+                        chrom = str(site.chrom)
+                        try:
+                            pos = int(site.pos)
+                        except Exception:
+                            pos = 0
+                        sid = f"{chrom}_{pos}"
+                        ref = str(site.ref_allele)
+                        alt = str(site.alt_allele)
+                        fbim.write(f"{chrom}\t{sid}\t0\t{pos}\t{ref}\t{alt}\n")
+                n_rows = int(arr.shape[0])
+                written += n_rows
+                _advance_site_progress(progress, task_id, pbar, n_rows)
+            _write_bin_header(fbin, n_sites=written, n_samples=n_samples, reserved=0)
+            _write_bin_site_header(fsite, n_sites=written, reserved=0)
+            fbin.flush()
+            fsite.flush()
+        finally:
+            _close_site_progress(progress, pbar)
+            if fbim is not None:
+                fbim.close()
+
+    if written != int(total_sites):
+        print(
+            f"! Warning: Written site count mismatch for BIN output: {written} vs {total_sites}. "
+            f"Header was written with n_sites={written}.",
+            file=sys.stderr,
+        )
 
 
 def _open_site_progress(desc: str, total_sites: int):

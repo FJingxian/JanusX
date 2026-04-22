@@ -246,7 +246,7 @@ def _strip_known_suffix(path_or_prefix: str) -> str:
         return p[: -len(".hmp.gz")]
     if low.endswith(".vcf.gz"):
         return p[: -len(".vcf.gz")]
-    for ext in (".hmp", ".vcf", ".txt", ".tsv", ".csv", ".npy"):
+    for ext in (".hmp", ".vcf", ".txt", ".tsv", ".csv", ".npy", ".bin"):
         if low.endswith(ext):
             return p[: -len(ext)]
     return p
@@ -256,7 +256,7 @@ def _resolve_input(path_or_prefix: str):
     """
     Resolve input kind and prefix.
     Returns (kind, prefix, src_path_or_none).
-    kind: "plink" | "vcf" | "hmp" | "txt" | "npy" | "unknown"
+    kind: "plink" | "vcf" | "hmp" | "txt" | "npy" | "bin" | "unknown"
     """
     p = str(path_or_prefix)
     low = p.lower()
@@ -280,6 +280,12 @@ def _resolve_input(path_or_prefix: str):
         if base.startswith("~"):
             prefix = os.path.join(os.path.dirname(prefix), base[1:])
         return "npy", prefix, p
+    if low.endswith(".bin"):
+        prefix = _strip_known_suffix(p)
+        base = os.path.basename(prefix)
+        if base.startswith("~"):
+            prefix = os.path.join(os.path.dirname(prefix), base[1:])
+        return "bin", prefix, p
 
     prefix = p
     if _is_plink_prefix(prefix):
@@ -298,12 +304,16 @@ def _resolve_input(path_or_prefix: str):
         return "txt", prefix, f"{prefix}.tsv"
     if os.path.exists(f"{prefix}.csv"):
         return "txt", prefix, f"{prefix}.csv"
-    # New FILE layout: prefix.npy + prefix.id (+ optional prefix.site)
+    # FILE layout: prefix.(npy/txt/tsv/csv/bin) + prefix.(id/fam) (+ optional prefix.site/bim)
     if os.path.exists(f"{prefix}.npy"):
         return "npy", prefix, f"{prefix}.npy"
     cache_prefix = _cache_prefix(prefix)
     if os.path.exists(f"{cache_prefix}.npy"):
         return "npy", prefix, f"{cache_prefix}.npy"
+    if os.path.exists(f"{prefix}.bin"):
+        return "bin", prefix, f"{prefix}.bin"
+    if os.path.exists(f"{cache_prefix}.bin"):
+        return "bin", prefix, f"{cache_prefix}.bin"
     if os.path.isfile(prefix):
         return "txt", prefix, prefix
 
@@ -756,6 +766,10 @@ def prepare_cli_input_cache(
         if src_path is not None:
             return src_path
         return f"{prefix}.npy"
+    if kind == "bin":
+        if src_path is not None:
+            return src_path
+        return f"{prefix}.bin"
     return path_or_prefix
 
 
@@ -817,7 +831,10 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
     src_prefix = _strip_known_suffix(src_path)
     staged_prefix = _strip_known_suffix(staged)
     sidecar_suffixes = (
+        ".bin.id",
         ".id",
+        ".fam",
+        ".bin.site",
         ".site",
         ".site.tsv",
         ".site.txt",
@@ -1162,6 +1179,7 @@ def load_genotype_chunks(
       - VCF / VCF.GZ (converted once to cached PLINK BED/BIM/FAM: ~prefix.*)
       - HMP / HMP.GZ (prefer cached PLINK BED/BIM/FAM; fallback direct HMP streaming)
       - Numeric TXT matrix (converted once to cached NPY: ~prefix.npy)
+      - FILE NPY/BIN matrix (read directly from prefix.npy or prefix.bin)
 
     Parameters
     ----------
@@ -1171,6 +1189,7 @@ def load_genotype_chunks(
         - VCF  : full path, e.g. "data/QC.vcf.gz" (cached as "data/~QC.*")
         - HMP  : full path, e.g. "data/QC.hmp.gz" (prefer cached as "data/~QC.*")
         - TXT  : matrix path, e.g. "data/matrix.txt" (cached as "data/~matrix.npy")
+        - NPY/BIN: matrix path, e.g. "data/matrix.npy" or "data/matrix.bin"
 
     chunk_size : int
         Number of SNPs (rows) decoded per iteration.
@@ -1469,7 +1488,7 @@ def load_genotype_chunks(
             yield geno_np, sites_list
         return
 
-    if kind in ("txt", "npy"):
+    if kind in ("txt", "npy", "bin"):
         if mmap_window_mb is not None:
             raise ValueError("mmap_window_mb is only supported for PLINK BED inputs.")
         txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)
@@ -1512,7 +1531,7 @@ def load_genotype_chunks(
         "Unable to infer genotype input type. Provide a VCF path, "
         "an HMP path (.hmp/.hmp.gz), "
         "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
-        "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
+        "(prefix.id/.fam + prefix.npy/.txt/.tsv/.csv/.bin)."
     )
 
 def inspect_genotype_file(
@@ -1541,6 +1560,7 @@ def inspect_genotype_file(
         - For HMP     : count from cached PLINK BIM when cache path is available;
                         otherwise direct HMP row count.
         - For TXT     : matrix row count from cached NPY metadata.
+        - For NPY/BIN : matrix row count from matrix header metadata.
 
     Notes
     -----
@@ -1548,7 +1568,7 @@ def inspect_genotype_file(
         * .fam IID column (PLINK)
         * VCF #CHROM header columns (after PLINK cache is created)
         * HMP sample columns (after PLINK cache is created, or direct HMP reader fallback)
-        * TXT header row tokens
+        * FILE sidecar IDs from prefix.id or prefix.fam
     - sample_ids do NOT contain SNP / site information.
     """
     kind, prefix, src_path = _resolve_input(path_or_prefix)
@@ -1616,7 +1636,7 @@ def inspect_genotype_file(
             )
             return reader.sample_ids, int(count_hmp_snps(src_path))
 
-    if kind in ("txt", "npy"):
+    if kind in ("txt", "npy", "bin"):
         txt_input = _prepare_txtlike_input_for_cache(kind, prefix, src_path)
         reader = TxtChunkReader(
             txt_input,
@@ -1638,7 +1658,7 @@ def inspect_genotype_file(
         "Unable to infer genotype input type. Provide a VCF path, "
         "an HMP path (.hmp/.hmp.gz), "
         "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
-        "(prefix.id + prefix.npy/.txt/.tsv/.csv)."
+        "(prefix.id/.fam + prefix.npy/.txt/.tsv/.csv/.bin)."
     )
 
 

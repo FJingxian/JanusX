@@ -7001,6 +7001,168 @@ fn convert_geno_to_alignment_u8(
         .map_err(|e| format!("failed to build alignment chunk: {e}"))
 }
 
+fn normalize_distance_matrix_from_ndarray(
+    d: &numpy::ndarray::ArrayView2<'_, f64>,
+) -> Result<Vec<Vec<f64>>, String> {
+    let shape = d.shape();
+    if shape.len() != 2 {
+        return Err("distance matrix must be 2D".to_string());
+    }
+    let n = shape[0];
+    if n < 2 {
+        return Err("need at least 2 samples to build a tree".to_string());
+    }
+    if shape[1] != n {
+        return Err(format!(
+            "distance matrix must be square, got {}x{}",
+            n, shape[1]
+        ));
+    }
+
+    let mut out = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        let dii = d[[i, i]];
+        if !dii.is_finite() {
+            return Err(format!("distance matrix diagonal has NaN/Inf at ({},{})", i, i));
+        }
+        for j in (i + 1)..n {
+            let a = d[[i, j]];
+            let b = d[[j, i]];
+            let mut v = if a.is_finite() && b.is_finite() {
+                0.5 * (a + b)
+            } else if a.is_finite() {
+                a
+            } else if b.is_finite() {
+                b
+            } else {
+                return Err(format!(
+                    "distance matrix has NaN/Inf in both directions at ({}, {}) and ({}, {})",
+                    i, j, j, i
+                ));
+            };
+            if !v.is_finite() {
+                return Err(format!(
+                    "distance matrix has invalid value after symmetrization at ({}, {})",
+                    i, j
+                ));
+            }
+            if v < 0.0 {
+                v = 0.0;
+            }
+            out[i][j] = v;
+            out[j][i] = v;
+        }
+    }
+    Ok(out)
+}
+
+fn nj_newick_from_distance_exact(
+    mut dist: Vec<Vec<f64>>,
+    sample_ids: Vec<String>,
+) -> Result<String, String> {
+    let n_taxa = sample_ids.len();
+    if n_taxa < 2 {
+        return Err("need at least 2 samples to build a tree".to_string());
+    }
+    if dist.len() != n_taxa || dist.iter().any(|r| r.len() != n_taxa) {
+        return Err("distance matrix size does not match sample_ids length".to_string());
+    }
+
+    let mut nodes: Vec<TreeNode> = sample_ids.into_iter().map(TreeNode::Leaf).collect();
+    let mut active: Vec<usize> = (0..n_taxa).collect();
+
+    while active.len() > 2 {
+        let m = active.len() as f64;
+        let mut r = vec![0.0f64; dist.len()];
+        for ai in 0..active.len() {
+            let i = active[ai];
+            for &j in active.iter().skip(ai + 1) {
+                let d = dist[i][j];
+                r[i] += d;
+                r[j] += d;
+            }
+        }
+
+        let mut best_q = f64::INFINITY;
+        let mut best_i = active[0];
+        let mut best_j = active[1];
+        for ai in 0..active.len() {
+            let i = active[ai];
+            for &j in active.iter().skip(ai + 1) {
+                let q = (m - 2.0) * dist[i][j] - r[i] - r[j];
+                if q < best_q || (q == best_q && (i < best_i || (i == best_i && j < best_j))) {
+                    best_q = q;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        let dij = dist[best_i][best_j];
+        let denom = (m - 2.0).max(1.0);
+        let mut li = 0.5 * dij + (r[best_i] - r[best_j]) / (2.0 * denom);
+        let mut lj = dij - li;
+        if !li.is_finite() || li < 0.0 {
+            li = 0.0;
+        }
+        if !lj.is_finite() || lj < 0.0 {
+            lj = 0.0;
+        }
+
+        let u = nodes.len();
+        nodes.push(TreeNode::Internal {
+            left: best_i,
+            right: best_j,
+            left_len: li,
+            right_len: lj,
+        });
+
+        let ud = add_dist_node(&mut dist);
+        if ud != u {
+            return Err("distance-matrix NJ internal index mismatch".to_string());
+        }
+
+        for &k in &active {
+            if k == best_i || k == best_j {
+                continue;
+            }
+            let dik = dist[best_i][k];
+            let djk = dist[best_j][k];
+            let mut duk = 0.5 * (dik + djk - dij);
+            if !duk.is_finite() || duk < 0.0 {
+                duk = 0.0;
+            }
+            dist[u][k] = duk;
+            dist[k][u] = duk;
+        }
+
+        active.retain(|&x| x != best_i && x != best_j);
+        active.push(u);
+    }
+
+    if active.len() != 2 {
+        return Err("distance-matrix NJ failed to end with exactly 2 active nodes".to_string());
+    }
+    let a0 = active[0];
+    let a1 = active[1];
+    let mut d = dist[a0][a1];
+    if !d.is_finite() || d < 0.0 {
+        d = 0.0;
+    }
+    let l = 0.5 * d;
+    let root = nodes.len();
+    nodes.push(TreeNode::Internal {
+        left: a0,
+        right: a1,
+        left_len: l,
+        right_len: l,
+    });
+
+    let mut out = render_newick(root, &nodes);
+    out.push(';');
+    Ok(out)
+}
+
 #[pyfunction]
 pub fn geno_chunk_to_alignment_u8<'py>(
     py: Python<'py>,
@@ -7015,6 +7177,58 @@ pub fn geno_chunk_to_alignment_u8<'py>(
     let ac_vec: Vec<u8> = ac.iter().copied().collect();
     let arr = convert_geno_to_alignment_u8(&g, &rc_vec, &ac_vec).map_err(PyValueError::new_err)?;
     Ok(PyArray2::from_owned_array(py, arr))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    dist,
+    sample_ids,
+    max_taxa=20000usize
+))]
+pub fn nj_newick_from_distance_matrix(
+    dist: PyReadonlyArray2<f64>,
+    sample_ids: Vec<String>,
+    max_taxa: usize,
+) -> PyResult<String> {
+    let d = dist.as_array();
+    let shape = d.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err(
+            "distance matrix must be a 2D float matrix: (n_samples, n_samples)",
+        ));
+    }
+    let n_taxa = shape[0];
+    if n_taxa < 2 {
+        return Err(PyValueError::new_err(
+            "need at least 2 samples to build a tree",
+        ));
+    }
+    if shape[1] != n_taxa {
+        return Err(PyValueError::new_err(format!(
+            "distance matrix must be square, got {}x{}",
+            n_taxa, shape[1]
+        )));
+    }
+    if sample_ids.len() != n_taxa {
+        return Err(PyValueError::new_err(format!(
+            "sample_ids length mismatch: got {}, expected {}",
+            sample_ids.len(),
+            n_taxa
+        )));
+    }
+    if max_taxa == 0 {
+        return Err(PyValueError::new_err("max_taxa must be > 0"));
+    }
+    if n_taxa > max_taxa {
+        return Err(PyValueError::new_err(format!(
+            "n_samples={} exceeds max_taxa={}; distance-NJ is O(N^3)",
+            n_taxa, max_taxa
+        )));
+    }
+
+    let dist_vec = normalize_distance_matrix_from_ndarray(&d).map_err(PyValueError::new_err)?;
+    let nwk = nj_newick_from_distance_exact(dist_vec, sample_ids).map_err(PyValueError::new_err)?;
+    Ok(nwk)
 }
 
 #[pyfunction]

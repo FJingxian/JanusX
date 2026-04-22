@@ -47,6 +47,7 @@ def rich_progress_available() -> bool:
 def build_rich_progress(
     *,
     description_template: str = "[green]{task.description}",
+    show_spinner: bool = True,
     show_bar: bool = True,
     show_percentage: bool = True,
     show_elapsed: bool = True,
@@ -62,24 +63,24 @@ def build_rich_progress(
     assert SpinnerColumn is not None
     assert TextColumn is not None
 
-    spinner_name = get_rich_spinner_name()
-    try:
-        spinner_col = SpinnerColumn(
-            spinner_name=spinner_name,
-            style="cyan",
-            finished_text=str(finished_text),
-        )
-    except Exception:
-        # Absolute fallback for environment-specific Rich spinner registries.
-        spinner_col = SpinnerColumn(
-            spinner_name="line",
-            style="cyan",
-            finished_text=str(finished_text),
-        )
-    columns: list[object] = [
-        spinner_col,
-        TextColumn(str(description_template)),
-    ]
+    columns: list[object] = []
+    if show_spinner:
+        spinner_name = get_rich_spinner_name()
+        try:
+            spinner_col = SpinnerColumn(
+                spinner_name=spinner_name,
+                style="cyan",
+                finished_text=str(finished_text),
+            )
+        except Exception:
+            # Absolute fallback for environment-specific Rich spinner registries.
+            spinner_col = SpinnerColumn(
+                spinner_name="line",
+                style="cyan",
+                finished_text=str(finished_text),
+            )
+        columns.append(spinner_col)
+    columns.append(TextColumn(str(description_template)))
     if show_bar:
         assert BarColumn is not None
         columns.append(BarColumn(bar_width=bar_width) if bar_width is not None else BarColumn())
@@ -104,6 +105,9 @@ class ProgressAdapter:
         total: int,
         desc: str,
         *,
+        show_spinner: bool = True,
+        show_postfix: bool = True,
+        keep_display: bool = False,
         show_remaining: bool = True,
         emit_done: bool = True,
         bar_width: int | None = None,
@@ -119,14 +123,17 @@ class ProgressAdapter:
         self._finished = False
         self._start_ts = time.monotonic()
         self._animate = bool(force_animate or should_animate_status(self.desc))
+        self._show_postfix = bool(show_postfix)
+        self._keep_display = bool(keep_display)
 
         if self._animate:
             progress = build_rich_progress(
+                show_spinner=bool(show_spinner),
                 show_remaining=bool(show_remaining),
-                field_templates=["{task.fields[postfix]}"],
+                field_templates=["{task.fields[postfix]}"] if self._show_postfix else [],
                 bar_width=bar_width,
                 finished_text=" ",
-                transient=True,
+                transient=(not self._keep_display),
             )
             if progress is not None:
                 try:
@@ -149,7 +156,7 @@ class ProgressAdapter:
                     total=self.total,
                     desc=self.desc,
                     ascii=True,
-                    leave=False,
+                    leave=bool(self._keep_display),
                     bar_format="{desc}: {percentage:3.0f}%|{bar}| "
                     "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
                 )
@@ -165,6 +172,8 @@ class ProgressAdapter:
             self._tqdm.update(step)
 
     def set_postfix(self, **kwargs: object) -> None:
+        if not self._show_postfix:
+            return
         if len(kwargs) == 0:
             return
         text = " ".join([f"{k}={v}" for k, v in kwargs.items()])

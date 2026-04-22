@@ -1055,10 +1055,12 @@ def _resolve_file_input_matrix(genofile: str) -> tuple[Optional[str], Optional[s
     low = path.lower()
     if low.endswith(".npy"):
         return path[: -len(".npy")], path
+    if low.endswith(".bin"):
+        return path[: -len(".bin")], path
     for ext in (".txt", ".tsv", ".csv"):
         if low.endswith(ext):
             return path[: -len(ext)], path
-    for ext in (".npy", ".txt", ".tsv", ".csv"):
+    for ext in (".npy", ".bin", ".txt", ".tsv", ".csv"):
         cand = f"{path}{ext}"
         if os.path.isfile(cand):
             return path, cand
@@ -1067,7 +1069,9 @@ def _resolve_file_input_matrix(genofile: str) -> tuple[Optional[str], Optional[s
 
 def _file_input_sidecars(prefix: str) -> list[str]:
     return [
+        f"{prefix}.bin.id",
         f"{prefix}.id",
+        f"{prefix}.bin.site",
         f"{prefix}.site",
         f"{prefix}.site.tsv",
         f"{prefix}.site.txt",

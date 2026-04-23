@@ -621,6 +621,7 @@ enum SgemmBackend {
     Accelerate,
     OpenBlas,
     Blas,
+    Rust,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -634,8 +635,11 @@ const HAS_OPENBLAS_BACKEND: bool = cfg!(any(
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const HAS_ACCELERATE_BACKEND: bool = cfg!(target_os = "macos");
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-const HAS_BLAS_BACKEND: bool =
-    cfg!(all(target_os = "linux", not(all(feature = "blas-openblas", jx_openblas_available))));
+const HAS_BLAS_BACKEND: bool = cfg!(all(
+    target_os = "linux",
+    jx_blas_available,
+    not(all(feature = "blas-openblas", jx_openblas_available))
+));
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
@@ -656,7 +660,10 @@ fn default_sgemm_backend() -> SgemmBackend {
         if HAS_OPENBLAS_BACKEND {
             return SgemmBackend::OpenBlas;
         }
-        return SgemmBackend::Blas;
+        if HAS_BLAS_BACKEND {
+            return SgemmBackend::Blas;
+        }
+        return SgemmBackend::Rust;
     }
 }
 
@@ -691,6 +698,7 @@ fn resolve_sgemm_backend() -> SgemmBackend {
                 default_backend
             }
         }
+        "rust" => SgemmBackend::Rust,
         _ => default_backend,
     }
 }
@@ -725,6 +733,7 @@ unsafe extern "C" {
 
 #[cfg(all(
     target_os = "linux",
+    jx_blas_available,
     not(all(feature = "blas-openblas", jx_openblas_available))
 ))]
 #[link(name = "blas")]
@@ -856,7 +865,7 @@ unsafe extern "C" {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(jx_openblas_link_openblas_plain)))]
 #[link(name = "libopenblas")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
@@ -876,6 +885,81 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: CblasInt,
     );
+}
+
+#[cfg(all(target_os = "windows", jx_openblas_link_openblas_plain))]
+#[link(name = "openblas")]
+unsafe extern "C" {
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_openblas(
+        order: CblasInt,
+        transa: CblasInt,
+        transb: CblasInt,
+        m: CblasInt,
+        n: CblasInt,
+        k: CblasInt,
+        alpha: f32,
+        a: *const f32,
+        lda: CblasInt,
+        b: *const f32,
+        ldb: CblasInt,
+        beta: f32,
+        c: *mut f32,
+        ldc: CblasInt,
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn cblas_sgemm_rust(
+    order: CblasInt,
+    transa: CblasInt,
+    transb: CblasInt,
+    m: CblasInt,
+    n: CblasInt,
+    k: CblasInt,
+    alpha: f32,
+    a: *const f32,
+    lda: CblasInt,
+    b: *const f32,
+    ldb: CblasInt,
+    beta: f32,
+    c: *mut f32,
+    ldc: CblasInt,
+) {
+    assert_eq!(
+        order, CBLAS_COL_MAJOR,
+        "Rust SGEMM fallback expects column-major order"
+    );
+    let (m, n, k) = (m as usize, n as usize, k as usize);
+    let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
+
+    let a_cols = if transa == CBLAS_NO_TRANS { k } else { m };
+    let b_cols = if transb == CBLAS_NO_TRANS { n } else { k };
+    let a_slice = std::slice::from_raw_parts(a, lda.saturating_mul(a_cols));
+    let b_slice = std::slice::from_raw_parts(b, ldb.saturating_mul(b_cols));
+    let c_slice = std::slice::from_raw_parts_mut(c, ldc.saturating_mul(n));
+
+    for col in 0..n {
+        for row in 0..m {
+            let mut acc = 0.0_f32;
+            for p in 0..k {
+                let av = if transa == CBLAS_NO_TRANS {
+                    a_slice[row + p * lda]
+                } else {
+                    a_slice[p + row * lda]
+                };
+                let bv = if transb == CBLAS_NO_TRANS {
+                    b_slice[p + col * ldb]
+                } else {
+                    b_slice[col + p * ldb]
+                };
+                acc += av * bv;
+            }
+            let idx = row + col * ldc;
+            c_slice[idx] = alpha * acc + beta * c_slice[idx];
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -921,6 +1005,7 @@ unsafe fn cblas_sgemm_dispatch(
         SgemmBackend::Blas => {
             #[cfg(all(
                 target_os = "linux",
+                jx_blas_available,
                 not(all(feature = "blas-openblas", jx_openblas_available))
             ))]
             {
@@ -929,6 +1014,12 @@ unsafe fn cblas_sgemm_dispatch(
                 );
                 return;
             }
+        }
+        SgemmBackend::Rust => {
+            cblas_sgemm_rust(
+                order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+            );
+            return;
         }
     }
 
@@ -946,10 +1037,21 @@ unsafe fn cblas_sgemm_dispatch(
     }
     #[cfg(all(
         target_os = "linux",
+        jx_blas_available,
         not(all(feature = "blas-openblas", jx_openblas_available))
     ))]
     {
         cblas_sgemm_blas(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(jx_blas_available),
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_sgemm_rust(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
@@ -969,6 +1071,7 @@ pub fn rust_sgemm_backend() -> String {
             SgemmBackend::Accelerate => "accelerate".to_string(),
             SgemmBackend::OpenBlas => "openblas".to_string(),
             SgemmBackend::Blas => "blas".to_string(),
+            SgemmBackend::Rust => "rust".to_string(),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -987,11 +1090,7 @@ fn grm_rankk_update_cblas(
     copy_rhs: bool,
     beta_zero_accum: bool,
 ) {
-    let rhs_owned = if copy_rhs {
-        Some(block.to_vec())
-    } else {
-        None
-    };
+    let rhs_owned = if copy_rhs { Some(block.to_vec()) } else { None };
     let rhs_ptr = match rhs_owned.as_ref() {
         Some(v) => v.as_ptr(),
         None => block.as_ptr(),
@@ -1067,8 +1166,18 @@ fn grm_rankk_update(
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = (grm, block, cur_rows, n, cblas_copy_rhs, cblas_beta_zero_accum);
-        Err("Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM.".to_string())
+        let _ = (
+            grm,
+            block,
+            cur_rows,
+            n,
+            cblas_copy_rhs,
+            cblas_beta_zero_accum,
+        );
+        Err(
+            "Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM."
+                .to_string(),
+        )
     }
 }
 
@@ -1546,10 +1655,8 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                     let blk_slice = &mut block[..cur_rows * n_out];
 
                     if full_sample_fast {
-                        blk_slice
-                            .par_chunks_mut(n_out)
-                            .enumerate()
-                            .for_each(|(local_row, out_row)| {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
                                 let row_idx = st + local_row;
                                 let row = &packed_flat
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
@@ -1566,12 +1673,11 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                                     &value_lut,
                                     out_row,
                                 );
-                            });
+                            },
+                        );
                     } else {
-                        blk_slice
-                            .par_chunks_mut(n_out)
-                            .enumerate()
-                            .for_each(|(local_row, out_row)| {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
                                 let row_idx = st + local_row;
                                 let row = &packed_flat
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
@@ -1591,7 +1697,8 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                                     }
                                     out_row[j] = gv;
                                 }
-                            });
+                            },
+                        );
                     }
 
                     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1640,7 +1747,11 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
                         }
                     }
 
-                    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "linux",
+                        target_os = "windows"
+                    )))]
                     {
                         let alpha_blk = &m_alpha_vec[st..ed];
                         let mean_blk = &m_mean_vec[st..ed];
@@ -1803,10 +1914,8 @@ pub fn packed_malpha_f64<'py>(
                     let blk_slice = &mut block[..cur_rows * n_out];
 
                     if full_sample_fast {
-                        blk_slice
-                            .par_chunks_mut(n_out)
-                            .enumerate()
-                            .for_each(|(local_row, out_row)| {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
                                 let row_idx = st + local_row;
                                 let row = &packed_flat
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
@@ -1823,12 +1932,11 @@ pub fn packed_malpha_f64<'py>(
                                     &value_lut,
                                     out_row,
                                 );
-                            });
+                            },
+                        );
                     } else {
-                        blk_slice
-                            .par_chunks_mut(n_out)
-                            .enumerate()
-                            .for_each(|(local_row, out_row)| {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
                                 let row_idx = st + local_row;
                                 let row = &packed_flat
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
@@ -1848,7 +1956,8 @@ pub fn packed_malpha_f64<'py>(
                                     }
                                     out_row[j] = gv;
                                 }
-                            });
+                            },
+                        );
                     }
 
                     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1882,7 +1991,11 @@ pub fn packed_malpha_f64<'py>(
                         }
                     }
 
-                    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "linux",
+                        target_os = "windows"
+                    )))]
                     {
                         let out_blk = &mut out[st..ed];
                         for r in 0..cur_rows {
@@ -2366,7 +2479,11 @@ block_target_mb={:.1}, n_samples={}, full_sample={}, threads={}",
                     block_target_mb,
                     n,
                     if full_sample_fast { "yes" } else { "no" },
-                    if threads > 0 { threads } else { rayon::current_num_threads() }
+                    if threads > 0 {
+                        threads
+                    } else {
+                        rayon::current_num_threads()
+                    }
                 );
             }
             Ok(grm)
@@ -2497,8 +2614,7 @@ pub fn grm_packed_bed_f32<'py>(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .into_bound();
-    let maf_keep_arr =
-        PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
+    let maf_keep_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
 
     let row_flip = bed_packed_row_flip_mask(py, packed_keep_arr.readonly(), n_samples)?;
     let grm = grm_packed_f32(
@@ -2542,11 +2658,7 @@ pub fn grm_packed_f32_with_stats<'py>(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
-) -> PyResult<(
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray1<f64>>,
-    f64,
-)> {
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<f64>>, f64)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
@@ -2683,7 +2795,8 @@ pub fn grm_packed_f32_with_stats<'py>(
                             .enumerate()
                             .for_each(|(off, ((out_row, row_varsum_dst), row_sum_dst))| {
                                 let idx = row_start + off;
-                                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                let row =
+                                    &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                                 let flip = row_flip_vec[idx];
                                 let p = row_maf_vec[idx].clamp(0.0, 0.5);
                                 let mean_g = 2.0_f32 * p;
@@ -2734,23 +2847,24 @@ pub fn grm_packed_f32_with_stats<'py>(
                                 || vec![0.0_f32; n_samples],
                                 |full_row, (off, ((out_row, row_varsum_dst), row_sum_dst))| {
                                     let idx = row_start + off;
-                                    let row =
-                                        &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                                    let row = &packed_flat
+                                        [idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
                                     let flip = row_flip_vec[idx];
                                     let p = row_maf_vec[idx].clamp(0.0, 0.5);
                                     let default_mean_g = 2.0_f32 * p;
-                                    let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
-                                        row,
-                                        n_samples,
-                                        &sample_idx,
-                                        flip,
-                                        default_mean_g,
-                                        method,
-                                        eps,
-                                        &byte_lut.code4,
-                                        full_row.as_mut_slice(),
-                                        out_row,
-                                    );
+                                    let (var_centered, row_sum) =
+                                        decode_subset_row_from_full_scratch(
+                                            row,
+                                            n_samples,
+                                            &sample_idx,
+                                            flip,
+                                            default_mean_g,
+                                            method,
+                                            eps,
+                                            &byte_lut.code4,
+                                            full_row.as_mut_slice(),
+                                            out_row,
+                                        );
                                     if method == 1 {
                                         *row_varsum_dst = var_centered;
                                     }

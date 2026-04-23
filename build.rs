@@ -113,21 +113,34 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
         return false;
     }
 
+    let has_win_libopenblas = Path::new(lib_dir_s).join("libopenblas.lib").exists()
+        || Path::new(lib_dir_s).join("libopenblas.dll.a").exists()
+        || Path::new(lib_dir_s).join("libopenblas.dll").exists();
+    let has_win_openblas = Path::new(lib_dir_s).join("openblas.lib").exists();
+
     // Conda/macOS can expose versioned soname only (e.g. libopenblas.0.dylib)
     // without a generic libopenblas.dylib symlink.
     let has_generic = Path::new(lib_dir_s).join("libopenblas.dylib").exists()
         || Path::new(lib_dir_s).join("libopenblas.so").exists()
-        || Path::new(lib_dir_s).join("libopenblas.a").exists();
+        || Path::new(lib_dir_s).join("libopenblas.a").exists()
+        // Windows (vcpkg/conda) layouts.
+        || has_win_libopenblas
+        || has_win_openblas;
     let has_versioned = Path::new(lib_dir_s).join("libopenblas.0.dylib").exists()
         || Path::new(lib_dir_s).join("libopenblas.so.0").exists();
     if !has_generic && !has_versioned {
         return false;
     }
     println!("cargo:rustc-link-search=native={lib_dir_s}");
-    // Ensure wheel-repair tools can resolve @rpath-linked dependencies
-    // (e.g. libopenblas.0.dylib -> libiconv.2.dylib in conda environments).
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        // Ensure wheel-repair tools can resolve @rpath-linked dependencies
+        // (e.g. libopenblas.0.dylib -> libiconv.2.dylib in conda environments).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+    }
     println!("cargo:rustc-cfg=jx_openblas_available");
+    if cfg!(target_os = "windows") && has_win_openblas && !has_win_libopenblas {
+        println!("cargo:rustc-cfg=jx_openblas_link_openblas_plain");
+    }
     if !has_generic && has_versioned {
         println!("cargo:rustc-cfg=jx_openblas_link_openblas0");
         println!(
@@ -148,13 +161,48 @@ fn main() {
     // Allow conditional compilation checks for our custom cfg.
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_available)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas0)");
+    println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas_plain)");
+    println!("cargo:rustc-check-cfg=cfg(jx_blas_available)");
+    println!("cargo:rerun-if-env-changed=JANUSX_REQUIRE_OPENBLAS");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=OPENBLAS_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=BLAS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+    let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
 
     // Only probe OpenBLAS when user explicitly enabled the feature.
     if env::var_os("CARGO_FEATURE_BLAS_OPENBLAS").is_none() {
+        if require_openblas {
+            panic!(
+                "JANUSX_REQUIRE_OPENBLAS=1 but feature `blas-openblas` is not enabled. \
+Enable default features or pass --features blas-openblas."
+            );
+        }
+        if cfg!(target_os = "linux") {
+            if let Some(lib_dir) = env::var_os("BLAS_LIB_DIR") {
+                let lib_dir_s = lib_dir.to_string_lossy().to_string();
+                if Path::new(&lib_dir_s).exists() {
+                    println!("cargo:rustc-link-search=native={lib_dir_s}");
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+                    println!("cargo:rustc-cfg=jx_blas_available");
+                    println!("cargo:warning=BLAS enabled via BLAS_LIB_DIR.");
+                    return;
+                }
+            }
+            if pkg_config::Config::new()
+                .cargo_metadata(true)
+                .probe("blas")
+                .is_ok()
+            {
+                println!("cargo:rustc-cfg=jx_blas_available");
+                println!("cargo:warning=BLAS detected by pkg-config.");
+            } else {
+                println!(
+                    "cargo:warning=No BLAS/OpenBLAS detected on Linux; falling back to pure Rust SGEMM."
+                );
+            }
+        }
         return;
     }
 
@@ -188,16 +236,56 @@ fn main() {
     }
 
     // Try pkg-config discovery.
-    match pkg_config::Config::new().cargo_metadata(true).probe("openblas") {
+    match pkg_config::Config::new()
+        .cargo_metadata(true)
+        .probe("openblas")
+    {
         Ok(_) => {
             println!("cargo:rustc-cfg=jx_openblas_available");
             println!("cargo:warning=OpenBLAS detected by pkg-config.");
         }
         Err(err) => {
-            println!(
-                "cargo:warning=OpenBLAS feature requested but library not found ({err}); \
+            if require_openblas {
+                panic!(
+                    "JANUSX_REQUIRE_OPENBLAS=1 but OpenBLAS was not detected ({err}). \
+Set OPENBLAS_LIB_DIR/OPENBLAS_INCLUDE_DIR or install OpenBLAS + pkg-config metadata."
+                );
+            }
+            if cfg!(target_os = "linux") {
+                if let Some(lib_dir) = env::var_os("BLAS_LIB_DIR") {
+                    let lib_dir_s = lib_dir.to_string_lossy().to_string();
+                    if Path::new(&lib_dir_s).exists() {
+                        println!("cargo:rustc-link-search=native={lib_dir_s}");
+                        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+                        println!("cargo:rustc-cfg=jx_blas_available");
+                        println!(
+                            "cargo:warning=OpenBLAS feature requested but library not found ({err}); \
+falling back to BLAS via BLAS_LIB_DIR."
+                        );
+                        return;
+                    }
+                }
+                match pkg_config::Config::new().cargo_metadata(true).probe("blas") {
+                    Ok(_) => {
+                        println!("cargo:rustc-cfg=jx_blas_available");
+                        println!(
+                            "cargo:warning=OpenBLAS feature requested but library not found ({err}); \
+falling back to pkg-config BLAS."
+                        );
+                    }
+                    Err(blas_err) => {
+                        println!(
+                            "cargo:warning=OpenBLAS feature requested but library not found ({err}); \
+BLAS also unavailable ({blas_err}); falling back to pure Rust SGEMM."
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "cargo:warning=OpenBLAS feature requested but library not found ({err}); \
 falling back to platform backend."
-            );
+                );
+            }
         }
     }
 }

@@ -246,6 +246,10 @@ jobs:
     name: Build wheels (${{ matrix.label }})
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     runs-on: ${{ matrix.runner }}
+    env:
+      JANUSX_REQUIRE_OPENBLAS: "1"
+      OPENBLAS_LIB_DIR: /usr/lib64
+      OPENBLAS_INCLUDE_DIR: /usr/include/openblas
     strategy:
       fail-fast: false
       matrix:
@@ -325,14 +329,51 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4
 
+      - name: Install OpenBLAS (macOS)
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          brew update
+          brew install openblas pkg-config
+          OPENBLAS_PREFIX="$(brew --prefix openblas)"
+          echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${OPENBLAS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install OpenBLAS (Windows)
+        if: ${{ matrix.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone --depth=1 https://github.com/microsoft/vcpkg $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+
+          if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
+            $triplet = "arm64-windows-static-md"
+          } else {
+            $triplet = "x64-windows-static-md"
+          }
+
+          & "$vcpkgRoot\vcpkg.exe" install "openblas:$triplet"
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install openblas failed for triplet $triplet"
+          }
+
+          $installed = Join-Path $vcpkgRoot "installed\$triplet"
+          "OPENBLAS_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENBLAS_INCLUDE_DIR=$installed\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build wheels (Linux)
         if: ${{ matrix.platform == 'linux' }}
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --target ${{ matrix.target }} --interpreter ${{ matrix.interpreter }}
+          args: --release --out dist --target ${{ matrix.target }} --interpreter ${{ matrix.interpreter }} --features blas-openblas
           manylinux: ${{ matrix.manylinux }}
           python-version: ${{ matrix.python-version }}
+          before-script-linux: |
+            yum install -y epel-release || true
+            yum install -y openblas-devel pkgconfig
 
       - name: Build wheels (macOS/Windows)
         if: ${{ matrix.platform != 'linux' }}
@@ -342,10 +383,25 @@ jobs:
             # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
             export PYO3_CROSS=1
             export PYO3_CROSS_PYTHON_VERSION=3.9
-            maturin build --release --out dist --target ${{ matrix.target }}
+            maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas
           else
-            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python
+            maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas
           fi
+
+      - name: Probe SGEMM backend from built wheel
+        shell: bash
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
+          "$PY" - <<'PY'
+          import janusx.janusx as _jx
+          backend = _jx.rust_sgemm_backend()
+          print(f"[janusx] rust_sgemm_backend={backend}")
+          if backend != "openblas":
+              raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
+          PY
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

@@ -411,6 +411,7 @@ jobs:
           fi
 
       - name: Probe SGEMM backend from built wheel
+        if: ${{ matrix.label != 'windows-arm64' }}
         shell: bash
         run: |
           PY=python3
@@ -423,6 +424,31 @@ jobs:
           print(f"[janusx] rust_sgemm_backend={backend}")
           if backend != "openblas":
               raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
+          PY
+
+      - name: Sanity check wheel artifact (windows-arm64 cross-build)
+        if: ${{ matrix.label == 'windows-arm64' }}
+        shell: bash
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" - <<'PY'
+          import glob
+          import os
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          print(f"[windows-arm64] built wheels: {wheels}")
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one wheel, got {len(wheels)}")
+          wheel = wheels[0]
+          if "win_arm64" not in os.path.basename(wheel):
+              raise SystemExit(f"Expected win_arm64 wheel, got {wheel}")
+          with zipfile.ZipFile(wheel, "r") as zf:
+              names = zf.namelist()
+          if not any(name.endswith(".pyd") for name in names):
+              raise SystemExit("No .pyd extension module found inside wheel")
+          print("[windows-arm64] runtime probe skipped on x64 host; static wheel sanity check passed.")
           PY
 
       - name: Upload wheel artifact

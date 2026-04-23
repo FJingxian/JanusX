@@ -866,7 +866,7 @@ unsafe extern "C" {
 }
 
 #[cfg(all(target_os = "windows", not(jx_openblas_link_openblas_plain)))]
-#[link(name = "libopenblas")]
+#[link(name = "libopenblas", kind = "static")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(
@@ -888,7 +888,7 @@ unsafe extern "C" {
 }
 
 #[cfg(all(target_os = "windows", jx_openblas_link_openblas_plain))]
-#[link(name = "openblas")]
+#[link(name = "openblas", kind = "static")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(

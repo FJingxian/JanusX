@@ -248,8 +248,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       JANUSX_REQUIRE_OPENBLAS: "1"
-      OPENBLAS_LIB_DIR: /usr/lib64
-      OPENBLAS_INCLUDE_DIR: /usr/include/openblas
     strategy:
       fail-fast: false
       matrix:
@@ -260,6 +258,7 @@ jobs:
             platform: linux
             python-version: "3.9"
             manylinux: "2014"
+            manylinux_image: quay.io/pypa/manylinux2014_x86_64:latest
             interpreter: /opt/python/cp39-cp39/bin/python
             target: x86_64-unknown-linux-gnu
           - label: linux-aarch64
@@ -267,6 +266,7 @@ jobs:
             platform: linux
             python-version: "3.9"
             manylinux: "2014"
+            manylinux_image: quay.io/pypa/manylinux2014_aarch64:latest
             interpreter: /opt/python/cp39-cp39/bin/python
             target: aarch64-unknown-linux-gnu
           - label: macos-x86_64
@@ -365,15 +365,37 @@ jobs:
 
       - name: Build wheels (Linux)
         if: ${{ matrix.platform == 'linux' }}
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: --release --out dist --target ${{ matrix.target }} --interpreter ${{ matrix.interpreter }} --features blas-openblas
-          manylinux: ${{ matrix.manylinux }}
-          python-version: ${{ matrix.python-version }}
-          before-script-linux: |
-            yum install -y epel-release || true
-            yum install -y openblas-devel pkgconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ matrix.manylinux_image }}"
+          TARGET="${{ matrix.target }}"
+          INTERP="${{ matrix.interpreter }}"
+
+          docker run --rm \
+            -v "$PWD:/io" \
+            -w /io \
+            "$IMAGE" \
+            bash -lc "
+              set -euo pipefail
+              yum install -y epel-release || true
+              yum install -y openblas-devel pkgconfig curl
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+              source /root/.cargo/env
+              ${INTERP} -m pip install -U pip
+              ${INTERP} -m pip install maturin==1.9.4
+              export JANUSX_REQUIRE_OPENBLAS=1
+              export OPENBLAS_LIB_DIR=/usr/lib64
+              export OPENBLAS_INCLUDE_DIR=/usr/include/openblas
+              ${INTERP} -m maturin build \
+                --release \
+                --out dist \
+                --target ${TARGET} \
+                --interpreter ${INTERP} \
+                --features blas-openblas
+              ${INTERP} -m pip install --force-reinstall --no-deps dist/*.whl
+              ${INTERP} -c 'import janusx.janusx as _jx; backend=_jx.rust_sgemm_backend(); print(f\"[linux build container] rust_sgemm_backend={backend}\"); import sys; sys.exit(0 if backend == \"openblas\" else 1)'
+            "
 
       - name: Build wheels (macOS/Windows)
         if: ${{ matrix.platform != 'linux' }}

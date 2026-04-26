@@ -63,6 +63,21 @@ def _draw_hwe_genotypes(mafs: np.ndarray, n_samples: int, rng: np.random.Generat
     return g
 
 
+def _draw_homo_genotypes(mafs: np.ndarray, n_samples: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Draw diploid genotypes constrained to pure homozygotes only.
+    Returns matrix of shape (m_snps, n_samples), dtype int8 in {0,2}.
+    """
+    m = int(mafs.shape[0])
+    if n_samples <= 0:
+        return np.empty((m, 0), dtype=np.int8)
+
+    u = rng.random((m, n_samples), dtype=np.float32)
+    g = np.zeros((m, n_samples), dtype=np.int8)
+    g[u < mafs[:, None]] = 2
+    return g
+
+
 def _build_family_layout(
     n_individuals: int,
     structure: str,
@@ -119,10 +134,12 @@ def simulate_chunks(
     maf_high: float = 0.45,
     seed: int = 1,
     layout: Optional[FamilyLayout] = None,
+    homo: bool = False,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
     rng = np.random.default_rng(seed)
     n_done = 0
     layout = layout or _build_family_layout(nidv, "unrelated", 0.0, 4)
+    draw_genotypes = _draw_homo_genotypes if bool(homo) else _draw_hwe_genotypes
 
     while n_done < nsnp:
         m = min(chunk_size, nsnp - n_done)
@@ -130,7 +147,7 @@ def simulate_chunks(
         g = np.empty((m, nidv), dtype=np.int8)
 
         if layout.n_families > 0:
-            founders = _draw_hwe_genotypes(mafs, layout.n_families * 2, rng)
+            founders = draw_genotypes(mafs, layout.n_families * 2, rng)
             sires = founders[:, 0::2]
             dams = founders[:, 1::2]
 
@@ -138,12 +155,17 @@ def simulate_chunks(
             g[:, layout.dam_idx] = dams
 
             for child_idx in layout.child_groups:
-                pat = (rng.random((m, layout.n_families), dtype=np.float32) * 2.0) < sires
-                mat = (rng.random((m, layout.n_families), dtype=np.float32) * 2.0) < dams
-                g[:, child_idx] = pat.astype(np.int8) + mat.astype(np.int8)
+                if bool(homo):
+                    # Keep offspring in {0,2} by inheriting homozygous state from one parent.
+                    pick_sire = rng.random((m, layout.n_families), dtype=np.float32) < 0.5
+                    g[:, child_idx] = np.where(pick_sire, sires, dams).astype(np.int8, copy=False)
+                else:
+                    pat = (rng.random((m, layout.n_families), dtype=np.float32) * 2.0) < sires
+                    mat = (rng.random((m, layout.n_families), dtype=np.float32) * 2.0) < dams
+                    g[:, child_idx] = pat.astype(np.int8) + mat.astype(np.int8)
 
         if layout.n_unrelated > 0:
-            g[:, layout.unrelated_idx] = _draw_hwe_genotypes(mafs, layout.n_unrelated, rng)
+            g[:, layout.unrelated_idx] = draw_genotypes(mafs, layout.n_unrelated, rng)
 
         sites = [SiteInfo("1", int(i), "A", "T") for i in range(n_done, n_done + m)]
         yield g, sites
@@ -288,6 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-ve", "--ve", type=float, default=1.0, help="Environmental variance for phenotype simulation.")
     parser.add_argument("-trait-name", "--trait-name", type=str, default="test", help="Trait column name in .pheno.txt outputs.")
     parser.add_argument("-na-rate", "--na-rate", type=float, default=0.10, help="Missing-value rate in .pheno.NA.txt.")
+    parser.add_argument(
+        "-homo", "--homo",
+        action="store_true",
+        help="Use pure homozygous genotype simulation (0/2 only). Default is mixed diploid 0/1/2.",
+    )
     return parser
 
 
@@ -328,7 +355,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"{nsnp:.1e} SNPs, {nidv} individuals, chunk={chunk_size}, "
         f"structure={layout.structure}, families={layout.n_families}, "
         f"family_samples={layout.n_family_samples} ({realized_family_frac:.1%}), "
-        f"unrelated={layout.n_unrelated}{auto_structure_note}..."
+        f"unrelated={layout.n_unrelated}, genotype_mode={'homo_0_2' if args.homo else 'hwe_0_1_2'}"
+        f"{auto_structure_note}..."
     )
 
     chunks_for_trait = simulate_chunks(
@@ -339,6 +367,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         maf_high=maf_high,
         seed=int(args.seed),
         layout=layout,
+        homo=bool(args.homo),
     )
     y = _simulate_trait(
         chunks_for_trait,
@@ -357,6 +386,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         maf_high=maf_high,
         seed=int(args.seed),
         layout=layout,
+        homo=bool(args.homo),
     )
     save_genotype_streaming(outprefix, sample_ids.tolist(), chunks_for_write, total_snps=nsnp)
     _write_phenotypes(

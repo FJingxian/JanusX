@@ -45,6 +45,15 @@ def resolve_optional_dependency(module_name: str | None) -> OptionalDependencySp
     return _OPTIONAL_DEPENDENCIES.get(_top_module_name(module_name))
 
 
+def _python_executable_hint() -> str:
+    exe = str(sys.executable or "").strip()
+    if exe == "":
+        return "python"
+    if " " in exe:
+        return f'"{exe}"'
+    return exe
+
+
 def format_install_hint(
     packages: Sequence[str],
     *,
@@ -56,26 +65,34 @@ def format_install_hint(
         return ""
 
     pkg_joined = " ".join(package_list)
-    launcher_cmd = f"jx -update {pkg_joined}"
-    pip_cmd = f"pip install {pkg_joined}"
+    pip_cmd = f"python -m pip install {pkg_joined}"
+    pip_extra_cmd = f'python -m pip install "janusx[{extra}]"' if extra else None
+    runtime_pip_cmd = f"{_python_executable_hint()} -m pip install {pkg_joined}"
+    runtime_extra_cmd = (
+        f'{_python_executable_hint()} -m pip install "janusx[{extra}]"'
+        if extra
+        else None
+    )
     mode = str(entrypoint or "").strip().lower()
     if mode == "":
         mode = detect_entrypoint()
 
     if mode == "jx":
-        return f"Install with `{launcher_cmd}`."
+        if extra:
+            return (
+                f"Install in launcher runtime with `{runtime_pip_cmd}` "
+                f"(or `{runtime_extra_cmd}`)."
+            )
+        return f"Install in launcher runtime with `{runtime_pip_cmd}`."
 
     if mode == "jxpy":
         if extra:
-            return f"Install with `{pip_cmd}` (or `pip install \"janusx[{extra}]\"`)."
+            return f"Install with `{pip_cmd}` (or `{pip_extra_cmd}`)."
         return f"Install with `{pip_cmd}`."
 
     if extra:
-        return (
-            f"Install with `{launcher_cmd}` or `{pip_cmd}` "
-            f"(or `pip install \"janusx[{extra}]\"`)."
-        )
-    return f"Install with `{launcher_cmd}` or `{pip_cmd}`."
+        return f"Install with `{pip_cmd}` (or `{pip_extra_cmd}`)."
+    return f"Install with `{pip_cmd}`."
 
 
 def detect_entrypoint() -> str:

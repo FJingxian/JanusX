@@ -5,6 +5,7 @@ import math
 import os
 import platform
 import re
+import warnings
 from contextlib import redirect_stdout
 from typing import Any
 
@@ -201,8 +202,17 @@ def detect_blas_backend() -> str:
         import numpy as _np
 
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            _np.show_config()
+        # NumPy may warn "Install `pyyaml` for better output" when emitting
+        # textual config. This is informational only and should not surface
+        # during normal JanusX execution.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Install `pyyaml` for better output",
+                category=UserWarning,
+            )
+            with redirect_stdout(buf):
+                _np.show_config()
         cfg = buf.getvalue().lower()
         name_hits = re.findall(r"^\s*name:\s*([a-z0-9_+.-]+)\s*$", cfg, flags=re.MULTILINE)
         if any("openblas" in x for x in name_hits):

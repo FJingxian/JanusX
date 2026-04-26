@@ -20,7 +20,7 @@ Supported outputs
 Notes
 -----
 - `-file` inputs must carry sibling `prefix.id`.
-- `-file -> vcf/hmp/plink` requires real site metadata via `prefix.site` or `prefix.bim`.
+- `-file -> vcf/hmp/plink` requires real site metadata via `prefix.bsite`/`prefix.site` or `prefix.bim`.
 - `txt/npy` outputs always write headerless `prefix.site` as four columns:
   `CHR POS REF ALT`.
 """
@@ -32,15 +32,48 @@ import socket
 import time
 import re
 import gzip
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
 import numpy as np
 
-from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming, SiteInfo
-from janusx.janusx import VcfChunkReader, HmpChunkReader, count_vcf_snps, count_hmp_snps
-from janusx.gfreader.gfreader import _resolve_input, _process_txt_like_chunk
+from janusx.gfreader import (
+    inspect_genotype_file,
+    load_bed_2bit_packed,
+    load_genotype_chunks,
+    save_genotype_streaming,
+    SiteInfo,
+)
+from janusx.janusx import (
+    VcfChunkReader,
+    HmpChunkReader,
+    TxtChunkReader,
+    count_vcf_snps,
+    count_hmp_snps,
+)
+from janusx.gfreader.gfreader import _resolve_input
+
+try:
+    from janusx.janusx import bed_packed_ld_prune_maf_priority as _bed_packed_ld_prune_maf_priority
+except Exception:
+    _bed_packed_ld_prune_maf_priority = None
+
+try:
+    from janusx.janusx import bed_prune_to_plink_rust as _bed_prune_to_plink_rust
+except Exception:
+    _bed_prune_to_plink_rust = None
+
+try:
+    from janusx.janusx import bed_filter_to_plink_rust as _bed_filter_to_plink_rust
+except Exception:
+    _bed_filter_to_plink_rust = None
+
+try:
+    from janusx.janusx import packed_prune_kernel_stats as _packed_prune_kernel_stats
+except Exception:
+    _packed_prune_kernel_stats = None
 
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import (
@@ -49,6 +82,7 @@ from ._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     discover_id_sidecar_path,
     discover_site_path,
+    write_gfd_output,
     write_npy_output,
     write_text_output,
 )
@@ -225,6 +259,71 @@ class SiteFilterSpec:
         return bool(self.chr_keys) or self.bp_min is not None or self.bp_max is not None or bool(self.exact_sites) or bool(self.ranges)
 
 
+@dataclass
+class PruneSpec:
+    window_variants: int | None
+    window_bp: int | None
+    step_variants: int
+    r2_threshold: float
+
+    def label(self) -> str:
+        if self.window_bp is not None:
+            return (
+                f"window={int(self.window_bp)}bp, "
+                f"step={int(self.step_variants)}, r2={float(self.r2_threshold):.4f}"
+            )
+        return (
+            f"window={int(self.window_variants or 0)} variants, "
+            f"step={int(self.step_variants)}, r2={float(self.r2_threshold):.4f}"
+        )
+
+
+def _parse_prune_window(token: str) -> tuple[int | None, int | None]:
+    t = str(token).strip().lower()
+    if t == "":
+        raise ValueError("Empty prune window token.")
+    # Default unit is kb:
+    #   1   -> 1kb  -> 1000bp
+    #   0.1 -> 0.1kb -> 100bp
+    if t.endswith("kb"):
+        v = float(t[:-2].strip())
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"Invalid prune window (kb): {token}")
+        return None, int(max(1, round(v * 1000.0)))
+    if t.endswith("bp"):
+        v = float(t[:-2].strip())
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"Invalid prune window (bp): {token}")
+        return None, int(max(1, round(v)))
+    v = float(t)
+    if not np.isfinite(v) or v <= 0:
+        raise ValueError(f"Invalid prune window: {token}")
+    return None, int(max(1, round(v * 1000.0)))
+
+
+def _parse_prune_args(values: list[str] | None) -> PruneSpec | None:
+    if values is None:
+        return None
+    if len(values) != 3:
+        raise ValueError(
+            "Invalid --prune usage. Expected 3 values: "
+            "--prune <window size['kb']> <step size (variant ct)> <r^2 threshold>"
+        )
+    w_var, w_bp = _parse_prune_window(values[0])
+    step = int(float(str(values[1]).strip()))
+    if step <= 0:
+        raise ValueError(f"--prune step must be > 0, got {values[1]!r}")
+    r2 = float(str(values[2]).strip())
+    if (not np.isfinite(r2)) or (r2 <= 0.0) or (r2 > 1.0):
+        raise ValueError(f"--prune r^2 threshold must be in (0, 1], got {values[2]!r}")
+    return PruneSpec(
+        window_variants=w_var,
+        window_bp=w_bp,
+        step_variants=int(step),
+        r2_threshold=float(r2),
+    )
+
+
 def _site_passes(site: SiteInfo, flt: SiteFilterSpec) -> bool:
     c = _normalize_chr_key(str(site.chrom))
     p = int(site.pos)
@@ -243,6 +342,76 @@ def _site_passes(site: SiteInfo, flt: SiteFilterSpec) -> bool:
                 matched = True
                 break
         if not matched:
+            return False
+    return True
+
+
+def _prepare_direct_filter_expr(
+    *,
+    snp_sites: list[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_keys: set[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+) -> tuple[
+    set[tuple[str, int]] | None,
+    tuple[str, int, int] | None,
+    set[str] | None,
+    int | None,
+    int | None,
+    list[tuple[str, int, int]] | None,
+]:
+    site_set: set[tuple[str, int]] | None = None
+    if snp_sites:
+        site_set = set((_normalize_chr_key(c), int(p)) for c, p in snp_sites)
+
+    bim_norm: tuple[str, int, int] | None = None
+    if bim_range is not None:
+        bim_norm = (_normalize_chr_key(str(bim_range[0])), int(bim_range[1]), int(bim_range[2]))
+
+    chr_set: set[str] | None = None
+    if chr_keys:
+        chr_set = set(_normalize_chr_key(c) for c in chr_keys)
+
+    ranges_norm: list[tuple[str, int, int]] | None = None
+    if ranges:
+        ranges_norm = [(_normalize_chr_key(c), int(s), int(e)) for c, s, e in ranges]
+
+    return site_set, bim_norm, chr_set, bp_min, bp_max, ranges_norm
+
+
+def _site_passes_direct_expr(
+    site: SiteInfo,
+    *,
+    site_set: set[tuple[str, int]] | None,
+    bim_range: tuple[str, int, int] | None,
+    chr_set: set[str] | None,
+    bp_min: int | None,
+    bp_max: int | None,
+    ranges: list[tuple[str, int, int]] | None,
+) -> bool:
+    c = _normalize_chr_key(str(site.chrom))
+    p = int(site.pos)
+    if site_set and (c, p) not in site_set:
+        return False
+    if bim_range is not None:
+        bc, bs, be = bim_range
+        if not (c == bc and bs <= p <= be):
+            return False
+    if chr_set and c not in chr_set:
+        return False
+    if bp_min is not None and p < int(bp_min):
+        return False
+    if bp_max is not None and p > int(bp_max):
+        return False
+    if ranges:
+        hit = False
+        for rc, rs, re in ranges:
+            if c == rc and rs <= p <= re:
+                hit = True
+                break
+        if not hit:
             return False
     return True
 
@@ -267,6 +436,39 @@ def _filter_chunk_by_site(
     return np.asarray(geno[keep_idx, :], dtype=np.float32), keep_sites
 
 
+def _heter_keep_mask(geno: np.ndarray, het_threshold: float) -> np.ndarray:
+    """
+    Keep SNP rows whose heterozygosity rate is within [het, 1-het].
+
+    - Heterozygous call is defined as genotype == 1 (within tolerance).
+    - Missing calls (NaN/Inf/<0) are ignored in the denominator.
+    - Rows with no observed calls are dropped.
+    """
+    g = np.asarray(geno, dtype=np.float32)
+    if g.ndim != 2:
+        raise ValueError(f"Invalid genotype matrix shape for het filter: {g.shape}")
+    m = int(g.shape[0])
+    keep = np.ones(m, dtype=bool)
+    h = float(het_threshold)
+    if m == 0 or h <= 0.0:
+        return keep
+
+    valid = np.isfinite(g) & (g >= 0.0)
+    non_missing = np.sum(valid, axis=1, dtype=np.int64)
+    has_obs = non_missing > 0
+
+    het_count = np.sum(np.isclose(g, 1.0, atol=1e-6) & valid, axis=1, dtype=np.int64)
+    het_rate = np.zeros(m, dtype=np.float64)
+    het_rate[has_obs] = (
+        het_count[has_obs].astype(np.float64) / non_missing[has_obs].astype(np.float64)
+    )
+
+    low = float(h)
+    high = 1.0 - low
+    keep &= has_obs & (het_rate >= low) & (het_rate <= high)
+    return keep
+
+
 def _has_real_file_sites(file_arg: str) -> bool:
     raw_prefix, _ = build_prefix_candidates(file_arg, text_suffixes=GENOTYPE_TEXT_SUFFIXES)
     prefixes = [raw_prefix]
@@ -286,18 +488,36 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
         return fmt, base, f"{base}.txt"
     if fmt == "npy":
         return fmt, base, f"{base}.npy"
+    if fmt == "gfd":
+        return fmt, base, f"{base}.bin"
     if fmt == "plink":
         return fmt, base, base
-    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy.")
+    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy, gfd.")
 
 def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
     flt: SiteFilterSpec,
+    *,
+    het_threshold: float = 0.0,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
     for geno, sites in chunks:
-        g2, s2 = _filter_chunk_by_site(np.asarray(geno, dtype=np.float32), list(sites), flt)
+        g2 = np.asarray(geno, dtype=np.float32)
+        s2 = list(sites)
+
+        if flt.active():
+            g2, s2 = _filter_chunk_by_site(g2, s2, flt)
         if len(s2) == 0:
             continue
+
+        if float(het_threshold) > 0.0:
+            keep_mask = _heter_keep_mask(g2, float(het_threshold))
+            if not np.any(keep_mask):
+                continue
+            if not np.all(keep_mask):
+                keep_idx = np.flatnonzero(keep_mask).astype(int).tolist()
+                g2 = np.asarray(g2[keep_idx, :], dtype=np.float32)
+                s2 = [s2[i] for i in keep_idx]
+
         yield g2, s2
 
 
@@ -308,6 +528,376 @@ def _count_sites_from_chunks(
     for block, _sites in chunks:
         cnt += int(np.asarray(block).shape[0])
     return int(cnt)
+
+
+def _mode_impute_012(geno: np.ndarray) -> np.ndarray:
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Genotype block must be 2D, got {x.shape}")
+    if x.shape[0] == 0 or x.shape[1] == 0:
+        return np.empty_like(x, dtype=np.int8)
+
+    g = np.full(x.shape, -9, dtype=np.int8)
+    valid = np.isfinite(x) & (x >= 0.0)
+    if np.any(valid):
+        vals = np.rint(x[valid]).astype(np.int16, copy=False)
+        vals = np.clip(vals, 0, 2).astype(np.int8, copy=False)
+        g[valid] = vals
+
+    c0 = np.sum(g == 0, axis=1, dtype=np.int64)
+    c1 = np.sum(g == 1, axis=1, dtype=np.int64)
+    c2 = np.sum(g == 2, axis=1, dtype=np.int64)
+    modes = np.argmax(np.stack([c0, c1, c2], axis=1), axis=1).astype(np.int8, copy=False)
+
+    miss = g < 0
+    if np.any(miss):
+        rows, cols = np.where(miss)
+        g[rows, cols] = modes[rows]
+    return g
+
+
+def _transform_gfd_block(
+    geno: np.ndarray,
+    sites: Sequence[SiteInfo],
+) -> tuple[np.ndarray, list[SiteInfo]]:
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Genotype block must be 2D, got {x.shape}")
+    m, n = x.shape
+    if m != len(sites):
+        raise ValueError(f"Genotype/sites mismatch: rows={m}, sites={len(sites)}")
+    if m == 0:
+        return np.empty((0, n), dtype=np.uint8), []
+
+    g = _mode_impute_012(x)
+    left = (g != 0).astype(np.uint8, copy=False)
+    right = (g != 2).astype(np.uint8, copy=False)
+
+    out = np.empty((m * 2, n), dtype=np.uint8)
+    out[0::2, :] = left
+    out[1::2, :] = right
+
+    out_sites: list[SiteInfo] = []
+    for s in sites:
+        chrom0 = str(s.chrom)
+        try:
+            pos0 = int(s.pos)
+        except Exception:
+            pos0 = 0
+        out_sites.append(SiteInfo(f"{chrom0}_1", pos0, "0", "1"))
+        out_sites.append(SiteInfo(f"{chrom0}_2", pos0, "0", "1"))
+    return out, out_sites
+
+
+def _iter_gfd_chunks(
+    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    for geno, sites in chunks:
+        arr, gfd_sites = _transform_gfd_block(np.asarray(geno, dtype=np.float32), list(sites))
+        if arr.shape[0] == 0:
+            continue
+        yield arr, gfd_sites
+
+
+def _stack_chunks(
+    chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
+) -> tuple[np.ndarray, list[SiteInfo]]:
+    mats: list[np.ndarray] = []
+    sites_all: list[SiteInfo] = []
+    for geno, sites in chunks:
+        gg = np.asarray(geno, dtype=np.float32)
+        if gg.ndim != 2:
+            raise ValueError(f"Invalid genotype block shape: {gg.shape}")
+        if gg.shape[0] != len(sites):
+            raise ValueError(
+                f"Genotype/sites length mismatch: rows={gg.shape[0]}, sites={len(sites)}"
+            )
+        if gg.shape[0] == 0:
+            continue
+        mats.append(gg)
+        sites_all.extend(list(sites))
+    if len(mats) == 0:
+        return np.empty((0, 0), dtype=np.float32), []
+    mat = np.concatenate(mats, axis=0).astype(np.float32, copy=False)
+    return np.ascontiguousarray(mat, dtype=np.float32), sites_all
+
+
+def _read_plink_bim_sites(prefix: str) -> list[SiteInfo]:
+    p = str(prefix)
+    bim_path = p if p.lower().endswith(".bim") else f"{p}.bim"
+    if not Path(bim_path).is_file():
+        raise ValueError(f"Cannot find BIM file for PLINK prefix: {prefix}")
+    out: list[SiteInfo] = []
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for line_no, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            tok = _split_tokens(s)
+            if len(tok) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{line_no} (need >=6 columns)."
+                )
+            chrom = str(tok[0])
+            pos = int(float(tok[3]))
+            ref = str(tok[4])
+            alt = str(tok[5])
+            out.append(SiteInfo(chrom, int(pos), ref, alt))
+    if len(out) == 0:
+        raise ValueError(f"No variants found in BIM: {bim_path}")
+    return out
+
+
+def _ld_prune_with_maf_priority_packed_plink(
+    prefix: str,
+    spec: PruneSpec,
+) -> tuple[np.ndarray, list[SiteInfo], np.ndarray, int]:
+    if _bed_packed_ld_prune_maf_priority is None:
+        raise RuntimeError(
+            "Rust packed LD prune kernel is unavailable. Rebuild JanusX extension."
+        )
+    packed_raw, _miss_raw, _maf_raw, _std_raw, n_samples = load_bed_2bit_packed(str(prefix))
+    packed = np.ascontiguousarray(packed_raw, dtype=np.uint8)
+    if packed.ndim != 2:
+        raise ValueError(f"Invalid packed BED matrix shape: {packed.shape}")
+    sites_all = _read_plink_bim_sites(str(prefix))
+    if int(packed.shape[0]) != len(sites_all):
+        raise ValueError(
+            "BED/BIM row count mismatch for prune: "
+            f"packed_rows={packed.shape[0]}, bim_rows={len(sites_all)}"
+        )
+
+    chrom_code_map: dict[str, int] = {}
+    chrom_codes = np.zeros((len(sites_all),), dtype=np.int32)
+    positions = np.zeros((len(sites_all),), dtype=np.int64)
+    next_code = 0
+    for i, s in enumerate(sites_all):
+        c = str(s.chrom)
+        if c not in chrom_code_map:
+            chrom_code_map[c] = int(next_code)
+            next_code += 1
+        chrom_codes[i] = int(chrom_code_map[c])
+        positions[i] = int(s.pos)
+
+    keep = np.asarray(
+        _bed_packed_ld_prune_maf_priority(
+            packed=packed,
+            n_samples=int(n_samples),
+            chrom_codes=chrom_codes,
+            positions=positions,
+            window_bp=(
+                int(spec.window_bp)
+                if spec.window_bp is not None
+                else None
+            ),
+            window_variants=(
+                int(spec.window_variants)
+                if spec.window_variants is not None
+                else None
+            ),
+            step_variants=int(spec.step_variants),
+            r2_threshold=float(spec.r2_threshold),
+            threads=0,
+        ),
+        dtype=bool,
+    ).reshape(-1)
+    if int(keep.size) != len(sites_all):
+        raise ValueError(
+            f"Rust prune keep-mask mismatch: got {keep.size}, expected {len(sites_all)}"
+        )
+    return keep, sites_all, packed, int(n_samples)
+
+
+def _write_plink_subset_from_packed(
+    *,
+    src_prefix: str,
+    out_prefix: str,
+    packed: np.ndarray,
+    keep_mask: np.ndarray,
+) -> None:
+    src = str(src_prefix)
+    out = str(out_prefix)
+    src_bed = f"{src}.bed"
+    src_bim = f"{src}.bim"
+    src_fam = f"{src}.fam"
+    out_bed = f"{out}.bed"
+    out_bim = f"{out}.bim"
+    out_fam = f"{out}.fam"
+
+    if not Path(src_bed).is_file() or not Path(src_bim).is_file() or not Path(src_fam).is_file():
+        raise ValueError(f"PLINK source prefix is incomplete: {src_prefix}")
+
+    keep = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    x = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
+    if x.ndim != 2:
+        raise ValueError(f"Packed BED matrix must be 2D, got {x.shape}")
+    if int(x.shape[0]) != int(keep.size):
+        raise ValueError(
+            f"Packed rows/keep mask mismatch: rows={x.shape[0]}, keep={keep.size}"
+        )
+
+    Path(out_bed).parent.mkdir(parents=True, exist_ok=True)
+
+    # Write SNP-major BED directly from packed rows.
+    with open(out_bed, "wb") as fw:
+        fw.write(bytes([0x6C, 0x1B, 0x01]))
+        keep_idx = np.flatnonzero(keep)
+        for i in keep_idx.tolist():
+            fw.write(memoryview(x[int(i)]))
+
+    # Keep original BIM lines for kept variants.
+    with open(src_bim, "r", encoding="utf-8", errors="replace") as fr, open(
+        out_bim, "w", encoding="utf-8"
+    ) as fw:
+        for i, line in enumerate(fr):
+            if i < int(keep.size) and bool(keep[i]):
+                fw.write(line)
+
+    # FAM is unchanged when sample filtering is absent.
+    shutil.copyfile(src_fam, out_fam)
+
+
+def _compute_maf_and_z(geno: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Genotype matrix must be 2D, got {x.shape}")
+    m, n = x.shape
+    valid = np.isfinite(x) & (x >= 0.0)
+    cnt = valid.sum(axis=1).astype(np.float64, copy=False)
+    x_safe = np.where(valid, x, 0.0).astype(np.float64, copy=False)
+    s = x_safe.sum(axis=1)
+    mean = np.divide(s, cnt, out=np.zeros_like(s), where=cnt > 0)
+    af = np.divide(s, 2.0 * cnt, out=np.zeros_like(s), where=cnt > 0)
+    maf = np.minimum(af, 1.0 - af).astype(np.float64, copy=False)
+
+    x_imp = np.where(valid, x.astype(np.float64, copy=False), mean[:, None])
+    xc = x_imp - mean[:, None]
+    denom = max(1, int(n - 1))
+    var = np.sum(xc * xc, axis=1) / float(denom)
+    std = np.sqrt(np.maximum(var, 1e-12))
+    z = (xc / std[:, None]).astype(np.float32, copy=False)
+    return np.asarray(maf, dtype=np.float64), np.ascontiguousarray(z, dtype=np.float32)
+
+
+def _window_end_by_bp(pos: np.ndarray, start_idx: int, win_bp: int) -> int:
+    if pos.size <= 0:
+        return 0
+    s = int(start_idx)
+    if s >= int(pos.size):
+        return int(pos.size)
+    p0 = int(pos[s])
+    target = p0 + int(win_bp)
+    if np.all(pos[1:] >= pos[:-1]):
+        e = int(np.searchsorted(pos, target, side="right"))
+        return max(s + 1, e)
+    e2 = s + 1
+    n = int(pos.size)
+    while e2 < n and int(pos[e2]) <= target:
+        e2 += 1
+    return e2
+
+
+def _ld_prune_with_maf_priority(
+    geno: np.ndarray,
+    sites: list[SiteInfo],
+    spec: PruneSpec,
+) -> np.ndarray:
+    """
+    Greedy LD prune (windowed) with MAF-priority conflict rule:
+    1) Current site i compares with sites j in current window.
+    2) If any correlated j has higher MAF than i, drop i.
+    3) Otherwise drop correlated j with lower MAF than i.
+    """
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Invalid genotype matrix shape: {x.shape}")
+    m, n = x.shape
+    if m == 0:
+        return np.zeros((0,), dtype=bool)
+    if len(sites) != int(m):
+        raise ValueError(f"sites length mismatch: rows={m}, sites={len(sites)}")
+
+    maf, z = _compute_maf_and_z(x)
+    keep = np.ones((m,), dtype=bool)
+    denom = float(max(1, int(n - 1)))
+    eps = 1e-12
+    by_chr: dict[str, list[int]] = {}
+    for i, s in enumerate(sites):
+        c = _normalize_chr_key(str(s.chrom))
+        by_chr.setdefault(c, []).append(int(i))
+
+    for _chrom, idx_list in by_chr.items():
+        if len(idx_list) <= 1:
+            continue
+        idx_arr = np.asarray(idx_list, dtype=np.int64)
+        pos = np.asarray([int(sites[int(i)].pos) for i in idx_arr], dtype=np.int64)
+        dropped = np.zeros((idx_arr.size,), dtype=bool)
+        l = int(idx_arr.size)
+        start = 0
+        while start < l:
+            if spec.window_bp is not None:
+                end = _window_end_by_bp(pos, start, int(spec.window_bp))
+            else:
+                end = min(l, start + int(spec.window_variants or 1))
+            if end <= start:
+                end = start + 1
+            win = np.arange(start, end, dtype=np.int64)
+            for li in win.tolist():
+                if dropped[int(li)]:
+                    continue
+                right = win[win > int(li)]
+                if right.size <= 0:
+                    continue
+                right = right[~dropped[right]]
+                if right.size <= 0:
+                    continue
+
+                gi = int(idx_arr[int(li)])
+                gj = idx_arr[right].astype(np.int64, copy=False)
+                zi = np.asarray(z[gi, :], dtype=np.float32)
+                zj = np.asarray(z[gj, :], dtype=np.float32)
+                corr = (zj @ zi) / denom
+                r2 = np.asarray(corr * corr, dtype=np.float64)
+                hit = np.asarray(r2 >= float(spec.r2_threshold), dtype=bool)
+                if not np.any(hit):
+                    continue
+                hit_local = right[hit]
+                hit_global = idx_arr[hit_local].astype(np.int64, copy=False)
+                maf_i = float(maf[gi])
+                maf_j = np.asarray(maf[hit_global], dtype=np.float64)
+
+                if np.any(maf_j > (maf_i + eps)):
+                    dropped[int(li)] = True
+                    continue
+
+                drop_low = hit_local[maf_j < (maf_i - eps)]
+                if drop_low.size > 0:
+                    dropped[drop_low] = True
+
+            start += int(spec.step_variants)
+
+        keep[idx_arr[dropped]] = False
+    return keep
+
+
+def _iter_chunks_from_matrix(
+    geno: np.ndarray,
+    sites: list[SiteInfo],
+    *,
+    chunk_size: int = 50000,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    x = np.asarray(geno, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"Invalid genotype matrix shape: {x.shape}")
+    if int(x.shape[0]) != len(sites):
+        raise ValueError(
+            f"Genotype/sites length mismatch: rows={x.shape[0]}, sites={len(sites)}"
+        )
+    m = int(x.shape[0])
+    step = max(1000, int(chunk_size))
+    for s in range(0, m, step):
+        e = min(m, s + step)
+        yield np.asarray(x[s:e, :], dtype=np.float32), list(sites[s:e])
 
 
 def _open_text_auto(path: str):
@@ -376,51 +966,6 @@ def _resolve_txt_direct_paths(file_arg: str) -> tuple[str, str, str | None]:
     return matrix_path, id_path, site_path
 
 
-def _parse_site_line(site_line: str, *, is_bim: bool, row_idx: int, site_path: str) -> SiteInfo:
-    tok = _split_tokens(site_line)
-    if is_bim:
-        if len(tok) < 6:
-            raise ValueError(
-                f"Invalid BIM row at {site_path}:{row_idx} (need >=6 columns)."
-            )
-        chrom = str(tok[0])
-        pos = int(float(tok[3]))
-        ref = str(tok[4])
-        alt = str(tok[5])
-    else:
-        if len(tok) < 4:
-            raise ValueError(
-                f"Invalid SITE row at {site_path}:{row_idx} (need >=4 columns: CHR POS REF ALT)."
-            )
-        chrom = str(tok[0])
-        pos = int(float(tok[1]))
-        ref = str(tok[2])
-        alt = str(tok[3])
-    return SiteInfo(chrom, int(pos), ref, alt)
-
-
-def _parse_text_row_values(line: str, *, expected_cols: int, row_idx: int, matrix_path: str) -> np.ndarray:
-    tok = _split_tokens(line)
-    if len(tok) != int(expected_cols):
-        raise ValueError(
-            f"Text matrix column mismatch at {matrix_path}:{row_idx}: expected {expected_cols}, got {len(tok)}."
-        )
-    vals = np.empty(int(expected_cols), dtype=np.float32)
-    for i, t in enumerate(tok):
-        tt = str(t).strip()
-        up = tt.upper()
-        if up in {"NA", "NAN", "."}:
-            vals[i] = np.float32(-9.0)
-            continue
-        try:
-            vals[i] = np.float32(float(tt))
-        except Exception as e:
-            raise ValueError(
-                f"Invalid numeric token at {matrix_path}:{row_idx}, col={i + 1}: {tt}"
-            ) from e
-    return vals
-
-
 def _iter_vcf_direct_chunks(
     vcf_path: str,
     *,
@@ -428,23 +973,100 @@ def _iter_vcf_direct_chunks(
     sample_ids: list[str] | None,
     maf_threshold: float,
     max_missing_rate: float,
+    model: str = "add",
+    het_threshold: float = 0.02,
+    snp_sites: list[tuple[str, int]] | None = None,
+    bim_range: tuple[str, int, int] | None = None,
+    chr_keys: set[str] | None = None,
+    bp_min: int | None = None,
+    bp_max: int | None = None,
+    ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    reader = VcfChunkReader(
-        str(vcf_path),
-        float(maf_threshold),
-        float(max_missing_rate),
-        False,
-        sample_ids,
-        None,
-        "add",
-        0.02,
+    model_key = str(model).strip().lower()
+    if model_key not in {"add", "dom", "rec", "het"}:
+        raise ValueError("model must be one of: add, dom, rec, het")
+    het_val = float(het_threshold)
+    if not (0.0 <= het_val <= 0.5):
+        raise ValueError("het_threshold must be within [0, 0.5]")
+
+    chr_list = sorted(list(chr_keys)) if chr_keys else None
+    expr = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
     )
+    legacy_python_filter = False
+    legacy_need_het_filter = False
+    try:
+        reader = VcfChunkReader(
+            str(vcf_path),
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            sample_ids,
+            None,
+            model_key,
+            het_val,
+            snp_sites=snp_sites,
+            bim_range=bim_range,
+            chr_keys=chr_list,
+            bp_min=bp_min,
+            bp_max=bp_max,
+            ranges=ranges,
+        )
+    except TypeError:
+        reader = VcfChunkReader(
+            str(vcf_path),
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            sample_ids,
+            None,
+            "add",
+            0.02,
+        )
+        legacy_python_filter = bool(
+            snp_sites or bim_range is not None or chr_list or bp_min is not None or bp_max is not None or ranges
+        )
+        legacy_need_het_filter = bool(model_key != "add" and het_val > 0.0)
     while True:
         out = reader.next_chunk(int(chunk_size))
         if out is None:
             break
         geno, sites = out
-        yield np.asarray(geno, dtype=np.float32), list(sites)
+        g = np.asarray(geno, dtype=np.float32)
+        s = list(sites)
+        if legacy_python_filter and s:
+            site_set, bim_norm, chr_set, bp_lo, bp_hi, rr = expr
+            keep_idx = [
+                i for i, si in enumerate(s)
+                if _site_passes_direct_expr(
+                    si,
+                    site_set=site_set,
+                    bim_range=bim_norm,
+                    chr_set=chr_set,
+                    bp_min=bp_lo,
+                    bp_max=bp_hi,
+                    ranges=rr,
+                )
+            ]
+            if len(keep_idx) == 0:
+                continue
+            if len(keep_idx) != len(s):
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        if legacy_need_het_filter and len(s) > 0:
+            keep_mask = _heter_keep_mask(g, het_val)
+            if not np.any(keep_mask):
+                continue
+            if not np.all(keep_mask):
+                keep_idx = np.flatnonzero(keep_mask).astype(int).tolist()
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        yield g, s
 
 
 def _iter_hmp_direct_chunks(
@@ -454,23 +1076,100 @@ def _iter_hmp_direct_chunks(
     sample_ids: list[str] | None,
     maf_threshold: float,
     max_missing_rate: float,
+    model: str = "add",
+    het_threshold: float = 0.02,
+    snp_sites: list[tuple[str, int]] | None = None,
+    bim_range: tuple[str, int, int] | None = None,
+    chr_keys: set[str] | None = None,
+    bp_min: int | None = None,
+    bp_max: int | None = None,
+    ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    reader = HmpChunkReader(
-        str(hmp_path),
-        float(maf_threshold),
-        float(max_missing_rate),
-        False,
-        sample_ids,
-        None,
-        "add",
-        0.02,
+    model_key = str(model).strip().lower()
+    if model_key not in {"add", "dom", "rec", "het"}:
+        raise ValueError("model must be one of: add, dom, rec, het")
+    het_val = float(het_threshold)
+    if not (0.0 <= het_val <= 0.5):
+        raise ValueError("het_threshold must be within [0, 0.5]")
+
+    chr_list = sorted(list(chr_keys)) if chr_keys else None
+    expr = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
     )
+    legacy_python_filter = False
+    legacy_need_het_filter = False
+    try:
+        reader = HmpChunkReader(
+            str(hmp_path),
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            sample_ids,
+            None,
+            model_key,
+            het_val,
+            snp_sites=snp_sites,
+            bim_range=bim_range,
+            chr_keys=chr_list,
+            bp_min=bp_min,
+            bp_max=bp_max,
+            ranges=ranges,
+        )
+    except TypeError:
+        reader = HmpChunkReader(
+            str(hmp_path),
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            sample_ids,
+            None,
+            "add",
+            0.02,
+        )
+        legacy_python_filter = bool(
+            snp_sites or bim_range is not None or chr_list or bp_min is not None or bp_max is not None or ranges
+        )
+        legacy_need_het_filter = bool(model_key != "add" and het_val > 0.0)
     while True:
         out = reader.next_chunk(int(chunk_size))
         if out is None:
             break
         geno, sites = out
-        yield np.asarray(geno, dtype=np.float32), list(sites)
+        g = np.asarray(geno, dtype=np.float32)
+        s = list(sites)
+        if legacy_python_filter and s:
+            site_set, bim_norm, chr_set, bp_lo, bp_hi, rr = expr
+            keep_idx = [
+                i for i, si in enumerate(s)
+                if _site_passes_direct_expr(
+                    si,
+                    site_set=site_set,
+                    bim_range=bim_norm,
+                    chr_set=chr_set,
+                    bp_min=bp_lo,
+                    bp_max=bp_hi,
+                    ranges=rr,
+                )
+            ]
+            if len(keep_idx) == 0:
+                continue
+            if len(keep_idx) != len(s):
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        if legacy_need_het_filter and len(s) > 0:
+            keep_mask = _heter_keep_mask(g, het_val)
+            if not np.any(keep_mask):
+                continue
+            if not np.all(keep_mask):
+                keep_idx = np.flatnonzero(keep_mask).astype(int).tolist()
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        yield g, s
 
 
 def _iter_txt_direct_chunks(
@@ -482,99 +1181,109 @@ def _iter_txt_direct_chunks(
     sample_ids: list[str] | None,
     maf_threshold: float,
     max_missing_rate: float,
+    model: str = "add",
+    het_threshold: float = 0.02,
+    snp_sites: list[tuple[str, int]] | None = None,
+    bim_range: tuple[str, int, int] | None = None,
+    chr_keys: set[str] | None = None,
+    bp_min: int | None = None,
+    bp_max: int | None = None,
+    ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    all_sample_ids = _read_id_sidecar(id_path)
-    sample_index_map = {sid: i for i, sid in enumerate(all_sample_ids)}
-    if sample_ids is None:
-        selected_indices = np.arange(len(all_sample_ids), dtype=np.int64)
-    else:
-        idx: list[int] = []
-        for sid in sample_ids:
-            if sid not in sample_index_map:
-                raise ValueError(f"Sample ID not found in {id_path}: {sid}")
-            idx.append(int(sample_index_map[sid]))
-        selected_indices = np.asarray(idx, dtype=np.int64)
-    n_expected = int(len(all_sample_ids))
+    model_key = str(model).strip().lower()
+    if model_key not in {"add", "dom", "rec", "het"}:
+        raise ValueError("model must be one of: add, dom, rec, het")
+    het_val = float(het_threshold)
+    if not (0.0 <= het_val <= 0.5):
+        raise ValueError("het_threshold must be within [0, 0.5]")
 
-    site_fh = None
-    is_bim = False
-    site_row_idx = 0
-    if site_path is not None:
-        site_fh = open(site_path, "r", encoding="utf-8", errors="replace")
-        is_bim = str(site_path).lower().endswith(".bim")
-
-    def _next_site(matrix_row_idx: int) -> SiteInfo:
-        nonlocal site_row_idx
-        if site_fh is None:
-            return SiteInfo("N", int(matrix_row_idx), "N", "N")
-        while True:
-            line = site_fh.readline()
-            if line == "":
-                raise ValueError(
-                    f"Site metadata ended early at row {matrix_row_idx} in {site_path}."
-                )
-            site_row_idx += 1
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            return _parse_site_line(
-                s,
-                is_bim=bool(is_bim),
-                row_idx=site_row_idx,
-                site_path=str(site_path),
-            )
-
-    rows: list[np.ndarray] = []
-    sites: list[SiteInfo] = []
-    matrix_row_idx = 0
+    # Keep explicit sidecar resolution in caller for early validation,
+    # but sink per-site filtering into the unified Rust kernel.
+    _ = (id_path, site_path)
+    chr_list = sorted(list(chr_keys)) if chr_keys else None
+    expr = _prepare_direct_filter_expr(
+        snp_sites=snp_sites,
+        bim_range=bim_range,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
+    )
+    legacy_python_filter = False
+    legacy_need_het_filter = False
     try:
-        with _open_text_auto(matrix_path) as f:
-            for line_idx, line in enumerate(f, start=1):
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                matrix_row_idx += 1
-                row = _parse_text_row_values(
-                    s,
-                    expected_cols=n_expected,
-                    row_idx=line_idx,
-                    matrix_path=matrix_path,
+        reader = TxtChunkReader(
+            str(matrix_path),
+            None,
+            None,
+            None,
+            bim_range,
+            snp_sites,
+            sample_ids,
+            None,
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            model_key,
+            het_val,
+            chr_keys=chr_list,
+            bp_min=bp_min,
+            bp_max=bp_max,
+            ranges=ranges,
+        )
+    except TypeError:
+        reader = TxtChunkReader(
+            str(matrix_path),
+            None,
+            None,
+            None,
+            bim_range,
+            snp_sites,
+            sample_ids,
+            None,
+            float(maf_threshold),
+            float(max_missing_rate),
+            False,
+            "add",
+            0.02,
+        )
+        legacy_python_filter = bool(chr_list or bp_min is not None or bp_max is not None or ranges)
+        legacy_need_het_filter = bool(model_key != "add" and het_val > 0.0)
+    while True:
+        out = reader.next_chunk(int(chunk_size))
+        if out is None:
+            break
+        geno, sites = out
+        g = np.asarray(geno, dtype=np.float32)
+        s = list(sites)
+        if legacy_python_filter and s:
+            site_set, bim_norm, chr_set, bp_lo, bp_hi, rr = expr
+            keep_idx = [
+                i for i, si in enumerate(s)
+                if _site_passes_direct_expr(
+                    si,
+                    site_set=site_set,
+                    bim_range=bim_norm,
+                    chr_set=chr_set,
+                    bp_min=bp_lo,
+                    bp_max=bp_hi,
+                    ranges=rr,
                 )
-                if selected_indices.size != n_expected:
-                    row = np.asarray(row[selected_indices], dtype=np.float32)
-                rows.append(row)
-                sites.append(_next_site(matrix_row_idx))
-                if len(rows) >= int(chunk_size):
-                    arr = np.asarray(rows, dtype=np.float32)
-                    arr, sites_out = _process_txt_like_chunk(
-                        arr,
-                        sites,
-                        maf=float(maf_threshold),
-                        missing_rate=float(max_missing_rate),
-                        impute=False,
-                        model="add",
-                        het=0.02,
-                    )
-                    if arr.shape[0] > 0:
-                        yield arr, list(sites_out)
-                    rows = []
-                    sites = []
-        if len(rows) > 0:
-            arr = np.asarray(rows, dtype=np.float32)
-            arr, sites_out = _process_txt_like_chunk(
-                arr,
-                sites,
-                maf=float(maf_threshold),
-                missing_rate=float(max_missing_rate),
-                impute=False,
-                model="add",
-                het=0.02,
-            )
-            if arr.shape[0] > 0:
-                yield arr, list(sites_out)
-    finally:
-        if site_fh is not None:
-            site_fh.close()
+            ]
+            if len(keep_idx) == 0:
+                continue
+            if len(keep_idx) != len(s):
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        if legacy_need_het_filter and len(s) > 0:
+            keep_mask = _heter_keep_mask(g, het_val)
+            if not np.any(keep_mask):
+                continue
+            if not np.all(keep_mask):
+                keep_idx = np.flatnonzero(keep_mask).astype(int).tolist()
+                g = np.asarray(g[keep_idx, :], dtype=np.float32)
+                s = [s[i] for i in keep_idx]
+        yield g, s
 
 
 def _count_selected_sites(
@@ -586,6 +1295,7 @@ def _count_selected_sites(
     site_filter: SiteFilterSpec,
     maf_threshold: float,
     max_missing_rate: float,
+    het_threshold: float,
 ) -> int:
     cnt = 0
     chunks = load_genotype_chunks(
@@ -598,8 +1308,12 @@ def _count_selected_sites(
         snp_sites=snp_sites,
         bim_range=bim_range,
     )
-    if site_filter.active():
-        chunks = _iter_filtered_chunks(chunks, site_filter)
+    if site_filter.active() or float(het_threshold) > 0.0:
+        chunks = _iter_filtered_chunks(
+            chunks,
+            site_filter,
+            het_threshold=float(het_threshold),
+        )
     for block, _sites in chunks:
         cnt += int(np.asarray(block).shape[0])
     return int(cnt)
@@ -615,6 +1329,8 @@ def build_parser() -> CliArgumentParser:
                 "jx gformat -hmp geno.hmp.gz -fmt plink",
                 "jx gformat -bfile geno_prefix -fmt txt -o outdir -prefix panel",
                 "jx gformat -file geno_prefix -fmt vcf",
+                "jx gformat -bfile geno_prefix -fmt npy --prune 1 5 0.2",
+                "jx gformat -bfile geno_prefix -fmt npy --prune 500kb 10 0.2",
             ]
         ),
     )
@@ -630,7 +1346,7 @@ def build_parser() -> CliArgumentParser:
         type=str,
         help=(
             "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+            "Requires sibling prefix.id. Optional site metadata: prefix.bsite/prefix.site or prefix.bim."
         ),
     )
 
@@ -639,9 +1355,9 @@ def build_parser() -> CliArgumentParser:
         "-fmt",
         "--fmt",
         dest="format",
-        choices=["plink", "vcf", "hmp", "txt", "npy"],
+        choices=["plink", "vcf", "hmp", "txt", "npy", "gfd"],
         default="npy",
-        help="Output genotype format: plink, vcf, hmp, txt, npy (default: npy).",
+        help="Output genotype format: plink, vcf, hmp, txt, npy, gfd (default: npy).",
     )
     opt.add_argument(
         "-o",
@@ -676,6 +1392,16 @@ def build_parser() -> CliArgumentParser:
         ),
     )
     opt.add_argument(
+        "-het",
+        "--het",
+        type=float,
+        default=0.0,
+        help=(
+            "Filter variants by heterozygosity rate. Keep only variants with het rate "
+            "between het and (1-het) (default: %(default)s; no filtering)."
+        ),
+    )
+    opt.add_argument(
         "-keep",
         "--keep",
         type=str,
@@ -692,6 +1418,19 @@ def build_parser() -> CliArgumentParser:
             "Keep only listed variants. Use '--extract <file>' for site list "
             "(CHR POS or CHR:POS/CHR_POS), or '--extract range <file>' "
             "for range list (CHR START END). No header."
+        ),
+    )
+    opt.add_argument(
+        "-prune",
+        "--prune",
+        nargs=3,
+        default=None,
+        metavar=("WINDOW", "STEP", "R2"),
+        help=(
+            "LD prune with MAF-priority rule. Usage: "
+            "--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
+            "Numeric window defaults to kb (1=1kb, 0.1=100bp). "
+            "Examples: --prune 1 5 0.2, --prune 1kb 5 0.2, --prune 100bp 5 0.2."
         ),
     )
     opt.add_argument(
@@ -723,6 +1462,12 @@ def main() -> None:
         parser.error("-maf must be within [0, 0.5].")
     if not (0.0 <= float(args.geno) <= 1.0):
         parser.error("-geno must be within [0, 1.0].")
+    if not (0.0 <= float(args.het) <= 0.5):
+        parser.error("-het must be within [0, 0.5].")
+    try:
+        prune_spec = _parse_prune_args(args.prune)
+    except Exception as e:
+        parser.error(str(e))
 
     gfile, default_prefix = determine_genotype_source(args)
     if args.prefix is None:
@@ -756,10 +1501,12 @@ def main() -> None:
                     ("Output format", out_fmt),
                     ("Keep samples", str(args.keep or "None")),
                     ("Extract", f"{extract_mode or 'None'}:{extract_file or 'None'}"),
+                    ("Prune", (prune_spec.label() if prune_spec is not None else "None")),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
                     ("MAF threshold", float(args.maf)),
                     ("Miss threshold", float(args.geno)),
+                    ("Het threshold", float(args.het)),
                 ],
             )
         ],
@@ -786,7 +1533,7 @@ def main() -> None:
     if args.file and out_fmt in {"vcf", "hmp", "plink"} and (not _has_real_file_sites(gfile)):
         raise ValueError(
             f"{out_fmt.upper()} output from -file input requires real site metadata. "
-            "Please provide a matching prefix.site or prefix.bim sidecar."
+            "Please provide a matching prefix.bsite/prefix.site or prefix.bim sidecar."
         )
 
     source_kind, _source_prefix, source_path = _resolve_input(gfile)
@@ -901,42 +1648,52 @@ def main() -> None:
         push_bim_range = (c, start, end)
         post_filter = SiteFilterSpec()
 
+    reader_model = "het" if float(args.het) > 0.0 else "add"
+    reader_het = float(args.het) if float(args.het) > 0.0 else 0.02
+
     def _make_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+        apply_python_post_filter = True
         if use_direct_no_cache and source_kind == "vcf":
             if source_path is None:
                 raise ValueError(f"VCF source path not found: {gfile}")
-            if push_snp_sites is not None:
-                post_filter.exact_sites = set(push_snp_sites)
-            if push_bim_range is not None:
-                post_filter.ranges = [push_bim_range]
             c = _iter_vcf_direct_chunks(
                 str(source_path),
                 chunk_size=50_000,
                 sample_ids=keep_sample_ids,
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
+                model=reader_model,
+                het_threshold=reader_het,
+                snp_sites=push_snp_sites,
+                bim_range=push_bim_range,
+                chr_keys=post_filter.chr_keys,
+                bp_min=post_filter.bp_min,
+                bp_max=post_filter.bp_max,
+                ranges=post_filter.ranges,
             )
+            apply_python_post_filter = False
         elif use_direct_no_cache and source_kind == "hmp":
             if source_path is None:
                 raise ValueError(f"HMP source path not found: {gfile}")
-            if push_snp_sites is not None:
-                post_filter.exact_sites = set(push_snp_sites)
-            if push_bim_range is not None:
-                post_filter.ranges = [push_bim_range]
             c = _iter_hmp_direct_chunks(
                 str(source_path),
                 chunk_size=50_000,
                 sample_ids=keep_sample_ids,
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
+                model=reader_model,
+                het_threshold=reader_het,
+                snp_sites=push_snp_sites,
+                bim_range=push_bim_range,
+                chr_keys=post_filter.chr_keys,
+                bp_min=post_filter.bp_min,
+                bp_max=post_filter.bp_max,
+                ranges=post_filter.ranges,
             )
+            apply_python_post_filter = False
         elif use_direct_no_cache and source_kind == "txt":
             if txt_matrix_path is None or txt_id_path is None:
                 raise ValueError("Internal error: text input paths are unresolved.")
-            if push_snp_sites is not None:
-                post_filter.exact_sites = set(push_snp_sites)
-            if push_bim_range is not None:
-                post_filter.ranges = [push_bim_range]
             c = _iter_txt_direct_chunks(
                 str(txt_matrix_path),
                 id_path=str(txt_id_path),
@@ -945,7 +1702,16 @@ def main() -> None:
                 sample_ids=keep_sample_ids,
                 maf_threshold=float(args.maf),
                 max_missing_rate=float(args.geno),
+                model=reader_model,
+                het_threshold=reader_het,
+                snp_sites=push_snp_sites,
+                bim_range=push_bim_range,
+                chr_keys=post_filter.chr_keys,
+                bp_min=post_filter.bp_min,
+                bp_max=post_filter.bp_max,
+                ranges=post_filter.ranges,
             )
+            apply_python_post_filter = False
         else:
             c = load_genotype_chunks(
                 gfile,
@@ -953,12 +1719,19 @@ def main() -> None:
                 maf=float(args.maf),
                 missing_rate=float(args.geno),
                 impute=False,
+                model=reader_model,
+                het=reader_het,
                 sample_ids=keep_sample_ids,
                 snp_sites=push_snp_sites,
                 bim_range=push_bim_range,
             )
-        if post_filter.active():
-            c = _iter_filtered_chunks(c, post_filter)
+        py_filter = post_filter if apply_python_post_filter else SiteFilterSpec()
+        if py_filter.active():
+            c = _iter_filtered_chunks(
+                c,
+                py_filter,
+                het_threshold=0.0,
+            )
         return c
 
     need_selected_count = (
@@ -967,17 +1740,276 @@ def main() -> None:
         or post_filter.active()
         or (float(args.maf) > 0.0)
         or (float(args.geno) < 1.0)
+        or (float(args.het) > 0.0)
         or (use_direct_no_cache and out_fmt in {"npy", "txt"})
+        or (prune_spec is not None)
     )
     selected_n_sites = int(n_sites)
-    if need_selected_count:
+    pruned_geno: np.ndarray | None = None
+    pruned_sites: list[SiteInfo] | None = None
+    packed_prune_keep_mask: np.ndarray | None = None
+    packed_prune_packed: np.ndarray | None = None
+    packed_prune_source_prefix: str | None = None
+    rust_prune_direct_done = False
+    rust_prune_direct_wall = 0.0
+
+    # Direct Rust packed path for PLINK -> PLINK conversion with all non-prune filters.
+    # This sinks keep/extract/chr/bp/maf/geno filtering and writing into Rust.
+    if (
+        prune_spec is None
+        and source_kind == "plink"
+        and out_fmt == "plink"
+        and _bed_filter_to_plink_rust is not None
+    ):
+        filter_desc = "Applying filters/slices..."
+        if not status_enabled:
+            logger.info(filter_desc)
+        with CliStatus(filter_desc, enabled=status_enabled) as task:
+            try:
+                t_direct = time.time()
+                keep_n, scanned_n, out_n = _bed_filter_to_plink_rust(
+                    src_prefix=str(gfile),
+                    out_prefix=str(out_prefix),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    fill_missing=False,
+                    model=reader_model,
+                    het_threshold=reader_het,
+                    sample_ids=keep_sample_ids,
+                    snp_sites=(
+                        [(str(c), int(p)) for c, p in push_snp_sites]
+                        if push_snp_sites is not None
+                        else None
+                    ),
+                    bim_range=(
+                        (str(push_bim_range[0]), int(push_bim_range[1]), int(push_bim_range[2]))
+                        if push_bim_range is not None
+                        else None
+                    ),
+                    chr_keys=(
+                        sorted(list(post_filter.chr_keys))
+                        if post_filter.chr_keys
+                        else None
+                    ),
+                    bp_min=(int(post_filter.bp_min) if post_filter.bp_min is not None else None),
+                    bp_max=(int(post_filter.bp_max) if post_filter.bp_max is not None else None),
+                    ranges=(
+                        [(str(c), int(s), int(e)) for c, s, e in post_filter.ranges]
+                        if post_filter.ranges
+                        else None
+                    ),
+                )
+                rust_filter_direct_wall = float(time.time() - t_direct)
+                selected_n_sites = int(keep_n)
+                dropped_n = int(max(0, int(scanned_n) - int(keep_n)))
+                task.complete(
+                    "Applying filters/slices ...Finished "
+                    f"(backend=rust-packed-io, kept={int(keep_n)}, dropped={dropped_n})"
+                )
+            except Exception:
+                task.fail("Applying filters/slices ...Failed")
+                raise
+        if not status_enabled:
+            logger.info(
+                "Applying filters/slices ...Finished "
+                f"(backend=rust-packed-io, kept={int(keep_n)}, dropped={dropped_n})"
+            )
+        if selected_n_sites <= 0:
+            raise ValueError(
+                "All variants were filtered out by filters (-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
+            )
+        out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
+        if int(out_n) != int(len(out_sample_ids)):
+            logger.warning(
+                "Rust direct path sample count mismatch: "
+                f"writer={int(out_n)}, expected={int(len(out_sample_ids))}"
+            )
+        print(f"Genotype source: {format_path_for_display(gfile)}")
+        print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
+        log_success(logger, f"Format conversion completed in {rust_filter_direct_wall:.2f} s")
+        log_success(logger, f"Output written: {output_display}")
+        return
+
+    if prune_spec is not None:
+        prune_desc = "Applying LD prune..."
+        prune_pre_sites = 0
+        use_packed_prune_fastpath = bool(
+            source_kind == "plink"
+            and _bed_packed_ld_prune_maf_priority is not None
+            and keep_sample_ids is None
+            and push_snp_sites is None
+            and push_bim_range is None
+            and (not post_filter.active())
+            and float(args.maf) <= 0.0
+            and float(args.geno) >= 1.0
+            and float(args.het) <= 0.0
+        )
+        if use_packed_prune_fastpath and _packed_prune_kernel_stats is not None:
+            try:
+                _packed_prune_kernel_stats(reset=True)
+            except Exception:
+                pass
+        if not status_enabled:
+            logger.info(prune_desc)
+        with CliStatus(prune_desc, enabled=status_enabled) as task:
+            try:
+                use_rust_prune_direct = bool(
+                    use_packed_prune_fastpath
+                    and out_fmt == "plink"
+                    and keep_sample_ids is None
+                    and _bed_prune_to_plink_rust is not None
+                )
+                if use_rust_prune_direct:
+                    t_direct = time.time()
+                    keep_n, total_n = _bed_prune_to_plink_rust(
+                        src_prefix=str(gfile),
+                        out_prefix=str(out_prefix),
+                        window_bp=(
+                            int(prune_spec.window_bp)
+                            if prune_spec.window_bp is not None
+                            else None
+                        ),
+                        window_variants=(
+                            int(prune_spec.window_variants)
+                            if prune_spec.window_variants is not None
+                            else None
+                        ),
+                        step_variants=int(prune_spec.step_variants),
+                        r2_threshold=float(prune_spec.r2_threshold),
+                        threads=0,
+                    )
+                    rust_prune_direct_wall = float(time.time() - t_direct)
+                    prune_pre_sites = int(total_n)
+                    selected_n_sites = int(keep_n)
+                    rust_prune_direct_done = True
+                elif use_packed_prune_fastpath:
+                    keep_mask, sites_all, packed_raw, _packed_n = _ld_prune_with_maf_priority_packed_plink(
+                        gfile,
+                        prune_spec,
+                    )
+                    packed_prune_keep_mask = np.asarray(keep_mask, dtype=bool).reshape(-1)
+                    packed_prune_packed = np.ascontiguousarray(
+                        np.asarray(packed_raw, dtype=np.uint8)
+                    )
+                    packed_prune_source_prefix = str(gfile)
+                else:
+                    geno_all, sites_all = _stack_chunks(_make_chunks())
+                    if geno_all.shape[0] <= 0 or len(sites_all) == 0:
+                        raise ValueError(
+                            "All variants were filtered out before LD prune "
+                            "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
+                        )
+                    keep_mask = _ld_prune_with_maf_priority(
+                        geno_all,
+                        sites_all,
+                        prune_spec,
+                    )
+                if not rust_prune_direct_done:
+                    prune_pre_sites = int(len(sites_all))
+                    keep_n = int(np.sum(keep_mask))
+                else:
+                    keep_n = int(selected_n_sites)
+                if keep_n <= 0:
+                    raise ValueError(
+                        "All variants were filtered out by LD prune; "
+                        "try a looser --prune r^2 threshold or larger window."
+                    )
+                if rust_prune_direct_done:
+                    pass
+                elif use_packed_prune_fastpath:
+                    kept_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
+                    push_snp_sites = [(str(s.chrom), int(s.pos)) for s in kept_sites]
+                    pruned_geno = None
+                    pruned_sites = None
+                else:
+                    pruned_geno = np.asarray(geno_all[keep_mask, :], dtype=np.float32)
+                    pruned_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
+                selected_n_sites = int(keep_n)
+                if rust_prune_direct_done:
+                    backend = "rust-packed-io"
+                else:
+                    backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
+                task.complete(
+                    "Applying LD prune ...Finished "
+                    f"(backend={backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
+                )
+            except Exception:
+                task.fail("Applying LD prune ...Failed")
+                raise
+        if not status_enabled:
+            if rust_prune_direct_done:
+                backend = "rust-packed-io"
+            else:
+                backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
+            logger.info(
+                "Applying LD prune ...Finished "
+                f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
+            )
+        if use_packed_prune_fastpath and _packed_prune_kernel_stats is not None:
+            try:
+                (
+                    k_backend,
+                    avx2_available,
+                    neon_available,
+                    force_scalar,
+                    total_calls,
+                    avx2_calls,
+                    neon_calls,
+                    scalar_calls,
+                    avx2_hit_rate,
+                ) = _packed_prune_kernel_stats(reset=False)
+                logger.info(
+                    "Prune kernel stats: "
+                    f"backend={k_backend}, "
+                    f"avx2_available={int(bool(avx2_available))}, "
+                    f"neon_available={int(bool(neon_available))}, "
+                    f"force_scalar={int(bool(force_scalar))}, "
+                    f"dot_calls={int(total_calls)}, "
+                    f"avx2_calls={int(avx2_calls)}, "
+                    f"neon_calls={int(neon_calls)}, "
+                    f"scalar_calls={int(scalar_calls)}, "
+                    f"avx2_hit_rate={float(avx2_hit_rate):.4f}"
+                )
+            except Exception:
+                pass
+    elif need_selected_count:
         selected_n_sites = _count_sites_from_chunks(_make_chunks())
         if selected_n_sites <= 0:
-            raise ValueError("All variants were filtered out by filters (-extract/-chr/-from-bp/-to-bp/-maf/-geno).")
+            raise ValueError("All variants were filtered out by filters (-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het).")
 
     out_sample_ids = keep_sample_ids if keep_sample_ids is not None else [str(s) for s in sample_ids]
     print(f"Genotype source: {format_path_for_display(gfile)}")
     print(f"Samples: {len(out_sample_ids)}, sites: {selected_n_sites}")
+
+    def _make_output_chunks() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+        if pruned_geno is not None and pruned_sites is not None:
+            return _iter_chunks_from_matrix(pruned_geno, pruned_sites, chunk_size=50_000)
+        return _make_chunks()
+
+    if rust_prune_direct_done:
+        log_success(logger, f"Format conversion completed in {rust_prune_direct_wall:.2f} s")
+        log_success(logger, f"Output written: {output_display}")
+        return
+
+    # Fast path for PLINK->PLINK when prune was done on packed BED:
+    # avoid decode/re-encode by writing BED subset directly.
+    if (
+        out_fmt == "plink"
+        and packed_prune_keep_mask is not None
+        and packed_prune_packed is not None
+        and packed_prune_source_prefix is not None
+        and keep_sample_ids is None
+    ):
+        t0 = time.time()
+        _write_plink_subset_from_packed(
+            src_prefix=str(packed_prune_source_prefix),
+            out_prefix=str(out_prefix),
+            packed=np.asarray(packed_prune_packed, dtype=np.uint8),
+            keep_mask=np.asarray(packed_prune_keep_mask, dtype=bool),
+        )
+        log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
+        log_success(logger, f"Output written: {output_display}")
+        return
 
     t0 = time.time()
     if out_fmt == "vcf":
@@ -985,7 +2017,7 @@ def main() -> None:
         save_genotype_streaming(
             out_path,
             out_sample_ids,
-            _make_chunks(),
+            _make_output_chunks(),
             fmt="vcf",
             total_snps=int(selected_n_sites),
             desc="Writing VCF",
@@ -995,7 +2027,7 @@ def main() -> None:
         save_genotype_streaming(
             out_path,
             out_sample_ids,
-            _make_chunks(),
+            _make_output_chunks(),
             fmt="hmp",
             total_snps=int(selected_n_sites),
             desc="Writing HMP",
@@ -1005,15 +2037,23 @@ def main() -> None:
         save_genotype_streaming(
             out_prefix,
             out_sample_ids,
-            _make_chunks(),
+            _make_output_chunks(),
             fmt="plink",
             total_snps=int(selected_n_sites),
             desc="Writing PLINK",
         )
     elif out_fmt == "txt":
-        write_text_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
+        write_text_output(out_path, out_sample_ids, _make_output_chunks(), total_sites=int(selected_n_sites))
+    elif out_fmt == "gfd":
+        write_gfd_output(
+            out_path,
+            out_sample_ids,
+            _make_output_chunks(),
+            total_sites=int(selected_n_sites) * 2,
+            source_is_dosage012=True,
+        )
     else:
-        write_npy_output(out_path, out_sample_ids, _make_chunks(), total_sites=int(selected_n_sites))
+        write_npy_output(out_path, out_sample_ids, _make_output_chunks(), total_sites=int(selected_n_sites))
 
     log_success(logger, f"Format conversion completed in {time.time() - t0:.2f} s")
     log_success(logger, f"Output written: {output_display}")

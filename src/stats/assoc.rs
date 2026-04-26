@@ -17,6 +17,10 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -297,6 +301,7 @@ fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
 struct PackedByteLut {
     nonmiss: [u8; 256],
     alt_sum: [u8; 256],
+    sq_sum: [u8; 256],
     code4: [[u8; 4]; 256],
 }
 
@@ -305,11 +310,13 @@ fn packed_byte_lut() -> &'static PackedByteLut {
     LUT.get_or_init(|| {
         let mut nonmiss = [0u8; 256];
         let mut alt_sum = [0u8; 256];
+        let mut sq_sum = [0u8; 256];
         let mut code4 = [[0u8; 4]; 256];
         for b in 0u16..=255 {
             let byte = b as u8;
             let mut nm = 0u8;
             let mut alt = 0u8;
+            let mut sq = 0u8;
             let mut codes = [0u8; 4];
             for lane in 0..4usize {
                 let code = (byte >> (lane * 2)) & 0b11;
@@ -321,10 +328,12 @@ fn packed_byte_lut() -> &'static PackedByteLut {
                     0b10 => {
                         nm += 1;
                         alt += 1;
+                        sq += 1;
                     }
                     0b11 => {
                         nm += 1;
                         alt += 2;
+                        sq += 4;
                     }
                     _ => {}
                 }
@@ -332,14 +341,1033 @@ fn packed_byte_lut() -> &'static PackedByteLut {
             let idx = byte as usize;
             nonmiss[idx] = nm;
             alt_sum[idx] = alt;
+            sq_sum[idx] = sq;
             code4[idx] = codes;
         }
         PackedByteLut {
             nonmiss,
             alt_sum,
+            sq_sum,
             code4,
         }
     })
+}
+
+struct PackedPairLut {
+    dot_obs0: [u8; 65536],
+    sum_j_when_i_miss: [u8; 65536],
+    sum_i_when_j_miss: [u8; 65536],
+    miss_both: [u8; 65536],
+}
+
+#[inline]
+fn _code_to_dosage_or_zero(code: u8) -> u8 {
+    match code {
+        0b00 => 0,
+        0b10 => 1,
+        0b11 => 2,
+        _ => 0, // missing
+    }
+}
+
+fn packed_pair_lut() -> &'static PackedPairLut {
+    static LUT: OnceLock<PackedPairLut> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let code4 = &packed_byte_lut().code4;
+        let mut dot_obs0 = [0u8; 65536];
+        let mut sum_j_when_i_miss = [0u8; 65536];
+        let mut sum_i_when_j_miss = [0u8; 65536];
+        let mut miss_both = [0u8; 65536];
+
+        for bi in 0u16..=255 {
+            for bj in 0u16..=255 {
+                let idx = ((bi as usize) << 8) | (bj as usize);
+                let ci = &code4[bi as usize];
+                let cj = &code4[bj as usize];
+
+                let mut dot_v: u8 = 0;
+                let mut sj_imiss: u8 = 0;
+                let mut si_jmiss: u8 = 0;
+                let mut mb: u8 = 0;
+                for lane in 0..4usize {
+                    let a = ci[lane];
+                    let b = cj[lane];
+                    let ga = _code_to_dosage_or_zero(a);
+                    let gb = _code_to_dosage_or_zero(b);
+                    dot_v = dot_v.saturating_add(ga.saturating_mul(gb));
+                    if a == 0b01 {
+                        sj_imiss = sj_imiss.saturating_add(gb);
+                        if b == 0b01 {
+                            mb = mb.saturating_add(1);
+                        }
+                    }
+                    if b == 0b01 {
+                        si_jmiss = si_jmiss.saturating_add(ga);
+                    }
+                }
+                dot_obs0[idx] = dot_v;
+                sum_j_when_i_miss[idx] = sj_imiss;
+                sum_i_when_j_miss[idx] = si_jmiss;
+                miss_both[idx] = mb;
+            }
+        }
+
+        PackedPairLut {
+            dot_obs0,
+            sum_j_when_i_miss,
+            sum_i_when_j_miss,
+            miss_both,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+struct PackedRowStats {
+    mean: f64,
+    std: f64,
+    maf: f64,
+    has_missing: bool,
+}
+
+#[inline]
+fn dot_imputed_pair_from_packed(
+    row_i: &[u8],
+    row_j: &[u8],
+    n_samples: usize,
+    mean_i: f64,
+    mean_j: f64,
+    pair_lut: &PackedPairLut,
+    code4_lut: &[[u8; 4]; 256],
+) -> f64 {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut dot = 0.0_f64;
+
+    for b in 0..full_bytes {
+        let idx = ((row_i[b] as usize) << 8) | (row_j[b] as usize);
+        dot += pair_lut.dot_obs0[idx] as f64;
+        dot += mean_i * pair_lut.sum_j_when_i_miss[idx] as f64;
+        dot += mean_j * pair_lut.sum_i_when_j_miss[idx] as f64;
+        dot += mean_i * mean_j * pair_lut.miss_both[idx] as f64;
+    }
+
+    if rem > 0 {
+        let ci = &code4_lut[row_i[full_bytes] as usize];
+        let cj = &code4_lut[row_j[full_bytes] as usize];
+        for lane in 0..rem {
+            let vi = match ci[lane] {
+                0b00 => 0.0_f64,
+                0b10 => 1.0_f64,
+                0b11 => 2.0_f64,
+                _ => mean_i,
+            };
+            let vj = match cj[lane] {
+                0b00 => 0.0_f64,
+                0b10 => 1.0_f64,
+                0b11 => 2.0_f64,
+                _ => mean_j,
+            };
+            dot += vi * vj;
+        }
+    }
+    dot
+}
+
+#[inline]
+fn dot_nomiss_pair_from_packed(
+    row_i: &[u8],
+    row_j: &[u8],
+    n_samples: usize,
+    pair_lut: &PackedPairLut,
+    code4_lut: &[[u8; 4]; 256],
+) -> f64 {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut dot = 0.0_f64;
+    for b in 0..full_bytes {
+        let idx = ((row_i[b] as usize) << 8) | (row_j[b] as usize);
+        dot += pair_lut.dot_obs0[idx] as f64;
+    }
+    if rem > 0 {
+        let ci = &code4_lut[row_i[full_bytes] as usize];
+        let cj = &code4_lut[row_j[full_bytes] as usize];
+        for lane in 0..rem {
+            let vi = _code_to_dosage_or_zero(ci[lane]) as f64;
+            let vj = _code_to_dosage_or_zero(cj[lane]) as f64;
+            dot += vi * vj;
+        }
+    }
+    dot
+}
+
+static PRUNE_DOT_TOTAL_CALLS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_DOT_AVX2_CALLS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_DOT_NEON_CALLS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_DOT_SCALAR_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prune_force_scalar_runtime() -> bool {
+    static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
+    *FORCE_SCALAR.get_or_init(|| _env_truthy("JANUSX_PRUNE_FORCE_SCALAR"))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prune_force_scalar_runtime() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prune_avx2_runtime_available() -> bool {
+    static AVX2_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVX2_AVAILABLE.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prune_avx2_runtime_available() -> bool {
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn prune_neon_runtime_available() -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn prune_neon_runtime_available() -> bool {
+    false
+}
+
+#[pyfunction]
+#[pyo3(signature = (reset=false))]
+pub fn packed_prune_kernel_stats(
+    reset: bool,
+) -> (String, bool, bool, bool, u64, u64, u64, u64, f64) {
+    if reset {
+        PRUNE_DOT_TOTAL_CALLS.store(0, Ordering::Relaxed);
+        PRUNE_DOT_AVX2_CALLS.store(0, Ordering::Relaxed);
+        PRUNE_DOT_NEON_CALLS.store(0, Ordering::Relaxed);
+        PRUNE_DOT_SCALAR_CALLS.store(0, Ordering::Relaxed);
+    }
+    let total = PRUNE_DOT_TOTAL_CALLS.load(Ordering::Relaxed);
+    let avx2_calls = PRUNE_DOT_AVX2_CALLS.load(Ordering::Relaxed);
+    let neon_calls = PRUNE_DOT_NEON_CALLS.load(Ordering::Relaxed);
+    let scalar_calls = PRUNE_DOT_SCALAR_CALLS.load(Ordering::Relaxed);
+
+    let force_scalar = prune_force_scalar_runtime();
+    let avx2_available = prune_avx2_runtime_available();
+    let neon_available = prune_neon_runtime_available();
+    let backend = if cfg!(target_arch = "x86_64") {
+        if force_scalar {
+            "x86_64+scalar(forced)".to_string()
+        } else if avx2_available {
+            "x86_64+avx2".to_string()
+        } else {
+            "x86_64+scalar".to_string()
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64+neon".to_string()
+    } else {
+        "scalar".to_string()
+    };
+    let avx2_hit_rate = if total > 0 {
+        (avx2_calls as f64) / (total as f64)
+    } else {
+        0.0_f64
+    };
+    (
+        backend,
+        avx2_available,
+        neon_available,
+        force_scalar,
+        total,
+        avx2_calls,
+        neon_calls,
+        scalar_calls,
+        avx2_hit_rate,
+    )
+}
+
+fn build_bitplanes_u64(
+    packed_flat: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (Vec<u64>, Vec<u64>, usize, Vec<u64>) {
+    let words = (n_samples + 63) / 64;
+    if m == 0 || words == 0 {
+        return (Vec::new(), Vec::new(), 0, Vec::new());
+    }
+
+    let mut lut_h = [0u8; 256];
+    let mut lut_l = [0u8; 256];
+    for b in 0u16..=255 {
+        let byte = b as u8;
+        let mut hb = 0u8;
+        let mut lb = 0u8;
+        for lane in 0..4usize {
+            let code = (byte >> (lane * 2)) & 0b11;
+            if ((code >> 1) & 1) != 0 {
+                hb |= 1u8 << lane;
+            }
+            if (code & 1) != 0 {
+                lb |= 1u8 << lane;
+            }
+        }
+        lut_h[byte as usize] = hb;
+        lut_l[byte as usize] = lb;
+    }
+
+    let mut word_masks = vec![u64::MAX; words];
+    let rem = n_samples % 64;
+    if rem != 0 {
+        word_masks[words - 1] = (1u64 << rem) - 1u64;
+    }
+    let last_mask = word_masks[words - 1];
+
+    let mut h_bits = vec![0u64; m * words];
+    let mut l_bits = vec![0u64; m * words];
+    let mut run = || {
+        h_bits
+            .par_chunks_mut(words)
+            .zip(l_bits.par_chunks_mut(words))
+            .enumerate()
+            .for_each(|(row_idx, (hrow, lrow))| {
+                let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                for (bi, &b) in row.iter().enumerate() {
+                    let w = bi >> 4;
+                    let sh = ((bi & 15) << 2) as u32;
+                    hrow[w] |= (lut_h[b as usize] as u64) << sh;
+                    lrow[w] |= (lut_l[b as usize] as u64) << sh;
+                }
+                hrow[words - 1] &= last_mask;
+                lrow[words - 1] &= last_mask;
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(&mut run);
+    } else {
+        run();
+    }
+    (h_bits, l_bits, words, word_masks)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn popcount_u8x32_avx2(
+    v: core::arch::x86_64::__m256i,
+    lut4: core::arch::x86_64::__m256i,
+    low_mask: core::arch::x86_64::__m256i,
+    zero: core::arch::x86_64::__m256i,
+) -> u64 {
+    use core::arch::x86_64::{
+        _mm256_add_epi8, _mm256_and_si256, _mm256_extract_epi64, _mm256_sad_epu8,
+        _mm256_shuffle_epi8, _mm256_srli_epi16,
+    };
+    let lo = _mm256_and_si256(v, low_mask);
+    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
+    let cnt = _mm256_add_epi8(_mm256_shuffle_epi8(lut4, lo), _mm256_shuffle_epi8(lut4, hi));
+    let sum64 = _mm256_sad_epu8(cnt, zero);
+    (_mm256_extract_epi64(sum64, 0) as u64)
+        + (_mm256_extract_epi64(sum64, 1) as u64)
+        + (_mm256_extract_epi64(sum64, 2) as u64)
+        + (_mm256_extract_epi64(sum64, 3) as u64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_nomiss_pair_bitplanes_avx2(
+    hi: &[u64],
+    li: &[u64],
+    hj: &[u64],
+    lj: &[u64],
+    full_words: usize,
+) -> (u64, usize) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_setr_epi8,
+        _mm256_setzero_si256,
+    };
+
+    let lut4 = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    );
+    let low_mask = _mm256_set1_epi8(0x0f_i8);
+    let zero = _mm256_setzero_si256();
+
+    let mut acc = 0u64;
+    let mut w = 0usize;
+    // AVX2 chunk: 4 * u64 (256 bit) per iteration.
+    while w + 4 <= full_words {
+        let hx = _mm256_loadu_si256(hi.as_ptr().add(w) as *const __m256i);
+        let lx = _mm256_loadu_si256(li.as_ptr().add(w) as *const __m256i);
+        let hy = _mm256_loadu_si256(hj.as_ptr().add(w) as *const __m256i);
+        let ly = _mm256_loadu_si256(lj.as_ptr().add(w) as *const __m256i);
+
+        acc += popcount_u8x32_avx2(_mm256_and_si256(hx, hy), lut4, low_mask, zero)
+            + popcount_u8x32_avx2(_mm256_and_si256(hx, ly), lut4, low_mask, zero)
+            + popcount_u8x32_avx2(_mm256_and_si256(lx, hy), lut4, low_mask, zero)
+            + popcount_u8x32_avx2(_mm256_and_si256(lx, ly), lut4, low_mask, zero);
+        w += 4;
+    }
+    (acc, w)
+}
+
+#[inline]
+fn dot_nomiss_pair_bitplanes(
+    i: usize,
+    j: usize,
+    h_bits: &[u64],
+    l_bits: &[u64],
+    words: usize,
+    word_masks: &[u64],
+) -> f64 {
+    PRUNE_DOT_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+    if words == 0 {
+        PRUNE_DOT_SCALAR_CALLS.fetch_add(1, Ordering::Relaxed);
+        return 0.0_f64;
+    }
+    let oi = i * words;
+    let oj = j * words;
+    let hi = &h_bits[oi..oi + words];
+    let li = &l_bits[oi..oi + words];
+    let hj = &h_bits[oj..oj + words];
+    let lj = &l_bits[oj..oj + words];
+
+    let mut acc: u64 = 0;
+    let full_words = words - 1;
+    let mut w = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let vector_hit = true;
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut vector_hit = false;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if prune_avx2_runtime_available() && !prune_force_scalar_runtime() {
+            let (acc_avx2, w_avx2) =
+                unsafe { dot_nomiss_pair_bitplanes_avx2(hi, li, hj, lj, full_words) };
+            acc += acc_avx2;
+            w = w_avx2;
+            vector_hit = true;
+            PRUNE_DOT_AVX2_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            vandq_u64, vcntq_u8, vgetq_lane_u64, vld1q_u64, vpaddlq_u16, vpaddlq_u32, vpaddlq_u8,
+            vreinterpretq_u8_u64,
+        };
+
+        #[inline(always)]
+        unsafe fn popcount_u64x2(v: core::arch::aarch64::uint64x2_t) -> u64 {
+            let cnt8 = vcntq_u8(vreinterpretq_u8_u64(v));
+            let sum16 = vpaddlq_u8(cnt8);
+            let sum32 = vpaddlq_u16(sum16);
+            let sum64 = vpaddlq_u32(sum32);
+            vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1)
+        }
+
+        // Explicit SIMD (NEON): 2x u64 lanes per iteration.
+        while w + 2 <= full_words {
+            let hx = unsafe { vld1q_u64(hi.as_ptr().add(w)) };
+            let lx = unsafe { vld1q_u64(li.as_ptr().add(w)) };
+            let hy = unsafe { vld1q_u64(hj.as_ptr().add(w)) };
+            let ly = unsafe { vld1q_u64(lj.as_ptr().add(w)) };
+            unsafe {
+                acc += popcount_u64x2(vandq_u64(hx, hy))
+                    + popcount_u64x2(vandq_u64(hx, ly))
+                    + popcount_u64x2(vandq_u64(lx, hy))
+                    + popcount_u64x2(vandq_u64(lx, ly));
+            }
+            w += 2;
+        }
+        PRUNE_DOT_NEON_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    if !vector_hit {
+        PRUNE_DOT_SCALAR_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Unrolled popcount accumulation on full words (no tail mask).
+    while w + 4 <= full_words {
+        let hx0 = hi[w];
+        let lx0 = li[w];
+        let hy0 = hj[w];
+        let ly0 = lj[w];
+        let hx1 = hi[w + 1];
+        let lx1 = li[w + 1];
+        let hy1 = hj[w + 1];
+        let ly1 = lj[w + 1];
+        let hx2 = hi[w + 2];
+        let lx2 = li[w + 2];
+        let hy2 = hj[w + 2];
+        let ly2 = lj[w + 2];
+        let hx3 = hi[w + 3];
+        let lx3 = li[w + 3];
+        let hy3 = hj[w + 3];
+        let ly3 = lj[w + 3];
+
+        acc += (hx0 & hy0).count_ones() as u64
+            + (hx0 & ly0).count_ones() as u64
+            + (lx0 & hy0).count_ones() as u64
+            + (lx0 & ly0).count_ones() as u64
+            + (hx1 & hy1).count_ones() as u64
+            + (hx1 & ly1).count_ones() as u64
+            + (lx1 & hy1).count_ones() as u64
+            + (lx1 & ly1).count_ones() as u64
+            + (hx2 & hy2).count_ones() as u64
+            + (hx2 & ly2).count_ones() as u64
+            + (lx2 & hy2).count_ones() as u64
+            + (lx2 & ly2).count_ones() as u64
+            + (hx3 & hy3).count_ones() as u64
+            + (hx3 & ly3).count_ones() as u64
+            + (lx3 & hy3).count_ones() as u64
+            + (lx3 & ly3).count_ones() as u64;
+        w += 4;
+    }
+    while w < full_words {
+        let hx = hi[w];
+        let lx = li[w];
+        let hy = hj[w];
+        let ly = lj[w];
+        acc += (hx & hy).count_ones() as u64
+            + (hx & ly).count_ones() as u64
+            + (lx & hy).count_ones() as u64
+            + (lx & ly).count_ones() as u64;
+        w += 1;
+    }
+
+    // Tail word with sample-count mask.
+    let tail = words - 1;
+    let m = word_masks[tail];
+    let hx = hi[tail] & m;
+    let lx = li[tail] & m;
+    let hy = hj[tail] & m;
+    let ly = lj[tail] & m;
+    acc += (hx & hy).count_ones() as u64
+        + (hx & ly).count_ones() as u64
+        + (lx & hy).count_ones() as u64
+        + (lx & ly).count_ones() as u64;
+    acc as f64
+}
+
+fn prune_one_chrom_packed(
+    idx_list: &[usize],
+    pos_vec: &[i64],
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    stats: &[PackedRowStats],
+    pair_lut: &PackedPairLut,
+    code4_lut: &[[u8; 4]; 256],
+    bitplane_h: &[u64],
+    bitplane_l: &[u64],
+    bitplane_words: usize,
+    bitplane_masks: &[u64],
+    enable_intra_chrom_parallel: bool,
+    intra_parallel_min_neighbors: usize,
+) -> Vec<bool> {
+    let l = idx_list.len();
+    let mut dropped = vec![false; l];
+    if l <= 1 {
+        return dropped;
+    }
+
+    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = n_samples as f64;
+    let eps = 1e-12_f64;
+    let step = step_variants.max(1);
+    let use_bp = window_bp.is_some();
+    let mut pos_sorted = true;
+    for k in 1..l {
+        if pos_vec[idx_list[k]] < pos_vec[idx_list[k - 1]] {
+            pos_sorted = false;
+            break;
+        }
+    }
+    let mut bp_end_ptr = 1usize;
+
+    let mut block_start = 0usize;
+    while block_start < l {
+        let block_end = (block_start + step).min(l);
+        for li in block_start..block_end {
+            if dropped[li] {
+                continue;
+            }
+            let end = if use_bp {
+                let bp = window_bp.unwrap_or(1);
+                if pos_sorted {
+                    if bp_end_ptr < li + 1 {
+                        bp_end_ptr = li + 1;
+                    }
+                    let target = pos_vec[idx_list[li]].saturating_add(bp);
+                    while bp_end_ptr < l && pos_vec[idx_list[bp_end_ptr]] <= target {
+                        bp_end_ptr += 1;
+                    }
+                    bp_end_ptr
+                } else {
+                    let mut e = li + 1;
+                    let p0 = pos_vec[idx_list[li]];
+                    while e < l {
+                        let d = pos_vec[idx_list[e]].saturating_sub(p0);
+                        if d <= bp {
+                            e += 1;
+                        } else if pos_vec[idx_list[e]] > p0 {
+                            break;
+                        } else {
+                            e += 1;
+                        }
+                    }
+                    e
+                }
+            } else {
+                (li + window_variants.unwrap_or(1)).min(l)
+            };
+            if end <= li + 1 {
+                continue;
+            }
+
+            let gi = idx_list[li];
+            let row_i = &packed_flat[gi * bytes_per_snp..(gi + 1) * bytes_per_snp];
+            let st_i = stats[gi];
+            let mut drop_i = false;
+            let mut drop_low: Vec<usize> = Vec::new();
+            let classify_lj = |lj: usize| -> Option<u8> {
+                if dropped[lj] {
+                    return None;
+                }
+                let gj = idx_list[lj];
+                let st_j = stats[gj];
+
+                let dot_imp = if !st_i.has_missing && !st_j.has_missing && bitplane_words > 0 {
+                    dot_nomiss_pair_bitplanes(
+                        gi,
+                        gj,
+                        bitplane_h,
+                        bitplane_l,
+                        bitplane_words,
+                        bitplane_masks,
+                    )
+                } else {
+                    let row_j = &packed_flat[gj * bytes_per_snp..(gj + 1) * bytes_per_snp];
+                    if !st_i.has_missing && !st_j.has_missing {
+                        dot_nomiss_pair_from_packed(row_i, row_j, n_samples, pair_lut, code4_lut)
+                    } else {
+                        dot_imputed_pair_from_packed(
+                            row_i, row_j, n_samples, st_i.mean, st_j.mean, pair_lut, code4_lut,
+                        )
+                    }
+                };
+                let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
+                let denom_corr = denom * st_i.std * st_j.std;
+                let corr = if denom_corr > 0.0_f64 {
+                    cov / denom_corr
+                } else {
+                    0.0_f64
+                };
+                let r2 = corr * corr;
+                if !(r2.is_finite() && r2 >= r2_threshold) {
+                    return None;
+                }
+                if st_j.maf > st_i.maf + eps {
+                    Some(1)
+                } else if st_j.maf + eps < st_i.maf {
+                    Some(2)
+                } else {
+                    None
+                }
+            };
+
+            let n_neighbors = end.saturating_sub(li + 1);
+            if enable_intra_chrom_parallel && n_neighbors >= intra_parallel_min_neighbors {
+                let decisions: Vec<(usize, u8)> = ((li + 1)..end)
+                    .into_par_iter()
+                    .filter_map(|lj| classify_lj(lj).map(|tag| (lj, tag)))
+                    .collect();
+                if decisions.iter().any(|(_, tag)| *tag == 1u8) {
+                    drop_i = true;
+                } else {
+                    drop_low.extend(decisions.into_iter().filter_map(|(lj, tag)| {
+                        if tag == 2u8 {
+                            Some(lj)
+                        } else {
+                            None
+                        }
+                    }));
+                }
+            } else {
+                for lj in (li + 1)..end {
+                    if let Some(tag) = classify_lj(lj) {
+                        if tag == 1u8 {
+                            drop_i = true;
+                            break;
+                        }
+                        drop_low.push(lj);
+                    }
+                }
+            }
+
+            if drop_i {
+                dropped[li] = true;
+            } else if !drop_low.is_empty() {
+                for j in drop_low {
+                    dropped[j] = true;
+                }
+            }
+        }
+        block_start = block_start.saturating_add(step);
+    }
+    dropped
+}
+
+fn bed_packed_ld_prune_keep(
+    packed_flat: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    chrom_vec: &[i32],
+    pos_vec: &[i64],
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    threads: usize,
+) -> Result<Vec<bool>, String> {
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        ));
+    }
+    if packed_flat.len() != m.saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "packed payload length mismatch: got {}, expected {}",
+            packed_flat.len(),
+            m.saturating_mul(bytes_per_snp)
+        ));
+    }
+    if chrom_vec.len() != m {
+        return Err(format!(
+            "chrom_codes length mismatch: got {}, expected {m}",
+            chrom_vec.len()
+        ));
+    }
+    if pos_vec.len() != m {
+        return Err(format!(
+            "positions length mismatch: got {}, expected {m}",
+            pos_vec.len()
+        ));
+    }
+    if !(r2_threshold.is_finite() && r2_threshold > 0.0 && r2_threshold <= 1.0) {
+        return Err("r2_threshold must be finite and in (0, 1]".to_string());
+    }
+    if step_variants == 0 {
+        return Err("step_variants must be > 0".to_string());
+    }
+    if window_bp.is_none() && window_variants.is_none() {
+        return Err("provide one of window_bp or window_variants".to_string());
+    }
+    if let Some(bp) = window_bp {
+        if bp <= 0 {
+            return Err("window_bp must be > 0".to_string());
+        }
+    }
+    if let Some(wv) = window_variants {
+        if wv == 0 {
+            return Err("window_variants must be > 0".to_string());
+        }
+    }
+
+    let mut stats = vec![PackedRowStats::default(); m];
+    let byte_lut = packed_byte_lut();
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    {
+        let mut run = || {
+            stats.par_iter_mut().enumerate().for_each(|(row_idx, st)| {
+                let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                let mut non_missing: usize = 0;
+                let mut alt_sum: usize = 0;
+                let mut sq_sum: usize = 0;
+                for &b in row.iter().take(full_bytes) {
+                    let idx = b as usize;
+                    non_missing += byte_lut.nonmiss[idx] as usize;
+                    alt_sum += byte_lut.alt_sum[idx] as usize;
+                    sq_sum += byte_lut.sq_sum[idx] as usize;
+                }
+                if rem > 0 {
+                    let codes = &byte_lut.code4[row[full_bytes] as usize];
+                    for &code in codes.iter().take(rem) {
+                        match code {
+                            0b00 => {
+                                non_missing += 1;
+                            }
+                            0b10 => {
+                                non_missing += 1;
+                                alt_sum += 1;
+                                sq_sum += 1;
+                            }
+                            0b11 => {
+                                non_missing += 1;
+                                alt_sum += 2;
+                                sq_sum += 4;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if non_missing > 0 {
+                    let obs_n = non_missing as f64;
+                    let sum_g = alt_sum as f64;
+                    let sum_g2 = sq_sum as f64;
+                    let p = sum_g / (2.0_f64 * obs_n);
+                    let maf = p.min(1.0_f64 - p);
+                    let mean = sum_g / obs_n;
+                    let ss = (sum_g2 - (sum_g * sum_g / obs_n)).max(0.0_f64);
+                    let var = ss / denom;
+                    let std = var.max(1e-12_f64).sqrt();
+                    *st = PackedRowStats {
+                        mean,
+                        std,
+                        maf,
+                        has_missing: non_missing < n_samples,
+                    };
+                } else {
+                    *st = PackedRowStats {
+                        mean: 0.0_f64,
+                        std: 1e-6_f64,
+                        maf: 0.0_f64,
+                        has_missing: true,
+                    };
+                }
+            });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+
+    let mut by_chr: HashMap<i32, Vec<usize>> = HashMap::new();
+    for i in 0..m {
+        by_chr.entry(chrom_vec[i]).or_default().push(i);
+    }
+    let chrom_groups: Vec<Vec<usize>> = by_chr.into_values().collect();
+
+    let pair_lut = packed_pair_lut();
+    let (bitplane_h, bitplane_l, bitplane_words, bitplane_masks) =
+        build_bitplanes_u64(packed_flat, m, bytes_per_snp, n_samples, pool.as_ref());
+    // If there is a single chromosome group, parallelize heavy inner window scans
+    // to avoid the "only one outer task" bottleneck.
+    let enable_intra_chrom_parallel = chrom_groups.len() == 1;
+    let intra_parallel_min_neighbors = 96usize;
+    let dropped_groups: Vec<Vec<bool>> = {
+        let run = || {
+            chrom_groups
+                .par_iter()
+                .map(|idx_list| {
+                    prune_one_chrom_packed(
+                        idx_list,
+                        pos_vec,
+                        packed_flat,
+                        bytes_per_snp,
+                        n_samples,
+                        window_bp,
+                        window_variants,
+                        step_variants,
+                        r2_threshold,
+                        &stats,
+                        pair_lut,
+                        &byte_lut.code4,
+                        &bitplane_h,
+                        &bitplane_l,
+                        bitplane_words,
+                        &bitplane_masks,
+                        enable_intra_chrom_parallel,
+                        intra_parallel_min_neighbors,
+                    )
+                })
+                .collect::<Vec<Vec<bool>>>()
+        };
+        if let Some(tp) = &pool {
+            tp.install(run)
+        } else {
+            run()
+        }
+    };
+
+    let mut keep = vec![true; m];
+    for (idx_list, dropped) in chrom_groups.iter().zip(dropped_groups.iter()) {
+        for (local_idx, &global_idx) in idx_list.iter().enumerate() {
+            if dropped[local_idx] {
+                keep[global_idx] = false;
+            }
+        }
+    }
+    Ok(keep)
+}
+
+fn normalize_plink_prefix(p: &str) -> String {
+    let s = p.trim();
+    let low = s.to_ascii_lowercase();
+    if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
+        return s[..s.len() - 4].to_string();
+    }
+    s.to_string()
+}
+
+fn read_bim_lines_chrom_pos(prefix: &str) -> Result<(Vec<String>, Vec<i32>, Vec<i64>), String> {
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut lines: Vec<String> = Vec::new();
+    let mut chrom_codes: Vec<i32> = Vec::new();
+    let mut positions: Vec<i64> = Vec::new();
+    let mut chr_map: HashMap<String, i32> = HashMap::new();
+    let mut next_code: i32 = 0;
+    for (line_no, line) in reader.lines().enumerate() {
+        let l = line.map_err(|e| format!("{bim_path}:{}: {}", line_no + 1, e))?;
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let toks: Vec<&str> = t.split_whitespace().collect();
+        if toks.len() < 4 {
+            return Err(format!(
+                "{bim_path}:{}: malformed BIM row (need >=4 columns)",
+                line_no + 1
+            ));
+        }
+        let chr_raw = toks[0].to_string();
+        let pos = toks[3].parse::<i64>().map_err(|_| {
+            format!(
+                "{bim_path}:{}: invalid POS column '{}'",
+                line_no + 1,
+                toks[3]
+            )
+        })?;
+        let code = if let Some(&c) = chr_map.get(&chr_raw) {
+            c
+        } else {
+            let c = next_code;
+            chr_map.insert(chr_raw, c);
+            next_code = next_code.saturating_add(1);
+            c
+        };
+        lines.push(t.to_string());
+        chrom_codes.push(code);
+        positions.push(pos);
+    }
+    if lines.is_empty() {
+        return Err(format!("no variant rows in {bim_path}"));
+    }
+    Ok((lines, chrom_codes, positions))
+}
+
+fn read_bed_payload(prefix: &str, n_samples: usize, n_snps: usize) -> Result<Vec<u8>, String> {
+    let bed_path = format!("{prefix}.bed");
+    let mut f = File::open(&bed_path).map_err(|e| format!("{bed_path}: {e}"))?;
+    let mut bytes = Vec::<u8>::new();
+    f.read_to_end(&mut bytes)
+        .map_err(|e| format!("{bed_path}: {e}"))?;
+    if bytes.len() < 3 {
+        return Err(format!("{bed_path}: invalid BED header"));
+    }
+    if bytes[0] != 0x6C || bytes[1] != 0x1B || bytes[2] != 0x01 {
+        return Err(format!(
+            "{bed_path}: unsupported BED header (expect SNP-major 0x6C 0x1B 0x01)"
+        ));
+    }
+    let bps = (n_samples + 3) / 4;
+    let expect = n_snps.saturating_mul(bps);
+    let got = bytes.len().saturating_sub(3);
+    if got != expect {
+        return Err(format!(
+            "{bed_path}: payload size mismatch, got {got}, expected {expect} (n_snps={n_snps}, n_samples={n_samples})"
+        ));
+    }
+    Ok(bytes[3..].to_vec())
+}
+
+fn write_pruned_plink(
+    src_prefix: &str,
+    out_prefix: &str,
+    keep: &[bool],
+    bed_payload: &[u8],
+    bytes_per_snp: usize,
+    bim_lines: &[String],
+) -> Result<(usize, usize), String> {
+    if keep.len() != bim_lines.len() {
+        return Err(format!(
+            "keep mask length mismatch: keep={}, bim_rows={}",
+            keep.len(),
+            bim_lines.len()
+        ));
+    }
+    if bed_payload.len() != keep.len().saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "bed payload mismatch: got {}, expected {}",
+            bed_payload.len(),
+            keep.len().saturating_mul(bytes_per_snp)
+        ));
+    }
+    let out_bed = format!("{out_prefix}.bed");
+    let out_bim = format!("{out_prefix}.bim");
+    let out_fam = format!("{out_prefix}.fam");
+    let src_fam = format!("{src_prefix}.fam");
+    if let Some(parent) = Path::new(&out_bed).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let mut wbed = BufWriter::new(File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?);
+    wbed.write_all(&[0x6C, 0x1B, 0x01])
+        .map_err(|e| format!("{out_bed}: {e}"))?;
+    let mut wbim = BufWriter::new(File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?);
+
+    let mut kept = 0usize;
+    for i in 0..keep.len() {
+        if !keep[i] {
+            continue;
+        }
+        let s = i.saturating_mul(bytes_per_snp);
+        let e = s.saturating_add(bytes_per_snp);
+        wbed.write_all(&bed_payload[s..e])
+            .map_err(|e| format!("{out_bed}: {e}"))?;
+        wbim.write_all(bim_lines[i].as_bytes())
+            .and_then(|_| wbim.write_all(b"\n"))
+            .map_err(|e| format!("{out_bim}: {e}"))?;
+        kept = kept.saturating_add(1);
+    }
+    wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+    wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+
+    fs::copy(&src_fam, &out_fam).map_err(|e| format!("{src_fam} -> {out_fam}: {e}"))?;
+    Ok((kept, keep.len()))
 }
 
 #[inline]
@@ -1377,6 +2405,191 @@ pub fn bed_packed_decode_rows_f32<'py>(
     };
     arr_slice.copy_from_slice(&out);
     Ok(arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    chrom_codes,
+    positions,
+    window_bp=None,
+    window_variants=None,
+    step_variants=1,
+    r2_threshold=0.2,
+    threads=0
+))]
+pub fn bed_packed_ld_prune_maf_priority<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    chrom_codes: PyReadonlyArray1<'py, i32>,
+    positions: PyReadonlyArray1<'py, i64>,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if !(r2_threshold.is_finite() && r2_threshold > 0.0 && r2_threshold <= 1.0) {
+        return Err(PyRuntimeError::new_err(
+            "r2_threshold must be finite and in (0, 1]",
+        ));
+    }
+    if step_variants == 0 {
+        return Err(PyRuntimeError::new_err("step_variants must be > 0"));
+    }
+    if window_bp.is_none() && window_variants.is_none() {
+        return Err(PyRuntimeError::new_err(
+            "provide one of window_bp or window_variants",
+        ));
+    }
+    if let Some(bp) = window_bp {
+        if bp <= 0 {
+            return Err(PyRuntimeError::new_err("window_bp must be > 0"));
+        }
+    }
+    if let Some(wv) = window_variants {
+        if wv == 0 {
+            return Err(PyRuntimeError::new_err("window_variants must be > 0"));
+        }
+    }
+
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let chrom_vec: Cow<[i32]> = match chrom_codes.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(chrom_codes.as_array().iter().copied().collect()),
+    };
+    let pos_vec: Cow<[i64]> = match positions.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(positions.as_array().iter().copied().collect()),
+    };
+    if chrom_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "chrom_codes length mismatch: got {}, expected {m}",
+            chrom_vec.len()
+        )));
+    }
+    if pos_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "positions length mismatch: got {}, expected {m}",
+            pos_vec.len()
+        )));
+    }
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+
+    let keep = py
+        .detach(|| {
+            bed_packed_ld_prune_keep(
+                &packed_flat,
+                m,
+                bytes_per_snp,
+                n_samples,
+                &chrom_vec,
+                &pos_vec,
+                window_bp,
+                window_variants,
+                step_variants,
+                r2_threshold,
+                threads,
+            )
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let out = PyArray1::<bool>::zeros(py, [m], false).into_bound();
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    out_slice.copy_from_slice(&keep);
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    src_prefix,
+    out_prefix,
+    window_bp=None,
+    window_variants=None,
+    step_variants=1,
+    r2_threshold=0.2,
+    threads=0
+))]
+pub fn bed_prune_to_plink_rust(
+    py: Python<'_>,
+    src_prefix: String,
+    out_prefix: String,
+    window_bp: Option<i64>,
+    window_variants: Option<usize>,
+    step_variants: usize,
+    r2_threshold: f64,
+    threads: usize,
+) -> PyResult<(usize, usize)> {
+    let src = normalize_plink_prefix(&src_prefix);
+    let out = normalize_plink_prefix(&out_prefix);
+    if src.is_empty() || out.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "src_prefix/out_prefix must not be empty",
+        ));
+    }
+
+    let (bim_lines, chrom_codes, positions) =
+        read_bim_lines_chrom_pos(&src).map_err(_map_err_string_to_py)?;
+    let n_snps = bim_lines.len();
+    let n_samples = crate::gfcore::read_fam(&src)
+        .map_err(_map_err_string_to_py)?
+        .len();
+    if n_samples == 0 || n_snps == 0 {
+        return Err(PyRuntimeError::new_err(
+            "empty PLINK input (no samples or no SNPs)",
+        ));
+    }
+
+    let bed_payload = read_bed_payload(&src, n_samples, n_snps).map_err(_map_err_string_to_py)?;
+    let bytes_per_snp = (n_samples + 3) / 4;
+
+    let keep = py
+        .detach(|| {
+            bed_packed_ld_prune_keep(
+                &bed_payload,
+                n_snps,
+                bytes_per_snp,
+                n_samples,
+                &chrom_codes,
+                &positions,
+                window_bp,
+                window_variants,
+                step_variants,
+                r2_threshold,
+                threads,
+            )
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let (kept, total) =
+        write_pruned_plink(&src, &out, &keep, &bed_payload, bytes_per_snp, &bim_lines)
+            .map_err(_map_err_string_to_py)?;
+    Ok((kept, total))
 }
 
 #[pyfunction]

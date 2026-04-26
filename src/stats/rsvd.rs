@@ -1,9 +1,7 @@
 use nalgebra::{DMatrix, SymmetricEigen};
-use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-};
-use pyo3::exceptions::PyRuntimeError;
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyKeyboardInterrupt;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
@@ -17,8 +15,7 @@ const _INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 
 #[inline]
 fn _check_ctrlc() -> Result<(), String> {
-    Python::attach(|py| py.check_signals())
-        .map_err(|_| _INTERRUPTED_MSG.to_string())
+    Python::attach(|py| py.check_signals()).map_err(|_| _INTERRUPTED_MSG.to_string())
 }
 
 #[inline]
@@ -239,9 +236,7 @@ fn parse_index_vec_i64(src: &[i64], n_total: usize, name: &str) -> Result<Vec<us
         }
         let u = v as usize;
         if u >= n_total {
-            return Err(format!(
-                "{name}[{i}] out of range: {u} >= {n_total}"
-            ));
+            return Err(format!("{name}[{i}] out of range: {u} >= {n_total}"));
         }
         out.push(u);
     }
@@ -338,11 +333,7 @@ fn spectral_proxy_from_columns(x: &[f32], rows: usize, cols: usize) -> Vec<f32> 
     s
 }
 
-fn qr_normalize_mgs(
-    x: &[f32],
-    rows: usize,
-    cols: usize,
-) -> Result<(Vec<f32>, Vec<f32>), String> {
+fn qr_normalize_mgs(x: &[f32], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
     if x.len() != rows * cols {
         return Err("buffer size mismatch in qr_normalize_mgs".to_string());
     }
@@ -593,13 +584,7 @@ pub fn rsvd_packed_subset(
             q = q_new;
             q_is_qr = true;
         } else {
-            let (q_new, used_lu) = lu_normalize_with_qr_fallback(
-                &y,
-                n,
-                kp,
-                lu_eps,
-                lu_cond_ratio,
-            )?;
+            let (q_new, used_lu) = lu_normalize_with_qr_fallback(&y, n, kp, lu_eps, lu_cond_ratio)?;
             q = q_new;
             q_is_qr = !used_lu;
         }
@@ -711,7 +696,9 @@ pub fn py_rsvd_packed_subset<'py>(
 
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("packed must be 2D (m, bytes_per_snp)"));
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
     }
     let m = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];

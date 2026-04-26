@@ -834,6 +834,7 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
         ".bin.id",
         ".id",
         ".fam",
+        ".bsite",
         ".bin.site",
         ".site",
         ".site.tsv",
@@ -1237,8 +1238,7 @@ def load_genotype_chunks(
     - Sample order (columns) is fixed and defined by `reader.sample_ids`.
     - SNP order (rows) follows the original file order after filtering.
     - VCF/HMP/TXT caching itself does not perform maf/missing filtering or imputation.
-      Filters are applied during chunk streaming (Rust for PLINK/VCF/HMP-cached path,
-      Python for TXT/NPY and HMP direct fallback path).
+      Filters are applied during chunk streaming in Rust readers.
     - VCF cache uses parameterized filenames:
       `~prefix.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam`
       with mtime-based stale detection and lock-based concurrent build safety.
@@ -1501,6 +1501,11 @@ def load_genotype_chunks(
             snp_sites,
             sample_ids,
             sample_indices,
+            float(maf),
+            float(missing_rate),
+            bool(impute),
+            str(model),
+            float(het),
         )
         # 2) Iterate until exhausted
         while True:
@@ -1513,18 +1518,9 @@ def load_genotype_chunks(
             # geno is already float32 C-contiguous memory managed by Rust
             # Convert to NumPy array (zero-copy)
             geno_np = np.asarray(geno, dtype=np.float32)
-            geno_np, sites = _process_txt_like_chunk(
-                geno_np,
-                list(sites),
-                maf=float(maf),
-                missing_rate=float(missing_rate),
-                impute=bool(impute),
-                model=str(model),
-                het=float(het),
-            )
             if geno_np.shape[0] == 0:
                 continue
-            yield geno_np, sites
+            yield geno_np, list(sites)
         return
 
     raise ValueError(

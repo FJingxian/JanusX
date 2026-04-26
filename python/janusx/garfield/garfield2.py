@@ -451,6 +451,7 @@ def getLogicgate(
     response:Literal['binary', 'continuous']="continuous",
     gsetmode:bool = True,
     gset_groups: Union[None, List[np.ndarray], List[list[int]]] = None,
+    min_literals: int = 2,
 ):
     """
     Find logic combinations (xcombine) in a genotype block using
@@ -545,14 +546,18 @@ def getLogicgate(
             return None
     else:
         idx = np.argsort(Imp)[::-1][:topk]
-    # 0/1/2 ->0/1
-    Mchoice = (M[idx] / 2).astype(int).T
+    # Convert dosage-like rows to binary carrier matrix for logic fitting.
+    # This supports both binary 0/1 matrices and additive 0/1/2 matrices.
+    Mchoice = (np.asarray(M[idx], dtype=np.float32) > 0.5).astype(np.uint8).T
 
     resdict = logreg(Mchoice, y, response=response, tags=sites[idx])
     if resdict is None:
         return None
     indices = resdict.get("indices", [])
-    if indices is None or len(indices) <= 1:
+    if indices is None:
+        return None
+    min_lit = max(1, int(min_literals))
+    if len(indices) < min_lit:
         return None
     if resdict.get("expression", "") == "1":
         return None
@@ -567,6 +572,7 @@ def _window_task(
     n_estimators: int,
     response: Literal['binary', 'continuous'],
     gsetmode: bool,
+    min_literals: int,
 ) -> tuple[Union[dict[str,Any], None], Union[str, None]]:
     chrom, start, end, M_win, tags = task
     try:
@@ -578,6 +584,7 @@ def _window_task(
             sites=tags,
             response=response,
             gsetmode=gsetmode,
+            min_literals=min_literals,
         )
     except Exception as e:
         emsg = str(e)
@@ -632,6 +639,7 @@ def window(
     batch_size: int = 128,
     mmap_window_mb: Union[int, None] = None,
     collect_warnings: bool = False,
+    min_literals: int = 2,
 ):
     """
     Whole-genome sliding-window traversal (load by chunksize order to reduce repeated IO).
@@ -775,12 +783,12 @@ def window(
                                 if len(tasks) >= batch_size:
                                     if threads <= 1:
                                         batch_outputs = [
-                                            _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                            _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
                                             for t in tasks
                                         ]
                                     else:
                                         batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                            delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
+                                            delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
                                         )
                                     _consume_task_outputs(batch_outputs)
                                     tasks.clear()
@@ -805,12 +813,12 @@ def window(
                         if len(tasks) >= batch_size:
                             if threads <= 1:
                                 batch_outputs = [
-                                    _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                    _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
                                     for t in tasks
                                 ]
                             else:
                                 batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
+                                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
                                 )
                             _consume_task_outputs(batch_outputs)
                             tasks.clear()
@@ -833,12 +841,12 @@ def window(
                     if len(tasks) >= batch_size:
                         if threads <= 1:
                             batch_outputs = [
-                                _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                                _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
                                 for t in tasks
                             ]
                         else:
                             batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
+                                delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
                             )
                         _consume_task_outputs(batch_outputs)
                         tasks.clear()
@@ -847,12 +855,12 @@ def window(
         if tasks:
             if threads <= 1:
                 batch_outputs = [
-                    _window_task(t, y, nsnp, n_estimators, response, gsetmode)
+                    _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
                     for t in tasks
                 ]
             else:
                 batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode) for t in tasks
+                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
                 )
             _consume_task_outputs(batch_outputs)
     finally:
@@ -883,6 +891,7 @@ def _process(
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     mmap_window_mb: Union[int, None] = None,
+    min_literals: int = 2,
 ):
     """
     Run on one BED region:
@@ -982,6 +991,7 @@ def _process(
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
+            min_literals=min_literals,
         )
     except Exception as e:
         # If one region fails, do not crash the whole parallel job.
@@ -1056,6 +1066,7 @@ def _process_inmemory(
     n_estimators: int = 200,
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
+    min_literals: int = 2,
 ):
     if isinstance(ChromPos, tuple):
         chrom, start, end = ChromPos
@@ -1109,6 +1120,7 @@ def _process_inmemory(
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
+            min_literals=min_literals,
         )
     except Exception as e:
         print(f"[WARN] process {ChromPos} failed: {e}")
@@ -1129,6 +1141,7 @@ def _process_inmemory_packed(
     n_estimators: int = 200,
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
+    min_literals: int = 2,
 ):
     if isinstance(ChromPos, tuple):
         chrom, start, end = ChromPos
@@ -1182,6 +1195,7 @@ def _process_inmemory_packed(
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
+            min_literals=min_literals,
         )
     except Exception as e:
         print(f"[WARN] process {ChromPos} failed: {e}")
@@ -1206,6 +1220,7 @@ def main(
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
     mmap_window_mb: Union[int, None] = None,
+    min_literals: int = 2,
 ):
     y = np.asarray(y, dtype=float).ravel()
     if gsetmodes is not None and len(gsetmodes) != len(bedlist):
@@ -1225,6 +1240,7 @@ def main(
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             mmap_window_mb,
+            min_literals,
         )
         for i, ChromPos in enumerate(bedlist)
     )
@@ -1241,6 +1257,7 @@ def main_inmemory(
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
+    min_literals: int = 2,
 ):
     """
     Run GARFIELD search from preloaded in-memory int8 genotype matrix.
@@ -1266,6 +1283,7 @@ def main_inmemory(
             n_estimators,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
+            min_literals,
         )
         for i, ChromPos in enumerate(bedlist)
     )
@@ -1284,6 +1302,7 @@ def main_inmemory_packed(
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
+    min_literals: int = 2,
 ):
     """
     Run GARFIELD search from preloaded BED-packed genotype matrix.
@@ -1315,6 +1334,7 @@ def main_inmemory_packed(
             n_estimators,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
+            min_literals,
         )
         for i, ChromPos in enumerate(bedlist)
     )

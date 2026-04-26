@@ -61,3 +61,4 @@ benchmark
 *.so
 *.exe
 *.pdb
+out

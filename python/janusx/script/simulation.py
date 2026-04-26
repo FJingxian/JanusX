@@ -18,7 +18,7 @@ import os
 import time
 import socket
 import argparse
-from typing import Literal, Optional, List, Tuple
+from typing import Literal, Optional, List, Tuple, Any
 
 import numpy as np
 from janusx.garfield.garfield2 import ldprune
@@ -39,6 +39,97 @@ from ._common.genoio import determine_genotype_source_from_args as determine_gen
 from ._common.status import log_success
 
 
+def _site_to_chr_pos(site: Any) -> Tuple[str, int]:
+    if hasattr(site, "chrom") and hasattr(site, "pos"):
+        return str(site.chrom), int(site.pos)
+    if isinstance(site, (tuple, list)) and len(site) >= 2:
+        return str(site[0]), int(site[1])
+    s = str(site)
+    if "_" in s:
+        chrom, pos = s.rsplit("_", 1)
+        try:
+            return str(chrom), int(pos)
+        except Exception:
+            pass
+    return str(site), 0
+
+
+def _extract_window_matrix(
+    gfile: str,
+    *,
+    window: Tuple[str, int, int],
+    chunk_size: int,
+    maf: float,
+    missing_rate: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    m_list: List[np.ndarray] = []
+    sites_list: List[Any] = []
+    for m_chunk, sites in load_genotype_chunks(
+        gfile,
+        chunk_size=chunk_size,
+        maf=maf,
+        missing_rate=missing_rate,
+        bim_range=window,
+    ):
+        if m_chunk.size == 0:
+            continue
+        m_list.append(np.asarray(m_chunk, dtype=np.float32))
+        sites_list.extend(list(sites))
+    if not m_list:
+        return np.empty((0, 0), dtype=np.float32), np.asarray([], dtype=object)
+    m = np.vstack(m_list)
+    s = np.asarray(sites_list, dtype=object)
+    return m, s
+
+
+def _select_low_ld_indices(
+    g01: np.ndarray,
+    *,
+    k: int,
+    ld_max: float,
+    rng: np.random.Generator,
+    n_trials: int = 64,
+) -> Optional[np.ndarray]:
+    """
+    Randomized greedy selection under pairwise r^2 <= ld_max.
+    Returns row indices on g01 or None.
+    """
+    m, n = g01.shape
+    if k <= 0 or m < k or n <= 1:
+        return None
+
+    x = np.asarray(g01, dtype=np.float32)
+    mu = x.mean(axis=1, keepdims=True)
+    sd = x.std(axis=1, keepdims=True, ddof=0)
+    keep = np.asarray(sd[:, 0] > 1e-8, dtype=bool)
+    if int(np.sum(keep)) < k:
+        return None
+
+    idx_map = np.flatnonzero(keep)
+    z = (x[keep] - mu[keep]) / (sd[keep] + 1e-8)
+    mm = z.shape[0]
+
+    if ld_max >= 0.999:
+        pick = rng.choice(np.arange(mm), size=k, replace=False)
+        return idx_map[np.asarray(pick, dtype=int)]
+
+    for _ in range(max(1, int(n_trials))):
+        order = rng.permutation(mm)
+        chosen: List[int] = []
+        for cand in order:
+            if not chosen:
+                chosen.append(int(cand))
+            else:
+                # corr of candidate against chosen rows; rows are standardized.
+                corr = np.dot(z[np.asarray(chosen, dtype=int)], z[cand]) / float(n)
+                r2 = np.asarray(corr, dtype=np.float64) ** 2
+                if float(np.max(r2)) <= float(ld_max) + 1e-12:
+                    chosen.append(int(cand))
+            if len(chosen) >= k:
+                return idx_map[np.asarray(chosen[:k], dtype=int)]
+    return None
+
+
 # -----------------------------
 # Phenotype simulator from genotype stream
 # -----------------------------
@@ -52,6 +143,13 @@ def simulate_phenotype_from_genofile(
     pve: float = 0.5,
     ve: float = 1.0,
     windows: int = 50_000,
+    and_k_min: int = 2,
+    and_k_max: int = 4,
+    and_ld_max: float = 0.2,
+    and_af_min: float = 0.02,
+    and_af_max: float = 0.98,
+    and_target_pve: float = 0.2,
+    and_max_iter: int = 100,
 ) -> Tuple[np.ndarray, List[Tuple[str, int, int]]]:
     """
     Simulate phenotype y (n,1) from an existing genotype file.
@@ -124,40 +222,91 @@ def simulate_phenotype_from_genofile(
             y += Mchunk.T  # -> (n,1)
             outsites.extend([(str(i.chrom), int(i.pos), int(i.pos)) for i in sites])
 
-    else:  # Garfield-like: build a burden pseudo-SNP within the window
-        npseudo = int(rng.integers(2, 5))
-        maxiter = 100
+    else:
+        # Strict AND logic simulation:
+        # 1) sample multiple low-LD loci in a random window
+        # 2) construct gate = X1 & X2 & ... & Xk
+        # 3) scale effect size to target PVE
+        outsites = []
+        best_candidate: Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]] = None
+        af_target_center = 0.5 * (float(and_af_min) + float(and_af_max))
 
-        pseudo = np.zeros((n, 1), dtype=np.int32)
-        for _ in range(maxiter):
-            outsites.clear()
-            pseudo[:] = 0
+        if arr.shape[0] == 0:
+            return y.astype(np.float32), outsites
 
-            for Mchunk, sites in load_genotype_chunks(
+        for _ in range(max(1, int(and_max_iter))):
+            win = tuple(arr[rng.integers(len(arr))])  # (chrom, start, end)
+            m_raw, s_raw = _extract_window_matrix(
                 gfile,
+                window=win,  # type: ignore[arg-type]
                 chunk_size=chunk_size,
                 maf=maf,
                 missing_rate=missing_rate,
-                bim_range=siteslistrc,
-            ):
-                # 0/1/2 -> 0/1
-                Mchunk,sites = ldprune(Mchunk,sites,0.75)
-                G01 = (Mchunk / 2).astype(np.int32)  # (m,n)
-                m = G01.shape[0]
-                if m == 0:
+            )
+            if m_raw.size == 0 or s_raw.size == 0:
+                continue
+
+            # Keep only loosely non-redundant variants before strict low-LD sampling.
+            m_keep, s_keep = ldprune(
+                np.asarray(m_raw, dtype=np.float32),
+                np.asarray(s_raw, dtype=object),
+                float(min(max(and_ld_max, 0.01), 0.95)),
+            )
+            g01 = (np.asarray(m_keep, dtype=np.float32) > 0.5).astype(np.uint8)
+            m = int(g01.shape[0])
+            if m < max(2, int(and_k_min)):
+                continue
+
+            k_hi = min(int(and_k_max), m)
+            k_lo = max(2, min(int(and_k_min), k_hi))
+            if k_lo > k_hi:
+                continue
+            k = int(rng.integers(k_lo, k_hi + 1))
+
+            sel = _select_low_ld_indices(
+                g01,
+                k=k,
+                ld_max=float(and_ld_max),
+                rng=rng,
+                n_trials=64,
+            )
+            if sel is None:
+                # Fallback: keep strict AND but relax low-LD selection when window is too tight.
+                sel = np.asarray(rng.choice(np.arange(m), size=k, replace=False), dtype=int)
+
+            gate = np.all(g01[np.asarray(sel, dtype=int), :] > 0, axis=0).astype(np.float32).reshape(-1, 1)
+            af = float(np.mean(gate))
+            sel_sites: List[Tuple[str, int, int]] = []
+            for si in np.asarray(sel, dtype=int):
+                chrom, pos = _site_to_chr_pos(np.asarray(s_keep, dtype=object)[int(si)])
+                sel_sites.append((str(chrom), int(pos), int(pos)))
+
+            if best_candidate is None or abs(af - af_target_center) < abs(best_candidate[2] - af_target_center):
+                best_candidate = (gate, sel_sites, af)
+
+            if float(and_af_min) <= af <= float(and_af_max):
+                var_gate = float(np.var(gate, ddof=0))
+                if var_gate <= 1e-12:
                     continue
-                idxrc = rng.choice(np.arange(m), size=min(npseudo, m), replace=False)
-                burden = (np.sum(G01[idxrc, :], axis=0) >= 1).astype(np.int32).reshape(-1, 1)
-                pseudo = burden
-                sel_sites = np.array([(str(i.chrom), int(i.pos), int(i.pos)) for i in sites], dtype=object)
-                outsites.extend(sel_sites[idxrc].tolist())
-
-            af = pseudo.mean()
-            if 0.02 <= af <= 0.98:
+                var_base = float(np.var(y, ddof=0))
+                target = float(and_target_pve)
+                target_var = (target / max(1e-12, 1.0 - target)) * max(var_base, 1e-12)
+                beta = float(np.sqrt(target_var / var_gate))
+                y += beta * (gate - float(np.mean(gate)))
+                outsites = sel_sites
                 break
-
-        # Add a fixed effect size
-        y += 2.0 * pseudo.astype(np.float32)
+        else:
+            # If no gate meets AF constraints, use the best available strict-AND candidate.
+            if best_candidate is not None:
+                gate, sel_sites, _af = best_candidate
+                var_gate = float(np.var(gate, ddof=0))
+                if var_gate > 1e-12:
+                    var_base = float(np.var(y, ddof=0))
+                    target = float(and_target_pve)
+                    target_var = (target / max(1e-12, 1.0 - target)) * max(var_base, 1e-12)
+                    beta = float(np.sqrt(target_var / var_gate))
+                    y += beta * (gate - float(np.mean(gate)))
+                    outsites = sel_sites
 
     return y.astype(np.float32), outsites
 
@@ -320,6 +469,34 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: %(default)s).",
     )
     optional_group.add_argument(
+        "--and-k-min", type=int, default=2,
+        help="Minimum number of loci in strict AND gate for garfield mode (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-k-max", type=int, default=4,
+        help="Maximum number of loci in strict AND gate for garfield mode (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-ld-max", type=float, default=0.2,
+        help="Maximum pairwise r^2 among selected loci for strict AND gate (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-af-min", type=float, default=0.02,
+        help="Minimum gate frequency for strict AND gate acceptance (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-af-max", type=float, default=0.98,
+        help="Maximum gate frequency for strict AND gate acceptance (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-target-pve", type=float, default=0.2,
+        help="Target PVE contributed by strict AND gate effect (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--and-max-iter", type=int, default=100,
+        help="Maximum attempts to sample strict AND gate in garfield mode (default: %(default)s).",
+    )
+    optional_group.add_argument(
         "-write-sites", "--write-sites", action="store_true",
         help="Write causal sites file "
              "(default: %(default)s).",
@@ -361,6 +538,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ("Windows", args.windows),
                     ("PVE", args.pve),
                     ("VE", args.ve),
+                    ("AND k[min,max]", f"{args.and_k_min},{args.and_k_max}"),
+                    ("AND ld max", args.and_ld_max),
+                    ("AND af[min,max]", f"{args.and_af_min},{args.and_af_max}"),
+                    ("AND target PVE", args.and_target_pve),
+                    ("AND max iter", args.and_max_iter),
                     ("Write sites", args.write_sites),
                     ("Seed", args.seed),
                 ],
@@ -383,6 +565,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not (0.0 < args.pve < 1.0):
         logger.error("--pve must be in (0, 1).")
         raise SystemExit(1)
+    if int(args.and_k_min) < 2:
+        logger.error("--and-k-min must be >= 2 for strict AND simulation.")
+        raise SystemExit(1)
+    if int(args.and_k_max) < int(args.and_k_min):
+        logger.error("--and-k-max must be >= --and-k-min.")
+        raise SystemExit(1)
+    if not (0.0 <= float(args.and_ld_max) <= 1.0):
+        logger.error("--and-ld-max must be in [0, 1].")
+        raise SystemExit(1)
+    if not (0.0 <= float(args.and_af_min) <= 1.0) or not (0.0 <= float(args.and_af_max) <= 1.0):
+        logger.error("--and-af-min/--and-af-max must be in [0, 1].")
+        raise SystemExit(1)
+    if float(args.and_af_min) > float(args.and_af_max):
+        logger.error("--and-af-min must be <= --and-af-max.")
+        raise SystemExit(1)
+    if not (0.0 < float(args.and_target_pve) < 1.0):
+        logger.error("--and-target-pve must be in (0, 1).")
+        raise SystemExit(1)
+    if int(args.and_max_iter) <= 0:
+        logger.error("--and-max-iter must be > 0.")
+        raise SystemExit(1)
 
     t_start = time.time()
     logger.info(f"Simulating phenotype from genotype: {gfile}")
@@ -396,6 +599,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         pve=args.pve,
         ve=args.ve,
         windows=args.windows,
+        and_k_min=args.and_k_min,
+        and_k_max=args.and_k_max,
+        and_ld_max=args.and_ld_max,
+        and_af_min=args.and_af_min,
+        and_af_max=args.and_af_max,
+        and_target_pve=args.and_target_pve,
+        and_max_iter=args.and_max_iter,
     )
 
     sampleid, _nsnp = inspect_genotype_file(gfile)

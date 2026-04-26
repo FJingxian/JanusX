@@ -8,6 +8,8 @@ mod admixture;
 mod assoc;
 #[path = "stats/bayes.rs"]
 mod bayes;
+#[path = "stats/beam.rs"]
+pub mod beam;
 #[path = "stats/bsa.rs"]
 mod bsa;
 #[path = "stats/lmm.rs"]
@@ -16,6 +18,8 @@ mod lmm;
 mod logreg;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
+#[path = "stats/score.rs"]
+pub mod score;
 #[path = "stats/tree.rs"]
 mod tree;
 
@@ -32,6 +36,8 @@ mod gwasio;
 mod vcfout;
 
 // math
+#[path = "math/bitwise.rs"]
+mod bitwise;
 #[path = "math/brent.rs"]
 mod brent;
 #[path = "math/linalg.rs"]
@@ -50,27 +56,36 @@ use assoc::{
     ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, farmcpu_rem_dense,
     farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed, fastlmm_assoc_chunk_f32,
-    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_f32,
-    grm_packed_bed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
+    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_bed_f32,
+    grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
     lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
     packed_malpha_f64, rust_sgemm_backend,
 };
 use bayes::{bayesa, bayesb, bayescpi};
+use beam::{
+    beam_scan_windows_binary_mcc_bin_py, beam_search_and_binary_mcc_bin_indices_py,
+    beam_search_and_binary_mcc_bin_py,
+};
+use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use bsa::preprocess_bsa;
 use gfreader::{
-    count_hmp_snps, count_vcf_snps, load_bed_2bit_packed, load_bed_u8_matrix, BedChunkReader,
-    HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader,
-    VcfStreamWriter,
+    count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
+    load_bed_u8_matrix, load_site_info, BedChunkReader, HmpChunkReader, HmpStreamWriter,
+    PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use logreg::fit_best_and_not_py;
 use rsvd::py_rsvd_packed_subset;
+use score::{
+    score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
+    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
+};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
-    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8,
-    nj_newick_from_alignment_u8, nj_newick_from_distance_matrix,
+    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
+    nj_newick_from_distance_matrix,
 };
 // ============================================================
 // PyO3 module exports
@@ -88,12 +103,31 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<SiteInfo>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
+    m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
+    m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
+    m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;
+    m.add_function(wrap_pyfunction!(bitor_into_py, m)?)?;
+    m.add_function(wrap_pyfunction!(bitnot_masked_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_binary_ba_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_binary_mcc_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_binary_ba_mcc_batch_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
+    m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
+    m.add_function(wrap_pyfunction!(beam_search_and_binary_mcc_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        beam_search_and_binary_mcc_bin_indices_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(beam_scan_windows_binary_mcc_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
+    m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;

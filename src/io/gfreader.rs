@@ -5,11 +5,11 @@ use pyo3::BoundObject;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2};
 
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use rayon::prelude::*;
 
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
@@ -192,6 +192,422 @@ pub(crate) fn build_snp_indices(
     }
 
     Ok(None)
+}
+
+#[inline]
+fn normalize_plink_prefix_local(p: &str) -> String {
+    let s = p.trim();
+    let low = s.to_ascii_lowercase();
+    if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
+        return s[..s.len() - 4].to_string();
+    }
+    s.to_string()
+}
+
+#[inline]
+fn normalize_chr_key_local(chrom: &str) -> String {
+    let mut s = chrom.trim().to_string();
+    let low = s.to_ascii_lowercase();
+    if low.starts_with("chr") {
+        s = s[3..].to_string();
+    }
+    s.trim().to_ascii_uppercase()
+}
+
+#[derive(Default, Clone)]
+struct SiteFilterExpr {
+    site_set: Option<HashSet<(String, i32)>>,
+    bim_range: Option<(String, i32, i32)>,
+    chr_set: Option<HashSet<String>>,
+    bp_min: Option<i32>,
+    bp_max: Option<i32>,
+    ranges: Option<Vec<(String, i32, i32)>>,
+}
+
+impl SiteFilterExpr {
+    fn from_parts(
+        snp_sites: Option<Vec<(String, i32)>>,
+        bim_range: Option<(String, i32, i32)>,
+        chr_keys: Option<Vec<String>>,
+        bp_min: Option<i32>,
+        bp_max: Option<i32>,
+        ranges: Option<Vec<(String, i32, i32)>>,
+    ) -> Result<Self, String> {
+        if let (Some(lo), Some(hi)) = (bp_min, bp_max) {
+            if lo > hi {
+                return Err("bp_min cannot be greater than bp_max".to_string());
+            }
+        }
+
+        let site_set: Option<HashSet<(String, i32)>> = snp_sites.and_then(|v| {
+            let mut s: HashSet<(String, i32)> = HashSet::new();
+            for (c, p) in v.into_iter() {
+                s.insert((normalize_chr_key_local(&c), p));
+            }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+
+        let bim_range: Option<(String, i32, i32)> = if let Some((c, s, e)) = bim_range {
+            if s > e {
+                return Err("bim_range start cannot be greater than end".to_string());
+            }
+            Some((normalize_chr_key_local(&c), s, e))
+        } else {
+            None
+        };
+
+        let chr_set: Option<HashSet<String>> = chr_keys.and_then(|v| {
+            let mut s: HashSet<String> = HashSet::new();
+            for c in v.into_iter() {
+                let k = normalize_chr_key_local(&c);
+                if !k.is_empty() {
+                    s.insert(k);
+                }
+            }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+
+        let ranges: Option<Vec<(String, i32, i32)>> = if let Some(v) = ranges {
+            if v.is_empty() {
+                None
+            } else {
+                let mut out: Vec<(String, i32, i32)> = Vec::with_capacity(v.len());
+                for (c, s, e) in v.into_iter() {
+                    if s > e {
+                        return Err("One range has start > end".to_string());
+                    }
+                    out.push((normalize_chr_key_local(&c), s, e));
+                }
+                Some(out)
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            site_set,
+            bim_range,
+            chr_set,
+            bp_min,
+            bp_max,
+            ranges,
+        })
+    }
+
+    #[inline]
+    fn keep_site(&self, site: &core::SiteInfo) -> bool {
+        let c = normalize_chr_key_local(&site.chrom);
+        let p = site.pos;
+
+        if let Some(ref st) = self.site_set {
+            if !st.contains(&(c.clone(), p)) {
+                return false;
+            }
+        }
+        if let Some((ref bc, bs, be)) = self.bim_range {
+            if !(c == *bc && p >= bs && p <= be) {
+                return false;
+            }
+        }
+        if let Some(ref cs) = self.chr_set {
+            if !cs.contains(&c) {
+                return false;
+            }
+        }
+        if let Some(lo) = self.bp_min {
+            if p < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = self.bp_max {
+            if p > hi {
+                return false;
+            }
+        }
+        if let Some(ref rr) = self.ranges {
+            let mut hit = false;
+            for (rc, rs, re) in rr.iter() {
+                if c == *rc && p >= *rs && p <= *re {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    src_prefix,
+    out_prefix,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    fill_missing=false,
+    model=None,
+    het_threshold=None,
+    sample_ids=None,
+    snp_sites=None,
+    bim_range=None,
+    chr_keys=None,
+    bp_min=None,
+    bp_max=None,
+    ranges=None,
+))]
+pub fn bed_filter_to_plink_rust(
+    py: Python<'_>,
+    src_prefix: String,
+    out_prefix: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    fill_missing: bool,
+    model: Option<String>,
+    het_threshold: Option<f32>,
+    sample_ids: Option<Vec<String>>,
+    snp_sites: Option<Vec<(String, i32)>>,
+    bim_range: Option<(String, i32, i32)>,
+    chr_keys: Option<Vec<String>>,
+    bp_min: Option<i32>,
+    bp_max: Option<i32>,
+    ranges: Option<Vec<(String, i32, i32)>>,
+) -> PyResult<(usize, usize, usize)> {
+    let src = normalize_plink_prefix_local(&src_prefix);
+    let out = normalize_plink_prefix_local(&out_prefix);
+    if src.is_empty() || out.is_empty() {
+        return Err(PyValueError::new_err(
+            "src_prefix/out_prefix must not be empty",
+        ));
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+
+    let model_key = model
+        .unwrap_or_else(|| "add".to_string())
+        .to_ascii_lowercase();
+    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+        return Err(PyValueError::new_err(
+            "model must be one of: add, dom, rec, het",
+        ));
+    }
+    let het = het_threshold.unwrap_or(0.02);
+    if !(0.0..=0.5).contains(&het) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 0.5]",
+        ));
+    }
+    let apply_het_filter = model_key != "add";
+
+    let outv = py
+        .detach(move || -> Result<(usize, usize, usize), String> {
+            let it = BedSnpIter::new_with_fill(&src, 0.0, 1.0, false, false, het)?;
+            let (sample_indices, out_sample_ids) =
+                build_sample_selection(&it.samples, sample_ids, None)?;
+            if out_sample_ids.is_empty() {
+                return Err("No samples selected.".to_string());
+            }
+            let n_out_samples = out_sample_ids.len();
+            let full_samples = sample_indices.len() == it.n_samples();
+
+            if let (Some(lo), Some(hi)) = (bp_min, bp_max) {
+                if lo > hi {
+                    return Err("bp_min cannot be greater than bp_max".to_string());
+                }
+            }
+
+            let chr_set: Option<HashSet<String>> = chr_keys.and_then(|v| {
+                let mut s: HashSet<String> = HashSet::new();
+                for c in v.into_iter() {
+                    let k = normalize_chr_key_local(&c);
+                    if !k.is_empty() {
+                        s.insert(k);
+                    }
+                }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            });
+
+            let site_set: Option<HashSet<(String, i32)>> = snp_sites.and_then(|v| {
+                let mut s: HashSet<(String, i32)> = HashSet::new();
+                for (c, p) in v.into_iter() {
+                    s.insert((normalize_chr_key_local(&c), p));
+                }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            });
+
+            let bim_range_norm: Option<(String, i32, i32)> = if let Some((c, s, e)) = bim_range {
+                if s > e {
+                    return Err("bim_range start cannot be greater than end".to_string());
+                }
+                Some((normalize_chr_key_local(&c), s, e))
+            } else {
+                None
+            };
+
+            let ranges_norm: Option<Vec<(String, i32, i32)>> = if let Some(v) = ranges {
+                if v.is_empty() {
+                    None
+                } else {
+                    let mut out_r: Vec<(String, i32, i32)> = Vec::with_capacity(v.len());
+                    for (c, s, e) in v.into_iter() {
+                        if s > e {
+                            return Err("One range has start > end".to_string());
+                        }
+                        out_r.push((normalize_chr_key_local(&c), s, e));
+                    }
+                    Some(out_r)
+                }
+            } else {
+                None
+            };
+
+            let bed_path = format!("{out}.bed");
+            let bim_path = format!("{out}.bim");
+            let fam_path = format!("{out}.fam");
+
+            write_fam_simple(Path::new(&fam_path), &out_sample_ids, None)?;
+            let mut bed = BufWriter::new(File::create(&bed_path).map_err(|e| e.to_string())?);
+            bed.write_all(&[0x6C, 0x1B, 0x01])
+                .map_err(|e| e.to_string())?;
+            let mut bim = BufWriter::new(File::create(&bim_path).map_err(|e| e.to_string())?);
+
+            let bytes_per_snp = (n_out_samples + 3) / 4;
+            let mut n_scanned: usize = 0;
+            let mut n_kept: usize = 0;
+
+            for snp_idx in 0..it.sites.len() {
+                let site0 = &it.sites[snp_idx];
+                let c = normalize_chr_key_local(&site0.chrom);
+                let p = site0.pos;
+
+                if let Some(ref st) = site_set {
+                    if !st.contains(&(c.clone(), p)) {
+                        continue;
+                    }
+                }
+                if let Some((ref bc, bs, be)) = bim_range_norm {
+                    if !(c == *bc && p >= bs && p <= be) {
+                        continue;
+                    }
+                }
+                if let Some(ref cs) = chr_set {
+                    if !cs.contains(&c) {
+                        continue;
+                    }
+                }
+                if let Some(lo) = bp_min {
+                    if p < lo {
+                        continue;
+                    }
+                }
+                if let Some(hi) = bp_max {
+                    if p > hi {
+                        continue;
+                    }
+                }
+                if let Some(ref rr) = ranges_norm {
+                    let mut hit = false;
+                    for (rc, rs, re) in rr.iter() {
+                        if c == *rc && p >= *rs && p <= *re {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if !hit {
+                        continue;
+                    }
+                }
+
+                n_scanned = n_scanned.saturating_add(1);
+                let maybe = if full_samples {
+                    it.get_snp_row_raw(snp_idx)
+                } else {
+                    it.get_snp_row_selected_raw(snp_idx, &sample_indices)
+                };
+                let (mut row, mut site) = match maybe {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let keep = core::process_snp_row(
+                    &mut row,
+                    &mut site.ref_allele,
+                    &mut site.alt_allele,
+                    maf_threshold,
+                    max_missing_rate,
+                    fill_missing,
+                    apply_het_filter,
+                    het,
+                );
+                if !keep {
+                    continue;
+                }
+
+                let snp_id = format!("{}_{}", site.chrom, site.pos);
+                writeln!(
+                    bim,
+                    "{}\t{}\t0\t{}\t{}\t{}",
+                    site.chrom, snp_id, site.pos, site.ref_allele, site.alt_allele
+                )
+                .map_err(|e| e.to_string())?;
+
+                let mut si = 0usize;
+                for _ in 0..bytes_per_snp {
+                    let mut byte: u8 = 0;
+                    for k in 0..4usize {
+                        let bits = if si < row.len() {
+                            let g = row[si];
+                            let gi: i8 = if !g.is_finite() || g < 0.0 {
+                                -9_i8
+                            } else {
+                                g.round().clamp(0.0, 2.0) as i8
+                            };
+                            plink2bits_from_g_i8(gi)
+                        } else {
+                            0b00
+                        };
+                        byte |= bits << (k * 2);
+                        si += 1;
+                    }
+                    bed.write_all(&[byte]).map_err(|e| e.to_string())?;
+                }
+
+                n_kept = n_kept.saturating_add(1);
+            }
+
+            bed.flush().map_err(|e| e.to_string())?;
+            bim.flush().map_err(|e| e.to_string())?;
+            Ok((n_kept, n_scanned, n_out_samples))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    Ok(outv)
 }
 
 // -------- BedChunkReader --------
@@ -383,7 +799,8 @@ impl BedChunkReader {
                         let maybe = if full_samples {
                             self.it.get_snp_row_raw(snp_idx)
                         } else {
-                            self.it.get_snp_row_selected_raw(snp_idx, &self.sample_indices)
+                            self.it
+                                .get_snp_row_selected_raw(snp_idx, &self.sample_indices)
                         };
                         if let Some((mut row_sub, mut site)) = maybe {
                             let keep = core::process_snp_row(
@@ -499,6 +916,7 @@ pub struct VcfChunkReader {
     it: VcfSnpIter,
     sample_indices: Vec<usize>,
     sample_ids: Vec<String>,
+    site_filter: SiteFilterExpr,
     maf: f32,
     miss: f32,
     fill_missing: bool,
@@ -518,6 +936,12 @@ impl VcfChunkReader {
         sample_indices=None,
         model=None,
         het_threshold=None,
+        snp_sites=None,
+        bim_range=None,
+        chr_keys=None,
+        bp_min=None,
+        bp_max=None,
+        ranges=None,
     ))]
     fn new(
         path: String,
@@ -528,6 +952,12 @@ impl VcfChunkReader {
         sample_indices: Option<Vec<usize>>,
         model: Option<String>,
         het_threshold: Option<f32>,
+        snp_sites: Option<Vec<(String, i32)>>,
+        bim_range: Option<(String, i32, i32)>,
+        chr_keys: Option<Vec<String>>,
+        bp_min: Option<i32>,
+        bp_max: Option<i32>,
+        ranges: Option<Vec<(String, i32, i32)>>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -550,10 +980,14 @@ impl VcfChunkReader {
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let site_filter =
+            SiteFilterExpr::from_parts(snp_sites, bim_range, chr_keys, bp_min, bp_max, ranges)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
         Ok(Self {
             it,
             sample_indices,
             sample_ids,
+            site_filter,
             maf,
             miss,
             fill_missing: fill,
@@ -587,6 +1021,9 @@ impl VcfChunkReader {
         while m < chunk_size {
             match self.it.next_snp_raw() {
                 Some((row, mut site)) => {
+                    if !self.site_filter.keep_site(&site) {
+                        continue;
+                    }
                     let mut row_sub = if full_samples {
                         row
                     } else {
@@ -629,6 +1066,7 @@ pub struct HmpChunkReader {
     it: HmpSnpIter,
     sample_indices: Vec<usize>,
     sample_ids: Vec<String>,
+    site_filter: SiteFilterExpr,
     maf: f32,
     miss: f32,
     fill_missing: bool,
@@ -648,6 +1086,12 @@ impl HmpChunkReader {
         sample_indices=None,
         model=None,
         het_threshold=None,
+        snp_sites=None,
+        bim_range=None,
+        chr_keys=None,
+        bp_min=None,
+        bp_max=None,
+        ranges=None,
     ))]
     fn new(
         path: String,
@@ -658,6 +1102,12 @@ impl HmpChunkReader {
         sample_indices: Option<Vec<usize>>,
         model: Option<String>,
         het_threshold: Option<f32>,
+        snp_sites: Option<Vec<(String, i32)>>,
+        bim_range: Option<(String, i32, i32)>,
+        chr_keys: Option<Vec<String>>,
+        bp_min: Option<i32>,
+        bp_max: Option<i32>,
+        ranges: Option<Vec<(String, i32, i32)>>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -680,10 +1130,14 @@ impl HmpChunkReader {
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let site_filter =
+            SiteFilterExpr::from_parts(snp_sites, bim_range, chr_keys, bp_min, bp_max, ranges)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
         Ok(Self {
             it,
             sample_indices,
             sample_ids,
+            site_filter,
             maf,
             miss,
             fill_missing: fill,
@@ -717,6 +1171,9 @@ impl HmpChunkReader {
         while m < chunk_size {
             match self.it.next_snp_raw() {
                 Some((row, mut site)) => {
+                    if !self.site_filter.keep_site(&site) {
+                        continue;
+                    }
                     let mut row_sub = if full_samples {
                         row
                     } else {
@@ -761,6 +1218,12 @@ pub struct TxtChunkReader {
     snp_pos: usize,
     sample_indices: Vec<usize>,
     sample_ids: Vec<String>,
+    site_filter: SiteFilterExpr,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
 }
 
 #[pymethods]
@@ -775,6 +1238,15 @@ impl TxtChunkReader {
         snp_sites=None,
         sample_ids=None,
         sample_indices=None,
+        maf_threshold=None,
+        max_missing_rate=None,
+        fill_missing=None,
+        model=None,
+        het_threshold=None,
+        chr_keys=None,
+        bp_min=None,
+        bp_max=None,
+        ranges=None,
     ))]
     fn new(
         path: String,
@@ -785,7 +1257,33 @@ impl TxtChunkReader {
         snp_sites: Option<Vec<(String, i32)>>,
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
+        maf_threshold: Option<f32>,
+        max_missing_rate: Option<f32>,
+        fill_missing: Option<bool>,
+        model: Option<String>,
+        het_threshold: Option<f32>,
+        chr_keys: Option<Vec<String>>,
+        bp_min: Option<i32>,
+        bp_max: Option<i32>,
+        ranges: Option<Vec<(String, i32, i32)>>,
     ) -> PyResult<Self> {
+        let maf = maf_threshold.unwrap_or(0.0);
+        let miss = max_missing_rate.unwrap_or(1.0);
+        let fill = fill_missing.unwrap_or(true);
+        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
+        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "model must be one of: add, dom, rec, het",
+            ));
+        }
+        let het = het_threshold.unwrap_or(0.02);
+        if !(0.0..=0.5).contains(&het) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "het_threshold must be within [0, 0.5]",
+            ));
+        }
+        let apply_het_filter = model_key != "add";
+
         let it = TxtSnpIter::new(&path, delimiter.as_deref())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
@@ -796,6 +1294,8 @@ impl TxtChunkReader {
         let snp_indices =
             build_snp_indices(&it.sites, snp_range, snp_indices, bim_range, snp_sites)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let site_filter = SiteFilterExpr::from_parts(None, None, chr_keys, bp_min, bp_max, ranges)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
         Ok(Self {
             it,
@@ -803,6 +1303,12 @@ impl TxtChunkReader {
             snp_pos: 0,
             sample_indices,
             sample_ids,
+            site_filter,
+            maf,
+            miss,
+            fill_missing: fill,
+            apply_het_filter,
+            het_threshold: het,
         })
     }
 
@@ -848,27 +1354,59 @@ impl TxtChunkReader {
             while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let snp_idx = snp_indices[self.snp_pos];
                 self.snp_pos += 1;
-                if let Some((row, site)) = self.it.get_snp_row(snp_idx) {
-                    if full_samples {
-                        data.extend_from_slice(&row);
-                    } else {
-                        data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                if let Some((row, mut site)) = self.it.get_snp_row(snp_idx) {
+                    if !self.site_filter.keep_site(&site) {
+                        continue;
                     }
-                    sites.push(site.into());
-                    m += 1;
+                    let mut row_sub = if full_samples {
+                        row
+                    } else {
+                        self.sample_indices.iter().map(|&i| row[i]).collect()
+                    };
+                    let keep = core::process_snp_row(
+                        &mut row_sub,
+                        &mut site.ref_allele,
+                        &mut site.alt_allele,
+                        self.maf,
+                        self.miss,
+                        self.fill_missing,
+                        self.apply_het_filter,
+                        self.het_threshold,
+                    );
+                    if keep {
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site.into());
+                        m += 1;
+                    }
                 }
             }
         } else {
             while m < chunk_size {
                 match self.it.next_snp() {
-                    Some((row, site)) => {
-                        if full_samples {
-                            data.extend_from_slice(&row);
-                        } else {
-                            data.extend(self.sample_indices.iter().map(|&i| row[i]));
+                    Some((row, mut site)) => {
+                        if !self.site_filter.keep_site(&site) {
+                            continue;
                         }
-                        sites.push(site.into());
-                        m += 1;
+                        let mut row_sub = if full_samples {
+                            row
+                        } else {
+                            self.sample_indices.iter().map(|&i| row[i]).collect()
+                        };
+                        let keep = core::process_snp_row(
+                            &mut row_sub,
+                            &mut site.ref_allele,
+                            &mut site.alt_allele,
+                            self.maf,
+                            self.miss,
+                            self.fill_missing,
+                            self.apply_het_filter,
+                            self.het_threshold,
+                        );
+                        if keep {
+                            data.extend_from_slice(&row_sub);
+                            sites.push(site.into());
+                            m += 1;
+                        }
                     }
                     None => break,
                 }
@@ -1101,6 +1639,140 @@ pub fn load_bed_u8_matrix<'py>(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     #[allow(deprecated)]
     Ok(PyArray2::from_owned_array(py, mat).into_bound())
+}
+
+#[pyfunction]
+pub fn gfd_packbits_from_dosage_block<'py>(
+    py: Python<'py>,
+    block: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    let x = block.as_array();
+    if x.ndim() != 2 {
+        return Err(PyValueError::new_err(
+            "block must be 2D (n_sites, n_samples)",
+        ));
+    }
+    let n_rows = x.shape()[0];
+    let n_samples = x.shape()[1];
+    if n_samples == 0 {
+        let out = Array2::<u8>::zeros((0, 0));
+        #[allow(deprecated)]
+        return Ok(PyArray2::from_owned_array(py, out).into_bound());
+    }
+
+    let packed_cols = (n_samples + 7) / 8;
+    let out_rows = n_rows.saturating_mul(2);
+    let total = out_rows.saturating_mul(packed_cols);
+    let mut out: Vec<u8> = vec![0u8; total];
+
+    // Prefer zero-copy for contiguous blocks; otherwise make one contiguous copy.
+    let input_owned;
+    let input: &[f32] = if let Some(s) = x.as_slice_memory_order() {
+        s
+    } else {
+        input_owned = x.to_owned().into_raw_vec();
+        &input_owned
+    };
+
+    #[inline]
+    fn normalize_g(v: f32) -> Option<u8> {
+        if !v.is_finite() || v < 0.0 {
+            None
+        } else {
+            let r = v.round();
+            if r <= 0.0 {
+                Some(0)
+            } else if r >= 2.0 {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        }
+    }
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(2 * packed_cols)
+            .enumerate()
+            .for_each(|(r, out_rows2)| {
+                let row = &input[r * n_samples..(r + 1) * n_samples];
+
+                let mut c0: usize = 0;
+                let mut c1: usize = 0;
+                let mut c2: usize = 0;
+                for &v in row.iter() {
+                    if let Some(g) = normalize_g(v) {
+                        match g {
+                            0 => c0 += 1,
+                            1 => c1 += 1,
+                            _ => c2 += 1,
+                        }
+                    }
+                }
+                // Tie order follows numpy argmax([c0,c1,c2]) => 0 > 1 > 2 on ties.
+                let mode: u8 = if c0 >= c1 && c0 >= c2 {
+                    0
+                } else if c1 >= c2 {
+                    1
+                } else {
+                    2
+                };
+
+                let (left, right) = out_rows2.split_at_mut(packed_cols);
+                for b in 0..packed_cols {
+                    let base = b * 8;
+                    let mut lb: u8 = 0;
+                    let mut rb: u8 = 0;
+                    for bit in 0..8 {
+                        let i = base + bit;
+                        if i >= n_samples {
+                            break;
+                        }
+                        let g = normalize_g(row[i]).unwrap_or(mode);
+                        let mask = 1u8 << (bit as u8);
+                        if g != 0 {
+                            lb |= mask;
+                        }
+                        if g != 2 {
+                            rb |= mask;
+                        }
+                    }
+                    left[b] = lb;
+                    right[b] = rb;
+                }
+            });
+    });
+
+    let mat = Array2::from_shape_vec((out_rows, packed_cols), out)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    #[allow(deprecated)]
+    Ok(PyArray2::from_owned_array(py, mat).into_bound())
+}
+
+#[pyfunction]
+#[pyo3(signature = (path_or_prefix, delimiter=None))]
+pub fn load_site_info(
+    path_or_prefix: String,
+    delimiter: Option<String>,
+) -> PyResult<Vec<SiteInfo>> {
+    let p = path_or_prefix.trim().to_string();
+    if p.is_empty() {
+        return Err(PyValueError::new_err("path_or_prefix must not be empty"));
+    }
+
+    let lower = p.to_ascii_lowercase();
+    let is_plink_explicit =
+        lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam");
+    let is_plink_prefix = Path::new(&(p.clone() + ".bed")).exists()
+        && Path::new(&(p.clone() + ".bim")).exists()
+        && Path::new(&(p.clone() + ".fam")).exists();
+    if is_plink_explicit || is_plink_prefix {
+        let prefix = normalize_plink_prefix_local(&p);
+        let sites = core::read_bim(&prefix).map_err(PyRuntimeError::new_err)?;
+        return Ok(sites.into_iter().map(Into::into).collect());
+    }
+
+    let it = TxtSnpIter::new(&p, delimiter.as_deref()).map_err(PyRuntimeError::new_err)?;
+    Ok(it.sites.into_iter().map(Into::into).collect())
 }
 
 // -------- count_vcf_snps (Py function) --------
@@ -1543,11 +2215,7 @@ impl VcfStreamWriter {
 
 #[inline]
 fn hmp_base_byte(s: &str) -> u8 {
-    let c = s
-        .chars()
-        .next()
-        .unwrap_or('N')
-        .to_ascii_uppercase();
+    let c = s.chars().next().unwrap_or('N').to_ascii_uppercase();
     match c {
         'A' | 'C' | 'G' | 'T' => c as u8,
         _ => b'N',

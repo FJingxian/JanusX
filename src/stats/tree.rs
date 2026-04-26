@@ -366,7 +366,11 @@ fn mismatch_to_jc69_distance(p_mismatch: f64) -> f64 {
     let p = p_mismatch.clamp(0.0, 0.75 - 1e-12);
     let denom = (1.0 - (4.0 * p / 3.0)).max(1e-12);
     let d = -0.75 * denom.ln();
-    if d.is_finite() { d.max(0.0) } else { 1.0 }
+    if d.is_finite() {
+        d.max(0.0)
+    } else {
+        1.0
+    }
 }
 
 #[inline]
@@ -2471,11 +2475,7 @@ fn resolve_compat_edge_select_mode() -> CompatEdgeSelectMode {
     }
 }
 
-fn select_nni_edges_window(
-    edges: &[NniEdge],
-    budget: usize,
-    cursor: &mut usize,
-) -> Vec<NniEdge> {
+fn select_nni_edges_window(edges: &[NniEdge], budget: usize, cursor: &mut usize) -> Vec<NniEdge> {
     if budget == 0 || edges.len() <= budget {
         return edges.to_vec();
     }
@@ -4242,8 +4242,8 @@ fn infer_ml_tree_jc69(
     //   downstream compat optimizer.
     let compat_jc_init_small_taxa = env_usize_or("JANUSX_ML_COMPAT_JC_INIT_SMALL_TAXA", 256).max(2);
     let use_jc_nj_init_default = n_taxa <= compat_jc_init_small_taxa;
-    let use_jc_nj_init = mode == "compat"
-        && env_bool_or("JANUSX_ML_COMPAT_JC_INIT", use_jc_nj_init_default);
+    let use_jc_nj_init =
+        mode == "compat" && env_bool_or("JANUSX_ML_COMPAT_JC_INIT", use_jc_nj_init_default);
     let (nodes, root) = build_nj_tree_exact(a, sample_ids, min_ov, use_jc_nj_init, pool)?;
     let mut tree = convert_to_ml_tree(&nodes, root, n_taxa)?;
     if n_taxa >= 4 {
@@ -7023,7 +7023,10 @@ fn normalize_distance_matrix_from_ndarray(
     for i in 0..n {
         let dii = d[[i, i]];
         if !dii.is_finite() {
-            return Err(format!("distance matrix diagonal has NaN/Inf at ({},{})", i, i));
+            return Err(format!(
+                "distance matrix diagonal has NaN/Inf at ({},{})",
+                i, i
+            ));
         }
         for j in (i + 1)..n {
             let a = d[[i, j]];
@@ -7392,7 +7395,7 @@ pub fn nj_newick_from_alignment_u8(
             pool.as_ref(),
             bionj_var_override,
         )
-            .map_err(PyValueError::new_err)?;
+        .map_err(PyValueError::new_err)?;
         return Ok(nwk);
     }
 

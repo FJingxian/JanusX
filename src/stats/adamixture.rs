@@ -16,7 +16,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::gfcore::{process_snp_row, read_bim, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::gfcore::{
+    process_snp_row, read_bim, read_fam, BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter,
+};
 
 const EPS64: f64 = 1e-5;
 const EPS32: f32 = 1e-5;
@@ -817,7 +819,9 @@ pub fn admx_rsvd_stream_sample<'py>(
         return Err(PyRuntimeError::new_err("maf must be within [0, 0.5]"));
     }
     if !(0.0..=1.0).contains(&missing_rate) {
-        return Err(PyRuntimeError::new_err("missing_rate must be within [0, 1]"));
+        return Err(PyRuntimeError::new_err(
+            "missing_rate must be within [0, 1]",
+        ));
     }
     if !(tol.is_finite() && tol > 0.0) {
         return Err(PyRuntimeError::new_err("tol must be positive and finite"));
@@ -871,7 +875,9 @@ pub fn admx_rsvd_stream_sample<'py>(
         ));
     }
     if n == 0 {
-        return Err(PyRuntimeError::new_err("no samples available for streaming RSVD"));
+        return Err(PyRuntimeError::new_err(
+            "no samples available for streaming RSVD",
+        ));
     }
     if !(varsum.is_finite() && varsum > 0.0) {
         return Err(PyRuntimeError::new_err(
@@ -944,7 +950,8 @@ pub fn admx_rsvd_stream_sample<'py>(
         compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
     }
     .map_err(PyRuntimeError::new_err)?;
-    let (_, s_all, v_small) = thin_svd_from_tall(&g_small, m, kp).map_err(PyRuntimeError::new_err)?;
+    let (_, s_all, v_small) =
+        thin_svd_from_tall(&g_small, m, kp).map_err(PyRuntimeError::new_err)?;
 
     let mut eigvals = vec![0.0_f32; k_eff];
     // Align PCA eigenvalue scaling with the GRM pathway in python/janusx/script/pca.py.

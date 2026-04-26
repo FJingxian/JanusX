@@ -231,6 +231,7 @@ def emit_cli_configuration(
     host: str,
     sections: Sequence[tuple[str, Sequence[tuple[str, object]]]],
     footer_rows: Optional[Sequence[tuple[str, object]]] = None,
+    emit_to_stdout: bool = True,
     line_max_chars: int = 60,
     overflow_mark: str = "***",
 ) -> None:
@@ -293,28 +294,23 @@ def emit_cli_configuration(
     full_lines.append(divider_full + "\n")
     terminal_lines.append(divider_terminal + "\n")
 
-    rich_rendered = _render_rich_panel(
-        app_title=str(app_title),
-        config_title=str(config_title),
-        host=str(host),
-        sections=sec_norm,
-        footer_rows=footer_norm,
-        key_width=key_width,
-        line_max_chars=line_max_chars,
-        overflow_mark=overflow_mark,
-    )
+    if bool(emit_to_stdout):
+        rich_rendered = _render_rich_panel(
+            app_title=str(app_title),
+            config_title=str(config_title),
+            host=str(host),
+            sections=sec_norm,
+            footer_rows=footer_norm,
+            key_width=key_width,
+            line_max_chars=line_max_chars,
+            overflow_mark=overflow_mark,
+        )
 
-    if rich_rendered:
-        _emit_info_to_file_handlers(logger, str(app_title))
-        _emit_info_to_file_handlers(logger, f"Host: {host}\n")
-        for line in full_lines:
-            _emit_info_to_file_handlers(logger, line)
-        return
-
-    _emit_info_to_stream_handlers(logger, str(app_title))
-    _emit_info_to_stream_handlers(logger, f"Host: {host}\n")
-    for line in terminal_lines:
-        _emit_info_to_stream_handlers(logger, line)
+        if not rich_rendered:
+            _emit_info_to_stream_handlers(logger, str(app_title))
+            _emit_info_to_stream_handlers(logger, f"Host: {host}\n")
+            for line in terminal_lines:
+                _emit_info_to_stream_handlers(logger, line)
 
     _emit_info_to_file_handlers(logger, str(app_title))
     _emit_info_to_file_handlers(logger, f"Host: {host}\n")

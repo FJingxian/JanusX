@@ -298,7 +298,7 @@ def main() -> None:
         "-file", "--file", type=str,
         help=(
             "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
+            "Requires sibling prefix.id. Optional site metadata: prefix.bsite/prefix.site or prefix.bim."
         ),
     )
     required_group.add_argument(
@@ -342,6 +342,10 @@ def main() -> None:
     optional_group.add_argument(
         "-nsnp", "--nsnp", type=int, default=5,
         help="Top SNPs selected by model (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "--min-literals", type=int, default=2,
+        help="Minimum literals in logic gate (default: %(default)s; 2 enforces '&').",
     )
     optional_group.add_argument(
         "-nestimators", "--nestimators", type=int, default=50,
@@ -400,6 +404,8 @@ def main() -> None:
         args.step = max(1, int(args.extension) // 2)
     elif int(args.step) <= 0:
         parser.error("-step/--step must be > 0")
+    if int(args.min_literals) <= 0:
+        parser.error("--min-literals must be >= 1")
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
@@ -445,6 +451,7 @@ def main() -> None:
         [
             ("Extension", args.extension),
             ("Top SNPs", args.nsnp),
+            ("Min literals", args.min_literals),
             ("Estimators", args.nestimators),
             ("Mmap limit", args.mmap_limit),
         ]
@@ -646,6 +653,7 @@ def main() -> None:
                         bimranges,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        min_literals=args.min_literals,
                         threads=threads,
                         response=response_mode,
                         gsetmodes=gset_flags,
@@ -660,6 +668,7 @@ def main() -> None:
                         bimranges,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        min_literals=args.min_literals,
                         threads=threads,
                         response=response_mode,
                         gsetmodes=gset_flags,
@@ -673,6 +682,7 @@ def main() -> None:
                         args.extension,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        min_literals=args.min_literals,
                         response=response_mode,
                         gsetmode=False,
                         threads=threads,

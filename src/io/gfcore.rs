@@ -12,6 +12,9 @@ const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
 const BIN01_HEADER_LEN: usize = 32;
 const BIN_SITE_MAGIC: &[u8; 8] = b"JXBSITE1";
 const BIN_SITE_HEADER_LEN: usize = 24;
+const BSITE_MAGIC: &[u8; 8] = b"JXBSIT02";
+const BSITE_HEADER_LEN: usize = 36;
+const BSITE_VERSION: u16 = 1;
 
 #[inline]
 fn system_page_size() -> usize {
@@ -308,6 +311,7 @@ fn find_bin_with_prefix(prefix: &Path) -> Option<PathBuf> {
 
 fn find_site_with_prefix(prefix: &Path) -> Option<PathBuf> {
     let candidates = [
+        append_suffix(prefix, ".bsite"),
         append_suffix(prefix, ".bin.site"),
         append_suffix(prefix, ".site"),
         append_suffix(prefix, ".site.tsv"),
@@ -564,6 +568,31 @@ fn decode_kmer_2bit(packed: &[u8], klen: usize) -> String {
     out
 }
 
+#[inline]
+fn decode_allele_nibble(code: u8) -> char {
+    match code & 0x0F {
+        0 => 'A',
+        1 => 'T',
+        2 => 'C',
+        3 => 'G',
+        _ => 'N',
+    }
+}
+
+fn decode_allele_nibbles(packed: &[u8], n_chars: usize) -> String {
+    let mut out = String::with_capacity(n_chars.max(1));
+    for i in 0..n_chars {
+        let b = packed[i >> 1];
+        let code = if (i & 1) == 0 {
+            b & 0x0F
+        } else {
+            (b >> 4) & 0x0F
+        };
+        out.push(decode_allele_nibble(code));
+    }
+    out
+}
+
 fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut header = [0u8; BIN_SITE_HEADER_LEN];
@@ -630,6 +659,203 @@ fn read_bin_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     Ok(sites)
 }
 
+fn read_bsite_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() < BSITE_HEADER_LEN {
+        return Err(format!("failed to read bsite header {}", path.display()));
+    }
+    if &bytes[0..8] != BSITE_MAGIC {
+        return Err(format!(
+            "invalid bsite magic in {} (expect {:?})",
+            path.display(),
+            BSITE_MAGIC
+        ));
+    }
+    let version = u16::from_le_bytes(
+        bytes[8..10]
+            .try_into()
+            .map_err(|_| "invalid bsite version".to_string())?,
+    );
+    if version != BSITE_VERSION {
+        return Err(format!(
+            "unsupported bsite version {} in {} (expect {})",
+            version,
+            path.display(),
+            BSITE_VERSION
+        ));
+    }
+
+    let n_sites_u64 = u64::from_le_bytes(
+        bytes[12..20]
+            .try_into()
+            .map_err(|_| "invalid bsite n_sites".to_string())?,
+    );
+    let n_sites = usize::try_from(n_sites_u64)
+        .map_err(|_| "bsite n_sites too large for this platform".to_string())?;
+    let n_chrom_u32 = u32::from_le_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| "invalid bsite n_chrom".to_string())?,
+    );
+    let n_chrom = usize::try_from(n_chrom_u32)
+        .map_err(|_| "bsite n_chrom too large for this platform".to_string())?;
+    let dict_offset_u64 = u64::from_le_bytes(
+        bytes[24..32]
+            .try_into()
+            .map_err(|_| "invalid bsite dictionary offset".to_string())?,
+    );
+    let dict_offset = usize::try_from(dict_offset_u64)
+        .map_err(|_| "bsite dictionary offset too large for this platform".to_string())?;
+    if dict_offset < BSITE_HEADER_LEN || dict_offset > bytes.len() {
+        return Err(format!(
+            "invalid bsite dictionary offset in {}: {}",
+            path.display(),
+            dict_offset
+        ));
+    }
+
+    let mut rows: Vec<(usize, u8, i32, String, String)> = Vec::with_capacity(n_sites);
+    let mut cur = BSITE_HEADER_LEN;
+    for i in 0..n_sites {
+        if cur + 13 > dict_offset {
+            return Err(format!(
+                "bsite truncated at record {} header in {}",
+                i + 1,
+                path.display()
+            ));
+        }
+        let chrom_code_u32 = u32::from_le_bytes(
+            bytes[cur..cur + 4]
+                .try_into()
+                .map_err(|_| "invalid bsite chrom_code".to_string())?,
+        );
+        let chrom_code = usize::try_from(chrom_code_u32)
+            .map_err(|_| "bsite chrom_code too large for this platform".to_string())?;
+        let strand = bytes[cur + 4];
+        // reserved for future score functions / display; not used in current SiteInfo.
+        let _cm = f32::from_le_bytes(
+            bytes[cur + 5..cur + 9]
+                .try_into()
+                .map_err(|_| "invalid bsite cM".to_string())?,
+        );
+        let bp = i32::from_le_bytes(
+            bytes[cur + 9..cur + 13]
+                .try_into()
+                .map_err(|_| "invalid bsite bp".to_string())?,
+        );
+        cur += 13;
+
+        if cur + 2 > dict_offset {
+            return Err(format!(
+                "bsite truncated at record {} allele0 length in {}",
+                i + 1,
+                path.display()
+            ));
+        }
+        let a0_len = u16::from_le_bytes(
+            bytes[cur..cur + 2]
+                .try_into()
+                .map_err(|_| "invalid bsite allele0 length".to_string())?,
+        ) as usize;
+        cur += 2;
+        let a0_bytes = if a0_len == 0 { 0 } else { a0_len.div_ceil(2) };
+        if cur + a0_bytes > dict_offset {
+            return Err(format!(
+                "bsite truncated at record {} allele0 payload in {}",
+                i + 1,
+                path.display()
+            ));
+        }
+        let a0 = if a0_len == 0 {
+            "N".to_string()
+        } else {
+            decode_allele_nibbles(&bytes[cur..cur + a0_bytes], a0_len)
+        };
+        cur += a0_bytes;
+
+        if cur + 2 > dict_offset {
+            return Err(format!(
+                "bsite truncated at record {} allele1 length in {}",
+                i + 1,
+                path.display()
+            ));
+        }
+        let a1_len = u16::from_le_bytes(
+            bytes[cur..cur + 2]
+                .try_into()
+                .map_err(|_| "invalid bsite allele1 length".to_string())?,
+        ) as usize;
+        cur += 2;
+        let a1_bytes = if a1_len == 0 { 0 } else { a1_len.div_ceil(2) };
+        if cur + a1_bytes > dict_offset {
+            return Err(format!(
+                "bsite truncated at record {} allele1 payload in {}",
+                i + 1,
+                path.display()
+            ));
+        }
+        let a1 = if a1_len == 0 {
+            "N".to_string()
+        } else {
+            decode_allele_nibbles(&bytes[cur..cur + a1_bytes], a1_len)
+        };
+        cur += a1_bytes;
+
+        rows.push((chrom_code, strand, bp, a0, a1));
+    }
+
+    let mut chrom_names: Vec<String> = Vec::with_capacity(n_chrom);
+    let mut dcur = dict_offset;
+    for i in 0..n_chrom {
+        if dcur + 2 > bytes.len() {
+            return Err(format!(
+                "bsite chromosome dictionary truncated at entry {} in {}",
+                i,
+                path.display()
+            ));
+        }
+        let slen = u16::from_le_bytes(
+            bytes[dcur..dcur + 2]
+                .try_into()
+                .map_err(|_| "invalid bsite chromosome length".to_string())?,
+        ) as usize;
+        dcur += 2;
+        if dcur + slen > bytes.len() {
+            return Err(format!(
+                "bsite chromosome name truncated at entry {} in {}",
+                i,
+                path.display()
+            ));
+        }
+        let name = String::from_utf8_lossy(&bytes[dcur..dcur + slen]).to_string();
+        dcur += slen;
+        chrom_names.push(name);
+    }
+
+    let mut out: Vec<SiteInfo> = Vec::with_capacity(rows.len());
+    for (i, (chrom_code, strand, bp, allele0, allele1)) in rows.into_iter().enumerate() {
+        let chrom_base = chrom_names.get(chrom_code).ok_or_else(|| {
+            format!(
+                "bsite chromosome code out of range at row {} in {}",
+                i + 1,
+                path.display()
+            )
+        })?;
+        let chrom = match strand {
+            0 => format!("{chrom_base}_1"),
+            1 => format!("{chrom_base}_2"),
+            _ => chrom_base.clone(),
+        };
+        out.push(SiteInfo {
+            chrom,
+            pos: bp,
+            ref_allele: allele0,
+            alt_allele: allele1,
+        });
+    }
+    Ok(out)
+}
+
 fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
@@ -664,14 +890,24 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
             if let (Some(chr_i), Some(pos_i), Some(ref_i), Some(alt_i)) = (
                 pick(&["#chrom", "chrom", "chr", "chromosome"]),
                 pick(&["pos", "bp", "position", "ps"]),
-                pick(&["ref", "a0", "ref_allele"]),
-                pick(&["alt", "a1", "alt_allele"]),
+                pick(&["ref", "a0", "allele0", "allele_0", "ref_allele"]),
+                pick(&["alt", "a1", "allele1", "allele_1", "alt_allele"]),
             ) {
                 idx_chr = chr_i;
                 idx_pos = pos_i;
                 idx_ref = ref_i;
                 idx_alt = alt_i;
                 continue;
+            }
+        }
+        if idx_pos == 1 && idx_ref == 2 && idx_alt == 3 && toks.len() >= 6 {
+            let strand_tok = toks[1];
+            let looks_new_layout =
+                matches!(strand_tok, "+" | "-" | "0" | "1") && toks[3].parse::<i32>().is_ok();
+            if looks_new_layout {
+                idx_pos = 3;
+                idx_ref = 4;
+                idx_alt = 5;
             }
         }
         if toks.len() <= idx_alt {
@@ -706,8 +942,13 @@ fn read_site_file_text(path: &Path) -> Result<Vec<SiteInfo>, String> {
 fn read_site_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
     let mut probe = File::open(path).map_err(|e| e.to_string())?;
     let mut magic = [0u8; 8];
-    if probe.read_exact(&mut magic).is_ok() && &magic == BIN_SITE_MAGIC {
-        return read_bin_site_file(path);
+    if probe.read_exact(&mut magic).is_ok() {
+        if &magic == BIN_SITE_MAGIC {
+            return read_bin_site_file(path);
+        }
+        if &magic == BSITE_MAGIC {
+            return read_bsite_file(path);
+        }
     }
     read_site_file_text(path)
 }
@@ -1007,8 +1248,8 @@ fn parse_bin01_header(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
             .try_into()
             .map_err(|_| "invalid BIN header n_samples".to_string())?,
     );
-    let n_snps =
-        usize::try_from(n_snps).map_err(|_| "BIN n_snps too large for this platform".to_string())?;
+    let n_snps = usize::try_from(n_snps)
+        .map_err(|_| "BIN n_snps too large for this platform".to_string())?;
     let n_samples = usize::try_from(n_samples)
         .map_err(|_| "BIN n_samples too large for this platform".to_string())?;
     if n_samples == 0 {
@@ -1762,7 +2003,10 @@ fn parse_hmp_gt_token(token: &str) -> Option<(char, char)> {
     if up.is_empty() {
         return None;
     }
-    if matches!(up.as_str(), "." | "./." | ".|." | "-" | "--" | "N" | "NN" | "NA") {
+    if matches!(
+        up.as_str(),
+        "." | "./." | ".|." | "-" | "--" | "N" | "NN" | "NA"
+    ) {
         return None;
     }
 
@@ -1912,7 +2156,11 @@ impl HmpSnpIter {
 
             let chrom = parts[2].to_string();
             let pos: i32 = parts[3].parse().unwrap_or(0);
-            let sample_fields = if parts.len() > 11 { &parts[11..] } else { &[][..] };
+            let sample_fields = if parts.len() > 11 {
+                &parts[11..]
+            } else {
+                &[][..]
+            };
 
             let (ref_c, alt_c) = if let Some((r, a)) = parse_hmp_alleles_field(parts[1]) {
                 if r != a {
@@ -2020,23 +2268,23 @@ impl TxtSnpIter {
 
         purge_stale_txt_cache(&paths)?;
 
-        let (matrix_kind, matrix_path, n_snps, n_cols) = if let Some(bin_path) = paths.bin_path.as_ref()
-        {
-            let file = File::open(bin_path).map_err(|e| e.to_string())?;
-            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-            let (rows, cols, _) = parse_bin01_header(&mmap[..])?;
-            (TxtMatrixKind::Bin01, bin_path.clone(), rows, cols)
-        } else {
-            let (rows, cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
-                ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?
-            } else {
-                let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+        let (matrix_kind, matrix_path, n_snps, n_cols) =
+            if let Some(bin_path) = paths.bin_path.as_ref() {
+                let file = File::open(bin_path).map_err(|e| e.to_string())?;
                 let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-                let (rows, cols, _) = parse_npy_f32_header(&mmap[..])?;
-                (rows, cols)
+                let (rows, cols, _) = parse_bin01_header(&mmap[..])?;
+                (TxtMatrixKind::Bin01, bin_path.clone(), rows, cols)
+            } else {
+                let (rows, cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
+                    ensure_cached_text_npy(txt_path, &paths.npy_path, delimiter, n_samples)?
+                } else {
+                    let file = File::open(&paths.npy_path).map_err(|e| e.to_string())?;
+                    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+                    let (rows, cols, _) = parse_npy_f32_header(&mmap[..])?;
+                    (rows, cols)
+                };
+                (TxtMatrixKind::NpyF32, paths.npy_path.clone(), rows, cols)
             };
-            (TxtMatrixKind::NpyF32, paths.npy_path.clone(), rows, cols)
-        };
         if n_cols != n_samples {
             return Err(format!(
                 "sample ID count mismatch: ids={}, matrix columns={}",
@@ -2142,7 +2390,7 @@ impl TxtSnpIter {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bim, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC};
+    use super::{read_bim, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC, BSITE_MAGIC, BSITE_VERSION};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2280,7 +2528,7 @@ mod tests {
         bytes.extend_from_slice(&(2u64).to_le_bytes()); // n_snps
         bytes.extend_from_slice(&(5u64).to_le_bytes()); // n_samples
         bytes.extend_from_slice(&(0u64).to_le_bytes()); // reserved
-        // row0: [0,1,0,1,1]
+                                                        // row0: [0,1,0,1,1]
         bytes.push(0b0001_1010);
         // row1: [1,0,1,0,0]
         bytes.push(0b0000_0101);
@@ -2312,7 +2560,7 @@ mod tests {
         bytes.extend_from_slice(&(2u64).to_le_bytes()); // n_snps
         bytes.extend_from_slice(&(3u64).to_le_bytes()); // n_samples
         bytes.extend_from_slice(&(0u64).to_le_bytes()); // reserved
-        // row0: [1,0,1]
+                                                        // row0: [1,0,1]
         bytes.push(0b0000_0101);
         // row1: [0,1,0]
         bytes.push(0b0000_0010);
@@ -2325,7 +2573,7 @@ mod tests {
         sb.extend_from_slice(BIN_SITE_MAGIC);
         sb.extend_from_slice(&(2u64).to_le_bytes()); // n_sites
         sb.extend_from_slice(&(0u64).to_le_bytes()); // reserved
-        // "ATCG" => 00,01,10,11 => 0b1110_0100
+                                                     // "ATCG" => 00,01,10,11 => 0b1110_0100
         sb.extend_from_slice(&(4u16).to_le_bytes());
         sb.push(0b1110_0100);
         // "TGCA" => 01,11,10,00 => 0b0010_1101
@@ -2341,6 +2589,75 @@ mod tests {
         assert_eq!(it.sites[0].pos, 1);
         assert_eq!(it.sites[0].alt_allele, "ATCG");
         assert_eq!(it.sites[1].alt_allele, "TGCA");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bin_iter_reads_bsite_sidecar() {
+        let dir = make_temp_dir("bin_iter_bsite");
+        let bin_path = dir.join("k.bin");
+        let id_path = dir.join("k.id");
+        let bsite_path = dir.join("k.bsite");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(BIN01_MAGIC);
+        bytes.extend_from_slice(&(2u64).to_le_bytes()); // n_snps
+        bytes.extend_from_slice(&(3u64).to_le_bytes()); // n_samples
+        bytes.extend_from_slice(&(0u64).to_le_bytes()); // reserved
+        bytes.push(0b0000_0101);
+        bytes.push(0b0000_0010);
+        fs::write(&bin_path, bytes).unwrap();
+        fs::write(&id_path, "S1\nS2\nS3\n").unwrap();
+
+        let row1_len = 13usize + 2usize + 1usize + 2usize + 1usize;
+        let row2_len = 13usize + 2usize + 2usize + 2usize + 1usize;
+        let dict_offset = (36usize + row1_len + row2_len) as u64;
+
+        let mut sb: Vec<u8> = Vec::new();
+        sb.extend_from_slice(BSITE_MAGIC);
+        sb.extend_from_slice(&(BSITE_VERSION as u16).to_le_bytes());
+        sb.extend_from_slice(&(0u16).to_le_bytes()); // flags
+        sb.extend_from_slice(&(2u64).to_le_bytes()); // n_sites
+        sb.extend_from_slice(&(1u32).to_le_bytes()); // n_chrom
+        sb.extend_from_slice(&dict_offset.to_le_bytes());
+        sb.extend_from_slice(&(0u32).to_le_bytes()); // reserved
+                                                     // row 1
+        sb.extend_from_slice(&(0u32).to_le_bytes()); // chrom code
+        sb.push(0u8); // strand '-'
+        sb.extend_from_slice(&(0.0f32).to_le_bytes()); // cM
+        sb.extend_from_slice(&(123i32).to_le_bytes()); // bp
+        sb.extend_from_slice(&(1u16).to_le_bytes()); // a0 len
+        sb.push(0x00); // A
+        sb.extend_from_slice(&(1u16).to_le_bytes()); // a1 len
+        sb.push(0x01); // T
+                       // row 2
+        sb.extend_from_slice(&(0u32).to_le_bytes()); // chrom code
+        sb.push(1u8); // strand '+'
+        sb.extend_from_slice(&(0.0f32).to_le_bytes()); // cM
+        sb.extend_from_slice(&(456i32).to_le_bytes()); // bp
+        sb.extend_from_slice(&(4u16).to_le_bytes()); // a0 len
+        sb.push(0x10); // A,T
+        sb.push(0x22); // C,C
+        sb.extend_from_slice(&(1u16).to_le_bytes()); // a1 len
+        sb.push(0x04); // N
+                       // chromosome dictionary
+        sb.extend_from_slice(&(4u16).to_le_bytes());
+        sb.extend_from_slice(b"chr1");
+        fs::write(&bsite_path, sb).unwrap();
+
+        let it = TxtSnpIter::new(bin_path.to_str().unwrap(), None).unwrap();
+        assert_eq!(it.n_samples(), 3);
+        assert_eq!(it.samples, vec!["S1", "S2", "S3"]);
+        assert_eq!(it.sites.len(), 2);
+        assert_eq!(it.sites[0].chrom, "chr1_1");
+        assert_eq!(it.sites[0].pos, 123);
+        assert_eq!(it.sites[0].ref_allele, "A");
+        assert_eq!(it.sites[0].alt_allele, "T");
+        assert_eq!(it.sites[1].chrom, "chr1_2");
+        assert_eq!(it.sites[1].pos, 456);
+        assert_eq!(it.sites[1].ref_allele, "ATCC");
+        assert_eq!(it.sites[1].alt_allele, "N");
 
         let _ = fs::remove_dir_all(&dir);
     }

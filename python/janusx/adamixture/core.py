@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
@@ -40,6 +40,7 @@ class ADAMixtureConfig:
     geno: float = 0.05
     solver: str = "adam-em"
     tol: float = 1e-5
+    cv: int = 0
 
     lr: float = 0.005
     beta1: float = 0.80
@@ -55,6 +56,248 @@ class ADAMixtureConfig:
     reg_als: float = 1e-5
     power: int = 5
     tole_svd: float = 1e-1
+
+
+def _eval_holdout_nll(
+    g_full: np.ndarray,
+    p: np.ndarray,
+    q: np.ndarray,
+    holdout_flat_idx: np.ndarray,
+    *,
+    eval_chunk: int = 250000,
+) -> tuple[float, float]:
+    """
+    Evaluate holdout negative log-likelihood for diploid genotype counts.
+
+    Returns
+    -------
+    mean_nll : float
+        Mean negative log-likelihood per held-out genotype.
+    deviance : float
+        -2 * log-likelihood over held-out genotypes.
+    """
+    if holdout_flat_idx.size <= 0:
+        return float("nan"), float("nan")
+
+    g = np.asarray(g_full, dtype=np.uint8)
+    p_mat = np.asarray(p, dtype=np.float64)
+    q_mat = np.asarray(q, dtype=np.float64)
+    if g.ndim != 2 or p_mat.ndim != 2 or q_mat.ndim != 2:
+        raise ValueError("Invalid matrix rank for CV evaluation.")
+    if int(g.shape[0]) != int(p_mat.shape[0]):
+        raise ValueError(
+            f"P row mismatch in CV evaluation: g={g.shape}, p={p_mat.shape}"
+        )
+    if int(g.shape[1]) != int(q_mat.shape[0]):
+        raise ValueError(
+            f"Q row mismatch in CV evaluation: g={g.shape}, q={q_mat.shape}"
+        )
+    if int(p_mat.shape[1]) != int(q_mat.shape[1]):
+        raise ValueError(
+            f"P/Q K mismatch in CV evaluation: p={p_mat.shape}, q={q_mat.shape}"
+        )
+
+    n_samples = int(g.shape[1])
+    g_flat = np.ravel(g)
+    ll_sum = 0.0
+    n_sum = 0
+    step = max(10000, int(eval_chunk))
+    ln2 = float(np.log(2.0))
+
+    for start in range(0, int(holdout_flat_idx.size), step):
+        idx = np.asarray(holdout_flat_idx[start : start + step], dtype=np.int64)
+        rows = np.floor_divide(idx, n_samples)
+        cols = np.mod(idx, n_samples)
+
+        g_obs = g_flat[idx].astype(np.float64, copy=False)
+        pred_p = np.einsum(
+            "ij,ij->i",
+            p_mat[rows, :],
+            q_mat[cols, :],
+            optimize=True,
+        )
+        pred_p = np.clip(pred_p, 1e-8, 1.0 - 1e-8)
+
+        log_comb = np.where(g_obs == 1.0, ln2, 0.0)
+        ll = log_comb + g_obs * np.log(pred_p) + (2.0 - g_obs) * np.log1p(-pred_p)
+        ll_sum += float(np.sum(ll, dtype=np.float64))
+        n_sum += int(idx.size)
+
+    if n_sum <= 0:
+        return float("nan"), float("nan")
+    mean_nll = float(-ll_sum / float(n_sum))
+    deviance = float(-2.0 * ll_sum)
+    return mean_nll, deviance
+
+
+def _cv_assign_fold_ids(
+    flat_idx: np.ndarray,
+    *,
+    folds: int,
+    seed: int,
+) -> np.ndarray:
+    """Deterministic, low-memory fold assignment from flattened genotype indices."""
+    if flat_idx.size <= 0:
+        return np.empty((0,), dtype=np.int64)
+    x = np.asarray(flat_idx, dtype=np.uint64, order="C")
+    mix = np.uint64((int(seed) & 0xFFFFFFFFFFFFFFFF) ^ 0x9E3779B97F4A7C15)
+    x = x ^ mix
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    x = x ^ (x >> np.uint64(31))
+    return np.asarray(x % np.uint64(max(1, int(folds))), dtype=np.int64)
+
+
+def _cv_scan_observed_and_fold_counts(
+    g_flat: np.ndarray,
+    *,
+    folds: int,
+    seed: int,
+    scan_chunk: int,
+) -> tuple[int, np.ndarray]:
+    """Single pass over genotype vector to collect observed count and per-fold counts."""
+    total = int(g_flat.size)
+    step = max(10000, int(scan_chunk))
+    fold_counts = np.zeros((int(folds),), dtype=np.int64)
+    n_obs = 0
+    for start in range(0, total, step):
+        end = min(total, int(start + step))
+        block = g_flat[start:end]
+        obs_rel = np.flatnonzero(block <= 2)
+        if obs_rel.size <= 0:
+            continue
+        obs_abs = np.asarray(obs_rel, dtype=np.int64) + np.int64(start)
+        fold_ids = _cv_assign_fold_ids(
+            obs_abs,
+            folds=int(folds),
+            seed=int(seed),
+        )
+        fold_counts += np.bincount(fold_ids, minlength=int(folds)).astype(np.int64, copy=False)
+        n_obs += int(obs_abs.size)
+    return int(n_obs), np.asarray(fold_counts, dtype=np.int64)
+
+
+def _cv_mark_holdout_missing(
+    g_train_flat: np.ndarray,
+    g_src_flat: np.ndarray,
+    *,
+    fold_id: int,
+    folds: int,
+    seed: int,
+    scan_chunk: int,
+) -> int:
+    """Mark one fold as missing (3) in-place without materializing global holdout index arrays."""
+    total = int(g_src_flat.size)
+    step = max(10000, int(scan_chunk))
+    holdout_n = 0
+    for start in range(0, total, step):
+        end = min(total, int(start + step))
+        block = g_src_flat[start:end]
+        obs_rel = np.flatnonzero(block <= 2)
+        if obs_rel.size <= 0:
+            continue
+        obs_abs = np.asarray(obs_rel, dtype=np.int64) + np.int64(start)
+        fold_ids = _cv_assign_fold_ids(
+            obs_abs,
+            folds=int(folds),
+            seed=int(seed),
+        )
+        sel = np.asarray(fold_ids == int(fold_id), dtype=bool)
+        if not np.any(sel):
+            continue
+        holdout_idx = np.asarray(obs_abs[sel], dtype=np.int64)
+        g_train_flat[holdout_idx] = np.uint8(3)
+        holdout_n += int(holdout_idx.size)
+    return int(holdout_n)
+
+
+def _eval_holdout_nll_fold_stream(
+    g_full: np.ndarray,
+    p: np.ndarray,
+    q: np.ndarray,
+    *,
+    fold_id: int,
+    folds: int,
+    seed: int,
+    scan_chunk: int,
+    eval_chunk: int,
+) -> tuple[float, float, int]:
+    """
+    Evaluate one CV fold NLL without storing full holdout index vectors.
+
+    Returns
+    -------
+    mean_nll : float
+        Mean negative log-likelihood per held-out genotype.
+    deviance : float
+        -2 * log-likelihood over held-out genotypes.
+    n_holdout : int
+        Number of held-out genotypes in this fold.
+    """
+    g = np.asarray(g_full, dtype=np.uint8)
+    p_mat = np.asarray(p, dtype=np.float64)
+    q_mat = np.asarray(q, dtype=np.float64)
+    if g.ndim != 2 or p_mat.ndim != 2 or q_mat.ndim != 2:
+        raise ValueError("Invalid matrix rank for CV evaluation.")
+    if int(g.shape[0]) != int(p_mat.shape[0]):
+        raise ValueError(
+            f"P row mismatch in CV evaluation: g={g.shape}, p={p_mat.shape}"
+        )
+    if int(g.shape[1]) != int(q_mat.shape[0]):
+        raise ValueError(
+            f"Q row mismatch in CV evaluation: g={g.shape}, q={q_mat.shape}"
+        )
+    if int(p_mat.shape[1]) != int(q_mat.shape[1]):
+        raise ValueError(
+            f"P/Q K mismatch in CV evaluation: p={p_mat.shape}, q={q_mat.shape}"
+        )
+
+    n_samples = int(g.shape[1])
+    g_flat = np.ravel(g)
+    scan_step = max(10000, int(scan_chunk))
+    eval_step = max(10000, int(eval_chunk))
+    ln2 = float(np.log(2.0))
+    ll_sum = 0.0
+    n_sum = 0
+
+    total = int(g_flat.size)
+    for start in range(0, total, scan_step):
+        end = min(total, int(start + scan_step))
+        block = g_flat[start:end]
+        obs_rel = np.flatnonzero(block <= 2)
+        if obs_rel.size <= 0:
+            continue
+        obs_abs = np.asarray(obs_rel, dtype=np.int64) + np.int64(start)
+        fold_ids = _cv_assign_fold_ids(
+            obs_abs,
+            folds=int(folds),
+            seed=int(seed),
+        )
+        holdout = np.asarray(obs_abs[fold_ids == int(fold_id)], dtype=np.int64)
+        if holdout.size <= 0:
+            continue
+        for j in range(0, int(holdout.size), eval_step):
+            idx = np.asarray(holdout[j : j + eval_step], dtype=np.int64)
+            rows = np.floor_divide(idx, n_samples)
+            cols = np.mod(idx, n_samples)
+            g_obs = g_flat[idx].astype(np.float64, copy=False)
+            pred_p = np.einsum(
+                "ij,ij->i",
+                p_mat[rows, :],
+                q_mat[cols, :],
+                optimize=True,
+            )
+            pred_p = np.clip(pred_p, 1e-8, 1.0 - 1e-8)
+            log_comb = np.where(g_obs == 1.0, ln2, 0.0)
+            ll = log_comb + g_obs * np.log(pred_p) + (2.0 - g_obs) * np.log1p(-pred_p)
+            ll_sum += float(np.sum(ll, dtype=np.float64))
+            n_sum += int(idx.size)
+
+    if n_sum <= 0:
+        return float("nan"), float("nan"), 0
+    mean_nll = float(-ll_sum / float(n_sum))
+    deviance = float(-2.0 * ll_sum)
+    return mean_nll, deviance, int(n_sum)
 
 def _resolve_solver_mode(solver: str) -> str:
     x = str(solver).strip().lower()
@@ -575,61 +818,73 @@ def _adam_em_optimize(
     )
 
 
-def train_adamixture(
+def _fit_adamixture_on_u8(
+    g: np.ndarray,
     cfg: ADAMixtureConfig,
     logger: logging.Logger,
     callback: ProgressCallback = None,
+    *,
+    log_data_loaded: bool = True,
+    init_p: Optional[np.ndarray] = None,
+    init_q: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
-    _set_thread_env(cfg.threads)
-    try:
-        jxrs.admx_set_threads(int(max(1, int(cfg.threads))))
-    except Exception:
-        # Backward-compatible fallback when Rust extension doesn't expose thread setter.
-        pass
-    np.random.seed(int(cfg.seed))
-
-    g = load_genotype_u8_matrix(
-        cfg.genotype_path,
-        chunk_size=int(cfg.chunk_size),
-        snps_only=bool(cfg.snps_only),
-        maf=float(cfg.maf),
-        missing_rate=float(cfg.geno),
-    )
     m, n = g.shape
-    logger.info(f"{'Data loaded':<22}: SNPs={m}, samples={n}")
+    if log_data_loaded:
+        logger.info(f"{'Data loaded':<22}: SNPs={m}, samples={n}")
     _emit_progress(callback, "data_loaded", m=int(m), n=int(n))
     solver_mode = _resolve_solver_mode(cfg.solver)
     tol = float(max(1e-12, float(cfg.tol)))
-
-    f = np.ascontiguousarray(jxrs.admx_allele_frequency(g), dtype=np.float32)
-    u, s, v = _rsvd(
-        g,
-        f,
-        k=int(cfg.k),
-        seed=int(cfg.seed),
-        power=int(cfg.power),
-        tol=tol,
-        logger=logger,
-        callback=callback,
+    warm_start_ok = (
+        (init_p is not None)
+        and (init_q is not None)
     )
-    if solver_mode == "adam-em":
-        p0, q0 = _als_init(
+    if warm_start_ok:
+        p0 = np.ascontiguousarray(np.asarray(init_p, dtype=np.float32))
+        q0_raw = np.ascontiguousarray(np.asarray(init_q, dtype=np.float32))
+        if p0.shape != (int(m), int(cfg.k)):
+            raise ValueError(
+                f"Warm-start P shape mismatch: got {p0.shape}, expected {(int(m), int(cfg.k))}."
+            )
+        if q0_raw.shape != (int(n), int(cfg.k)):
+            raise ValueError(
+                f"Warm-start Q shape mismatch: got {q0_raw.shape}, expected {(int(n), int(cfg.k))}."
+            )
+        p0 = np.ascontiguousarray(np.clip(p0, 1e-5, 1.0 - 1e-5), dtype=np.float32)
+        q0 = np.ascontiguousarray(
+            jxrs.admx_map_q_f32(np.ascontiguousarray(q0_raw, dtype=np.float32)),
+            dtype=np.float32,
+        )
+        logger.info(f"{'Warm-start':<22}: enabled (reuse previous K)")
+    else:
+        f = np.ascontiguousarray(jxrs.admx_allele_frequency(g), dtype=np.float32)
+        u, s, v = _rsvd(
             g,
-            u,
-            s,
-            v,
             f,
-            seed=int(cfg.seed),
             k=int(cfg.k),
-            max_iter=int(cfg.max_als),
+            seed=int(cfg.seed),
+            power=int(cfg.power),
             tol=tol,
-            reg=float(cfg.reg_als),
             logger=logger,
             callback=callback,
         )
-    else:
-        logger.info(f"{'Solver':<22}: ADAM (skip ALS)")
-        p0, q0 = _adam_seed_init(m, n, int(cfg.k), int(cfg.seed))
+        if solver_mode == "adam-em":
+            p0, q0 = _als_init(
+                g,
+                u,
+                s,
+                v,
+                f,
+                seed=int(cfg.seed),
+                k=int(cfg.k),
+                max_iter=int(cfg.max_als),
+                tol=tol,
+                reg=float(cfg.reg_als),
+                logger=logger,
+                callback=callback,
+            )
+        else:
+            logger.info(f"{'Solver':<22}: ADAM (skip ALS)")
+            p0, q0 = _adam_seed_init(m, n, int(cfg.k), int(cfg.seed))
     p, q = _adam_em_optimize(
         g,
         p0,
@@ -646,3 +901,186 @@ def train_adamixture(
         callback=callback,
     )
     return p, q, m, n
+
+
+def evaluate_adamixture_cverror(
+    cfg: ADAMixtureConfig,
+    logger: logging.Logger,
+    progress_callback: ProgressCallback = None,
+    g_full: Optional[np.ndarray] = None,
+) -> Optional[dict[str, float]]:
+    folds = int(max(0, int(cfg.cv)))
+    if folds <= 0:
+        logger.info(f"{'CVerror':<22}: disabled")
+        return None
+    if folds < 2:
+        raise ValueError(
+            f"CVerror requires folds >= 2, got {folds}. "
+            "Use -cv N with N>=2."
+        )
+
+    _set_thread_env(cfg.threads)
+    try:
+        jxrs.admx_set_threads(int(max(1, int(cfg.threads))))
+    except Exception:
+        pass
+
+    if g_full is None:
+        g_full = load_genotype_u8_matrix(
+            cfg.genotype_path,
+            chunk_size=int(cfg.chunk_size),
+            snps_only=bool(cfg.snps_only),
+            maf=float(cfg.maf),
+            missing_rate=float(cfg.geno),
+        )
+    else:
+        g_full = np.ascontiguousarray(np.asarray(g_full, dtype=np.uint8))
+    m, n = g_full.shape
+    g_flat = np.ravel(g_full)
+    scan_chunk = max(10000, int(os.environ.get("JANUSX_ADMX_CV_SCAN_CHUNK", "1000000")))
+    n_obs, fold_counts = _cv_scan_observed_and_fold_counts(
+        g_flat,
+        folds=int(folds),
+        seed=int(cfg.seed),
+        scan_chunk=int(scan_chunk),
+    )
+    if n_obs < int(folds):
+        raise ValueError(
+            f"Not enough observed genotypes for CVerror: observed={n_obs}, folds={folds}."
+        )
+    if np.any(fold_counts <= 0):
+        bad = [str(i + 1) for i in np.flatnonzero(fold_counts <= 0)]
+        raise ValueError(
+            "Failed to build non-empty CV folds in low-memory assignment; "
+            f"empty folds={','.join(bad)}."
+        )
+    logger.info(
+        f"{'CVerror':<22}: estimating from {int(folds)} folds "
+        f"(observed={n_obs}, SNPs={m}, samples={n}, scan_chunk={int(scan_chunk)})"
+    )
+    logger.info(
+        f"{'CV fold sizes':<22}: "
+        + ", ".join(f"F{i+1}={int(c)}" for i, c in enumerate(fold_counts.tolist()))
+    )
+    _emit_progress(
+        progress_callback,
+        "cv_start",
+        folds=int(folds),
+        mode="k-fold",
+    )
+    t0 = time.time()
+    fold_mean_nll: list[float] = []
+    fold_obs_counts: list[int] = []
+    eval_chunk = max(10000, int(os.environ.get("JANUSX_ADMX_CV_EVAL_CHUNK", "250000")))
+
+    for i in range(int(folds)):
+        fold_id = int(i)
+        g_train = np.array(g_full, copy=True, dtype=np.uint8, order="C")
+        holdout_n = _cv_mark_holdout_missing(
+            np.ravel(g_train),
+            g_flat,
+            fold_id=int(fold_id),
+            folds=int(folds),
+            seed=int(cfg.seed),
+            scan_chunk=int(scan_chunk),
+        )
+        if holdout_n <= 0:
+            raise ValueError(f"Fold {fold_id + 1} has no held-out genotypes.")
+
+        cfg_fold = replace(cfg, seed=int(cfg.seed) + int(i + 1))
+        p_fold, q_fold, _m, _n = _fit_adamixture_on_u8(
+            g_train,
+            cfg_fold,
+            logger,
+            callback=None,
+            log_data_loaded=False,
+        )
+        mean_nll, _deviance, n_fold_eval = _eval_holdout_nll_fold_stream(
+            g_full,
+            p_fold,
+            q_fold,
+            fold_id=int(fold_id),
+            folds=int(folds),
+            seed=int(cfg.seed),
+            scan_chunk=int(scan_chunk),
+            eval_chunk=int(eval_chunk),
+        )
+        fold_mean_nll.append(float(mean_nll))
+        fold_obs_counts.append(int(n_fold_eval))
+        _emit_progress(
+            progress_callback,
+            "cv_fold_done",
+            fold=int(i + 1),
+            folds=int(folds),
+            mean_nll=float(mean_nll),
+            holdout_n=int(n_fold_eval),
+        )
+
+    mean_arr = np.asarray(fold_mean_nll, dtype=np.float64)
+    cverror = float(np.mean(mean_arr))
+    cverror_se = float(np.std(mean_arr, ddof=1) / np.sqrt(mean_arr.size)) if mean_arr.size > 1 else 0.0
+    elapsed = float(time.time() - t0)
+    logger.info(
+        f"{'CVerror':<22}: {cverror:.6f} "
+        f"(SE={cverror_se:.6f}, folds={int(mean_arr.size)}, elapsed {elapsed:.2f}s)"
+    )
+    logger.info(
+        f"{'CV eval counts':<22}: "
+        + ", ".join(f"F{i+1}={int(c)}" for i, c in enumerate(fold_obs_counts))
+    )
+    _emit_progress(
+        progress_callback,
+        "cv_done",
+        folds=int(mean_arr.size),
+        cverror=float(cverror),
+        cverror_se=float(cverror_se),
+    )
+    return {
+        "cverror": float(cverror),
+        "cverror_se": float(cverror_se),
+        "cv_folds": float(mean_arr.size),
+        "cv_observed": float(n_obs),
+    }
+
+
+def train_adamixture(
+    cfg: ADAMixtureConfig,
+    logger: logging.Logger,
+    callback: ProgressCallback = None,
+    g_matrix: Optional[np.ndarray] = None,
+    warm_start: Optional[tuple[np.ndarray, np.ndarray]] = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    _set_thread_env(cfg.threads)
+    try:
+        jxrs.admx_set_threads(int(max(1, int(cfg.threads))))
+    except Exception:
+        # Backward-compatible fallback when Rust extension doesn't expose thread setter.
+        pass
+    np.random.seed(int(cfg.seed))
+
+    if g_matrix is None:
+        g = load_genotype_u8_matrix(
+            cfg.genotype_path,
+            chunk_size=int(cfg.chunk_size),
+            snps_only=bool(cfg.snps_only),
+            maf=float(cfg.maf),
+            missing_rate=float(cfg.geno),
+        )
+    else:
+        g = np.ascontiguousarray(np.asarray(g_matrix, dtype=np.uint8))
+    init_p: Optional[np.ndarray] = None
+    init_q: Optional[np.ndarray] = None
+    if warm_start is not None:
+        try:
+            init_p, init_q = warm_start
+        except Exception as ex:
+            raise ValueError("warm_start must be a tuple (P, Q).") from ex
+    return _fit_adamixture_on_u8(
+        g,
+        cfg,
+        logger,
+        callback=callback,
+        log_data_loaded=True,
+        init_p=init_p,
+        init_q=init_q,
+    )

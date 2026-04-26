@@ -15,6 +15,11 @@ from .progress import build_rich_progress, rich_progress_available
 from .status import CliStatus, should_animate_status, stdout_is_tty
 
 try:
+    from janusx.janusx import gfd_packbits_from_dosage_block as _gfd_packbits_from_dosage_block
+except Exception:
+    _gfd_packbits_from_dosage_block = None
+
+try:
     from tqdm.auto import tqdm
 except Exception:
     tqdm = None  # type: ignore[assignment]
@@ -160,6 +165,7 @@ def build_prefix_candidates(
 def discover_site_path(prefixes: Sequence[str]) -> str | None:
     for prefix in prefixes:
         for cand in (
+            f"{prefix}.bsite",
             f"{prefix}.bin.site",
             f"{prefix}.site",
             f"{prefix}.site.tsv",
@@ -346,6 +352,22 @@ BIN01_MAGIC = b"JXBIN001"
 BIN01_HEADER_SIZE = 32
 BIN_SITE_MAGIC = b"JXBSITE1"
 BIN_SITE_HEADER_SIZE = 24
+BSITE_MAGIC = b"JXBSIT02"
+BSITE_HEADER_SIZE = 36
+BSITE_VERSION = 1
+
+_ALLELE_CHAR_TO_CODE: dict[str, int] = {
+    "A": 0,
+    "T": 1,
+    "C": 2,
+    "G": 3,
+    "N": 4,
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+}
 
 
 def _encode_base_2bit(ch: int) -> int:
@@ -395,6 +417,98 @@ def write_bin_site_file(handle, sites: Sequence[SiteInfo]) -> None:
         packed = _encode_kmer_2bit(kmer)
         handle.write(struct.pack("<H", int(klen)))
         handle.write(packed)
+
+
+def _split_chrom_strand(chrom: str) -> tuple[str, int]:
+    s = str(chrom).strip()
+    if s.endswith("_1"):
+        return s[:-2], 0
+    if s.endswith("_2"):
+        return s[:-2], 1
+    if s.endswith("-"):
+        return s[:-1], 0
+    if s.endswith("+"):
+        return s[:-1], 1
+    return s, 1
+
+
+def _encode_allele_nibbles(seq: str) -> bytes:
+    text = str(seq).strip().upper()
+    if text == "":
+        text = "N"
+    raw = bytearray((len(text) + 1) // 2)
+    for i, ch in enumerate(text):
+        code = _ALLELE_CHAR_TO_CODE.get(ch, 4)
+        bi = i >> 1
+        shift = 0 if (i & 1) == 0 else 4
+        raw[bi] |= (code & 0x0F) << shift
+    return bytes(raw)
+
+
+def _write_bsite_header(
+    handle,
+    *,
+    n_sites: int,
+    n_chrom: int,
+    chrom_dict_offset: int,
+    flags: int = 0,
+) -> None:
+    handle.seek(0)
+    handle.write(BSITE_MAGIC)
+    handle.write(struct.pack("<H", int(BSITE_VERSION)))
+    handle.write(struct.pack("<H", int(flags)))
+    handle.write(struct.pack("<Q", int(n_sites)))
+    handle.write(struct.pack("<I", int(n_chrom)))
+    handle.write(struct.pack("<Q", int(chrom_dict_offset)))
+    handle.write(struct.pack("<I", 0))
+
+
+def write_bsite_records(
+    handle,
+    sites: Sequence[SiteInfo],
+    *,
+    chrom_codes: dict[str, int],
+    chrom_names: list[str],
+    cm_value: float = 0.0,
+) -> None:
+    for site in sites:
+        chrom_raw = str(getattr(site, "chrom", ""))
+        chrom_key, strand = _split_chrom_strand(chrom_raw)
+        if chrom_key not in chrom_codes:
+            chrom_codes[chrom_key] = len(chrom_names)
+            chrom_names.append(chrom_key)
+        chrom_code = chrom_codes[chrom_key]
+
+        try:
+            bp = int(getattr(site, "pos", 0))
+        except Exception:
+            bp = 0
+
+        allele0 = str(getattr(site, "ref_allele", "N"))
+        allele1 = str(getattr(site, "alt_allele", "N"))
+        enc0 = _encode_allele_nibbles(allele0)
+        enc1 = _encode_allele_nibbles(allele1)
+        n0 = max(1, len(str(allele0).strip()))
+        n1 = max(1, len(str(allele1).strip()))
+        if n0 > 0xFFFF or n1 > 0xFFFF:
+            raise ValueError("Allele length exceeds u16 limit for .bsite output.")
+
+        handle.write(struct.pack("<IBfi", int(chrom_code), int(strand), float(cm_value), int(bp)))
+        handle.write(struct.pack("<H", int(n0)))
+        handle.write(enc0)
+        handle.write(struct.pack("<H", int(n1)))
+        handle.write(enc1)
+
+
+def write_bsite_chrom_dict(handle, chrom_names: Sequence[str]) -> int:
+    offset = int(handle.tell())
+    for chrom in chrom_names:
+        raw = str(chrom).encode("utf-8")
+        if len(raw) > 0xFFFF:
+            raise ValueError("Chromosome label too long for .bsite output.")
+        handle.write(struct.pack("<H", int(len(raw))))
+        handle.write(raw)
+    return offset
 
 
 def _write_bin_header(
@@ -488,6 +602,156 @@ def write_bin01_output(
     if written != int(total_sites):
         print(
             f"! Warning: Written site count mismatch for BIN output: {written} vs {total_sites}. "
+            f"Header was written with n_sites={written}.",
+            file=sys.stderr,
+        )
+
+
+def write_gfd_output(
+    out_path: str,
+    sample_ids: Sequence[str],
+    chunks: Iterable[tuple[np.ndarray, Sequence[SiteInfo]]],
+    *,
+    total_sites: int,
+    source_is_dosage012: bool = False,
+) -> None:
+    """
+    Write Garfield dedicated binary matrix output:
+      - {prefix}.bin : header + packed 0/1 rows (JXBIN001)
+      - {prefix}.id  : sample IDs (text)
+      - {prefix}.bsite: binary site metadata
+        (chrom-code, strand[0='-',1='+'], cM, bp, allele0, allele1)
+    """
+    sample_ids = [str(x) for x in sample_ids]
+    n_samples = len(sample_ids)
+    if n_samples <= 0:
+        raise ValueError("sample_ids is empty")
+
+    prefix = output_prefix_from_path(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    write_id_file(f"{prefix}.id", sample_ids)
+
+    written = 0
+    packed_cols = (n_samples + 7) // 8
+    progress, task_id, pbar = _open_site_progress("Writing GFD", int(total_sites))
+    with open(out_path, "wb") as fbin, open(f"{prefix}.bsite", "wb") as fsite:
+        try:
+            _write_bin_header(fbin, n_sites=0, n_samples=n_samples, reserved=0)
+            _write_bsite_header(
+                fsite,
+                n_sites=0,
+                n_chrom=0,
+                chrom_dict_offset=BSITE_HEADER_SIZE,
+                flags=0,
+            )
+            chrom_codes: dict[str, int] = {}
+            chrom_names: list[str] = []
+            for block, sites in chunks:
+                arr = np.asarray(block)
+                if arr.ndim != 2:
+                    raise ValueError("GFD chunk must be 2D (n_sites, n_samples)")
+                if int(arr.shape[1]) != n_samples:
+                    raise ValueError(
+                        f"GFD chunk sample mismatch: got {arr.shape[1]}, expected {n_samples}"
+                    )
+                sites_list = list(sites)
+                n_rows_in = int(arr.shape[0])
+                if n_rows_in != len(sites_list):
+                    raise ValueError(
+                        f"GFD chunk rows/sites mismatch: rows={n_rows_in}, sites={len(sites_list)}"
+                    )
+
+                if source_is_dosage012:
+                    # Input block is dosage rows (0/1/2 with possible missing),
+                    # expand to two 0/1 rows per site in Rust when available.
+                    if _gfd_packbits_from_dosage_block is not None:
+                        packed = np.asarray(
+                            _gfd_packbits_from_dosage_block(np.asarray(arr, dtype=np.float32))
+                        )
+                    else:
+                        # Python fallback: mode-impute 0/1/2, then build two Boolean rows.
+                        x = np.asarray(arr, dtype=np.float32)
+                        g = np.full(x.shape, -9, dtype=np.int8)
+                        valid = np.isfinite(x) & (x >= 0.0)
+                        if np.any(valid):
+                            vals = np.rint(x[valid]).astype(np.int16, copy=False)
+                            vals = np.clip(vals, 0, 2).astype(np.int8, copy=False)
+                            g[valid] = vals
+                        c0 = np.sum(g == 0, axis=1, dtype=np.int64)
+                        c1 = np.sum(g == 1, axis=1, dtype=np.int64)
+                        c2 = np.sum(g == 2, axis=1, dtype=np.int64)
+                        modes = np.argmax(np.stack([c0, c1, c2], axis=1), axis=1).astype(
+                            np.int8, copy=False
+                        )
+                        miss = g < 0
+                        if np.any(miss):
+                            rows, cols = np.where(miss)
+                            g[rows, cols] = modes[rows]
+                        out = np.empty((n_rows_in * 2, n_samples), dtype=np.uint8)
+                        out[0::2, :] = (g != 0).astype(np.uint8, copy=False)
+                        out[1::2, :] = (g != 2).astype(np.uint8, copy=False)
+                        packed = np.packbits(out, axis=1, bitorder="little")
+
+                    if int(packed.shape[1]) != packed_cols:
+                        raise ValueError(
+                            f"GFD packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
+                        )
+                    fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
+
+                    out_sites: list[SiteInfo] = []
+                    for s in sites_list:
+                        chrom0 = str(getattr(s, "chrom", ""))
+                        try:
+                            pos0 = int(getattr(s, "pos", 0))
+                        except Exception:
+                            pos0 = 0
+                        out_sites.append(SiteInfo(f"{chrom0}_1", pos0, "0", "1"))
+                        out_sites.append(SiteInfo(f"{chrom0}_2", pos0, "0", "1"))
+                    write_bsite_records(
+                        fsite,
+                        out_sites,
+                        chrom_codes=chrom_codes,
+                        chrom_names=chrom_names,
+                    )
+                    n_rows_out = int(packed.shape[0])
+                    written += n_rows_out
+                    _advance_site_progress(progress, task_id, pbar, n_rows_out)
+                else:
+                    # Input block is already a 0/1 matrix aligned with provided sites.
+                    bin01 = (arr > 0).astype(np.uint8, copy=False)
+                    packed = np.packbits(bin01, axis=1, bitorder="little")
+                    if int(packed.shape[1]) != packed_cols:
+                        raise ValueError(
+                            f"GFD packbits column mismatch: got {packed.shape[1]}, expected {packed_cols}"
+                        )
+                    fbin.write(np.ascontiguousarray(packed).tobytes(order="C"))
+                    write_bsite_records(
+                        fsite,
+                        sites_list,
+                        chrom_codes=chrom_codes,
+                        chrom_names=chrom_names,
+                    )
+                    n_rows_out = int(arr.shape[0])
+                    written += n_rows_out
+                    _advance_site_progress(progress, task_id, pbar, n_rows_out)
+
+            chrom_dict_offset = write_bsite_chrom_dict(fsite, chrom_names)
+            _write_bin_header(fbin, n_sites=written, n_samples=n_samples, reserved=0)
+            _write_bsite_header(
+                fsite,
+                n_sites=written,
+                n_chrom=len(chrom_names),
+                chrom_dict_offset=chrom_dict_offset,
+                flags=0,
+            )
+            fbin.flush()
+            fsite.flush()
+        finally:
+            _close_site_progress(progress, pbar)
+
+    if written != int(total_sites):
+        print(
+            f"! Warning: Written site count mismatch for GFD output: {written} vs {total_sites}. "
             f"Header was written with n_sites={written}.",
             file=sys.stderr,
         )

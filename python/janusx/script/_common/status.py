@@ -39,6 +39,8 @@ _LOADING_PREFIXES = (
     "computing ",
     "building ",
     "calculating ",
+    "writing ",
+    "converting ",
 )
 _COMPLETION_TOKENS = (
     "...finished",

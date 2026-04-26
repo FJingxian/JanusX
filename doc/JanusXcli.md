@@ -442,22 +442,37 @@ Examples:
 
 ```bash
 jx adamixture -bfile geno -k 8 -o out -prefix cohort
-jx adamixture -vcf geno.vcf.gz -k 6 -t 16
+jx adamixture -vcf geno.vcf.gz -k 2..10 -t 16
+jx adamixture -vcf geno.vcf.gz -k 2..10..3 -t 16
+jx adamixture -vcf geno.vcf.gz -k 2,5,8 -t 16
+jx adamixture -vcf geno.vcf.gz -k 2..10 -cv
+jx adamixture -vcf geno.vcf.gz -k 2..10 -cv 5
+jx adamixture -vcf geno.vcf.gz -k 6 -tag sample1,sample2
+jx adamixture -vcf geno.vcf.gz -k 6 --tag tag_samples.txt
 ```
 
 Key options:
 
 - required input: one of `-bfile/-vcf/-hmp/-file`
-- required clusters: `-k`
+- required clusters: `-k` (single `8`, range `2..10` / `2:10`, stepped range `2..10..3` / `2:10:3` / `2..10:3`, list `2,5,8`)
 - input filter: `-chunksize`, `-snps-only`, `-maf`, `-geno`
+- structure axis labels: `-tag/--tag` (file with one sample per line, or `sample1,sample2`)
 - runtime: `-t`, `-seed`
 - optimization: `-solver {auto,adam,adam-em}`, `-max-iter`, `-tol`
+- CVerror:
+`-cv` (no value defaults to 5-fold),
+`-cv N` (N-fold, N>=2).
+Omit `-cv` to disable CVerror.
 
 Outputs:
 
-- `<prefix>.<k>.Q`
-- `<prefix>.<k>.P`
-- `<prefix>.adamixture.log`
+- `<prefix>.<k>.Q.txt`
+- `<prefix>.<k>.P.npy`
+- `<prefix>.<k>.P.site`
+- `<prefix>.<k>.admix.svg`
+- `<prefix>.<k>.adamix.log`
+- `<prefix>.adamixture.cverror.summary.tsv` (when `-cv` enabled)
+- `<prefix>.adamixture.summary.log`
 
 ### 4.11 `gformat`
 
@@ -469,6 +484,9 @@ Examples:
 jx gformat -vcf geno.vcf.gz -fmt npy -o out -prefix panel
 jx gformat -file matrix_prefix -fmt vcf --keep keep_samples.txt
 jx gformat -bfile geno -fmt txt --chr 1-5,8 --from-bp 100000 --to-bp 500000
+jx gformat -bfile geno -fmt npy --prune 1 5 0.2
+jx gformat -bfile geno -fmt npy --prune 0.1 5 0.2
+jx gformat -bfile geno -fmt npy --prune 500kb 10 0.2
 ```
 
 Key options:
@@ -479,6 +497,8 @@ Key options:
 - `-extract` (`--extract <file>` or `--extract range <file>`)
 - chromosome/range filters: `--chr`, `--from-bp`, `--to-bp`
 - site filters: `-maf`, `-geno`
+- LD prune: `-prune/--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>`  
+  Numeric window defaults to `kb` (`1` = `1kb`, `0.1` = `100bp`)
 
 Outputs:
 

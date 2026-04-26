@@ -12,7 +12,9 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{open_text_maybe_gz, process_snp_row, read_bim, read_fam, HmpSnpIter, SiteInfo};
+use crate::gfcore::{
+    open_text_maybe_gz, process_snp_row, read_bim, read_fam, HmpSnpIter, SiteInfo,
+};
 use crate::gfreader::build_sample_selection;
 use crate::vcfout::VcfOut;
 
@@ -1281,12 +1283,9 @@ pub fn convert_genotypes(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let mut it = InputIter::new(&input).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-    let (selected_indices, selected_sample_ids) = build_sample_selection(
-        it.sample_ids(),
-        sample_ids,
-        sample_indices,
-    )
-    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let (selected_indices, selected_sample_ids) =
+        build_sample_selection(it.sample_ids(), sample_ids, sample_indices)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     let n_samples = selected_indices.len();
     let full_sample_selection = n_samples == it.n_samples();
 

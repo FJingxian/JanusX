@@ -662,10 +662,13 @@ jobs:
           build:
             number: 0
             script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
+            run_exports:
+              - {{{{ pin_subpackage('janusx', max_pin='x') }}}}
 
           requirements:
             build:
               - {{{{ compiler('c') }}}}
+              - {{{{ stdlib('c') }}}}
               - {{{{ compiler('rust') }}}}
             host:
               - python

@@ -155,6 +155,20 @@ def detect_blas_backend() -> str:
     Returns one of:
       openblas / mkl / accelerate / blis / atlas / unknown
     """
+    def _backend_from_name(text: str) -> str:
+        t = str(text).lower()
+        if "openblas" in t:
+            return "openblas"
+        if ("mkl" in t) or ("intel" in t and "blas" in t):
+            return "mkl"
+        if "accelerate" in t or "veclib" in t:
+            return "accelerate"
+        if "blis" in t:
+            return "blis"
+        if "atlas" in t:
+            return "atlas"
+        return "unknown"
+
     def _detect_from_threadpool_info() -> str:
         try:
             from threadpoolctl import threadpool_info  # type: ignore
@@ -165,16 +179,59 @@ def detect_blas_backend() -> str:
                     str(rec.get(k, ""))
                     for k in ("internal_api", "user_api", "prefix", "filepath", "version")
                 ).lower()
-                if "openblas" in text:
-                    return "openblas"
-                if ("mkl" in text) or ("intel" in text and "blas" in text):
-                    return "mkl"
-                if "accelerate" in text or "veclib" in text:
-                    return "accelerate"
-                if "blis" in text:
-                    return "blis"
-                if "atlas" in text:
-                    return "atlas"
+                b = _backend_from_name(text)
+                if b != "unknown":
+                    return b
+        except Exception:
+            pass
+        return "unknown"
+
+    def _detect_from_numpy_config_dict() -> str:
+        try:
+            import numpy as _np
+
+            cfg_mod = getattr(_np, "__config__", None)
+            cfg = getattr(cfg_mod, "CONFIG", None)
+            if not isinstance(cfg, dict):
+                return "unknown"
+
+            build_deps = cfg.get("Build Dependencies", {})
+            if isinstance(build_deps, dict):
+                for key in ("blas", "lapack"):
+                    info = build_deps.get(key, {})
+                    if isinstance(info, dict):
+                        b = _backend_from_name(str(info.get("name", "")))
+                        if b != "unknown":
+                            return b
+
+            # Fallback on values-only deep scan (avoid false positives from keys
+            # like "openblas configuration" in Accelerate entries).
+            values: list[str] = []
+
+            def _collect_vals(obj: Any) -> None:
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        _collect_vals(v)
+                    return
+                if isinstance(obj, (list, tuple, set)):
+                    for v in obj:
+                        _collect_vals(v)
+                    return
+                values.append(str(obj))
+
+            _collect_vals(cfg)
+            blob = " ".join(values).lower()
+            if (
+                "scipy-openblas" in blob
+                or "libopenblas" in blob
+                or "openblas64" in blob
+                or "openblas_" in blob
+                or "openblas-" in blob
+            ):
+                return "openblas"
+            b = _backend_from_name(blob)
+            if b != "unknown":
+                return b
         except Exception:
             pass
         return "unknown"
@@ -197,7 +254,12 @@ def detect_blas_backend() -> str:
     except Exception:
         pass
 
-    # 2) Fallback to NumPy build config text.
+    # 2) Prefer structured NumPy config when available (NumPy>=2).
+    b = _detect_from_numpy_config_dict()
+    if b != "unknown":
+        return b
+
+    # 3) Fallback to NumPy textual config.
     try:
         import numpy as _np
 
@@ -214,23 +276,28 @@ def detect_blas_backend() -> str:
             with redirect_stdout(buf):
                 _np.show_config()
         cfg = buf.getvalue().lower()
-        name_hits = re.findall(r"^\s*name:\s*([a-z0-9_+.-]+)\s*$", cfg, flags=re.MULTILINE)
-        if any("openblas" in x for x in name_hits):
-            return "openblas"
-        if any(("mkl" in x) or ("intel" in x) for x in name_hits):
-            return "mkl"
-        if any(("accelerate" in x) or ("veclib" in x) for x in name_hits):
-            return "accelerate"
-        if any("blis" in x for x in name_hits):
-            return "blis"
-        if any("atlas" in x for x in name_hits):
-            return "atlas"
+        name_hits = re.findall(
+            r"^\s*(?:['\"]?name['\"]?)\s*[:=]\s*['\"]?([a-z0-9_+.-]+)",
+            cfg,
+            flags=re.MULTILINE,
+        )
+        for hit in name_hits:
+            b = _backend_from_name(hit)
+            if b != "unknown":
+                return b
         # Last-resort text hints (guarded after name-based checks to avoid
         # false positives from "openblas configuration: unknown" in Accelerate builds).
-        if ("libopenblas" in cfg) or ("openblas_" in cfg) or ("openblas-" in cfg):
+        if (
+            ("scipy-openblas" in cfg)
+            or ("libopenblas" in cfg)
+            or ("openblas64" in cfg)
+            or ("openblas_" in cfg)
+            or ("openblas-" in cfg)
+        ):
             return "openblas"
-        if ("accelerate" in cfg) or ("veclib" in cfg):
-            return "accelerate"
+        b = _backend_from_name(cfg)
+        if b != "unknown":
+            return b
     except Exception:
         pass
 
@@ -285,6 +352,11 @@ def maybe_warn_non_openblas(
         f"OpenBLAS is preferred; fallback accepted (platform={platform_name}, "
         f"priority={rank}/{len(priority)}; order: {prefer_chain})."
     )
+    if backend == "unknown":
+        msg += (
+            " Detection may be limited in this environment; install "
+            "`threadpoolctl` and `pyyaml` to improve backend introspection."
+        )
     if logger is not None:
         try:
             logger.warning(msg)

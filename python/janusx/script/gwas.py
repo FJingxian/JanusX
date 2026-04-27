@@ -298,6 +298,36 @@ def _emit_gwas_summary(
         logger.info("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
 
 
+def _align_pheno_to_sample_order(
+    pheno: pd.DataFrame,
+    sample_ids: np.ndarray,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Align phenotype rows to genotype sample order once, then reuse for fast slicing.
+    """
+    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
+    sid_index = pd.Index(ids, dtype=str)
+    if pheno.index.equals(sid_index):
+        return pheno, ids
+    return pheno.reindex(sid_index), ids
+
+
+def _trait_values_and_mask(
+    pheno_aligned: pd.DataFrame,
+    trait_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return trait values in aligned sample order and a non-missing mask.
+    """
+    col = pheno_aligned[str(trait_name)]
+    if pd.api.types.is_numeric_dtype(col.dtype):
+        y_full = col.to_numpy(dtype=np.float64, copy=False)
+    else:
+        y_full = pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    keep = ~np.isnan(y_full)
+    return y_full, keep
+
+
 def _gwas_model_sort_key(model_name: object) -> tuple[int, str]:
     model = str(model_name or "").strip()
     order = {
@@ -1579,7 +1609,8 @@ def load_phenotype(
     data = data.apply(pd.to_numeric, errors="coerce")
     pheno = data
     pheno.index = ids
-    pheno = pheno.groupby(pheno.index).mean()
+    # Keep first-seen sample order while averaging duplicated IDs.
+    pheno = pheno.groupby(pheno.index, sort=False).mean()
     selected_ncol: list[int] = list(range(pheno.shape[1]))
 
     if pheno.shape[1] <= 0:
@@ -3275,7 +3306,8 @@ def run_lrlmm_packed(
     if saved_paths is None:
         saved_paths = []
 
-    trait_iter = list(pheno.columns) if trait_names is None else [t for t in trait_names if t in pheno.columns]
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
     multi_trait_mode = len(trait_iter) > 1
 
     for trait_idx, pname in enumerate(trait_iter):
@@ -3283,9 +3315,9 @@ def run_lrlmm_packed(
         t0 = time.time()
         peak_rss = process.memory_info().rss
 
-        pheno_sub = pheno[pname].dropna()
-        sameidx = np.isin(ids, pheno_sub.index)
-        n_idv = int(np.sum(sameidx))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
         if n_idv == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
@@ -3304,14 +3336,14 @@ def run_lrlmm_packed(
                 width=60,
             )
 
-        trait_ids = np.asarray(ids[sameidx], dtype=str)
-        y_vec = np.ascontiguousarray(pheno_sub.loc[trait_ids].values, dtype=np.float64)
-        x_cov = qmatrix[sameidx]
+        trait_ids = np.asarray(ids[keep_idx], dtype=str)
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = qmatrix[keep_idx]
         if cov_all is not None:
-            x_cov = np.concatenate([x_cov, cov_all[sameidx]], axis=1)
+            x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
         x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
         x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
-        sample_idx_trait = np.ascontiguousarray(sample_map[sameidx], dtype=np.int64)
+        sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
 
         rank_trait = _resolve_lrlmm_rank(rank_opt, int(n_idv))
         rsvd_t0 = time.monotonic()
@@ -3739,7 +3771,8 @@ def run_chunked_gwas_lmm_lm(
     if saved_paths is None:
         saved_paths = []
 
-    trait_iter = list(pheno.columns) if trait_names is None else [t for t in trait_names if t in pheno.columns]
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
     multi_trait_mode = len(trait_iter) > 1
     for trait_idx, pname in enumerate(trait_iter):
         cpu_t0 = process.cpu_times()
@@ -3748,9 +3781,9 @@ def run_chunked_gwas_lmm_lm(
         peak_rss = rss0
         evd_secs = 0.0
 
-        pheno_sub = pheno[pname].dropna()
-        sameidx = np.isin(ids, pheno_sub.index)
-        n_idv = int(np.sum(sameidx))
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
         if n_idv == 0:
             logger.warning(f"{pname}: no overlapping samples, skipped.")
             if pname not in eff_snp_by_trait:
@@ -3769,12 +3802,12 @@ def run_chunked_gwas_lmm_lm(
                 width=60,
             )
 
-        trait_ids = np.asarray(ids[sameidx], dtype=str)
-        y_vec = pheno_sub.loc[trait_ids].values
+        trait_ids = np.asarray(ids[keep_idx], dtype=str)
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
         # Build covariate matrix X_cov for this trait
-        X_cov = qmatrix[sameidx]
+        X_cov = qmatrix[keep_idx]
         if cov_all is not None:
-            X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
+            X_cov = np.concatenate([X_cov, cov_all[keep_idx]], axis=1)
 
         model_chunk_size = _resolve_stream_scan_chunk_size(
             int(chunk_size),
@@ -3790,7 +3823,7 @@ def run_chunked_gwas_lmm_lm(
         if model_key in ("lmm", "fastlmm"):
             if grm is None:
                 raise ValueError("LMM/fastLMM requires GRM, but GRM was not prepared.")
-            Ksub = grm[np.ix_(sameidx, sameidx)]
+            Ksub = grm[np.ix_(keep_idx, keep_idx)]
             evd_t0 = time.monotonic()
             evd_label = "LMM" if model_key == "lmm" else "FastLMM"
             evd_desc = f"{evd_label} Eigen-Decomposition"
@@ -4268,21 +4301,25 @@ def run_chunked_gwas_streaming_shared(
     if saved_paths is None:
         saved_paths = []
 
+    # Shared streaming path is fed by prepare_streaming_context(), where
+    # phenotype has already been aligned to `ids` order.
+    pheno_aligned = pheno
+    ids = np.asarray(ids, dtype=str).reshape(-1)
     pname = str(trait_name)
-    pheno_sub = pheno[pname].dropna()
-    sameidx = np.isin(ids, pheno_sub.index)
-    n_idv = int(np.sum(sameidx))
+    y_full, sameidx = _trait_values_and_mask(pheno_aligned, pname)
+    keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+    n_idv = int(keep_idx.shape[0])
     if n_idv == 0:
         logger.warning(f"{pname}: no overlapping samples, skipped.")
         if pname not in eff_snp_by_trait:
             eff_snp_by_trait[pname] = 0
         return
 
-    trait_ids = np.asarray(ids[sameidx], dtype=str)
-    y_vec = pheno_sub.loc[trait_ids].values
-    X_cov = qmatrix[sameidx]
+    trait_ids = np.asarray(ids[keep_idx], dtype=str)
+    y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+    X_cov = qmatrix[keep_idx]
     if cov_all is not None:
-        X_cov = np.concatenate([X_cov, cov_all[sameidx]], axis=1)
+        X_cov = np.concatenate([X_cov, cov_all[keep_idx]], axis=1)
     _emit_trait_header(
         logger,
         pname,
@@ -4491,7 +4528,7 @@ def run_chunked_gwas_streaming_shared(
                 )
             else:
                 if shared_ksub is None:
-                    shared_ksub = grm[np.ix_(sameidx, sameidx)]
+                    shared_ksub = grm[np.ix_(keep_idx, keep_idx)]
                 evd_desc = f"{model_label} Eigen-Decomposition"
                 with CliStatus(
                     f"Running {evd_desc}...",
@@ -5591,25 +5628,25 @@ def run_farmcpu_fullmem(
     if saved_paths is None:
         saved_paths = []
 
-    trait_iter = list(pheno.columns) if trait_names is None else [t for t in trait_names if t in pheno.columns]
+    pheno_aligned, famid = _align_pheno_to_sample_order(pheno, famid)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
     multi_trait_mode = len(trait_iter) > 1
     for trait_idx, phename in enumerate(trait_iter):
-        p = pheno[phename].dropna()
-        famidretain = np.isin(famid, p.index)
-        if np.sum(famidretain) == 0:
+        y_full, famidretain = _trait_values_and_mask(pheno_aligned, str(phename))
+        keep_idx = np.flatnonzero(famidretain).astype(np.int64, copy=False)
+        if keep_idx.size == 0:
             logger.warning(f"{phename}: no overlapping samples, skipped.")
             if multi_trait_mode:
                 logger.info("")  # single blank line between traits
             continue
 
-        p_sub = p.loc[famid[famidretain]].values.reshape(-1, 1)
-        keep_idx = np.flatnonzero(famidretain).astype(np.int64, copy=False)
-        q_sub = qmatrix[famidretain]
-        n_idv = int(np.sum(famidretain))
+        p_sub = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64).reshape(-1, 1)
+        q_sub = qmatrix[keep_idx]
+        n_idv = int(keep_idx.shape[0])
         if packed_ctx is None:
             if geno is None:
                 raise ValueError("FarmCPU genotype payload is missing.")
-            m_input = np.ascontiguousarray(geno[:, famidretain], dtype=np.float32)
+            m_input = np.ascontiguousarray(geno[:, keep_idx], dtype=np.float32)
             sample_idx_arg = None
             maf = (m_input.mean(axis=1) / 2.0).astype(np.float32, copy=False)
             eff_snp = int(m_input.shape[0])
@@ -6258,42 +6295,40 @@ def main(log: bool = True):
         # 1) Streaming models first
         # -------------------------------
         if len(stream_models) > 0:
-            for trait_idx, pname in enumerate(trait_order):
-                if len(stream_models) == 1:
-                    model_key = stream_models[0]
-                    pve_line_model = (
-                        model_key if model_key in {"lmm", "fastlmm"} else None
-                    )
-                    run_chunked_gwas_lmm_lm(
-                        model_name=model_key,
-                        genofile=genofile_stream,
-                        pheno=pheno,
-                        ids=ids,
-                        n_snps=n_snps,
-                        outprefix=outprefix,
-                        maf_threshold=args.maf,
-                        max_missing_rate=args.geno,
-                        genetic_model=args.model,
-                        het_threshold=args.het,
-                        chunk_size=args.chunksize,
-                        mmap_limit=args.mmap_limit,
-                        grm=grm,
-                        qmatrix=qmatrix,
-                        cov_all=cov_all,
-                        eff_m=eff_m,
-                        plot=args.plot,
-                        threads=args.thread,
-                        logger=logger,
-                        use_spinner=use_spinner,
-                        snps_only=bool(args.snps_only),
-                        eff_snp_by_trait=eff_snp_by_trait,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=[str(pname)],
-                        show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
-                        emit_trait_header=True,
-                    )
-                else:
+            if len(stream_models) == 1:
+                model_key = stream_models[0]
+                pve_line_model = model_key if model_key in {"lmm", "fastlmm"} else None
+                run_chunked_gwas_lmm_lm(
+                    model_name=model_key,
+                    genofile=genofile_stream,
+                    pheno=pheno,
+                    ids=ids,
+                    n_snps=n_snps,
+                    outprefix=outprefix,
+                    maf_threshold=args.maf,
+                    max_missing_rate=args.geno,
+                    genetic_model=args.model,
+                    het_threshold=args.het,
+                    chunk_size=args.chunksize,
+                    mmap_limit=args.mmap_limit,
+                    grm=grm,
+                    qmatrix=qmatrix,
+                    cov_all=cov_all,
+                    eff_m=eff_m,
+                    plot=args.plot,
+                    threads=args.thread,
+                    logger=logger,
+                    use_spinner=use_spinner,
+                    snps_only=bool(args.snps_only),
+                    eff_snp_by_trait=eff_snp_by_trait,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                    show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
+                    emit_trait_header=True,
+                )
+            else:
+                for trait_idx, pname in enumerate(trait_order):
                     run_chunked_gwas_streaming_shared(
                         model_names=stream_models,
                         trait_name=str(pname),
@@ -6320,9 +6355,8 @@ def main(log: bool = True):
                         summary_rows=gwas_summary_rows,
                         saved_paths=saved_result_paths,
                     )
-
-                if trait_idx < len(trait_order) - 1:
-                    logger.info("")
+                    if trait_idx < len(trait_order) - 1:
+                        logger.info("")
 
         # -------------------------------
         # 2) Full genotype task (LowRankLMM / FarmCPU)

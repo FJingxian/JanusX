@@ -34,11 +34,3 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 criterion = "0.5.1"
-
-[[bench]]
-name = "score_bench"
-harness = false
-
-[[bench]]
-name = "beam_bench"
-harness = false

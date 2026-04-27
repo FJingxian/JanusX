@@ -1,5 +1,6 @@
 use crate::bitwise::{and_popcount, bitand_assign, popcount};
 use crate::gfcore::TxtSnpIter;
+use crate::score::score_cont_corr_packed;
 use memmap2::Mmap;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyRuntimeError;
@@ -373,19 +374,24 @@ fn build_windows_from_sites(
         let max_bp = bps[n - 1];
         let mut l = 0usize;
         let mut r = 0usize;
-        let mut start = min_bp;
+        let mut center = min_bp;
         let mut prev_sig: Option<(usize, usize, usize)> = None;
 
         loop {
-            while l < n && bps[l] < start {
+            let left_i64 = (center as i64)
+                .saturating_sub(extension as i64)
+                .max(min_bp as i64);
+            let right_i64 = (center as i64)
+                .saturating_add(extension as i64)
+                .min(max_bp as i64);
+
+            while l < n && (bps[l] as i64) < left_i64 {
                 l += 1;
             }
             if r < l {
                 r = l;
             }
-
-            let end_i64 = (start as i64).saturating_add(extension as i64);
-            while r < n && (bps[r] as i64) < end_i64 {
+            while r < n && (bps[r] as i64) <= right_i64 {
                 r += 1;
             }
 
@@ -393,16 +399,23 @@ fn build_windows_from_sites(
                 let chunk = idxs[l..r].to_vec();
                 let sig = (chunk[0], chunk[chunk.len() - 1], chunk.len());
                 if prev_sig.map_or(true, |s| s != sig) {
-                    let bp_end = if end_i64 > i32::MAX as i64 {
+                    let bp_start = if left_i64 > i32::MAX as i64 {
                         i32::MAX
-                    } else if end_i64 < i32::MIN as i64 {
+                    } else if left_i64 < i32::MIN as i64 {
                         i32::MIN
                     } else {
-                        end_i64 as i32
+                        left_i64 as i32
+                    };
+                    let bp_end = if right_i64 > i32::MAX as i64 {
+                        i32::MAX
+                    } else if right_i64 < i32::MIN as i64 {
+                        i32::MIN
+                    } else {
+                        right_i64 as i32
                     };
                     windows.push(BeamWindow {
                         chrom: chrom.clone(),
-                        bp_start: start,
+                        bp_start,
                         bp_end,
                         indices: chunk,
                     });
@@ -410,14 +423,14 @@ fn build_windows_from_sites(
                 }
             }
 
-            if start >= max_bp {
+            if center >= max_bp {
                 break;
             }
-            let next = (start as i64).saturating_add(step as i64);
+            let next = (center as i64).saturating_add(step as i64);
             if next > i32::MAX as i64 {
                 break;
             }
-            start = next as i32;
+            center = next as i32;
         }
 
         let has_chrom_window = windows.last().map(|w| w.chrom == chrom).unwrap_or(false);
@@ -900,6 +913,28 @@ fn validate_binary_y(y: &[u8], n_samples: usize, ctx: &str) -> Result<(), String
 }
 
 #[inline]
+fn validate_continuous_y(y: &[f64], n_samples: usize, ctx: &str) -> Result<(), String> {
+    if y.len() < n_samples {
+        return Err(format!(
+            "{ctx}: y length={} smaller than n_samples={}",
+            y.len(),
+            n_samples
+        ));
+    }
+    if let Some((idx, bad)) = y
+        .iter()
+        .take(n_samples)
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+    {
+        return Err(format!(
+            "{ctx}: y must be finite for continuous mode; found y[{idx}]={bad}"
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
 fn pack_binary_y_to_bits(y: &[u8], n_samples: usize) -> (Vec<u64>, u64) {
     let words = words_for_samples(n_samples);
     let mut out = vec![0u64; words];
@@ -960,6 +995,11 @@ fn mcc_from_xpos_tp(x_pos: u64, tp: u64, y_pos: u64, n_samples: usize) -> f64 {
     let fnv = y_pos.saturating_sub(tp);
     let tn = (n_samples as u64).saturating_sub(tp + fp + fnv);
     mcc_from_confusion(tp, tn, fp, fnv)
+}
+
+#[inline]
+fn abs_corr_from_x_bits(y: &[f64], bits: &[u64], n_samples: usize) -> f64 {
+    score_cont_corr_packed(y, bits, n_samples).abs()
 }
 
 #[inline]
@@ -1426,12 +1466,142 @@ pub fn beam_search_and_binary_mcc(
     )
 }
 
+pub fn beam_search_and_continuous_abs_corr(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    max_pick: usize,
+    beam_width: usize,
+) -> Result<BeamAndResult, String> {
+    let ctx = "beam_search_and_continuous_abs_corr";
+    validate_continuous_y(y, n_samples, ctx)?;
+    beam_search_and_with_score(
+        bits_flat,
+        row_words,
+        n_rows,
+        n_samples,
+        max_pick,
+        beam_width,
+        |combined| abs_corr_from_x_bits(y, combined, n_samples),
+    )
+}
+
 #[inline]
 fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> std::borrow::Cow<'a, [u8]> {
     match arr.as_slice() {
         Ok(s) => std::borrow::Cow::Borrowed(s),
         Err(_) => std::borrow::Cow::Owned(arr.as_array().iter().copied().collect()),
     }
+}
+
+#[inline]
+fn readonly_f64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, f64>) -> std::borrow::Cow<'a, [f64]> {
+    match arr.as_slice() {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => std::borrow::Cow::Owned(arr.as_array().iter().copied().collect()),
+    }
+}
+
+type BeamWindowScanOutput = (
+    Vec<usize>,
+    f64,
+    String,
+    i32,
+    i32,
+    usize,
+    usize,
+    Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)>,
+);
+
+fn scan_windows_with_objective<F>(
+    bin_path: &str,
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    extension: usize,
+    step_v: usize,
+    return_window_results: bool,
+    search_fn: F,
+) -> Result<BeamWindowScanOutput, String>
+where
+    F: Fn(&[u64], usize) -> Result<BeamAndResult, String>,
+{
+    let windows = load_windows_for_bin(bin_path, n_rows, extension, step_v)?;
+    if windows.is_empty() {
+        return Err("no windows available".to_string());
+    }
+
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_selected: Vec<usize> = Vec::new();
+    let mut best_chrom = "ALL".to_string();
+    let mut best_bp_start = 0i32;
+    let mut best_bp_end = 0i32;
+    let mut best_n_candidates = 0usize;
+    let mut evaluated = 0usize;
+
+    let mut trace: Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)> = Vec::new();
+    for (wi0, win) in windows.iter().enumerate() {
+        if win.indices.is_empty() {
+            continue;
+        }
+        let wi = wi0 + 1;
+
+        let local_out = if win.indices.len() == n_rows {
+            search_fn(bits_flat, n_rows)?
+        } else {
+            let sub = gather_rows_by_indices(bits_flat, row_words, &win.indices)?;
+            search_fn(&sub, win.indices.len())?
+        };
+
+        let selected_global = local_out
+            .selected_indices
+            .iter()
+            .map(|&i| win.indices[i])
+            .collect::<Vec<_>>();
+        let score = local_out.score;
+        evaluated += 1;
+
+        let better = score_key(score) > score_key(best_score);
+        let tie_better = (score_key(score) - score_key(best_score)).abs() <= 1e-12
+            && selected_global.len() < best_selected.len();
+        if best_selected.is_empty() || better || tie_better {
+            best_score = score;
+            best_selected = selected_global.clone();
+            best_chrom = win.chrom.clone();
+            best_bp_start = win.bp_start;
+            best_bp_end = win.bp_end;
+            best_n_candidates = win.indices.len();
+        }
+
+        if return_window_results {
+            trace.push((
+                wi,
+                win.chrom.clone(),
+                win.bp_start,
+                win.bp_end,
+                win.indices.len(),
+                score,
+                selected_global,
+            ));
+        }
+    }
+
+    if best_selected.is_empty() {
+        return Err("no valid window/candidate found".to_string());
+    }
+
+    Ok((
+        best_selected,
+        best_score,
+        best_chrom,
+        best_bp_start,
+        best_bp_end,
+        best_n_candidates,
+        evaluated,
+        trace,
+    ))
 }
 
 /// Run MCC-based AND beam search directly on JXBIN001 (`jx gformat` .bin) input.
@@ -1492,6 +1662,67 @@ pub fn beam_search_and_binary_mcc_bin_indices_py(
         )));
     }
     let out = beam_search_and_binary_mcc(
+        yv.as_ref(),
+        &bits_flat,
+        row_words,
+        n_rows,
+        n_samples,
+        max_pick,
+        beam_width,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    let selected_global = out
+        .selected_indices
+        .iter()
+        .map(|&i| snp_indices[i])
+        .collect::<Vec<_>>();
+    Ok((selected_global, out.score))
+}
+
+/// Run abs-correlation-based AND beam search directly on JXBIN001 (`jx gformat` .bin) input.
+///
+/// Returns `(selected_indices, best_score)`, where `best_score = max(abs(corr(y, xcombine)))`.
+#[pyfunction(name = "beam_search_and_continuous_corr_bin")]
+#[pyo3(signature = (bin_path, y, max_pick=3, beam_width=128))]
+pub fn beam_search_and_continuous_corr_bin_py(
+    bin_path: String,
+    y: PyReadonlyArray1<'_, f64>,
+    max_pick: usize,
+    beam_width: usize,
+) -> PyResult<(Vec<usize>, f64)> {
+    let yv = readonly_f64_to_cow(&y);
+    let (bits_flat, row_words, n_rows, n_samples) =
+        load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
+    let out = beam_search_and_continuous_abs_corr(
+        yv.as_ref(),
+        &bits_flat,
+        row_words,
+        n_rows,
+        n_samples,
+        max_pick,
+        beam_width,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    Ok((out.selected_indices, out.score))
+}
+
+/// Run abs-correlation-based AND beam search on selected row indices from JXBIN001 input.
+///
+/// Returns `(selected_indices_global, best_score)`.
+#[pyfunction(name = "beam_search_and_continuous_corr_bin_indices")]
+#[pyo3(signature = (bin_path, y, snp_indices, max_pick=3, beam_width=128))]
+pub fn beam_search_and_continuous_corr_bin_indices_py(
+    bin_path: String,
+    y: PyReadonlyArray1<'_, f64>,
+    snp_indices: Vec<usize>,
+    max_pick: usize,
+    beam_width: usize,
+) -> PyResult<(Vec<usize>, f64)> {
+    let yv = readonly_f64_to_cow(&y);
+    let (bits_flat, row_words, n_rows, n_samples) =
+        load_bin01_selected_rows_as_u64_words(&bin_path, &snp_indices)
+            .map_err(PyRuntimeError::new_err)?;
+    let out = beam_search_and_continuous_abs_corr(
         yv.as_ref(),
         &bits_flat,
         row_words,
@@ -1571,102 +1802,99 @@ pub fn beam_scan_windows_binary_mcc_bin_py(
         )));
     }
 
-    let windows = load_windows_for_bin(&bin_path, n_rows, extension, step_v)
-        .map_err(PyRuntimeError::new_err)?;
-    if windows.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "beam_scan_windows_binary_mcc_bin: no windows available",
-        ));
-    }
-
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_selected: Vec<usize> = Vec::new();
-    let mut best_chrom = "ALL".to_string();
-    let mut best_bp_start = 0i32;
-    let mut best_bp_end = 0i32;
-    let mut best_n_candidates = 0usize;
-    let mut evaluated = 0usize;
-
-    let mut trace: Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)> = Vec::new();
-    for (wi0, win) in windows.iter().enumerate() {
-        if win.indices.is_empty() {
-            continue;
-        }
-        let wi = wi0 + 1;
-        let local_out = if win.indices.len() == n_rows {
+    scan_windows_with_objective(
+        &bin_path,
+        &bits_flat,
+        row_words,
+        n_rows,
+        extension,
+        step_v,
+        return_window_results,
+        |bits, rows| {
             beam_search_and_binary_mcc(
                 yv.as_ref(),
-                &bits_flat,
+                bits,
                 row_words,
-                n_rows,
+                rows,
                 n_samples,
                 max_pick,
                 beam_width,
             )
-        } else {
-            let sub = gather_rows_by_indices(&bits_flat, row_words, &win.indices)
-                .map_err(PyRuntimeError::new_err)?;
-            beam_search_and_binary_mcc(
+        },
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("beam_scan_windows_binary_mcc_bin: {e}")))
+}
+
+/// Run abs-correlation-based AND beam search over chromosome windows.
+///
+/// Returns:
+/// - selected indices on global BIN row space
+/// - best score (abs corr)
+/// - best window chrom/start/end and candidate count
+/// - number of non-empty windows evaluated
+/// - optional per-window summaries when `return_window_results=true`
+#[pyfunction(name = "beam_scan_windows_continuous_corr_bin")]
+#[pyo3(signature = (
+    bin_path,
+    y,
+    max_pick=3,
+    beam_width=5,
+    extension=50000,
+    step=None,
+    return_window_results=false
+))]
+pub fn beam_scan_windows_continuous_corr_bin_py(
+    bin_path: String,
+    y: PyReadonlyArray1<'_, f64>,
+    max_pick: usize,
+    beam_width: usize,
+    extension: usize,
+    step: Option<usize>,
+    return_window_results: bool,
+) -> PyResult<BeamWindowScanOutput> {
+    if extension == 0 {
+        return Err(PyRuntimeError::new_err(
+            "beam_scan_windows_continuous_corr_bin: extension must be > 0",
+        ));
+    }
+    let step_v = step.unwrap_or((extension / 2).max(1));
+    if step_v == 0 {
+        return Err(PyRuntimeError::new_err(
+            "beam_scan_windows_continuous_corr_bin: step must be > 0",
+        ));
+    }
+
+    let yv = readonly_f64_to_cow(&y);
+    let (bits_flat, row_words, n_rows, n_samples) =
+        load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
+    validate_continuous_y(
+        yv.as_ref(),
+        n_samples,
+        "beam_scan_windows_continuous_corr_bin",
+    )
+    .map_err(PyRuntimeError::new_err)?;
+
+    scan_windows_with_objective(
+        &bin_path,
+        &bits_flat,
+        row_words,
+        n_rows,
+        extension,
+        step_v,
+        return_window_results,
+        |bits, rows| {
+            beam_search_and_continuous_abs_corr(
                 yv.as_ref(),
-                &sub,
+                bits,
                 row_words,
-                win.indices.len(),
+                rows,
                 n_samples,
                 max_pick,
                 beam_width,
             )
-        }
-        .map_err(PyRuntimeError::new_err)?;
-
-        let selected_global = local_out
-            .selected_indices
-            .iter()
-            .map(|&i| win.indices[i])
-            .collect::<Vec<_>>();
-        let score = local_out.score;
-        evaluated += 1;
-
-        let better = score_key(score) > score_key(best_score);
-        let tie_better = (score_key(score) - score_key(best_score)).abs() <= 1e-12
-            && selected_global.len() < best_selected.len();
-        if best_selected.is_empty() || better || tie_better {
-            best_score = score;
-            best_selected = selected_global.clone();
-            best_chrom = win.chrom.clone();
-            best_bp_start = win.bp_start;
-            best_bp_end = win.bp_end;
-            best_n_candidates = win.indices.len();
-        }
-
-        if return_window_results {
-            trace.push((
-                wi,
-                win.chrom.clone(),
-                win.bp_start,
-                win.bp_end,
-                win.indices.len(),
-                score,
-                selected_global,
-            ));
-        }
-    }
-
-    if best_selected.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "beam_scan_windows_binary_mcc_bin: no valid window/candidate found",
-        ));
-    }
-
-    Ok((
-        best_selected,
-        best_score,
-        best_chrom,
-        best_bp_start,
-        best_bp_end,
-        best_n_candidates,
-        evaluated,
-        trace,
-    ))
+        },
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("beam_scan_windows_continuous_corr_bin: {e}")))
 }
 
 #[cfg(test)]
@@ -1839,6 +2067,24 @@ mod tests {
 
         assert_eq!(res.selected_indices, vec![1]);
         assert_eq!(res.score, 5.0);
+    }
+
+    #[test]
+    fn test_beam_continuous_abs_corr_prefers_signal_row() {
+        let y = vec![2.0_f64, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let rows = vec![
+            vec![1, 1, 1, 0, 0, 0, 0, 0], // corr ~= 1.0
+            vec![1, 0, 1, 0, 1, 0, 1, 0], // weaker
+            vec![0, 1, 0, 1, 0, 1, 0, 1], // inverse weaker
+        ];
+        let (bits_flat, row_words, n_rows, n_samples) = pack_rows_01(&rows);
+
+        let out =
+            beam_search_and_continuous_abs_corr(&y, &bits_flat, row_words, n_rows, n_samples, 2, 8)
+                .expect("continuous beam search should succeed");
+
+        assert_eq!(out.selected_indices, vec![0]);
+        assert!((out.score - 1.0).abs() < 1e-12);
     }
 
     #[test]

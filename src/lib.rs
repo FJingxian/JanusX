@@ -63,8 +63,9 @@ use assoc::{
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use beam::{
-    beam_scan_windows_binary_mcc_bin_py, beam_search_and_binary_mcc_bin_indices_py,
-    beam_search_and_binary_mcc_bin_py,
+    beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
+    beam_search_and_binary_mcc_bin_indices_py, beam_search_and_binary_mcc_bin_py,
+    beam_search_and_continuous_corr_bin_indices_py, beam_search_and_continuous_corr_bin_py,
 };
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use bsa::preprocess_bsa;
@@ -120,6 +121,15 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(beam_scan_windows_binary_mcc_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(beam_search_and_continuous_corr_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        beam_search_and_continuous_corr_bin_indices_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        beam_scan_windows_continuous_corr_bin_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;

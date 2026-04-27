@@ -48,7 +48,7 @@ requirements:
     - python
     - numpy
     - scipy
-    - pandas <3.0
+    - pandas >=1.5
     - matplotlib-base
     - psutil
     - rich

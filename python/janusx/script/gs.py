@@ -2118,6 +2118,9 @@ def main(log: bool = True) -> None:
     if int(args.thread) > int(detected_threads):
         thread_capped = True
         args.thread = int(detected_threads)
+    # Keep pyBLUP eigh fallback aligned with CLI `-t` even when runtime
+    # thread coordination is skipped for mixed model sets.
+    os.environ["JX_THREADS"] = str(int(args.thread))
 
     # ------------------------------------------------------------------
     # Logger

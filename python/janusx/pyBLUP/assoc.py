@@ -90,6 +90,61 @@ except Exception:
     _farmcpu_super_packed = None
 
 
+def _infer_blas_threads_from_env() -> Optional[int]:
+    """
+    Best-effort parse of BLAS/OpenMP thread cap from common env vars.
+    """
+    for key in (
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        raw = os.environ.get(key, None)
+        if raw is None:
+            continue
+        txt = str(raw).strip()
+        if not txt:
+            continue
+        try:
+            val = int(txt)
+        except Exception:
+            continue
+        if val > 0:
+            return val
+    return None
+
+
+def _lmm_from_snp_use_py_rotate(
+    mode: str,
+    m_chunk: int,
+    n: int,
+    threads: int,
+) -> bool:
+    """
+    Decide whether from-SNP path should rotate in NumPy (BLAS) first.
+    """
+    m = str(mode).strip().lower()
+    if m in {"py", "numpy", "python"}:
+        return True
+    if m in {"rust", "native"}:
+        return False
+
+    # Auto baseline: for large dense chunks, NumPy/BLAS rotation can be faster.
+    prefer_py = (int(n) >= 512) and (int(m_chunk) >= 2048)
+    if not prefer_py:
+        return False
+
+    # If scan stage pins BLAS to 1 thread while Rust uses multiple workers,
+    # prefer Rust-side rotation+scan to avoid serial BLAS bottleneck.
+    blas_threads = _infer_blas_threads_from_env()
+    if (blas_threads is not None) and (blas_threads <= 1) and (int(threads) > 1):
+        return False
+    return True
+
+
 def _coerce_bed_packed_ctx(M: Any) -> Optional[Dict[str, Any]]:
     """
     Normalize BED-packed payload into a dict context.
@@ -487,14 +542,12 @@ def lmm_reml_from_snp(
     mode = str(os.environ.get("JX_LMM_FROM_SNP_BACKEND", "auto")).strip().lower()
     m_chunk = int(np.asarray(snp_chunk).shape[0])
     n = int(np.asarray(snp_chunk).shape[1])
-    use_py_rotate = False
-    if mode in {"py", "numpy", "python"}:
-        use_py_rotate = True
-    elif mode in {"rust", "native"}:
-        use_py_rotate = False
-    else:
-        # Auto: for large dense chunks, NumPy/BLAS rotation is usually faster.
-        use_py_rotate = (n >= 512) and (m_chunk >= 2048)
+    use_py_rotate = _lmm_from_snp_use_py_rotate(
+        mode=mode,
+        m_chunk=m_chunk,
+        n=n,
+        threads=threads,
+    )
 
     if (_lmm_reml_chunk_from_snp_f32 is None) or use_py_rotate:
         # Backward compatibility: extension not rebuilt yet.
@@ -930,13 +983,12 @@ def lmm_assoc_fixed_from_snp(
     mode = str(os.environ.get("JX_LMM_FROM_SNP_BACKEND", "auto")).strip().lower()
     m_chunk = int(np.asarray(snp_chunk).shape[0])
     n = int(np.asarray(snp_chunk).shape[1])
-    use_py_rotate = False
-    if mode in {"py", "numpy", "python"}:
-        use_py_rotate = True
-    elif mode in {"rust", "native"}:
-        use_py_rotate = False
-    else:
-        use_py_rotate = (n >= 512) and (m_chunk >= 2048)
+    use_py_rotate = _lmm_from_snp_use_py_rotate(
+        mode=mode,
+        m_chunk=m_chunk,
+        n=n,
+        threads=threads,
+    )
 
     if (_lmm_assoc_chunk_from_snp_f32 is None) or use_py_rotate:
         # Backward compatibility: extension not rebuilt yet.

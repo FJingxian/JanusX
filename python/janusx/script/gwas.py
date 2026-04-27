@@ -1610,7 +1610,7 @@ def load_phenotype(
     pheno = data
     pheno.index = ids
     # Keep first-seen sample order while averaging duplicated IDs.
-    pheno = pheno.groupby(pheno.index, sort=False).mean()
+    pheno = pheno.groupby(pheno.index, sort=False).mean(numeric_only=True)
     selected_ncol: list[int] = list(range(pheno.shape[1]))
 
     if pheno.shape[1] <= 0:

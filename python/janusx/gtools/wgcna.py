@@ -450,7 +450,7 @@ if __name__ == "__main__":
     tpm = tpm.loc[cv.index]
     
     tpm.columns = tpm.columns.map(tpmid[1])
-    tpm = tpm.T.reset_index().groupby('index').mean().T
+    tpm = tpm.T.reset_index().groupby('index').mean(numeric_only=True).T
     kinid:np.ndarray = np.genfromtxt("/Volumes/HP X306W/genotype/AMP_WGS_SNP.grm.npy.id",dtype=str)
     kin:np.ndarray = np.load("/Volumes/HP X306W/genotype/AMP_WGS_SNP.grm.npy")
     inmask = np.isin(kinid,tpm.columns)

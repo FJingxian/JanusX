@@ -5,18 +5,19 @@ description = "A Suite of Genotyping Tools for Genome-Wide Association Study and
 requires-python = ">=3.9"
 dependencies = [
     "numpy", "scipy",
-    "pandas<3.0",
+    "pandas>=1.5",
     "matplotlib",
     "psutil",
     "rich", "tqdm", "rich-argparse",
     "joblib>=1.5",
+    "threadpoolctl",
 ]
 authors = [
   {name = "Jingxian FU", email = "827888724@qq.com"},
 ]
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
-keywords = ["GWAS", "GS", "REML", "PCA"]
+keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
 ml = [

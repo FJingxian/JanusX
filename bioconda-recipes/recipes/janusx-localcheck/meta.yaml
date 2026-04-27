@@ -1,5 +1,5 @@
 {% set name = "janusx" %}
-{% set version = "1.0.20" %}
+{% set version = "1.0.21" %}
 
 package:
   name: {{ name|lower }}

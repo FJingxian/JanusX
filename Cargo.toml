@@ -1,6 +1,6 @@
 [package]
 name = "janusx"
-version = "1.0.20"
+version = "1.0.21"
 edition = "2021"
 rust-version = "1.74"
 

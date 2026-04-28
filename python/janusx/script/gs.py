@@ -941,6 +941,659 @@ def _tune_ml_method_once(
     }
 
 
+def _iter_row_blocks(
+    n_rows: int,
+    block_size: int,
+) -> list[tuple[int, int, np.ndarray]]:
+    n = int(max(0, int(n_rows)))
+    step = max(1, int(block_size))
+    out: list[tuple[int, int, np.ndarray]] = []
+    for st in range(0, n, step):
+        ed = min(st + step, n)
+        ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64))
+        out.append((st, ed, ridx))
+    return out
+
+
+def _resolve_rrblup_solver(
+    *,
+    solver: str,
+    n_train: int,
+    n_snp: int,
+    cfg: dict[str, typing.Any] | None,
+) -> str:
+    mode = str(solver).strip().lower()
+    if mode not in {"exact", "adamw", "auto"}:
+        mode = "auto"
+    if mode != "auto":
+        return mode
+    cfg_use = cfg or {}
+    auto_min_cells = int(max(1, int(cfg_use.get("auto_min_cells", 200_000_000))))
+    cells = int(max(0, int(n_train))) * int(max(0, int(n_snp)))
+    return "adamw" if cells >= auto_min_cells else "exact"
+
+
+def _cfg_truthy(value: typing.Any, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text == "":
+        return bool(default)
+    if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _build_rrblup_adamw_grid(
+    cfg: dict[str, typing.Any] | None,
+) -> list[tuple[float, float]]:
+    cfg_use = cfg or {}
+    lam0 = float(cfg_use.get("lambda_value", 10000.0))
+    lr0 = float(cfg_use.get("lr", 1e-2))
+    if (not np.isfinite(lam0)) or lam0 < 0.0:
+        lam0 = 10000.0
+    if (not np.isfinite(lr0)) or lr0 <= 0.0:
+        lr0 = 1e-2
+    grid_size = int(max(1, min(4, int(cfg_use.get("grid_size", 4)))))
+    lam_anchor = float(max(lam0, 10000.0))
+    cands = [
+        (lam_anchor, lr0),
+        (lam_anchor * 0.5, lr0),
+        (lam_anchor * 2.0, lr0),
+        (lam_anchor * 4.0, lr0),
+    ]
+    out: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for lam, lr in cands:
+        lam_use = float(max(0.0, lam))
+        lr_use = float(max(np.finfo(np.float32).eps, lr))
+        key = (float(f"{lam_use:.12g}"), float(f"{lr_use:.12g}"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((lam_use, lr_use))
+        if len(out) >= grid_size:
+            break
+    if len(out) == 0:
+        out = [(float(max(0.0, lam0)), float(max(np.finfo(np.float32).eps, lr0)))]
+    return out
+
+
+def _build_rrblup_validation_indices(
+    *,
+    n_train: int,
+    cfg: dict[str, typing.Any] | None,
+) -> np.ndarray | None:
+    cfg_use = cfg or {}
+    n = int(max(0, int(n_train)))
+    if n <= 0:
+        return None
+    val_frac = float(cfg_use.get("es_val_frac", 0.1))
+    val_frac = min(0.45, max(0.0, val_frac))
+    val_min = int(max(1, int(cfg_use.get("es_val_min", 64))))
+    min_train = int(max(8, int(cfg_use.get("es_min_train", 128))))
+    if n <= min_train:
+        return None
+    if val_frac <= 0.0 and val_min <= 0:
+        return None
+    val_n = int(round(float(n) * float(val_frac)))
+    val_n = max(val_min, val_n)
+    val_n = min(val_n, max(1, n - min_train))
+    if val_n <= 0 or val_n >= n:
+        return None
+    seed = int(cfg_use.get("seed", 42))
+    grid_seed = int(cfg_use.get("grid_seed", seed))
+    rng = np.random.default_rng(grid_seed + 7919)
+    idx = np.ascontiguousarray(rng.permutation(n)[:val_n], dtype=np.int64)
+    idx.sort()
+    return idx
+
+
+def _adamw_update_inplace_f32(
+    *,
+    param: np.ndarray,
+    grad: np.ndarray,
+    m1: np.ndarray,
+    m2: np.ndarray,
+    step: int,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+) -> None:
+    if int(step) <= 0:
+        raise ValueError("AdamW step must be > 0.")
+    grad32 = np.asarray(grad, dtype=np.float32)
+    m1 *= np.float32(beta1)
+    m1 += np.float32(1.0 - beta1) * grad32
+    m2 *= np.float32(beta2)
+    m2 += np.float32(1.0 - beta2) * (grad32 * grad32)
+
+    b1_corr = 1.0 - (float(beta1) ** float(step))
+    b2_corr = 1.0 - (float(beta2) ** float(step))
+    if b1_corr <= 0.0 or b2_corr <= 0.0:
+        return
+    m_hat = m1 / np.float32(b1_corr)
+    v_hat = m2 / np.float32(b2_corr)
+    denom = np.sqrt(v_hat, dtype=np.float32) + np.float32(eps)
+    param -= np.float32(lr) * (m_hat / denom)
+    if float(weight_decay) > 0.0:
+        decay = max(0.0, 1.0 - float(lr) * float(weight_decay))
+        param *= np.float32(decay)
+
+
+def _ensure_packed_row_flip_cached(
+    packed_ctx: dict[str, typing.Any],
+) -> np.ndarray:
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    n_samples = int(packed_ctx["n_samples"])
+    if row_flip_raw is None:
+        if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
+            raise RuntimeError(
+                "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+            )
+        row_flip = np.asarray(
+            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip
+    else:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    if int(row_flip.shape[0]) != int(packed.shape[0]):
+        raise ValueError(
+            "Packed payload mismatch: row_flip length does not match packed SNP rows."
+        )
+    return row_flip
+
+
+def _decode_packed_block_standardized(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    row_idx: np.ndarray,
+    sample_indices: np.ndarray,
+    row_mean: np.ndarray,
+    row_inv_sd: np.ndarray,
+) -> np.ndarray:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    n_samples = int(packed_ctx["n_samples"])
+    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    ridx = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1))
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
+    blk = _jxrs.bed_packed_decode_rows_f32(
+        packed,
+        int(n_samples),
+        ridx,
+        row_flip,
+        maf,
+        sidx,
+    )
+    x = np.ascontiguousarray(np.asarray(blk, dtype=np.float32), dtype=np.float32)
+    mu = np.ascontiguousarray(np.asarray(row_mean[ridx], dtype=np.float32).reshape(-1, 1))
+    inv_sd = np.ascontiguousarray(np.asarray(row_inv_sd[ridx], dtype=np.float32).reshape(-1, 1))
+    x -= mu
+    x *= inv_sd
+    return x
+
+
+def _predict_rrblup_dense_from_beta(
+    *,
+    X: np.ndarray,
+    alpha: float,
+    beta: np.ndarray,
+    snp_block_size: int,
+) -> np.ndarray:
+    mat = np.asarray(X, dtype=np.float32)
+    if mat.ndim != 2:
+        raise ValueError(f"Dense rrBLUP predict expects 2D matrix, got {mat.shape}.")
+    m, n = int(mat.shape[0]), int(mat.shape[1])
+    b = np.asarray(beta, dtype=np.float32).reshape(-1)
+    if int(b.shape[0]) != m:
+        raise ValueError(f"beta length mismatch: got {b.shape[0]}, expected {m}.")
+    pred = np.full((n,), np.float32(alpha), dtype=np.float32)
+    for st, ed, _ in _iter_row_blocks(m, snp_block_size):
+        blk = np.ascontiguousarray(mat[st:ed], dtype=np.float32)
+        pred += np.asarray(blk.T @ b[st:ed], dtype=np.float32).reshape(-1)
+    return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
+
+
+def _predict_rrblup_packed_from_beta(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    alpha: float,
+    beta: np.ndarray,
+    row_mean: np.ndarray,
+    row_inv_sd: np.ndarray,
+    snp_block_size: int,
+    sample_chunk_size: int,
+) -> np.ndarray:
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
+    n_out = int(sidx.shape[0])
+    if n_out == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+
+    m = int(np.asarray(packed_ctx["packed"]).shape[0])
+    b = np.asarray(beta, dtype=np.float32).reshape(-1)
+    if int(b.shape[0]) != m:
+        raise ValueError(f"beta length mismatch: got {b.shape[0]}, expected {m}.")
+
+    out = np.zeros((n_out,), dtype=np.float32)
+    row_blocks = _iter_row_blocks(m, snp_block_size)
+    chunk = max(1, int(sample_chunk_size))
+    for cst in range(0, n_out, chunk):
+        ced = min(cst + chunk, n_out)
+        blk_idx = np.ascontiguousarray(sidx[cst:ced], dtype=np.int64)
+        pred = np.full((int(blk_idx.shape[0]),), np.float32(alpha), dtype=np.float32)
+        for st, ed, ridx in row_blocks:
+            x = _decode_packed_block_standardized(
+                packed_ctx=packed_ctx,
+                row_idx=ridx,
+                sample_indices=blk_idx,
+                row_mean=row_mean,
+                row_inv_sd=row_inv_sd,
+            )
+            pred += np.asarray(x.T @ b[st:ed], dtype=np.float32).reshape(-1)
+        out[cst:ced] = pred
+    return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
+def _fit_rrblup_adamw_cpu(
+    *,
+    y: np.ndarray,
+    Xtrain: typing.Any,
+    is_packed_input: bool,
+    packed_train_indices: np.ndarray | None,
+    cfg: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any]:
+    cfg_use = cfg or {}
+    y_vec = np.asarray(y, dtype=np.float32).reshape(-1)
+    n_train = int(y_vec.shape[0])
+    if n_train <= 0:
+        raise ValueError("rrBLUP AdamW training requires at least one sample.")
+
+    lambda_value = float(cfg_use.get("lambda_value", 10000.0))
+    lambda_scale = str(cfg_use.get("lambda_scale", "equation")).strip().lower()
+    lr = float(cfg_use.get("lr", 1e-2))
+    epochs = int(max(1, int(cfg_use.get("epochs", 60))))
+    batch_size = int(max(1, int(cfg_use.get("batch_size", 4096))))
+    snp_block_size = int(max(1, int(cfg_use.get("snp_block_size", 2048))))
+    beta1 = float(cfg_use.get("beta1", 0.9))
+    beta2 = float(cfg_use.get("beta2", 0.999))
+    eps = float(cfg_use.get("eps", 1e-8))
+    seed = int(cfg_use.get("seed", 42))
+    log_every = int(max(0, int(cfg_use.get("log_every", 0))))
+    sample_chunk_size = int(max(1, int(cfg_use.get("sample_chunk_size", 4096))))
+    std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("std_eps", 1e-12))))
+    early_stop_patience = int(max(0, int(cfg_use.get("early_stop_patience", 0))))
+    early_stop_warmup = int(max(1, int(cfg_use.get("early_stop_warmup", 5))))
+    early_stop_min_delta = float(max(0.0, float(cfg_use.get("early_stop_min_delta", 1e-5))))
+    exclude_val_from_train = bool(_cfg_truthy(cfg_use.get("exclude_val_from_train", False), default=False))
+
+    if lambda_value < 0.0 or (not np.isfinite(lambda_value)):
+        raise ValueError(f"rrBLUP lambda must be finite and >= 0, got {lambda_value!r}.")
+    if lambda_scale not in {"equation", "mean-loss"}:
+        raise ValueError(
+            f"rrBLUP lambda_scale must be one of {{'equation', 'mean-loss'}}, got {lambda_scale!r}."
+        )
+    if (not np.isfinite(lr)) or lr <= 0.0:
+        raise ValueError(f"rrBLUP learning rate must be > 0, got {lr!r}.")
+    if (not np.isfinite(beta1)) or (not np.isfinite(beta2)):
+        raise ValueError("rrBLUP beta1/beta2 must be finite.")
+    if beta1 < 0.0 or beta1 >= 1.0 or beta2 < 0.0 or beta2 >= 1.0:
+        raise ValueError("rrBLUP beta1/beta2 must be in [0,1).")
+    if (not np.isfinite(eps)) or eps <= 0.0:
+        raise ValueError(f"rrBLUP eps must be > 0, got {eps!r}.")
+
+    lambda_effective = (
+        (lambda_value / float(max(1, n_train)))
+        if lambda_scale == "equation"
+        else lambda_value
+    )
+    lambda_equation = (
+        lambda_value
+        if lambda_scale == "equation"
+        else (lambda_value * float(max(1, n_train)))
+    )
+
+    row_mean: np.ndarray | None = None
+    row_inv_sd: np.ndarray | None = None
+    train_abs_idx: np.ndarray | None = None
+    X_dense: np.ndarray | None = None
+    m_snp: int
+    m_effective: int
+
+    if is_packed_input:
+        packed_ctx = typing.cast(dict[str, typing.Any], Xtrain)
+        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+        maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+        if packed.ndim != 2:
+            raise ValueError("Packed rrBLUP input must have 2D packed SNP matrix.")
+        m_snp = int(packed.shape[0])
+        if int(maf.shape[0]) != m_snp:
+            raise ValueError("Packed rrBLUP input mismatch: maf length != packed SNP rows.")
+        n_samples = int(packed_ctx["n_samples"])
+        if packed_train_indices is None:
+            if int(n_samples) != n_train:
+                raise ValueError(
+                    "Packed rrBLUP requires train sample indices when train size differs from packed n_samples."
+                )
+            train_abs_idx = np.ascontiguousarray(np.arange(n_samples, dtype=np.int64))
+        else:
+            train_abs_idx = np.ascontiguousarray(
+                np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            if int(train_abs_idx.shape[0]) != n_train:
+                raise ValueError(
+                    f"Packed rrBLUP train index length mismatch: got {train_abs_idx.shape[0]}, expected {n_train}."
+                )
+            if np.any(train_abs_idx < 0) or np.any(train_abs_idx >= int(n_samples)):
+                raise ValueError("Packed rrBLUP train sample indices are out of range.")
+        _ensure_packed_row_flip_cached(packed_ctx)
+        row_mean = np.ascontiguousarray((2.0 * maf).astype(np.float32, copy=False))
+        var = np.asarray(2.0 * maf * (1.0 - maf), dtype=np.float32)
+        row_inv_sd = np.zeros_like(var, dtype=np.float32)
+        good = var > np.float32(std_eps)
+        row_inv_sd[good] = np.asarray(1.0 / np.sqrt(var[good], dtype=np.float32), dtype=np.float32)
+        m_effective = int(np.count_nonzero(good))
+    else:
+        X_dense = np.asarray(Xtrain, dtype=np.float32)
+        if X_dense.ndim != 2:
+            raise ValueError(f"Dense rrBLUP input must be 2D, got shape={X_dense.shape}.")
+        m_snp = int(X_dense.shape[0])
+        if int(X_dense.shape[1]) != n_train:
+            raise ValueError(
+                f"Dense rrBLUP input sample mismatch: Xtrain n={X_dense.shape[1]}, y n={n_train}."
+            )
+        m_effective = int(m_snp)
+
+    val_idx_raw = cfg_use.get("val_indices_local", None)
+    val_loc: np.ndarray | None = None
+    if val_idx_raw is not None:
+        try:
+            v = np.asarray(val_idx_raw, dtype=np.int64).reshape(-1)
+            if int(v.size) > 0:
+                v = v[(v >= 0) & (v < n_train)]
+                if int(v.size) > 0:
+                    val_loc = np.unique(np.ascontiguousarray(v, dtype=np.int64))
+        except Exception:
+            val_loc = None
+
+    if (
+        val_loc is not None
+        and exclude_val_from_train
+        and int(val_loc.size) > 0
+        and int(val_loc.size) < n_train
+    ):
+        opt_mask = np.ones((n_train,), dtype=np.bool_)
+        opt_mask[val_loc] = False
+        opt_loc = np.ascontiguousarray(np.flatnonzero(opt_mask), dtype=np.int64)
+    else:
+        opt_loc = np.ascontiguousarray(np.arange(n_train, dtype=np.int64))
+    n_opt = int(opt_loc.size)
+    if n_opt <= 0:
+        raise ValueError("rrBLUP AdamW has zero optimization samples after validation split.")
+    opt_is_full = bool(n_opt == n_train)
+
+    beta = np.zeros((m_snp,), dtype=np.float32)
+    alpha = np.zeros((1,), dtype=np.float32)
+    m_alpha = np.zeros_like(alpha, dtype=np.float32)
+    v_alpha = np.zeros_like(alpha, dtype=np.float32)
+    m_beta = np.zeros_like(beta, dtype=np.float32)
+    v_beta = np.zeros_like(beta, dtype=np.float32)
+    step_alpha = 0
+    step_beta = 0
+    row_blocks = _iter_row_blocks(m_snp, snp_block_size)
+    rng = np.random.default_rng(seed)
+    full_batch_mode = bool(batch_size >= n_opt)
+    full_loc = np.ascontiguousarray(opt_loc, dtype=np.int64)
+    y_full = np.ascontiguousarray(y_vec[opt_loc], dtype=np.float32)
+
+    use_val_monitor = bool((val_loc is not None) and (int(val_loc.size) > 0))
+    use_early_stop = bool(use_val_monitor and (early_stop_patience > 0))
+    best_val_loss = np.inf
+    best_epoch = 0
+    best_alpha = float(alpha[0])
+    best_beta: np.ndarray | None = None
+    bad_epochs = 0
+    epochs_ran = 0
+
+    def _compute_val_mse() -> float:
+        if (val_loc is None) or int(val_loc.size) <= 0:
+            return float("nan")
+        y_val = np.asarray(y_vec[val_loc], dtype=np.float32)
+        if is_packed_input:
+            assert train_abs_idx is not None
+            assert row_mean is not None
+            assert row_inv_sd is not None
+            pred_val = _predict_rrblup_packed_from_beta(
+                packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                sample_indices=np.ascontiguousarray(train_abs_idx[val_loc], dtype=np.int64),
+                alpha=float(alpha[0]),
+                beta=beta,
+                row_mean=row_mean,
+                row_inv_sd=row_inv_sd,
+                snp_block_size=snp_block_size,
+                sample_chunk_size=sample_chunk_size,
+            )
+        else:
+            assert X_dense is not None
+            pred_val = _predict_rrblup_dense_from_beta(
+                X=np.ascontiguousarray(np.take(X_dense, val_loc, axis=1), dtype=np.float32),
+                alpha=float(alpha[0]),
+                beta=beta,
+                snp_block_size=snp_block_size,
+            )
+        pv = np.asarray(pred_val, dtype=np.float32).reshape(-1)
+        if int(pv.size) != int(y_val.size):
+            return float("nan")
+        diff = np.asarray(pv - y_val, dtype=np.float32)
+        return float(np.mean(diff * diff, dtype=np.float64))
+
+    for ep in range(epochs):
+        order = (
+            full_loc
+            if full_batch_mode
+            else np.ascontiguousarray(rng.permutation(full_loc), dtype=np.int64)
+        )
+        loss_sum = 0.0
+        batch_ct = 0
+        batch_stride = n_opt if full_batch_mode else batch_size
+        for b_st in range(0, n_opt, batch_stride):
+            b_ed = min(b_st + batch_size, n_opt)
+            if full_batch_mode:
+                loc = full_loc
+            else:
+                loc = np.ascontiguousarray(order[b_st:b_ed], dtype=np.int64)
+            bs = int(loc.shape[0])
+            if bs <= 0:
+                continue
+            yb = y_full if full_batch_mode else np.ascontiguousarray(y_vec[loc], dtype=np.float32)
+            pred = np.full((bs,), alpha[0], dtype=np.float32)
+
+            if is_packed_input:
+                assert train_abs_idx is not None
+                assert row_mean is not None
+                assert row_inv_sd is not None
+                abs_idx = (
+                    train_abs_idx
+                    if (full_batch_mode and opt_is_full)
+                    else np.ascontiguousarray(train_abs_idx[loc], dtype=np.int64)
+                )
+                for st, ed, ridx in row_blocks:
+                    x = _decode_packed_block_standardized(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                        row_idx=ridx,
+                        sample_indices=abs_idx,
+                        row_mean=row_mean,
+                        row_inv_sd=row_inv_sd,
+                    )
+                    pred += np.asarray(x.T @ beta[st:ed], dtype=np.float32).reshape(-1)
+            else:
+                assert X_dense is not None
+                for st, ed, _ in row_blocks:
+                    if full_batch_mode and opt_is_full:
+                        x = X_dense[st:ed]
+                    else:
+                        x = np.ascontiguousarray(
+                            np.take(X_dense[st:ed], loc, axis=1),
+                            dtype=np.float32,
+                        )
+                    pred += np.asarray(x.T @ beta[st:ed], dtype=np.float32).reshape(-1)
+
+            resid = np.asarray(pred - yb, dtype=np.float32)
+            loss_sum += float(np.mean(resid * resid, dtype=np.float64))
+            batch_ct += 1
+
+            step_alpha += 1
+            grad_alpha = np.asarray([float(np.mean(resid, dtype=np.float64))], dtype=np.float32)
+            _adamw_update_inplace_f32(
+                param=alpha,
+                grad=grad_alpha,
+                m1=m_alpha,
+                m2=v_alpha,
+                step=step_alpha,
+                lr=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=0.0,
+            )
+
+            step_beta += 1
+            inv_bs = np.float32(1.0 / float(bs))
+            if is_packed_input:
+                assert train_abs_idx is not None
+                assert row_mean is not None
+                assert row_inv_sd is not None
+                abs_idx = (
+                    train_abs_idx
+                    if (full_batch_mode and opt_is_full)
+                    else np.ascontiguousarray(train_abs_idx[loc], dtype=np.int64)
+                )
+                for st, ed, ridx in row_blocks:
+                    x = _decode_packed_block_standardized(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                        row_idx=ridx,
+                        sample_indices=abs_idx,
+                        row_mean=row_mean,
+                        row_inv_sd=row_inv_sd,
+                    )
+                    grad_beta = np.asarray((x @ resid) * inv_bs, dtype=np.float32).reshape(-1)
+                    _adamw_update_inplace_f32(
+                        param=beta[st:ed],
+                        grad=grad_beta,
+                        m1=m_beta[st:ed],
+                        m2=v_beta[st:ed],
+                        step=step_beta,
+                        lr=lr,
+                        beta1=beta1,
+                        beta2=beta2,
+                        eps=eps,
+                        weight_decay=float(lambda_effective),
+                    )
+            else:
+                assert X_dense is not None
+                for st, ed, _ in row_blocks:
+                    if full_batch_mode and opt_is_full:
+                        x = X_dense[st:ed]
+                    else:
+                        x = np.ascontiguousarray(
+                            np.take(X_dense[st:ed], loc, axis=1),
+                            dtype=np.float32,
+                        )
+                    grad_beta = np.asarray((x @ resid) * inv_bs, dtype=np.float32).reshape(-1)
+                    _adamw_update_inplace_f32(
+                        param=beta[st:ed],
+                        grad=grad_beta,
+                        m1=m_beta[st:ed],
+                        m2=v_beta[st:ed],
+                        step=step_beta,
+                        lr=lr,
+                        beta1=beta1,
+                        beta2=beta2,
+                        eps=eps,
+                        weight_decay=float(lambda_effective),
+                    )
+
+        epochs_ran = ep + 1
+        val_mse = _compute_val_mse() if use_val_monitor else float("nan")
+        if use_val_monitor and np.isfinite(val_mse):
+            improved = (best_epoch <= 0) or (val_mse < (best_val_loss - early_stop_min_delta))
+            if improved:
+                best_val_loss = float(val_mse)
+                best_epoch = ep + 1
+                best_alpha = float(alpha[0])
+                best_beta = np.ascontiguousarray(beta.copy(), dtype=np.float32)
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+            if use_early_stop and (ep + 1) >= early_stop_warmup and bad_epochs >= early_stop_patience:
+                if _GS_DEBUG_STAGE:
+                    print(
+                        f"[GS-DEBUG] rrBLUP-AdamW early-stop at epoch={ep + 1}, "
+                        f"best_epoch={best_epoch}, best_val_mse={best_val_loss:.6g}",
+                        flush=True,
+                    )
+                break
+
+        if _GS_DEBUG_STAGE and log_every > 0 and ((ep + 1) % log_every == 0):
+            mean_loss = (loss_sum / float(max(1, batch_ct)))
+            if np.isfinite(val_mse):
+                print(
+                    f"[GS-DEBUG] rrBLUP-AdamW epoch={ep + 1}/{epochs} "
+                    f"train_mse={mean_loss:.6g} val_mse={float(val_mse):.6g}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[GS-DEBUG] rrBLUP-AdamW epoch={ep + 1}/{epochs} train_mse={mean_loss:.6g}",
+                    flush=True,
+                )
+
+    if use_val_monitor and (best_beta is not None) and (best_epoch > 0):
+        alpha[0] = np.float32(best_alpha)
+        beta[:] = np.asarray(best_beta, dtype=np.float32)
+    else:
+        best_epoch = max(1, int(epochs_ran))
+        if not np.isfinite(best_val_loss):
+            best_val_loss = float("nan")
+
+    return {
+        "alpha": float(alpha[0]),
+        "beta": np.ascontiguousarray(beta, dtype=np.float32),
+        "lambda_effective": float(lambda_effective),
+        "lambda_equation": float(lambda_equation),
+        "snp_block_size": int(snp_block_size),
+        "sample_chunk_size": int(sample_chunk_size),
+        "is_packed": bool(is_packed_input),
+        "row_mean": row_mean,
+        "row_inv_sd": row_inv_sd,
+        "train_abs_idx": train_abs_idx,
+        "m_effective": int(max(1, m_effective)),
+        "best_epoch": int(max(1, int(best_epoch))),
+        "best_val_loss": float(best_val_loss),
+        "epochs_ran": int(max(1, int(epochs_ran))),
+        "opt_samples": int(max(1, n_opt)),
+        "val_samples": int(0 if val_loc is None else int(val_loc.size)),
+    }
+
+
 def GSapi(
     Y: np.ndarray,
     Xtrain: typing.Any,
@@ -954,6 +1607,9 @@ def GSapi(
     packed_train_indices: np.ndarray | None = None,
     packed_test_indices: np.ndarray | None = None,
     train_pred_indices: np.ndarray | None = None,
+    rrblup_solver: typing.Literal["exact", "adamw", "auto"] = "adamw",
+    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    rrblup_runtime_state: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -978,6 +1634,13 @@ def GSapi(
     train_pred_indices : np.ndarray, optional
         Optional local indices (relative to Xtrain columns) used for train-set
         prediction. When provided, only these training samples are predicted.
+    rrblup_solver : {'exact', 'adamw', 'auto'}, optional
+        rrBLUP backend policy. `exact` keeps the legacy solver; `adamw`
+        enables mini-batch AdamW; `auto` chooses by dataset scale.
+    rrblup_adamw_cfg : dict, optional
+        AdamW rrBLUP configuration used when backend resolves to `adamw`.
+    rrblup_runtime_state : dict, optional
+        Mutable runtime state sink for rrBLUP AdamW (selected tuning params, diagnostics).
 
     Returns
     -------
@@ -1056,6 +1719,22 @@ def GSapi(
 
     # Linear mixed models
     if method in ("GBLUP", "rrBLUP"):
+        n_train_local = int(Y.reshape(-1).shape[0])
+        n_snp_local = int(
+            Xtrain["packed"].shape[0]
+            if _looks_like_packed_payload(Xtrain)
+            else np.asarray(Xtrain).shape[0]
+        )
+        resolved_rr_solver = (
+            _resolve_rrblup_solver(
+                solver=str(rrblup_solver),
+                n_train=n_train_local,
+                n_snp=n_snp_local,
+                cfg=rrblup_adamw_cfg,
+            )
+            if method == "rrBLUP"
+            else "exact"
+        )
         kinship = 1 if method == "GBLUP" else None
         if _GS_DEBUG_STAGE:
             t_fit = time.time()
@@ -1077,9 +1756,275 @@ def GSapi(
             print(
                 f"[GS-DEBUG] GSapi start method={method} "
                 f"n_train={n_train_dbg} n_test={n_test_dbg} n_snp={n_snp_dbg} "
-                f"force_fast={int(bool(force_fast))}",
+                f"force_fast={int(bool(force_fast))} rr_solver={resolved_rr_solver}",
                 flush=True,
             )
+        if method == "rrBLUP" and resolved_rr_solver == "adamw":
+            rr_cfg_base = dict(rrblup_adamw_cfg or {})
+            auto_grid_enabled = _cfg_truthy(rr_cfg_base.get("auto_grid", "on"), default=True)
+            grid_candidates = _build_rrblup_adamw_grid(rr_cfg_base) if auto_grid_enabled else []
+            min_grid_samples = int(max(16, int(rr_cfg_base.get("grid_min_samples", 256))))
+            use_auto_grid = bool(
+                auto_grid_enabled
+                and len(grid_candidates) > 1
+                and n_train_local >= min_grid_samples
+            )
+            selected_cfg = dict(rr_cfg_base)
+            trial_rows: list[dict[str, typing.Any]] = []
+
+            if use_auto_grid:
+                val_idx = _build_rrblup_validation_indices(
+                    n_train=n_train_local,
+                    cfg=rr_cfg_base,
+                )
+                if val_idx is not None and int(val_idx.size) > 0:
+                    trial_epochs = int(
+                        max(
+                            1,
+                            min(
+                                int(rr_cfg_base.get("epochs", 60)),
+                                int(rr_cfg_base.get("grid_trial_epochs", 40)),
+                            ),
+                        )
+                    )
+                    best_score = np.inf
+                    best_row: dict[str, typing.Any] | None = None
+                    base_lambda = float(max(float(rr_cfg_base.get("lambda_value", 10000.0)), 10000.0))
+                    base_lr = float(rr_cfg_base.get("lr", 1e-2))
+                    baseline_row: dict[str, typing.Any] | None = None
+                    for trial_id, (lam_try, lr_try) in enumerate(grid_candidates, start=1):
+                        cfg_trial = dict(rr_cfg_base)
+                        cfg_trial["lambda_value"] = float(lam_try)
+                        cfg_trial["lr"] = float(lr_try)
+                        cfg_trial["epochs"] = int(trial_epochs)
+                        cfg_trial["val_indices_local"] = np.ascontiguousarray(
+                            np.asarray(val_idx, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        )
+                        cfg_trial["exclude_val_from_train"] = True
+                        cfg_trial["early_stop_patience"] = int(
+                            max(0, int(rr_cfg_base.get("es_patience", 5)))
+                        )
+                        cfg_trial["early_stop_warmup"] = int(
+                            max(1, int(rr_cfg_base.get("es_warmup", 5)))
+                        )
+                        cfg_trial["early_stop_min_delta"] = float(
+                            max(0.0, float(rr_cfg_base.get("es_min_delta", 1e-5)))
+                        )
+                        fit_trial = _fit_rrblup_adamw_cpu(
+                            y=np.asarray(Y, dtype=np.float32).reshape(-1),
+                            Xtrain=Xtrain,
+                            is_packed_input=bool(is_packed_input),
+                            packed_train_indices=packed_train_indices,
+                            cfg=cfg_trial,
+                        )
+                        trial_val = float(fit_trial.get("best_val_loss", np.nan))
+                        trial_epoch = int(max(1, int(fit_trial.get("best_epoch", trial_epochs))))
+                        trial_row = {
+                            "id": int(trial_id),
+                            "lambda": float(lam_try),
+                            "lr": float(lr_try),
+                            "val_mse": float(trial_val),
+                            "best_epoch": int(trial_epoch),
+                        }
+                        trial_rows.append(trial_row)
+                        if np.isclose(float(lam_try), base_lambda) and np.isclose(float(lr_try), base_lr):
+                            baseline_row = trial_row
+                        if np.isfinite(trial_val) and (trial_val < best_score):
+                            best_score = float(trial_val)
+                            best_row = trial_row
+                    if best_row is not None and baseline_row is not None:
+                        best_val = float(best_row["val_mse"])
+                        base_val = float(baseline_row["val_mse"])
+                        min_rel_improve = float(
+                            max(0.0, float(rr_cfg_base.get("grid_switch_min_improve", 0.02)))
+                        )
+                        if np.isfinite(best_val) and np.isfinite(base_val):
+                            rel_improve = float((base_val - best_val) / max(1e-12, abs(base_val)))
+                            if rel_improve < min_rel_improve:
+                                best_row = baseline_row
+                    if best_row is None and len(grid_candidates) > 0:
+                        # Guardrail: when all trial scores are non-finite, fall back to
+                        # the first grid candidate (anchor lambda) instead of user-input
+                        # low-lambda defaults that can destabilize AdamW training.
+                        best_row = {
+                            "id": 0,
+                            "lambda": float(grid_candidates[0][0]),
+                            "lr": float(grid_candidates[0][1]),
+                            "val_mse": float("nan"),
+                            "best_epoch": int(trial_epochs),
+                        }
+                    if best_row is not None:
+                        selected_cfg["lambda_value"] = float(best_row["lambda"])
+                        selected_cfg["lr"] = float(best_row["lr"])
+                        selected_cfg["epochs"] = int(max(1, int(rr_cfg_base.get("epochs", 60))))
+                        if _GS_DEBUG_STAGE:
+                            print(
+                                "[GS-DEBUG] rrBLUP-AdamW auto-grid selected "
+                                f"lambda={float(best_row['lambda']):.6g}, "
+                                f"lr={float(best_row['lr']):.6g}, "
+                                f"epochs={int(selected_cfg['epochs'])}, "
+                                f"val_mse={float(best_row['val_mse']):.6g}",
+                                flush=True,
+                            )
+                elif _GS_DEBUG_STAGE:
+                    print(
+                        "[GS-DEBUG] rrBLUP-AdamW auto-grid skipped: validation split unavailable.",
+                        flush=True,
+                    )
+
+            fit = _fit_rrblup_adamw_cpu(
+                y=np.asarray(Y, dtype=np.float32).reshape(-1),
+                Xtrain=Xtrain,
+                is_packed_input=bool(is_packed_input),
+                packed_train_indices=packed_train_indices,
+                cfg=selected_cfg,
+            )
+            if len(trial_rows) > 0:
+                fit["auto_grid_trials"] = trial_rows
+                fit["auto_grid_selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
+                fit["auto_grid_selected_lr"] = float(selected_cfg.get("lr", np.nan))
+                fit["auto_grid_selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
+            if rrblup_runtime_state is not None:
+                rrblup_runtime_state["solver"] = "adamw"
+                rrblup_runtime_state["auto_grid_enabled"] = bool(use_auto_grid)
+                rrblup_runtime_state["selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
+                rrblup_runtime_state["selected_lr"] = float(selected_cfg.get("lr", np.nan))
+                rrblup_runtime_state["selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
+                rrblup_runtime_state["best_epoch"] = int(max(1, int(fit.get("best_epoch", 1))))
+                rrblup_runtime_state["best_val_loss"] = float(fit.get("best_val_loss", np.nan))
+                if len(trial_rows) > 0:
+                    rrblup_runtime_state["auto_grid_trials"] = trial_rows
+            if _GS_DEBUG_STAGE:
+                print(
+                    f"[GS-DEBUG] GSapi model_fit_done method={method}(adamw) "
+                    f"elapsed={time.time() - t_fit:.3f}s",
+                    flush=True,
+                )
+                t_pred = time.time()
+
+            alpha_hat = float(fit["alpha"])
+            beta_hat = np.ascontiguousarray(np.asarray(fit["beta"], dtype=np.float32).reshape(-1))
+            snp_block = int(fit["snp_block_size"])
+            sample_chunk = int(fit["sample_chunk_size"])
+
+            if is_packed_input:
+                packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+                n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
+                if packed_train_indices is None:
+                    if int(packed_train["n_samples"]) != n_train_expected:
+                        raise ValueError(
+                            "Packed rrBLUP AdamW prediction requires packed_train_indices when n_train differs from packed n_samples."
+                        )
+                    train_abs = np.ascontiguousarray(
+                        np.arange(int(packed_train["n_samples"]), dtype=np.int64)
+                    )
+                else:
+                    train_abs = np.ascontiguousarray(
+                        np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                if int(train_abs.shape[0]) != n_train_expected:
+                    raise ValueError(
+                        f"Packed rrBLUP AdamW train index mismatch: got {train_abs.shape[0]}, expected {n_train_expected}."
+                    )
+                row_mean = np.ascontiguousarray(
+                    np.asarray(fit["row_mean"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                row_inv_sd = np.ascontiguousarray(
+                    np.asarray(fit["row_inv_sd"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                pred_train_full = _predict_rrblup_packed_from_beta(
+                    packed_ctx=packed_train,
+                    sample_indices=train_abs,
+                    alpha=alpha_hat,
+                    beta=beta_hat,
+                    row_mean=row_mean,
+                    row_inv_sd=row_inv_sd,
+                    snp_block_size=snp_block,
+                    sample_chunk_size=sample_chunk,
+                )
+                if (packed_test_indices is None) or (int(np.asarray(packed_test_indices).size) == 0):
+                    pred_test = np.zeros((0, 1), dtype=float)
+                else:
+                    pred_test = _predict_rrblup_packed_from_beta(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
+                        sample_indices=np.ascontiguousarray(
+                            np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        ),
+                        alpha=alpha_hat,
+                        beta=beta_hat,
+                        row_mean=row_mean,
+                        row_inv_sd=row_inv_sd,
+                        snp_block_size=snp_block,
+                        sample_chunk_size=sample_chunk,
+                    )
+            else:
+                dense_train = np.asarray(Xtrain, dtype=np.float32)
+                pred_train_full = _predict_rrblup_dense_from_beta(
+                    X=dense_train,
+                    alpha=alpha_hat,
+                    beta=beta_hat,
+                    snp_block_size=snp_block,
+                )
+                dense_test = np.asarray(Xtest, dtype=np.float32)
+                if int(dense_test.shape[1]) <= 0:
+                    pred_test = np.zeros((0, 1), dtype=float)
+                else:
+                    pred_test = _predict_rrblup_dense_from_beta(
+                        X=dense_test,
+                        alpha=alpha_hat,
+                        beta=beta_hat,
+                        snp_block_size=snp_block,
+                    )
+
+            y_train_vec = np.asarray(Y, dtype=np.float64).reshape(-1)
+            pred_train_vec = np.asarray(pred_train_full, dtype=np.float64).reshape(-1)
+            g_hat = pred_train_vec - float(alpha_hat)
+            var_g = float(np.var(g_hat, ddof=1))
+            var_e = float(np.var(y_train_vec - pred_train_vec, ddof=1))
+            denom = var_g + var_e
+            pve_trainvar = float(var_g / denom) if (np.isfinite(denom) and denom > 0.0) else float("nan")
+            lambda_eq = float(fit.get("lambda_equation", np.nan))
+            m_eff = int(max(1, int(fit.get("m_effective", int(beta_hat.shape[0])))))
+            pve_lambda = float("nan")
+            if np.isfinite(lambda_eq) and lambda_eq >= 0.0:
+                pve_lambda = float(m_eff / (m_eff + lambda_eq))
+            rr_cfg = rrblup_adamw_cfg or {}
+            pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
+            if pve_mode not in {"lambda", "trainvar"}:
+                pve_mode = "lambda"
+            pve = pve_lambda if (pve_mode == "lambda") else pve_trainvar
+
+            if need_train_pred:
+                if train_pred_idx is None:
+                    pred_train = pred_train_full
+                elif int(train_pred_idx.size) == 0:
+                    pred_train = np.zeros((0, 1), dtype=float)
+                else:
+                    pred_train = np.asarray(
+                        np.asarray(pred_train_full, dtype=np.float64)[train_pred_idx],
+                        dtype=np.float64,
+                    ).reshape(-1, 1)
+            else:
+                pred_train = np.zeros((0, 1), dtype=float)
+            if _GS_DEBUG_STAGE:
+                print(
+                    f"[GS-DEBUG] GSapi predict_done method={method}(adamw) "
+                    f"elapsed={time.time() - t_pred:.3f}s pve_mode={pve_mode} "
+                    f"pve={float(pve):.6g} pve_lambda={float(pve_lambda):.6g} "
+                    f"pve_trainvar={float(pve_trainvar):.6g}",
+                    flush=True,
+                )
+            return (
+                np.asarray(pred_train, dtype=float).reshape(-1, 1),
+                np.asarray(pred_test, dtype=float).reshape(-1, 1),
+                float(pve),
+            )
+
         model = MLMBLUP(
             Y.reshape(-1, 1),
             Xtrain,
@@ -1200,12 +2145,21 @@ def _run_method_task(
     progress_hook: typing.Any = None,
     search_progress_hook: typing.Any = None,
     limit_predtrain: int | None = None,
+    rrblup_solver: str = "adamw",
+    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
 ) -> dict[str, typing.Any]:
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     best_test = None
     best_train = None
     best_r2 = -np.inf
     ml_tuning_cache: dict[str, typing.Any] | None = None
+    rrblup_cfg_base = dict(rrblup_adamw_cfg or {})
+    rrblup_cv_reuse_enabled = bool(
+        method == "rrBLUP"
+        and cv_splits is not None
+        and _cfg_truthy(rrblup_cfg_base.get("grid_reuse_cv", "on"), default=True)
+    )
+    rrblup_cv_selected: dict[str, float] | None = None
     packed_payload = (
         typing.cast(dict[str, typing.Any], packed_ctx)
         if _looks_like_packed_payload(packed_ctx)
@@ -1531,6 +2485,15 @@ def _run_method_task(
                     fold_train = train_snp[:, fold_train_idx]
                     fold_test = train_snp[:, fold_test_idx]
                     fold_pca = pca_dec
+                rr_cfg_call: dict[str, typing.Any] | None = rrblup_adamw_cfg
+                rr_state_call: dict[str, typing.Any] | None = None
+                if method == "rrBLUP":
+                    rr_cfg_call = dict(rrblup_cfg_base)
+                    if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+                        rr_cfg_call["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
+                        rr_cfg_call["lr"] = float(rrblup_cv_selected["lr"])
+                        rr_cfg_call["auto_grid"] = "off"
+                    rr_state_call = {}
                 yhat_train, yhat_test, pve = GSapi(
                     train_pheno[fold_train_idx],
                     fold_train,
@@ -1544,7 +2507,29 @@ def _run_method_task(
                     packed_train_indices=fold_train_idx_arg,
                     packed_test_indices=fold_test_idx_arg,
                     train_pred_indices=fold_train_pred_local_idx,
+                    rrblup_solver=typing.cast(typing.Any, rrblup_solver),
+                    rrblup_adamw_cfg=rr_cfg_call,
+                    rrblup_runtime_state=rr_state_call,
                 )
+                if (
+                    method == "rrBLUP"
+                    and rrblup_cv_reuse_enabled
+                    and rrblup_cv_selected is None
+                    and rr_state_call is not None
+                ):
+                    sel_lam = float(rr_state_call.get("selected_lambda", np.nan))
+                    sel_lr = float(rr_state_call.get("selected_lr", np.nan))
+                    if np.isfinite(sel_lam) and sel_lam >= 0.0 and np.isfinite(sel_lr) and sel_lr > 0.0:
+                        rrblup_cv_selected = {
+                            "lambda_value": float(sel_lam),
+                            "lr": float(sel_lr),
+                        }
+                        if _GS_DEBUG_STAGE:
+                            print(
+                                "[GS-DEBUG] rrBLUP CV reuse armed "
+                                f"lambda={sel_lam:.6g} lr={sel_lr:.6g}",
+                                flush=True,
+                            )
             if ml_tuning_cache is not None:
                 pve = float(ml_tuning_cache.get("pve", np.nan))
             ttest = np.concatenate([train_pheno[fold_test_idx], yhat_test], axis=1)
@@ -1712,6 +2697,15 @@ def _run_method_task(
                 beta=beta,
             )
     else:
+        rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
+        rr_state_final: dict[str, typing.Any] | None = None
+        if method == "rrBLUP":
+            rr_cfg_final = dict(rrblup_cfg_base)
+            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+                rr_cfg_final["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
+                rr_cfg_final["lr"] = float(rrblup_cv_selected["lr"])
+                rr_cfg_final["auto_grid"] = "off"
+            rr_state_final = {}
         _, test_pred, pve_final = GSapi(
             train_pheno,
             final_train,
@@ -1724,6 +2718,9 @@ def _run_method_task(
             need_train_pred=False,
             packed_train_indices=final_train_idx_arg,
             packed_test_indices=final_test_idx_arg,
+            rrblup_solver=typing.cast(typing.Any, rrblup_solver),
+            rrblup_adamw_cfg=rr_cfg_final,
+            rrblup_runtime_state=rr_state_final,
         )
         if ml_tuning_cache is not None:
             pve_final = float(ml_tuning_cache.get("pve", np.nan))
@@ -1756,6 +2753,8 @@ def _run_methods_parallel(
     test_sample_indices: np.ndarray | None = None,
     limit_predtrain: int | None = None,
     elapsed_offset_by_method: dict[str, float] | None = None,
+    rrblup_solver: str = "adamw",
+    rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -1933,6 +2932,8 @@ def _run_methods_parallel(
                             progress_hook=_cv_hook,
                             search_progress_hook=_search_hook,
                             limit_predtrain=limit_predtrain,
+                            rrblup_solver=rrblup_solver,
+                            rrblup_adamw_cfg=rrblup_adamw_cfg,
                         )
                     except Exception:
                         _close_search_task()
@@ -2124,6 +3125,8 @@ def _run_methods_parallel(
                         progress_hook=(_cv_hook if enable_tqdm_progress else None),
                         search_progress_hook=(_search_hook if enable_tqdm_progress else None),
                         limit_predtrain=limit_predtrain,
+                        rrblup_solver=rrblup_solver,
+                        rrblup_adamw_cfg=rrblup_adamw_cfg,
                     )
                 except Exception:
                     _close_search_bar()
@@ -2192,6 +3195,8 @@ def _run_methods_parallel(
                     None,
                     None,
                     limit_predtrain,
+                    rrblup_solver,
+                    rrblup_adamw_cfg,
                 ): m
                 for m in methods
             }
@@ -2278,6 +3283,8 @@ def _run_methods_parallel(
                             None,
                             None,
                             limit_predtrain,
+                            rrblup_solver,
+                            rrblup_adamw_cfg,
                         ): m
                         for m in methods
                     }
@@ -2379,6 +3386,8 @@ def _run_methods_parallel(
                         None,
                         None,
                         limit_predtrain,
+                        rrblup_solver,
+                        rrblup_adamw_cfg,
                     ): m
                     for m in methods
                 }
@@ -2433,6 +3442,8 @@ def _run_methods_parallel(
                     None,
                     None,
                     limit_predtrain,
+                    rrblup_solver,
+                    rrblup_adamw_cfg,
                 ): m
                 for m in methods
             }
@@ -3841,6 +4852,192 @@ def main(log: bool = True) -> None:
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
+        "--rrblup-solver",
+        type=str,
+        choices=("exact", "adamw", "auto"),
+        default="adamw",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-lambda",
+        type=float,
+        default=10000.0,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-lambda-scale",
+        type=str,
+        choices=("equation", "mean-loss"),
+        default="equation",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-lr",
+        type=float,
+        default=1e-2,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-epochs",
+        type=int,
+        default=60,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-batch-size",
+        type=int,
+        default=4096,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-snp-block-size",
+        type=int,
+        default=2048,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-beta1",
+        type=float,
+        default=0.9,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-beta2",
+        type=float,
+        default=0.999,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-eps",
+        type=float,
+        default=1e-8,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-seed",
+        type=int,
+        default=42,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-auto-min-cells",
+        type=int,
+        default=200000000,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-log-every",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-sample-chunk-size",
+        type=int,
+        default=4096,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-pve-mode",
+        type=str,
+        choices=("lambda", "trainvar"),
+        default="lambda",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-auto-grid",
+        type=str,
+        choices=("on", "off"),
+        default="on",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-size",
+        type=int,
+        default=2,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-min-samples",
+        type=int,
+        default=256,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-trial-epochs",
+        type=int,
+        default=20,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-switch-min-improve",
+        type=float,
+        default=0.15,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-reuse-cv",
+        type=str,
+        choices=("on", "off"),
+        default="on",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-grid-seed",
+        type=int,
+        default=42,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-val-frac",
+        type=float,
+        default=0.08,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-val-min",
+        type=int,
+        default=64,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-min-train",
+        type=int,
+        default=128,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-patience",
+        type=int,
+        default=3,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-warmup",
+        type=int,
+        default=4,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--rrblup-es-min-delta",
+        type=float,
+        default=1e-5,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--packed-lmm-auto",
+        type=str,
+        choices=("on", "off"),
+        default="on",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--packed-lmm-auto-min-cells",
+        type=int,
+        default=200000000,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
         "-pcd", "--pcd",
         action="store_true",
         default=False,
@@ -3919,6 +5116,52 @@ def main(log: bool = True) -> None:
         parser.error(str(e))
     if (args.limit_predtrain is not None) and (int(args.limit_predtrain) < 0):
         parser.error("--limit-predtrain/--limit-train must be >= 0.")
+    if (not np.isfinite(float(args.rrblup_lambda))) or (float(args.rrblup_lambda) < 0.0):
+        parser.error("--rrblup-lambda must be a finite value >= 0.")
+    if (not np.isfinite(float(args.rrblup_lr))) or (float(args.rrblup_lr) <= 0.0):
+        parser.error("--rrblup-lr must be a finite value > 0.")
+    if int(args.rrblup_epochs) <= 0:
+        parser.error("--rrblup-epochs must be > 0.")
+    if int(args.rrblup_batch_size) <= 0:
+        parser.error("--rrblup-batch-size must be > 0.")
+    if int(args.rrblup_snp_block_size) <= 0:
+        parser.error("--rrblup-snp-block-size must be > 0.")
+    if int(args.rrblup_auto_min_cells) <= 0:
+        parser.error("--rrblup-auto-min-cells must be > 0.")
+    if int(args.rrblup_log_every) < 0:
+        parser.error("--rrblup-log-every must be >= 0.")
+    if int(args.rrblup_sample_chunk_size) <= 0:
+        parser.error("--rrblup-sample-chunk-size must be > 0.")
+    if (not np.isfinite(float(args.rrblup_beta1))) or (not np.isfinite(float(args.rrblup_beta2))):
+        parser.error("--rrblup-beta1/--rrblup-beta2 must be finite.")
+    if float(args.rrblup_beta1) < 0.0 or float(args.rrblup_beta1) >= 1.0:
+        parser.error("--rrblup-beta1 must be in [0, 1).")
+    if float(args.rrblup_beta2) < 0.0 or float(args.rrblup_beta2) >= 1.0:
+        parser.error("--rrblup-beta2 must be in [0, 1).")
+    if (not np.isfinite(float(args.rrblup_eps))) or (float(args.rrblup_eps) <= 0.0):
+        parser.error("--rrblup-eps must be a finite value > 0.")
+    if int(args.rrblup_grid_size) <= 0 or int(args.rrblup_grid_size) > 4:
+        parser.error("--rrblup-grid-size must be in [1, 4].")
+    if int(args.rrblup_grid_min_samples) <= 0:
+        parser.error("--rrblup-grid-min-samples must be > 0.")
+    if int(args.rrblup_grid_trial_epochs) <= 0:
+        parser.error("--rrblup-grid-trial-epochs must be > 0.")
+    if (not np.isfinite(float(args.rrblup_grid_switch_min_improve))) or float(args.rrblup_grid_switch_min_improve) < 0.0:
+        parser.error("--rrblup-grid-switch-min-improve must be a finite value >= 0.")
+    if (not np.isfinite(float(args.rrblup_es_val_frac))) or float(args.rrblup_es_val_frac) < 0.0:
+        parser.error("--rrblup-es-val-frac must be a finite value >= 0.")
+    if int(args.rrblup_es_val_min) <= 0:
+        parser.error("--rrblup-es-val-min must be > 0.")
+    if int(args.rrblup_es_min_train) <= 0:
+        parser.error("--rrblup-es-min-train must be > 0.")
+    if int(args.rrblup_es_patience) < 0:
+        parser.error("--rrblup-es-patience must be >= 0.")
+    if int(args.rrblup_es_warmup) <= 0:
+        parser.error("--rrblup-es-warmup must be > 0.")
+    if (not np.isfinite(float(args.rrblup_es_min_delta))) or float(args.rrblup_es_min_delta) < 0.0:
+        parser.error("--rrblup-es-min-delta must be a finite value >= 0.")
+    if int(args.packed_lmm_auto_min_cells) <= 0:
+        parser.error("--packed-lmm-auto-min-cells must be > 0.")
     try:
         args.ldprune_spec = _parse_ld_prune_args(args.ldprune)
     except ValueError as e:
@@ -3958,6 +5201,37 @@ def main(log: bool = True) -> None:
 
     if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
         parser.error("--hash dim must be > 0.")
+
+    rrblup_solver = str(args.rrblup_solver).strip().lower()
+    rrblup_adamw_cfg: dict[str, typing.Any] = {
+        "lambda_value": float(args.rrblup_lambda),
+        "lambda_scale": str(args.rrblup_lambda_scale),
+        "lr": float(args.rrblup_lr),
+        "epochs": int(args.rrblup_epochs),
+        "batch_size": int(args.rrblup_batch_size),
+        "snp_block_size": int(args.rrblup_snp_block_size),
+        "beta1": float(args.rrblup_beta1),
+        "beta2": float(args.rrblup_beta2),
+        "eps": float(args.rrblup_eps),
+        "seed": int(args.rrblup_seed),
+        "auto_min_cells": int(args.rrblup_auto_min_cells),
+        "log_every": int(args.rrblup_log_every),
+        "sample_chunk_size": int(args.rrblup_sample_chunk_size),
+        "pve_mode": str(args.rrblup_pve_mode),
+        "auto_grid": str(args.rrblup_auto_grid),
+        "grid_size": int(args.rrblup_grid_size),
+        "grid_min_samples": int(args.rrblup_grid_min_samples),
+        "grid_trial_epochs": int(args.rrblup_grid_trial_epochs),
+        "grid_switch_min_improve": float(args.rrblup_grid_switch_min_improve),
+        "grid_reuse_cv": str(args.rrblup_grid_reuse_cv),
+        "grid_seed": int(args.rrblup_grid_seed),
+        "es_val_frac": float(args.rrblup_es_val_frac),
+        "es_val_min": int(args.rrblup_es_val_min),
+        "es_min_train": int(args.rrblup_es_min_train),
+        "es_patience": int(args.rrblup_es_patience),
+        "es_warmup": int(args.rrblup_es_warmup),
+        "es_min_delta": float(args.rrblup_es_min_delta),
+    }
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
@@ -4019,10 +5293,52 @@ def main(log: bool = True) -> None:
             f"using {int(args.thread)}."
         )
 
-    packed_preprocess_requested = bool(
+    manual_packed_preprocess_requested = bool(
         (args.hash_dim is not None) or (getattr(args, "ldprune_spec", None) is not None)
     )
     gfile_is_plink = _is_plink_prefix(str(gfile))
+    lmm_only_requested = bool(
+        (bool(args.GBLUP) or bool(args.rrBLUP))
+        and (not bool(args.adBLUP))
+        and (not bool(args.BayesA))
+        and (not bool(args.BayesB))
+        and (not bool(args.BayesCpi))
+        and (not bool(args.RF))
+        and (not bool(args.ET))
+        and (not bool(args.GBDT))
+        and (not bool(args.XGB))
+        and (not bool(args.SVM))
+        and (not bool(args.ENET))
+    )
+    auto_packed_lmm_requested = False
+    packed_auto_cells: int | None = None
+    packed_auto_min_cells = int(max(1, int(getattr(args, "packed_lmm_auto_min_cells", 200000000))))
+    if (
+        (not gfile_is_plink)
+        and _cfg_truthy(getattr(args, "packed_lmm_auto", "on"), default=True)
+        and lmm_only_requested
+        and (bool(args.vcf) or bool(args.hmp) or bool(args.file))
+    ):
+        try:
+            _probe_ids, _probe_m = inspect_genotype_file(
+                str(gfile),
+                snps_only=False,
+                maf=float(args.maf),
+                missing_rate=float(args.geno),
+            )
+            packed_auto_cells = int(max(0, len(_probe_ids))) * int(max(0, int(_probe_m)))
+            auto_packed_lmm_requested = bool(packed_auto_cells >= packed_auto_min_cells)
+        except Exception as ex:
+            # Fail open for memory-safety: if probing fails, prefer packed fallback.
+            auto_packed_lmm_requested = True
+            if bool(debug_mode):
+                logger.warning(
+                    "Packed LMM auto probe failed; defaulting to packed-preprocess path. "
+                    f"reason: {ex}"
+                )
+    packed_preprocess_requested = bool(
+        manual_packed_preprocess_requested or auto_packed_lmm_requested
+    )
     if packed_preprocess_requested and (not gfile_is_plink):
         if bool(args.vcf) or bool(args.hmp) or bool(args.file):
             src_label = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
@@ -4036,34 +5352,52 @@ def main(log: bool = True) -> None:
                         snps_only=False,
                         delimiter=None,
                         # For -file inputs, allow TXT/TSV/CSV sources to be packed
-                        # into PLINK BED when hash/LD-prune preprocessing is requested.
+                        # into PLINK BED for packed preprocessing / auto packed LMM flow.
                         prefer_plink_for_txt=True,
                     )
-                except Exception:
-                    task.fail("Preparing PLINK cache for packed GS ...Failed")
-                    raise
-                if not _is_plink_prefix(str(cached_prefix)):
-                    task.fail("Preparing PLINK cache for packed GS ...Failed")
-                    logger.error(
-                        "--hash/--ldprune require PLINK BED input. "
-                        "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
-                        "when source resolves to VCF/HMP/TXT. "
-                        f"Current input could not be converted to BED: {cached_prefix}. "
-                        "For -file inputs backed by .npy/.bin, please convert to -bfile first."
+                except Exception as ex:
+                    if manual_packed_preprocess_requested:
+                        task.fail("Preparing PLINK cache for packed GS ...Failed")
+                        raise
+                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
+                    logger.warning(
+                        "Auto packed LMM cache was requested but failed; fallback to dense path. "
+                        f"reason: {ex}"
                     )
-                    raise SystemExit(1)
-                gfile = str(cached_prefix).replace("\\", "/")
-                gfile_is_plink = True
-                task.complete(
-                    "Preparing PLINK cache for packed GS ...Finished "
-                    f"({format_path_for_display(gfile)})"
-                )
+                    cached_prefix = None
+                if cached_prefix is not None and _is_plink_prefix(str(cached_prefix)):
+                    gfile = str(cached_prefix).replace("\\", "/")
+                    gfile_is_plink = True
+                    task.complete(
+                        "Preparing PLINK cache for packed GS ...Finished "
+                        f"({format_path_for_display(gfile)})"
+                    )
+                elif cached_prefix is not None:
+                    if manual_packed_preprocess_requested:
+                        task.fail("Preparing PLINK cache for packed GS ...Failed")
+                        logger.error(
+                            "--hash/--ldprune require PLINK BED input. "
+                            "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
+                            "when source resolves to VCF/HMP/TXT. "
+                            f"Current input could not be converted to BED: {cached_prefix}. "
+                            "For -file inputs backed by .npy/.bin, please convert to -bfile first."
+                        )
+                        raise SystemExit(1)
+                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
+                    logger.warning(
+                        "Auto packed LMM cache produced non-PLINK output; fallback to dense path. "
+                        f"resolved={cached_prefix}"
+                    )
         else:
-            logger.error(
-                "--hash/--ldprune require PLINK BED input. "
-                "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
+            if manual_packed_preprocess_requested:
+                logger.error(
+                    "--hash/--ldprune require PLINK BED input. "
+                    "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
+                )
+                raise SystemExit(1)
+            logger.warning(
+                "Auto packed LMM cache requested but input is not convertible; fallback to dense path."
             )
-            raise SystemExit(1)
 
     # Configuration summary
     if log:
@@ -4137,8 +5471,30 @@ def main(log: bool = True) -> None:
                 ("Limit train-pred", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
                 ("Strict CV", args.strict_cv),
                 ("Force fast Gram", args.force_fast),
+                ("Packed LMM auto", str(args.packed_lmm_auto)),
+                ("Packed LMM auto min-cells", int(packed_auto_min_cells)),
+                (
+                    "Packed LMM probed cells",
+                    ("" if packed_auto_cells is None else int(packed_auto_cells)),
+                ),
+                ("Packed LMM active", bool(gfile_is_plink and lmm_only_requested)),
             ]
         )
+        if bool(args.rrBLUP):
+            cfg_rows.extend(
+                [
+                    ("rrBLUP solver", rrblup_solver),
+                    ("rrBLUP lambda", float(args.rrblup_lambda)),
+                    ("rrBLUP lambda-scale", str(args.rrblup_lambda_scale)),
+                    ("rrBLUP AdamW lr", float(args.rrblup_lr)),
+                    ("rrBLUP AdamW epochs", int(args.rrblup_epochs)),
+                    ("rrBLUP AdamW batch", int(args.rrblup_batch_size)),
+                    ("rrBLUP AdamW snp-block", int(args.rrblup_snp_block_size)),
+                    ("rrBLUP PVE mode", str(args.rrblup_pve_mode)),
+                    ("rrBLUP auto-grid", str(args.rrblup_auto_grid)),
+                    ("rrBLUP grid-reuse-cv", str(args.rrblup_grid_reuse_cv)),
+                ]
+            )
         emit_cli_configuration(
             logger,
             app_title="JanusX - GS",
@@ -5524,6 +6880,8 @@ def main(log: bool = True) -> None:
             test_sample_indices=test_sample_idx,
             limit_predtrain=args.limit_predtrain,
             elapsed_offset_by_method=method_elapsed_offsets,
+            rrblup_solver=rrblup_solver,
+            rrblup_adamw_cfg=rrblup_adamw_cfg,
         )
         if _GS_DEBUG_STAGE:
             logger.info(

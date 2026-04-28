@@ -1,9 +1,10 @@
 # JanusX Core API Guide
 
-Version baseline: `v1.0.20`
+Version baseline: `v1.0.21`
 
 This guide focuses on Python usage (`janusx`) and how it maps to Rust kernels (`janusx.janusx`).
 CLI commands are documented separately in `doc/JanusXcli.md`.
+Repository structure and entrypoint differences are summarized in `doc/PROJECT_MAP.md`.
 
 ## 1. Start Here
 

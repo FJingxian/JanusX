@@ -1,6 +1,6 @@
 # JanusX CLI Guide
 
-Version baseline: `v1.0.14`
+Version baseline: `v1.0.21`
 
 ## 1. Scope and entrypoints
 
@@ -8,13 +8,15 @@ This document describes the current CLI behavior from source code in this reposi
 
 Entrypoints:
 
-- `jx`: Rust launcher (recommended for normal use)
-- `jxpy`: Python package entry (`python -m janusx.script.JanusX` equivalent)
+- `jx` (installer/launcher build): Rust launcher binary
+- `jx` / `jxpy` (pip/source install): Python dispatcher (`python -m janusx.script.JanusX`)
 
 Important boundary:
 
-- `fastq2vcf` and `fastq2count` are launcher-only modules (use `jx`)
-- Launcher flags `-update/-upgrade/-list/-clean/-uninstall` are launcher-only
+- Launcher flags `-update/-upgrade/-list/-clean/-uninstall` are launcher-binary-only.
+- In Python dispatcher mode (`jxpy`, and `jx` from pip/source install), `fastq2vcf/fastq2count` run preflight checks only and do not execute the full pipeline.
+- Extra modules `kmerge/view/treeplot/gblupbench` are available in Python dispatcher mode but not in launcher module whitelist.
+- `beam` script exists in repository but is not wired into launcher or Python dispatcher; run it directly via `python -m janusx.script.beam ...`.
 
 Quick checks:
 
@@ -307,6 +309,8 @@ Examples:
 jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5 -n 0 -o out
 jx gs -file matrix_prefix -p pheno.tsv -adBLUP -BayesA -BayesB -BayesCpi -cv 5
 jx gs -bfile geno -p pheno.tsv -RF -ET -GBDT -XGB -SVM -ENET -cv 5
+jx gs -bfile geno -p pheno.tsv -rrBLUP -cv 5 -n 0
+jx gs -bfile geno -p pheno.tsv -rrBLUP --rrblup-solver exact    # advanced hidden option
 ```
 
 Model flags:
@@ -323,6 +327,14 @@ Other options:
 - `-pcd`
 - `-maf`, `-geno`
 - `-t`
+
+Notes:
+
+- `rrBLUP` defaults to mini-batch AdamW backend.
+- rrBLUP backend/tuning switches are advanced flags and hidden from `jx gs -h`, but still accepted by CLI (for example `--rrblup-solver exact`).
+- AdamW rrBLUP now runs a small automatic lambda grid (default 2 candidates) with fold-internal validation + early-stop in tuning trials; in CV mode the selected hyperparameters are reused across folds by default to reduce repeated tuning overhead (hidden advanced switch: `--rrblup-grid-reuse-cv off`).
+- AdamW rrBLUP reports `h2/PVE` in lambda-consistent mode by default (`--rrblup-pve-mode lambda`), and can switch to train-variance mode via hidden advanced flag `--rrblup-pve-mode trainvar`.
+- For `GBLUP/rrBLUP`-only runs with non-PLINK input (`-vcf/-hmp/-file`), `jx gs` will auto-probe data scale and switch to packed BED flow when `n_samples * n_snps` exceeds the hidden threshold `--packed-lmm-auto-min-cells` (default `200000000`).
 
 Outputs:
 
@@ -700,9 +712,197 @@ Execution note:
 
 - UI may display merged preprocess (`fastp+hisat2-index`) while internal checkpoint steps remain 1..4.
 
+### 4.19 `kmer`
+
+K-mer workflow entry with two modes: KMC counting and WASTER tree inference.
+
+Examples:
+
+```bash
+jx kmer -fa sample.fastq.gz --count -o out -prefix sample_k19 -k 19 -t 8
+jx kmer -fa species1.fa species2.fa --tree -o out -prefix species_tree -t 8 --waster-mode 4
+```
+
+Key options:
+
+- required input: `-fa` (one or more FASTQ/FASTA files)
+- mode: `--count` or `--tree` (default falls back to count mode)
+- shared: `-k`, `-t`, `-o`, `-prefix`, `-limit-mem`
+- count mode: `-ci`, `-cx`, `--counter-max`, `--tmp-dir`
+- tree mode: `--waster-mode`, `--waster-sampled`, `--waster-qcs`, `--waster-qcn`, `--waster-pattern`, `--waster-consensus`, `--waster-continue-file`
+
+Outputs:
+
+- count mode: `<prefix>.kmc_pre`, `<prefix>.kmc_suf`
+- tree mode: `<prefix>.waster.nw`, plus optional `.waster.snps.fa` / `.waster.patterns`
+
+### 4.20 `tree`
+
+Tree workflow (current CLI-exposed path is NJ mode).
+
+Examples:
+
+```bash
+jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj
+jx tree -fa aln.fasta -o out --prefix aln_tree -nj bionj
+jx tree -bfile panel -o out --prefix panel_tree --write-phylip -nj
+```
+
+Key options:
+
+- input: `-vcf/-hmp/-file/-bfile/-fa`
+- model: `-nj [exact|bionj|bionj-dist|bionj-jc|bionj-binom|bionj-auto|approx]`
+- filters/runtime: `-maf`, `-geno`, `-het`, `-snps-only`, `-chunksize`, `-t`
+- output controls: `--write-phylip`, `--profile`, `-o`, `-prefix`
+
+Outputs:
+
+- `<prefix>.nwk`
+- `<prefix>.fasta`
+- optional `<prefix>.phy`
+- optional `<prefix>.profile.tsv`
+- log `<prefix>.tree.log`
+
+### 4.21 `benchmark`
+
+FarmCPU benchmark workflow across JanusX / GAPIT / rMVP.
+
+Examples:
+
+```bash
+jx benchmark -bfile example_prefix -p pheno.tsv -n 0
+jx benchmark -vcf example.vcf.gz -p pheno.tsv -n 0 --kernels janusx,gapit,rmvp
+```
+
+Key options:
+
+- input: `-vcf/-hmp/-file/-bfile`, phenotype `-p`, trait selector `-n`
+- kernels: `--kernels janusx,gapit,rmvp`
+- filters/runtime: `-maf`, `-geno`, `-chunksize`, `-t`, `-q`, `-c`
+- analysis controls: `--topk`, `--check`
+- advanced (dev help): FarmCPU grid/threshold tuning flags with `-h -dev`
+
+Outputs:
+
+- benchmark workspace: `<prefix>.farmcpu_bench/`
+- summary tables: `summary/<prefix>.benchmark.tsv`, `.md`
+
+### 4.22 `kmerge` (Python dispatcher mode)
+
+Merge multiple KMC databases to binary k-mer matrix outputs.
+
+Examples:
+
+```bash
+jxpy kmerge -db s1 s2 s3 -o out -prefix merged_bin
+jxpy kmerge -db sampleA.kmc_pre sampleB -o out -prefix panel
+```
+
+Key options:
+
+- required: `-db` (KMC prefixes or `.kmc_pre/.kmc_suf` paths)
+- optional: `-sid`, `-t`, `--max-kmers`, `-kmerf`
+- safety controls: `--max-output-sites`, `--allow-large-output`
+
+Outputs:
+
+- `<prefix>.bin`
+- `<prefix>.bin.id`
+- `<prefix>.bin.site`
+
+### 4.23 `view` (Python dispatcher mode)
+
+Decode JanusX binary files for shell pipelines.
+
+Examples:
+
+```bash
+jxpy view -bin test/kmerge_new.bin | head
+jxpy view -bin test/kmerge_new.bin.site | head
+```
+
+Key options:
+
+- `-bin` (one or more `.bin` / `.bin.site` files)
+
+Behavior:
+
+- `.bin` -> rows of `0/1` strings
+- `.bin.site` -> decoded DNA k-mer rows
+
+### 4.24 `treeplot` (Python dispatcher mode)
+
+Visualize Newick/GRM trees with toytree.
+
+Examples:
+
+```bash
+jxpy treeplot -nwk result.tree.nwk -o out -prefix fig1 --layout c --showlabels -fmt svg
+jxpy treeplot -k panel.grm.npy -kid panel.grm.npy.id -o out -prefix panel_tree --method nj -fmt pdf
+```
+
+Key options:
+
+- input: `-nwk` or `-k` (GRM)
+- GRM metadata: `-kid`
+- layout/render: `-layout`, `-root`, `-showlabels`, `-regexlabels`, `--node-size`, `--edge-width`, `--scale-bar`, `--hover`
+- output: `-fmt`, `-o`, `-prefix`, `--height`, `-ratio`
+
+Outputs:
+
+- `<prefix>.tree.<fmt>` (`svg/png/pdf/html`)
+- `<prefix>.tree.nwk` when GRM is converted to NJ tree
+
+### 4.25 `gblupbench` (Python dispatcher mode)
+
+GBLUP engine benchmark across JanusX / sommer / rrBLUP / BLUPF90 family / HIBLUP.
+
+Examples:
+
+```bash
+jxpy gblupbench -bfile example_prefix -p pheno.tsv -n 0
+jxpy gblupbench -vcf example.vcf.gz -p pheno.tsv -n 0 --engines janusx,sommer,rrblup
+```
+
+Key options:
+
+- input: `-vcf/-hmp/-file/-bfile`, phenotype `-p`, trait selector `-n`
+- engine set: `--engines janusx,sommer,rrblup,blupf90,blupf90apy,hiblup`
+- CV/runtime: `--cv`, `--seed`, `-t`, `-chunksize`, `-limit-mem`
+- utility: `--check` (env + smoke test)
+
+Outputs:
+
+- benchmark workspace: `<prefix>.gblup_bench/`
+- summary: `summary/<prefix>.gblupbench.tsv`, `.md`
+- prediction compare artifacts: `summary/<prefix>.gblupbench.pred*`
+
+### 4.26 `beam` (direct script entry)
+
+AND-combination beam search over `JXBIN001` (`.bin`) genotype rows.
+
+Entry:
+
+```bash
+python -m janusx.script.beam -bin panel.bin -p pheno.tsv -n 0 -m 3 -nsnp 5 -ext 50000
+```
+
+Key options:
+
+- required: `-bin`, `-p`
+- trait selection: `-n`
+- search control: `-m` (max-pick), `-nsnp`, `-ext`, `-step`
+- optional output prefix: `-o`
+
+Outputs:
+
+- `<prefix>.beam.tsv`
+- `<prefix>.beam.windows.tsv`
+
 ## 5. Practical notes
 
 - Use `jx <module> -h` as the final authority when flags change.
 - For `-file` input, keep `prefix.id` consistent with genotype column order.
 - For large cohorts, prefer streaming/chunked workflows (`-chunksize`, low-memory modes).
 - Keep generated log files for reproducibility (`*.log`).
+- For a full structure/entrypoint matrix, see `doc/PROJECT_MAP.md`.

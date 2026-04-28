@@ -2095,6 +2095,7 @@ def build_grm_streaming(
     logger,
     use_spinner: bool = False,
     snps_only: bool = True,
+    allow_packed_full_load: bool = False,
 ) -> tuple[np.ndarray, int]:
     """
     Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
@@ -2104,7 +2105,7 @@ def build_grm_streaming(
         hasattr(jxrs, "grm_packed_f32")
         and hasattr(jxrs, "bed_packed_row_flip_mask")
     )
-    if packed_prefix is not None and has_packed_kernel:
+    if bool(allow_packed_full_load) and packed_prefix is not None and has_packed_kernel:
         _log_info(logger, f"Building GRM (packed BED + CBLAS), method={method}", use_spinner=use_spinner)
         pbar = _ProgressAdapter(total=n_snps, desc="GRM (packed-bed)", force_animate=True)
         process = psutil.Process()
@@ -2227,7 +2228,7 @@ def build_grm_streaming(
             prefetch_iter(chunk_iter, in_flight=prefetch_depth),
             n_samples=n_samples,
             method=method,
-            accumulate="gemm",
+            accumulate="auto",
             on_chunk=_on_grm_chunk,
         )
         # force bar to 100% even if SNPs were filtered in Rust
@@ -2337,6 +2338,8 @@ def load_or_build_grm_with_cache(
                     logger=logger,
                     use_spinner=use_spinner,
                     snps_only=bool(snps_only),
+                    # Streaming task: avoid full-load packed GRM path.
+                    allow_packed_full_load=False,
                 )
                 grm_msg = (
                     f"Calculating GRM from genotype (n={int(n_samples)}) "
@@ -5134,6 +5137,8 @@ def build_qmatrix_farmcpu(
                         logger=logger,
                         use_spinner=bool(use_spinner),
                         snps_only=bool(snps_only),
+                        # Full task (FarmCPU): allow packed full-load acceleration.
+                        allow_packed_full_load=True,
                     )
                     grm = np.asarray(grm, dtype="float32")
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"

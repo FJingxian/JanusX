@@ -2228,6 +2228,29 @@ fn parse_index_vec_i64(indices: &[i64], upper_bound: usize, label: &str) -> PyRe
     Ok(out)
 }
 
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn signed_hash_bucket_sign(seed: u64, row_idx: usize, n_buckets: usize) -> (usize, f32) {
+    let key = (row_idx as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let h_bucket = splitmix64(seed ^ key);
+    let bucket = (h_bucket % (n_buckets as u64)) as usize;
+    let h_sign = splitmix64(seed.wrapping_add(0x517CC1B727220A95) ^ key.rotate_left(17));
+    let sign = if (h_sign & 1) == 0 {
+        1.0_f32
+    } else {
+        -1.0_f32
+    };
+    (bucket, sign)
+}
+
 #[pyfunction]
 #[pyo3(signature = (packed, n_samples))]
 pub fn bed_packed_row_flip_mask<'py>(
@@ -2405,6 +2428,1002 @@ pub fn bed_packed_decode_rows_f32<'py>(
     };
     arr_slice.copy_from_slice(&out);
     Ok(arr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    n_buckets,
+    seed=20260428_u64,
+    sample_indices=None,
+    row_missing=None,
+    min_maf=0.0_f32,
+    max_missing=1.0_f32,
+    standardize=true,
+    threads=0
+))]
+pub fn bed_packed_signed_hash_f32<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_buckets: usize,
+    seed: u64,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_missing: Option<PyReadonlyArray1<'py, f32>>,
+    min_maf: f32,
+    max_missing: f32,
+    standardize: bool,
+    threads: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, f32, usize)> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if n_buckets == 0 {
+        return Err(PyRuntimeError::new_err("n_buckets must be > 0"));
+    }
+    if !(min_maf.is_finite() && min_maf >= 0.0_f32 && min_maf <= 0.5_f32) {
+        return Err(PyRuntimeError::new_err(
+            "min_maf must be finite and in [0, 0.5]",
+        ));
+    }
+    if !(max_missing.is_finite() && max_missing >= 0.0_f32 && max_missing <= 1.0_f32) {
+        return Err(PyRuntimeError::new_err(
+            "max_missing must be finite and in [0, 1]",
+        ));
+    }
+
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+    let row_missing_vec: Option<Vec<f32>> = match row_missing {
+        Some(arr) => {
+            let v: Vec<f32> = match arr.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => arr.as_array().iter().copied().collect(),
+            };
+            if v.len() != m {
+                return Err(PyRuntimeError::new_err(format!(
+                    "row_missing length mismatch: got {}, expected {m}",
+                    v.len()
+                )));
+            }
+            Some(v)
+        }
+        None => None,
+    };
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let sample_lut: Vec<(usize, u8)> = sample_idx
+        .iter()
+        .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
+        .collect();
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let out_len = n_buckets
+        .checked_mul(n_out)
+        .ok_or_else(|| PyRuntimeError::new_err("hashed output size overflow"))?;
+    let pool = get_cached_pool(threads)?;
+
+    let (mut out, scale, kept_snps) = py
+        .detach(|| -> Result<(Vec<f32>, f32, usize), String> {
+            let mut rows_by_bucket: Vec<Vec<usize>> =
+                (0..n_buckets).map(|_| Vec::new()).collect();
+            let mut sign_by_row = vec![0.0_f32; m];
+            let mut kept: usize = 0;
+
+            for row_idx in 0..m {
+                let maf = row_maf_vec[row_idx];
+                if !maf.is_finite() {
+                    continue;
+                }
+                if maf < min_maf || maf > 0.5_f32 {
+                    continue;
+                }
+                if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
+                    if !miss.is_finite() || miss > max_missing {
+                        continue;
+                    }
+                }
+                if standardize {
+                    let var = 2.0_f32 * maf * (1.0_f32 - maf);
+                    if !(var.is_finite() && var > 1e-12_f32) {
+                        continue;
+                    }
+                }
+                let (bucket, sign) = signed_hash_bucket_sign(seed, row_idx, n_buckets);
+                rows_by_bucket[bucket].push(row_idx);
+                sign_by_row[row_idx] = sign;
+                kept += 1;
+            }
+
+            if kept == 0 {
+                return Err(
+                    "No SNPs left after signed hashing filters; relax min_maf/max_missing."
+                        .to_string(),
+                );
+            }
+
+            let mut out = vec![0.0_f32; out_len];
+            let mut run = || {
+                out.par_chunks_mut(n_out)
+                    .enumerate()
+                    .for_each(|(bucket, out_row)| {
+                        let rows = &rows_by_bucket[bucket];
+                        if rows.is_empty() {
+                            return;
+                        }
+                        for &row_idx in rows.iter() {
+                            let row =
+                                &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                            let flip = row_flip_vec[row_idx];
+                            let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                            let mean_g = 2.0_f32 * maf;
+                            let denom = if standardize {
+                                (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
+                            } else {
+                                1.0_f32
+                            };
+                            let sign = sign_by_row[row_idx];
+                            for (j, &(byte_idx, shift_bits)) in sample_lut.iter().enumerate() {
+                                let b = row[byte_idx];
+                                let code = (b >> shift_bits) & 0b11;
+                                let mut gv = match code {
+                                    0b00 => 0.0_f32,
+                                    0b10 => 1.0_f32,
+                                    0b11 => 2.0_f32,
+                                    _ => mean_g, // missing -> mean impute
+                                };
+                                if flip && code != 0b01 {
+                                    gv = 2.0_f32 - gv;
+                                }
+                                let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                out_row[j] += sign * v;
+                            }
+                        }
+                    });
+            };
+            if let Some(tp) = &pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+
+            let mut sum_diag = 0.0_f64;
+            for j in 0..n_out {
+                let mut acc = 0.0_f64;
+                let mut idx = j;
+                for _ in 0..n_buckets {
+                    let v = out[idx] as f64;
+                    acc += v * v;
+                    idx += n_out;
+                }
+                sum_diag += acc;
+            }
+            let mean_diag = sum_diag / (n_out as f64);
+            let mut scale = mean_diag.sqrt() as f32;
+            if !scale.is_finite() || scale <= 0.0_f32 {
+                scale = 1.0_f32;
+            } else {
+                let inv_scale = 1.0_f32 / scale;
+                out.iter_mut().for_each(|v| *v *= inv_scale);
+            }
+
+            Ok((out, scale, kept))
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let arr = PyArray2::<f32>::zeros(py, [n_buckets, n_out], false).into_bound();
+    let arr_slice = unsafe {
+        arr.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err("output not contiguous"))?
+    };
+    arr_slice.copy_from_slice(&out);
+    out.clear();
+    Ok((arr, scale, kept_snps))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    n_buckets,
+    train_sample_indices,
+    y_train,
+    seed=20260428_u64,
+    row_missing=None,
+    min_maf=0.0_f32,
+    max_missing=1.0_f32,
+    standardize=true,
+    threads=0,
+    sample_block=1024
+))]
+pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_buckets: usize,
+    train_sample_indices: PyReadonlyArray1<'py, i64>,
+    y_train: PyReadonlyArray1<'py, f64>,
+    seed: u64,
+    row_missing: Option<PyReadonlyArray1<'py, f32>>,
+    min_maf: f32,
+    max_missing: f32,
+    standardize: bool,
+    threads: usize,
+    sample_block: usize,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+    usize,
+)> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if n_buckets == 0 {
+        return Err(PyRuntimeError::new_err("n_buckets must be > 0"));
+    }
+    if !(min_maf.is_finite() && min_maf >= 0.0_f32 && min_maf <= 0.5_f32) {
+        return Err(PyRuntimeError::new_err(
+            "min_maf must be finite and in [0, 0.5]",
+        ));
+    }
+    if !(max_missing.is_finite() && max_missing >= 0.0_f32 && max_missing <= 1.0_f32) {
+        return Err(PyRuntimeError::new_err(
+            "max_missing must be finite and in [0, 1]",
+        ));
+    }
+
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+    let row_missing_vec: Option<Vec<f32>> = match row_missing {
+        Some(arr) => {
+            let v: Vec<f32> = match arr.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => arr.as_array().iter().copied().collect(),
+            };
+            if v.len() != m {
+                return Err(PyRuntimeError::new_err(format!(
+                    "row_missing length mismatch: got {}, expected {m}",
+                    v.len()
+                )));
+            }
+            Some(v)
+        }
+        None => None,
+    };
+
+    let train_idx =
+        parse_index_vec_i64(train_sample_indices.as_slice()?, n_samples, "train_sample_indices")?;
+    if train_idx.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "train_sample_indices must not be empty",
+        ));
+    }
+    let n_train = train_idx.len();
+    let y_vec: Cow<[f64]> = match y_train.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(y_train.as_array().iter().copied().collect()),
+    };
+    if y_vec.len() != n_train {
+        return Err(PyRuntimeError::new_err(format!(
+            "y_train length mismatch: got {}, expected {}",
+            y_vec.len(),
+            n_train
+        )));
+    }
+    let sample_lut: Vec<(usize, u8)> = train_idx
+        .iter()
+        .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
+        .collect();
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+
+    let (gram_vec, row_sum_vec, row_sq_sum_vec, zy_vec, scale, kept_snps) = py
+        .detach(|| -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64, usize), String> {
+            let mut rows_by_bucket: Vec<Vec<usize>> =
+                (0..n_buckets).map(|_| Vec::new()).collect();
+            let mut sign_by_row = vec![0.0_f32; m];
+            let mut kept: usize = 0;
+            for row_idx in 0..m {
+                let maf = row_maf_vec[row_idx];
+                if !maf.is_finite() {
+                    continue;
+                }
+                if maf < min_maf || maf > 0.5_f32 {
+                    continue;
+                }
+                if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
+                    if !miss.is_finite() || miss > max_missing {
+                        continue;
+                    }
+                }
+                if standardize {
+                    let var = 2.0_f32 * maf * (1.0_f32 - maf);
+                    if !(var.is_finite() && var > 1e-12_f32) {
+                        continue;
+                    }
+                }
+                let (bucket, sign) = signed_hash_bucket_sign(seed, row_idx, n_buckets);
+                rows_by_bucket[bucket].push(row_idx);
+                sign_by_row[row_idx] = sign;
+                kept += 1;
+            }
+            if kept == 0 {
+                return Err(
+                    "No SNPs left after signed hashing filters; relax min_maf/max_missing."
+                        .to_string(),
+                );
+            }
+
+            let mut gram = vec![0.0_f32; n_buckets * n_buckets];
+            let mut row_sum = vec![0.0_f64; n_buckets];
+            let mut row_sq_sum = vec![0.0_f64; n_buckets];
+            let mut zy = vec![0.0_f64; n_buckets];
+            let step = sample_block.max(1);
+
+            for st in (0..n_train).step_by(step) {
+                let ed = (st + step).min(n_train);
+                let b = ed - st;
+                if b == 0 {
+                    continue;
+                }
+                let lut_blk = &sample_lut[st..ed];
+                let y_blk = &y_vec[st..ed];
+                let mut z_blk = vec![0.0_f32; n_buckets * b];
+
+                let mut decode_run = || {
+                    z_blk
+                        .par_chunks_mut(b)
+                        .enumerate()
+                        .for_each(|(bucket, out_row)| {
+                            let rows = &rows_by_bucket[bucket];
+                            if rows.is_empty() {
+                                return;
+                            }
+                            for &row_idx in rows.iter() {
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[row_idx];
+                                let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                let mean_g = 2.0_f32 * maf;
+                                let denom = if standardize {
+                                    (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
+                                } else {
+                                    1.0_f32
+                                };
+                                let sign = sign_by_row[row_idx];
+                                for (j, &(byte_idx, shift_bits)) in lut_blk.iter().enumerate() {
+                                    let bcode = row[byte_idx];
+                                    let code = (bcode >> shift_bits) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g,
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                    out_row[j] += sign * v;
+                                }
+                            }
+                        });
+                };
+                if let Some(tp) = &pool {
+                    tp.install(&mut decode_run);
+                } else {
+                    decode_run();
+                }
+
+                for bucket in 0..n_buckets {
+                    let row = &z_blk[bucket * b..(bucket + 1) * b];
+                    let mut sum = 0.0_f64;
+                    let mut sq = 0.0_f64;
+                    let mut doty = 0.0_f64;
+                    for j in 0..b {
+                        let v = row[j] as f64;
+                        sum += v;
+                        sq += v * v;
+                        doty += v * y_blk[j];
+                    }
+                    row_sum[bucket] += sum;
+                    row_sq_sum[bucket] += sq;
+                    zy[bucket] += doty;
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                unsafe {
+                    cblas_sgemm_dispatch(
+                        CBLAS_COL_MAJOR,
+                        CBLAS_TRANS,
+                        CBLAS_NO_TRANS,
+                        n_buckets as CblasInt,
+                        n_buckets as CblasInt,
+                        b as CblasInt,
+                        1.0,
+                        z_blk.as_ptr(),
+                        b as CblasInt,
+                        z_blk.as_ptr(),
+                        b as CblasInt,
+                        1.0,
+                        gram.as_mut_ptr(),
+                        n_buckets as CblasInt,
+                    );
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                unsafe {
+                    sgemm(
+                        n_buckets,
+                        n_buckets,
+                        b,
+                        1.0,
+                        z_blk.as_ptr(),
+                        b as isize,
+                        1,
+                        z_blk.as_ptr(),
+                        b as isize,
+                        1,
+                        1.0,
+                        gram.as_mut_ptr(),
+                        n_buckets as isize,
+                        1,
+                    );
+                }
+            }
+
+            let mut sum_diag = 0.0_f64;
+            for v in row_sq_sum.iter() {
+                sum_diag += *v;
+            }
+            let mean_diag = sum_diag / (n_train as f64);
+            let mut scale = mean_diag.sqrt();
+            if !scale.is_finite() || scale <= 0.0_f64 {
+                scale = 1.0_f64;
+            }
+            let inv = 1.0_f64 / scale;
+            let inv2 = inv * inv;
+            for v in row_sum.iter_mut() {
+                *v *= inv;
+            }
+            for v in row_sq_sum.iter_mut() {
+                *v *= inv2;
+            }
+            for v in zy.iter_mut() {
+                *v *= inv;
+            }
+            for v in gram.iter_mut() {
+                *v *= inv2 as f32;
+            }
+
+            for i in 0..n_buckets {
+                for j in (i + 1)..n_buckets {
+                    let a = 0.5_f32 * (gram[i * n_buckets + j] + gram[j * n_buckets + i]);
+                    gram[i * n_buckets + j] = a;
+                    gram[j * n_buckets + i] = a;
+                }
+            }
+
+            let gram_f64: Vec<f64> = gram.into_iter().map(|v| v as f64).collect();
+            Ok((gram_f64, row_sum, row_sq_sum, zy, scale, kept))
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let gram_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n_buckets, n_buckets), gram_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let row_sum_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_sum_vec)).into_bound();
+    let row_sq_sum_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(row_sq_sum_vec)).into_bound();
+    let zy_arr = PyArray1::from_owned_array(py, Array1::from_vec(zy_vec)).into_bound();
+    Ok((gram_arr, row_sum_arr, row_sq_sum_arr, zy_arr, scale, kept_snps))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    n_buckets,
+    train_sample_indices,
+    test_sample_indices=None,
+    seed=20260428_u64,
+    row_missing=None,
+    min_maf=0.0_f32,
+    max_missing=1.0_f32,
+    standardize=true,
+    threads=0,
+    bucket_block=64
+))]
+pub fn bed_packed_signed_hash_kernels_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    n_buckets: usize,
+    train_sample_indices: PyReadonlyArray1<'py, i64>,
+    test_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    seed: u64,
+    row_missing: Option<PyReadonlyArray1<'py, f32>>,
+    min_maf: f32,
+    max_missing: f32,
+    standardize: bool,
+    threads: usize,
+    bucket_block: usize,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>, usize)> {
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if n_buckets == 0 {
+        return Err(PyRuntimeError::new_err("n_buckets must be > 0"));
+    }
+    if !(min_maf.is_finite() && min_maf >= 0.0_f32 && min_maf <= 0.5_f32) {
+        return Err(PyRuntimeError::new_err(
+            "min_maf must be finite and in [0, 0.5]",
+        ));
+    }
+    if !(max_missing.is_finite() && max_missing >= 0.0_f32 && max_missing <= 1.0_f32) {
+        return Err(PyRuntimeError::new_err(
+            "max_missing must be finite and in [0, 1]",
+        ));
+    }
+
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+    let row_missing_vec: Option<Vec<f32>> = match row_missing {
+        Some(arr) => {
+            let v: Vec<f32> = match arr.as_slice() {
+                Ok(s) => s.to_vec(),
+                Err(_) => arr.as_array().iter().copied().collect(),
+            };
+            if v.len() != m {
+                return Err(PyRuntimeError::new_err(format!(
+                    "row_missing length mismatch: got {}, expected {m}",
+                    v.len()
+                )));
+            }
+            Some(v)
+        }
+        None => None,
+    };
+
+    let train_idx = parse_index_vec_i64(train_sample_indices.as_slice()?, n_samples, "train_sample_indices")?;
+    if train_idx.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "train_sample_indices must not be empty",
+        ));
+    }
+    let test_idx: Vec<usize> = if let Some(sidx) = test_sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "test_sample_indices")?
+    } else {
+        Vec::new()
+    };
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    let train_lut: Vec<(usize, u8)> = train_idx
+        .iter()
+        .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
+        .collect();
+    let test_lut: Vec<(usize, u8)> = test_idx
+        .iter()
+        .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
+        .collect();
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+
+    let (train_grm_f64, test_train_f64, kept_snps) = py
+        .detach(|| -> Result<(Vec<f64>, Vec<f64>, usize), String> {
+            let mut rows_by_bucket: Vec<Vec<usize>> =
+                (0..n_buckets).map(|_| Vec::new()).collect();
+            let mut sign_by_row = vec![0.0_f32; m];
+            let mut kept: usize = 0;
+            for row_idx in 0..m {
+                let maf = row_maf_vec[row_idx];
+                if !maf.is_finite() {
+                    continue;
+                }
+                if maf < min_maf || maf > 0.5_f32 {
+                    continue;
+                }
+                if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
+                    if !miss.is_finite() || miss > max_missing {
+                        continue;
+                    }
+                }
+                if standardize {
+                    let var = 2.0_f32 * maf * (1.0_f32 - maf);
+                    if !(var.is_finite() && var > 1e-12_f32) {
+                        continue;
+                    }
+                }
+                let (bucket, sign) = signed_hash_bucket_sign(seed, row_idx, n_buckets);
+                rows_by_bucket[bucket].push(row_idx);
+                sign_by_row[row_idx] = sign;
+                kept += 1;
+            }
+            if kept == 0 {
+                return Err(
+                    "No SNPs left after signed hashing filters; relax min_maf/max_missing."
+                        .to_string(),
+                );
+            }
+
+            let train_grm_len = n_train
+                .checked_mul(n_train)
+                .ok_or_else(|| "train_grm allocation overflow".to_string())?;
+            let cross_len = n_test
+                .checked_mul(n_train)
+                .ok_or_else(|| "test_train_grm allocation overflow".to_string())?;
+            let mut train_grm = vec![0.0_f32; train_grm_len];
+            let mut test_train = vec![0.0_f32; cross_len];
+            let mut var_sum_total = 0.0_f64;
+            let block_sz = bucket_block.max(1);
+
+            for b0 in (0..n_buckets).step_by(block_sz) {
+                let b1 = (b0 + block_sz).min(n_buckets);
+                let cur = b1 - b0;
+                if cur == 0 {
+                    continue;
+                }
+                let train_blk_len = cur
+                    .checked_mul(n_train)
+                    .ok_or_else(|| "train block allocation overflow".to_string())?;
+                let mut train_blk = vec![0.0_f32; train_blk_len];
+                let mut var_blk = vec![0.0_f32; cur];
+                let rows_blk = &rows_by_bucket[b0..b1];
+
+                if n_test > 0 {
+                    let test_blk_len = cur
+                        .checked_mul(n_test)
+                        .ok_or_else(|| "test block allocation overflow".to_string())?;
+                    let mut test_blk = vec![0.0_f32; test_blk_len];
+
+                    let mut decode_run = || {
+                        train_blk
+                            .par_chunks_mut(n_train)
+                            .zip(test_blk.par_chunks_mut(n_test))
+                            .zip(var_blk.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(off, ((train_row, test_row), var_dst))| {
+                                let rows = &rows_blk[off];
+                                for &row_idx in rows.iter() {
+                                    let row = &packed_flat
+                                        [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                    let flip = row_flip_vec[row_idx];
+                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                    let mean_g = 2.0_f32 * maf;
+                                    let denom = if standardize {
+                                        (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
+                                    } else {
+                                        1.0_f32
+                                    };
+                                    let sign = sign_by_row[row_idx];
+                                    for (j, &(byte_idx, shift_bits)) in train_lut.iter().enumerate() {
+                                        let b = row[byte_idx];
+                                        let code = (b >> shift_bits) & 0b11;
+                                        let mut gv = match code {
+                                            0b00 => 0.0_f32,
+                                            0b10 => 1.0_f32,
+                                            0b11 => 2.0_f32,
+                                            _ => mean_g,
+                                        };
+                                        if flip && code != 0b01 {
+                                            gv = 2.0_f32 - gv;
+                                        }
+                                        let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                        train_row[j] += sign * v;
+                                    }
+                                    for (j, &(byte_idx, shift_bits)) in test_lut.iter().enumerate() {
+                                        let b = row[byte_idx];
+                                        let code = (b >> shift_bits) & 0b11;
+                                        let mut gv = match code {
+                                            0b00 => 0.0_f32,
+                                            0b10 => 1.0_f32,
+                                            0b11 => 2.0_f32,
+                                            _ => mean_g,
+                                        };
+                                        if flip && code != 0b01 {
+                                            gv = 2.0_f32 - gv;
+                                        }
+                                        let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                        test_row[j] += sign * v;
+                                    }
+                                }
+                                let mean = train_row.iter().copied().sum::<f32>() / (n_train as f32);
+                                let mut var_acc = 0.0_f32;
+                                for v in train_row.iter_mut() {
+                                    let c = *v - mean;
+                                    *v = c;
+                                    var_acc += c * c;
+                                }
+                                *var_dst = var_acc / (n_train as f32);
+                                for v in test_row.iter_mut() {
+                                    *v -= mean;
+                                }
+                            });
+                    };
+                    if let Some(tp) = &pool {
+                        tp.install(&mut decode_run);
+                    } else {
+                        decode_run();
+                    }
+
+                    var_sum_total += var_blk.iter().map(|&v| v as f64).sum::<f64>();
+                    unsafe {
+                        sgemm(
+                            n_train,
+                            cur,
+                            n_train,
+                            1.0_f32,
+                            train_blk.as_ptr(),
+                            1,
+                            n_train as isize,
+                            train_blk.as_ptr(),
+                            n_train as isize,
+                            1,
+                            1.0_f32,
+                            train_grm.as_mut_ptr(),
+                            n_train as isize,
+                            1,
+                        );
+                        sgemm(
+                            n_test,
+                            cur,
+                            n_train,
+                            1.0_f32,
+                            test_blk.as_ptr(),
+                            1,
+                            n_test as isize,
+                            train_blk.as_ptr(),
+                            n_train as isize,
+                            1,
+                            1.0_f32,
+                            test_train.as_mut_ptr(),
+                            n_train as isize,
+                            1,
+                        );
+                    }
+                } else {
+                    let mut decode_run = || {
+                        train_blk
+                            .par_chunks_mut(n_train)
+                            .zip(var_blk.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(off, (train_row, var_dst))| {
+                                let rows = &rows_blk[off];
+                                for &row_idx in rows.iter() {
+                                    let row = &packed_flat
+                                        [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                    let flip = row_flip_vec[row_idx];
+                                    let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                    let mean_g = 2.0_f32 * maf;
+                                    let denom = if standardize {
+                                        (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
+                                    } else {
+                                        1.0_f32
+                                    };
+                                    let sign = sign_by_row[row_idx];
+                                    for (j, &(byte_idx, shift_bits)) in train_lut.iter().enumerate() {
+                                        let b = row[byte_idx];
+                                        let code = (b >> shift_bits) & 0b11;
+                                        let mut gv = match code {
+                                            0b00 => 0.0_f32,
+                                            0b10 => 1.0_f32,
+                                            0b11 => 2.0_f32,
+                                            _ => mean_g,
+                                        };
+                                        if flip && code != 0b01 {
+                                            gv = 2.0_f32 - gv;
+                                        }
+                                        let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                        train_row[j] += sign * v;
+                                    }
+                                }
+                                let mean = train_row.iter().copied().sum::<f32>() / (n_train as f32);
+                                let mut var_acc = 0.0_f32;
+                                for v in train_row.iter_mut() {
+                                    let c = *v - mean;
+                                    *v = c;
+                                    var_acc += c * c;
+                                }
+                                *var_dst = var_acc / (n_train as f32);
+                            });
+                    };
+                    if let Some(tp) = &pool {
+                        tp.install(&mut decode_run);
+                    } else {
+                        decode_run();
+                    }
+
+                    var_sum_total += var_blk.iter().map(|&v| v as f64).sum::<f64>();
+                    unsafe {
+                        sgemm(
+                            n_train,
+                            cur,
+                            n_train,
+                            1.0_f32,
+                            train_blk.as_ptr(),
+                            1,
+                            n_train as isize,
+                            train_blk.as_ptr(),
+                            n_train as isize,
+                            1,
+                            1.0_f32,
+                            train_grm.as_mut_ptr(),
+                            n_train as isize,
+                            1,
+                        );
+                    }
+                }
+            }
+
+            if !(var_sum_total.is_finite() && var_sum_total > 0.0_f64) {
+                return Err("Invalid hashed GBLUP denominator (sum(var)<=0).".to_string());
+            }
+            let inv = (1.0_f64 / var_sum_total) as f32;
+            train_grm.iter_mut().for_each(|v| *v *= inv);
+            test_train.iter_mut().for_each(|v| *v *= inv);
+
+            for i in 0..n_train {
+                for j in (i + 1)..n_train {
+                    let a = 0.5_f32 * (train_grm[i * n_train + j] + train_grm[j * n_train + i]);
+                    train_grm[i * n_train + j] = a;
+                    train_grm[j * n_train + i] = a;
+                }
+            }
+
+            let train_grm_f64: Vec<f64> = train_grm.into_iter().map(|v| v as f64).collect();
+            let test_train_f64: Vec<f64> = test_train.into_iter().map(|v| v as f64).collect();
+            Ok((train_grm_f64, test_train_f64, kept))
+        })
+        .map_err(_map_err_string_to_py)?;
+
+    let train_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n_train, n_train), train_grm_f64)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    let cross_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n_test, n_train), test_train_f64)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok((train_arr, cross_arr, kept_snps))
 }
 
 #[pyfunction]

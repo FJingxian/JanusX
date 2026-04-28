@@ -575,7 +575,10 @@ jobs:
             echo "Invalid tag for Bioconda update: '$TAG'"
             exit 1
           fi
-          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          VERSION="${TAG#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          # Use per-version branch to avoid collisions with old closed PRs.
+          echo "BIOCONDA_BRANCH=update-janusx-v${VERSION}" >> "$GITHUB_ENV"
 
       - name: Wait for PyPI sdist
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
@@ -640,89 +643,69 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import re
           from pathlib import Path
-          from textwrap import dedent
 
           version = os.environ["VERSION"]
           sha = os.environ["SHA256"]
+          md5 = os.environ.get("MD5", "").strip()
           path = Path("bioconda-recipes/recipes/janusx/meta.yaml")
-          path.parent.mkdir(parents=True, exist_ok=True)
+          if not path.exists():
+              raise SystemExit(f"Bioconda recipe not found: {path}")
 
-          text = dedent(f"""\
-          {{% set version = "{version}" %}}
+          text = path.read_text(encoding="utf-8")
 
-          package:
-            name: janusx
-            version: {{{{ version }}}}
+          text, n_ver = re.subn(
+              r'(?m)^\s*\{%\s*set\s+version\s*=\s*"[^"]+"\s*%\}\s*$',
+              f'{{% set version = "{version}" %}}',
+              text,
+              count=1,
+          )
+          if n_ver != 1:
+              raise SystemExit("Failed to update recipe version line.")
 
-          source:
-            url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{{{ version }}}}.tar.gz
-            sha256: {sha}
+          text, n_sha = re.subn(
+              r'(?m)^(\s*sha256:\s*)[0-9a-fA-F]{32,}\s*$',
+              rf"\g<1>{sha}",
+              text,
+              count=1,
+          )
+          if n_sha != 1:
+              raise SystemExit("Failed to update recipe sha256.")
 
-          build:
-            number: 0
-            script: "{{{{ PYTHON }}}} -m pip install . -vv --no-deps"
-            run_exports:
-              - {{{{ pin_subpackage('janusx', max_pin='x') }}}}
-
-          requirements:
-            build:
-              - {{{{ compiler('c') }}}}
-              - {{{{ stdlib('c') }}}}
-              - {{{{ compiler('rust') }}}}
-            host:
-              - python
-              - pip
-              - maturin >=1.7,<2
-              - setuptools
-            run:
-              - python >=3.9
-              - numpy
-              - scipy
-              - pandas <3.0
-              - matplotlib-base
-              - psutil
-              - rich
-              - tqdm
-              - rich-argparse
-              - joblib >=1.5
-
-          test:
-            imports:
-              - janusx
-            commands:
-              - jxpy -h
-
-          about:
-            home: https://github.com/FJingxian/JanusX
-            summary: A suite of genotyping tools for genome-wide association study and genomic selection
-            license: AGPL-3.0-or-later
-            license_file: LICENSE
-
-          extra:
-            recipe-maintainers:
-              - FJingxian
-          """)
+          if md5 != "":
+              text, _ = re.subn(
+                  r'(?m)^(\s*md5:\s*)[0-9a-fA-F]{32,}\s*$',
+                  rf"\g<1>{md5}",
+                  text,
+                  count=1,
+              )
 
           path.write_text(text, encoding="utf-8")
+          print(f"Updated {path} to version={version}, sha256={sha}")
           PY
         env:
           SHA256: ${{ steps.sdist_hash.outputs.sha256 }}
+          MD5: ${{ steps.sdist_hash.outputs.md5 }}
 
       - name: Commit and push
+        id: commit_recipe
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
           cd bioconda-recipes
           git add recipes/janusx/meta.yaml
-          git commit -m "Update janusx to ${VERSION}" || {
+          if git diff --cached --quiet; then
             echo "No changes to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
-          }
+          fi
+          git commit -m "Update janusx to ${VERSION}"
           git push origin "${BIOCONDA_BRANCH}" --force-with-lease
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Create or update PR
-        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' && steps.commit_recipe.outputs.changed == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.BIOCONDA_PAT }}
@@ -753,7 +736,7 @@ jobs:
                 echo "[INFO] PR already exists; resolving existing PR number."
                 pr="$(gh pr list \
                   --repo bioconda/bioconda-recipes \
-                  --search "is:open head:${BIOCONDA_BRANCH}" \
+                  --search "is:open head:${OWNER}:${BIOCONDA_BRANCH}" \
                   --state open \
                   --json number \
                   -q '.[0].number')"
@@ -773,6 +756,10 @@ jobs:
           fi
 
           if [[ -n "${pr}" ]]; then
+            gh pr comment \
+              --repo bioconda/bioconda-recipes \
+              --body "@BiocondaBot please add label" \
+              "${pr}" || true
             gh pr comment \
               --repo bioconda/bioconda-recipes \
               --body "Updated janusx to ${VERSION} via automated release workflow." \

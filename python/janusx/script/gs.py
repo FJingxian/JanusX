@@ -63,6 +63,7 @@ import sys
 import re
 import math
 import gc
+from dataclasses import dataclass
 from collections import OrderedDict
 import multiprocessing as mp
 import queue as queue_mod
@@ -87,6 +88,7 @@ logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from scipy.optimize import minimize_scalar
 from scipy.stats import pearsonr, spearmanr
 try:
     from sklearn.model_selection import KFold
@@ -95,9 +97,15 @@ except Exception:
 from janusx.bioplotkit.sci_set import color_set
 from janusx.bioplotkit import gsplot
 from janusx._optional_deps import format_missing_dependency_message
-from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, load_bed_2bit_packed
+from janusx.gfreader import (
+    inspect_genotype_file,
+    load_genotype_chunks,
+    load_bed_2bit_packed,
+    prepare_cli_input_cache,
+)
 from janusx.pyBLUP.kfold import kfold
 from janusx.pyBLUP.mlm import BLUP as MLMBLUP
+from janusx.pyBLUP.QK2 import GRM as _QK2_GRM
 from janusx.pyBLUP.bayes import BAYES
 from janusx.pyBLUP.ml import (
     MLGS,
@@ -141,6 +149,11 @@ from ._common.colspec import parse_zero_based_index_specs
 from ._common.threads import maybe_warn_non_openblas, require_openblas_by_default
 
 try:
+    from janusx import janusx as _jxrs
+except Exception:
+    _jxrs = None
+
+try:
     from tqdm.auto import tqdm
     _HAS_TQDM = True
 except Exception:
@@ -160,6 +173,78 @@ _ML_METHOD_MAP: dict[str, str] = {
     "SVM": "svm",
     "ENET": "enet",
 }
+
+
+@dataclass
+class _GsLdPruneSpec:
+    window_variants: int | None
+    window_bp: int | None
+    step_variants: int
+    r2_threshold: float
+
+    def label(self) -> str:
+        if self.window_bp is not None:
+            return (
+                f"window={int(self.window_bp)}bp, "
+                f"step={int(self.step_variants)}, r2={float(self.r2_threshold):.4f}"
+            )
+        return (
+            f"window={int(self.window_variants or 0)} variants, "
+            f"step={int(self.step_variants)}, r2={float(self.r2_threshold):.4f}"
+        )
+
+
+def _parse_ld_prune_window(token: str) -> tuple[int | None, int | None]:
+    t = str(token).strip().lower()
+    if t == "":
+        raise ValueError("Empty LD prune window token.")
+    if t.endswith("kb"):
+        v = float(t[:-2].strip())
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"Invalid LD prune window (kb): {token}")
+        return None, int(max(1, round(v * 1000.0)))
+    if t.endswith("bp"):
+        v = float(t[:-2].strip())
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"Invalid LD prune window (bp): {token}")
+        return None, int(max(1, round(v)))
+    v = float(t)
+    if not np.isfinite(v) or v <= 0:
+        raise ValueError(f"Invalid LD prune window: {token}")
+    # Keep gformat-compatible semantics: numeric window defaults to kb.
+    return None, int(max(1, round(v * 1000.0)))
+
+
+def _parse_ld_prune_args(values: list[str] | None) -> _GsLdPruneSpec | None:
+    if values is None:
+        return None
+    if len(values) != 3:
+        raise ValueError(
+            "Invalid --ldprune usage. Expected 3 values: "
+            "--ldprune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>"
+        )
+    w_var, w_bp = _parse_ld_prune_window(values[0])
+    step = int(float(str(values[1]).strip()))
+    if step <= 0:
+        raise ValueError(f"--ldprune step must be > 0, got {values[1]!r}")
+    r2 = float(str(values[2]).strip())
+    if (not np.isfinite(r2)) or (r2 <= 0.0) or (r2 > 1.0):
+        raise ValueError(
+            f"--ldprune r^2 threshold must be in (0, 1], got {values[2]!r}"
+        )
+    return _GsLdPruneSpec(
+        window_variants=w_var,
+        window_bp=w_bp,
+        step_variants=int(step),
+        r2_threshold=float(r2),
+    )
+
+
+def _is_plink_prefix(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix).strip()
+    if p == "":
+        return False
+    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -289,8 +374,11 @@ def _parse_nonnegative_int(raw: object) -> int | None:
 def _split_runtime_threads(total_threads: int, policy: str) -> tuple[int, int, str]:
     total = max(1, int(total_threads))
     p = str(policy).strip().lower()
-    if p not in {"auto", "blas", "balanced", "split", "rust"}:
+    if p not in {"auto", "align", "blas", "balanced", "split", "rust"}:
         p = "auto"
+    if p == "align":
+        # Keep BLAS and Rust thread caps identical to `-t`.
+        return total, total, p
     if p == "auto":
         # Auto heuristic: favor BLAS on small/medium cores, split on larger hosts.
         p = "blas" if total <= 4 else ("balanced" if total <= 12 else "split")
@@ -557,6 +645,254 @@ def _resolve_train_pred_local_indices(
     )
     picked.sort()
     return np.ascontiguousarray(picked, dtype=np.int64)
+
+
+def _build_gblup_cv_grm_once(
+    *,
+    train_snp: np.ndarray | None,
+    packed_ctx: dict[str, typing.Any] | None,
+    train_sample_indices: np.ndarray | None,
+    n_jobs: int,
+) -> np.ndarray | None:
+    """
+    Build one GRM for GBLUP-CV and reuse it by slicing in each fold.
+    """
+    if packed_ctx is not None:
+        if train_sample_indices is None:
+            raise ValueError("Packed GBLUP-CV requires train sample indices.")
+        if _jxrs is None:
+            return None
+        if (not hasattr(_jxrs, "grm_packed_f32")) or (
+            not hasattr(_jxrs, "bed_packed_row_flip_mask")
+        ):
+            return None
+
+        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+        maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+        n_samples = int(packed_ctx["n_samples"])
+        if packed.ndim != 2:
+            raise ValueError("Invalid packed payload: packed must be 2D.")
+        if maf.shape[0] != packed.shape[0]:
+            raise ValueError(
+                f"Packed payload mismatch: maf={maf.shape[0]}, packed_rows={packed.shape[0]}."
+            )
+        exp_bps = (n_samples + 3) // 4
+        if int(packed.shape[1]) != int(exp_bps):
+            raise ValueError(
+                f"Packed payload mismatch: bytes_per_snp={packed.shape[1]}, expected={exp_bps}."
+            )
+
+        row_flip_raw = packed_ctx.get("row_flip", None)
+        if row_flip_raw is None:
+            row_flip = np.asarray(
+                _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+                dtype=np.bool_,
+            )
+            row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+            packed_ctx["row_flip"] = row_flip
+        else:
+            row_flip = np.ascontiguousarray(
+                np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            if row_flip.shape[0] != packed.shape[0]:
+                raise ValueError(
+                    "Packed payload mismatch: row_flip length does not match packed rows."
+                )
+
+        sidx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+        if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
+            raise ValueError("train sample indices contain out-of-range values.")
+        full_identity = bool(
+            int(sidx.size) == int(n_samples)
+            and np.array_equal(sidx, np.arange(n_samples, dtype=np.int64))
+        )
+        sidx_arg = None if full_identity else sidx
+        block_cols = max(1, min(4096, int(sidx.size) if sidx.size > 0 else int(n_samples)))
+
+        grm_raw = _jxrs.grm_packed_f32(
+            packed,
+            int(n_samples),
+            row_flip,
+            maf,
+            sample_indices=sidx_arg,
+            method=1,
+            block_cols=int(block_cols),
+            threads=max(1, int(n_jobs)),
+            progress_callback=None,
+            progress_every=0,
+        )
+        grm = np.asarray(grm_raw, dtype=np.float64)
+    else:
+        if train_snp is None:
+            return None
+        grm = np.asarray(_QK2_GRM(np.asarray(train_snp, dtype=np.float32), log=False), dtype=np.float64)
+
+    if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
+        raise ValueError(f"GBLUP CV GRM must be square; got shape={grm.shape}.")
+    grm = 0.5 * (grm + grm.T)
+    return np.ascontiguousarray(grm, dtype=np.float64)
+
+
+def _fit_gblup_reml_from_grm(
+    y: np.ndarray,
+    grm: np.ndarray,
+) -> dict[str, typing.Any]:
+    """
+    Fit intercept-only GBLUP from a precomputed train-train GRM block.
+    """
+    y_vec = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+    g_base = np.asarray(grm, dtype=np.float64)
+    if y_vec.shape[0] != g_base.shape[0] or g_base.shape[0] != g_base.shape[1]:
+        raise ValueError(
+            f"GBLUP fit expects y and GRM with matching n. got y={y_vec.shape}, grm={g_base.shape}."
+        )
+    n = int(y_vec.shape[0])
+    if n == 0:
+        raise ValueError("GBLUP fit received empty training set.")
+
+    # Degenerate tiny folds: return mean-only predictor.
+    if n <= 1:
+        beta = float(y_vec[0, 0]) if n == 1 else 0.0
+        alpha = np.zeros((n, 1), dtype=np.float64)
+        return {
+            "beta": beta,
+            "alpha": alpha,
+            "pve": float("nan"),
+        }
+
+    x = np.ones((n, 1), dtype=np.float64)
+    g_fit = np.ascontiguousarray(0.5 * (g_base + g_base.T), dtype=np.float64)
+    g_fit += np.eye(n, dtype=np.float64) * np.float64(1e-6)
+    evals, evec = np.linalg.eigh(g_fit)
+    evals = np.asarray(evals, dtype=np.float64)
+    evec = np.asarray(evec, dtype=np.float64)
+    max_eval = float(np.max(evals)) if evals.size > 0 else 0.0
+    eig_floor = max(
+        1e-12,
+        float(np.finfo(np.float64).eps * max(1.0, max_eval)),
+    )
+    evals = np.maximum(evals, eig_floor)
+
+    x_rot = evec.T @ x
+    y_rot = evec.T @ y_vec
+    v_floor = max(1e-12, float(np.finfo(np.float64).tiny))
+    n_eff = int(n - 1)
+    if n_eff <= 0:
+        beta = float(np.mean(y_vec))
+        alpha = np.zeros((n, 1), dtype=np.float64)
+        return {
+            "beta": beta,
+            "alpha": alpha,
+            "pve": float("nan"),
+        }
+
+    def _reml_at_lambda(lbd: float) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        lam = float(lbd)
+        if (not np.isfinite(lam)) or (lam <= 0.0):
+            lam = float(v_floor)
+        v = np.maximum(evals + lam, v_floor)
+        v_inv = 1.0 / v
+        x_w = v_inv[:, None] * x_rot
+        y_w = v_inv[:, None] * y_rot
+        xtvx = x_rot.T @ x_w
+        xtvy = x_rot.T @ y_w
+        xtvx_00 = float(xtvx[0, 0]) if xtvx.size > 0 else 0.0
+        if (not np.isfinite(xtvx_00)) or (xtvx_00 <= v_floor):
+            xtvx_00 = float(v_floor)
+        beta = np.array([[float(xtvy[0, 0]) / xtvx_00]], dtype=np.float64)
+        r = y_rot - x_rot @ beta
+        rtv = float(np.sum((r.reshape(-1) ** 2) * v_inv))
+        if (not np.isfinite(rtv)) or (rtv <= v_floor):
+            rtv = float(v_floor)
+        log_det_v = float(np.sum(np.log(v)))
+        log_det_xtvx = float(np.log(xtvx_00))
+        total_log = float(n_eff) * float(np.log(rtv)) + log_det_v + log_det_xtvx
+        c = float(n_eff) * (float(np.log(float(n_eff))) - 1.0 - float(np.log(2.0 * np.pi))) / 2.0
+        return c - total_log / 2.0, beta, r, v_inv, rtv
+
+    def _objective(log10_lbd: float) -> float:
+        lbd = 10.0 ** float(log10_lbd)
+        ll, _beta, _r, _v_inv, _rtv = _reml_at_lambda(lbd)
+        return -float(ll)
+
+    opt = minimize_scalar(_objective, bounds=(-6, 6), method="bounded")
+    log10_lbd = float(opt.x) if np.isfinite(float(opt.x)) else 0.0
+    lbd = float(10.0 ** log10_lbd)
+    _ll, beta_mat, r, v_inv, rtv = _reml_at_lambda(lbd)
+
+    rhs = v_inv[:, None] * r
+    alpha = evec @ rhs
+    sigma_g2 = float(rtv) / float(max(1, n_eff))
+    sigma_e2 = float(lbd) * sigma_g2
+    var_g = sigma_g2 * float(np.mean(evals))
+    denom = var_g + sigma_e2
+    pve = float(var_g / denom) if (np.isfinite(denom) and denom > 0.0) else float("nan")
+    beta = float(beta_mat[0, 0])
+
+    return {
+        "beta": beta,
+        "alpha": np.ascontiguousarray(alpha, dtype=np.float64),
+        "pve": float(pve),
+    }
+
+
+def _predict_gblup_from_cross(
+    *,
+    cross_kernel: np.ndarray,
+    alpha: np.ndarray,
+    beta: float,
+) -> np.ndarray:
+    cross = np.asarray(cross_kernel, dtype=np.float64)
+    a = np.asarray(alpha, dtype=np.float64).reshape(-1, 1)
+    if cross.ndim != 2:
+        raise ValueError(f"cross kernel must be 2D, got shape={cross.shape}.")
+    if cross.shape[1] != a.shape[0]:
+        raise ValueError(
+            f"cross kernel width ({cross.shape[1]}) != alpha length ({a.shape[0]})."
+        )
+    out = cross @ a + float(beta)
+    return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
+def _build_gblup_test_train_cross_from_markers(
+    test_snp: np.ndarray,
+    train_snp: np.ndarray,
+    *,
+    chunk_rows: int = 50_000,
+) -> np.ndarray:
+    """
+    Build cross-kernel K_test_train using train-side centering/variance:
+      K = (M_test - mu_train)^T (M_train - mu_train) / sum(var_train)
+    """
+    m, n_train = train_snp.shape
+    m_test, n_test = test_snp.shape
+    if int(m_test) != int(m):
+        raise ValueError(
+            f"test/train marker mismatch: test m={m_test}, train m={m}"
+        )
+    if int(n_test) == 0:
+        return np.zeros((0, int(n_train)), dtype=np.float64)
+
+    step = max(1, int(chunk_rows))
+    cross = np.zeros((int(n_test), int(n_train)), dtype=np.float64)
+    var_sum_total = 0.0
+
+    for st in range(0, int(m), step):
+        ed = min(st + step, int(m))
+        tr_blk = np.asarray(train_snp[st:ed], dtype=np.float32)
+        te_blk = np.asarray(test_snp[st:ed], dtype=np.float32)
+        mu_blk = np.mean(tr_blk, axis=1, dtype=np.float32, keepdims=True)
+        var_blk = np.var(tr_blk, axis=1, dtype=np.float32, keepdims=True)
+        var_sum_total += float(np.sum(var_blk, dtype=np.float64))
+        tr_ctr = tr_blk - mu_blk
+        te_ctr = te_blk - mu_blk
+        cross += np.asarray(te_ctr.T @ tr_ctr, dtype=np.float64)
+
+    if (not np.isfinite(var_sum_total)) or (var_sum_total <= 0.0):
+        raise ValueError("Invalid GBLUP denominator in cross kernel build (sum(var)<=0).")
+    cross /= float(var_sum_total)
+    return np.ascontiguousarray(cross, dtype=np.float64)
 
 
 def _tune_ml_method_once(
@@ -867,6 +1203,46 @@ def _run_method_task(
     best_train = None
     best_r2 = -np.inf
     ml_tuning_cache: dict[str, typing.Any] | None = None
+    packed_payload = (
+        typing.cast(dict[str, typing.Any], packed_ctx)
+        if _looks_like_packed_payload(packed_ctx)
+        else None
+    )
+    precomputed_train_grm = None
+    precomputed_test_train_grm = None
+    precomputed_hash_ztz_test_pred = None
+    precomputed_hash_ztz_pve = None
+    if isinstance(packed_ctx, dict):
+        precomputed_train_grm = packed_ctx.get("__gblup_train_grm__", None)
+        precomputed_test_train_grm = packed_ctx.get("__gblup_test_train_grm__", None)
+        precomputed_hash_ztz_test_pred = packed_ctx.get("__gblup_hash_ztz_test_pred__", None)
+        precomputed_hash_ztz_pve = packed_ctx.get("__gblup_hash_ztz_pve__", None)
+    gblup_cv_grm_full: np.ndarray | None = None
+    gblup_final_test_train: np.ndarray | None = None
+    gblup_force_kinship = False
+
+    if (
+        method == "GBLUP"
+        and cv_splits is None
+        and precomputed_hash_ztz_test_pred is not None
+    ):
+        pred = np.ascontiguousarray(
+            np.asarray(precomputed_hash_ztz_test_pred, dtype=np.float64).reshape(-1, 1),
+            dtype=np.float64,
+        )
+        pve_final = (
+            float(precomputed_hash_ztz_pve)
+            if precomputed_hash_ztz_pve is not None
+            else float("nan")
+        )
+        return {
+            "method": method,
+            "fold_rows": [],
+            "best_test": None,
+            "best_train": None,
+            "test_pred": pred,
+            "pve_final": float(pve_final),
+        }
 
     if method in _ML_METHOD_MAP and (not strict_cv):
         if train_snp_ml is None:
@@ -879,6 +1255,86 @@ def _run_method_task(
             n_jobs=n_jobs,
             progress_hook=search_progress_hook,
         )
+
+    if method == "GBLUP":
+        if precomputed_train_grm is not None:
+            gblup_cv_grm_full = np.asarray(precomputed_train_grm, dtype=np.float64)
+            if precomputed_test_train_grm is not None:
+                gblup_final_test_train = np.asarray(
+                    precomputed_test_train_grm,
+                    dtype=np.float64,
+                )
+            gblup_force_kinship = True
+        elif packed_payload is None and train_snp is not None:
+            # GBLUP backend policy (dense markers only):
+            # - n > m: use marker-space ZTZ/FaST route (no explicit kinship build)
+            # - m >= n: build kinship once and reuse by slicing
+            n_train = int(train_pheno.shape[0])
+            m_snp = int(train_snp.shape[0])
+            gblup_force_kinship = bool(m_snp >= n_train)
+            if gblup_force_kinship:
+                try:
+                    gblup_cv_grm_full = _build_gblup_cv_grm_once(
+                        train_snp=train_snp,
+                        packed_ctx=None,
+                        train_sample_indices=None,
+                        n_jobs=max(1, int(n_jobs)),
+                    )
+                    if test_snp is not None and int(test_snp.shape[1]) > 0:
+                        gblup_final_test_train = _build_gblup_test_train_cross_from_markers(
+                            test_snp=test_snp,
+                            train_snp=train_snp,
+                        )
+                    if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
+                        print(
+                            f"[GS-DEBUG] GBLUP kinship backend prebuilt GRM shape={gblup_cv_grm_full.shape}",
+                            flush=True,
+                        )
+                except Exception as ex:
+                    # Fallback to legacy GSapi route on unexpected numeric issues.
+                    gblup_cv_grm_full = None
+                    gblup_final_test_train = None
+                    gblup_force_kinship = False
+                    if _GS_DEBUG_STAGE:
+                        print(
+                            f"[GS-DEBUG] GBLUP kinship backend failed -> fallback GSapi: {ex}",
+                            flush=True,
+                        )
+
+    need_cv_grm_prebuild = bool(
+        (method == "GBLUP")
+        and (
+            gblup_force_kinship
+            or (precomputed_train_grm is not None)
+            or (packed_payload is not None)
+        )
+    )
+    if (
+        (method == "GBLUP")
+        and (cv_splits is not None)
+        and (gblup_cv_grm_full is None)
+        and need_cv_grm_prebuild
+    ):
+        try:
+            gblup_cv_grm_full = _build_gblup_cv_grm_once(
+                train_snp=train_snp,
+                packed_ctx=packed_payload,
+                train_sample_indices=train_sample_indices,
+                n_jobs=max(1, int(n_jobs)),
+            )
+            if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
+                print(
+                    f"[GS-DEBUG] GBLUP CV prebuilt GRM shape={gblup_cv_grm_full.shape}",
+                    flush=True,
+                )
+        except Exception as ex:
+            # Keep backward-compatible fallback path if one-shot GRM cannot be built.
+            gblup_cv_grm_full = None
+            if _GS_DEBUG_STAGE:
+                print(
+                    f"[GS-DEBUG] GBLUP CV prebuilt GRM failed -> fallback per-fold fit: {ex}",
+                    flush=True,
+                )
 
     if cv_splits is not None:
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
@@ -893,50 +1349,92 @@ def _run_method_task(
             need_fold_train_pred = bool(
                 (fold_train_pred_local_idx is None) or (int(fold_train_pred_local_idx.size) > 0)
             )
-            if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
-                if train_sample_indices is None:
-                    raise ValueError("Packed LMM requires train sample indices.")
-                fold_train = packed_ctx
-                fold_test = packed_ctx
-                fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[train_idx], dtype=np.int64)
-                fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[test_idx], dtype=np.int64)
-                fold_pca = False
-            elif method == "adBLUP":
-                if train_snp_add is None:
-                    raise ValueError(f"{method} requires additive raw genotype matrix.")
-                fold_train = train_snp_add[:, train_idx]
-                fold_test = train_snp_add[:, test_idx]
-                fold_pca = False
-            elif method in _ML_METHOD_MAP:
-                if train_snp_ml is None:
-                    raise ValueError(f"{method} requires raw genotype matrix.")
-                fold_train = train_snp_ml[:, train_idx]
-                fold_test = train_snp_ml[:, test_idx]
-                fold_pca = pca_dec
+            fold_train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
+            fold_test_idx = np.asarray(test_idx, dtype=np.int64).reshape(-1)
+            if (method == "GBLUP") and (gblup_cv_grm_full is not None):
+                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
+                grm_train = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_train_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                fit = _fit_gblup_reml_from_grm(y_fold, grm_train)
+                alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
+                beta = float(fit["beta"])
+                pve = float(fit["pve"])
+
+                grm_test_train = np.asarray(
+                    gblup_cv_grm_full[np.ix_(fold_test_idx, fold_train_idx)],
+                    dtype=np.float64,
+                )
+                yhat_test = _predict_gblup_from_cross(
+                    cross_kernel=grm_test_train,
+                    alpha=alpha,
+                    beta=beta,
+                )
+                if need_fold_train_pred:
+                    if fold_train_pred_local_idx is None:
+                        yhat_train = _predict_gblup_from_cross(
+                            cross_kernel=grm_train,
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                    elif int(fold_train_pred_local_idx.size) == 0:
+                        yhat_train = np.zeros((0, 1), dtype=float)
+                    else:
+                        local_idx = np.asarray(fold_train_pred_local_idx, dtype=np.int64).reshape(-1)
+                        grm_pick = np.asarray(grm_train[local_idx, :], dtype=np.float64)
+                        yhat_train = _predict_gblup_from_cross(
+                            cross_kernel=grm_pick,
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                else:
+                    yhat_train = np.zeros((0, 1), dtype=float)
             else:
-                fold_train = train_snp[:, train_idx]
-                fold_test = train_snp[:, test_idx]
-                fold_pca = pca_dec
-            yhat_train, yhat_test, pve = GSapi(
-                train_pheno[train_idx],
-                fold_train,
-                fold_test,
-                method=method,
-                PCAdec=fold_pca,
-                n_jobs=n_jobs,
-                force_fast=force_fast,
-                ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
-                need_train_pred=need_fold_train_pred,
-                packed_train_indices=fold_train_idx_arg,
-                packed_test_indices=fold_test_idx_arg,
-                train_pred_indices=fold_train_pred_local_idx,
-            )
+                if (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
+                    if train_sample_indices is None:
+                        raise ValueError("Packed LMM requires train sample indices.")
+                    fold_train = packed_payload
+                    fold_test = packed_payload
+                    fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[fold_train_idx], dtype=np.int64)
+                    fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[fold_test_idx], dtype=np.int64)
+                    fold_pca = False
+                elif method == "adBLUP":
+                    if train_snp_add is None:
+                        raise ValueError(f"{method} requires additive raw genotype matrix.")
+                    fold_train = train_snp_add[:, fold_train_idx]
+                    fold_test = train_snp_add[:, fold_test_idx]
+                    fold_pca = False
+                elif method in _ML_METHOD_MAP:
+                    if train_snp_ml is None:
+                        raise ValueError(f"{method} requires raw genotype matrix.")
+                    fold_train = train_snp_ml[:, fold_train_idx]
+                    fold_test = train_snp_ml[:, fold_test_idx]
+                    fold_pca = pca_dec
+                else:
+                    fold_train = train_snp[:, fold_train_idx]
+                    fold_test = train_snp[:, fold_test_idx]
+                    fold_pca = pca_dec
+                yhat_train, yhat_test, pve = GSapi(
+                    train_pheno[fold_train_idx],
+                    fold_train,
+                    fold_test,
+                    method=method,
+                    PCAdec=fold_pca,
+                    n_jobs=n_jobs,
+                    force_fast=force_fast,
+                    ml_fixed_params=(None if ml_tuning_cache is None else ml_tuning_cache.get("params")),
+                    need_train_pred=need_fold_train_pred,
+                    packed_train_indices=fold_train_idx_arg,
+                    packed_test_indices=fold_test_idx_arg,
+                    train_pred_indices=fold_train_pred_local_idx,
+                )
             if ml_tuning_cache is not None:
                 pve = float(ml_tuning_cache.get("pve", np.nan))
-            ttest = np.concatenate([train_pheno[test_idx], yhat_test], axis=1)
+            ttest = np.concatenate([train_pheno[fold_test_idx], yhat_test], axis=1)
             ttrain = None
             if need_fold_train_pred:
-                y_train_fold = train_pheno[train_idx]
+                y_train_fold = train_pheno[fold_train_idx]
                 if fold_train_pred_local_idx is not None:
                     y_train_fold = y_train_fold[fold_train_pred_local_idx]
                 ttrain = np.concatenate([y_train_fold, yhat_train], axis=1)
@@ -966,11 +1464,11 @@ def _run_method_task(
 
     final_train_idx_arg = None
     final_test_idx_arg = None
-    if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
+    if (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
         if train_sample_indices is None or test_sample_indices is None:
             raise ValueError("Packed LMM requires train/test sample indices.")
-        final_train = packed_ctx
-        final_test = packed_ctx
+        final_train = packed_payload
+        final_test = packed_payload
         final_pca = False
         final_train_idx_arg = np.ascontiguousarray(train_sample_indices, dtype=np.int64)
         final_test_idx_arg = np.ascontiguousarray(test_sample_indices, dtype=np.int64)
@@ -995,8 +1493,18 @@ def _run_method_task(
     # full-data fit does not contribute to fold metrics and only adds runtime.
     # Keep default behavior for all other cases.
     skip_final_fit = False
+    use_custom_gblup_final = bool(
+        method == "GBLUP"
+        and gblup_cv_grm_full is not None
+        and (gblup_force_kinship or precomputed_train_grm is not None)
+    )
     if cv_splits is not None:
-        if (packed_ctx is not None) and (method in ("GBLUP", "rrBLUP")):
+        if use_custom_gblup_final:
+            skip_final_fit = bool(
+                gblup_final_test_train is None
+                or int(gblup_final_test_train.shape[0]) == 0
+            )
+        elif (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
             skip_final_fit = bool(final_test_idx_arg is not None and int(final_test_idx_arg.size) == 0)
         else:
             skip_final_fit = bool(
@@ -1011,6 +1519,22 @@ def _run_method_task(
             pve_final = float(np.nanmean([float(r[5]) for r in fold_rows]))
         else:
             pve_final = float("nan")
+    elif use_custom_gblup_final:
+        fit = _fit_gblup_reml_from_grm(
+            np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+            np.asarray(gblup_cv_grm_full, dtype=np.float64),
+        )
+        alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
+        beta = float(fit["beta"])
+        pve_final = float(fit["pve"])
+        if gblup_final_test_train is None or int(gblup_final_test_train.shape[0]) == 0:
+            test_pred = np.zeros((0, 1), dtype=float)
+        else:
+            test_pred = _predict_gblup_from_cross(
+                cross_kernel=np.asarray(gblup_final_test_train, dtype=np.float64),
+                alpha=alpha,
+                beta=beta,
+            )
     else:
         _, test_pred, pve_final = GSapi(
             train_pheno,
@@ -1795,6 +2319,7 @@ def _load_plink_packed_for_lmm(
         raise ValueError(
             "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
         )
+    site_keep = np.ascontiguousarray(np.asarray(keep, dtype=np.bool_).reshape(-1))
     packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
     if not np.all(keep):
         packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
@@ -1805,8 +2330,636 @@ def _load_plink_packed_for_lmm(
         "missing_rate": miss_arr,
         "maf": maf_arr,
         "n_samples": int(packed_n),
+        "site_keep": site_keep,
+        "source_prefix": str(genotype_prefix),
     }
     return sample_ids_arr, packed_ctx
+
+
+def _decode_packed_ctx_to_dense(
+    packed_ctx: dict[str, typing.Any],
+) -> np.ndarray:
+    """
+    Decode packed BED payload to dense float32 genotype matrix (m, n).
+    """
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
+        raise RuntimeError(
+            "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+        )
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(packed.shape[0]) != int(maf.shape[0]):
+        raise ValueError("Packed payload shape mismatch between packed rows and maf.")
+
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        row_flip = np.asarray(
+            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip
+    else:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+
+    ridx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64))
+    decoded = _jxrs.bed_packed_decode_rows_f32(
+        packed,
+        int(n_samples),
+        ridx,
+        row_flip,
+        maf,
+        None,
+    )
+    dense = np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
+    if dense.ndim != 2 or dense.shape != (int(packed.shape[0]), int(n_samples)):
+        raise ValueError(
+            "Packed decode shape mismatch: "
+            f"expected ({int(packed.shape[0])},{int(n_samples)}), got {dense.shape}"
+        )
+    return dense
+
+
+def _read_plink_bim_chrom_pos(prefix: str) -> tuple[np.ndarray, np.ndarray]:
+    bim_path = str(prefix)
+    if not bim_path.lower().endswith(".bim"):
+        bim_path = f"{bim_path}.bim"
+    if not os.path.isfile(bim_path):
+        raise ValueError(f"Cannot find BIM file for PLINK prefix: {prefix}")
+
+    chrom_codes: list[int] = []
+    positions: list[int] = []
+    code_map: dict[str, int] = {}
+    next_code = 0
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            s = str(line).strip()
+            if s == "" or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{line_no} (expected >= 6 columns)."
+                )
+            chrom = str(parts[0]).strip()
+            if chrom not in code_map:
+                code_map[chrom] = int(next_code)
+                next_code += 1
+            chrom_codes.append(int(code_map[chrom]))
+            try:
+                pos = int(parts[3])
+            except Exception:
+                try:
+                    pos = int(float(parts[3]))
+                except Exception as ex:
+                    raise ValueError(
+                        f"Invalid BIM position at {bim_path}:{line_no}: {parts[3]!r}"
+                    ) from ex
+            positions.append(int(pos))
+    if len(chrom_codes) == 0:
+        raise ValueError(f"No SNP rows found in BIM: {bim_path}")
+    return (
+        np.ascontiguousarray(np.asarray(chrom_codes, dtype=np.int32)),
+        np.ascontiguousarray(np.asarray(positions, dtype=np.int64)),
+    )
+
+
+def _apply_packed_ld_prune_for_gs(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    genotype_prefix: str,
+    spec: _GsLdPruneSpec,
+    n_jobs: int,
+) -> dict[str, typing.Any]:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_ld_prune_maf_priority")):
+        raise RuntimeError(
+            "Rust packed LD prune kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    miss = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1)
+    )
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(packed.shape[0]) != int(maf.shape[0]) or int(packed.shape[0]) != int(miss.shape[0]):
+        raise ValueError("Packed payload shape mismatch among packed/maf/missing_rate.")
+
+    chrom_codes_full, positions_full = _read_plink_bim_chrom_pos(str(genotype_prefix))
+    n_full = int(chrom_codes_full.shape[0])
+    if int(positions_full.shape[0]) != n_full:
+        raise ValueError("BIM chrom/position arrays length mismatch.")
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(site_keep.shape[0]) != n_full:
+            raise ValueError(
+                "Packed payload mismatch: site_keep length does not match BIM row count."
+            )
+        chrom_codes = np.ascontiguousarray(chrom_codes_full[site_keep], dtype=np.int32)
+        positions = np.ascontiguousarray(positions_full[site_keep], dtype=np.int64)
+    else:
+        chrom_codes = chrom_codes_full
+        positions = positions_full
+
+    m = int(packed.shape[0])
+    if int(chrom_codes.shape[0]) != m or int(positions.shape[0]) != m:
+        raise ValueError(
+            f"Packed/BIM row mismatch for LD prune: packed={m}, bim_aligned={chrom_codes.shape[0]}"
+        )
+
+    keep = np.asarray(
+        _jxrs.bed_packed_ld_prune_maf_priority(
+            packed=packed,
+            n_samples=int(n_samples),
+            chrom_codes=chrom_codes,
+            positions=positions,
+            window_bp=(
+                int(spec.window_bp)
+                if spec.window_bp is not None
+                else None
+            ),
+            window_variants=(
+                int(spec.window_variants)
+                if spec.window_variants is not None
+                else None
+            ),
+            step_variants=int(spec.step_variants),
+            r2_threshold=float(spec.r2_threshold),
+            threads=max(1, int(n_jobs)),
+        ),
+        dtype=np.bool_,
+    ).reshape(-1)
+    if int(keep.shape[0]) != m:
+        raise ValueError(
+            f"LD prune keep-mask mismatch: got {keep.shape[0]}, expected {m}"
+        )
+    if not np.any(keep):
+        raise ValueError(
+            "All SNPs were filtered out by LD prune; loosen --ldprune thresholds."
+        )
+    if np.all(keep):
+        return packed_ctx
+
+    packed_ctx["packed"] = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+    packed_ctx["maf"] = np.ascontiguousarray(maf[keep], dtype=np.float32)
+    packed_ctx["missing_rate"] = np.ascontiguousarray(miss[keep], dtype=np.float32)
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is not None:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != m:
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+        packed_ctx["row_flip"] = np.ascontiguousarray(row_flip[keep], dtype=np.bool_)
+
+    if site_keep_raw is not None:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        idx_kept = np.flatnonzero(site_keep).astype(np.int64, copy=False)
+        if int(idx_kept.shape[0]) != m:
+            raise ValueError("Packed payload mismatch: site_keep true-count does not match packed rows.")
+        site_keep_new = np.zeros_like(site_keep, dtype=np.bool_)
+        site_keep_new[idx_kept[keep]] = True
+        packed_ctx["site_keep"] = np.ascontiguousarray(site_keep_new, dtype=np.bool_)
+
+    return packed_ctx
+
+
+def _hash_packed_for_gs(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    hash_dim: int,
+    hash_seed: int,
+    standardize: bool,
+    n_jobs: int,
+    sample_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, int]:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_f32")):
+        raise RuntimeError(
+            "Rust signed-hash kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
+        raise RuntimeError(
+            "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    if int(hash_dim) <= 0:
+        raise ValueError("hash_dim must be > 0.")
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    miss = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1)
+    )
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(packed.shape[0]) != int(maf.shape[0]) or int(packed.shape[0]) != int(miss.shape[0]):
+        raise ValueError("Packed payload shape mismatch among packed/maf/missing_rate.")
+
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        row_flip = np.asarray(
+            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip
+    else:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+
+    sidx_arg = None
+    if sample_indices is not None:
+        sidx_arg = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
+        if np.any(sidx_arg < 0) or np.any(sidx_arg >= int(n_samples)):
+            raise ValueError("sample_indices contain out-of-range values for packed hashing.")
+
+    z_raw, scale_raw, kept_raw = _jxrs.bed_packed_signed_hash_f32(
+        packed=packed,
+        n_samples=int(n_samples),
+        row_flip=row_flip,
+        row_maf=maf,
+        n_buckets=int(hash_dim),
+        seed=int(hash_seed),
+        sample_indices=sidx_arg,
+        row_missing=miss,
+        min_maf=0.0,
+        max_missing=1.0,
+        standardize=bool(standardize),
+        threads=max(1, int(n_jobs)),
+    )
+    z = np.ascontiguousarray(np.asarray(z_raw, dtype=np.float32))
+    expected_n = int(n_samples if sidx_arg is None else sidx_arg.shape[0])
+    if z.ndim != 2 or int(z.shape[0]) != int(hash_dim) or int(z.shape[1]) != expected_n:
+        raise ValueError(
+            f"Signed hash output shape mismatch: expected ({hash_dim},{expected_n}), got {z.shape}"
+        )
+    return z, float(scale_raw), int(kept_raw)
+
+
+def _hash_packed_kernels_for_gblup(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    hash_dim: int,
+    hash_seed: int,
+    standardize: bool,
+    n_jobs: int,
+    train_sample_indices: np.ndarray,
+    test_sample_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_kernels_f64")):
+        raise RuntimeError(
+            "Rust signed-hash kernel->GRM path is unavailable. Rebuild/install JanusX extension."
+        )
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
+        raise RuntimeError(
+            "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    if int(hash_dim) <= 0:
+        raise ValueError("hash_dim must be > 0.")
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    miss = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1)
+    )
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(packed.shape[0]) != int(maf.shape[0]) or int(packed.shape[0]) != int(miss.shape[0]):
+        raise ValueError("Packed payload shape mismatch among packed/maf/missing_rate.")
+
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        row_flip = np.asarray(
+            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip
+    else:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+
+    train_idx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+    if train_idx.size == 0:
+        raise ValueError("train_sample_indices must not be empty.")
+    if np.any(train_idx < 0) or np.any(train_idx >= int(n_samples)):
+        raise ValueError("train_sample_indices contain out-of-range values for packed hashing.")
+    test_idx: np.ndarray | None = None
+    if test_sample_indices is not None:
+        t = np.ascontiguousarray(np.asarray(test_sample_indices, dtype=np.int64).reshape(-1))
+        if np.any(t < 0) or np.any(t >= int(n_samples)):
+            raise ValueError("test_sample_indices contain out-of-range values for packed hashing.")
+        test_idx = t
+
+    train_grm_raw, cross_raw, kept_raw = _jxrs.bed_packed_signed_hash_kernels_f64(
+        packed=packed,
+        n_samples=int(n_samples),
+        row_flip=row_flip,
+        row_maf=maf,
+        n_buckets=int(hash_dim),
+        train_sample_indices=train_idx,
+        test_sample_indices=test_idx,
+        seed=int(hash_seed),
+        row_missing=miss,
+        min_maf=0.0,
+        max_missing=1.0,
+        standardize=bool(standardize),
+        threads=max(1, int(n_jobs)),
+    )
+    train_grm = np.ascontiguousarray(np.asarray(train_grm_raw, dtype=np.float64))
+    cross = np.ascontiguousarray(np.asarray(cross_raw, dtype=np.float64))
+
+    n_train = int(train_idx.shape[0])
+    n_test = 0 if test_idx is None else int(test_idx.shape[0])
+    if train_grm.ndim != 2 or train_grm.shape != (n_train, n_train):
+        raise ValueError(
+            f"Signed hash kernel output mismatch: expected train GRM ({n_train},{n_train}), got {train_grm.shape}"
+        )
+    if cross.ndim != 2 or cross.shape != (n_test, n_train):
+        raise ValueError(
+            f"Signed hash kernel output mismatch: expected cross ({n_test},{n_train}), got {cross.shape}"
+        )
+    return train_grm, cross, int(kept_raw)
+
+
+def _hash_packed_ztz_stats_for_gblup(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    hash_dim: int,
+    hash_seed: int,
+    standardize: bool,
+    n_jobs: int,
+    train_sample_indices: np.ndarray,
+    y_train: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")):
+        raise RuntimeError(
+            "Rust signed-hash ZTZ stats kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_row_flip_mask")):
+        raise RuntimeError(
+            "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+        )
+    if int(hash_dim) <= 0:
+        raise ValueError("hash_dim must be > 0.")
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    miss = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1)
+    )
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(packed.shape[0]) != int(maf.shape[0]) or int(packed.shape[0]) != int(miss.shape[0]):
+        raise ValueError("Packed payload shape mismatch among packed/maf/missing_rate.")
+
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        row_flip = np.asarray(
+            _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+            dtype=np.bool_,
+        )
+        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip
+    else:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+
+    train_idx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
+    if train_idx.size == 0:
+        raise ValueError("train_sample_indices must not be empty.")
+    if np.any(train_idx < 0) or np.any(train_idx >= int(n_samples)):
+        raise ValueError("train_sample_indices contain out-of-range values for packed hashing.")
+    y_vec = np.ascontiguousarray(np.asarray(y_train, dtype=np.float64).reshape(-1))
+    if int(y_vec.shape[0]) != int(train_idx.shape[0]):
+        raise ValueError(
+            f"y_train length mismatch: got {y_vec.shape[0]}, expected {train_idx.shape[0]}"
+        )
+
+    gram_raw, row_sum_raw, row_sq_sum_raw, zy_raw, scale_raw, kept_raw = (
+        _jxrs.bed_packed_signed_hash_ztz_stats_f64(
+            packed=packed,
+            n_samples=int(n_samples),
+            row_flip=row_flip,
+            row_maf=maf,
+            n_buckets=int(hash_dim),
+            train_sample_indices=train_idx,
+            y_train=y_vec,
+            seed=int(hash_seed),
+            row_missing=miss,
+            min_maf=0.0,
+            max_missing=1.0,
+            standardize=bool(standardize),
+            threads=max(1, int(n_jobs)),
+        )
+    )
+    gram = np.ascontiguousarray(np.asarray(gram_raw, dtype=np.float64))
+    row_sum = np.ascontiguousarray(np.asarray(row_sum_raw, dtype=np.float64).reshape(-1))
+    row_sq_sum = np.ascontiguousarray(np.asarray(row_sq_sum_raw, dtype=np.float64).reshape(-1))
+    zy = np.ascontiguousarray(np.asarray(zy_raw, dtype=np.float64).reshape(-1))
+
+    if gram.ndim != 2 or gram.shape != (int(hash_dim), int(hash_dim)):
+        raise ValueError(
+            f"Signed hash ZTZ output mismatch: expected gram ({hash_dim},{hash_dim}), got {gram.shape}"
+        )
+    for name, arr in (("row_sum", row_sum), ("row_sq_sum", row_sq_sum), ("zy", zy)):
+        if arr.ndim != 1 or int(arr.shape[0]) != int(hash_dim):
+            raise ValueError(
+                f"Signed hash ZTZ output mismatch: expected {name} length {hash_dim}, got {arr.shape}"
+            )
+    return gram, row_sum, row_sq_sum, zy, float(scale_raw), int(kept_raw)
+
+
+def _fit_gblup_reml_from_hash_ztz_stats(
+    *,
+    gram: np.ndarray,
+    row_sum: np.ndarray,
+    row_sq_sum: np.ndarray,
+    zy: np.ndarray,
+    n_train: int,
+) -> dict[str, typing.Any]:
+    g = np.ascontiguousarray(np.asarray(gram, dtype=np.float64))
+    rs = np.ascontiguousarray(np.asarray(row_sum, dtype=np.float64).reshape(-1))
+    r2 = np.ascontiguousarray(np.asarray(row_sq_sum, dtype=np.float64).reshape(-1))
+    zy_vec = np.ascontiguousarray(np.asarray(zy, dtype=np.float64).reshape(-1))
+    if g.ndim != 2 or g.shape[0] != g.shape[1]:
+        raise ValueError(f"gram must be square; got shape={g.shape}.")
+    k = int(g.shape[0])
+    if int(rs.shape[0]) != k or int(r2.shape[0]) != k or int(zy_vec.shape[0]) != k:
+        raise ValueError("row_sum/row_sq_sum/zy length mismatch with gram dimension.")
+    n = int(n_train)
+    if n <= 1:
+        beta = float(np.mean(zy_vec)) if zy_vec.size > 0 else 0.0
+        return {
+            "beta": float(beta),
+            "pve": float("nan"),
+            "m_mean": np.zeros((k, 1), dtype=np.float64),
+            "m_var_sum": 1.0,
+            "m_alpha": np.zeros((k, 1), dtype=np.float64),
+            "alpha_sum": 0.0,
+            "mean_sq": 0.0,
+            "mean_malpha": 0.0,
+        }
+
+    m_mean = (rs / float(n)).reshape(-1, 1)
+    m_var = (r2 / float(n)).reshape(-1, 1) - m_mean * m_mean
+    m_var = np.maximum(m_var, 0.0)
+    m_var_sum = float(np.sum(m_var, dtype=np.float64))
+    if (not np.isfinite(m_var_sum)) or (m_var_sum <= 0.0):
+        m_var_sum = 1e-12
+
+    eigvals, eigvec = np.linalg.eigh(g)
+    max_eval = float(eigvals[-1]) if eigvals.size > 0 else 0.0
+    tol = np.finfo(np.float64).eps * max(1.0, max_eval) * max(1, k)
+    keep_start = int(np.searchsorted(eigvals, tol, side="right"))
+    if keep_start >= int(eigvals.shape[0]):
+        raise RuntimeError("Numerically singular hashed ZTZ matrix (all eigenvalues dropped).")
+    eigvals = np.asarray(eigvals[keep_start:], dtype=np.float64)
+    eigvec = np.asarray(eigvec[:, keep_start:], dtype=np.float64)
+    svals = np.sqrt(np.maximum(eigvals, 1e-18))
+    inv_s = 1.0 / svals
+    s_spec = svals * svals
+
+    mx = rs.reshape(-1, 1)
+    my = zy_vec.reshape(-1, 1)
+    x_proj = (eigvec.T @ mx) * inv_s[:, None]
+    y_proj = (eigvec.T @ my) * inv_s[:, None]
+    v_floor = max(1e-12, float(np.finfo(np.float64).tiny))
+    n_obj = int(x_proj.shape[0])
+    n_eff_obj = int(max(1, n_obj - 1))
+
+    def _reml_at_lambda(lbd: float) -> tuple[float, float, np.ndarray, np.ndarray, float]:
+        lam = float(lbd)
+        if (not np.isfinite(lam)) or (lam <= 0.0):
+            lam = v_floor
+        v = np.maximum(s_spec + lam, v_floor)
+        v_inv = 1.0 / v
+        x_w = v_inv[:, None] * x_proj
+        xtvx = float((x_proj.T @ x_w)[0, 0])
+        if (not np.isfinite(xtvx)) or (xtvx <= v_floor):
+            xtvx = v_floor
+        xtvy = float((x_proj.T @ (v_inv[:, None] * y_proj))[0, 0])
+        beta = float(xtvy / xtvx)
+        r = y_proj - x_proj * beta
+        rtv = float(np.sum((r.reshape(-1) ** 2) * v_inv))
+        if (not np.isfinite(rtv)) or (rtv <= v_floor):
+            rtv = v_floor
+        log_det_v = float(np.sum(np.log(v)))
+        log_det_xtvx = float(np.log(xtvx))
+        total_log = float(n_eff_obj) * float(np.log(rtv)) + log_det_v + log_det_xtvx
+        c = float(n_eff_obj) * (
+            float(np.log(float(n_eff_obj))) - 1.0 - float(np.log(2.0 * np.pi))
+        ) / 2.0
+        return c - total_log / 2.0, beta, r, v_inv, rtv
+
+    def _objective(log10_lbd: float) -> float:
+        lbd = 10.0 ** float(log10_lbd)
+        ll, _beta, _r, _v_inv, _rtv = _reml_at_lambda(lbd)
+        return -float(ll)
+
+    opt = minimize_scalar(_objective, bounds=(-6, 6), method="bounded")
+    log10_lbd = float(opt.x) if np.isfinite(float(opt.x)) else 0.0
+    lbd = float(10.0 ** log10_lbd)
+    _ll, beta, r, v_inv, rtv = _reml_at_lambda(lbd)
+
+    rhs = (v_inv.reshape(-1, 1) * r).reshape(-1, 1)
+    q_alpha = eigvec @ (inv_s[:, None] * rhs)
+    m_alpha = eigvec @ (svals[:, None] * rhs)
+    alpha_sum = float((rs.reshape(1, -1) @ q_alpha)[0, 0])
+    mean_sq = float((m_mean.T @ m_mean)[0, 0])
+    mean_malpha = float((m_mean.T @ m_alpha)[0, 0])
+
+    sigma_g2 = float(rtv) / float(max(1, n - 1))
+    sigma_e2 = float(lbd) * sigma_g2
+    var_g = sigma_g2 * float(np.mean(s_spec))
+    denom = var_g + sigma_e2
+    pve = float(var_g / denom) if (np.isfinite(denom) and denom > 0.0) else float("nan")
+    return {
+        "beta": float(beta),
+        "pve": float(pve),
+        "m_mean": np.ascontiguousarray(m_mean, dtype=np.float64),
+        "m_var_sum": float(m_var_sum),
+        "m_alpha": np.ascontiguousarray(m_alpha, dtype=np.float64),
+        "alpha_sum": float(alpha_sum),
+        "mean_sq": float(mean_sq),
+        "mean_malpha": float(mean_malpha),
+    }
+
+
+def _predict_hashed_gblup_test_from_compact(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    hash_dim: int,
+    hash_seed: int,
+    standardize: bool,
+    n_jobs: int,
+    test_sample_indices: np.ndarray,
+    beta: float,
+    m_mean: np.ndarray,
+    m_var_sum: float,
+    m_alpha: np.ndarray,
+    alpha_sum: float,
+    mean_sq: float,
+    mean_malpha: float,
+    sample_chunk: int = 4096,
+) -> np.ndarray:
+    test_idx = np.ascontiguousarray(np.asarray(test_sample_indices, dtype=np.int64).reshape(-1))
+    n_test = int(test_idx.shape[0])
+    if n_test == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+    out = np.zeros((n_test, 1), dtype=np.float64)
+    step = max(1, int(sample_chunk))
+    m_mean64 = np.ascontiguousarray(np.asarray(m_mean, dtype=np.float64).reshape(-1, 1))
+    m_alpha64 = np.ascontiguousarray(np.asarray(m_alpha, dtype=np.float64).reshape(-1, 1))
+    denom = float(m_var_sum)
+    if (not np.isfinite(denom)) or (denom <= 0.0):
+        raise ValueError(f"Invalid hashed GBLUP denominator: {denom!r}")
+    for st in range(0, n_test, step):
+        ed = min(st + step, n_test)
+        blk_idx = np.ascontiguousarray(test_idx[st:ed], dtype=np.int64)
+        z_blk, _scale, _kept = _hash_packed_for_gs(
+            packed_ctx=packed_ctx,
+            hash_dim=int(hash_dim),
+            hash_seed=int(hash_seed),
+            standardize=bool(standardize),
+            n_jobs=max(1, int(n_jobs)),
+            sample_indices=blk_idx,
+        )
+        z64 = np.asarray(z_blk, dtype=np.float64)
+        t1 = z64.T @ m_alpha64
+        t2 = z64.T @ m_mean64
+        cross = (t1 - t2 * float(alpha_sum) - float(mean_malpha) + float(mean_sq) * float(alpha_sum)) / denom
+        out[st:ed] = cross + float(beta)
+    return np.ascontiguousarray(out, dtype=np.float64)
 
 
 # ======================================================================
@@ -1959,13 +3112,6 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument(
-        "-pcd", "--pcd",
-        action="store_true",
-        default=False,
-        help="Enable PCA-based dimensionality reduction on genotypes "
-             "(default: %(default)s).",
-    )
-    optional_group.add_argument(
         "-maf", "--maf",
         type=float,
         default=0.02,
@@ -2022,23 +3168,63 @@ def main(log: bool = True) -> None:
         type=int,
         default=None,
         dest="limit_predtrain",
-        help=(
-            "Limit train-set predictions per outer CV fold for diagnostics. "
-            "Use 0 to disable fold train predictions; default predicts all training samples."
-        ),
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-strict-cv", "--strict-cv",
         action="store_true",
         default=False,
-        help="For ML methods, retune hyperparameters inside every outer CV fold. "
-             "By default, ML methods tune once per trait and reuse best params across outer folds.",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-force-fast", "--force-fast",
         action="store_true",
         default=False,
-        help="Force pyBLUP LMM Gram strategy to fast mode and never use lowmem auto-switch.",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "-pcd", "--pcd",
+        action="store_true",
+        default=False,
+        help="Enable PCA-based dimensionality reduction on genotypes "
+             "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-ldprune", "--ldprune",
+        nargs=3,
+        default=None,
+        metavar=("WINDOW", "STEP", "R2"),
+        help=(
+            "Apply packed BED LD prune before GS model fitting. "
+            "Usage: --ldprune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
+            "Numeric window defaults to kb (e.g. 1=1kb, 0.1=100bp)."
+        ),
+    )
+    optional_group.add_argument(
+        "-hash", "--hash",
+        nargs="*",
+        default=None,
+        metavar=("DIM", "SEED"),
+        help=(
+            "Enable signed feature hashing before GS. "
+            "Usage: --hash [dim] [seed]. "
+            "Defaults when enabled: dim=2048, seed=520."
+        ),
+    )
+    # Backward-compatible legacy flags (hidden): --hash-dim / --hash-seed
+    optional_group.add_argument("-hash-dim", "--hash-dim", type=int, default=None, help=argparse.SUPPRESS)
+    optional_group.add_argument("-hash-seed", "--hash-seed", type=int, default=None, help=argparse.SUPPRESS)
+    optional_group.add_argument(
+        "-hash-raw", "--hash-raw",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "-debug", "--debug",
+        action="store_true",
+        default=False,
+        help="Enable runtime debug logs (thread/runtime/model diagnostics).",
     )
     optional_group.add_argument(
         "-o", "--out",
@@ -2068,12 +3254,52 @@ def main(log: bool = True) -> None:
         parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    debug_mode = bool(getattr(args, "debug", False))
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
     if (args.limit_predtrain is not None) and (int(args.limit_predtrain) < 0):
         parser.error("--limit-predtrain/--limit-train must be >= 0.")
+    try:
+        args.ldprune_spec = _parse_ld_prune_args(args.ldprune)
+    except ValueError as e:
+        parser.error(str(e))
+    hash_default_dim = 2048
+    hash_default_seed = 520
+    hash_tokens = typing.cast(list[str] | None, getattr(args, "hash", None))
+    legacy_hash_dim = getattr(args, "hash_dim", None)
+    legacy_hash_seed = getattr(args, "hash_seed", None)
+    if (hash_tokens is not None) and ((legacy_hash_dim is not None) or (legacy_hash_seed is not None)):
+        parser.error("Use either --hash or legacy --hash-dim/--hash-seed, not both.")
+
+    if hash_tokens is not None:
+        if len(hash_tokens) > 2:
+            parser.error("--hash accepts at most two values: [dim] [seed].")
+        if len(hash_tokens) >= 1:
+            try:
+                args.hash_dim = int(hash_tokens[0])
+            except Exception:
+                parser.error(f"Invalid --hash dim value: {hash_tokens[0]!r}")
+        else:
+            args.hash_dim = int(hash_default_dim)
+        if len(hash_tokens) >= 2:
+            try:
+                args.hash_seed = int(hash_tokens[1])
+            except Exception:
+                parser.error(f"Invalid --hash seed value: {hash_tokens[1]!r}")
+        else:
+            args.hash_seed = int(hash_default_seed)
+    else:
+        if legacy_hash_dim is not None:
+            args.hash_dim = int(legacy_hash_dim)
+            args.hash_seed = int(hash_default_seed if legacy_hash_seed is None else legacy_hash_seed)
+        else:
+            args.hash_dim = None
+            args.hash_seed = int(hash_default_seed if legacy_hash_seed is None else legacy_hash_seed)
+
+    if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
+        parser.error("--hash dim must be > 0.")
 
     # ------------------------------------------------------------------
     # Determine genotype file and output prefix
@@ -2135,6 +3361,52 @@ def main(log: bool = True) -> None:
             f"using {int(args.thread)}."
         )
 
+    packed_preprocess_requested = bool(
+        (args.hash_dim is not None) or (getattr(args, "ldprune_spec", None) is not None)
+    )
+    gfile_is_plink = _is_plink_prefix(str(gfile))
+    if packed_preprocess_requested and (not gfile_is_plink):
+        if bool(args.vcf) or bool(args.hmp) or bool(args.file):
+            src_label = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
+            with CliStatus(
+                f"Preparing PLINK cache for packed GS from {src_label}...",
+                enabled=use_spinner,
+            ) as task:
+                try:
+                    cached_prefix = prepare_cli_input_cache(
+                        str(gfile),
+                        snps_only=False,
+                        delimiter=None,
+                        # For -file inputs, allow TXT/TSV/CSV sources to be packed
+                        # into PLINK BED when hash/LD-prune preprocessing is requested.
+                        prefer_plink_for_txt=True,
+                    )
+                except Exception:
+                    task.fail("Preparing PLINK cache for packed GS ...Failed")
+                    raise
+                if not _is_plink_prefix(str(cached_prefix)):
+                    task.fail("Preparing PLINK cache for packed GS ...Failed")
+                    logger.error(
+                        "--hash/--ldprune require PLINK BED input. "
+                        "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
+                        "when source resolves to VCF/HMP/TXT. "
+                        f"Current input could not be converted to BED: {cached_prefix}. "
+                        "For -file inputs backed by .npy/.bin, please convert to -bfile first."
+                    )
+                    raise SystemExit(1)
+                gfile = str(cached_prefix).replace("\\", "/")
+                gfile_is_plink = True
+                task.complete(
+                    "Preparing PLINK cache for packed GS ...Finished "
+                    f"({format_path_for_display(gfile)})"
+                )
+        else:
+            logger.error(
+                "--hash/--ldprune require PLINK BED input. "
+                "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
+            )
+            raise SystemExit(1)
+
     # Configuration summary
     if log:
         ncol_cfg = (
@@ -2189,6 +3461,20 @@ def main(log: bool = True) -> None:
                 ("Use PCA", args.pcd),
                 ("MAF threshold", args.maf),
                 ("Missing rate", args.geno),
+                (
+                    "LD prune",
+                    (
+                        args.ldprune_spec.label()
+                        if getattr(args, "ldprune_spec", None) is not None
+                        else "off"
+                    ),
+                ),
+                ("Hash dim", ("off" if args.hash_dim is None else int(args.hash_dim))),
+                (
+                    "Hash standardize",
+                    ("n/a" if args.hash_dim is None else (not bool(args.hash_raw))),
+                ),
+                ("Hash seed", ("" if args.hash_dim is None else int(args.hash_seed))),
                 ("Threads", f"{args.thread} ({detected_threads} available)"),
                 ("Limit train-pred", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
                 ("Strict CV", args.strict_cv),
@@ -2206,7 +3492,7 @@ def main(log: bool = True) -> None:
         )
 
     checks: list[bool] = []
-    if args.bfile:
+    if gfile_is_plink:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -2340,36 +3626,45 @@ def main(log: bool = True) -> None:
         )
         raise SystemExit(1)
 
-    # Runtime-thread default tuning for packed GBLUP:
-    # GS global default policy is rust-priority for stability, but packed-BED
-    # GBLUP/rrBLUP workloads can be BLAS-dominant on many hosts. When users do
-    # not explicitly set a policy, prefer `auto` here to avoid apparent
-    # under-utilization in fit-heavy stages.
+    # Runtime-thread default tuning for packed GBLUP/rrBLUP:
+    # When users do not explicitly set a policy, prefer aligned caps so
+    # `-t` applies to both BLAS and Rust runtimes consistently.
     policy_env_raw = str(os.getenv("JX_THREAD_POLICY", "")).strip()
     gblup_only_models = bool(len(methods) > 0 and all(m in {"GBLUP", "rrBLUP"} for m in methods))
-    if (policy_env_raw == "") and bool(args.bfile) and gblup_only_models:
-        os.environ["JX_THREAD_POLICY"] = "auto"
-        logger.info(
-            "Thread runtime hint: packed GBLUP/rrBLUP detected; "
-            "using auto policy by default (set JX_THREAD_POLICY to override)."
-        )
+    if (args.hash_dim is not None) and ("adBLUP" in methods):
+        logger.error("--hash is currently not supported together with adBLUP.")
+        raise SystemExit(1)
+    hash_gblup_only_mode = bool(
+        (args.hash_dim is not None)
+        and (len(methods) == 1)
+        and (methods[0] == "GBLUP")
+    )
+    if (policy_env_raw == "") and bool(gfile_is_plink) and gblup_only_models:
+        os.environ["JX_THREAD_POLICY"] = "align"
+        if bool(debug_mode):
+            logger.info(
+                "Thread runtime hint: packed GBLUP/rrBLUP detected; "
+                "using align policy by default (set JX_THREAD_POLICY to override)."
+            )
 
     thread_plan = configure_thread_runtime(
         total_threads=int(args.thread),
         methods=methods,
-        logger=logger,
+        logger=(logger if bool(debug_mode) else None),
     )
-    if not bool(thread_plan.get("applied", False)):
+    if bool(debug_mode) and (not bool(thread_plan.get("applied", False))):
         logger.info(
             "Thread runtime coordination: "
             f"skipped ({str(thread_plan.get('reason', 'unknown'))})."
         )
-    maybe_warn_non_openblas(
-        logger=logger,
-        strict=require_openblas_by_default(),
-    )
+    if bool(debug_mode):
+        maybe_warn_non_openblas(
+            logger=logger,
+            strict=require_openblas_by_default(),
+        )
 
-    logger.info("Effective models: " + ", ".join(methods))
+    if bool(debug_mode):
+        logger.info("Effective models: " + ", ".join(methods))
     if ("adBLUP" in methods) and args.pcd:
         logger.info("Note: --pcd is ignored for adBLUP.")
 
@@ -2378,9 +3673,13 @@ def main(log: bool = True) -> None:
     # ------------------------------------------------------------------
     gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
     use_packed_lmm = bool(
-        args.bfile
+        gfile_is_plink
         and len(methods) > 0
         and all(m in {"GBLUP", "rrBLUP"} for m in methods)
+    )
+    ldprune_spec = typing.cast(
+        _GsLdPruneSpec | None,
+        getattr(args, "ldprune_spec", None),
     )
     packed_lmm_ctx: dict[str, typing.Any] | None = None
     if use_packed_lmm:
@@ -2397,11 +3696,219 @@ def main(log: bool = True) -> None:
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
-        samples = sample_ids
-        geno = None
-        geno_raw = None
-        geno_add_raw = None
-        geno_ml_raw = None
+        if ldprune_spec is not None:
+            with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+                try:
+                    packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                        genotype_prefix=str(gfile),
+                        spec=ldprune_spec,
+                        n_jobs=max(1, int(args.thread)),
+                    )
+                except Exception:
+                    task.fail("Applying LD prune ...Failed")
+                    raise
+                m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+                task.complete(
+                    "Applying LD prune ...Finished "
+                    f"(kept={m_after}, spec={ldprune_spec.label()})"
+                )
+
+        if args.hash_dim is not None:
+            hash_dim = int(args.hash_dim)
+            hash_std = not bool(args.hash_raw)
+            if hash_gblup_only_mode:
+                samples = np.asarray(sample_ids, dtype=str)
+                geno = None
+                geno_raw = None
+                geno_add_raw = None
+                geno_ml_raw = None
+            else:
+                with CliStatus(
+                    f"Running signed feature hashing (k={hash_dim})...",
+                    enabled=use_spinner,
+                ) as task:
+                    try:
+                        geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            hash_dim=hash_dim,
+                            hash_seed=int(args.hash_seed),
+                            standardize=bool(hash_std),
+                            n_jobs=max(1, int(args.thread)),
+                        )
+                    except Exception:
+                        task.fail("Signed feature hashing ...Failed")
+                        raise
+                    task.complete(
+                        "Signed feature hashing ...Finished "
+                        f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                    )
+
+                samples = np.asarray(sample_ids, dtype=str)
+                geno = np.ascontiguousarray(np.asarray(geno_h, dtype=np.float32))
+                packed_lmm_ctx = None
+                use_packed_lmm = False
+
+                need_std_geno = bool(
+                    any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods)
+                )
+                need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+                geno_raw = (
+                    np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+                    if need_raw_geno
+                    else None
+                )
+                geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+                geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
+                if need_std_geno:
+                    geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+                        geno.std(axis=1, keepdims=True) + 1e-6
+                    )
+        else:
+            samples = sample_ids
+            geno = None
+            geno_raw = None
+            geno_add_raw = None
+            geno_ml_raw = None
+    elif gfile_is_plink and (args.hash_dim is not None):
+        # Global hash path for non-packed-model sets:
+        # load packed BED -> optional LD prune -> hash projection -> dense hashed matrix.
+        with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
+            try:
+                sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
+                    str(gfile),
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
+                )
+            except Exception:
+                task.fail(f"Loading genotype from {gsrc} ...Failed")
+                raise
+            n = int(sample_ids.shape[0])
+            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+
+        if ldprune_spec is not None:
+            with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+                try:
+                    packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                        genotype_prefix=str(gfile),
+                        spec=typing.cast(_GsLdPruneSpec, ldprune_spec),
+                        n_jobs=max(1, int(args.thread)),
+                    )
+                except Exception:
+                    task.fail("Applying LD prune ...Failed")
+                    raise
+                m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+                task.complete(
+                    "Applying LD prune ...Finished "
+                    f"(kept={m_after}, spec={typing.cast(_GsLdPruneSpec, ldprune_spec).label()})"
+                )
+
+        hash_dim = int(args.hash_dim)
+        hash_std = not bool(args.hash_raw)
+        with CliStatus(
+            f"Running signed feature hashing (k={hash_dim})...",
+            enabled=use_spinner,
+        ) as task:
+            try:
+                geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                    hash_dim=hash_dim,
+                    hash_seed=int(args.hash_seed),
+                    standardize=bool(hash_std),
+                    n_jobs=max(1, int(args.thread)),
+                )
+            except Exception:
+                task.fail("Signed feature hashing ...Failed")
+                raise
+            task.complete(
+                "Signed feature hashing ...Finished "
+                f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+            )
+
+        samples = np.asarray(sample_ids, dtype=str)
+        geno = np.ascontiguousarray(np.asarray(geno_h, dtype=np.float32))
+        packed_lmm_ctx = None
+        use_packed_lmm = False
+
+        need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
+        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        geno_raw = (
+            np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+            if need_raw_geno
+            else None
+        )
+        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
+        if need_std_geno:
+            geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+                geno.std(axis=1, keepdims=True) + 1e-6
+            )
+    elif gfile_is_plink and (ldprune_spec is not None):
+        # For non-GBLUP/rrBLUP model sets, allow global LD prune by
+        # pruning on packed BED first, then decoding once to dense matrix.
+        with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
+            try:
+                sample_ids, packed_lmm_ctx = _load_plink_packed_for_lmm(
+                    str(gfile),
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
+                )
+            except Exception:
+                task.fail(f"Loading genotype from {gsrc} ...Failed")
+                raise
+            n = int(sample_ids.shape[0])
+            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+
+        with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+            try:
+                packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                    genotype_prefix=str(gfile),
+                    spec=typing.cast(_GsLdPruneSpec, ldprune_spec),
+                    n_jobs=max(1, int(args.thread)),
+                )
+            except Exception:
+                task.fail("Applying LD prune ...Failed")
+                raise
+            m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            task.complete(
+                "Applying LD prune ...Finished "
+                f"(kept={m_after}, spec={typing.cast(_GsLdPruneSpec, ldprune_spec).label()})"
+            )
+
+        with CliStatus("Decoding packed genotype after LD prune...", enabled=use_spinner) as task:
+            try:
+                geno = _decode_packed_ctx_to_dense(
+                    typing.cast(dict[str, typing.Any], packed_lmm_ctx)
+                )
+            except Exception:
+                task.fail("Decoding packed genotype after LD prune ...Failed")
+                raise
+            task.complete(
+                "Decoding packed genotype after LD prune ...Finished "
+                f"(n={int(geno.shape[1])}, nSNP={int(geno.shape[0])})"
+            )
+
+        samples = np.asarray(sample_ids, dtype=str)
+        packed_lmm_ctx = None
+        use_packed_lmm = False
+
+        need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
+        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        geno_raw = (
+            np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+            if need_raw_geno
+            else None
+        )
+        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
+        if need_std_geno:
+            geno = (geno - geno.mean(axis=1, keepdims=True)) / (
+                geno.std(axis=1, keepdims=True) + 1e-6
+            )
     else:
         with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
             try:
@@ -2433,12 +3940,78 @@ def main(log: bool = True) -> None:
                 geno.std(axis=1, keepdims=True) + 1e-6
             )  # standardization for marker-effect models
 
+    # Cache for repeated trait train/test partitions in GBLUP-only hash kinship mode.
+    # Key: (train_idx bytes, test_idx bytes) in genotype sample order.
+    hash_kernel_cache: dict[tuple[bytes, bytes], tuple[np.ndarray, np.ndarray, int]] = {}
+    if (
+        hash_gblup_only_mode
+        and bool(use_packed_lmm)
+        and (packed_lmm_ctx is not None)
+        and (args.hash_dim is not None)
+        and (_jxrs is not None)
+        and hasattr(_jxrs, "bed_packed_signed_hash_kernels_f64")
+    ):
+        # If all requested traits share the same train/test split and backend=kinship,
+        # prebuild kernels once right after genotype loading.
+        common_trainmask: np.ndarray | None = None
+        shared_mask = True
+        for _tname in pheno.columns:
+            _p = pheno[_tname]
+            _namark = _p.isna()
+            _train_id_set = set(_p.index[~_namark])
+            _trainmask = np.fromiter(
+                (x in _train_id_set for x in samples),
+                dtype=bool,
+                count=len(samples),
+            )
+            if common_trainmask is None:
+                common_trainmask = _trainmask
+            elif not np.array_equal(common_trainmask, _trainmask):
+                shared_mask = False
+                break
+        if shared_mask and common_trainmask is not None:
+            train_idx_common = np.flatnonzero(common_trainmask).astype(np.int64, copy=False)
+            test_idx_common = np.flatnonzero(~common_trainmask).astype(np.int64, copy=False)
+            if int(train_idx_common.shape[0]) <= int(args.hash_dim):
+                key_common = (
+                    np.ascontiguousarray(train_idx_common, dtype=np.int64).tobytes(),
+                    np.ascontiguousarray(test_idx_common, dtype=np.int64).tobytes(),
+                )
+                if key_common not in hash_kernel_cache:
+                    hash_dim = int(args.hash_dim)
+                    hash_std = not bool(args.hash_raw)
+                    with CliStatus(
+                        f"Running signed hash kernels (shared traits, k={hash_dim})...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            train_grm_c, test_train_grm_c, hash_kept_c = _hash_packed_kernels_for_gblup(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                train_sample_indices=np.ascontiguousarray(train_idx_common, dtype=np.int64),
+                                test_sample_indices=np.ascontiguousarray(test_idx_common, dtype=np.int64),
+                            )
+                        except Exception:
+                            task.fail("Signed hash kernels ...Failed")
+                            raise
+                        task.complete(
+                            "Signed feature hashing ...Finished "
+                            f"(k={hash_dim}, kept_snp={hash_kept_c}, gram-only)"
+                        )
+                    hash_kernel_cache[key_common] = (
+                        np.ascontiguousarray(train_grm_c, dtype=np.float64),
+                        np.ascontiguousarray(test_train_grm_c, dtype=np.float64),
+                        int(hash_kept_c),
+                    )
+
     # ------------------------------------------------------------------
     # Genomic Selection for each phenotype
     # ------------------------------------------------------------------
     single_trait_mode = (pheno.shape[1] == 1)
     for trait_name in pheno.columns:
-        logger.info("*" * 60)
         t_trait = time.time()
         if _GS_DEBUG_STAGE:
             logger.info(f"[GS-DEBUG][{trait_name}] stage=trait_start")
@@ -2471,7 +4044,12 @@ def main(log: bool = True) -> None:
         test_snp_add = None
         train_snp_ml = None
         test_snp_ml = None
-        if use_packed_lmm:
+        trait_use_packed_lmm = bool(use_packed_lmm)
+        trait_packed_ctx: dict[str, typing.Any] | None = packed_lmm_ctx
+        gblup_backend_label: str | None = None
+        gblup_backend_n: int | None = None
+        gblup_backend_m: int | None = None
+        if trait_use_packed_lmm:
             if _GS_DEBUG_STAGE:
                 logger.info(
                     f"[GS-DEBUG][{trait_name}] stage=build_sample_indices "
@@ -2495,19 +4073,242 @@ def main(log: bool = True) -> None:
                 f"[GS-DEBUG][{trait_name}] stage=align_train_pheno "
                 f"shape={train_pheno.shape} elapsed={time.time() - t_stage:.3f}s"
             )
-        eff_snp = (
-            int(packed_lmm_ctx["packed"].shape[0])
-            if (use_packed_lmm and packed_lmm_ctx is not None)
-            else int(train_snp.shape[0] if train_snp is not None else 0)
-        )
-        logger.info(
-            f"* Genomic Selection for trait: {trait_name}\n"
-            f"Train size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {eff_snp}"
-        )
 
         if train_pheno.size == 0:
             logger.warning(f"No non-missing phenotypes for trait {trait_name}; skipped.")
             continue
+
+        if hash_gblup_only_mode:
+            if packed_lmm_ctx is None:
+                raise RuntimeError(
+                    "Internal error: packed genotype context missing for GBLUP-only hash mode."
+                )
+            hash_dim = int(args.hash_dim)
+            hash_std = not bool(args.hash_raw)
+            n_train_now = int(train_sample_idx.shape[0])
+            gblup_backend_label = "ZTZ" if n_train_now > hash_dim else "kinship"
+            gblup_backend_n = int(n_train_now)
+            gblup_backend_m = int(hash_dim)
+            trait_use_packed_lmm = False
+            if gblup_backend_label == "kinship":
+                used_gram_only = False
+                if _jxrs is not None and hasattr(_jxrs, "bed_packed_signed_hash_kernels_f64"):
+                    key_kin = (
+                        np.ascontiguousarray(train_sample_idx, dtype=np.int64).tobytes(),
+                        np.ascontiguousarray(test_sample_idx, dtype=np.int64).tobytes(),
+                    )
+                    cached_kin = hash_kernel_cache.get(key_kin)
+                    if cached_kin is not None:
+                        train_grm, test_train_grm, _hash_kept = cached_kin
+                    else:
+                        with CliStatus(
+                            f"Running signed feature hashing kernels for trait {trait_name} (k={hash_dim})...",
+                            enabled=use_spinner,
+                        ) as task:
+                            try:
+                                train_grm, test_train_grm, hash_kept = _hash_packed_kernels_for_gblup(
+                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                    hash_dim=hash_dim,
+                                    hash_seed=int(args.hash_seed),
+                                    standardize=bool(hash_std),
+                                    n_jobs=max(1, int(args.thread)),
+                                    train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                    test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                )
+                            except Exception:
+                                task.fail("Signed hash kernels ...Failed")
+                                raise
+                            task.complete(
+                                "Signed hash kernels ...Finished "
+                                f"(k={hash_dim}, kept_snp={hash_kept}, gram-only)"
+                            )
+                        train_grm = np.ascontiguousarray(train_grm, dtype=np.float64)
+                        test_train_grm = np.ascontiguousarray(test_train_grm, dtype=np.float64)
+                        hash_kernel_cache[key_kin] = (train_grm, test_train_grm, int(hash_kept))
+                    train_snp = None
+                    test_snp = None
+                    trait_packed_ctx = {
+                        "__gblup_train_grm__": np.ascontiguousarray(train_grm, dtype=np.float64),
+                        "__gblup_test_train_grm__": np.ascontiguousarray(test_train_grm, dtype=np.float64),
+                    }
+                    used_gram_only = True
+
+                if not used_gram_only:
+                    with CliStatus(
+                        f"Running signed feature hashing for trait {trait_name} (k={hash_dim})...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                            )
+                            if int(test_sample_idx.shape[0]) > 0:
+                                z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                    hash_dim=hash_dim,
+                                    hash_seed=int(args.hash_seed),
+                                    standardize=bool(hash_std),
+                                    n_jobs=max(1, int(args.thread)),
+                                    sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                )
+                            else:
+                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                        except Exception:
+                            task.fail("Signed feature hashing ...Failed")
+                            raise
+                        task.complete(
+                            "Signed feature hashing ...Finished "
+                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                        )
+                    with CliStatus(
+                        "Building hashed GBLUP kinship kernels...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            train_grm = np.asarray(
+                                _QK2_GRM(np.asarray(z_train, dtype=np.float32), log=False),
+                                dtype=np.float64,
+                            )
+                            if int(z_test.shape[1]) > 0:
+                                test_train_grm = _build_gblup_test_train_cross_from_markers(
+                                    test_snp=np.asarray(z_test, dtype=np.float32),
+                                    train_snp=np.asarray(z_train, dtype=np.float32),
+                                )
+                            else:
+                                test_train_grm = np.zeros((0, int(z_train.shape[1])), dtype=np.float64)
+                        except Exception:
+                            task.fail("Building hashed GBLUP kinship kernels ...Failed")
+                            raise
+                        task.complete("Building hashed GBLUP kinship kernels ...Finished")
+                    train_snp = None
+                    test_snp = None
+                    trait_packed_ctx = {
+                        "__gblup_train_grm__": np.ascontiguousarray(train_grm, dtype=np.float64),
+                        "__gblup_test_train_grm__": np.ascontiguousarray(test_train_grm, dtype=np.float64),
+                    }
+            else:
+                used_stream_ztz = False
+                if (
+                    args.cv is None
+                    and _jxrs is not None
+                    and hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")
+                ):
+                    with CliStatus(
+                        f"Streaming signed-hash ZTZ stats for trait {trait_name} (k={hash_dim})...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            gram, row_sum, row_sq_sum, zy_vec, hash_scale, hash_kept = (
+                                _hash_packed_ztz_stats_for_gblup(
+                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                    hash_dim=hash_dim,
+                                    hash_seed=int(args.hash_seed),
+                                    standardize=bool(hash_std),
+                                    n_jobs=max(1, int(args.thread)),
+                                    train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                    y_train=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                                )
+                            )
+                        except Exception:
+                            task.fail("Streaming signed-hash ZTZ stats ...Failed")
+                            raise
+                        task.complete(
+                            "Streaming signed-hash ZTZ stats ...Finished "
+                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                        )
+
+                    with CliStatus(
+                        "Fitting hashed GBLUP from streaming ZTZ stats...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            fit_fast = _fit_gblup_reml_from_hash_ztz_stats(
+                                gram=np.asarray(gram, dtype=np.float64),
+                                row_sum=np.asarray(row_sum, dtype=np.float64),
+                                row_sq_sum=np.asarray(row_sq_sum, dtype=np.float64),
+                                zy=np.asarray(zy_vec, dtype=np.float64),
+                                n_train=int(train_sample_idx.shape[0]),
+                            )
+                        except Exception:
+                            task.fail("Fitting hashed GBLUP from streaming ZTZ stats ...Failed")
+                            raise
+                        task.complete("Fitting hashed GBLUP from streaming ZTZ stats ...Finished")
+
+                    with CliStatus(
+                        "Predicting hashed GBLUP test set (compact)...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            test_pred_fast = _predict_hashed_gblup_test_from_compact(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                beta=float(fit_fast["beta"]),
+                                m_mean=np.asarray(fit_fast["m_mean"], dtype=np.float64),
+                                m_var_sum=float(fit_fast["m_var_sum"]),
+                                m_alpha=np.asarray(fit_fast["m_alpha"], dtype=np.float64),
+                                alpha_sum=float(fit_fast["alpha_sum"]),
+                                mean_sq=float(fit_fast["mean_sq"]),
+                                mean_malpha=float(fit_fast["mean_malpha"]),
+                            )
+                        except Exception:
+                            task.fail("Predicting hashed GBLUP test set ...Failed")
+                            raise
+                        task.complete("Predicting hashed GBLUP test set (compact) ...Finished")
+
+                    train_snp = None
+                    test_snp = None
+                    trait_packed_ctx = {
+                        "__gblup_hash_ztz_test_pred__": np.ascontiguousarray(
+                            test_pred_fast, dtype=np.float64
+                        ),
+                        "__gblup_hash_ztz_pve__": float(fit_fast["pve"]),
+                    }
+                    used_stream_ztz = True
+
+                if not used_stream_ztz:
+                    with CliStatus(
+                        f"Running signed feature hashing for trait {trait_name} (k={hash_dim})...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                            )
+                            if int(test_sample_idx.shape[0]) > 0:
+                                z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                    hash_dim=hash_dim,
+                                    hash_seed=int(args.hash_seed),
+                                    standardize=bool(hash_std),
+                                    n_jobs=max(1, int(args.thread)),
+                                    sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                )
+                            else:
+                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                        except Exception:
+                            task.fail("Signed feature hashing ...Failed")
+                            raise
+                        task.complete(
+                            "Signed feature hashing ...Finished "
+                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                        )
+                    train_snp = np.ascontiguousarray(np.asarray(z_train, dtype=np.float32))
+                    test_snp = np.ascontiguousarray(np.asarray(z_test, dtype=np.float32))
+                    trait_packed_ctx = None
 
         # 5-fold cross-validation on training population
         cv_splits = None
@@ -2518,9 +4319,8 @@ def main(log: bool = True) -> None:
                 seed=42,
             )
 
-        if not use_packed_lmm:
+        if (not trait_use_packed_lmm) and (test_snp is None) and (geno is not None):
             t_stage = time.time()
-            assert geno is not None
             test_snp = geno[:, testmask]
             if _GS_DEBUG_STAGE:
                 logger.info(
@@ -2538,7 +4338,7 @@ def main(log: bool = True) -> None:
                     raise RuntimeError("Internal error: raw genotype matrix for MLGS is missing.")
                 train_snp_ml = geno_ml_raw[:, trainmask]
                 test_snp_ml = geno_ml_raw[:, testmask]
-        if single_trait_mode and (not use_packed_lmm):
+        if single_trait_mode and (not trait_use_packed_lmm) and (geno is not None):
             # In single-trait runs, release full matrices once train/test views are materialized.
             # This avoids carrying an extra full-genotype buffer through model fitting.
             geno = np.empty((0, 0), dtype=np.float32)
@@ -2548,6 +4348,35 @@ def main(log: bool = True) -> None:
             gc.collect()
             if _GS_DEBUG_STAGE:
                 logger.info(f"[GS-DEBUG][{trait_name}] stage=release_full_geno done=1")
+
+        if hash_gblup_only_mode:
+            eff_snp = int(args.hash_dim)
+        else:
+            eff_snp = (
+                int(trait_packed_ctx["packed"].shape[0])
+                if (trait_use_packed_lmm and trait_packed_ctx is not None)
+                else int(train_snp.shape[0] if train_snp is not None else 0)
+            )
+        if gblup_backend_label is None and ("GBLUP" in methods) and (train_snp is not None):
+            gblup_backend_n = int(train_pheno.shape[0])
+            gblup_backend_m = int(train_snp.shape[0])
+            gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
+
+        logger.info("*" * 60)
+        logger.info(
+            f"* Genomic Selection for trait: {trait_name}\n"
+            f"Train size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {eff_snp}"
+        )
+        if (
+            bool(debug_mode)
+            and gblup_backend_label is not None
+            and gblup_backend_n is not None
+            and gblup_backend_m is not None
+        ):
+            logger.info(
+                f"GBLUP backend(auto): {gblup_backend_label} "
+                f"(n={gblup_backend_n}, m={gblup_backend_m})"
+            )
         t_stage = time.time()
         method_results = _run_methods_parallel(
             methods=methods,
@@ -2563,7 +4392,7 @@ def main(log: bool = True) -> None:
             n_jobs=int(max(1, args.thread)),
             strict_cv=bool(args.strict_cv),
             force_fast=bool(args.force_fast),
-            packed_ctx=packed_lmm_ctx,
+            packed_ctx=trait_packed_ctx,
             train_sample_indices=train_sample_idx,
             test_sample_indices=test_sample_idx,
             limit_predtrain=args.limit_predtrain,

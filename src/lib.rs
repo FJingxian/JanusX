@@ -54,12 +54,14 @@ use admixture::{
 };
 use assoc::{
     ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
-    bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, farmcpu_rem_dense,
-    farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed, fastlmm_assoc_chunk_f32,
-    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_bed_f32,
-    grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
-    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
-    packed_malpha_f64, rust_sgemm_backend,
+    bed_packed_ld_prune_maf_priority, bed_packed_row_flip_mask, bed_packed_signed_hash_f32,
+    bed_packed_signed_hash_ztz_stats_f64, bed_packed_signed_hash_kernels_f64,
+    cross_grm_times_alpha_packed_f64,
+    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
+    fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed,
+    grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32,
+    lmm_assoc_chunk_from_snp_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32,
+    lmm_reml_null_f32, ml_loglike_null_f32, packed_malpha_f64, rust_sgemm_backend,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use beam::{
@@ -145,6 +147,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_signed_hash_ztz_stats_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_packed_signed_hash_kernels_f64, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;

@@ -174,6 +174,8 @@ _ML_METHOD_MAP: dict[str, str] = {
     "SVM": "svm",
     "ENET": "enet",
 }
+_HASH_KERNEL_QC_SAMPLE_N = 2000
+_HASH_KERNEL_QC_MIN_N = 64
 
 
 @dataclass
@@ -3069,6 +3071,259 @@ def _hash_progress_step(total_hint: int) -> int:
     return max(1, t // 200)
 
 
+def _upper_offdiag_values(mat: np.ndarray) -> np.ndarray:
+    arr = np.asarray(mat, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(f"matrix must be square for off-diagonal extraction, got {arr.shape}")
+    n = int(arr.shape[0])
+    if n <= 1:
+        return np.zeros((0,), dtype=np.float64)
+    tri = np.triu_indices(n, k=1)
+    return np.ascontiguousarray(arr[tri], dtype=np.float64)
+
+
+def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
+    a = np.asarray(x, dtype=np.float64).reshape(-1)
+    b = np.asarray(y, dtype=np.float64).reshape(-1)
+    if int(a.size) == 0 or int(b.size) == 0 or int(a.size) != int(b.size):
+        return float("nan")
+    ax = a - float(np.mean(a))
+    bx = b - float(np.mean(b))
+    denom = float(np.sqrt(np.sum(ax * ax) * np.sum(bx * bx)))
+    if (not np.isfinite(denom)) or (denom <= 0.0):
+        return float("nan")
+    return float(np.sum(ax * bx) / denom)
+
+
+def _snapshot_packed_ctx_for_qc(
+    packed_ctx: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any] | None:
+    """
+    Keep a lightweight snapshot of packed payload references for pre/post
+    preprocessing QC comparison. Arrays are not deep-copied.
+    """
+    if packed_ctx is None:
+        return None
+    snap: dict[str, typing.Any] = {
+        "packed": packed_ctx["packed"],
+        "maf": packed_ctx["maf"],
+        "missing_rate": packed_ctx["missing_rate"],
+        "n_samples": packed_ctx["n_samples"],
+    }
+    if "row_flip" in packed_ctx:
+        snap["row_flip"] = packed_ctx["row_flip"]
+    if "site_keep" in packed_ctx:
+        snap["site_keep"] = packed_ctx["site_keep"]
+    return snap
+
+
+def _hash_kernel_sanity_check(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_ids: np.ndarray,
+    pheno: pd.DataFrame,
+    hash_dim: int | None,
+    hash_seed: int,
+    standardize: bool,
+    n_jobs: int,
+    baseline_packed_ctx: dict[str, typing.Any] | None = None,
+    sample_n: int = _HASH_KERNEL_QC_SAMPLE_N,
+) -> dict[str, typing.Any]:
+    sid = np.asarray(sample_ids, dtype=str).reshape(-1)
+    if int(sid.size) == 0:
+        raise ValueError("Hash QC requires non-empty sample IDs.")
+    if int(pheno.shape[1]) <= 0:
+        raise ValueError("Hash QC requires at least one phenotype column.")
+
+    trait_name = str(pheno.columns[0])
+    sid_index = pd.Index(sid, dtype=str)
+    y_col = pd.to_numeric(
+        pheno[str(trait_name)].reindex(sid_index),
+        errors="coerce",
+    )
+    y_all = np.asarray(y_col.to_numpy(dtype=np.float64, copy=False), dtype=np.float64)
+    valid = np.isfinite(y_all)
+    pool = np.flatnonzero(valid).astype(np.int64, copy=False)
+    if int(pool.size) < int(_HASH_KERNEL_QC_MIN_N):
+        raise ValueError(
+            f"Hash QC requires at least {_HASH_KERNEL_QC_MIN_N} non-missing samples "
+            f"in phenotype column '{trait_name}', got {int(pool.size)}."
+        )
+
+    take = int(max(_HASH_KERNEL_QC_MIN_N, min(int(sample_n), int(pool.size))))
+    if int(pool.size) > take:
+        rng = np.random.default_rng(int(hash_seed) + 20260428)
+        pick = np.asarray(rng.choice(pool, size=take, replace=False), dtype=np.int64)
+        pick.sort()
+    else:
+        pick = np.asarray(pool, dtype=np.int64)
+    sub_idx = np.ascontiguousarray(pick.reshape(-1), dtype=np.int64)
+    y_sub = np.ascontiguousarray(y_all[sub_idx].reshape(-1, 1), dtype=np.float64)
+
+    full_ctx = baseline_packed_ctx if baseline_packed_ctx is not None else packed_ctx
+    full_snp = int(
+        np.asarray(
+            typing.cast(dict[str, typing.Any], full_ctx)["packed"]
+        ).shape[0]
+    )
+    proc_snp = int(
+        np.asarray(
+            typing.cast(dict[str, typing.Any], packed_ctx)["packed"]
+        ).shape[0]
+    )
+
+    k_full = _build_gblup_cv_grm_once(
+        train_snp=None,
+        packed_ctx=full_ctx,
+        train_sample_indices=sub_idx,
+        n_jobs=max(1, int(n_jobs)),
+    )
+    if k_full is None:
+        raise RuntimeError("Hash QC failed to build full GRM from packed genotype.")
+    k_full = np.ascontiguousarray(0.5 * (k_full + k_full.T), dtype=np.float64)
+
+    mode = "ldprune"
+    if hash_dim is not None:
+        mode = "hash"
+        if int(proc_snp) < int(full_snp):
+            mode = "ldprune+hash"
+        k_proc, _cross, kept_snp = _hash_packed_kernels_for_gblup(
+            packed_ctx=packed_ctx,
+            hash_dim=int(hash_dim),
+            hash_seed=int(hash_seed),
+            standardize=bool(standardize),
+            n_jobs=max(1, int(n_jobs)),
+            train_sample_indices=sub_idx,
+            test_sample_indices=np.zeros((0,), dtype=np.int64),
+        )
+        k_proc = np.ascontiguousarray(0.5 * (k_proc + k_proc.T), dtype=np.float64)
+    else:
+        k_proc_tmp = _build_gblup_cv_grm_once(
+            train_snp=None,
+            packed_ctx=packed_ctx,
+            train_sample_indices=sub_idx,
+            n_jobs=max(1, int(n_jobs)),
+        )
+        if k_proc_tmp is None:
+            raise RuntimeError("Kernel QC failed to build post-prune GRM from packed genotype.")
+        k_proc = np.ascontiguousarray(0.5 * (k_proc_tmp + k_proc_tmp.T), dtype=np.float64)
+        kept_snp = int(proc_snp)
+
+    off_full = _upper_offdiag_values(k_full)
+    off_proc = _upper_offdiag_values(k_proc)
+    offdiag_r = _safe_pearson(off_full, off_proc)
+
+    fit_full = _fit_gblup_reml_from_grm(y_sub, k_full)
+    fit_proc = _fit_gblup_reml_from_grm(y_sub, k_proc)
+    pve_full = float(fit_full.get("pve", float("nan")))
+    pve_proc = float(fit_proc.get("pve", float("nan")))
+    pve_delta = (
+        abs(pve_proc - pve_full)
+        if np.isfinite(pve_proc) and np.isfinite(pve_full)
+        else float("nan")
+    )
+    return {
+        "mode": str(mode),
+        "trait": trait_name,
+        "n": int(sub_idx.shape[0]),
+        "full_snp": int(full_snp),
+        "proc_snp": int(proc_snp),
+        "kept_snp": int(kept_snp),
+        "offdiag_r": float(offdiag_r),
+        "pve_full": float(pve_full),
+        "pve_proc": float(pve_proc),
+        "pve_delta": float(pve_delta),
+    }
+
+
+def _report_hash_kernel_sanity_check(
+    *,
+    packed_ctx: dict[str, typing.Any] | None,
+    sample_ids: np.ndarray | None,
+    pheno: pd.DataFrame,
+    hash_dim: int | None,
+    hash_seed: int,
+    hash_standardize: bool,
+    n_jobs: int,
+    use_spinner: bool,
+    logger: logging.Logger,
+    baseline_packed_ctx: dict[str, typing.Any] | None = None,
+    debug_mode: bool = False,
+) -> None:
+    if packed_ctx is None or sample_ids is None:
+        return
+    t0 = time.monotonic()
+    try:
+        def _estimate_details(qc_row: dict[str, typing.Any]) -> list[str]:
+            full_snp = int(qc_row["full_snp"])
+            proc_snp = int(qc_row["proc_snp"])
+            if hash_dim is None:
+                m_part = f"m={full_snp}->{proc_snp}"
+            else:
+                m_part = f"m={full_snp}->{proc_snp}, k={int(hash_dim)}"
+            return [
+                f"n={int(qc_row['n'])}",
+                m_part,
+                f"offdiag_r={float(qc_row['offdiag_r']):.3f}",
+                f"ΔPVE={float(qc_row['pve_delta']):.3f}",
+            ]
+
+        if use_spinner:
+            qc = _run_indeterminate_task_with_progress_bar(
+                desc="Estimate",
+                enabled=True,
+                runner=lambda: _hash_kernel_sanity_check(
+                    packed_ctx=packed_ctx,
+                    sample_ids=np.asarray(sample_ids, dtype=str),
+                    pheno=pheno,
+                    hash_dim=(None if hash_dim is None else int(hash_dim)),
+                    hash_seed=int(hash_seed),
+                    standardize=bool(hash_standardize),
+                    n_jobs=max(1, int(n_jobs)),
+                    baseline_packed_ctx=baseline_packed_ctx,
+                    sample_n=int(_HASH_KERNEL_QC_SAMPLE_N),
+                ),
+            )
+            msg = _compact_done_message("Estimate", _estimate_details(qc))
+            print_success(
+                f"{msg} [{format_elapsed(time.monotonic() - t0)}]",
+                force_color=True,
+            )
+        else:
+            with CliStatus("Running estimate...", enabled=use_spinner) as task:
+                qc = _hash_kernel_sanity_check(
+                    packed_ctx=packed_ctx,
+                    sample_ids=np.asarray(sample_ids, dtype=str),
+                    pheno=pheno,
+                    hash_dim=(None if hash_dim is None else int(hash_dim)),
+                    hash_seed=int(hash_seed),
+                    standardize=bool(hash_standardize),
+                    n_jobs=max(1, int(n_jobs)),
+                    baseline_packed_ctx=baseline_packed_ctx,
+                    sample_n=int(_HASH_KERNEL_QC_SAMPLE_N),
+                )
+                task.complete(_compact_done_message("Estimate", _estimate_details(qc)))
+        if bool(debug_mode):
+            logger.info(
+                "Estimate details: "
+                f"mode={qc['mode']}, "
+                f"trait={qc['trait']}, "
+                f"n={int(qc['n'])}, "
+                f"full_snp={int(qc['full_snp'])}, "
+                f"proc_snp={int(qc['proc_snp'])}, "
+                f"offdiag_r={float(qc['offdiag_r']):.6f}, "
+                f"pve_full={float(qc['pve_full']):.6f}, "
+                f"pve_proc={float(qc['pve_proc']):.6f}, "
+                f"delta_pve={float(qc['pve_delta']):.6f}, "
+                f"hash_kept_snp={int(qc['kept_snp'])}"
+            )
+    except Exception as ex:
+        logger.warning(
+            "Estimate skipped due to diagnostic failure: "
+            f"{ex}"
+        )
+
+
 def _run_hash_job_with_progress_bar(
     *,
     desc: str,
@@ -4084,7 +4339,11 @@ def main(log: bool = True) -> None:
         _GsLdPruneSpec | None,
         getattr(args, "ldprune_spec", None),
     )
+    preprocess_qc_requested = bool(
+        (args.hash_dim is not None) or (ldprune_spec is not None)
+    )
     packed_lmm_ctx: dict[str, typing.Any] | None = None
+    packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
     if use_packed_lmm:
         with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
             try:
@@ -4099,6 +4358,8 @@ def main(log: bool = True) -> None:
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        if preprocess_qc_requested:
+            packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
         if ldprune_spec is not None:
             if use_spinner:
                 t_ld = time.monotonic()
@@ -4141,6 +4402,21 @@ def main(log: bool = True) -> None:
                             [f"kept={m_after}", f"spec={ldprune_spec.label()}"],
                         )
                     )
+
+        if preprocess_qc_requested:
+            _report_hash_kernel_sanity_check(
+                packed_ctx=packed_lmm_ctx,
+                sample_ids=sample_ids,
+                pheno=pheno,
+                hash_dim=(int(args.hash_dim) if args.hash_dim is not None else None),
+                hash_seed=int(args.hash_seed),
+                hash_standardize=(not bool(args.hash_raw)),
+                n_jobs=max(1, int(args.thread)),
+                use_spinner=bool(use_spinner),
+                logger=logger,
+                baseline_packed_ctx=packed_qc_baseline_ctx,
+                debug_mode=bool(debug_mode),
+            )
 
         if args.hash_dim is not None:
             hash_dim = int(args.hash_dim)
@@ -4252,6 +4528,7 @@ def main(log: bool = True) -> None:
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         if ldprune_spec is not None:
             _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
@@ -4296,6 +4573,20 @@ def main(log: bool = True) -> None:
                             [f"kept={m_after}", f"spec={_spec.label()}"],
                         )
                     )
+
+        _report_hash_kernel_sanity_check(
+            packed_ctx=packed_lmm_ctx,
+            sample_ids=sample_ids,
+            pheno=pheno,
+            hash_dim=(int(args.hash_dim) if args.hash_dim is not None else None),
+            hash_seed=int(args.hash_seed),
+            hash_standardize=(not bool(args.hash_raw)),
+            n_jobs=max(1, int(args.thread)),
+            use_spinner=bool(use_spinner),
+            logger=logger,
+            baseline_packed_ctx=packed_qc_baseline_ctx,
+            debug_mode=bool(debug_mode),
+        )
 
         hash_dim = int(args.hash_dim)
         hash_std = not bool(args.hash_raw)
@@ -4391,6 +4682,7 @@ def main(log: bool = True) -> None:
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
         if use_spinner:
@@ -4434,6 +4726,20 @@ def main(log: bool = True) -> None:
                         [f"kept={m_after}", f"spec={_spec.label()}"],
                     )
                 )
+
+        _report_hash_kernel_sanity_check(
+            packed_ctx=packed_lmm_ctx,
+            sample_ids=sample_ids,
+            pheno=pheno,
+            hash_dim=None,
+            hash_seed=int(args.hash_seed),
+            hash_standardize=(not bool(args.hash_raw)),
+            n_jobs=max(1, int(args.thread)),
+            use_spinner=bool(use_spinner),
+            logger=logger,
+            baseline_packed_ctx=packed_qc_baseline_ctx,
+            debug_mode=bool(debug_mode),
+        )
 
         with CliStatus("Decoding packed genotype after LD prune...", enabled=use_spinner) as task:
             try:

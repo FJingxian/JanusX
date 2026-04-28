@@ -63,6 +63,7 @@ import sys
 import re
 import math
 import gc
+import threading
 from dataclasses import dataclass
 from collections import OrderedDict
 import multiprocessing as mp
@@ -133,7 +134,7 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import build_rich_progress, rich_progress_available
+from ._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
 from ._common.status import (
     CliStatus,
     failure_symbol,
@@ -1212,11 +1213,35 @@ def _run_method_task(
     precomputed_test_train_grm = None
     precomputed_hash_ztz_test_pred = None
     precomputed_hash_ztz_pve = None
+    precomputed_hash_cv_compact = False
+    hash_cv_dim: int | None = None
+    hash_cv_seed: int | None = None
+    hash_cv_standardize = True
     if isinstance(packed_ctx, dict):
         precomputed_train_grm = packed_ctx.get("__gblup_train_grm__", None)
         precomputed_test_train_grm = packed_ctx.get("__gblup_test_train_grm__", None)
         precomputed_hash_ztz_test_pred = packed_ctx.get("__gblup_hash_ztz_test_pred__", None)
         precomputed_hash_ztz_pve = packed_ctx.get("__gblup_hash_ztz_pve__", None)
+        precomputed_hash_cv_compact = bool(
+            packed_ctx.get("__gblup_hash_cv_compact__", False)
+        )
+        hash_dim_raw = packed_ctx.get("__gblup_hash_dim__", None)
+        hash_seed_raw = packed_ctx.get("__gblup_hash_seed__", None)
+        hash_std_raw = packed_ctx.get("__gblup_hash_standardize__", None)
+        if hash_dim_raw is not None:
+            hash_cv_dim = int(hash_dim_raw)
+        if hash_seed_raw is not None:
+            hash_cv_seed = int(hash_seed_raw)
+        if hash_std_raw is not None:
+            hash_cv_standardize = bool(hash_std_raw)
+    use_hash_cv_compact = bool(
+        method == "GBLUP"
+        and cv_splits is not None
+        and packed_payload is not None
+        and precomputed_hash_cv_compact
+        and hash_cv_dim is not None
+        and hash_cv_seed is not None
+    )
     gblup_cv_grm_full: np.ndarray | None = None
     gblup_final_test_train: np.ndarray | None = None
     gblup_force_kinship = False
@@ -1309,6 +1334,10 @@ def _run_method_task(
             or (packed_payload is not None)
         )
     )
+    if use_hash_cv_compact:
+        # Compact hash+CV path builds fold-level ZTZ stats directly and does
+        # not need a full n_train x n_train GRM prebuild.
+        need_cv_grm_prebuild = False
     if (
         (method == "GBLUP")
         and (cv_splits is not None)
@@ -1351,7 +1380,92 @@ def _run_method_task(
             )
             fold_train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
             fold_test_idx = np.asarray(test_idx, dtype=np.int64).reshape(-1)
-            if (method == "GBLUP") and (gblup_cv_grm_full is not None):
+            if (method == "GBLUP") and use_hash_cv_compact:
+                if train_sample_indices is None:
+                    raise ValueError(
+                        "Compact hash+CV mode requires train_sample_indices for packed genotype."
+                    )
+                train_abs_all = np.ascontiguousarray(
+                    np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+                fold_train_abs = np.ascontiguousarray(
+                    train_abs_all[fold_train_idx],
+                    dtype=np.int64,
+                )
+                fold_test_abs = np.ascontiguousarray(
+                    train_abs_all[fold_test_idx],
+                    dtype=np.int64,
+                )
+                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
+                gram, row_sum, row_sq_sum, zy_vec, _hash_scale, _hash_kept = (
+                    _hash_packed_ztz_stats_for_gblup(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_payload),
+                        hash_dim=int(hash_cv_dim),
+                        hash_seed=int(hash_cv_seed),
+                        standardize=bool(hash_cv_standardize),
+                        n_jobs=max(1, int(n_jobs)),
+                        train_sample_indices=fold_train_abs,
+                        y_train=y_fold,
+                    )
+                )
+                fit_fast = _fit_gblup_reml_from_hash_ztz_stats(
+                    gram=np.asarray(gram, dtype=np.float64),
+                    row_sum=np.asarray(row_sum, dtype=np.float64),
+                    row_sq_sum=np.asarray(row_sq_sum, dtype=np.float64),
+                    zy=np.asarray(zy_vec, dtype=np.float64),
+                    n_train=int(fold_train_idx.shape[0]),
+                )
+                yhat_test = _predict_hashed_gblup_test_from_compact(
+                    packed_ctx=typing.cast(dict[str, typing.Any], packed_payload),
+                    hash_dim=int(hash_cv_dim),
+                    hash_seed=int(hash_cv_seed),
+                    standardize=bool(hash_cv_standardize),
+                    n_jobs=max(1, int(n_jobs)),
+                    test_sample_indices=fold_test_abs,
+                    beta=float(fit_fast["beta"]),
+                    m_mean=np.asarray(fit_fast["m_mean"], dtype=np.float64),
+                    m_var_sum=float(fit_fast["m_var_sum"]),
+                    m_alpha=np.asarray(fit_fast["m_alpha"], dtype=np.float64),
+                    alpha_sum=float(fit_fast["alpha_sum"]),
+                    mean_sq=float(fit_fast["mean_sq"]),
+                    mean_malpha=float(fit_fast["mean_malpha"]),
+                )
+                if need_fold_train_pred:
+                    if fold_train_pred_local_idx is None:
+                        pred_train_abs = fold_train_abs
+                    elif int(fold_train_pred_local_idx.size) == 0:
+                        pred_train_abs = np.zeros((0,), dtype=np.int64)
+                    else:
+                        local_idx = np.asarray(
+                            fold_train_pred_local_idx, dtype=np.int64
+                        ).reshape(-1)
+                        pred_train_abs = np.ascontiguousarray(
+                            fold_train_abs[local_idx],
+                            dtype=np.int64,
+                        )
+                    if int(pred_train_abs.size) == 0:
+                        yhat_train = np.zeros((0, 1), dtype=float)
+                    else:
+                        yhat_train = _predict_hashed_gblup_test_from_compact(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_payload),
+                            hash_dim=int(hash_cv_dim),
+                            hash_seed=int(hash_cv_seed),
+                            standardize=bool(hash_cv_standardize),
+                            n_jobs=max(1, int(n_jobs)),
+                            test_sample_indices=pred_train_abs,
+                            beta=float(fit_fast["beta"]),
+                            m_mean=np.asarray(fit_fast["m_mean"], dtype=np.float64),
+                            m_var_sum=float(fit_fast["m_var_sum"]),
+                            m_alpha=np.asarray(fit_fast["m_alpha"], dtype=np.float64),
+                            alpha_sum=float(fit_fast["alpha_sum"]),
+                            mean_sq=float(fit_fast["mean_sq"]),
+                            mean_malpha=float(fit_fast["mean_malpha"]),
+                        )
+                else:
+                    yhat_train = np.zeros((0, 1), dtype=float)
+                pve = float(fit_fast["pve"])
+            elif (method == "GBLUP") and (gblup_cv_grm_full is not None):
                 y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
                 grm_train = np.asarray(
                     gblup_cv_grm_full[np.ix_(fold_train_idx, fold_train_idx)],
@@ -1461,6 +1575,66 @@ def _run_method_task(
                 best_r2 = r2
                 best_test = ttest
                 best_train = ttrain
+
+    if use_hash_cv_compact:
+        if train_sample_indices is None:
+            raise ValueError(
+                "Compact hash+CV mode requires train_sample_indices for final fit."
+            )
+        train_abs = np.ascontiguousarray(
+            np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        y_full = np.asarray(train_pheno, dtype=np.float64).reshape(-1)
+        gram_f, row_sum_f, row_sq_sum_f, zy_f, _hs_f, _hk_f = _hash_packed_ztz_stats_for_gblup(
+            packed_ctx=typing.cast(dict[str, typing.Any], packed_payload),
+            hash_dim=int(hash_cv_dim),
+            hash_seed=int(hash_cv_seed),
+            standardize=bool(hash_cv_standardize),
+            n_jobs=max(1, int(n_jobs)),
+            train_sample_indices=train_abs,
+            y_train=y_full,
+        )
+        fit_final = _fit_gblup_reml_from_hash_ztz_stats(
+            gram=np.asarray(gram_f, dtype=np.float64),
+            row_sum=np.asarray(row_sum_f, dtype=np.float64),
+            row_sq_sum=np.asarray(row_sq_sum_f, dtype=np.float64),
+            zy=np.asarray(zy_f, dtype=np.float64),
+            n_train=int(train_abs.shape[0]),
+        )
+        if test_sample_indices is None:
+            test_pred = np.zeros((0, 1), dtype=float)
+        else:
+            test_abs = np.ascontiguousarray(
+                np.asarray(test_sample_indices, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            if int(test_abs.size) == 0:
+                test_pred = np.zeros((0, 1), dtype=float)
+            else:
+                test_pred = _predict_hashed_gblup_test_from_compact(
+                    packed_ctx=typing.cast(dict[str, typing.Any], packed_payload),
+                    hash_dim=int(hash_cv_dim),
+                    hash_seed=int(hash_cv_seed),
+                    standardize=bool(hash_cv_standardize),
+                    n_jobs=max(1, int(n_jobs)),
+                    test_sample_indices=test_abs,
+                    beta=float(fit_final["beta"]),
+                    m_mean=np.asarray(fit_final["m_mean"], dtype=np.float64),
+                    m_var_sum=float(fit_final["m_var_sum"]),
+                    m_alpha=np.asarray(fit_final["m_alpha"], dtype=np.float64),
+                    alpha_sum=float(fit_final["alpha_sum"]),
+                    mean_sq=float(fit_final["mean_sq"]),
+                    mean_malpha=float(fit_final["mean_malpha"]),
+                )
+        return {
+            "method": method,
+            "fold_rows": fold_rows,
+            "best_test": best_test,
+            "best_train": best_train,
+            "test_pred": np.asarray(test_pred, dtype=float).reshape(-1, 1),
+            "pve_final": float(fit_final["pve"]),
+        }
 
     final_train_idx_arg = None
     final_test_idx_arg = None
@@ -1579,11 +1753,20 @@ def _run_methods_parallel(
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
     limit_predtrain: int | None = None,
+    elapsed_offset_by_method: dict[str, float] | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
 
     model_n_jobs = max(1, int(n_jobs))
+    offset_map = dict(elapsed_offset_by_method or {})
+
+    def _method_offset(name: str) -> float:
+        try:
+            return max(0.0, float(offset_map.get(str(name), 0.0)))
+        except Exception:
+            return 0.0
+
     show_method_progress = cv_splits is not None
     # Force serial execution for all GS methods to avoid cross-method contention
     # and keep runtime behavior consistent.
@@ -1784,10 +1967,15 @@ def _run_methods_parallel(
             return out
         for m in methods:
             t0 = time.monotonic()
+            method_offset = _method_offset(str(m))
             cv_total = int(max(1, fold_total_map.get(m, 1)))
             has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
             enable_tqdm_progress = bool(show_method_progress and _HAS_TQDM and stdout_is_tty())
-            enable_method_spinner = bool((not show_method_progress) and stdout_is_tty())
+            enable_method_spinner = bool(
+                (not show_method_progress)
+                and stdout_is_tty()
+                and (method_offset <= 0.0)
+            )
             search_bar = None
             cv_bar = None
             search_done = 0
@@ -1938,7 +2126,7 @@ def _run_methods_parallel(
                 except Exception:
                     _close_search_bar()
                     _close_cv_bar()
-                    elapsed = format_elapsed(time.monotonic() - t0)
+                    elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                     if method_status is not None:
                         method_status.fail(f"{m} ...Failed")
                     else:
@@ -1956,7 +2144,7 @@ def _run_methods_parallel(
                 _close_cv_bar()
 
                 out.append(res)
-                elapsed = format_elapsed(time.monotonic() - t0)
+                elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                 if method_status is not None:
                     method_status.complete(f"{m} ...Finished")
                 else:
@@ -2011,7 +2199,8 @@ def _run_methods_parallel(
                     results_by_method[method] = fut.result()
                 except Exception:
                     elapsed = format_elapsed(
-                        time.monotonic() - method_start_ts.get(method, time.monotonic())
+                        (time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                        + _method_offset(str(method))
                     )
                     print_failure(
                         f"{method} ...Failed [{elapsed}]",
@@ -2019,7 +2208,8 @@ def _run_methods_parallel(
                     )
                     raise
                 elapsed = format_elapsed(
-                    time.monotonic() - method_start_ts.get(method, time.monotonic())
+                    (time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                    + _method_offset(str(method))
                 )
                 print_success(
                     f"{method} ...Finished [{elapsed}]",
@@ -2127,7 +2317,10 @@ def _run_methods_parallel(
                                 except Exception:
                                     pass
                                 task_map.pop(method, None)
-                            elapsed = format_elapsed(time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                            elapsed = format_elapsed(
+                                (time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                                + _method_offset(str(method))
+                            )
                             _rich_print_success(method, elapsed)
             except Exception:
                 for method, tid in task_map.items():
@@ -2135,7 +2328,10 @@ def _run_methods_parallel(
                         progress.remove_task(tid)
                     except Exception:
                         pass
-                    elapsed = format_elapsed(time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                    elapsed = format_elapsed(
+                        (time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                        + _method_offset(str(method))
+                    )
                     _rich_print_failure(method, elapsed)
                 raise
             finally:
@@ -2196,7 +2392,10 @@ def _run_methods_parallel(
                         results_by_method[method] = res
                         pbar.update(1)
                         pbar.set_postfix(method=method)
-                        elapsed = format_elapsed(time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                        elapsed = format_elapsed(
+                            (time.monotonic() - method_start_ts.get(method, time.monotonic()))
+                            + _method_offset(str(method))
+                        )
                         print_success(
                             f"{method} ...Finished [{elapsed}]",
                             force_color=True,
@@ -2550,6 +2749,8 @@ def _hash_packed_for_gs(
     standardize: bool,
     n_jobs: int,
     sample_indices: np.ndarray | None = None,
+    progress_callback: typing.Callable[[int, int], None] | None = None,
+    progress_every: int = 0,
 ) -> tuple[np.ndarray, float, int]:
     if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_f32")):
         raise RuntimeError(
@@ -2594,20 +2795,40 @@ def _hash_packed_for_gs(
         if np.any(sidx_arg < 0) or np.any(sidx_arg >= int(n_samples)):
             raise ValueError("sample_indices contain out-of-range values for packed hashing.")
 
-    z_raw, scale_raw, kept_raw = _jxrs.bed_packed_signed_hash_f32(
-        packed=packed,
-        n_samples=int(n_samples),
-        row_flip=row_flip,
-        row_maf=maf,
-        n_buckets=int(hash_dim),
-        seed=int(hash_seed),
-        sample_indices=sidx_arg,
-        row_missing=miss,
-        min_maf=0.0,
-        max_missing=1.0,
-        standardize=bool(standardize),
-        threads=max(1, int(n_jobs)),
-    )
+    try:
+        z_raw, scale_raw, kept_raw = _jxrs.bed_packed_signed_hash_f32(
+            packed=packed,
+            n_samples=int(n_samples),
+            row_flip=row_flip,
+            row_maf=maf,
+            n_buckets=int(hash_dim),
+            seed=int(hash_seed),
+            sample_indices=sidx_arg,
+            row_missing=miss,
+            min_maf=0.0,
+            max_missing=1.0,
+            standardize=bool(standardize),
+            threads=max(1, int(n_jobs)),
+            progress_callback=progress_callback,
+            progress_every=max(0, int(progress_every)),
+        )
+    except TypeError:
+        # Backward compatibility with old extension builds that don't expose
+        # progress_callback/progress_every yet.
+        z_raw, scale_raw, kept_raw = _jxrs.bed_packed_signed_hash_f32(
+            packed=packed,
+            n_samples=int(n_samples),
+            row_flip=row_flip,
+            row_maf=maf,
+            n_buckets=int(hash_dim),
+            seed=int(hash_seed),
+            sample_indices=sidx_arg,
+            row_missing=miss,
+            min_maf=0.0,
+            max_missing=1.0,
+            standardize=bool(standardize),
+            threads=max(1, int(n_jobs)),
+        )
     z = np.ascontiguousarray(np.asarray(z_raw, dtype=np.float32))
     expected_n = int(n_samples if sidx_arg is None else sidx_arg.shape[0])
     if z.ndim != 2 or int(z.shape[0]) != int(hash_dim) or int(z.shape[1]) != expected_n:
@@ -2626,6 +2847,8 @@ def _hash_packed_kernels_for_gblup(
     n_jobs: int,
     train_sample_indices: np.ndarray,
     test_sample_indices: np.ndarray | None = None,
+    progress_callback: typing.Callable[[int, int], None] | None = None,
+    progress_every: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_kernels_f64")):
         raise RuntimeError(
@@ -2676,21 +2899,40 @@ def _hash_packed_kernels_for_gblup(
             raise ValueError("test_sample_indices contain out-of-range values for packed hashing.")
         test_idx = t
 
-    train_grm_raw, cross_raw, kept_raw = _jxrs.bed_packed_signed_hash_kernels_f64(
-        packed=packed,
-        n_samples=int(n_samples),
-        row_flip=row_flip,
-        row_maf=maf,
-        n_buckets=int(hash_dim),
-        train_sample_indices=train_idx,
-        test_sample_indices=test_idx,
-        seed=int(hash_seed),
-        row_missing=miss,
-        min_maf=0.0,
-        max_missing=1.0,
-        standardize=bool(standardize),
-        threads=max(1, int(n_jobs)),
-    )
+    try:
+        train_grm_raw, cross_raw, kept_raw = _jxrs.bed_packed_signed_hash_kernels_f64(
+            packed=packed,
+            n_samples=int(n_samples),
+            row_flip=row_flip,
+            row_maf=maf,
+            n_buckets=int(hash_dim),
+            train_sample_indices=train_idx,
+            test_sample_indices=test_idx,
+            seed=int(hash_seed),
+            row_missing=miss,
+            min_maf=0.0,
+            max_missing=1.0,
+            standardize=bool(standardize),
+            threads=max(1, int(n_jobs)),
+            progress_callback=progress_callback,
+            progress_every=max(0, int(progress_every)),
+        )
+    except TypeError:
+        train_grm_raw, cross_raw, kept_raw = _jxrs.bed_packed_signed_hash_kernels_f64(
+            packed=packed,
+            n_samples=int(n_samples),
+            row_flip=row_flip,
+            row_maf=maf,
+            n_buckets=int(hash_dim),
+            train_sample_indices=train_idx,
+            test_sample_indices=test_idx,
+            seed=int(hash_seed),
+            row_missing=miss,
+            min_maf=0.0,
+            max_missing=1.0,
+            standardize=bool(standardize),
+            threads=max(1, int(n_jobs)),
+        )
     train_grm = np.ascontiguousarray(np.asarray(train_grm_raw, dtype=np.float64))
     cross = np.ascontiguousarray(np.asarray(cross_raw, dtype=np.float64))
 
@@ -2716,6 +2958,8 @@ def _hash_packed_ztz_stats_for_gblup(
     n_jobs: int,
     train_sample_indices: np.ndarray,
     y_train: np.ndarray,
+    progress_callback: typing.Callable[[int, int], None] | None = None,
+    progress_every: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     if _jxrs is None or (not hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")):
         raise RuntimeError(
@@ -2765,23 +3009,44 @@ def _hash_packed_ztz_stats_for_gblup(
             f"y_train length mismatch: got {y_vec.shape[0]}, expected {train_idx.shape[0]}"
         )
 
-    gram_raw, row_sum_raw, row_sq_sum_raw, zy_raw, scale_raw, kept_raw = (
-        _jxrs.bed_packed_signed_hash_ztz_stats_f64(
-            packed=packed,
-            n_samples=int(n_samples),
-            row_flip=row_flip,
-            row_maf=maf,
-            n_buckets=int(hash_dim),
-            train_sample_indices=train_idx,
-            y_train=y_vec,
-            seed=int(hash_seed),
-            row_missing=miss,
-            min_maf=0.0,
-            max_missing=1.0,
-            standardize=bool(standardize),
-            threads=max(1, int(n_jobs)),
+    try:
+        gram_raw, row_sum_raw, row_sq_sum_raw, zy_raw, scale_raw, kept_raw = (
+            _jxrs.bed_packed_signed_hash_ztz_stats_f64(
+                packed=packed,
+                n_samples=int(n_samples),
+                row_flip=row_flip,
+                row_maf=maf,
+                n_buckets=int(hash_dim),
+                train_sample_indices=train_idx,
+                y_train=y_vec,
+                seed=int(hash_seed),
+                row_missing=miss,
+                min_maf=0.0,
+                max_missing=1.0,
+                standardize=bool(standardize),
+                threads=max(1, int(n_jobs)),
+                progress_callback=progress_callback,
+                progress_every=max(0, int(progress_every)),
+            )
         )
-    )
+    except TypeError:
+        gram_raw, row_sum_raw, row_sq_sum_raw, zy_raw, scale_raw, kept_raw = (
+            _jxrs.bed_packed_signed_hash_ztz_stats_f64(
+                packed=packed,
+                n_samples=int(n_samples),
+                row_flip=row_flip,
+                row_maf=maf,
+                n_buckets=int(hash_dim),
+                train_sample_indices=train_idx,
+                y_train=y_vec,
+                seed=int(hash_seed),
+                row_missing=miss,
+                min_maf=0.0,
+                max_missing=1.0,
+                standardize=bool(standardize),
+                threads=max(1, int(n_jobs)),
+            )
+        )
     gram = np.ascontiguousarray(np.asarray(gram_raw, dtype=np.float64))
     row_sum = np.ascontiguousarray(np.asarray(row_sum_raw, dtype=np.float64).reshape(-1))
     row_sq_sum = np.ascontiguousarray(np.asarray(row_sq_sum_raw, dtype=np.float64).reshape(-1))
@@ -2797,6 +3062,144 @@ def _hash_packed_ztz_stats_for_gblup(
                 f"Signed hash ZTZ output mismatch: expected {name} length {hash_dim}, got {arr.shape}"
             )
     return gram, row_sum, row_sq_sum, zy, float(scale_raw), int(kept_raw)
+
+
+def _hash_progress_step(total_hint: int) -> int:
+    t = int(max(1, int(total_hint)))
+    return max(1, t // 200)
+
+
+def _run_hash_job_with_progress_bar(
+    *,
+    desc: str,
+    total_hint: int,
+    enabled: bool,
+    runner: typing.Callable[[typing.Callable[[int, int], None] | None, int], typing.Any],
+) -> typing.Any:
+    total = int(max(0, int(total_hint)))
+    if (not bool(enabled)) or total <= 0:
+        return runner(None, 0)
+
+    pbar = ProgressAdapter(
+        total=total,
+        desc=str(desc),
+        show_spinner=False,
+        show_postfix=False,
+        show_remaining=False,
+        keep_display=False,
+        emit_done=False,
+        force_animate=True,
+    )
+    shown = 0
+
+    def _on_progress(done: int, total_from_backend: int) -> None:
+        nonlocal shown
+        b_total = int(max(1, int(total_from_backend)))
+        b_done = int(min(max(0, int(done)), b_total))
+        mapped = int(round(float(b_done) * float(total) / float(b_total)))
+        target = int(min(max(shown, mapped), total))
+        if target > shown:
+            pbar.update(target - shown)
+            shown = target
+
+    try:
+        out = runner(_on_progress, _hash_progress_step(total))
+    except Exception:
+        pbar.close()
+        raise
+    if shown < total:
+        pbar.update(total - shown)
+    pbar.finish()
+    pbar.close()
+    return out
+
+
+def _terminal_columns(default: int = 100) -> int:
+    try:
+        cols = int(os.get_terminal_size().columns)
+        return max(40, cols)
+    except Exception:
+        return int(max(40, default))
+
+
+def _compact_done_message(name: str, details: list[str] | None = None) -> str:
+    base = f"{str(name).strip()} ...Finished"
+    items = [str(x).strip() for x in (details or []) if str(x).strip() != ""]
+    if len(items) == 0:
+        return base
+    max_width = max(24, _terminal_columns() - 8)
+    chosen: list[str] = []
+    for item in items:
+        trial = f"{base} ({', '.join(chosen + [item])})"
+        if len(trial) <= max_width:
+            chosen.append(item)
+        else:
+            break
+    if len(chosen) == 0:
+        return base
+    if len(chosen) < len(items):
+        trial_more = f"{base} ({', '.join(chosen + ['...'])})"
+        if len(trial_more) <= max_width:
+            chosen.append("...")
+    return f"{base} ({', '.join(chosen)})"
+
+
+def _run_indeterminate_task_with_progress_bar(
+    *,
+    desc: str,
+    enabled: bool,
+    runner: typing.Callable[[], typing.Any],
+    interval_s: float = 0.2,
+    total_ticks: int = 80,
+    cap_ratio: float = 0.95,
+) -> typing.Any:
+    if not bool(enabled):
+        return runner()
+    total = max(20, int(total_ticks))
+    cap = max(1, min(total - 1, int(round(total * float(cap_ratio)))))
+    pbar = ProgressAdapter(
+        total=total,
+        desc=str(desc),
+        show_spinner=False,
+        show_postfix=False,
+        show_remaining=False,
+        keep_display=False,
+        emit_done=False,
+        force_animate=True,
+    )
+    ticked = {"n": 0}
+    stop_evt = threading.Event()
+
+    def _ticker() -> None:
+        wait_s = max(0.05, float(interval_s))
+        while not stop_evt.wait(wait_s):
+            if ticked["n"] < cap:
+                pbar.update(1)
+                ticked["n"] += 1
+
+    th = threading.Thread(target=_ticker, daemon=True)
+    th.start()
+    try:
+        out = runner()
+    except Exception:
+        stop_evt.set()
+        try:
+            th.join(timeout=0.6)
+        except Exception:
+            pass
+        pbar.close()
+        raise
+
+    stop_evt.set()
+    try:
+        th.join(timeout=0.6)
+    except Exception:
+        pass
+    if ticked["n"] < total:
+        pbar.update(total - ticked["n"])
+    pbar.finish()
+    pbar.close()
+    return out
 
 
 def _fit_gblup_reml_from_hash_ztz_stats(
@@ -3697,22 +4100,47 @@ def main(log: bool = True) -> None:
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
         if ldprune_spec is not None:
-            with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+            if use_spinner:
+                t_ld = time.monotonic()
                 try:
-                    packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
-                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
-                        genotype_prefix=str(gfile),
-                        spec=ldprune_spec,
-                        n_jobs=max(1, int(args.thread)),
+                    packed_lmm_ctx = _run_indeterminate_task_with_progress_bar(
+                        desc="LD prune",
+                        enabled=True,
+                        runner=lambda: _apply_packed_ld_prune_for_gs(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            genotype_prefix=str(gfile),
+                            spec=ldprune_spec,
+                            n_jobs=max(1, int(args.thread)),
+                        ),
                     )
                 except Exception:
-                    task.fail("Applying LD prune ...Failed")
+                    print_failure("LD prune ...Failed", force_color=True)
                     raise
                 m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
-                task.complete(
-                    "Applying LD prune ...Finished "
-                    f"(kept={m_after}, spec={ldprune_spec.label()})"
+                msg = _compact_done_message(
+                    "LD prune",
+                    [f"kept={m_after}", f"spec={ldprune_spec.label()}"],
                 )
+                print_success(f"{msg} [{format_elapsed(time.monotonic() - t_ld)}]", force_color=True)
+            else:
+                with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+                    try:
+                        packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            genotype_prefix=str(gfile),
+                            spec=ldprune_spec,
+                            n_jobs=max(1, int(args.thread)),
+                        )
+                    except Exception:
+                        task.fail("LD prune ...Failed")
+                        raise
+                    m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+                    task.complete(
+                        _compact_done_message(
+                            "LD prune",
+                            [f"kept={m_after}", f"spec={ldprune_spec.label()}"],
+                        )
+                    )
 
         if args.hash_dim is not None:
             hash_dim = int(args.hash_dim)
@@ -3724,25 +4152,63 @@ def main(log: bool = True) -> None:
                 geno_add_raw = None
                 geno_ml_raw = None
             else:
-                with CliStatus(
-                    f"Running signed feature hashing (k={hash_dim})...",
-                    enabled=use_spinner,
-                ) as task:
-                    try:
-                        geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                if use_spinner:
+                    hash_total = int(
+                        np.asarray(
+                            typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                        ).shape[0]
+                    )
+
+                    def _run_hash(
+                        cb: typing.Callable[[int, int], None] | None,
+                        pe: int,
+                    ) -> tuple[np.ndarray, float, int]:
+                        return _hash_packed_for_gs(
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             hash_dim=hash_dim,
                             hash_seed=int(args.hash_seed),
                             standardize=bool(hash_std),
                             n_jobs=max(1, int(args.thread)),
+                            progress_callback=cb,
+                            progress_every=pe,
+                        )
+
+                    t_hash = time.monotonic()
+                    try:
+                        geno_h, hash_scale, hash_kept = _run_hash_job_with_progress_bar(
+                            desc="Hash",
+                            total_hint=hash_total,
+                            enabled=True,
+                            runner=_run_hash,
                         )
                     except Exception:
-                        task.fail("Signed feature hashing ...Failed")
+                        print_failure("Hash ...Failed", force_color=True)
                         raise
-                    task.complete(
-                        "Signed feature hashing ...Finished "
-                        f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                    msg = _compact_done_message(
+                        "Hash",
+                        [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
                     )
+                    print_success(f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]", force_color=True)
+                else:
+                    with CliStatus(
+                        f"Hash (k={hash_dim})...",
+                        enabled=use_spinner,
+                    ) as task:
+                        try:
+                            geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                            )
+                        except Exception:
+                            task.fail("Hash ...Failed")
+                            raise
+                        task.complete(_compact_done_message(
+                            "Hash",
+                            [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                        ))
 
                 samples = np.asarray(sample_ids, dtype=str)
                 geno = np.ascontiguousarray(np.asarray(geno_h, dtype=np.float32))
@@ -3788,44 +4254,108 @@ def main(log: bool = True) -> None:
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
 
         if ldprune_spec is not None:
-            with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+            _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
+            if use_spinner:
+                t_ld = time.monotonic()
                 try:
-                    packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
-                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
-                        genotype_prefix=str(gfile),
-                        spec=typing.cast(_GsLdPruneSpec, ldprune_spec),
-                        n_jobs=max(1, int(args.thread)),
+                    packed_lmm_ctx = _run_indeterminate_task_with_progress_bar(
+                        desc="LD prune",
+                        enabled=True,
+                        runner=lambda: _apply_packed_ld_prune_for_gs(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            genotype_prefix=str(gfile),
+                            spec=_spec,
+                            n_jobs=max(1, int(args.thread)),
+                        ),
                     )
                 except Exception:
-                    task.fail("Applying LD prune ...Failed")
+                    print_failure("LD prune ...Failed", force_color=True)
                     raise
                 m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
-                task.complete(
-                    "Applying LD prune ...Finished "
-                    f"(kept={m_after}, spec={typing.cast(_GsLdPruneSpec, ldprune_spec).label()})"
+                msg = _compact_done_message(
+                    "LD prune",
+                    [f"kept={m_after}", f"spec={_spec.label()}"],
                 )
+                print_success(f"{msg} [{format_elapsed(time.monotonic() - t_ld)}]", force_color=True)
+            else:
+                with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+                    try:
+                        packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            genotype_prefix=str(gfile),
+                            spec=_spec,
+                            n_jobs=max(1, int(args.thread)),
+                        )
+                    except Exception:
+                        task.fail("LD prune ...Failed")
+                        raise
+                    m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+                    task.complete(
+                        _compact_done_message(
+                            "LD prune",
+                            [f"kept={m_after}", f"spec={_spec.label()}"],
+                        )
+                    )
 
         hash_dim = int(args.hash_dim)
         hash_std = not bool(args.hash_raw)
-        with CliStatus(
-            f"Running signed feature hashing (k={hash_dim})...",
-            enabled=use_spinner,
-        ) as task:
-            try:
-                geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+        if use_spinner:
+            hash_total = int(
+                np.asarray(
+                    typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                ).shape[0]
+            )
+
+            def _run_hash(
+                cb: typing.Callable[[int, int], None] | None,
+                pe: int,
+            ) -> tuple[np.ndarray, float, int]:
+                return _hash_packed_for_gs(
                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                     hash_dim=hash_dim,
                     hash_seed=int(args.hash_seed),
                     standardize=bool(hash_std),
                     n_jobs=max(1, int(args.thread)),
+                    progress_callback=cb,
+                    progress_every=pe,
+                )
+
+            t_hash = time.monotonic()
+            try:
+                geno_h, hash_scale, hash_kept = _run_hash_job_with_progress_bar(
+                    desc="Hash",
+                    total_hint=hash_total,
+                    enabled=True,
+                    runner=_run_hash,
                 )
             except Exception:
-                task.fail("Signed feature hashing ...Failed")
+                print_failure("Hash ...Failed", force_color=True)
                 raise
-            task.complete(
-                "Signed feature hashing ...Finished "
-                f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+            msg = _compact_done_message(
+                "Hash",
+                [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
             )
+            print_success(f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]", force_color=True)
+        else:
+            with CliStatus(
+                f"Hash (k={hash_dim})...",
+                enabled=use_spinner,
+            ) as task:
+                try:
+                    geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                        hash_dim=hash_dim,
+                        hash_seed=int(args.hash_seed),
+                        standardize=bool(hash_std),
+                        n_jobs=max(1, int(args.thread)),
+                    )
+                except Exception:
+                    task.fail("Hash ...Failed")
+                    raise
+                task.complete(_compact_done_message(
+                    "Hash",
+                    [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                ))
 
         samples = np.asarray(sample_ids, dtype=str)
         geno = np.ascontiguousarray(np.asarray(geno_h, dtype=np.float32))
@@ -3862,22 +4392,48 @@ def main(log: bool = True) -> None:
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
 
-        with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+        _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
+        if use_spinner:
+            t_ld = time.monotonic()
             try:
-                packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
-                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
-                    genotype_prefix=str(gfile),
-                    spec=typing.cast(_GsLdPruneSpec, ldprune_spec),
-                    n_jobs=max(1, int(args.thread)),
+                packed_lmm_ctx = _run_indeterminate_task_with_progress_bar(
+                    desc="LD prune",
+                    enabled=True,
+                    runner=lambda: _apply_packed_ld_prune_for_gs(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                        genotype_prefix=str(gfile),
+                        spec=_spec,
+                        n_jobs=max(1, int(args.thread)),
+                    ),
                 )
             except Exception:
-                task.fail("Applying LD prune ...Failed")
+                print_failure("LD prune ...Failed", force_color=True)
                 raise
             m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
-            task.complete(
-                "Applying LD prune ...Finished "
-                f"(kept={m_after}, spec={typing.cast(_GsLdPruneSpec, ldprune_spec).label()})"
+            msg = _compact_done_message(
+                "LD prune",
+                [f"kept={m_after}", f"spec={_spec.label()}"],
             )
+            print_success(f"{msg} [{format_elapsed(time.monotonic() - t_ld)}]", force_color=True)
+        else:
+            with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
+                try:
+                    packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                        genotype_prefix=str(gfile),
+                        spec=_spec,
+                        n_jobs=max(1, int(args.thread)),
+                    )
+                except Exception:
+                    task.fail("LD prune ...Failed")
+                    raise
+                m_after = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+                task.complete(
+                    _compact_done_message(
+                        "LD prune",
+                        [f"kept={m_after}", f"spec={_spec.label()}"],
+                    )
+                )
 
         with CliStatus("Decoding packed genotype after LD prune...", enabled=use_spinner) as task:
             try:
@@ -3980,12 +4536,18 @@ def main(log: bool = True) -> None:
                 if key_common not in hash_kernel_cache:
                     hash_dim = int(args.hash_dim)
                     hash_std = not bool(args.hash_raw)
-                    with CliStatus(
-                        f"Running signed hash kernels (shared traits, k={hash_dim})...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            train_grm_c, test_train_grm_c, hash_kept_c = _hash_packed_kernels_for_gblup(
+                    if use_spinner:
+                        hash_total = int(
+                            np.asarray(
+                                typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                            ).shape[0]
+                        )
+
+                        def _run_hash_kernels_shared(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, np.ndarray, int]:
+                            return _hash_packed_kernels_for_gblup(
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -3993,14 +4555,48 @@ def main(log: bool = True) -> None:
                                 n_jobs=max(1, int(args.thread)),
                                 train_sample_indices=np.ascontiguousarray(train_idx_common, dtype=np.int64),
                                 test_sample_indices=np.ascontiguousarray(test_idx_common, dtype=np.int64),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        t_hash = time.monotonic()
+                        try:
+                            train_grm_c, test_train_grm_c, hash_kept_c = _run_hash_job_with_progress_bar(
+                                desc="Hash",
+                                total_hint=hash_total,
+                                enabled=True,
+                                runner=_run_hash_kernels_shared,
                             )
                         except Exception:
-                            task.fail("Signed hash kernels ...Failed")
+                            print_failure("Hash ...Failed", force_color=True)
                             raise
-                        task.complete(
-                            "Signed feature hashing ...Finished "
-                            f"(k={hash_dim}, kept_snp={hash_kept_c}, gram-only)"
+                        msg = _compact_done_message(
+                            "Hash",
+                            [f"k={hash_dim}", f"kept_snp={hash_kept_c}", "gram-only"],
                         )
+                        print_success(f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]", force_color=True)
+                    else:
+                        with CliStatus(
+                            f"Hash (k={hash_dim})...",
+                            enabled=use_spinner,
+                        ) as task:
+                            try:
+                                train_grm_c, test_train_grm_c, hash_kept_c = _hash_packed_kernels_for_gblup(
+                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                    hash_dim=hash_dim,
+                                    hash_seed=int(args.hash_seed),
+                                    standardize=bool(hash_std),
+                                    n_jobs=max(1, int(args.thread)),
+                                    train_sample_indices=np.ascontiguousarray(train_idx_common, dtype=np.int64),
+                                    test_sample_indices=np.ascontiguousarray(test_idx_common, dtype=np.int64),
+                                )
+                            except Exception:
+                                task.fail("Hash ...Failed")
+                                raise
+                            task.complete(_compact_done_message(
+                                "Hash",
+                                [f"k={hash_dim}", f"kept_snp={hash_kept_c}", "gram-only"],
+                            ))
                     hash_kernel_cache[key_common] = (
                         np.ascontiguousarray(train_grm_c, dtype=np.float64),
                         np.ascontiguousarray(test_train_grm_c, dtype=np.float64),
@@ -4049,6 +4645,7 @@ def main(log: bool = True) -> None:
         gblup_backend_label: str | None = None
         gblup_backend_n: int | None = None
         gblup_backend_m: int | None = None
+        method_elapsed_offsets: dict[str, float] = {}
         if trait_use_packed_lmm:
             if _GS_DEBUG_STAGE:
                 logger.info(
@@ -4079,6 +4676,7 @@ def main(log: bool = True) -> None:
             continue
 
         if hash_gblup_only_mode:
+            gblup_prep_t0 = time.monotonic()
             if packed_lmm_ctx is None:
                 raise RuntimeError(
                     "Internal error: packed genotype context missing for GBLUP-only hash mode."
@@ -4101,12 +4699,18 @@ def main(log: bool = True) -> None:
                     if cached_kin is not None:
                         train_grm, test_train_grm, _hash_kept = cached_kin
                     else:
-                        with CliStatus(
-                            f"Running signed feature hashing kernels for trait {trait_name} (k={hash_dim})...",
-                            enabled=use_spinner,
-                        ) as task:
-                            try:
-                                train_grm, test_train_grm, hash_kept = _hash_packed_kernels_for_gblup(
+                        if use_spinner:
+                            hash_total = int(
+                                np.asarray(
+                                    typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                                ).shape[0]
+                            )
+
+                            def _run_hash_kernels_trait(
+                                cb: typing.Callable[[int, int], None] | None,
+                                pe: int,
+                            ) -> tuple[np.ndarray, np.ndarray, int]:
+                                return _hash_packed_kernels_for_gblup(
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
@@ -4114,14 +4718,51 @@ def main(log: bool = True) -> None:
                                     n_jobs=max(1, int(args.thread)),
                                     train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
                                     test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    progress_callback=cb,
+                                    progress_every=pe,
+                                )
+
+                            t_hash = time.monotonic()
+                            try:
+                                train_grm, test_train_grm, hash_kept = _run_hash_job_with_progress_bar(
+                                    desc="Hash",
+                                    total_hint=hash_total,
+                                    enabled=True,
+                                    runner=_run_hash_kernels_trait,
                                 )
                             except Exception:
-                                task.fail("Signed hash kernels ...Failed")
+                                print_failure("Hash ...Failed", force_color=True)
                                 raise
-                            task.complete(
-                                "Signed hash kernels ...Finished "
-                                f"(k={hash_dim}, kept_snp={hash_kept}, gram-only)"
+                            msg = _compact_done_message(
+                                "Hash",
+                                [f"k={hash_dim}", f"kept_snp={hash_kept}", "gram-only"],
                             )
+                            print_success(
+                                f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]",
+                                force_color=True,
+                            )
+                        else:
+                            with CliStatus(
+                                f"Hash (k={hash_dim})...",
+                                enabled=use_spinner,
+                            ) as task:
+                                try:
+                                    train_grm, test_train_grm, hash_kept = _hash_packed_kernels_for_gblup(
+                                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                        hash_dim=hash_dim,
+                                        hash_seed=int(args.hash_seed),
+                                        standardize=bool(hash_std),
+                                        n_jobs=max(1, int(args.thread)),
+                                        train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                        test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    )
+                                except Exception:
+                                    task.fail("Hash ...Failed")
+                                    raise
+                                task.complete(_compact_done_message(
+                                    "Hash",
+                                    [f"k={hash_dim}", f"kept_snp={hash_kept}", "gram-only"],
+                                ))
                         train_grm = np.ascontiguousarray(train_grm, dtype=np.float64)
                         test_train_grm = np.ascontiguousarray(test_train_grm, dtype=np.float64)
                         hash_kernel_cache[key_kin] = (train_grm, test_train_grm, int(hash_kept))
@@ -4134,37 +4775,103 @@ def main(log: bool = True) -> None:
                     used_gram_only = True
 
                 if not used_gram_only:
-                    with CliStatus(
-                        f"Running signed feature hashing for trait {trait_name} (k={hash_dim})...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                    if use_spinner:
+                        hash_total = int(
+                            np.asarray(
+                                typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                            ).shape[0]
+                        )
+
+                        def _run_hash_train(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, float, int]:
+                            return _hash_packed_for_gs(
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
                                 standardize=bool(hash_std),
                                 n_jobs=max(1, int(args.thread)),
                                 sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        def _run_hash_test(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, float, int]:
+                            return _hash_packed_for_gs(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        t_hash = time.monotonic()
+                        try:
+                            z_train, hash_scale, hash_kept = _run_hash_job_with_progress_bar(
+                                desc="Hash(train)",
+                                total_hint=hash_total,
+                                enabled=True,
+                                runner=_run_hash_train,
                             )
                             if int(test_sample_idx.shape[0]) > 0:
-                                z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                z_test, _scale_t, _kept_t = _run_hash_job_with_progress_bar(
+                                    desc="Hash(test)",
+                                    total_hint=hash_total,
+                                    enabled=True,
+                                    runner=_run_hash_test,
+                                )
+                            else:
+                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                        except Exception:
+                            print_failure("Hash ...Failed", force_color=True)
+                            raise
+                        msg = _compact_done_message(
+                            "Hash",
+                            [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                        )
+                        print_success(
+                            f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]",
+                            force_color=True,
+                        )
+                    else:
+                        with CliStatus(
+                            f"Hash (k={hash_dim})...",
+                            enabled=use_spinner,
+                        ) as task:
+                            try:
+                                z_train, hash_scale, hash_kept = _hash_packed_for_gs(
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
                                     standardize=bool(hash_std),
                                     n_jobs=max(1, int(args.thread)),
-                                    sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
                                 )
-                            else:
-                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
-                        except Exception:
-                            task.fail("Signed feature hashing ...Failed")
-                            raise
-                        task.complete(
-                            "Signed feature hashing ...Finished "
-                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
-                        )
+                                if int(test_sample_idx.shape[0]) > 0:
+                                    z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                        hash_dim=hash_dim,
+                                        hash_seed=int(args.hash_seed),
+                                        standardize=bool(hash_std),
+                                        n_jobs=max(1, int(args.thread)),
+                                        sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    )
+                                else:
+                                    z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                            except Exception:
+                                task.fail("Hash ...Failed")
+                                raise
+                            task.complete(_compact_done_message(
+                                "Hash",
+                                [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                            ))
                     with CliStatus(
                         "Building hashed GBLUP kinship kernels...",
                         enabled=use_spinner,
@@ -4194,75 +4901,121 @@ def main(log: bool = True) -> None:
             else:
                 used_stream_ztz = False
                 if (
+                    args.cv is not None
+                    and _jxrs is not None
+                    and hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")
+                ):
+                    # Compact hash+CV mode: keep packed payload and defer fold-level
+                    # ZTZ stats + prediction to _run_method_task, avoiding dense Z build.
+                    train_snp = None
+                    test_snp = None
+                    trait_packed_ctx = dict(
+                        typing.cast(dict[str, typing.Any], packed_lmm_ctx)
+                    )
+                    trait_packed_ctx["__gblup_hash_cv_compact__"] = True
+                    trait_packed_ctx["__gblup_hash_dim__"] = int(hash_dim)
+                    trait_packed_ctx["__gblup_hash_seed__"] = int(args.hash_seed)
+                    trait_packed_ctx["__gblup_hash_standardize__"] = bool(hash_std)
+                    used_stream_ztz = True
+                if (
                     args.cv is None
                     and _jxrs is not None
                     and hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")
                 ):
-                    with CliStatus(
-                        f"Streaming signed-hash ZTZ stats for trait {trait_name} (k={hash_dim})...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            gram, row_sum, row_sq_sum, zy_vec, hash_scale, hash_kept = (
-                                _hash_packed_ztz_stats_for_gblup(
-                                    packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
-                                    hash_dim=hash_dim,
-                                    hash_seed=int(args.hash_seed),
-                                    standardize=bool(hash_std),
-                                    n_jobs=max(1, int(args.thread)),
-                                    train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
-                                    y_train=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
-                                )
-                            )
-                        except Exception:
-                            task.fail("Streaming signed-hash ZTZ stats ...Failed")
-                            raise
-                        task.complete(
-                            "Streaming signed-hash ZTZ stats ...Finished "
-                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
+                    if use_spinner:
+                        hash_total = int(
+                            np.asarray(
+                                typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                            ).shape[0]
                         )
 
-                    with CliStatus(
-                        "Fitting hashed GBLUP from streaming ZTZ stats...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            fit_fast = _fit_gblup_reml_from_hash_ztz_stats(
-                                gram=np.asarray(gram, dtype=np.float64),
-                                row_sum=np.asarray(row_sum, dtype=np.float64),
-                                row_sq_sum=np.asarray(row_sq_sum, dtype=np.float64),
-                                zy=np.asarray(zy_vec, dtype=np.float64),
-                                n_train=int(train_sample_idx.shape[0]),
-                            )
-                        except Exception:
-                            task.fail("Fitting hashed GBLUP from streaming ZTZ stats ...Failed")
-                            raise
-                        task.complete("Fitting hashed GBLUP from streaming ZTZ stats ...Finished")
-
-                    with CliStatus(
-                        "Predicting hashed GBLUP test set (compact)...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            test_pred_fast = _predict_hashed_gblup_test_from_compact(
+                        def _run_hash_ztz(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
+                            return _hash_packed_ztz_stats_for_gblup(
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
                                 standardize=bool(hash_std),
                                 n_jobs=max(1, int(args.thread)),
-                                test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
-                                beta=float(fit_fast["beta"]),
-                                m_mean=np.asarray(fit_fast["m_mean"], dtype=np.float64),
-                                m_var_sum=float(fit_fast["m_var_sum"]),
-                                m_alpha=np.asarray(fit_fast["m_alpha"], dtype=np.float64),
-                                alpha_sum=float(fit_fast["alpha_sum"]),
-                                mean_sq=float(fit_fast["mean_sq"]),
-                                mean_malpha=float(fit_fast["mean_malpha"]),
+                                train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                y_train=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        t_hash = time.monotonic()
+                        try:
+                            gram, row_sum, row_sq_sum, zy_vec, hash_scale, hash_kept = _run_hash_job_with_progress_bar(
+                                desc="Hash",
+                                total_hint=hash_total,
+                                enabled=True,
+                                runner=_run_hash_ztz,
                             )
                         except Exception:
-                            task.fail("Predicting hashed GBLUP test set ...Failed")
+                            print_failure("Hash ...Failed", force_color=True)
                             raise
-                        task.complete("Predicting hashed GBLUP test set (compact) ...Finished")
+                        msg = _compact_done_message(
+                            "Hash",
+                            [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                        )
+                        print_success(
+                            f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]",
+                            force_color=True,
+                        )
+                    else:
+                        with CliStatus(
+                            f"Hash (k={hash_dim})...",
+                            enabled=use_spinner,
+                        ) as task:
+                            try:
+                                gram, row_sum, row_sq_sum, zy_vec, hash_scale, hash_kept = (
+                                    _hash_packed_ztz_stats_for_gblup(
+                                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                        hash_dim=hash_dim,
+                                        hash_seed=int(args.hash_seed),
+                                        standardize=bool(hash_std),
+                                        n_jobs=max(1, int(args.thread)),
+                                        train_sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                        y_train=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                                    )
+                                )
+                            except Exception:
+                                task.fail("Hash ...Failed")
+                                raise
+                            task.complete(_compact_done_message(
+                                "Hash",
+                                [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                            ))
+
+                    try:
+                        fit_fast = _fit_gblup_reml_from_hash_ztz_stats(
+                            gram=np.asarray(gram, dtype=np.float64),
+                            row_sum=np.asarray(row_sum, dtype=np.float64),
+                            row_sq_sum=np.asarray(row_sq_sum, dtype=np.float64),
+                            zy=np.asarray(zy_vec, dtype=np.float64),
+                            n_train=int(train_sample_idx.shape[0]),
+                        )
+                        test_pred_fast = _predict_hashed_gblup_test_from_compact(
+                            packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                            hash_dim=hash_dim,
+                            hash_seed=int(args.hash_seed),
+                            standardize=bool(hash_std),
+                            n_jobs=max(1, int(args.thread)),
+                            test_sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                            beta=float(fit_fast["beta"]),
+                            m_mean=np.asarray(fit_fast["m_mean"], dtype=np.float64),
+                            m_var_sum=float(fit_fast["m_var_sum"]),
+                            m_alpha=np.asarray(fit_fast["m_alpha"], dtype=np.float64),
+                            alpha_sum=float(fit_fast["alpha_sum"]),
+                            mean_sq=float(fit_fast["mean_sq"]),
+                            mean_malpha=float(fit_fast["mean_malpha"]),
+                        )
+                    except Exception:
+                        if bool(debug_mode):
+                            print_failure("GBLUP compact solve ...Failed", force_color=True)
+                        raise
 
                     train_snp = None
                     test_snp = None
@@ -4275,40 +5028,107 @@ def main(log: bool = True) -> None:
                     used_stream_ztz = True
 
                 if not used_stream_ztz:
-                    with CliStatus(
-                        f"Running signed feature hashing for trait {trait_name} (k={hash_dim})...",
-                        enabled=use_spinner,
-                    ) as task:
-                        try:
-                            z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                    if use_spinner:
+                        hash_total = int(
+                            np.asarray(
+                                typing.cast(dict[str, typing.Any], packed_lmm_ctx)["packed"]
+                            ).shape[0]
+                        )
+
+                        def _run_hash_train(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, float, int]:
+                            return _hash_packed_for_gs(
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
                                 standardize=bool(hash_std),
                                 n_jobs=max(1, int(args.thread)),
                                 sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        def _run_hash_test(
+                            cb: typing.Callable[[int, int], None] | None,
+                            pe: int,
+                        ) -> tuple[np.ndarray, float, int]:
+                            return _hash_packed_for_gs(
+                                packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                hash_dim=hash_dim,
+                                hash_seed=int(args.hash_seed),
+                                standardize=bool(hash_std),
+                                n_jobs=max(1, int(args.thread)),
+                                sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                progress_callback=cb,
+                                progress_every=pe,
+                            )
+
+                        t_hash = time.monotonic()
+                        try:
+                            z_train, hash_scale, hash_kept = _run_hash_job_with_progress_bar(
+                                desc="Hash(train)",
+                                total_hint=hash_total,
+                                enabled=True,
+                                runner=_run_hash_train,
                             )
                             if int(test_sample_idx.shape[0]) > 0:
-                                z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                z_test, _scale_t, _kept_t = _run_hash_job_with_progress_bar(
+                                    desc="Hash(test)",
+                                    total_hint=hash_total,
+                                    enabled=True,
+                                    runner=_run_hash_test,
+                                )
+                            else:
+                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                        except Exception:
+                            print_failure("Hash ...Failed", force_color=True)
+                            raise
+                        msg = _compact_done_message(
+                            "Hash",
+                            [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                        )
+                        print_success(
+                            f"{msg} [{format_elapsed(time.monotonic() - t_hash)}]",
+                            force_color=True,
+                        )
+                    else:
+                        with CliStatus(
+                            f"Hash (k={hash_dim})...",
+                            enabled=use_spinner,
+                        ) as task:
+                            try:
+                                z_train, hash_scale, hash_kept = _hash_packed_for_gs(
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
                                     standardize=bool(hash_std),
                                     n_jobs=max(1, int(args.thread)),
-                                    sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    sample_indices=np.ascontiguousarray(train_sample_idx, dtype=np.int64),
                                 )
-                            else:
-                                z_test = np.zeros((hash_dim, 0), dtype=np.float32)
-                        except Exception:
-                            task.fail("Signed feature hashing ...Failed")
-                            raise
-                        task.complete(
-                            "Signed feature hashing ...Finished "
-                            f"(k={hash_dim}, kept_snp={hash_kept}, scale={hash_scale:.6g})"
-                        )
+                                if int(test_sample_idx.shape[0]) > 0:
+                                    z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                        packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
+                                        hash_dim=hash_dim,
+                                        hash_seed=int(args.hash_seed),
+                                        standardize=bool(hash_std),
+                                        n_jobs=max(1, int(args.thread)),
+                                        sample_indices=np.ascontiguousarray(test_sample_idx, dtype=np.int64),
+                                    )
+                                else:
+                                    z_test = np.zeros((hash_dim, 0), dtype=np.float32)
+                            except Exception:
+                                task.fail("Hash ...Failed")
+                                raise
+                            task.complete(_compact_done_message(
+                                "Hash",
+                                [f"k={hash_dim}", f"kept_snp={hash_kept}", f"scale={hash_scale:.6g}"],
+                            ))
                     train_snp = np.ascontiguousarray(np.asarray(z_train, dtype=np.float32))
                     test_snp = np.ascontiguousarray(np.asarray(z_test, dtype=np.float32))
                     trait_packed_ctx = None
+            method_elapsed_offsets["GBLUP"] = max(0.0, time.monotonic() - gblup_prep_t0)
 
         # 5-fold cross-validation on training population
         cv_splits = None
@@ -4362,7 +5182,8 @@ def main(log: bool = True) -> None:
             gblup_backend_m = int(train_snp.shape[0])
             gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
 
-        logger.info("*" * 60)
+        sep_w = max(40, min(80, _terminal_columns()))
+        logger.info("*" * sep_w)
         logger.info(
             f"* Genomic Selection for trait: {trait_name}\n"
             f"Train size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {eff_snp}"
@@ -4396,6 +5217,7 @@ def main(log: bool = True) -> None:
             train_sample_indices=train_sample_idx,
             test_sample_indices=test_sample_idx,
             limit_predtrain=args.limit_predtrain,
+            elapsed_offset_by_method=method_elapsed_offsets,
         )
         if _GS_DEBUG_STAGE:
             logger.info(

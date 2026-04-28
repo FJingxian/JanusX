@@ -20,7 +20,7 @@ use std::f64::consts::PI;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -2443,7 +2443,9 @@ pub fn bed_packed_decode_rows_f32<'py>(
     min_maf=0.0_f32,
     max_missing=1.0_f32,
     standardize=true,
-    threads=0
+    threads=0,
+    progress_callback=None,
+    progress_every=0
 ))]
 pub fn bed_packed_signed_hash_f32<'py>(
     py: Python<'py>,
@@ -2459,6 +2461,8 @@ pub fn bed_packed_signed_hash_f32<'py>(
     max_missing: f32,
     standardize: bool,
     threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f32>>, f32, usize)> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
@@ -2591,48 +2595,82 @@ pub fn bed_packed_signed_hash_f32<'py>(
             }
 
             let mut out = vec![0.0_f32; out_len];
-            let mut run = || {
-                out.par_chunks_mut(n_out)
-                    .enumerate()
-                    .for_each(|(bucket, out_row)| {
-                        let rows = &rows_by_bucket[bucket];
-                        if rows.is_empty() {
-                            return;
-                        }
-                        for &row_idx in rows.iter() {
-                            let row =
-                                &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                            let flip = row_flip_vec[row_idx];
-                            let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
-                            let mean_g = 2.0_f32 * maf;
-                            let denom = if standardize {
-                                (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
-                            } else {
-                                1.0_f32
-                            };
-                            let sign = sign_by_row[row_idx];
-                            for (j, &(byte_idx, shift_bits)) in sample_lut.iter().enumerate() {
-                                let b = row[byte_idx];
-                                let code = (b >> shift_bits) & 0b11;
-                                let mut gv = match code {
-                                    0b00 => 0.0_f32,
-                                    0b10 => 1.0_f32,
-                                    0b11 => 2.0_f32,
-                                    _ => mean_g, // missing -> mean impute
-                                };
-                                if flip && code != 0b01 {
-                                    gv = 2.0_f32 - gv;
-                                }
-                                let v = if standardize { (gv - mean_g) / denom } else { gv };
-                                out_row[j] += sign * v;
-                            }
-                        }
-                    });
-            };
-            if let Some(tp) = &pool {
-                tp.install(run);
+            let notify_step = if progress_every == 0 {
+                (kept / 200).max(1)
             } else {
-                run();
+                progress_every.max(1)
+            };
+            let progress_done = AtomicUsize::new(0);
+            let mut last_notified = 0usize;
+            let bucket_step = 64usize;
+
+            for b0 in (0..n_buckets).step_by(bucket_step) {
+                let b1 = (b0 + bucket_step).min(n_buckets);
+                let chunk = &rows_by_bucket[b0..b1];
+                let chunk_done: usize = chunk.iter().map(|rows| rows.len()).sum();
+                let out_st = b0 * n_out;
+                let out_ed = b1 * n_out;
+                let out_slice = &mut out[out_st..out_ed];
+
+                let mut run = || {
+                    out_slice
+                        .par_chunks_mut(n_out)
+                        .enumerate()
+                        .for_each(|(off, out_row)| {
+                            let rows = &chunk[off];
+                            if rows.is_empty() {
+                                return;
+                            }
+                            for &row_idx in rows.iter() {
+                                let row =
+                                    &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[row_idx];
+                                let maf = row_maf_vec[row_idx].clamp(0.0_f32, 0.5_f32);
+                                let mean_g = 2.0_f32 * maf;
+                                let denom = if standardize {
+                                    (2.0_f32 * maf * (1.0_f32 - maf)).max(1e-12_f32).sqrt()
+                                } else {
+                                    1.0_f32
+                                };
+                                let sign = sign_by_row[row_idx];
+                                for (j, &(byte_idx, shift_bits)) in sample_lut.iter().enumerate() {
+                                    let b = row[byte_idx];
+                                    let code = (b >> shift_bits) & 0b11;
+                                    let mut gv = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_g, // missing -> mean impute
+                                    };
+                                    if flip && code != 0b01 {
+                                        gv = 2.0_f32 - gv;
+                                    }
+                                    let v = if standardize { (gv - mean_g) / denom } else { gv };
+                                    out_row[j] += sign * v;
+                                }
+                            }
+                        });
+                };
+                if let Some(tp) = &pool {
+                    tp.install(&mut run);
+                } else {
+                    run();
+                }
+
+                let done = progress_done.fetch_add(chunk_done, Ordering::Relaxed) + chunk_done;
+                if done >= last_notified.saturating_add(notify_step) || done == kept {
+                    last_notified = done;
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done, kept))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                    }
+                }
             }
 
             let mut sum_diag = 0.0_f64;
@@ -2684,7 +2722,9 @@ pub fn bed_packed_signed_hash_f32<'py>(
     max_missing=1.0_f32,
     standardize=true,
     threads=0,
-    sample_block=1024
+    sample_block=1024,
+    progress_callback=None,
+    progress_every=0
 ))]
 pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
     py: Python<'py>,
@@ -2702,6 +2742,8 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
     standardize: bool,
     threads: usize,
     sample_block: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray1<f64>>,
@@ -2851,6 +2893,12 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
             let mut row_sq_sum = vec![0.0_f64; n_buckets];
             let mut zy = vec![0.0_f64; n_buckets];
             let step = sample_block.max(1);
+            let notify_step = if progress_every == 0 {
+                step
+            } else {
+                progress_every.max(1)
+            };
+            let mut last_notified = 0usize;
 
             for st in (0..n_train).step_by(step) {
                 let ed = (st + step).min(n_train);
@@ -2961,6 +3009,21 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
                         1,
                     );
                 }
+
+                let done = ed;
+                if done >= last_notified.saturating_add(notify_step) || done == n_train {
+                    last_notified = done;
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done, n_train))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                    }
+                }
             }
 
             let mut sum_diag = 0.0_f64;
@@ -3028,7 +3091,9 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
     max_missing=1.0_f32,
     standardize=true,
     threads=0,
-    bucket_block=64
+    bucket_block=64,
+    progress_callback=None,
+    progress_every=0
 ))]
 pub fn bed_packed_signed_hash_kernels_f64<'py>(
     py: Python<'py>,
@@ -3046,6 +3111,8 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
     standardize: bool,
     threads: usize,
     bucket_block: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>, usize)> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
@@ -3191,6 +3258,13 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
             let mut test_train = vec![0.0_f32; cross_len];
             let mut var_sum_total = 0.0_f64;
             let block_sz = bucket_block.max(1);
+            let notify_step = if progress_every == 0 {
+                (kept / 200).max(1)
+            } else {
+                progress_every.max(1)
+            };
+            let mut done_rows = 0usize;
+            let mut last_notified = 0usize;
 
             for b0 in (0..n_buckets).step_by(block_sz) {
                 let b1 = (b0 + block_sz).min(n_buckets);
@@ -3204,6 +3278,7 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
                 let mut train_blk = vec![0.0_f32; train_blk_len];
                 let mut var_blk = vec![0.0_f32; cur];
                 let rows_blk = &rows_by_bucket[b0..b1];
+                let chunk_done: usize = rows_blk.iter().map(|rows| rows.len()).sum();
 
                 if n_test > 0 {
                     let test_blk_len = cur
@@ -3386,6 +3461,21 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
                             n_train as isize,
                             1,
                         );
+                    }
+                }
+
+                done_rows += chunk_done;
+                if done_rows >= last_notified.saturating_add(notify_step) || done_rows == kept {
+                    last_notified = done_rows;
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (done_rows, kept))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
                     }
                 }
             }

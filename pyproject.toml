@@ -56,7 +56,7 @@ python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-st
 [build-system]
 requires = ["maturin>=1.7,<2", "numpy>=1.23", "pybind11>=2.13.0"]
 build-backend = "build_backend"
-backend-path = ["."]
+backend-path = ["scripts"]
 
 [tool.maturin]
 bindings = "pyo3"
@@ -65,7 +65,7 @@ module-name = "janusx.janusx"
 python-source = "python"
 cargo-extra-args = "--locked"
 include = [
-    { path = "build_backend.py", format = "sdist" },
+    { path = "scripts/build_backend.py", format = "sdist" },
     { path = "python/janusx/native/build_kmc_bind.py", format = "sdist" },
     { path = "python/janusx/native/kmc_count_bind.cpp", format = "sdist" },
     { path = "python/janusx/native/vendor/kmc/3rd_party/cloudflare/zlib.h", format = "sdist" },

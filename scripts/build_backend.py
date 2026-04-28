@@ -21,7 +21,11 @@ def _env_flag(name: str) -> bool:
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return here.parent
 
 
 def _build_kmc_extension_for_wheel() -> Path | None:

@@ -64,6 +64,8 @@ import re
 import math
 import gc
 import threading
+import subprocess
+import shutil
 from dataclasses import dataclass
 from collections import OrderedDict
 import multiprocessing as mp
@@ -3717,6 +3719,9 @@ def _run_methods_parallel(
                     adam_grid_trial_epochs = 0
                     adam_grid_completed_epochs = 0
                     adam_grid_active_trial = 0
+                    lambda_task_id: int | None = None
+                    lambda_done = 0
+                    lambda_total = 0
 
                     def _close_search_task() -> None:
                         nonlocal search_task_id, search_done, search_total
@@ -3894,6 +3899,48 @@ def _run_methods_parallel(
                         adam_grid_completed_epochs = 0
                         adam_grid_active_trial = 0
 
+                    def _ensure_lambda_task(
+                        *,
+                        done: int,
+                        total: int,
+                    ) -> None:
+                        nonlocal lambda_task_id, lambda_done, lambda_total
+                        lambda_done = int(max(0, int(done)))
+                        lambda_total = int(max(1, int(total)))
+                        if lambda_task_id is None:
+                            lambda_task_id = progress.add_task(
+                                description="",
+                                total=lambda_total,
+                                label=f"{m} lambda search",
+                                counter=f"{lambda_done}/{lambda_total}",
+                            )
+                        progress.update(
+                            lambda_task_id,
+                            total=lambda_total,
+                            completed=min(lambda_done, lambda_total),
+                            label=f"{m} lambda search",
+                            counter=f"{lambda_done}/{lambda_total}",
+                        )
+
+                    def _close_lambda_task(*, complete: bool = False) -> None:
+                        nonlocal lambda_task_id, lambda_done, lambda_total
+                        if lambda_task_id is not None:
+                            if complete:
+                                progress.update(
+                                    lambda_task_id,
+                                    total=max(1, int(lambda_total)),
+                                    completed=max(0, int(lambda_total)),
+                                    label=f"{m} lambda search",
+                                    counter=f"{int(max(0, lambda_total))}/{int(max(1, lambda_total))}",
+                                )
+                            try:
+                                progress.remove_task(lambda_task_id)
+                            except Exception:
+                                pass
+                        lambda_task_id = None
+                        lambda_done = 0
+                        lambda_total = 0
+
                     def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
                         nonlocal search_task_id, search_done, search_total, search_total_fixed
                         ev = str(event)
@@ -3965,10 +4012,27 @@ def _run_methods_parallel(
 
                     def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
                         nonlocal adam_done, adam_total, adam_task_id, adam_stage
+                        nonlocal lambda_done, lambda_total
                         if not has_rrblup_iter_progress:
                             return
                         ev = str(event)
+                        if ev == "pcg_lambda_subsample_start":
+                            total = int(max(1, int(payload.get("total", payload.get("repeats", 1)))))
+                            _ensure_lambda_task(done=0, total=total)
+                            return
+                        if ev == "pcg_lambda_subsample_iter":
+                            total = int(max(1, int(payload.get("total", max(1, int(lambda_total or 1))))))
+                            done = int(max(0, int(payload.get("iter", lambda_done))))
+                            _ensure_lambda_task(done=min(done, total), total=total)
+                            return
+                        if ev == "pcg_lambda_subsample_end":
+                            total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
+                            done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
+                            _ensure_lambda_task(done=min(done, total), total=total)
+                            _close_lambda_task(complete=True)
+                            return
                         if ev == "pcg_start":
+                            _close_lambda_task()
                             pp = dict(payload)
                             pp["stage"] = "pcg"
                             _ensure_adam_task(pp, event="start")
@@ -4052,6 +4116,7 @@ def _run_methods_parallel(
                         nonlocal cv_done
                         if str(method_name) != str(m):
                             return
+                        _close_lambda_task()
                         _close_search_task()
                         _ensure_cv_task()
                         left = max(0, cv_total - int(cv_done))
@@ -4097,6 +4162,7 @@ def _run_methods_parallel(
                     except Exception:
                         _close_search_task()
                         _close_adam_task()
+                        _close_lambda_task()
                         if cv_task_id is not None:
                             try:
                                 progress.remove_task(cv_task_id)
@@ -4108,6 +4174,7 @@ def _run_methods_parallel(
                         )
                         raise
                     _close_search_task()
+                    _close_lambda_task()
                     if show_method_progress:
                         _ensure_cv_task()
                         left_cv = max(0, cv_total - int(cv_done))
@@ -4125,6 +4192,7 @@ def _run_methods_parallel(
                             except Exception:
                                 pass
                     _close_adam_task()
+                    _close_lambda_task()
                     out.append(res)
                     elapsed = format_elapsed(time.monotonic() - t0)
                     progress.console.print(
@@ -4152,6 +4220,7 @@ def _run_methods_parallel(
             search_bar = None
             cv_bar = None
             adam_bar = None
+            lambda_bar = None
             search_done = 0
             search_total = 0
             search_total_fixed = False
@@ -4163,6 +4232,8 @@ def _run_methods_parallel(
             adam_grid_trial_epochs = 0
             adam_grid_completed_epochs = 0
             adam_grid_active_trial = 0
+            lambda_done = 0
+            lambda_total = 0
 
             def _close_search_bar() -> None:
                 nonlocal search_bar
@@ -4334,6 +4405,53 @@ def _run_methods_parallel(
                 adam_grid_completed_epochs = 0
                 adam_grid_active_trial = 0
 
+            def _ensure_lambda_bar(
+                payload: dict[str, typing.Any],
+                *,
+                event: str = "start",
+            ) -> None:
+                nonlocal lambda_bar, lambda_done, lambda_total
+                if not enable_tqdm_progress:
+                    return
+                total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
+                if str(event) == "start":
+                    done = 0
+                elif str(event) == "end":
+                    done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
+                else:
+                    done = int(max(0, int(payload.get("iter", lambda_done))))
+                done = int(min(done, total))
+                lambda_done = int(done)
+                lambda_total = int(total)
+                if lambda_bar is None:
+                    assert tqdm is not None
+                    lambda_bar = tqdm(
+                        total=lambda_total,
+                        desc=f"{m} lambda search",
+                        unit="cfg",
+                        leave=False,
+                        dynamic_ncols=True,
+                        position=(2 if show_method_progress else 1),
+                        bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt} "
+                        "[{elapsed}, {rate_fmt}{postfix}]",
+                    )
+                lambda_bar.total = int(max(1, lambda_total))
+                lambda_bar.n = int(min(max(0, lambda_done), max(1, lambda_total)))
+                lambda_bar.set_description_str(
+                    f"{m} lambda search",
+                    refresh=False,
+                )
+                lambda_bar.set_postfix_str("", refresh=False)
+                lambda_bar.refresh()
+
+            def _close_lambda_bar() -> None:
+                nonlocal lambda_bar, lambda_done, lambda_total
+                if lambda_bar is not None:
+                    lambda_bar.close()
+                    lambda_bar = None
+                lambda_done = 0
+                lambda_total = 0
+
             def _ensure_search_bar() -> None:
                 nonlocal search_bar, search_total
                 if (not enable_tqdm_progress) or search_bar is not None:
@@ -4416,7 +4534,18 @@ def _run_methods_parallel(
                 if not has_rrblup_iter_progress:
                     return
                 ev = str(event)
+                if ev == "pcg_lambda_subsample_start":
+                    _ensure_lambda_bar(payload, event="start")
+                    return
+                if ev == "pcg_lambda_subsample_iter":
+                    _ensure_lambda_bar(payload, event="iter")
+                    return
+                if ev == "pcg_lambda_subsample_end":
+                    _ensure_lambda_bar(payload, event="end")
+                    _close_lambda_bar()
+                    return
                 if ev == "pcg_start":
+                    _close_lambda_bar()
                     pp = dict(payload)
                     pp["stage"] = "pcg"
                     _ensure_adam_bar(pp, event="start")
@@ -4504,6 +4633,7 @@ def _run_methods_parallel(
                 nonlocal cv_done
                 if str(method_name) != str(m):
                     return
+                _close_lambda_bar()
                 _close_search_bar()
                 _ensure_cv_bar()
                 if cv_bar is None:
@@ -4562,6 +4692,7 @@ def _run_methods_parallel(
                 except Exception:
                     _close_search_bar()
                     _close_adam_bar()
+                    _close_lambda_bar()
                     _close_cv_bar()
                     elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                     if method_status is not None:
@@ -4571,6 +4702,7 @@ def _run_methods_parallel(
                     raise
 
                 _close_search_bar()
+                _close_lambda_bar()
                 if enable_tqdm_progress and show_method_progress:
                     _ensure_cv_bar()
                     if cv_bar is not None:
@@ -4583,6 +4715,7 @@ def _run_methods_parallel(
                             refresh=True,
                         )
                 _close_adam_bar()
+                _close_lambda_bar()
                 _close_cv_bar()
 
                 out.append(res)
@@ -5093,6 +5226,217 @@ def _read_plink_bim_chrom_pos(prefix: str) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _read_plink_bim_marker_ids(prefix: str) -> list[str]:
+    bim_path = str(prefix)
+    if not bim_path.lower().endswith(".bim"):
+        bim_path = f"{bim_path}.bim"
+    if not os.path.isfile(bim_path):
+        raise ValueError(f"Cannot find BIM file for PLINK prefix: {prefix}")
+    ids: list[str] = []
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            s = str(line).strip()
+            if s == "" or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{line_no} (expected >= 6 columns)."
+                )
+            ids.append(str(parts[1]).strip())
+    if len(ids) == 0:
+        raise ValueError(f"No SNP rows found in BIM: {bim_path}")
+    return ids
+
+
+def _resolve_gs_ld_prune_backend() -> str:
+    raw = str(
+        os.getenv(
+            "JX_GS_LDPRUNE_BACKEND",
+            os.getenv("JX_LD_PRUNE_BACKEND", "rust"),
+        )
+    ).strip().lower()
+    if raw in {"", "auto", "default", "rust"}:
+        return "rust"
+    if raw in {"plink", "plink-external", "external-plink"}:
+        return "plink"
+    return "rust"
+
+
+def _format_gs_ld_prune_window_for_plink(spec: _GsLdPruneSpec) -> str:
+    if spec.window_variants is not None:
+        return str(int(spec.window_variants))
+    if spec.window_bp is None:
+        raise ValueError("Invalid LD prune window for PLINK backend.")
+    kb = float(int(spec.window_bp)) / 1000.0
+    tok = f"{kb:.6f}".rstrip("0").rstrip(".")
+    if tok == "":
+        tok = "0"
+    return f"{tok}kb"
+
+
+def _run_gs_external_command(cmd: list[str]) -> str:
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    out = str(proc.stdout or "").strip()
+    if int(proc.returncode) != 0:
+        tail = "\n".join(out.splitlines()[-20:]) if out else "(no output)"
+        raise RuntimeError(
+            "External command failed "
+            f"(exit={int(proc.returncode)}): {' '.join(cmd)}\n{tail}"
+        )
+    return out
+
+
+def _apply_packed_ld_prune_for_gs_external_plink(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    genotype_prefix: str,
+    spec: _GsLdPruneSpec,
+    n_jobs: int,
+) -> dict[str, typing.Any]:
+    plink_bin_raw = str(os.getenv("JX_PLINK_BIN", "plink")).strip() or "plink"
+    if os.path.sep in plink_bin_raw or plink_bin_raw.startswith("."):
+        if os.path.isfile(plink_bin_raw) and os.access(plink_bin_raw, os.X_OK):
+            plink_bin = plink_bin_raw
+        else:
+            plink_bin = ""
+    else:
+        found = shutil.which(plink_bin_raw)
+        plink_bin = str(found) if found else ""
+    if plink_bin == "":
+        raise RuntimeError(
+            "PLINK backend requested for GS LD prune but binary was not found. "
+            "Please install PLINK 1.9 and/or set JX_PLINK_BIN=/path/to/plink."
+        )
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    miss = np.ascontiguousarray(
+        np.asarray(packed_ctx["missing_rate"], dtype=np.float32).reshape(-1)
+    )
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    m = int(packed.shape[0])
+    if int(maf.shape[0]) != m or int(miss.shape[0]) != m:
+        raise ValueError("Packed payload shape mismatch among packed/maf/missing_rate.")
+
+    ids_full = _read_plink_bim_marker_ids(str(genotype_prefix))
+    n_full = int(len(ids_full))
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(site_keep.shape[0]) != n_full:
+            raise ValueError(
+                "Packed payload mismatch: site_keep length does not match BIM row count."
+            )
+        filtered_ids = [ids_full[i] for i in np.flatnonzero(site_keep).astype(int).tolist()]
+    else:
+        site_keep = None
+        filtered_ids = list(ids_full)
+
+    if int(len(filtered_ids)) != m:
+        raise ValueError(
+            f"Packed/BIM row mismatch for LD prune: packed={m}, bim_aligned={len(filtered_ids)}"
+        )
+    if m == 0:
+        raise ValueError("No SNPs available for LD prune after preprocessing.")
+
+    tmp_prefix = (
+        f"{str(genotype_prefix)}.jxgsprune_tmp_{int(os.getpid())}_{int(time.time() * 1000)}"
+    )
+    extract_path = f"{tmp_prefix}.extract.in"
+    prune_in = f"{tmp_prefix}.prune.in"
+    keep_tmp = _env_truthy("JX_KEEP_PLINK_TMP", "0")
+    tmp_paths = [
+        extract_path,
+        f"{tmp_prefix}.prune.in",
+        f"{tmp_prefix}.prune.out",
+        f"{tmp_prefix}.log",
+        f"{tmp_prefix}.nosex",
+    ]
+
+    try:
+        with open(extract_path, "w", encoding="utf-8") as fw:
+            for mid in filtered_ids:
+                fw.write(f"{mid}\n")
+
+        _run_gs_external_command(
+            [
+                str(plink_bin),
+                "--bfile",
+                str(genotype_prefix),
+                "--extract",
+                str(extract_path),
+                "--indep-pairwise",
+                str(_format_gs_ld_prune_window_for_plink(spec)),
+                str(int(spec.step_variants)),
+                str(f"{float(spec.r2_threshold):.12g}"),
+                "--threads",
+                str(max(1, int(n_jobs))),
+                "--out",
+                str(tmp_prefix),
+            ]
+        )
+        if not os.path.isfile(prune_in):
+            raise RuntimeError(f"PLINK did not produce prune list: {prune_in}")
+        keep_id_set: set[str] = set()
+        with open(prune_in, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                s = str(line).strip()
+                if s != "":
+                    keep_id_set.add(s)
+        keep = np.asarray([mid in keep_id_set for mid in filtered_ids], dtype=np.bool_)
+    finally:
+        if not keep_tmp:
+            for p in tmp_paths:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+    if int(keep.shape[0]) != m:
+        raise ValueError(
+            f"LD prune keep-mask mismatch: got {keep.shape[0]}, expected {m}"
+        )
+    if not np.any(keep):
+        raise ValueError(
+            "All SNPs were filtered out by LD prune; loosen --ldprune thresholds."
+        )
+    if np.all(keep):
+        return packed_ctx
+
+    packed_ctx["packed"] = np.ascontiguousarray(packed[keep], dtype=np.uint8)
+    packed_ctx["maf"] = np.ascontiguousarray(maf[keep], dtype=np.float32)
+    packed_ctx["missing_rate"] = np.ascontiguousarray(miss[keep], dtype=np.float32)
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is not None:
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if int(row_flip.shape[0]) != m:
+            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+        packed_ctx["row_flip"] = np.ascontiguousarray(row_flip[keep], dtype=np.bool_)
+
+    if site_keep is not None:
+        idx_kept = np.flatnonzero(site_keep).astype(np.int64, copy=False)
+        if int(idx_kept.shape[0]) != m:
+            raise ValueError("Packed payload mismatch: site_keep true-count does not match packed rows.")
+        site_keep_new = np.zeros_like(site_keep, dtype=np.bool_)
+        site_keep_new[idx_kept[keep]] = True
+        packed_ctx["site_keep"] = np.ascontiguousarray(site_keep_new, dtype=np.bool_)
+
+    return packed_ctx
+
+
 def _apply_packed_ld_prune_for_gs(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -5100,6 +5444,14 @@ def _apply_packed_ld_prune_for_gs(
     spec: _GsLdPruneSpec,
     n_jobs: int,
 ) -> dict[str, typing.Any]:
+    backend = _resolve_gs_ld_prune_backend()
+    if backend == "plink":
+        return _apply_packed_ld_prune_for_gs_external_plink(
+            packed_ctx=packed_ctx,
+            genotype_prefix=genotype_prefix,
+            spec=spec,
+            n_jobs=n_jobs,
+        )
     if _jxrs is None or (not hasattr(_jxrs, "bed_packed_ld_prune_maf_priority")):
         raise RuntimeError(
             "Rust packed LD prune kernel is unavailable. Rebuild/install JanusX extension."
@@ -6554,6 +6906,8 @@ def main(log: bool = True) -> None:
         help=(
             "Apply packed BED LD prune before GS model fitting. "
             "Usage: --ldprune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
+            "Set env JX_GS_LDPRUNE_BACKEND=plink to use external PLINK backend "
+            "(same prune strategy as PLINK indep-pairwise). "
             "Numeric window defaults to kb (e.g. 1=1kb, 0.1=100bp)."
         ),
     )

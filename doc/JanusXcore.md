@@ -277,6 +277,49 @@ print(format_report(r1))
 print(format_report(r2))
 ```
 
+### 4.8 rrBLUP progress hook (AdamW/PCG)
+
+```python
+import numpy as np
+from janusx.script.gs import GSapi
+
+rng = np.random.default_rng(42)
+Xtrain = rng.normal(size=(500, 240)).astype(np.float32)  # SNP-major
+Xtest = rng.normal(size=(500, 40)).astype(np.float32)
+y = rng.normal(size=(240, 1)).astype(np.float64)
+
+def on_rrblup_progress(event: str, payload: dict):
+    if event == "adam_epoch":
+        print("epoch", payload["epoch"], "/", payload["total"], payload.get("stage", "fit"))
+    if event == "pcg_iter":
+        print("pcg", payload["iter"], "/", payload["total"])
+
+yhat_train, yhat_test, pve = GSapi(
+    y,
+    Xtrain,
+    Xtest,
+    method="rrBLUP",
+    PCAdec=False,
+    n_jobs=4,
+    rrblup_solver="adamw",
+    rrblup_adamw_cfg={
+        "epochs": 60,
+        "grid_size": 2,
+        "grid_trial_epochs": 20,
+    },
+    rrblup_progress_hook=on_rrblup_progress,
+)
+
+print(yhat_test.shape, pve)
+```
+
+Notes:
+
+- `rrblup_progress_hook` emits `adam_start`, `adam_epoch`, `adam_end` for AdamW, and
+  `pcg_start`, `pcg_iter`, `pcg_end` for PCG.
+- AdamW auto-grid tunes on a validation subset drawn from the current training set, not a full-sample sweep.
+- In CV wrappers, progress payloads also carry labels such as `fold 1/5` or `final`.
+
 ## 5. API Reference By Package
 
 ### 5.1 `janusx.gfreader`
@@ -349,7 +392,7 @@ This appendix helps with code tracing and backend debugging.
 - Consumed by: `janusx.gfreader` high-level readers/writers.
 
 - `src/io/gfreader.rs`
-- Rust exports: `SiteInfo`, `BedChunkReader`, `VcfChunkReader`, `HmpChunkReader`, `TxtChunkReader`, `PlinkStreamWriter`, `VcfStreamWriter`, `HmpStreamWriter`, `count_vcf_snps`, `count_hmp_snps`, `load_bed_2bit_packed`, `load_bed_u8_matrix`, `load_site_info`, `gfd_packbits_from_dosage_block`.
+- Rust exports: `SiteInfo`, `BedChunkReader`, `VcfChunkReader`, `HmpChunkReader`, `TxtChunkReader`, `PlinkStreamWriter`, `VcfStreamWriter`, `HmpStreamWriter`, `count_vcf_snps`, `count_hmp_snps`, `load_bed_2bit_packed`, `load_bed_u8_matrix`, `load_site_info`, `gfd_packbits_from_dosage_block`, `bed_filter_to_plink_rust`.
 - Python entries: `load_genotype_chunks`, `inspect_genotype_file`, `save_genotype_streaming`, `load_bed_2bit_packed`.
 
 - `src/io/gmerge.rs`
@@ -382,8 +425,11 @@ This appendix helps with code tracing and backend debugging.
 - Fixed-effect kernels: `glmf32`, `glmf32_full`, `glmf32_packed`.
 - LMM kernels: `lmm_reml_null_f32`, `lmm_assoc_chunk_f32`, `lmm_reml_chunk_f32`, `lmm_reml_chunk_from_snp_f32`, `lmm_assoc_chunk_from_snp_f32`.
 - FaST-LMM kernels: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`, `fastlmm_assoc_chunk_f32`, `fastlmm_assoc_packed_f32`.
-- GRM/FarmCPU/REML helpers: `grm_packed_bed_f32`, `grm_packed_f32`, `grm_packed_f32_with_stats`, `bed_packed_row_flip_mask`, `bed_packed_decode_rows_f32`, `bed_packed_decode_stats_f64`, `cross_grm_times_alpha_packed_f64`, `packed_malpha_f64`, `farmcpu_rem_dense`, `farmcpu_rem_packed`, `farmcpu_super_dense`, `farmcpu_super_packed`, `ai_reml_null_f64`, `ai_reml_multi_f64`, `ml_loglike_null_f32`, `rust_sgemm_backend`.
+- GRM/FarmCPU/REML helpers: `grm_packed_bed_f32`, `grm_packed_f32`, `grm_packed_f32_with_stats`, `bed_packed_row_flip_mask`, `bed_packed_decode_rows_f32`, `bed_packed_decode_stats_f64`, `cross_grm_times_alpha_packed_f64`, `packed_malpha_f64`, `farmcpu_rem_dense`, `farmcpu_rem_packed`, `farmcpu_super_dense`, `farmcpu_super_packed`, `ai_reml_null_f64`, `ai_reml_multi_f64`, `ml_loglike_null_f32`, `rust_sgemm_backend`, `bed_prune_to_plink_rust`, `packed_prune_kernel_stats`.
 - Python entries: `janusx.pyBLUP.assoc` APIs (`LM/LMM/FastLMM`, `farmcpu`, etc.).
+- `gformat` uses `bed_filter_to_plink_rust` / `bed_prune_to_plink_rust` for packed, chromosome-sorted
+  `PLINK -> PLINK` direct paths, including streaming LD prune without materializing the whole
+  packed BED matrix; the prune direct path also supports thread hints and progress callbacks.
 
 - `src/stats/lmm.rs`
 - Rust exports: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`.
@@ -431,6 +477,7 @@ This appendix helps with code tracing and backend debugging.
 | LMM GWAS | `janusx.pyBLUP.assoc.lmm_reml` / `LMM.gwas()` | `lmm_reml_chunk_f32` / `lmm_reml_null_f32` |
 | FaST-LMM | `janusx.pyBLUP.assoc.fastlmm_reml` / `FastLMM.gwas()` | `fastlmm_reml_chunk_f32` / `fastlmm_reml_null_f32` |
 | FarmCPU | `janusx.pyBLUP.assoc.farmcpu` | `farmcpu_rem_*` / `farmcpu_super_*` |
+| GS rrBLUP / GBLUP | `janusx.script.gs.GSapi` | `pyBLUP` selection flows + packed decode / LMM helper kernels |
 | Bayes prediction | `janusx.pyBLUP.bayes.BayesA/BayesB/BayesCpi` | `bayesa` / `bayesb` / `bayescpi` |
 | Ancestry inference | `janusx.adamixture.train_adamixture` | `admx_*` family |
 | GFF/gene queries | `janusx.gtools.GFFQuery` | pure Python |

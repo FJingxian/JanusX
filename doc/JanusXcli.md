@@ -333,7 +333,10 @@ Notes:
 - `rrBLUP` defaults to mini-batch AdamW backend.
 - rrBLUP backend/tuning switches are advanced flags and hidden from `jx gs -h`, but still accepted by CLI (for example `--rrblup-solver exact`).
 - AdamW rrBLUP now runs a small automatic lambda grid (default 2 candidates) with fold-internal validation + early-stop in tuning trials; in CV mode the selected hyperparameters are reused across folds by default to reduce repeated tuning overhead (hidden advanced switch: `--rrblup-grid-reuse-cv off`).
-- AdamW rrBLUP reports `h2/PVE` in lambda-consistent mode by default (`--rrblup-pve-mode lambda`), and can switch to train-variance mode via hidden advanced flag `--rrblup-pve-mode trainvar`.
+- rrBLUP sub-progress is shown for both AdamW and PCG: with `-cv`, the rrBLUP sub-bar is rendered below the main CV progress; without `-cv`, only the rrBLUP sub-bar is shown. For AdamW it tracks epochs; for PCG it tracks iterations.
+- AdamW rrBLUP auto-grid is not a full-sample search: it tunes on a validation subset drawn from the current training set (`--rrblup-es-val-frac`, `--rrblup-es-val-min`, `--rrblup-es-min-train`). In CV mode, with default `--rrblup-grid-reuse-cv on`, the first fold's selected lambda/lr are reused for later folds and final refit.
+- AdamW/PCG rrBLUP reports `h2/PVE` in train-variance mode by default (`--rrblup-pve-mode trainvar`), and can switch to lambda-consistent mode via hidden advanced flag `--rrblup-pve-mode lambda`.
+- AdamW rrBLUP memory usage is primarily controlled by `-batchsize/--batchsize` (alias of hidden `--rrblup-batch-size`). By default, `--rrblup-snp-block-size` follows the same value unless explicitly overridden.
 - For `GBLUP/rrBLUP`-only runs with non-PLINK input (`-vcf/-hmp/-file`), `jx gs` will auto-probe data scale and switch to packed BED flow when `n_samples * n_snps` exceeds the hidden threshold `--packed-lmm-auto-min-cells` (default `200000000`).
 
 Outputs:
@@ -505,12 +508,24 @@ Key options:
 
 - input: `-vcf/-hmp/-bfile/-file`
 - output: `-fmt {plink,vcf,hmp,txt,npy}`
+- runtime: `-t/--thread/--threads`
 - `-keep`
 - `-extract` (`--extract <file>` or `--extract range <file>`)
 - chromosome/range filters: `--chr`, `--from-bp`, `--to-bp`
 - site filters: `-maf`, `-geno`
 - LD prune: `-prune/--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>`  
   Numeric window defaults to `kb` (`1` = `1kb`, `0.1` = `100bp`)
+- prune mode (default): fast anchor-stepped scan optimized for runtime and memory
+- strict mode (optional): set env `JX_LD_PRUNE_MODE=strict` to enable strict
+  sliding-window + window-local greedy pruning semantics (slower)
+- external backend (optional): set env `JX_LD_PRUNE_BACKEND=plink` to delegate
+  `--prune` to an external PLINK binary in prune-only `-bfile -> -fmt plink` path;
+  override binary with `JX_PLINK_BIN=/path/to/plink`
+- packed PLINK fast path: for chromosome-sorted `-bfile ... -fmt plink`, simple sample/site
+  filters and `--prune` use a Rust packed streaming path that scans/writes `.bed` rows
+  sequentially instead of materializing the whole packed BED matrix in memory
+- for packed streaming `--prune`, `jx gformat` now shows live prune/write progress and accepts
+  explicit thread count via `-t/--thread/--threads`
 
 Outputs:
 

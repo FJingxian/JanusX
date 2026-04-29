@@ -55,13 +55,13 @@ use admixture::{
 use assoc::{
     ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
     bed_packed_ld_prune_maf_priority, bed_packed_row_flip_mask, bed_packed_signed_hash_f32,
-    bed_packed_signed_hash_ztz_stats_f64, bed_packed_signed_hash_kernels_f64,
-    cross_grm_times_alpha_packed_f64,
-    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
-    fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed,
-    grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32,
-    lmm_assoc_chunk_from_snp_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32,
-    lmm_reml_null_f32, ml_loglike_null_f32, packed_malpha_f64, rust_sgemm_backend,
+    bed_packed_signed_hash_kernels_f64, bed_packed_signed_hash_ztz_stats_f64,
+    bed_prune_to_plink_rust, cross_grm_times_alpha_packed_f64, farmcpu_rem_dense,
+    farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed, fastlmm_assoc_chunk_f32,
+    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_bed_f32,
+    grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
+    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
+    packed_malpha_f64, packed_prune_kernel_stats, rrblup_pcg_bed, rust_sgemm_backend,
 };
 use bayes::{bayesa, bayesb, bayescpi};
 use beam::{
@@ -72,9 +72,9 @@ use beam::{
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use bsa::preprocess_bsa;
 use gfreader::{
-    count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
-    load_bed_u8_matrix, load_site_info, BedChunkReader, HmpChunkReader, HmpStreamWriter,
-    PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
+    bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
+    load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, BedChunkReader, HmpChunkReader,
+    HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
@@ -148,11 +148,15 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_prune_kernel_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_prune_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_ztz_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_kernels_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_filter_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;

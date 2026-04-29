@@ -33,6 +33,7 @@ import time
 import re
 import gzip
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -96,8 +97,10 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
+from ._common.progress import ProgressAdapter
 from ._common.status import CliStatus, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.threads import apply_blas_thread_env, detect_effective_threads
 
 
 def _normalize_chr_key(chrom: str) -> str:
@@ -322,6 +325,66 @@ def _parse_prune_args(values: list[str] | None) -> PruneSpec | None:
         step_variants=int(step),
         r2_threshold=float(r2),
     )
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    v = str(os.getenv(name, default)).strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _resolve_ld_prune_backend() -> str:
+    raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
+    if raw in {"", "auto", "default", "rust"}:
+        return "rust"
+    if raw in {"plink", "plink-external", "external-plink"}:
+        return "plink"
+    return "rust"
+
+
+def _format_prune_window_for_plink(spec: PruneSpec) -> str:
+    if spec.window_variants is not None:
+        return str(int(spec.window_variants))
+    if spec.window_bp is None:
+        raise ValueError("Invalid prune window for PLINK backend.")
+    kb = float(int(spec.window_bp)) / 1000.0
+    tok = f"{kb:.6f}".rstrip("0").rstrip(".")
+    if tok == "":
+        tok = "0"
+    return f"{tok}kb"
+
+
+def _count_nonempty_text_lines(path: str) -> int:
+    n = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if s and (not s.startswith("#")):
+                n += 1
+    return int(n)
+
+
+def _run_external_command(
+    cmd: list[str],
+    *,
+    logger,
+) -> None:
+    logger.info("Running external command: %s", " ".join(cmd))
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    out = str(proc.stdout or "").strip()
+    if out:
+        logger.info(out)
+    if int(proc.returncode) != 0:
+        tail = "\n".join(out.splitlines()[-20:]) if out else "(no output)"
+        raise RuntimeError(
+            "External command failed "
+            f"(exit={int(proc.returncode)}): {' '.join(cmd)}\n{tail}"
+        )
 
 
 def _site_passes(site: SiteInfo, flt: SiteFilterSpec) -> bool:
@@ -651,6 +714,8 @@ def _read_plink_bim_sites(prefix: str) -> list[SiteInfo]:
 def _ld_prune_with_maf_priority_packed_plink(
     prefix: str,
     spec: PruneSpec,
+    *,
+    threads: int = 0,
 ) -> tuple[np.ndarray, list[SiteInfo], np.ndarray, int]:
     if _bed_packed_ld_prune_maf_priority is None:
         raise RuntimeError(
@@ -697,7 +762,7 @@ def _ld_prune_with_maf_priority_packed_plink(
             ),
             step_variants=int(spec.step_variants),
             r2_threshold=float(spec.r2_threshold),
-            threads=0,
+            threads=int(max(0, int(threads))),
         ),
         dtype=bool,
     ).reshape(-1)
@@ -755,6 +820,92 @@ def _write_plink_subset_from_packed(
 
     # FAM is unchanged when sample filtering is absent.
     shutil.copyfile(src_fam, out_fam)
+
+
+def _ld_prune_with_external_plink(
+    *,
+    src_prefix: str,
+    out_prefix: str,
+    spec: PruneSpec,
+    threads: int,
+    logger,
+) -> tuple[int, int, float]:
+    plink_bin_raw = str(os.getenv("JX_PLINK_BIN", "plink")).strip() or "plink"
+    if os.path.sep in plink_bin_raw or plink_bin_raw.startswith("."):
+        plink_bin = plink_bin_raw
+    else:
+        found = shutil.which(plink_bin_raw)
+        plink_bin = str(found) if found else ""
+    if plink_bin == "":
+        raise RuntimeError(
+            "External PLINK backend requested but PLINK binary was not found. "
+            "Please install PLINK 1.9 and/or set JX_PLINK_BIN=/path/to/plink."
+        )
+
+    window_tok = _format_prune_window_for_plink(spec)
+    step_tok = str(int(spec.step_variants))
+    r2_tok = f"{float(spec.r2_threshold):.12g}"
+    thread_tok = str(max(1, int(threads)))
+
+    tmp_prefix = (
+        f"{str(out_prefix)}.jxprune_tmp_{int(os.getpid())}_{int(time.time() * 1000)}"
+    )
+    prune_in = f"{tmp_prefix}.prune.in"
+    t0 = time.time()
+    keep_tmp = _env_truthy("JX_KEEP_PLINK_TMP", "0")
+    tmp_paths = [
+        f"{tmp_prefix}.prune.in",
+        f"{tmp_prefix}.prune.out",
+        f"{tmp_prefix}.log",
+        f"{tmp_prefix}.nosex",
+    ]
+    try:
+        _run_external_command(
+            [
+                str(plink_bin),
+                "--bfile",
+                str(src_prefix),
+                "--indep-pairwise",
+                str(window_tok),
+                str(step_tok),
+                str(r2_tok),
+                "--threads",
+                str(thread_tok),
+                "--out",
+                str(tmp_prefix),
+            ],
+            logger=logger,
+        )
+        if not Path(prune_in).is_file():
+            raise RuntimeError(f"PLINK did not produce prune list: {prune_in}")
+
+        _run_external_command(
+            [
+                str(plink_bin),
+                "--bfile",
+                str(src_prefix),
+                "--extract",
+                str(prune_in),
+                "--make-bed",
+                "--threads",
+                str(thread_tok),
+                "--out",
+                str(out_prefix),
+            ],
+            logger=logger,
+        )
+
+        total_n = _count_nonempty_text_lines(f"{str(src_prefix)}.bim")
+        keep_n = _count_nonempty_text_lines(f"{str(out_prefix)}.bim")
+        return int(keep_n), int(total_n), float(time.time() - t0)
+    finally:
+        if not keep_tmp:
+            for p in tmp_paths:
+                try:
+                    if Path(p).exists():
+                        Path(p).unlink()
+                except Exception:
+                    pass
 
 
 def _compute_maf_and_z(geno: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1352,6 +1503,15 @@ def build_parser() -> CliArgumentParser:
 
     opt = parser.add_argument_group("Optional Arguments")
     opt.add_argument(
+        "-t",
+        "--thread",
+        "--threads",
+        dest="thread",
+        type=int,
+        default=detect_effective_threads(),
+        help="Number of CPU threads for packed Rust kernels (default: %(default)s).",
+    )
+    opt.add_argument(
         "-fmt",
         "--fmt",
         dest="format",
@@ -1429,6 +1589,10 @@ def build_parser() -> CliArgumentParser:
         help=(
             "LD prune with MAF-priority rule. Usage: "
             "--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
+            "Default mode is fast (anchor-stepped window scan). "
+            "Set env JX_LD_PRUNE_MODE=strict for strict sliding-window + greedy semantics. "
+            "Set env JX_LD_PRUNE_BACKEND=plink to run external PLINK backend "
+            "(PLINK input/output prune-only path). "
             "Numeric window defaults to kb (1=1kb, 0.1=100bp). "
             "Examples: --prune 1 5 0.2, --prune 1kb 5 0.2, --prune 100bp 5 0.2."
         ),
@@ -1464,10 +1628,21 @@ def main() -> None:
         parser.error("-geno must be within [0, 1.0].")
     if not (0.0 <= float(args.het) <= 0.5):
         parser.error("-het must be within [0, 0.5].")
+    detected_threads = int(detect_effective_threads())
+    requested_threads = int(args.thread)
+    if requested_threads <= 0:
+        args.thread = int(detected_threads)
+        thread_capped = False
+    else:
+        args.thread = int(min(requested_threads, detected_threads))
+        thread_capped = bool(requested_threads > detected_threads)
+    apply_blas_thread_env(int(args.thread))
     try:
         prune_spec = _parse_prune_args(args.prune)
     except Exception as e:
         parser.error(str(e))
+    prune_backend_raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
+    prune_backend = _resolve_ld_prune_backend()
 
     gfile, default_prefix = determine_genotype_source(args)
     if args.prefix is None:
@@ -1479,7 +1654,17 @@ def main() -> None:
     configure_genotype_cache_from_out(str(args.out))
     log_path = f"{out_prefix}.gformat.log"
     logger = setup_logging(log_path)
+    if thread_capped:
+        logger.warning(
+            f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "
+            f"using {int(args.thread)}."
+        )
     status_enabled = stdout_is_tty()
+    if prune_backend_raw not in {"", "auto", "default", "rust", "plink", "plink-external", "external-plink"}:
+        logger.warning(
+            "Unknown JX_LD_PRUNE_BACKEND=%r; fallback to Rust backend.",
+            prune_backend_raw,
+        )
 
     extract_mode, extract_file = _parse_extract_arg(args.extract)
     chr_keys = _expand_chr_selector(args.chr_filter)
@@ -1502,6 +1687,15 @@ def main() -> None:
                     ("Keep samples", str(args.keep or "None")),
                     ("Extract", f"{extract_mode or 'None'}:{extract_file or 'None'}"),
                     ("Prune", (prune_spec.label() if prune_spec is not None else "None")),
+                    (
+                        "Prune backend",
+                        (
+                            ("PLINK external (env)")
+                            if (prune_spec is not None and prune_backend == "plink")
+                            else "Rust (default)"
+                        ),
+                    ),
+                    ("Threads", int(args.thread)),
                     ("Chr filter", ",".join(sorted(chr_keys)) if chr_keys else "None"),
                     ("BP range", f"{args.from_bp if args.from_bp is not None else '-'}..{args.to_bp if args.to_bp is not None else '-'}"),
                     ("MAF threshold", float(args.maf)),
@@ -1752,6 +1946,7 @@ def main() -> None:
     packed_prune_source_prefix: str | None = None
     rust_prune_direct_done = False
     rust_prune_direct_wall = 0.0
+    prune_direct_backend: str | None = None
 
     # Direct Rust packed path for PLINK -> PLINK conversion with all non-prune filters.
     # This sinks keep/extract/chr/bp/maf/geno filtering and writing into Rust.
@@ -1833,6 +2028,18 @@ def main() -> None:
     if prune_spec is not None:
         prune_desc = "Applying LD prune..."
         prune_pre_sites = 0
+        use_external_plink_prune = bool(
+            prune_backend == "plink"
+            and source_kind == "plink"
+            and out_fmt == "plink"
+            and keep_sample_ids is None
+            and push_snp_sites is None
+            and push_bim_range is None
+            and (not post_filter.active())
+            and float(args.maf) <= 0.0
+            and float(args.geno) >= 1.0
+            and float(args.het) <= 0.0
+        )
         use_packed_prune_fastpath = bool(
             source_kind == "plink"
             and _bed_packed_ld_prune_maf_priority is not None
@@ -1844,108 +2051,228 @@ def main() -> None:
             and float(args.geno) >= 1.0
             and float(args.het) <= 0.0
         )
-        if use_packed_prune_fastpath and _packed_prune_kernel_stats is not None:
+        if (
+            use_packed_prune_fastpath
+            and (not use_external_plink_prune)
+            and _packed_prune_kernel_stats is not None
+        ):
             try:
                 _packed_prune_kernel_stats(reset=True)
             except Exception:
                 pass
+        use_rust_prune_direct = bool(
+            use_packed_prune_fastpath
+            and out_fmt == "plink"
+            and keep_sample_ids is None
+            and _bed_prune_to_plink_rust is not None
+        )
+        if prune_backend == "plink" and (not use_external_plink_prune):
+            logger.warning(
+                "JX_LD_PRUNE_BACKEND=plink requires PLINK input/output prune without "
+                "extra filters; falling back to built-in backend."
+            )
         if not status_enabled:
             logger.info(prune_desc)
-        with CliStatus(prune_desc, enabled=status_enabled) as task:
-            try:
-                use_rust_prune_direct = bool(
-                    use_packed_prune_fastpath
-                    and out_fmt == "plink"
-                    and keep_sample_ids is None
-                    and _bed_prune_to_plink_rust is not None
-                )
-                if use_rust_prune_direct:
-                    t_direct = time.time()
-                    keep_n, total_n = _bed_prune_to_plink_rust(
+        if use_external_plink_prune:
+            with CliStatus(prune_desc, enabled=status_enabled) as task:
+                try:
+                    keep_n, total_n, wall = _ld_prune_with_external_plink(
                         src_prefix=str(gfile),
                         out_prefix=str(out_prefix),
-                        window_bp=(
-                            int(prune_spec.window_bp)
-                            if prune_spec.window_bp is not None
-                            else None
-                        ),
-                        window_variants=(
-                            int(prune_spec.window_variants)
-                            if prune_spec.window_variants is not None
-                            else None
-                        ),
-                        step_variants=int(prune_spec.step_variants),
-                        r2_threshold=float(prune_spec.r2_threshold),
-                        threads=0,
+                        spec=prune_spec,
+                        threads=int(args.thread),
+                        logger=logger,
                     )
-                    rust_prune_direct_wall = float(time.time() - t_direct)
+                    rust_prune_direct_wall = float(wall)
                     prune_pre_sites = int(total_n)
                     selected_n_sites = int(keep_n)
                     rust_prune_direct_done = True
-                elif use_packed_prune_fastpath:
-                    keep_mask, sites_all, packed_raw, _packed_n = _ld_prune_with_maf_priority_packed_plink(
-                        gfile,
-                        prune_spec,
-                    )
-                    packed_prune_keep_mask = np.asarray(keep_mask, dtype=bool).reshape(-1)
-                    packed_prune_packed = np.ascontiguousarray(
-                        np.asarray(packed_raw, dtype=np.uint8)
-                    )
-                    packed_prune_source_prefix = str(gfile)
-                else:
-                    geno_all, sites_all = _stack_chunks(_make_chunks())
-                    if geno_all.shape[0] <= 0 or len(sites_all) == 0:
+                    prune_direct_backend = "plink-external"
+                    if keep_n <= 0:
                         raise ValueError(
-                            "All variants were filtered out before LD prune "
-                            "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
+                            "All variants were filtered out by LD prune; "
+                            "try a looser --prune r^2 threshold or larger window."
                         )
-                    keep_mask = _ld_prune_with_maf_priority(
-                        geno_all,
-                        sites_all,
-                        prune_spec,
+                    task.complete(
+                        "Applying LD prune ...Finished "
+                        f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
                     )
-                if not rust_prune_direct_done:
-                    prune_pre_sites = int(len(sites_all))
-                    keep_n = int(np.sum(keep_mask))
-                else:
-                    keep_n = int(selected_n_sites)
+                except Exception:
+                    task.fail("Applying LD prune ...Failed")
+                    raise
+            if not status_enabled:
+                logger.info(
+                    "Applying LD prune ...Finished "
+                    f"(backend={prune_direct_backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
+                )
+        elif use_rust_prune_direct and status_enabled:
+            pbar_total = int(max(1, int(n_sites)))
+            pbar = ProgressAdapter(
+                total=pbar_total,
+                desc="Applying LD prune",
+                force_animate=True,
+                keep_display=False,
+                show_remaining=True,
+                emit_done=False,
+            )
+            prune_done = 0
+
+            def _on_prune_progress(done: int, total: int) -> None:
+                nonlocal prune_done
+                d = int(max(0, int(done)))
+                t = int(max(1, int(total)))
+                if d > t:
+                    d = t
+                if d > prune_done:
+                    pbar.update(d - prune_done)
+                    prune_done = d
+
+            try:
+                t_direct = time.time()
+                call_args = dict(
+                    src_prefix=str(gfile),
+                    out_prefix=str(out_prefix),
+                    window_bp=(
+                        int(prune_spec.window_bp)
+                        if prune_spec.window_bp is not None
+                        else None
+                    ),
+                    window_variants=(
+                        int(prune_spec.window_variants)
+                        if prune_spec.window_variants is not None
+                        else None
+                    ),
+                    step_variants=int(prune_spec.step_variants),
+                    r2_threshold=float(prune_spec.r2_threshold),
+                    threads=int(args.thread),
+                )
+                try:
+                    keep_n, total_n = _bed_prune_to_plink_rust(
+                        **call_args,
+                        progress_callback=_on_prune_progress,
+                        progress_every=max(1000, int(max(1, int(n_sites) // 200))),
+                    )
+                except TypeError:
+                    # Backward-compatible fallback for older extension without callback args.
+                    keep_n, total_n = _bed_prune_to_plink_rust(**call_args)
+                total_n = int(total_n)
+                keep_n = int(keep_n)
+                if prune_done < total_n:
+                    pbar.update(total_n - prune_done)
+                pbar.finish()
+                rust_prune_direct_wall = float(time.time() - t_direct)
+                prune_pre_sites = int(total_n)
+                selected_n_sites = int(keep_n)
+                rust_prune_direct_done = True
+                prune_direct_backend = "rust-packed-io"
                 if keep_n <= 0:
                     raise ValueError(
                         "All variants were filtered out by LD prune; "
                         "try a looser --prune r^2 threshold or larger window."
                     )
+                log_success(
+                    logger,
+                    "Applying LD prune ...Finished "
+                    f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})",
+                )
+            finally:
+                pbar.close()
+        else:
+            with CliStatus(prune_desc, enabled=status_enabled) as task:
+                try:
+                    if use_rust_prune_direct:
+                        t_direct = time.time()
+                        keep_n, total_n = _bed_prune_to_plink_rust(
+                            src_prefix=str(gfile),
+                            out_prefix=str(out_prefix),
+                            window_bp=(
+                                int(prune_spec.window_bp)
+                                if prune_spec.window_bp is not None
+                                else None
+                            ),
+                            window_variants=(
+                                int(prune_spec.window_variants)
+                                if prune_spec.window_variants is not None
+                                else None
+                            ),
+                            step_variants=int(prune_spec.step_variants),
+                            r2_threshold=float(prune_spec.r2_threshold),
+                            threads=int(args.thread),
+                        )
+                        rust_prune_direct_wall = float(time.time() - t_direct)
+                        prune_pre_sites = int(total_n)
+                        selected_n_sites = int(keep_n)
+                        rust_prune_direct_done = True
+                        prune_direct_backend = "rust-packed-io"
+                    elif use_packed_prune_fastpath:
+                        keep_mask, sites_all, packed_raw, _packed_n = _ld_prune_with_maf_priority_packed_plink(
+                            gfile,
+                            prune_spec,
+                            threads=int(args.thread),
+                        )
+                        packed_prune_keep_mask = np.asarray(keep_mask, dtype=bool).reshape(-1)
+                        packed_prune_packed = np.ascontiguousarray(
+                            np.asarray(packed_raw, dtype=np.uint8)
+                        )
+                        packed_prune_source_prefix = str(gfile)
+                    else:
+                        geno_all, sites_all = _stack_chunks(_make_chunks())
+                        if geno_all.shape[0] <= 0 or len(sites_all) == 0:
+                            raise ValueError(
+                                "All variants were filtered out before LD prune "
+                                "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
+                            )
+                        keep_mask = _ld_prune_with_maf_priority(
+                            geno_all,
+                            sites_all,
+                            prune_spec,
+                        )
+                    if not rust_prune_direct_done:
+                        prune_pre_sites = int(len(sites_all))
+                        keep_n = int(np.sum(keep_mask))
+                    else:
+                        keep_n = int(selected_n_sites)
+                    if keep_n <= 0:
+                        raise ValueError(
+                            "All variants were filtered out by LD prune; "
+                            "try a looser --prune r^2 threshold or larger window."
+                        )
+                    if rust_prune_direct_done:
+                        pass
+                    elif use_packed_prune_fastpath:
+                        kept_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
+                        push_snp_sites = [(str(s.chrom), int(s.pos)) for s in kept_sites]
+                        pruned_geno = None
+                        pruned_sites = None
+                    else:
+                        pruned_geno = np.asarray(geno_all[keep_mask, :], dtype=np.float32)
+                        pruned_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
+                    selected_n_sites = int(keep_n)
+                    if rust_prune_direct_done:
+                        backend = str(prune_direct_backend or "rust-packed-io")
+                    else:
+                        backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
+                    task.complete(
+                        "Applying LD prune ...Finished "
+                        f"(backend={backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
+                    )
+                except Exception:
+                    task.fail("Applying LD prune ...Failed")
+                    raise
+            if not status_enabled:
                 if rust_prune_direct_done:
-                    pass
-                elif use_packed_prune_fastpath:
-                    kept_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
-                    push_snp_sites = [(str(s.chrom), int(s.pos)) for s in kept_sites]
-                    pruned_geno = None
-                    pruned_sites = None
-                else:
-                    pruned_geno = np.asarray(geno_all[keep_mask, :], dtype=np.float32)
-                    pruned_sites = [sites_all[i] for i in np.flatnonzero(keep_mask)]
-                selected_n_sites = int(keep_n)
-                if rust_prune_direct_done:
-                    backend = "rust-packed-io"
+                    backend = str(prune_direct_backend or "rust-packed-io")
                 else:
                     backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
-                task.complete(
+                logger.info(
                     "Applying LD prune ...Finished "
-                    f"(backend={backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
+                    f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
                 )
-            except Exception:
-                task.fail("Applying LD prune ...Failed")
-                raise
-        if not status_enabled:
-            if rust_prune_direct_done:
-                backend = "rust-packed-io"
-            else:
-                backend = "rust-packed" if use_packed_prune_fastpath else "python-dense"
-            logger.info(
-                "Applying LD prune ...Finished "
-                f"(backend={backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})"
-            )
-        if use_packed_prune_fastpath and _packed_prune_kernel_stats is not None:
+        if (
+            use_packed_prune_fastpath
+            and (not use_external_plink_prune)
+            and _packed_prune_kernel_stats is not None
+        ):
             try:
                 (
                     k_backend,

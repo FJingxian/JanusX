@@ -52,6 +52,7 @@ def build_rich_progress(
     show_percentage: bool = True,
     show_elapsed: bool = True,
     show_remaining: bool = False,
+    field_templates_before_elapsed: Sequence[str] | None = None,
     field_templates: Sequence[str] | None = None,
     bar_width: int | None = None,
     finished_text: str = " ",
@@ -86,6 +87,8 @@ def build_rich_progress(
         columns.append(BarColumn(bar_width=bar_width) if bar_width is not None else BarColumn())
     if show_percentage:
         columns.append(TextColumn("{task.percentage:>6.1f}%"))
+    for template in (field_templates_before_elapsed or []):
+        columns.append(TextColumn(str(template)))
     if show_elapsed:
         assert TimeElapsedColumn is not None
         columns.append(TimeElapsedColumn())

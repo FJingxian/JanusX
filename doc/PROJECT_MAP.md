@@ -98,6 +98,10 @@ Legend: `Y` supported, `N` unsupported, `Check` means preflight only.
 - Streaming read/write across `vcf/hmp/plink/txt/npy`.
 - Merge and conversion pipelines (`gmerge`, `gformat`).
 - Packed BED optimized kernels and bit-level transforms.
+- Packed, chromosome-sorted `PLINK -> PLINK` filter/prune fast paths can stream `.bed` rows
+  directly instead of loading the full packed matrix.
+- Streaming packed prune path supports runtime thread control and progress callbacks for
+  CLI-visible long-run progress.
 - K-mer binary matrix generation (`kmerge`) and text decode (`view`).
 
 Main code: `src/io/*`, `python/janusx/gfreader/*`, `python/janusx/script/{gformat,gmerge,kmerge,view}.py`
@@ -105,7 +109,8 @@ Main code: `src/io/*`, `python/janusx/gfreader/*`, `python/janusx/script/{gforma
 ### 5.2 Association and selection
 
 - GWAS models: `LM`, `LMM`, `FaST-LMM`, `LRLMM`, `FarmCPU`.
-- GS models: `GBLUP`, `adBLUP`, `rrBLUP` (exact + mini-batch AdamW backend), `BayesA/B/Cpi`, ML models.
+- GS models: `GBLUP`, `adBLUP`, `rrBLUP` (exact + mini-batch AdamW + packed-BED PCG), `BayesA/B/Cpi`, ML models.
+- `rrBLUP` progress hooks include AdamW (`adam_start/adam_epoch/adam_end`) and PCG (`pcg_start/pcg_iter/pcg_end`) events consumed by `jx gs` sub-progress bars.
 - REML variance estimation and BLUP output.
 
 Main code: `src/stats/{assoc,lmm,bayes}.rs`, `python/janusx/pyBLUP/*`, `python/janusx/script/{gwas,gs,reml}.py`

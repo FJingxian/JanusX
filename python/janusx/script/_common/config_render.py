@@ -180,7 +180,7 @@ def _render_rich_panel(
         def _kv_table(rows: Sequence[tuple[str, str]]) -> Any:
             table = Table(
                 show_header=False,
-                box=box.SIMPLE,
+                box=None,
                 pad_edge=False,
                 expand=False,
             )

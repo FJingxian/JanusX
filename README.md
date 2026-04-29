@@ -80,6 +80,22 @@ pip install janusx
 ```
 
 - If you only need a turnkey CLI environment with pipeline tooling, prefer launcher install.
+- Enhanced Rich-styled CLI help is optional: `pip install "janusx[cli]"`.
+
+### Option C: Conda / Bioconda
+
+Recommended Bioconda channel order:
+
+```bash
+conda create -n janusx \
+  --channel conda-forge \
+  --channel bioconda \
+  --strict-channel-priority \
+  janusx
+```
+
+- JanusX keeps `rich-argparse` as an optional CLI enhancement so the core runtime does not require that conda-forge-only package at install time.
+- Even so, Bioconda officially recommends keeping `conda-forge` above `bioconda`, because many Bioconda packages rely on the broader conda-forge ecosystem.
 
 ---
 

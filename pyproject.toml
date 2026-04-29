@@ -8,7 +8,7 @@ dependencies = [
     "pandas>=1.5",
     "matplotlib",
     "psutil",
-    "rich", "tqdm", "rich-argparse",
+    "rich", "tqdm",
     "joblib>=1.5",
     "threadpoolctl",
 ]
@@ -20,6 +20,9 @@ license = {file = "LICENSE"}
 keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
+cli = [
+    "rich-argparse",
+]
 ml = [
     "scikit-learn",
     "xgboost",
@@ -39,6 +42,7 @@ treeplot = [
     "toyplot",
 ]
 full = [
+    "rich-argparse",
     "scikit-learn",
     "xgboost",
     "statsmodels",

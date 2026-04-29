@@ -307,7 +307,8 @@ Examples:
 
 ```bash
 jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5 -n 0 -o out
-jx gs -file matrix_prefix -p pheno.tsv -adBLUP -BayesA -BayesB -BayesCpi -cv 5
+jx gs -file matrix_prefix -p pheno.tsv -GBLUP ad -BayesA -BayesB -BayesCpi -cv 5
+jx gs -bfile geno -p pheno.tsv -GBLUP a -GBLUP d -GBLUP ad -cv 5
 jx gs -bfile geno -p pheno.tsv -RF -ET -GBDT -XGB -SVM -ENET -cv 5
 jx gs -bfile geno -p pheno.tsv -rrBLUP -cv 5 -n 0
 jx gs -bfile geno -p pheno.tsv -rrBLUP --rrblup-solver exact    # advanced hidden option
@@ -315,7 +316,7 @@ jx gs -bfile geno -p pheno.tsv -rrBLUP --rrblup-solver exact    # advanced hidde
 
 Model flags:
 
-- `-GBLUP`, `-adBLUP`, `-rrBLUP`
+- `-GBLUP [a|d|ad]`, `-rrBLUP`
 - `-BayesA`, `-BayesB`, `-BayesCpi`
 - `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
 
@@ -325,6 +326,7 @@ Other options:
 - `-cv`
 - `-strict-cv`
 - `-pcd`
+- `-ldprune`
 - `-maf`, `-geno`
 - `-t`
 
@@ -338,6 +340,7 @@ Notes:
 - AdamW/PCG rrBLUP reports `h2/PVE` in train-variance mode by default (`--rrblup-pve-mode trainvar`), and can switch to lambda-consistent mode via hidden advanced flag `--rrblup-pve-mode lambda`.
 - AdamW rrBLUP memory usage is primarily controlled by `-batchsize/--batchsize` (alias of hidden `--rrblup-batch-size`). By default, `--rrblup-snp-block-size` follows the same value unless explicitly overridden.
 - For `GBLUP/rrBLUP`-only runs with non-PLINK input (`-vcf/-hmp/-file`), `jx gs` will auto-probe data scale and switch to packed BED flow when `n_samples * n_snps` exceeds the hidden threshold `--packed-lmm-auto-min-cells` (default `200000000`).
+- `--ldprune` default backend is JanusX Rust packed kernel; set env `JX_GS_LDPRUNE_BACKEND=plink` to delegate GS LD prune to external PLINK (`--indep-pairwise`) for closer PLINK semantics.
 
 Outputs:
 
@@ -515,6 +518,7 @@ Key options:
 - site filters: `-maf`, `-geno`
 - LD prune: `-prune/--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>`  
   Numeric window defaults to `kb` (`1` = `1kb`, `0.1` = `100bp`)
+- filter pushdown: `--keep/--extract/--chr/--from-bp/--to-bp/-maf/-geno/-het` are evaluated in Rust readers/kernels (Python CLI parses and forwards arguments)
 - prune mode (default): fast anchor-stepped scan optimized for runtime and memory
 - strict mode (optional): set env `JX_LD_PRUNE_MODE=strict` to enable strict
   sliding-window + window-local greedy pruning semantics (slower)

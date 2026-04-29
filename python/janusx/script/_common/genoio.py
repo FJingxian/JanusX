@@ -612,7 +612,7 @@ def write_gfd_output(
     sample_ids: Sequence[str],
     chunks: Iterable[tuple[np.ndarray, Sequence[SiteInfo]]],
     *,
-    total_sites: int,
+    total_sites: int | None,
     source_is_dosage012: bool = False,
 ) -> None:
     """
@@ -633,7 +633,7 @@ def write_gfd_output(
 
     written = 0
     packed_cols = (n_samples + 7) // 8
-    progress, task_id, pbar = _open_site_progress("Writing GFD", int(total_sites))
+    progress, task_id, pbar = _open_site_progress("Writing GFD", total_sites)
     with open(out_path, "wb") as fbin, open(f"{prefix}.bsite", "wb") as fsite:
         try:
             _write_bin_header(fbin, n_sites=0, n_samples=n_samples, reserved=0)
@@ -749,7 +749,7 @@ def write_gfd_output(
         finally:
             _close_site_progress(progress, pbar)
 
-    if written != int(total_sites):
+    if total_sites is not None and written != int(total_sites):
         print(
             f"! Warning: Written site count mismatch for GFD output: {written} vs {total_sites}. "
             f"Header was written with n_sites={written}.",
@@ -757,28 +757,34 @@ def write_gfd_output(
         )
 
 
-def _open_site_progress(desc: str, total_sites: int):
+def _open_site_progress(desc: str, total_sites: int | None):
     use_tty = stdout_is_tty()
     animate = bool(should_animate_status(desc))
+    total_known = total_sites is not None
     if animate and rich_progress_available():
         progress = build_rich_progress(
             description_template="[progress.description]{task.description}",
+            show_bar=bool(total_known),
+            show_percentage=bool(total_known),
             show_remaining=False,
-            bar_width=40,
+            bar_width=(40 if total_known else None),
             finished_text=" ",
             transient=True,
         )
         if progress is not None:
-            task_id = progress.add_task(str(desc), total=float(max(0, int(total_sites))))
+            task_id = progress.add_task(
+                str(desc),
+                total=(float(max(0, int(total_sites))) if total_known else None),
+            )
             progress.start()
             return progress, task_id, None
     if (not animate) or tqdm is None:
         return None, None, None
     pbar = tqdm(
-        total=max(0, int(total_sites)),
+        total=(None if total_sites is None else max(0, int(total_sites))),
         unit="SNP",
         desc=str(desc),
-        disable=not use_tty,
+        disable=(not use_tty) or (total_sites is None),
         bar_format="{desc}: {percentage:3.0f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
     )
     return None, None, pbar
@@ -804,13 +810,13 @@ def write_text_output(
     sample_ids: Sequence[str],
     chunks: Iterator[tuple[np.ndarray, Sequence[SiteInfo]]],
     *,
-    total_sites: int,
+    total_sites: int | None,
 ) -> None:
     prefix = output_prefix_from_path(out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     write_id_file(f"{prefix}.id", sample_ids)
     written = 0
-    progress, task_id, pbar = _open_site_progress("Writing TXT", int(total_sites))
+    progress, task_id, pbar = _open_site_progress("Writing TXT", total_sites)
     with open(out_path, "w", encoding="utf-8") as fw, open(
         f"{prefix}.site", "w", encoding="utf-8"
     ) as fsite:
@@ -824,7 +830,7 @@ def write_text_output(
                 _advance_site_progress(progress, task_id, pbar, n_rows)
         finally:
             _close_site_progress(progress, pbar)
-    if written != int(total_sites):
+    if total_sites is not None and written != int(total_sites):
         print(
             f"! Warning: Written site count mismatch for text output: {written} vs {total_sites}. "
             f"Kept written rows={written}.",

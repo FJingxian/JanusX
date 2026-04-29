@@ -51,8 +51,8 @@ requirements:
     - psutil
     - rich
     - tqdm
-    - rich-argparse
     - joblib >=1.5
+    - threadpoolctl
 
 test:
   requires:

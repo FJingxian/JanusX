@@ -373,9 +373,12 @@ fn packed_byte_lut() -> &'static PackedByteLut {
 
 struct PackedPairLut {
     dot_obs0: [u8; 65536],
-    sum_j_when_i_miss: [u8; 65536],
-    sum_i_when_j_miss: [u8; 65536],
-    miss_both: [u8; 65536],
+    obs_ct: [u8; 65536],
+    obs_sum_i: [u8; 65536],
+    obs_sum_j: [u8; 65536],
+    obs_sum_i2: [u8; 65536],
+    obs_sum_j2: [u8; 65536],
+    obs_sum_ij: [u8; 65536],
 }
 
 #[inline]
@@ -393,9 +396,12 @@ fn packed_pair_lut() -> &'static PackedPairLut {
     LUT.get_or_init(|| {
         let code4 = &packed_byte_lut().code4;
         let mut dot_obs0 = [0u8; 65536];
-        let mut sum_j_when_i_miss = [0u8; 65536];
-        let mut sum_i_when_j_miss = [0u8; 65536];
-        let mut miss_both = [0u8; 65536];
+        let mut obs_ct = [0u8; 65536];
+        let mut obs_sum_i = [0u8; 65536];
+        let mut obs_sum_j = [0u8; 65536];
+        let mut obs_sum_i2 = [0u8; 65536];
+        let mut obs_sum_j2 = [0u8; 65536];
+        let mut obs_sum_ij = [0u8; 65536];
 
         for bi in 0u16..=255 {
             for bj in 0u16..=255 {
@@ -404,37 +410,45 @@ fn packed_pair_lut() -> &'static PackedPairLut {
                 let cj = &code4[bj as usize];
 
                 let mut dot_v: u8 = 0;
-                let mut sj_imiss: u8 = 0;
-                let mut si_jmiss: u8 = 0;
-                let mut mb: u8 = 0;
+                let mut n_obs: u8 = 0;
+                let mut sum_i_obs: u8 = 0;
+                let mut sum_j_obs: u8 = 0;
+                let mut sum_i2_obs: u8 = 0;
+                let mut sum_j2_obs: u8 = 0;
+                let mut sum_ij_obs: u8 = 0;
                 for lane in 0..4usize {
                     let a = ci[lane];
                     let b = cj[lane];
                     let ga = _code_to_dosage_or_zero(a);
                     let gb = _code_to_dosage_or_zero(b);
                     dot_v = dot_v.saturating_add(ga.saturating_mul(gb));
-                    if a == 0b01 {
-                        sj_imiss = sj_imiss.saturating_add(gb);
-                        if b == 0b01 {
-                            mb = mb.saturating_add(1);
-                        }
-                    }
-                    if b == 0b01 {
-                        si_jmiss = si_jmiss.saturating_add(ga);
+                    if a != 0b01 && b != 0b01 {
+                        n_obs = n_obs.saturating_add(1);
+                        sum_i_obs = sum_i_obs.saturating_add(ga);
+                        sum_j_obs = sum_j_obs.saturating_add(gb);
+                        sum_i2_obs = sum_i2_obs.saturating_add(ga.saturating_mul(ga));
+                        sum_j2_obs = sum_j2_obs.saturating_add(gb.saturating_mul(gb));
+                        sum_ij_obs = sum_ij_obs.saturating_add(ga.saturating_mul(gb));
                     }
                 }
                 dot_obs0[idx] = dot_v;
-                sum_j_when_i_miss[idx] = sj_imiss;
-                sum_i_when_j_miss[idx] = si_jmiss;
-                miss_both[idx] = mb;
+                obs_ct[idx] = n_obs;
+                obs_sum_i[idx] = sum_i_obs;
+                obs_sum_j[idx] = sum_j_obs;
+                obs_sum_i2[idx] = sum_i2_obs;
+                obs_sum_j2[idx] = sum_j2_obs;
+                obs_sum_ij[idx] = sum_ij_obs;
             }
         }
 
         PackedPairLut {
             dot_obs0,
-            sum_j_when_i_miss,
-            sum_i_when_j_miss,
-            miss_both,
+            obs_ct,
+            obs_sum_i,
+            obs_sum_j,
+            obs_sum_i2,
+            obs_sum_j2,
+            obs_sum_ij,
         }
     })
 }
@@ -445,50 +459,6 @@ struct PackedRowStats {
     std: f64,
     maf: f64,
     has_missing: bool,
-}
-
-#[inline]
-fn dot_imputed_pair_from_packed(
-    row_i: &[u8],
-    row_j: &[u8],
-    n_samples: usize,
-    mean_i: f64,
-    mean_j: f64,
-    pair_lut: &PackedPairLut,
-    code4_lut: &[[u8; 4]; 256],
-) -> f64 {
-    let full_bytes = n_samples / 4;
-    let rem = n_samples % 4;
-    let mut dot = 0.0_f64;
-
-    for b in 0..full_bytes {
-        let idx = ((row_i[b] as usize) << 8) | (row_j[b] as usize);
-        dot += pair_lut.dot_obs0[idx] as f64;
-        dot += mean_i * pair_lut.sum_j_when_i_miss[idx] as f64;
-        dot += mean_j * pair_lut.sum_i_when_j_miss[idx] as f64;
-        dot += mean_i * mean_j * pair_lut.miss_both[idx] as f64;
-    }
-
-    if rem > 0 {
-        let ci = &code4_lut[row_i[full_bytes] as usize];
-        let cj = &code4_lut[row_j[full_bytes] as usize];
-        for lane in 0..rem {
-            let vi = match ci[lane] {
-                0b00 => 0.0_f64,
-                0b10 => 1.0_f64,
-                0b11 => 2.0_f64,
-                _ => mean_i,
-            };
-            let vj = match cj[lane] {
-                0b00 => 0.0_f64,
-                0b10 => 1.0_f64,
-                0b11 => 2.0_f64,
-                _ => mean_j,
-            };
-            dot += vi * vj;
-        }
-    }
-    dot
 }
 
 #[inline]
@@ -516,6 +486,73 @@ fn dot_nomiss_pair_from_packed(
         }
     }
     dot
+}
+
+#[inline]
+fn r2_pairwise_complete_from_packed(
+    row_i: &[u8],
+    row_j: &[u8],
+    n_samples: usize,
+    pair_lut: &PackedPairLut,
+    code4_lut: &[[u8; 4]; 256],
+) -> Option<f64> {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    let mut n_obs: u64 = 0;
+    let mut sum_i: u64 = 0;
+    let mut sum_j: u64 = 0;
+    let mut sum_i2: u64 = 0;
+    let mut sum_j2: u64 = 0;
+    let mut sum_ij: u64 = 0;
+
+    for b in 0..full_bytes {
+        let idx = ((row_i[b] as usize) << 8) | (row_j[b] as usize);
+        n_obs = n_obs.saturating_add(pair_lut.obs_ct[idx] as u64);
+        sum_i = sum_i.saturating_add(pair_lut.obs_sum_i[idx] as u64);
+        sum_j = sum_j.saturating_add(pair_lut.obs_sum_j[idx] as u64);
+        sum_i2 = sum_i2.saturating_add(pair_lut.obs_sum_i2[idx] as u64);
+        sum_j2 = sum_j2.saturating_add(pair_lut.obs_sum_j2[idx] as u64);
+        sum_ij = sum_ij.saturating_add(pair_lut.obs_sum_ij[idx] as u64);
+    }
+
+    if rem > 0 {
+        let ci = &code4_lut[row_i[full_bytes] as usize];
+        let cj = &code4_lut[row_j[full_bytes] as usize];
+        for lane in 0..rem {
+            let ai = ci[lane];
+            let aj = cj[lane];
+            if ai == 0b01 || aj == 0b01 {
+                continue;
+            }
+            let vi = _code_to_dosage_or_zero(ai) as u64;
+            let vj = _code_to_dosage_or_zero(aj) as u64;
+            n_obs = n_obs.saturating_add(1);
+            sum_i = sum_i.saturating_add(vi);
+            sum_j = sum_j.saturating_add(vj);
+            sum_i2 = sum_i2.saturating_add(vi.saturating_mul(vi));
+            sum_j2 = sum_j2.saturating_add(vj.saturating_mul(vj));
+            sum_ij = sum_ij.saturating_add(vi.saturating_mul(vj));
+        }
+    }
+
+    if n_obs <= 1 {
+        return None;
+    }
+    let n = n_obs as f64;
+    let si = sum_i as f64;
+    let sj = sum_j as f64;
+    let si2 = sum_i2 as f64;
+    let sj2 = sum_j2 as f64;
+    let sij = sum_ij as f64;
+
+    let cov_num = sij * n - si * sj;
+    let var_i_num = si2 * n - si * si;
+    let var_j_num = sj2 * n - sj * sj;
+    let denom = var_i_num * var_j_num;
+    if !(denom.is_finite() && denom > 0.0_f64 && cov_num.is_finite()) {
+        return None;
+    }
+    Some((cov_num * cov_num) / denom)
 }
 
 static PRUNE_DOT_TOTAL_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -617,18 +654,20 @@ fn build_bitplanes_u64(
     bytes_per_snp: usize,
     n_samples: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> (Vec<u64>, Vec<u64>, usize, Vec<u64>) {
+) -> (Vec<u64>, Vec<u64>, Vec<u64>, usize, Vec<u64>) {
     let words = (n_samples + 63) / 64;
     if m == 0 || words == 0 {
-        return (Vec::new(), Vec::new(), 0, Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new());
     }
 
     let mut lut_h = [0u8; 256];
     let mut lut_l = [0u8; 256];
+    let mut lut_m = [0u8; 256];
     for b in 0u16..=255 {
         let byte = b as u8;
         let mut hb = 0u8;
         let mut lb = 0u8;
+        let mut mb = 0u8;
         for lane in 0..4usize {
             let code = (byte >> (lane * 2)) & 0b11;
             if ((code >> 1) & 1) != 0 {
@@ -637,9 +676,13 @@ fn build_bitplanes_u64(
             if (code & 1) != 0 {
                 lb |= 1u8 << lane;
             }
+            if code == 0b01 {
+                mb |= 1u8 << lane;
+            }
         }
         lut_h[byte as usize] = hb;
         lut_l[byte as usize] = lb;
+        lut_m[byte as usize] = mb;
     }
 
     let mut word_masks = vec![u64::MAX; words];
@@ -651,21 +694,25 @@ fn build_bitplanes_u64(
 
     let mut h_bits = vec![0u64; m * words];
     let mut l_bits = vec![0u64; m * words];
+    let mut m_bits = vec![0u64; m * words];
     let mut run = || {
         h_bits
             .par_chunks_mut(words)
             .zip(l_bits.par_chunks_mut(words))
+            .zip(m_bits.par_chunks_mut(words))
             .enumerate()
-            .for_each(|(row_idx, (hrow, lrow))| {
+            .for_each(|(row_idx, ((hrow, lrow), mrow))| {
                 let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                 for (bi, &b) in row.iter().enumerate() {
                     let w = bi >> 4;
                     let sh = ((bi & 15) << 2) as u32;
                     hrow[w] |= (lut_h[b as usize] as u64) << sh;
                     lrow[w] |= (lut_l[b as usize] as u64) << sh;
+                    mrow[w] |= (lut_m[b as usize] as u64) << sh;
                 }
                 hrow[words - 1] &= last_mask;
                 lrow[words - 1] &= last_mask;
+                mrow[words - 1] &= last_mask;
             });
     };
     if let Some(tp) = pool {
@@ -673,7 +720,7 @@ fn build_bitplanes_u64(
     } else {
         run();
     }
-    (h_bits, l_bits, words, word_masks)
+    (h_bits, l_bits, m_bits, words, word_masks)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -884,9 +931,10 @@ fn classify_ld_pair_by_maf(maf_i: f64, maf_j: f64, eps: f64) -> u8 {
     //   1 => drop the first/anchor variant (i)
     //   2 => drop the second/candidate variant (j)
     //
-    // PLINK-compatible tie handling: when |maf_i - maf_j| <= eps,
-    // deterministically drop the second/later variant.
-    if maf_j > maf_i + eps {
+    // PLINK pairwise rule:
+    //   drop i only when maf_i < (1 - eps) * maf_j
+    // otherwise (ties / near-ties included), drop j.
+    if maf_i < (1.0_f64 - eps) * maf_j {
         1u8
     } else {
         2u8
@@ -896,18 +944,15 @@ fn classify_ld_pair_by_maf(maf_i: f64, maf_j: f64, eps: f64) -> u8 {
 fn prune_one_chrom_packed(
     idx_list: &[usize],
     pos_vec: &[i64],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
     n_samples: usize,
     window_bp: Option<i64>,
     window_variants: Option<usize>,
     step_variants: usize,
     r2_threshold: f64,
     stats: &[PackedRowStats],
-    pair_lut: &PackedPairLut,
-    code4_lut: &[[u8; 4]; 256],
     bitplane_h: &[u64],
     bitplane_l: &[u64],
+    bitplane_m: &[u64],
     bitplane_words: usize,
     bitplane_masks: &[u64],
     enable_intra_chrom_parallel: bool,
@@ -923,6 +968,7 @@ fn prune_one_chrom_packed(
     let denom = (n_samples.saturating_sub(1)).max(1) as f64;
     let n_samples_f = n_samples as f64;
     let eps = 1e-12_f64;
+    let prune_r2_thresh = r2_threshold * (1.0_f64 + eps);
     let step = step_variants.max(1);
     let use_bp = window_bp.is_some();
     let mut pos_sorted = true;
@@ -976,8 +1022,11 @@ fn prune_one_chrom_packed(
                 }
 
                 let gi = idx_list[li];
-                let row_i = &packed_flat[gi * bytes_per_snp..(gi + 1) * bytes_per_snp];
                 let st_i = stats[gi];
+                let off_i = gi * bitplane_words;
+                let hi_i = &bitplane_h[off_i..off_i + bitplane_words];
+                let li_i = &bitplane_l[off_i..off_i + bitplane_words];
+                let mi_i = &bitplane_m[off_i..off_i + bitplane_words];
                 let mut drop_i = false;
                 let mut drop_low: Vec<usize> = Vec::new();
                 let classify_lj = |lj: usize| -> Option<u8> {
@@ -986,47 +1035,40 @@ fn prune_one_chrom_packed(
                     }
                     let gj = idx_list[lj];
                     let st_j = stats[gj];
-
-                    let dot_imp = if !st_i.has_missing && !st_j.has_missing && bitplane_words > 0 {
-                        dot_nomiss_pair_bitplanes(
+                    let off_j = gj * bitplane_words;
+                    let hi_j = &bitplane_h[off_j..off_j + bitplane_words];
+                    let li_j = &bitplane_l[off_j..off_j + bitplane_words];
+                    let mi_j = &bitplane_m[off_j..off_j + bitplane_words];
+                    let r2 = if !st_i.has_missing && !st_j.has_missing {
+                        let dot_imp = dot_nomiss_pair_bitplanes(
                             gi,
                             gj,
                             bitplane_h,
                             bitplane_l,
                             bitplane_words,
                             bitplane_masks,
-                        )
-                    } else {
-                        let row_j = &packed_flat[gj * bytes_per_snp..(gj + 1) * bytes_per_snp];
-                        if !st_i.has_missing && !st_j.has_missing {
-                            dot_nomiss_pair_from_packed(
-                                row_i,
-                                row_j,
-                                n_samples,
-                                pair_lut,
-                                code4_lut,
-                            )
+                        );
+                        let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
+                        let denom_corr = denom * st_i.std * st_j.std;
+                        let corr = if denom_corr > 0.0_f64 {
+                            cov / denom_corr
                         } else {
-                            dot_imputed_pair_from_packed(
-                                row_i,
-                                row_j,
-                                n_samples,
-                                st_i.mean,
-                                st_j.mean,
-                                pair_lut,
-                                code4_lut,
-                            )
-                        }
-                    };
-                    let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
-                    let denom_corr = denom * st_i.std * st_j.std;
-                    let corr = if denom_corr > 0.0_f64 {
-                        cov / denom_corr
+                            0.0_f64
+                        };
+                        corr * corr
                     } else {
-                        0.0_f64
+                        r2_pairwise_complete_bitplanes(
+                            hi_i,
+                            li_i,
+                            mi_i,
+                            hi_j,
+                            li_j,
+                            mi_j,
+                            bitplane_masks,
+                        )
+                        .unwrap_or(f64::NAN)
                     };
-                    let r2 = corr * corr;
-                    if !(r2.is_finite() && r2 >= r2_threshold) {
+                    if !(r2.is_finite() && r2 > prune_r2_thresh) {
                         return None;
                     }
                     Some(classify_ld_pair_by_maf(st_i.maf, st_j.maf, eps))
@@ -1074,6 +1116,11 @@ fn prune_one_chrom_packed(
         return dropped;
     }
 
+    let mut first_unchecked = vec![0usize; l];
+    for (li, slot) in first_unchecked.iter_mut().enumerate() {
+        *slot = li.saturating_add(1);
+    }
+
     let mut block_start = 0usize;
     while block_start < l {
         let end = if use_bp {
@@ -1105,106 +1152,97 @@ fn prune_one_chrom_packed(
         } else {
             (block_start + window_variants.unwrap_or(1)).min(l)
         };
+
         if end > block_start + 1 {
-            for li in block_start..end {
-                if dropped[li] {
-                    continue;
-                }
-                let gi = idx_list[li];
-                let row_i = &packed_flat[gi * bytes_per_snp..(gi + 1) * bytes_per_snp];
-                let st_i = stats[gi];
-                let mut drop_i = false;
-                let mut drop_low: Vec<usize> = Vec::new();
-                let classify_lj = |lj: usize| -> Option<u8> {
-                    if dropped[lj] {
-                        return None;
+            loop {
+                let mut at_least_one_prune = false;
+                for li in block_start..end.saturating_sub(1) {
+                    if dropped[li] {
+                        continue;
                     }
-                    let gj = idx_list[lj];
-                    let st_j = stats[gj];
+                    let scan_min = first_unchecked[li].max(block_start.saturating_add(1));
+                    if scan_min >= end {
+                        first_unchecked[li] = end;
+                        continue;
+                    }
 
-                    let dot_imp = if !st_i.has_missing && !st_j.has_missing && bitplane_words > 0 {
-                        dot_nomiss_pair_bitplanes(
-                            gi,
-                            gj,
-                            bitplane_h,
-                            bitplane_l,
-                            bitplane_words,
-                            bitplane_masks,
-                        )
-                    } else {
-                        let row_j = &packed_flat[gj * bytes_per_snp..(gj + 1) * bytes_per_snp];
-                        if !st_i.has_missing && !st_j.has_missing {
-                            dot_nomiss_pair_from_packed(
-                                row_i,
-                                row_j,
-                                n_samples,
-                                pair_lut,
-                                code4_lut,
-                            )
-                        } else {
-                            dot_imputed_pair_from_packed(
-                                row_i,
-                                row_j,
-                                n_samples,
-                                st_i.mean,
-                                st_j.mean,
-                                pair_lut,
-                                code4_lut,
-                            )
+                    let gi = idx_list[li];
+                    let st_i = stats[gi];
+                    let off_i = gi * bitplane_words;
+                    let hi_i = &bitplane_h[off_i..off_i + bitplane_words];
+                    let li_i = &bitplane_l[off_i..off_i + bitplane_words];
+                    let mi_i = &bitplane_m[off_i..off_i + bitplane_words];
+                    let mut pruned_this_round = false;
+                    let mut lj = scan_min;
+                    while lj < end {
+                        if dropped[lj] {
+                            lj = lj.saturating_add(1);
+                            continue;
                         }
-                    };
-                    let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
-                    let denom_corr = denom * st_i.std * st_j.std;
-                    let corr = if denom_corr > 0.0_f64 {
-                        cov / denom_corr
-                    } else {
-                        0.0_f64
-                    };
-                    let r2 = corr * corr;
-                    if !(r2.is_finite() && r2 >= r2_threshold) {
-                        return None;
-                    }
-                    Some(classify_ld_pair_by_maf(st_i.maf, st_j.maf, eps))
-                };
-
-                let n_neighbors = end.saturating_sub(li + 1);
-                if enable_intra_chrom_parallel && n_neighbors >= intra_parallel_min_neighbors {
-                    let decisions: Vec<(usize, u8)> = ((li + 1)..end)
-                        .into_par_iter()
-                        .filter_map(|lj| classify_lj(lj).map(|tag| (lj, tag)))
-                        .collect();
-                    if decisions.iter().any(|(_, tag)| *tag == 1u8) {
-                        drop_i = true;
-                    } else {
-                        drop_low.extend(decisions.into_iter().filter_map(|(lj, tag)| {
-                            if tag == 2u8 {
-                                Some(lj)
+                        let gj = idx_list[lj];
+                        let st_j = stats[gj];
+                        let off_j = gj * bitplane_words;
+                        let hi_j = &bitplane_h[off_j..off_j + bitplane_words];
+                        let li_j = &bitplane_l[off_j..off_j + bitplane_words];
+                        let mi_j = &bitplane_m[off_j..off_j + bitplane_words];
+                        let r2 = if !st_i.has_missing && !st_j.has_missing {
+                            let dot_imp = dot_nomiss_pair_bitplanes(
+                                gi,
+                                gj,
+                                bitplane_h,
+                                bitplane_l,
+                                bitplane_words,
+                                bitplane_masks,
+                            );
+                            let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
+                            let denom_corr = denom * st_i.std * st_j.std;
+                            let corr = if denom_corr > 0.0_f64 {
+                                cov / denom_corr
                             } else {
-                                None
-                            }
-                        }));
-                    }
-                } else {
-                    for lj in (li + 1)..end {
-                        if let Some(tag) = classify_lj(lj) {
+                                0.0_f64
+                            };
+                            corr * corr
+                        } else {
+                            r2_pairwise_complete_bitplanes(
+                                hi_i,
+                                li_i,
+                                mi_i,
+                                hi_j,
+                                li_j,
+                                mi_j,
+                                bitplane_masks,
+                            )
+                            .unwrap_or(f64::NAN)
+                        };
+                        if r2.is_finite() && r2 > prune_r2_thresh {
+                            at_least_one_prune = true;
+                            pruned_this_round = true;
+                            let tag = classify_ld_pair_by_maf(st_i.maf, st_j.maf, eps);
                             if tag == 1u8 {
-                                drop_i = true;
-                                break;
+                                dropped[li] = true;
+                            } else {
+                                dropped[lj] = true;
+                                let mut nxt = lj.saturating_add(1);
+                                while nxt < end && dropped[nxt] {
+                                    nxt = nxt.saturating_add(1);
+                                }
+                                first_unchecked[li] = nxt;
                             }
-                            drop_low.push(lj);
+                            break;
                         }
+                        lj = lj.saturating_add(1);
+                    }
+
+                    if !pruned_this_round && !dropped[li] {
+                        first_unchecked[li] = end;
                     }
                 }
-
-                if drop_i {
-                    dropped[li] = true;
-                } else if !drop_low.is_empty() {
-                    for j in drop_low {
-                        dropped[j] = true;
-                    }
+                if !at_least_one_prune {
+                    break;
                 }
             }
         }
+
         if end >= l {
             break;
         }
@@ -1357,8 +1395,7 @@ fn bed_packed_ld_prune_keep(
     }
     let chrom_groups: Vec<Vec<usize>> = by_chr.into_values().collect();
 
-    let pair_lut = packed_pair_lut();
-    let (bitplane_h, bitplane_l, bitplane_words, bitplane_masks) =
+    let (bitplane_h, bitplane_l, bitplane_m, bitplane_words, bitplane_masks) =
         build_bitplanes_u64(packed_flat, m, bytes_per_snp, n_samples, pool.as_ref());
     let mode = resolve_ld_prune_mode();
     let worker_ct = if threads > 0 {
@@ -1386,18 +1423,15 @@ fn bed_packed_ld_prune_keep(
                     prune_one_chrom_packed(
                         idx_list,
                         pos_vec,
-                        packed_flat,
-                        bytes_per_snp,
                         n_samples,
                         window_bp,
                         window_variants,
                         step_variants,
                         r2_threshold,
                         &stats,
-                        pair_lut,
-                        &byte_lut.code4,
                         &bitplane_h,
                         &bitplane_l,
+                        &bitplane_m,
                         bitplane_words,
                         &bitplane_masks,
                         enable_intra_chrom_parallel,
@@ -1713,27 +1747,186 @@ fn compute_packed_row_stats(
     }
 }
 
-fn build_row_bitplanes_u64(row: &[u8], n_samples: usize) -> (Vec<u64>, Vec<u64>) {
+fn build_row_bitplanes_u64(row: &[u8], n_samples: usize) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
     let words = (n_samples + 63) / 64;
     if words == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
+
+    static ROW_LUT: OnceLock<([u8; 256], [u8; 256], [u8; 256])> = OnceLock::new();
+    let (lut_h, lut_l, lut_m) = ROW_LUT.get_or_init(|| {
+        let mut lh = [0u8; 256];
+        let mut ll = [0u8; 256];
+        let mut lm = [0u8; 256];
+        for b in 0u16..=255 {
+            let byte = b as u8;
+            let mut hb = 0u8;
+            let mut lb = 0u8;
+            let mut mb = 0u8;
+            for lane in 0..4usize {
+                let code = (byte >> (lane * 2)) & 0b11;
+                if ((code >> 1) & 1) != 0 {
+                    hb |= 1u8 << lane;
+                }
+                if (code & 1) != 0 {
+                    lb |= 1u8 << lane;
+                }
+                if code == 0b01 {
+                    mb |= 1u8 << lane;
+                }
+            }
+            lh[byte as usize] = hb;
+            ll[byte as usize] = lb;
+            lm[byte as usize] = mb;
+        }
+        (lh, ll, lm)
+    });
 
     let mut hi = vec![0u64; words];
     let mut lo = vec![0u64; words];
-    for sample_idx in 0..n_samples {
-        let byte = row[sample_idx >> 2];
-        let code = (byte >> ((sample_idx & 3) * 2)) & 0b11;
-        let word = sample_idx >> 6;
-        let shift = (sample_idx & 63) as u32;
-        if ((code >> 1) & 1) != 0 {
-            hi[word] |= 1u64 << shift;
-        }
-        if (code & 1) != 0 {
-            lo[word] |= 1u64 << shift;
-        }
+    let mut mi = vec![0u64; words];
+    for (bi, &b) in row.iter().enumerate() {
+        let w = bi >> 4;
+        let sh = ((bi & 15) << 2) as u32;
+        hi[w] |= (lut_h[b as usize] as u64) << sh;
+        lo[w] |= (lut_l[b as usize] as u64) << sh;
+        mi[w] |= (lut_m[b as usize] as u64) << sh;
     }
-    (hi, lo)
+    let rem = n_samples % 64;
+    if rem != 0 {
+        let tail_mask = (1u64 << rem) - 1u64;
+        hi[words - 1] &= tail_mask;
+        lo[words - 1] &= tail_mask;
+        mi[words - 1] &= tail_mask;
+    }
+    (hi, lo, mi)
+}
+
+#[inline]
+fn r2_pairwise_complete_bitplanes(
+    hi: &[u64],
+    li: &[u64],
+    mi: &[u64],
+    hj: &[u64],
+    lj: &[u64],
+    mj: &[u64],
+    word_masks: &[u64],
+) -> Option<f64> {
+    let words = hi.len();
+    if words == 0 {
+        return None;
+    }
+    debug_assert_eq!(li.len(), words);
+    debug_assert_eq!(mi.len(), words);
+    debug_assert_eq!(hj.len(), words);
+    debug_assert_eq!(lj.len(), words);
+    debug_assert_eq!(mj.len(), words);
+    debug_assert_eq!(word_masks.len(), words);
+
+    let mut n_obs: u64 = 0;
+    let mut sum_i: u64 = 0;
+    let mut sum_j: u64 = 0;
+    let mut sum_i2: u64 = 0;
+    let mut sum_j2: u64 = 0;
+    let mut sum_ij: u64 = 0;
+
+    let full_words = words.saturating_sub(1);
+    for w in 0..full_words {
+        let hiw = hi[w];
+        let liw = li[w];
+        let hjw = hj[w];
+        let ljw = lj[w];
+
+        let valid = !(mi[w] | mj[w]);
+        if valid == 0 {
+            continue;
+        }
+
+        let ai = hiw & liw; // dosage==2 indicator
+        let aj = hjw & ljw; // dosage==2 indicator
+        let hv_i = hiw & valid;
+        let hv_j = hjw & valid;
+        let av_i = ai & valid;
+        let av_j = aj & valid;
+
+        let cnt_n = valid.count_ones() as u64;
+        let cnt_hi = hv_i.count_ones() as u64;
+        let cnt_hj = hv_j.count_ones() as u64;
+        let cnt_ai = av_i.count_ones() as u64;
+        let cnt_aj = av_j.count_ones() as u64;
+
+        n_obs = n_obs.saturating_add(cnt_n);
+        sum_i = sum_i.saturating_add(cnt_hi.saturating_add(cnt_ai));
+        sum_j = sum_j.saturating_add(cnt_hj.saturating_add(cnt_aj));
+        sum_i2 = sum_i2.saturating_add(cnt_hi.saturating_add(3u64.saturating_mul(cnt_ai)));
+        sum_j2 = sum_j2.saturating_add(cnt_hj.saturating_add(3u64.saturating_mul(cnt_aj)));
+
+        let c_hh = (hv_i & hv_j).count_ones() as u64;
+        let c_ha = (hv_i & av_j).count_ones() as u64;
+        let c_ah = (av_i & hv_j).count_ones() as u64;
+        let c_aa = (av_i & av_j).count_ones() as u64;
+        sum_ij = sum_ij.saturating_add(
+            c_hh.saturating_add(c_ha)
+                .saturating_add(c_ah)
+                .saturating_add(c_aa),
+        );
+    }
+
+    let tail = words - 1;
+    let hiw = hi[tail];
+    let liw = li[tail];
+    let hjw = hj[tail];
+    let ljw = lj[tail];
+    let valid = (!(mi[tail] | mj[tail])) & word_masks[tail];
+    if valid != 0 {
+        let ai = hiw & liw;
+        let aj = hjw & ljw;
+        let hv_i = hiw & valid;
+        let hv_j = hjw & valid;
+        let av_i = ai & valid;
+        let av_j = aj & valid;
+
+        let cnt_n = valid.count_ones() as u64;
+        let cnt_hi = hv_i.count_ones() as u64;
+        let cnt_hj = hv_j.count_ones() as u64;
+        let cnt_ai = av_i.count_ones() as u64;
+        let cnt_aj = av_j.count_ones() as u64;
+
+        n_obs = n_obs.saturating_add(cnt_n);
+        sum_i = sum_i.saturating_add(cnt_hi.saturating_add(cnt_ai));
+        sum_j = sum_j.saturating_add(cnt_hj.saturating_add(cnt_aj));
+        sum_i2 = sum_i2.saturating_add(cnt_hi.saturating_add(3u64.saturating_mul(cnt_ai)));
+        sum_j2 = sum_j2.saturating_add(cnt_hj.saturating_add(3u64.saturating_mul(cnt_aj)));
+
+        let c_hh = (hv_i & hv_j).count_ones() as u64;
+        let c_ha = (hv_i & av_j).count_ones() as u64;
+        let c_ah = (av_i & hv_j).count_ones() as u64;
+        let c_aa = (av_i & av_j).count_ones() as u64;
+        sum_ij = sum_ij.saturating_add(
+            c_hh.saturating_add(c_ha)
+                .saturating_add(c_ah)
+                .saturating_add(c_aa),
+        );
+    }
+
+    if n_obs <= 1 {
+        return None;
+    }
+    let n = n_obs as f64;
+    let si = sum_i as f64;
+    let sj = sum_j as f64;
+    let si2 = sum_i2 as f64;
+    let sj2 = sum_j2 as f64;
+    let sij = sum_ij as f64;
+
+    let cov_num = sij * n - si * sj;
+    let var_i_num = si2 * n - si * si;
+    let var_j_num = sj2 * n - sj * sj;
+    let denom = var_i_num * var_j_num;
+    if !(denom.is_finite() && denom > 0.0_f64 && cov_num.is_finite()) {
+        return None;
+    }
+    Some((cov_num * cov_num) / denom)
 }
 
 #[inline]
@@ -1881,6 +2074,7 @@ struct StreamingPruneBufferedRow {
     stats: PackedRowStats,
     bit_h: Option<Vec<u64>>,
     bit_l: Option<Vec<u64>>,
+    bit_m: Option<Vec<u64>>,
     dropped: bool,
     finalized: bool,
 }
@@ -1893,14 +2087,12 @@ impl StreamingPruneBufferedRow {
         self.bim_line.clear();
         self.bit_h = None;
         self.bit_l = None;
+        self.bit_m = None;
     }
 }
 
 #[inline]
-fn mark_streaming_row_dropped(
-    rows: &mut [Option<StreamingPruneBufferedRow>],
-    rid: usize,
-) -> bool {
+fn mark_streaming_row_dropped(rows: &mut [Option<StreamingPruneBufferedRow>], rid: usize) -> bool {
     if let Some(Some(row)) = rows.get_mut(rid) {
         if !row.finalized && !row.dropped {
             row.mark_dropped();
@@ -2025,49 +2217,69 @@ fn classify_streaming_pair_by_maf(
         return None;
     }
 
-    let dot_imp = if !row_i.stats.has_missing && !row_j.stats.has_missing {
-        match (
-            row_i.bit_h.as_deref(),
-            row_i.bit_l.as_deref(),
-            row_j.bit_h.as_deref(),
-            row_j.bit_l.as_deref(),
-        ) {
-            (Some(ih), Some(il), Some(jh), Some(jl)) => {
-                dot_nomiss_row_bitplanes(ih, il, jh, jl, word_masks)
+    let r2 = match (
+        row_i.bit_h.as_deref(),
+        row_i.bit_l.as_deref(),
+        row_i.bit_m.as_deref(),
+        row_j.bit_h.as_deref(),
+        row_j.bit_l.as_deref(),
+        row_j.bit_m.as_deref(),
+    ) {
+        (Some(ih), Some(il), Some(im), Some(jh), Some(jl), Some(jm)) => {
+            if !row_i.stats.has_missing && !row_j.stats.has_missing {
+                let dot_imp = dot_nomiss_row_bitplanes(ih, il, jh, jl, word_masks);
+                let cov = dot_imp - n_samples_f * row_i.stats.mean * row_j.stats.mean;
+                let denom_corr = denom * row_i.stats.std * row_j.stats.std;
+                let corr = if denom_corr > 0.0_f64 {
+                    cov / denom_corr
+                } else {
+                    0.0_f64
+                };
+                corr * corr
+            } else {
+                r2_pairwise_complete_bitplanes(ih, il, im, jh, jl, jm, word_masks)
+                    .unwrap_or(f64::NAN)
             }
-            _ => dot_nomiss_pair_from_packed(
-                &row_i.packed,
-                &row_j.packed,
-                n_samples,
-                pair_lut,
-                code4_lut,
-            ),
         }
-    } else {
-        dot_imputed_pair_from_packed(
-            &row_i.packed,
-            &row_j.packed,
-            n_samples,
-            row_i.stats.mean,
-            row_j.stats.mean,
-            pair_lut,
-            code4_lut,
-        )
+        _ => {
+            if !row_i.stats.has_missing && !row_j.stats.has_missing {
+                let dot_imp = dot_nomiss_pair_from_packed(
+                    &row_i.packed,
+                    &row_j.packed,
+                    n_samples,
+                    pair_lut,
+                    code4_lut,
+                );
+                let cov = dot_imp - n_samples_f * row_i.stats.mean * row_j.stats.mean;
+                let denom_corr = denom * row_i.stats.std * row_j.stats.std;
+                let corr = if denom_corr > 0.0_f64 {
+                    cov / denom_corr
+                } else {
+                    0.0_f64
+                };
+                corr * corr
+            } else {
+                r2_pairwise_complete_from_packed(
+                    &row_i.packed,
+                    &row_j.packed,
+                    n_samples,
+                    pair_lut,
+                    code4_lut,
+                )
+                .unwrap_or(f64::NAN)
+            }
+        }
     };
-
-    let cov = dot_imp - n_samples_f * row_i.stats.mean * row_j.stats.mean;
-    let denom_corr = denom * row_i.stats.std * row_j.stats.std;
-    let corr = if denom_corr > 0.0_f64 {
-        cov / denom_corr
-    } else {
-        0.0_f64
-    };
-    let r2 = corr * corr;
-    if !(r2.is_finite() && r2 >= r2_threshold) {
+    let prune_r2_thresh = r2_threshold * (1.0_f64 + eps);
+    if !(r2.is_finite() && r2 > prune_r2_thresh) {
         return None;
     }
 
-    Some(classify_ld_pair_by_maf(row_i.stats.maf, row_j.stats.maf, eps))
+    Some(classify_ld_pair_by_maf(
+        row_i.stats.maf,
+        row_j.stats.maf,
+        eps,
+    ))
 }
 
 fn drain_finalized_streaming_rows(
@@ -2205,7 +2417,6 @@ fn stream_prune_plink_to_plink(
     let mut row_buf = vec![0u8; bytes_per_snp];
     let mut line_buf = String::new();
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let strict_parallel_min_neighbors = 128usize;
 
     if mode == LdPruneMode::Fast {
         let mut next_anchor_seq_by_chrom: HashMap<String, usize> = HashMap::new();
@@ -2230,7 +2441,9 @@ fn stream_prune_plink_to_plink(
                 out
             };
             let run_ld_compare = {
-                let next_anchor = next_anchor_seq_by_chrom.entry(chrom.clone()).or_insert(0usize);
+                let next_anchor = next_anchor_seq_by_chrom
+                    .entry(chrom.clone())
+                    .or_insert(0usize);
                 if current_chrom_seq >= *next_anchor {
                     while *next_anchor <= current_chrom_seq {
                         *next_anchor = next_anchor.saturating_add(step);
@@ -2263,59 +2476,89 @@ fn stream_prune_plink_to_plink(
                 .map_err(|e| format!("{src_bed}: row {}: {}", row_idx + 1, e))?;
 
             let current_stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
-            let (current_bit_h, current_bit_l) = if !current_stats.has_missing {
-                let (h, l) = build_row_bitplanes_u64(&row_buf, n_samples);
-                (Some(h), Some(l))
-            } else {
-                (None, None)
-            };
+            let (h_now, l_now, m_now) = build_row_bitplanes_u64(&row_buf, n_samples);
+            let current_bit_h = Some(h_now);
+            let current_bit_l = Some(l_now);
+            let current_bit_m = Some(m_now);
 
             let mut current_dropped = false;
             let mut drop_prior_ids: Vec<usize> = Vec::new();
             if run_ld_compare {
                 if let Some(active) = active_by_chrom.get(&chrom) {
                     let classify_prior = |prior: &StreamingPruneBufferedRow| -> Option<u8> {
-                        let dot_imp = if !prior.stats.has_missing && !current_stats.has_missing {
-                            match (
-                                prior.bit_h.as_deref(),
-                                prior.bit_l.as_deref(),
-                                current_bit_h.as_deref(),
-                                current_bit_l.as_deref(),
-                            ) {
-                                (Some(ph), Some(pl), Some(ch), Some(cl)) => {
-                                    dot_nomiss_row_bitplanes(ph, pl, ch, cl, &word_masks)
+                        let r2 = match (
+                            prior.bit_h.as_deref(),
+                            prior.bit_l.as_deref(),
+                            prior.bit_m.as_deref(),
+                            current_bit_h.as_deref(),
+                            current_bit_l.as_deref(),
+                            current_bit_m.as_deref(),
+                        ) {
+                            (Some(ph), Some(pl), Some(pm), Some(ch), Some(cl), Some(cm)) => {
+                                if !prior.stats.has_missing && !current_stats.has_missing {
+                                    let dot_imp =
+                                        dot_nomiss_row_bitplanes(ph, pl, ch, cl, &word_masks);
+                                    let cov = dot_imp
+                                        - n_samples_f * prior.stats.mean * current_stats.mean;
+                                    let denom_corr = denom * prior.stats.std * current_stats.std;
+                                    let corr = if denom_corr > 0.0_f64 {
+                                        cov / denom_corr
+                                    } else {
+                                        0.0_f64
+                                    };
+                                    corr * corr
+                                } else {
+                                    r2_pairwise_complete_bitplanes(
+                                        ph,
+                                        pl,
+                                        pm,
+                                        ch,
+                                        cl,
+                                        cm,
+                                        &word_masks,
+                                    )
+                                    .unwrap_or(f64::NAN)
                                 }
-                                _ => dot_nomiss_pair_from_packed(
-                                    &prior.packed,
-                                    &row_buf,
-                                    n_samples,
-                                    pair_lut,
-                                    code4_lut,
-                                ),
                             }
-                        } else {
-                            dot_imputed_pair_from_packed(
-                                &prior.packed,
-                                &row_buf,
-                                n_samples,
-                                prior.stats.mean,
-                                current_stats.mean,
-                                pair_lut,
-                                code4_lut,
-                            )
+                            _ => {
+                                if !prior.stats.has_missing && !current_stats.has_missing {
+                                    let dot_imp = dot_nomiss_pair_from_packed(
+                                        &prior.packed,
+                                        &row_buf,
+                                        n_samples,
+                                        pair_lut,
+                                        code4_lut,
+                                    );
+                                    let cov = dot_imp
+                                        - n_samples_f * prior.stats.mean * current_stats.mean;
+                                    let denom_corr = denom * prior.stats.std * current_stats.std;
+                                    let corr = if denom_corr > 0.0_f64 {
+                                        cov / denom_corr
+                                    } else {
+                                        0.0_f64
+                                    };
+                                    corr * corr
+                                } else {
+                                    r2_pairwise_complete_from_packed(
+                                        &prior.packed,
+                                        &row_buf,
+                                        n_samples,
+                                        pair_lut,
+                                        code4_lut,
+                                    )
+                                    .unwrap_or(f64::NAN)
+                                }
+                            }
                         };
-                        let cov = dot_imp - n_samples_f * prior.stats.mean * current_stats.mean;
-                        let denom_corr = denom * prior.stats.std * current_stats.std;
-                        let corr = if denom_corr > 0.0_f64 {
-                            cov / denom_corr
-                        } else {
-                            0.0_f64
-                        };
-                        let r2 = corr * corr;
-                        if !(r2.is_finite() && r2 >= r2_threshold) {
+                        let prune_r2_thresh = r2_threshold * (1.0_f64 + eps);
+                        if !(r2.is_finite() && r2 > prune_r2_thresh) {
                             return None;
                         }
-                        Some(classify_ld_pair_by_maf(prior.stats.maf, current_stats.maf, eps))
+                        Some(classify_ld_pair_by_maf(
+                            prior.stats.maf,
+                            current_stats.maf,
+                            eps,
+                        ))
                     };
 
                     let active_ids: Vec<usize> = active
@@ -2389,6 +2632,7 @@ fn stream_prune_plink_to_plink(
                     stats: current_stats,
                     bit_h: None,
                     bit_l: None,
+                    bit_m: None,
                     dropped: true,
                     finalized: true,
                 }
@@ -2402,6 +2646,7 @@ fn stream_prune_plink_to_plink(
                     stats: current_stats,
                     bit_h: current_bit_h,
                     bit_l: current_bit_l,
+                    bit_m: current_bit_m,
                     dropped: false,
                     finalized: false,
                 }
@@ -2453,294 +2698,297 @@ fn stream_prune_plink_to_plink(
             }
         }
     } else {
-    for row_idx in 0..total_snps {
-        line_buf.clear();
-        let n_line = bim_reader
-            .read_line(&mut line_buf)
-            .map_err(|e| format!("{src_bim}:{}: {}", row_idx + 1, e))?;
-        if n_line == 0 {
-            return Err(format!(
-                "{src_bim}: unexpected EOF at variant row {}",
-                row_idx + 1
-            ));
-        }
-        let bim_line = line_buf.trim_end_matches(&['\r', '\n'][..]).to_string();
-        let (chrom, pos) = parse_bim_line_chrom_pos(&bim_line, row_idx + 1, &src_bim)?;
+        for row_idx in 0..total_snps {
+            line_buf.clear();
+            let n_line = bim_reader
+                .read_line(&mut line_buf)
+                .map_err(|e| format!("{src_bim}:{}: {}", row_idx + 1, e))?;
+            if n_line == 0 {
+                return Err(format!(
+                    "{src_bim}: unexpected EOF at variant row {}",
+                    row_idx + 1
+                ));
+            }
+            let bim_line = line_buf.trim_end_matches(&['\r', '\n'][..]).to_string();
+            let (chrom, pos) = parse_bim_line_chrom_pos(&bim_line, row_idx + 1, &src_bim)?;
 
-        let current_chrom_seq = {
-            let entry = seen_by_chrom.entry(chrom.clone()).or_insert(0usize);
-            let out = *entry;
-            *entry = entry.saturating_add(1);
-            out
-        };
-        chrom_pos_by_seq.entry(chrom.clone()).or_default().push(pos);
+            let current_chrom_seq = {
+                let entry = seen_by_chrom.entry(chrom.clone()).or_insert(0usize);
+                let out = *entry;
+                *entry = entry.saturating_add(1);
+                out
+            };
+            chrom_pos_by_seq.entry(chrom.clone()).or_default().push(pos);
 
-        bread
-            .read_exact(&mut row_buf)
-            .map_err(|e| format!("{src_bed}: row {}: {}", row_idx + 1, e))?;
+            bread
+                .read_exact(&mut row_buf)
+                .map_err(|e| format!("{src_bed}: row {}: {}", row_idx + 1, e))?;
 
-        let current_stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
-        let (current_bit_h, current_bit_l) = if !current_stats.has_missing {
-            let (h, l) = build_row_bitplanes_u64(&row_buf, n_samples);
-            (Some(h), Some(l))
-        } else {
-            (None, None)
-        };
+            let current_stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
+            let (h_now, l_now, m_now) = build_row_bitplanes_u64(&row_buf, n_samples);
+            let current_bit_h = Some(h_now);
+            let current_bit_l = Some(l_now);
+            let current_bit_m = Some(m_now);
 
-        let stored_row = StreamingPruneBufferedRow {
-            pos,
-            chrom_seq: current_chrom_seq,
-            first_unchecked_seq: current_chrom_seq.saturating_add(1),
-            packed: row_buf.to_vec(),
-            bim_line,
-            stats: current_stats,
-            bit_h: current_bit_h,
-            bit_l: current_bit_l,
-            dropped: false,
-            finalized: false,
-        };
-        let row_id = rows.len();
-        rows.push(Some(stored_row));
+            let stored_row = StreamingPruneBufferedRow {
+                pos,
+                chrom_seq: current_chrom_seq,
+                first_unchecked_seq: current_chrom_seq.saturating_add(1),
+                packed: row_buf.to_vec(),
+                bim_line,
+                stats: current_stats,
+                bit_h: current_bit_h,
+                bit_l: current_bit_l,
+                bit_m: current_bit_m,
+                dropped: false,
+                finalized: false,
+            };
+            let row_id = rows.len();
+            rows.push(Some(stored_row));
 
-        {
-            let active = active_by_chrom.entry(chrom.clone()).or_default();
-            active.push_back(row_id);
-        }
+            {
+                let active = active_by_chrom.entry(chrom.clone()).or_default();
+                active.push_back(row_id);
+            }
 
-        let chrom_done = chrom_last_index.get(&chrom).copied() == Some(row_idx);
-        {
-            let active = active_by_chrom.entry(chrom.clone()).or_default();
-            active.retain(|rid| {
-                rows[*rid]
-                    .as_ref()
-                    .map(|row| !row.finalized)
-                    .unwrap_or(false)
-            });
-
-            let chrom_positions = chrom_pos_by_seq
-                .get(&chrom)
-                .ok_or_else(|| "streaming prune internal error: missing chromosome positions".to_string())?;
-            let seen_count = chrom_positions.len();
-            let mut next_start = *next_window_start_seq_by_chrom.get(&chrom).unwrap_or(&0usize);
-            let mut bp_scan = *bp_end_scan_seq_by_chrom.get(&chrom).unwrap_or(&0usize);
-
-            loop {
+            let chrom_done = chrom_last_index.get(&chrom).copied() == Some(row_idx);
+            {
+                let active = active_by_chrom.entry(chrom.clone()).or_default();
                 active.retain(|rid| {
                     rows[*rid]
                         .as_ref()
                         .map(|row| !row.finalized)
                         .unwrap_or(false)
                 });
-                if next_start >= seen_count {
-                    break;
-                }
 
-                let (window_end_seq, ready) = if let Some(bp) = window_bp {
-                    let start_pos = chrom_positions[next_start];
-                    let target = start_pos.saturating_add(bp);
-                    if bp_scan < next_start.saturating_add(1) {
-                        bp_scan = next_start.saturating_add(1);
-                    }
-                    while bp_scan < seen_count && chrom_positions[bp_scan] <= target {
-                        bp_scan = bp_scan.saturating_add(1);
-                    }
-                    let ready_now = chrom_done || (bp_scan < seen_count);
-                    let end_seq = if ready_now { bp_scan } else { seen_count };
-                    (end_seq, ready_now)
-                } else {
-                    let want_end = next_start.saturating_add(window_variants.unwrap_or(1));
-                    let end_seq = want_end.min(seen_count);
-                    let ready_now = chrom_done || (seen_count >= want_end);
-                    (end_seq, ready_now)
-                };
-                if !ready {
-                    break;
-                }
-                if window_end_seq > next_start.saturating_add(1) {
-                    let mut window_ids: Vec<usize> = Vec::new();
-                    for &rid in active.iter() {
-                        let Some(Some(row)) = rows.get(rid) else {
-                            continue;
-                        };
-                        if row.chrom_seq < next_start {
-                            continue;
-                        }
-                        if row.chrom_seq >= window_end_seq {
-                            break;
-                        }
-                        if !row.finalized && !row.dropped {
-                            window_ids.push(rid);
-                        }
+                let chrom_positions = chrom_pos_by_seq.get(&chrom).ok_or_else(|| {
+                    "streaming prune internal error: missing chromosome positions".to_string()
+                })?;
+                let seen_count = chrom_positions.len();
+                let mut next_start = *next_window_start_seq_by_chrom
+                    .get(&chrom)
+                    .unwrap_or(&0usize);
+                let mut bp_scan = *bp_end_scan_seq_by_chrom.get(&chrom).unwrap_or(&0usize);
+
+                loop {
+                    if next_start >= seen_count {
+                        break;
                     }
 
-                    for wi in 0..window_ids.len() {
-                        let rid_i = window_ids[wi];
-                        let (i_alive, scan_min_seq) = rows
-                            .get(rid_i)
-                            .and_then(|x| x.as_ref())
-                            .map(|row| {
-                                (
-                                    !row.finalized && !row.dropped,
-                                    row.first_unchecked_seq.max(next_start.saturating_add(1)),
-                                )
-                            })
-                            .unwrap_or((false, window_end_seq));
-                        if !i_alive || scan_min_seq >= window_end_seq {
-                            continue;
+                    let (window_end_seq, ready) = if let Some(bp) = window_bp {
+                        let start_pos = chrom_positions[next_start];
+                        let target = start_pos.saturating_add(bp);
+                        if bp_scan < next_start.saturating_add(1) {
+                            bp_scan = next_start.saturating_add(1);
                         }
-
-                        let mut drop_i = false;
-                        let mut drop_j_ids: Vec<usize> = Vec::new();
-                        let neighbor_ct = window_ids.len().saturating_sub(wi + 1);
-                        let use_parallel_scan =
-                            pool.is_some() && neighbor_ct >= strict_parallel_min_neighbors;
-                        if use_parallel_scan {
-                            let decisions: Vec<(usize, u8)> = if let Some(tp) = pool.as_ref() {
-                                tp.install(|| {
-                                    ((wi + 1)..window_ids.len())
-                                        .into_par_iter()
-                                        .filter_map(|wj| {
-                                            let rid_j = window_ids[wj];
-                                            let j_seq = rows
-                                                .get(rid_j)
-                                                .and_then(|x| x.as_ref())
-                                                .map(|row| row.chrom_seq)
-                                                .unwrap_or(window_end_seq);
-                                            if j_seq < scan_min_seq || j_seq >= window_end_seq {
-                                                return None;
-                                            }
-                                            let tag = classify_streaming_pair_by_maf(
-                                                &rows,
-                                                rid_i,
-                                                rid_j,
-                                                n_samples,
-                                                n_samples_f,
-                                                denom,
-                                                r2_threshold,
-                                                eps,
-                                                pair_lut,
-                                                code4_lut,
-                                                &word_masks,
-                                            )?;
-                                            Some((rid_j, tag))
-                                        })
-                                        .collect()
-                                })
-                            } else {
-                                Vec::new()
+                        while bp_scan < seen_count && chrom_positions[bp_scan] <= target {
+                            bp_scan = bp_scan.saturating_add(1);
+                        }
+                        let ready_now = chrom_done || (bp_scan < seen_count);
+                        let end_seq = if ready_now { bp_scan } else { seen_count };
+                        (end_seq, ready_now)
+                    } else {
+                        let want_end = next_start.saturating_add(window_variants.unwrap_or(1));
+                        let end_seq = want_end.min(seen_count);
+                        let ready_now = chrom_done || (seen_count >= want_end);
+                        (end_seq, ready_now)
+                    };
+                    if !ready {
+                        break;
+                    }
+                    if window_end_seq > next_start.saturating_add(1) {
+                        // Build window membership once, then keep the state resident
+                        // through strict re-scan rounds by in-place compaction.
+                        let mut window_ids: Vec<usize> = Vec::with_capacity(active.len());
+                        for &rid in active.iter() {
+                            let Some(Some(row)) = rows.get(rid) else {
+                                continue;
                             };
-                            if decisions.iter().any(|(_, tag)| *tag == 1u8) {
-                                drop_i = true;
-                            } else {
-                                drop_j_ids.extend(decisions.into_iter().filter_map(|(rid, tag)| {
-                                    if tag == 2u8 {
-                                        Some(rid)
-                                    } else {
-                                        None
-                                    }
-                                }));
+                            if row.chrom_seq < next_start {
+                                continue;
                             }
-                        } else {
-                            for wj in (wi + 1)..window_ids.len() {
-                                let rid_j = window_ids[wj];
-                                let j_seq = rows
-                                    .get(rid_j)
+                            if row.chrom_seq >= window_end_seq {
+                                break;
+                            }
+                            if !row.finalized && !row.dropped {
+                                window_ids.push(rid);
+                            }
+                        }
+                        loop {
+                            let mut keep_n = 0usize;
+                            for read_idx in 0..window_ids.len() {
+                                let rid = window_ids[read_idx];
+                                let keep = rows
+                                    .get(rid)
                                     .and_then(|x| x.as_ref())
-                                    .map(|row| row.chrom_seq)
-                                    .unwrap_or(window_end_seq);
-                                if j_seq < scan_min_seq {
+                                    .map(|row| {
+                                        !row.finalized
+                                            && !row.dropped
+                                            && row.chrom_seq >= next_start
+                                            && row.chrom_seq < window_end_seq
+                                    })
+                                    .unwrap_or(false);
+                                if keep {
+                                    if keep_n != read_idx {
+                                        window_ids[keep_n] = rid;
+                                    }
+                                    keep_n = keep_n.saturating_add(1);
+                                }
+                            }
+                            window_ids.truncate(keep_n);
+                            if window_ids.len() <= 1 {
+                                break;
+                            }
+
+                            let mut at_least_one_prune = false;
+                            for wi in 0..window_ids.len().saturating_sub(1) {
+                                let rid_i = window_ids[wi];
+                                let (i_alive, scan_min_seq) = rows
+                                    .get(rid_i)
+                                    .and_then(|x| x.as_ref())
+                                    .map(|row| {
+                                        (
+                                            !row.finalized && !row.dropped,
+                                            row.first_unchecked_seq
+                                                .max(next_start.saturating_add(1)),
+                                        )
+                                    })
+                                    .unwrap_or((false, window_end_seq));
+                                if !i_alive {
                                     continue;
                                 }
-                                if j_seq >= window_end_seq {
-                                    break;
+                                if scan_min_seq >= window_end_seq {
+                                    if let Some(Some(row_i)) = rows.get_mut(rid_i) {
+                                        if !row_i.finalized && !row_i.dropped {
+                                            row_i.first_unchecked_seq =
+                                                row_i.first_unchecked_seq.max(window_end_seq);
+                                        }
+                                    }
+                                    continue;
                                 }
-                                if let Some(tag) = classify_streaming_pair_by_maf(
-                                    &rows,
-                                    rid_i,
-                                    rid_j,
-                                    n_samples,
-                                    n_samples_f,
-                                    denom,
-                                    r2_threshold,
-                                    eps,
-                                    pair_lut,
-                                    code4_lut,
-                                    &word_masks,
-                                ) {
-                                    if tag == 1u8 {
-                                        drop_i = true;
+
+                                let mut pruned_this_round = false;
+                                for wj in (wi + 1)..window_ids.len() {
+                                    let rid_j = window_ids[wj];
+                                    let j_seq = rows
+                                        .get(rid_j)
+                                        .and_then(|x| x.as_ref())
+                                        .map(|row| row.chrom_seq)
+                                        .unwrap_or(window_end_seq);
+                                    if j_seq < scan_min_seq {
+                                        continue;
+                                    }
+                                    if j_seq >= window_end_seq {
                                         break;
                                     }
-                                    drop_j_ids.push(rid_j);
+                                    if let Some(tag) = classify_streaming_pair_by_maf(
+                                        &rows,
+                                        rid_i,
+                                        rid_j,
+                                        n_samples,
+                                        n_samples_f,
+                                        denom,
+                                        r2_threshold,
+                                        eps,
+                                        pair_lut,
+                                        code4_lut,
+                                        &word_masks,
+                                    ) {
+                                        at_least_one_prune = true;
+                                        pruned_this_round = true;
+                                        if tag == 1u8 {
+                                            mark_streaming_row_dropped(&mut rows, rid_i);
+                                        } else {
+                                            mark_streaming_row_dropped(&mut rows, rid_j);
+                                            let mut next_seq = window_end_seq;
+                                            for wk in (wj + 1)..window_ids.len() {
+                                                let rid_k = window_ids[wk];
+                                                let Some(Some(row_k)) = rows.get(rid_k) else {
+                                                    continue;
+                                                };
+                                                if row_k.finalized || row_k.dropped {
+                                                    continue;
+                                                }
+                                                if row_k.chrom_seq >= window_end_seq {
+                                                    break;
+                                                }
+                                                next_seq = row_k.chrom_seq;
+                                                break;
+                                            }
+                                            if let Some(Some(row_i)) = rows.get_mut(rid_i) {
+                                                if !row_i.finalized && !row_i.dropped {
+                                                    row_i.first_unchecked_seq =
+                                                        row_i.first_unchecked_seq.max(next_seq);
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                if !pruned_this_round {
+                                    if let Some(Some(row_i)) = rows.get_mut(rid_i) {
+                                        if !row_i.finalized && !row_i.dropped {
+                                            row_i.first_unchecked_seq =
+                                                row_i.first_unchecked_seq.max(window_end_seq);
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        if drop_i {
-                            mark_streaming_row_dropped(&mut rows, rid_i);
-                        } else {
-                            if let Some(Some(row_i)) = rows.get_mut(rid_i) {
-                                if !row_i.finalized && !row_i.dropped {
-                                    row_i.first_unchecked_seq =
-                                        row_i.first_unchecked_seq.max(window_end_seq);
-                                }
-                            }
-                            if !drop_j_ids.is_empty() {
-                                for rid_j in drop_j_ids {
-                                    mark_streaming_row_dropped(&mut rows, rid_j);
-                                }
+
+                            if !at_least_one_prune {
+                                break;
                             }
                         }
                     }
+
+                    next_start = next_start.saturating_add(step);
+                    finalize_streaming_rows_before_seq(active, &mut rows, next_start);
                 }
 
-                next_start = next_start.saturating_add(step);
-                finalize_streaming_rows_before_seq(active, &mut rows, next_start);
+                next_window_start_seq_by_chrom.insert(chrom.clone(), next_start);
+                bp_end_scan_seq_by_chrom.insert(chrom.clone(), bp_scan);
+                active.retain(|rid| {
+                    rows[*rid]
+                        .as_ref()
+                        .map(|row| !row.finalized)
+                        .unwrap_or(false)
+                });
+                if chrom_done {
+                    finalize_all_streaming_rows(active, &mut rows);
+                }
             }
 
-            next_window_start_seq_by_chrom.insert(chrom.clone(), next_start);
-            bp_end_scan_seq_by_chrom.insert(chrom.clone(), bp_scan);
-            active.retain(|rid| {
-                rows[*rid]
-                    .as_ref()
-                    .map(|row| !row.finalized)
-                    .unwrap_or(false)
-            });
             if chrom_done {
-                finalize_all_streaming_rows(active, &mut rows);
+                active_by_chrom.remove(&chrom);
+                next_window_start_seq_by_chrom.remove(&chrom);
+                bp_end_scan_seq_by_chrom.remove(&chrom);
+                chrom_pos_by_seq.remove(&chrom);
+            }
+
+            drain_finalized_streaming_rows(
+                &mut rows,
+                &mut next_write,
+                &mut wbed,
+                &mut wbim,
+                &mut kept,
+                &out_bed,
+                &out_bim,
+            )?;
+            let done = row_idx.saturating_add(1);
+            if done >= last_notified.saturating_add(notify_step) || done == total_snps {
+                last_notified = done;
+                if let Some(cb) = progress_callback.as_ref() {
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (done, total_snps))?;
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
+                }
             }
         }
-
-        if chrom_done {
-            active_by_chrom.remove(&chrom);
-            next_window_start_seq_by_chrom.remove(&chrom);
-            bp_end_scan_seq_by_chrom.remove(&chrom);
-            chrom_pos_by_seq.remove(&chrom);
-        }
-
-        drain_finalized_streaming_rows(
-            &mut rows,
-            &mut next_write,
-            &mut wbed,
-            &mut wbim,
-            &mut kept,
-            &out_bed,
-            &out_bim,
-        )?;
-        let done = row_idx.saturating_add(1);
-        if done >= last_notified.saturating_add(notify_step) || done == total_snps {
-            last_notified = done;
-            if let Some(cb) = progress_callback.as_ref() {
-                Python::attach(|py2| -> PyResult<()> {
-                    py2.check_signals()?;
-                    cb.call1(py2, (done, total_snps))?;
-                    Ok(())
-                })
-                .map_err(|e| e.to_string())?;
-            } else {
-                Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
-            }
-        }
-    }
     }
 
     let mut extra = [0u8; 1];
@@ -6060,13 +6308,7 @@ fn pcg_x_mul_samples(
             code4_lut,
             pool,
         )?;
-        row_major_block_t_mul_vec_accum_f32(
-            blk_slice,
-            cur_rows,
-            n_out,
-            &weights[st..ed],
-            &mut out,
-        );
+        row_major_block_t_mul_vec_accum_f32(blk_slice, cur_rows, n_out, &weights[st..ed], &mut out);
         tick += cur_rows;
         if tick >= row_step.saturating_mul(64).max(1) {
             _check_ctrlc()?;
@@ -6392,229 +6634,225 @@ pub fn rrblup_pcg_bed<'py>(
     }
 
     let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
-    let y_center_f32: Vec<f32> = y_vec_f64
-        .iter()
-        .map(|v| (*v - y_mean) as f32)
-        .collect();
+    let y_center_f32: Vec<f32> = y_vec_f64.iter().map(|v| (*v - y_mean) as f32).collect();
 
     let (pred_train_ret, pred_test_ret, pve_trainvar, converged, iters, rel_res) = py
-        .detach(move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64), String> {
-            let mut b = vec![0.0_f32; m];
-            let mut diag_inv = vec![0.0_f32; m];
-            let mut block = vec![0.0_f32; row_step * n_train];
-            let mut dot_blk = vec![0.0_f32; row_step];
-            let mut tick = 0usize;
-            for st in (0..m).step_by(row_step) {
-                let ed = (st + row_step).min(m);
-                let cur_rows = ed - st;
-                let blk_slice = &mut block[..cur_rows * n_train];
-                decode_standardized_block_f32(
-                    &packed_keep,
-                    bytes_per_snp,
-                    n_samples,
-                    &row_flip_keep,
-                    &row_mean,
-                    &row_inv_sd,
-                    &train_idx,
-                    full_train_fast,
-                    st,
-                    blk_slice,
-                    &code4_lut,
-                    pool_ref,
-                )?;
-                row_major_block_mul_vec_f32(
-                    blk_slice,
-                    cur_rows,
-                    n_train,
-                    &y_center_f32,
-                    &mut dot_blk[..cur_rows],
-                );
-                for r in 0..cur_rows {
-                    let row = &blk_slice[r * n_train..(r + 1) * n_train];
-                    let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() as f32;
-                    b[st + r] = dot_blk[r];
-                    let d = (ss + lambda_use).max(1e-12_f32);
-                    diag_inv[st + r] = 1.0_f32 / d;
-                }
-                tick += cur_rows;
-                if tick >= row_step.saturating_mul(64).max(1) {
-                    _check_ctrlc()?;
-                    tick = 0;
-                }
-            }
-
-            let bnorm = dot_f32_f64(&b, &b).sqrt();
-            if !(bnorm.is_finite()) {
-                return Err("rrBLUP-PCG invalid RHS norm.".to_string());
-            }
-            let denom_b = bnorm.max(1e-12);
-
-            let mut beta = vec![0.0_f32; m];
-            let mut r = b.clone();
-            let mut z = vec![0.0_f32; m];
-            for i in 0..m {
-                z[i] = diag_inv[i] * r[i];
-            }
-            let mut p = z.clone();
-            let mut rz_old = dot_f32_f64(&r, &z);
-            let mut converged = false;
-            let mut rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
-            let mut iters_done = 0usize;
-            let mut last_notified = 0usize;
-            let tiny = 1e-20_f64;
-
-            for it in 0..max_iter {
-                let xp = pcg_x_mul_samples(
-                    &packed_keep,
-                    bytes_per_snp,
-                    n_samples,
-                    &row_flip_keep,
-                    &row_mean,
-                    &row_inv_sd,
-                    &train_idx,
-                    full_train_fast,
-                    row_step,
-                    &p,
-                    &code4_lut,
-                    pool_ref,
-                )?;
-                let mut ap = pcg_xt_mul_rows(
-                    &packed_keep,
-                    bytes_per_snp,
-                    n_samples,
-                    &row_flip_keep,
-                    &row_mean,
-                    &row_inv_sd,
-                    &train_idx,
-                    full_train_fast,
-                    row_step,
-                    &xp,
-                    &code4_lut,
-                    pool_ref,
-                )?;
-                for j in 0..m {
-                    ap[j] += lambda_use * p[j];
-                }
-                let denom = dot_f32_f64(&p, &ap);
-                if !(denom.is_finite()) || denom <= tiny {
-                    break;
-                }
-                let alpha = rz_old / denom;
-                for j in 0..m {
-                    beta[j] += (alpha as f32) * p[j];
-                    r[j] -= (alpha as f32) * ap[j];
-                }
-                rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
-                iters_done = it + 1;
-                if (iters_done >= last_notified.saturating_add(notify_step))
-                    || (iters_done == max_iter)
-                {
-                    last_notified = iters_done;
-                    if let Some(cb) = progress_callback.as_ref() {
-                        Python::attach(|py2| -> PyResult<()> {
-                            py2.check_signals()?;
-                            cb.call1(py2, (iters_done, max_iter))?;
-                            Ok(())
-                        })
-                        .map_err(|e| e.to_string())?;
+        .detach(
+            move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64), String> {
+                let mut b = vec![0.0_f32; m];
+                let mut diag_inv = vec![0.0_f32; m];
+                let mut block = vec![0.0_f32; row_step * n_train];
+                let mut dot_blk = vec![0.0_f32; row_step];
+                let mut tick = 0usize;
+                for st in (0..m).step_by(row_step) {
+                    let ed = (st + row_step).min(m);
+                    let cur_rows = ed - st;
+                    let blk_slice = &mut block[..cur_rows * n_train];
+                    decode_standardized_block_f32(
+                        &packed_keep,
+                        bytes_per_snp,
+                        n_samples,
+                        &row_flip_keep,
+                        &row_mean,
+                        &row_inv_sd,
+                        &train_idx,
+                        full_train_fast,
+                        st,
+                        blk_slice,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    row_major_block_mul_vec_f32(
+                        blk_slice,
+                        cur_rows,
+                        n_train,
+                        &y_center_f32,
+                        &mut dot_blk[..cur_rows],
+                    );
+                    for r in 0..cur_rows {
+                        let row = &blk_slice[r * n_train..(r + 1) * n_train];
+                        let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() as f32;
+                        b[st + r] = dot_blk[r];
+                        let d = (ss + lambda_use).max(1e-12_f32);
+                        diag_inv[st + r] = 1.0_f32 / d;
+                    }
+                    tick += cur_rows;
+                    if tick >= row_step.saturating_mul(64).max(1) {
+                        _check_ctrlc()?;
+                        tick = 0;
                     }
                 }
-                if rel_res.is_finite() && rel_res <= tol_use {
-                    converged = true;
-                    break;
+
+                let bnorm = dot_f32_f64(&b, &b).sqrt();
+                if !(bnorm.is_finite()) {
+                    return Err("rrBLUP-PCG invalid RHS norm.".to_string());
+                }
+                let denom_b = bnorm.max(1e-12);
+
+                let mut beta = vec![0.0_f32; m];
+                let mut r = b.clone();
+                let mut z = vec![0.0_f32; m];
+                for i in 0..m {
+                    z[i] = diag_inv[i] * r[i];
+                }
+                let mut p = z.clone();
+                let mut rz_old = dot_f32_f64(&r, &z);
+                let mut converged = false;
+                let mut rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
+                let mut iters_done = 0usize;
+                let mut last_notified = 0usize;
+                let tiny = 1e-20_f64;
+
+                for it in 0..max_iter {
+                    let xp = pcg_x_mul_samples(
+                        &packed_keep,
+                        bytes_per_snp,
+                        n_samples,
+                        &row_flip_keep,
+                        &row_mean,
+                        &row_inv_sd,
+                        &train_idx,
+                        full_train_fast,
+                        row_step,
+                        &p,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    let mut ap = pcg_xt_mul_rows(
+                        &packed_keep,
+                        bytes_per_snp,
+                        n_samples,
+                        &row_flip_keep,
+                        &row_mean,
+                        &row_inv_sd,
+                        &train_idx,
+                        full_train_fast,
+                        row_step,
+                        &xp,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    for j in 0..m {
+                        ap[j] += lambda_use * p[j];
+                    }
+                    let denom = dot_f32_f64(&p, &ap);
+                    if !(denom.is_finite()) || denom <= tiny {
+                        break;
+                    }
+                    let alpha = rz_old / denom;
+                    for j in 0..m {
+                        beta[j] += (alpha as f32) * p[j];
+                        r[j] -= (alpha as f32) * ap[j];
+                    }
+                    rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
+                    iters_done = it + 1;
+                    if (iters_done >= last_notified.saturating_add(notify_step))
+                        || (iters_done == max_iter)
+                    {
+                        last_notified = iters_done;
+                        if let Some(cb) = progress_callback.as_ref() {
+                            Python::attach(|py2| -> PyResult<()> {
+                                py2.check_signals()?;
+                                cb.call1(py2, (iters_done, max_iter))?;
+                                Ok(())
+                            })
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    if rel_res.is_finite() && rel_res <= tol_use {
+                        converged = true;
+                        break;
+                    }
+
+                    for j in 0..m {
+                        z[j] = diag_inv[j] * r[j];
+                    }
+                    let rz_new = dot_f32_f64(&r, &z);
+                    if !(rz_new.is_finite()) || rz_new <= tiny {
+                        break;
+                    }
+                    let beta_cg = rz_new / rz_old.max(tiny);
+                    for j in 0..m {
+                        p[j] = z[j] + (beta_cg as f32) * p[j];
+                    }
+                    rz_old = rz_new;
+                    if (it & 7) == 7 {
+                        _check_ctrlc()?;
+                    }
                 }
 
-                for j in 0..m {
-                    z[j] = diag_inv[j] * r[j];
-                }
-                let rz_new = dot_f32_f64(&r, &z);
-                if !(rz_new.is_finite()) || rz_new <= tiny {
-                    break;
-                }
-                let beta_cg = rz_new / rz_old.max(tiny);
-                for j in 0..m {
-                    p[j] = z[j] + (beta_cg as f32) * p[j];
-                }
-                rz_old = rz_new;
-                if (it & 7) == 7 {
-                    _check_ctrlc()?;
-                }
-            }
-
-            let mut pred_train_full = pcg_x_mul_samples(
-                &packed_keep,
-                bytes_per_snp,
-                n_samples,
-                &row_flip_keep,
-                &row_mean,
-                &row_inv_sd,
-                &train_idx,
-                full_train_fast,
-                row_step,
-                &beta,
-                &code4_lut,
-                pool_ref,
-            )?;
-            for v in pred_train_full.iter_mut() {
-                *v += y_mean as f32;
-            }
-
-            let pred_train_f64: Vec<f64> = pred_train_full.iter().map(|v| *v as f64).collect();
-            let mut g_hat = pred_train_f64.clone();
-            for g in g_hat.iter_mut() {
-                *g -= y_mean;
-            }
-            let resid: Vec<f64> = y_vec_f64
-                .iter()
-                .zip(pred_train_f64.iter())
-                .map(|(y, p)| *y - *p)
-                .collect();
-            let var_g = sample_var_f64(&g_hat);
-            let var_e = sample_var_f64(&resid);
-            let denom = var_g + var_e;
-            let pve_trainvar = if denom.is_finite() && denom > 0.0 {
-                var_g / denom
-            } else {
-                f64::NAN
-            };
-
-            let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
-                local_idx.iter().map(|&i| pred_train_f64[i]).collect()
-            } else {
-                pred_train_f64
-            };
-
-            let mut pred_test_ret: Vec<f64> = Vec::new();
-            if !test_idx.is_empty() {
-                let test_pred_f32 = pcg_x_mul_samples(
+                let mut pred_train_full = pcg_x_mul_samples(
                     &packed_keep,
                     bytes_per_snp,
                     n_samples,
                     &row_flip_keep,
                     &row_mean,
                     &row_inv_sd,
-                    &test_idx,
-                    full_test_fast,
+                    &train_idx,
+                    full_train_fast,
                     row_step,
                     &beta,
                     &code4_lut,
                     pool_ref,
                 )?;
-                pred_test_ret = test_pred_f32
-                    .iter()
-                    .map(|v| (*v as f64) + y_mean)
-                    .collect();
-            }
+                for v in pred_train_full.iter_mut() {
+                    *v += y_mean as f32;
+                }
 
-            Ok((
-                pred_train_ret,
-                pred_test_ret,
-                pve_trainvar,
-                converged,
-                iters_done,
-                rel_res,
-            ))
-        })
+                let pred_train_f64: Vec<f64> = pred_train_full.iter().map(|v| *v as f64).collect();
+                let mut g_hat = pred_train_f64.clone();
+                for g in g_hat.iter_mut() {
+                    *g -= y_mean;
+                }
+                let resid: Vec<f64> = y_vec_f64
+                    .iter()
+                    .zip(pred_train_f64.iter())
+                    .map(|(y, p)| *y - *p)
+                    .collect();
+                let var_g = sample_var_f64(&g_hat);
+                let var_e = sample_var_f64(&resid);
+                let denom = var_g + var_e;
+                let pve_trainvar = if denom.is_finite() && denom > 0.0 {
+                    var_g / denom
+                } else {
+                    f64::NAN
+                };
+
+                let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
+                    local_idx.iter().map(|&i| pred_train_f64[i]).collect()
+                } else {
+                    pred_train_f64
+                };
+
+                let mut pred_test_ret: Vec<f64> = Vec::new();
+                if !test_idx.is_empty() {
+                    let test_pred_f32 = pcg_x_mul_samples(
+                        &packed_keep,
+                        bytes_per_snp,
+                        n_samples,
+                        &row_flip_keep,
+                        &row_mean,
+                        &row_inv_sd,
+                        &test_idx,
+                        full_test_fast,
+                        row_step,
+                        &beta,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    pred_test_ret = test_pred_f32.iter().map(|v| (*v as f64) + y_mean).collect();
+                }
+
+                Ok((
+                    pred_train_ret,
+                    pred_test_ret,
+                    pve_trainvar,
+                    converged,
+                    iters_done,
+                    rel_res,
+                ))
+            },
+        )
         .map_err(_map_err_string_to_py)?;
 
     let train_arr = PyArray2::from_owned_array(

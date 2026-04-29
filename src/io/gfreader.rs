@@ -7,10 +7,11 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray2};
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::bitwise::and_popcount;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 use crate::vcfout::VcfOut;
@@ -347,6 +348,766 @@ impl SiteFilterExpr {
 
         true
     }
+
+    #[inline]
+    fn active(&self) -> bool {
+        self.site_set.is_some()
+            || self.bim_range.is_some()
+            || self.chr_set.is_some()
+            || self.bp_min.is_some()
+            || self.bp_max.is_some()
+            || self.ranges.is_some()
+    }
+}
+
+#[inline]
+fn sample_indices_are_identity(indices: &[usize]) -> bool {
+    indices.iter().enumerate().all(|(i, &idx)| idx == i)
+}
+
+#[inline]
+fn write_bim_site_line(w: &mut BufWriter<File>, site: &core::SiteInfo) -> Result<(), String> {
+    let snp_id = format!("{}_{}", site.chrom, site.pos);
+    writeln!(
+        w,
+        "{}\t{}\t0\t{}\t{}\t{}",
+        site.chrom, snp_id, site.pos, site.ref_allele, site.alt_allele
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[inline]
+fn flip_bed_code(code: u8) -> u8 {
+    match code & 0b11 {
+        0b00 => 0b11,
+        0b11 => 0b00,
+        v => v,
+    }
+}
+
+fn build_bed_flip_byte_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    for b in 0u16..=255u16 {
+        let byte = b as u8;
+        let mut out = 0u8;
+        for k in 0..4usize {
+            let code = (byte >> (k * 2)) & 0b11;
+            let flip = flip_bed_code(code);
+            out |= flip << (k * 2);
+        }
+        table[b as usize] = out;
+    }
+    table
+}
+
+fn build_bed_low_high_nibble_tables() -> ([u8; 256], [u8; 256]) {
+    let mut low = [0u8; 256];
+    let mut high = [0u8; 256];
+    for b in 0u16..=255u16 {
+        let x = b as u8;
+        let lo = (x & 0b0000_0001)
+            | ((x & 0b0000_0100) >> 1)
+            | ((x & 0b0001_0000) >> 2)
+            | ((x & 0b0100_0000) >> 3);
+        let hi = ((x & 0b0000_0010) >> 1)
+            | ((x & 0b0000_1000) >> 2)
+            | ((x & 0b0010_0000) >> 3)
+            | ((x & 0b1000_0000) >> 4);
+        low[b as usize] = lo;
+        high[b as usize] = hi;
+    }
+    (low, high)
+}
+
+fn build_bed_count_byte_table() -> [(u8, u8, u8); 256] {
+    // For each BED byte (4 genotypes), return:
+    //   (missing_count, het_count, hom_alt_count)
+    let mut table = [(0u8, 0u8, 0u8); 256];
+    for b in 0u16..=255u16 {
+        let byte = b as u8;
+        let mut missing = 0u8;
+        let mut het = 0u8;
+        let mut hom_alt = 0u8;
+        for k in 0..4usize {
+            let code = (byte >> (k * 2)) & 0b11;
+            match code {
+                0b01 => missing = missing.saturating_add(1),
+                0b10 => het = het.saturating_add(1),
+                0b11 => hom_alt = hom_alt.saturating_add(1),
+                _ => {}
+            }
+        }
+        table[b as usize] = (missing, het, hom_alt);
+    }
+    table
+}
+
+#[inline]
+fn count_packed_row_counts(
+    row: &[u8],
+    n_samples: usize,
+    byte_counts: &[(u8, u8, u8); 256],
+) -> (usize, usize, usize) {
+    let full_bytes = n_samples / 4;
+    let rem_pairs = n_samples & 3;
+    let mut missing = 0usize;
+    let mut het = 0usize;
+    let mut hom_alt = 0usize;
+
+    for &b in row.iter().take(full_bytes) {
+        let (m, h, ha) = byte_counts[b as usize];
+        missing = missing.saturating_add(m as usize);
+        het = het.saturating_add(h as usize);
+        hom_alt = hom_alt.saturating_add(ha as usize);
+    }
+    if rem_pairs > 0 {
+        let b = row[full_bytes];
+        for k in 0..rem_pairs {
+            let code = (b >> (k * 2)) & 0b11;
+            match code {
+                0b01 => missing = missing.saturating_add(1),
+                0b10 => het = het.saturating_add(1),
+                0b11 => hom_alt = hom_alt.saturating_add(1),
+                _ => {}
+            }
+        }
+    }
+    (missing, het, hom_alt)
+}
+
+#[inline]
+fn load_u64_le_partial(bytes: &[u8], offset: usize) -> u64 {
+    let mut v = 0u64;
+    if offset >= bytes.len() {
+        return v;
+    }
+    let end = std::cmp::min(bytes.len(), offset.saturating_add(8));
+    for (i, &b) in bytes[offset..end].iter().enumerate() {
+        v |= (b as u64) << (i * 8);
+    }
+    v
+}
+
+#[inline]
+fn store_u64_le_partial(dst: &mut [u8], offset: usize, word: u64) {
+    if offset >= dst.len() {
+        return;
+    }
+    let bytes = word.to_le_bytes();
+    let end = std::cmp::min(dst.len(), offset.saturating_add(8));
+    dst[offset..end].copy_from_slice(&bytes[..(end - offset)]);
+}
+
+fn build_bed_spread4_table() -> [u8; 16] {
+    let mut table = [0u8; 16];
+    for x in 0u8..16u8 {
+        let mut out = 0u8;
+        out |= (x & 0b0001) << 0;
+        out |= (x & 0b0010) << 1;
+        out |= (x & 0b0100) << 2;
+        out |= (x & 0b1000) << 3;
+        table[x as usize] = out;
+    }
+    table
+}
+
+#[inline]
+fn and_and_mask_popcount(lhs: &[u64], rhs: &[u64], mask: &[u64]) -> u64 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    debug_assert_eq!(lhs.len(), mask.len());
+    let mut a0 = 0u64;
+    let mut a1 = 0u64;
+    let mut a2 = 0u64;
+    let mut a3 = 0u64;
+    let mut i = 0usize;
+    let n = lhs.len();
+
+    while i + 4 <= n {
+        a0 += (lhs[i] & rhs[i] & mask[i]).count_ones() as u64;
+        a1 += (lhs[i + 1] & rhs[i + 1] & mask[i + 1]).count_ones() as u64;
+        a2 += (lhs[i + 2] & rhs[i + 2] & mask[i + 2]).count_ones() as u64;
+        a3 += (lhs[i + 3] & rhs[i + 3] & mask[i + 3]).count_ones() as u64;
+        i += 4;
+    }
+    while i < n {
+        a0 += (lhs[i] & rhs[i] & mask[i]).count_ones() as u64;
+        i += 1;
+    }
+    a0 + a1 + a2 + a3
+}
+
+#[derive(Clone, Copy)]
+struct SubsetPackPlanByte {
+    word_idx: [u32; 4],
+    bit_idx: [u8; 4],
+    n_pairs: u8,
+}
+
+fn collapse_bed_row_sorted_subset(
+    src_row: &[u8],
+    include_words: &[u64],
+    out_row: &mut [u8],
+) -> Result<(), String> {
+    let mut cur_output_word = 0u64;
+    let mut word_write_halfshift: u32 = 0;
+    let mut out_word_idx = 0usize;
+    let mut raw_word_idx = 0usize;
+
+    for &include_word in include_words.iter() {
+        let mut include_half = include_word as u32;
+        for half_idx in 0..2usize {
+            if include_half != 0 {
+                let raw_word = load_u64_le_partial(src_row, raw_word_idx.saturating_mul(8));
+                let mut run_mask = include_half as u64;
+                while run_mask != 0 {
+                    let start = run_mask.trailing_zeros();
+                    let inv_shifted = (!run_mask) >> start;
+                    let mut run_len = inv_shifted.trailing_zeros();
+                    let max_len = 32u32.saturating_sub(start);
+                    if run_len > max_len {
+                        run_len = max_len;
+                    }
+
+                    let raw_shifted = raw_word >> (start * 2);
+                    let block_limit = 32u32.saturating_sub(word_write_halfshift);
+                    cur_output_word |= raw_shifted << (word_write_halfshift * 2);
+
+                    if run_len < block_limit {
+                        word_write_halfshift += run_len;
+                        if word_write_halfshift < 32 {
+                            cur_output_word &= (1u64 << (word_write_halfshift * 2)) - 1u64;
+                        }
+                    } else {
+                        store_u64_le_partial(
+                            out_row,
+                            out_word_idx.saturating_mul(8),
+                            cur_output_word,
+                        );
+                        out_word_idx = out_word_idx.saturating_add(1);
+                        word_write_halfshift = run_len - block_limit;
+                        if word_write_halfshift > 0 {
+                            cur_output_word = (raw_shifted >> (block_limit * 2))
+                                & ((1u64 << (word_write_halfshift * 2)) - 1u64);
+                        } else {
+                            cur_output_word = 0u64;
+                        }
+                    }
+
+                    let clear_through = start.saturating_add(run_len) as usize;
+                    if clear_through >= 64 {
+                        run_mask = 0u64;
+                    } else {
+                        run_mask &= !((1u64 << clear_through) - 1u64);
+                    }
+                }
+            }
+
+            raw_word_idx = raw_word_idx.saturating_add(1);
+            if half_idx == 0 {
+                include_half = (include_word >> 32) as u32;
+            }
+        }
+    }
+
+    if word_write_halfshift > 0 {
+        store_u64_le_partial(out_row, out_word_idx.saturating_mul(8), cur_output_word);
+        out_word_idx = out_word_idx.saturating_add(1);
+    }
+
+    let expected_word_ct = out_row.len().div_ceil(8);
+    if out_word_idx != expected_word_ct {
+        return Err(format!(
+            "subset collapse output words mismatch: got {out_word_idx}, expected {expected_word_ct}"
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn evaluate_packed_row_keep_and_flip(
+    n_samples: usize,
+    non_missing: usize,
+    alt_sum: usize,
+    het_count: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> (bool, bool) {
+    if n_samples == 0 {
+        return (false, false);
+    }
+    let n_samples_f = n_samples as f64;
+    let non_missing_f = non_missing as f64;
+    let missing_rate = 1.0 - (non_missing_f / n_samples_f);
+    if missing_rate > (max_missing_rate as f64) {
+        return (false, false);
+    }
+
+    if non_missing == 0 {
+        return (maf_threshold <= 0.0, false);
+    }
+
+    if apply_het_filter {
+        let het_rate = (het_count as f64) / non_missing_f;
+        let low = het_threshold as f64;
+        let high = 1.0 - low;
+        if het_rate < low || het_rate > high {
+            return (false, false);
+        }
+    }
+
+    let mut alt_freq = (alt_sum as f64) / (2.0 * non_missing_f);
+    let flip = alt_freq > 0.5;
+    if flip {
+        alt_freq = 1.0 - alt_freq;
+    }
+    let maf = alt_freq.min(1.0 - alt_freq);
+    if maf < (maf_threshold as f64) {
+        return (false, false);
+    }
+    (true, flip)
+}
+
+fn write_plink_subset_filtered_packed(
+    src_prefix: &str,
+    out_prefix: &str,
+    out_sample_ids: &[String],
+    sites: &[core::SiteInfo],
+    selected_snp_indices: &[usize],
+    sample_indices: &[usize],
+    n_source_samples: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    apply_het_filter: bool,
+    het_threshold: f32,
+) -> Result<usize, String> {
+    if out_sample_ids.is_empty() {
+        return Err("No samples selected.".to_string());
+    }
+    if sample_indices.is_empty() {
+        return Err("No samples selected.".to_string());
+    }
+    if out_sample_ids.len() != sample_indices.len() {
+        return Err("sample id/index size mismatch".to_string());
+    }
+    if n_source_samples == 0 {
+        return Err("source contains no samples".to_string());
+    }
+
+    let src_bed = format!("{src_prefix}.bed");
+    let out_bed = format!("{out_prefix}.bed");
+    let out_bim = format!("{out_prefix}.bim");
+    let out_fam = format!("{out_prefix}.fam");
+
+    if let Some(parent) = Path::new(&out_bed).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+
+    write_fam_simple(Path::new(&out_fam), out_sample_ids, None)?;
+
+    let mut rbed = File::open(&src_bed).map_err(|e| format!("{src_bed}: {e}"))?;
+    let mut header = [0u8; 3];
+    rbed.read_exact(&mut header)
+        .map_err(|e| format!("{src_bed}: {e}"))?;
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err(format!(
+            "{src_bed}: unsupported BED header (expect SNP-major 0x6C 0x1B 0x01)"
+        ));
+    }
+
+    let n_out_samples = out_sample_ids.len();
+    let src_bytes_per_snp = (n_source_samples + 3) / 4;
+    let out_bytes_per_snp = (n_out_samples + 3) / 4;
+    let expected_payload = sites.len().saturating_mul(src_bytes_per_snp);
+    let bed_size_u64 = rbed
+        .metadata()
+        .map_err(|e| format!("{src_bed}: {e}"))?
+        .len();
+    let bed_size = usize::try_from(bed_size_u64)
+        .map_err(|_| format!("{src_bed}: file too large for this platform"))?;
+    if bed_size < 3 {
+        return Err(format!("{src_bed}: invalid BED header"));
+    }
+    let payload = bed_size - 3;
+    if payload != expected_payload {
+        return Err(format!(
+            "{src_bed}: payload size mismatch, got {payload}, expected {expected_payload} (n_snps={}, n_samples={n_source_samples})",
+            sites.len()
+        ));
+    }
+
+    let mut wbed = BufWriter::new(File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?);
+    wbed.write_all(&header)
+        .map_err(|e| format!("{out_bed}: {e}"))?;
+    let mut wbim = BufWriter::new(File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?);
+
+    if selected_snp_indices.iter().any(|&idx| idx >= sites.len()) {
+        return Err("selected SNP index out of range".to_string());
+    }
+    if selected_snp_indices.windows(2).any(|w| w[0] >= w[1]) {
+        return Err("selected SNP indices must be strictly increasing".to_string());
+    }
+    if sample_indices.iter().any(|&idx| idx >= n_source_samples) {
+        return Err("sample index out of range".to_string());
+    }
+
+    let prefix_identity = sample_indices_are_identity(sample_indices);
+    let full_identity = n_out_samples == n_source_samples && prefix_identity;
+    let tail_pairs = n_out_samples & 3;
+    let full_bytes_out = if tail_pairs == 0 {
+        out_bytes_per_snp
+    } else {
+        out_bytes_per_snp.saturating_sub(1)
+    };
+    let tail_mask: u8 = if tail_pairs == 0 {
+        0xFF
+    } else {
+        ((1u16 << (tail_pairs * 2)) - 1) as u8
+    };
+
+    let flip_table = build_bed_flip_byte_table();
+    let byte_counts = build_bed_count_byte_table();
+
+    let mut kept = 0usize;
+    let mut out_row = vec![0u8; out_bytes_per_snp];
+
+    if prefix_identity {
+        let block_target_bytes = 8 * 1024 * 1024usize;
+        let block_rows = std::cmp::max(
+            64usize,
+            std::cmp::min(
+                4096usize,
+                std::cmp::max(
+                    1usize,
+                    block_target_bytes / std::cmp::max(1usize, src_bytes_per_snp),
+                ),
+            ),
+        );
+
+        let mut prev_idx_opt: Option<usize> = None;
+        for snp_chunk in selected_snp_indices.chunks(block_rows) {
+            let rows_n = snp_chunk.len();
+            let mut block = vec![0u8; rows_n.saturating_mul(src_bytes_per_snp)];
+
+            for (r, &snp_idx) in snp_chunk.iter().enumerate() {
+                match prev_idx_opt {
+                    None => {
+                        let off = 3usize
+                            .checked_add(
+                                snp_idx
+                                    .checked_mul(src_bytes_per_snp)
+                                    .ok_or_else(|| "BED row offset overflow".to_string())?,
+                            )
+                            .ok_or_else(|| "BED row offset overflow".to_string())?;
+                        rbed.seek(SeekFrom::Start(off as u64))
+                            .map_err(|e| format!("{src_bed}: {e}"))?;
+                    }
+                    Some(prev) => {
+                        if snp_idx <= prev {
+                            return Err(
+                                "selected SNP indices must be strictly increasing".to_string()
+                            );
+                        }
+                        let skip_rows = snp_idx - prev - 1;
+                        if skip_rows > 0 {
+                            let skip_bytes = skip_rows
+                                .checked_mul(src_bytes_per_snp)
+                                .ok_or_else(|| "BED seek offset overflow".to_string())?;
+                            rbed.seek(SeekFrom::Current(skip_bytes as i64))
+                                .map_err(|e| format!("{src_bed}: {e}"))?;
+                        }
+                    }
+                }
+                let st = r.saturating_mul(src_bytes_per_snp);
+                let ed = st.saturating_add(src_bytes_per_snp);
+                rbed.read_exact(&mut block[st..ed])
+                    .map_err(|e| format!("{src_bed}: {e}"))?;
+                prev_idx_opt = Some(snp_idx);
+            }
+
+            let decisions: Vec<(bool, bool)> = block
+                .par_chunks(src_bytes_per_snp)
+                .map(|row| {
+                    let (missing, het, hom_alt) =
+                        count_packed_row_counts(row, n_out_samples, &byte_counts);
+                    let non_missing = n_out_samples.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let het_count = if apply_het_filter { het } else { 0usize };
+                    evaluate_packed_row_keep_and_flip(
+                        n_out_samples,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het_filter,
+                        het_threshold,
+                    )
+                })
+                .collect();
+
+            for ((&snp_idx, &(keep, flip)), row) in snp_chunk
+                .iter()
+                .zip(decisions.iter())
+                .zip(block.chunks(src_bytes_per_snp))
+            {
+                if !keep {
+                    continue;
+                }
+                let mut site = sites[snp_idx].clone();
+                if flip {
+                    std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
+                }
+                write_bim_site_line(&mut wbim, &site)?;
+
+                if !flip {
+                    if tail_pairs == 0 {
+                        if full_identity {
+                            wbed.write_all(row).map_err(|e| format!("{out_bed}: {e}"))?;
+                        } else {
+                            wbed.write_all(&row[..out_bytes_per_snp])
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        }
+                    } else {
+                        if full_bytes_out > 0 {
+                            wbed.write_all(&row[..full_bytes_out])
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        }
+                        let last = row[full_bytes_out] & tail_mask;
+                        wbed.write_all(&[last])
+                            .map_err(|e| format!("{out_bed}: {e}"))?;
+                    }
+                } else {
+                    if full_bytes_out > 0 {
+                        for i in 0..full_bytes_out {
+                            out_row[i] = flip_table[row[i] as usize];
+                        }
+                        wbed.write_all(&out_row[..full_bytes_out])
+                            .map_err(|e| format!("{out_bed}: {e}"))?;
+                    }
+                    if tail_pairs > 0 {
+                        let last = flip_table[row[full_bytes_out] as usize] & tail_mask;
+                        wbed.write_all(&[last])
+                            .map_err(|e| format!("{out_bed}: {e}"))?;
+                    }
+                }
+                kept = kept.saturating_add(1);
+            }
+        }
+    } else {
+        let n_words_src = n_source_samples.div_ceil(64);
+        let last_word_src = n_words_src.saturating_sub(1);
+        let tail_bits_src_word = n_source_samples & 63;
+        let tail_mask_src_word: u64 = if tail_bits_src_word == 0 {
+            u64::MAX
+        } else {
+            (1u64 << tail_bits_src_word) - 1u64
+        };
+        let sample_indices_strictly_increasing = sample_indices.windows(2).all(|w| w[0] < w[1]);
+        let low_high_lut = if sample_indices_strictly_increasing {
+            None
+        } else {
+            Some(build_bed_low_high_nibble_tables())
+        };
+        let spread4 = if sample_indices_strictly_increasing {
+            None
+        } else {
+            Some(build_bed_spread4_table())
+        };
+
+        let mut selected_mask_words = vec![0u64; n_words_src];
+        for &sidx in sample_indices.iter() {
+            let w = sidx >> 6;
+            let b = sidx & 63;
+            selected_mask_words[w] |= 1u64 << b;
+        }
+
+        let mut pack_plan: Vec<SubsetPackPlanByte> = Vec::new();
+        if !sample_indices_strictly_increasing {
+            pack_plan = vec![
+                SubsetPackPlanByte {
+                    word_idx: [0u32; 4],
+                    bit_idx: [0u8; 4],
+                    n_pairs: 0u8,
+                };
+                out_bytes_per_snp
+            ];
+            for (out_i, &sidx) in sample_indices.iter().enumerate() {
+                let out_b = out_i >> 2;
+                let lane = out_i & 3;
+                let plan = &mut pack_plan[out_b];
+                plan.word_idx[lane] = (sidx >> 6) as u32;
+                plan.bit_idx[lane] = (sidx & 63) as u8;
+                let lane_pairs = (lane as u8) + 1;
+                if plan.n_pairs < lane_pairs {
+                    plan.n_pairs = lane_pairs;
+                }
+            }
+        }
+
+        let mut src_row = vec![0u8; src_bytes_per_snp];
+        let mut low_words = if sample_indices_strictly_increasing {
+            Vec::new()
+        } else {
+            vec![0u64; n_words_src]
+        };
+        let mut high_words = if sample_indices_strictly_increasing {
+            Vec::new()
+        } else {
+            vec![0u64; n_words_src]
+        };
+
+        for (k, &snp_idx) in selected_snp_indices.iter().enumerate() {
+            if k == 0 {
+                let off = 3usize
+                    .checked_add(
+                        snp_idx
+                            .checked_mul(src_bytes_per_snp)
+                            .ok_or_else(|| "BED row offset overflow".to_string())?,
+                    )
+                    .ok_or_else(|| "BED row offset overflow".to_string())?;
+                rbed.seek(SeekFrom::Start(off as u64))
+                    .map_err(|e| format!("{src_bed}: {e}"))?;
+            } else {
+                let prev = selected_snp_indices[k - 1];
+                if snp_idx <= prev {
+                    return Err("selected SNP indices must be strictly increasing".to_string());
+                }
+                let skip_rows = snp_idx - prev - 1;
+                if skip_rows > 0 {
+                    let skip_bytes = skip_rows
+                        .checked_mul(src_bytes_per_snp)
+                        .ok_or_else(|| "BED seek offset overflow".to_string())?;
+                    rbed.seek(SeekFrom::Current(skip_bytes as i64))
+                        .map_err(|e| format!("{src_bed}: {e}"))?;
+                }
+            }
+            rbed.read_exact(&mut src_row)
+                .map_err(|e| format!("{src_bed}: {e}"))?;
+
+            let (keep, flip) = if sample_indices_strictly_increasing {
+                collapse_bed_row_sorted_subset(
+                    src_row.as_slice(),
+                    selected_mask_words.as_slice(),
+                    out_row.as_mut_slice(),
+                )?;
+                let (missing, het, hom_alt) =
+                    count_packed_row_counts(out_row.as_slice(), n_out_samples, &byte_counts);
+                let non_missing = n_out_samples.saturating_sub(missing);
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let het_count = if apply_het_filter { het } else { 0usize };
+                evaluate_packed_row_keep_and_flip(
+                    n_out_samples,
+                    non_missing,
+                    alt_sum,
+                    het_count,
+                    maf_threshold,
+                    max_missing_rate,
+                    apply_het_filter,
+                    het_threshold,
+                )
+            } else {
+                let (low_lut, high_lut) = low_high_lut
+                    .as_ref()
+                    .ok_or_else(|| "subset low/high LUT missing".to_string())?;
+                for w in 0..n_words_src {
+                    let base = w.saturating_mul(16);
+                    let mut lo_w = 0u64;
+                    let mut hi_w = 0u64;
+                    for j in 0..16usize {
+                        let bi = base + j;
+                        if bi >= src_bytes_per_snp {
+                            break;
+                        }
+                        let b = src_row[bi] as usize;
+                        lo_w |= (low_lut[b] as u64) << (j * 4);
+                        hi_w |= (high_lut[b] as u64) << (j * 4);
+                    }
+                    low_words[w] = lo_w;
+                    high_words[w] = hi_w;
+                }
+                if n_words_src > 0 && tail_bits_src_word != 0 {
+                    low_words[last_word_src] &= tail_mask_src_word;
+                    high_words[last_word_src] &= tail_mask_src_word;
+                }
+
+                let low_pop =
+                    and_popcount(low_words.as_slice(), selected_mask_words.as_slice()) as usize;
+                let high_pop =
+                    and_popcount(high_words.as_slice(), selected_mask_words.as_slice()) as usize;
+                let hom_alt = and_and_mask_popcount(
+                    low_words.as_slice(),
+                    high_words.as_slice(),
+                    selected_mask_words.as_slice(),
+                ) as usize;
+                let missing = low_pop.saturating_sub(hom_alt);
+                let het = high_pop.saturating_sub(hom_alt);
+                let non_missing = n_out_samples.saturating_sub(missing);
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let het_count = if apply_het_filter { het } else { 0usize };
+                evaluate_packed_row_keep_and_flip(
+                    n_out_samples,
+                    non_missing,
+                    alt_sum,
+                    het_count,
+                    maf_threshold,
+                    max_missing_rate,
+                    apply_het_filter,
+                    het_threshold,
+                )
+            };
+            if !keep {
+                continue;
+            }
+
+            let mut site = sites[snp_idx].clone();
+            if flip {
+                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
+            }
+            write_bim_site_line(&mut wbim, &site)?;
+
+            if sample_indices_strictly_increasing {
+                if flip {
+                    for b in out_row.iter_mut() {
+                        *b = flip_table[*b as usize];
+                    }
+                }
+            } else {
+                let spread4 = spread4
+                    .as_ref()
+                    .ok_or_else(|| "subset spread table missing".to_string())?;
+                for (out_b, plan) in pack_plan.iter().enumerate() {
+                    let mut lo_nib = 0u8;
+                    let mut hi_nib = 0u8;
+                    for lane in 0..(plan.n_pairs as usize) {
+                        let w = plan.word_idx[lane] as usize;
+                        let bit = plan.bit_idx[lane];
+                        lo_nib |= (((low_words[w] >> bit) & 1u64) as u8) << lane;
+                        hi_nib |= (((high_words[w] >> bit) & 1u64) as u8) << lane;
+                    }
+                    let mut packed =
+                        spread4[lo_nib as usize] | (spread4[hi_nib as usize].wrapping_shl(1u32));
+                    if flip {
+                        packed = flip_table[packed as usize];
+                    }
+                    out_row[out_b] = packed;
+                }
+            }
+            if tail_pairs > 0 {
+                out_row[full_bytes_out] &= tail_mask;
+            }
+            wbed.write_all(&out_row)
+                .map_err(|e| format!("{out_bed}: {e}"))?;
+            kept = kept.saturating_add(1);
+        }
+    }
+
+    wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+    wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+    Ok(kept)
 }
 
 #[pyfunction]
@@ -416,7 +1177,6 @@ pub fn bed_filter_to_plink_rust(
         ));
     }
     let apply_het_filter = model_key != "add";
-
     let outv = py
         .detach(move || -> Result<(usize, usize, usize), String> {
             let it = BedSnpIter::new_with_fill(&src, 0.0, 1.0, false, false, het)?;
@@ -427,65 +1187,37 @@ pub fn bed_filter_to_plink_rust(
             }
             let n_out_samples = out_sample_ids.len();
             let full_samples = sample_indices.len() == it.n_samples();
-
-            if let (Some(lo), Some(hi)) = (bp_min, bp_max) {
-                if lo > hi {
-                    return Err("bp_min cannot be greater than bp_max".to_string());
+            let site_filter =
+                SiteFilterExpr::from_parts(snp_sites, bim_range, chr_keys, bp_min, bp_max, ranges)?;
+            let mut selected_snp_indices: Vec<usize> = Vec::new();
+            if site_filter.active() {
+                selected_snp_indices.reserve(it.sites.len());
+                for (snp_idx, site) in it.sites.iter().enumerate() {
+                    if site_filter.keep_site(site) {
+                        selected_snp_indices.push(snp_idx);
+                    }
                 }
+            } else {
+                selected_snp_indices.extend(0..it.sites.len());
             }
+            let n_scanned: usize = selected_snp_indices.len();
 
-            let chr_set: Option<HashSet<String>> = chr_keys.and_then(|v| {
-                let mut s: HashSet<String> = HashSet::new();
-                for c in v.into_iter() {
-                    let k = normalize_chr_key_local(&c);
-                    if !k.is_empty() {
-                        s.insert(k);
-                    }
-                }
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            });
-
-            let site_set: Option<HashSet<(String, i32)>> = snp_sites.and_then(|v| {
-                let mut s: HashSet<(String, i32)> = HashSet::new();
-                for (c, p) in v.into_iter() {
-                    s.insert((normalize_chr_key_local(&c), p));
-                }
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            });
-
-            let bim_range_norm: Option<(String, i32, i32)> = if let Some((c, s, e)) = bim_range {
-                if s > e {
-                    return Err("bim_range start cannot be greater than end".to_string());
-                }
-                Some((normalize_chr_key_local(&c), s, e))
-            } else {
-                None
-            };
-
-            let ranges_norm: Option<Vec<(String, i32, i32)>> = if let Some(v) = ranges {
-                if v.is_empty() {
-                    None
-                } else {
-                    let mut out_r: Vec<(String, i32, i32)> = Vec::with_capacity(v.len());
-                    for (c, s, e) in v.into_iter() {
-                        if s > e {
-                            return Err("One range has start > end".to_string());
-                        }
-                        out_r.push((normalize_chr_key_local(&c), s, e));
-                    }
-                    Some(out_r)
-                }
-            } else {
-                None
-            };
+            if !fill_missing {
+                let n_kept = write_plink_subset_filtered_packed(
+                    &src,
+                    &out,
+                    &out_sample_ids,
+                    &it.sites,
+                    &selected_snp_indices,
+                    &sample_indices,
+                    it.n_samples(),
+                    maf_threshold,
+                    max_missing_rate,
+                    apply_het_filter,
+                    het,
+                )?;
+                return Ok((n_kept, n_scanned, n_out_samples));
+            }
 
             let bed_path = format!("{out}.bed");
             let bim_path = format!("{out}.bim");
@@ -498,53 +1230,9 @@ pub fn bed_filter_to_plink_rust(
             let mut bim = BufWriter::new(File::create(&bim_path).map_err(|e| e.to_string())?);
 
             let bytes_per_snp = (n_out_samples + 3) / 4;
-            let mut n_scanned: usize = 0;
             let mut n_kept: usize = 0;
 
-            for snp_idx in 0..it.sites.len() {
-                let site0 = &it.sites[snp_idx];
-                let c = normalize_chr_key_local(&site0.chrom);
-                let p = site0.pos;
-
-                if let Some(ref st) = site_set {
-                    if !st.contains(&(c.clone(), p)) {
-                        continue;
-                    }
-                }
-                if let Some((ref bc, bs, be)) = bim_range_norm {
-                    if !(c == *bc && p >= bs && p <= be) {
-                        continue;
-                    }
-                }
-                if let Some(ref cs) = chr_set {
-                    if !cs.contains(&c) {
-                        continue;
-                    }
-                }
-                if let Some(lo) = bp_min {
-                    if p < lo {
-                        continue;
-                    }
-                }
-                if let Some(hi) = bp_max {
-                    if p > hi {
-                        continue;
-                    }
-                }
-                if let Some(ref rr) = ranges_norm {
-                    let mut hit = false;
-                    for (rc, rs, re) in rr.iter() {
-                        if c == *rc && p >= *rs && p <= *re {
-                            hit = true;
-                            break;
-                        }
-                    }
-                    if !hit {
-                        continue;
-                    }
-                }
-
-                n_scanned = n_scanned.saturating_add(1);
+            for &snp_idx in selected_snp_indices.iter() {
                 let maybe = if full_samples {
                     it.get_snp_row_raw(snp_idx)
                 } else {
@@ -640,6 +1328,10 @@ impl BedChunkReader {
         sample_ids=None,
         sample_indices=None,
         mmap_window_mb=None,
+        chr_keys=None,
+        bp_min=None,
+        bp_max=None,
+        ranges=None,
         model=None,
         het_threshold=None,
     ))]
@@ -655,6 +1347,10 @@ impl BedChunkReader {
         sample_ids: Option<Vec<String>>,
         sample_indices: Option<Vec<usize>>,
         mmap_window_mb: Option<usize>,
+        chr_keys: Option<Vec<String>>,
+        bp_min: Option<i32>,
+        bp_max: Option<i32>,
+        ranges: Option<Vec<(String, i32, i32)>>,
         model: Option<String>,
         het_threshold: Option<f32>,
     ) -> PyResult<Self> {
@@ -691,9 +1387,29 @@ impl BedChunkReader {
         let (sample_indices, sample_ids) =
             build_sample_selection(&it.samples, sample_ids, sample_indices)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        let snp_indices =
+        let mut snp_indices =
             build_snp_indices(&it.sites, snp_range, snp_indices, bim_range, snp_sites)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let site_filter = SiteFilterExpr::from_parts(None, None, chr_keys, bp_min, bp_max, ranges)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        if site_filter.active() {
+            if let Some(ref mut idx) = snp_indices {
+                idx.retain(|&snp_idx| {
+                    it.sites
+                        .get(snp_idx)
+                        .map(|s| site_filter.keep_site(s))
+                        .unwrap_or(false)
+                });
+            } else {
+                let mut idx: Vec<usize> = Vec::with_capacity(it.sites.len());
+                for (i, s) in it.sites.iter().enumerate() {
+                    if site_filter.keep_site(s) {
+                        idx.push(i);
+                    }
+                }
+                snp_indices = Some(idx);
+            }
+        }
 
         Ok(Self {
             it,

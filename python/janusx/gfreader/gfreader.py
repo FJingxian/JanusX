@@ -917,6 +917,10 @@ def bed_chunk_reader(
     snp_indices: Union[list[int],None ]= None,
     bim_range: Union[tuple[str, int, int] , None] = None,
     snp_sites: Union[list[tuple[str, int]], None] = None,
+    chr_keys: Union[list[str], None] = None,
+    bp_min: Union[int, None] = None,
+    bp_max: Union[int, None] = None,
+    ranges: Union[list[tuple[str, int, int]], None] = None,
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
@@ -946,6 +950,10 @@ def bed_chunk_reader(
         snp_indices=snp_indices,
         bim_range=bim_range,
         snp_sites=snp_sites,
+        chr_keys=chr_keys,
+        bp_min=bp_min,
+        bp_max=bp_max,
+        ranges=ranges,
         sample_ids=sample_ids,
         sample_indices=sample_indices,
         mmap_window_mb=mmap_window_mb,
@@ -959,28 +967,34 @@ def bed_chunk_reader(
     except TypeError:
         # Backward-compat for older compiled extensions that do not yet
         # expose model/het_threshold in BedChunkReader.
+        if (snp_sites is not None) and len(snp_sites) > 0:
+            raise RuntimeError(
+                "BedChunkReader extension does not support snp_sites selection. "
+                "Please rebuild/reinstall janusx Rust extension."
+            )
+        if chr_keys is not None or bp_min is not None or bp_max is not None or ranges:
+            raise RuntimeError(
+                "BedChunkReader extension does not support chr/bp/ranges filtering. "
+                "Please rebuild/reinstall janusx Rust extension."
+            )
+        if (str(model).strip().lower() != "add") or (abs(float(het) - 0.02) > 1e-12):
+            raise RuntimeError(
+                "BedChunkReader extension does not support model/het_threshold filtering. "
+                "Please rebuild/reinstall janusx Rust extension."
+            )
         legacy_kwargs = dict(base_kwargs)
         # Older extensions may not support snp_sites.
         legacy_kwargs.pop("snp_sites", None)
+        legacy_kwargs.pop("chr_keys", None)
+        legacy_kwargs.pop("bp_min", None)
+        legacy_kwargs.pop("bp_max", None)
+        legacy_kwargs.pop("ranges", None)
         reader = BedChunkReader(**legacy_kwargs)
-        if (snp_sites is not None) and len(snp_sites) > 0:
+        if not _WARNED_BED_MODEL_FALLBACK:
             warnings.warn(
                 (
-                    "BedChunkReader extension does not support snp_sites yet; "
-                    "falling back to legacy reader signature without snp_sites. "
-                    "Please rebuild/reinstall janusx Rust extension to enable "
-                    "chr/pos site-list selection."
-                ),
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if (model != "add") and (not _WARNED_BED_MODEL_FALLBACK):
-            warnings.warn(
-                (
-                    "BedChunkReader extension does not support model/het_threshold yet; "
-                    "falling back to legacy reader signature. "
-                    "Please rebuild/reinstall janusx Rust extension to enable "
-                    "Rust-side heterozygosity filtering."
+                    "BedChunkReader extension is in legacy compatibility mode; "
+                    "please rebuild/reinstall janusx Rust extension."
                 ),
                 RuntimeWarning,
                 stacklevel=2,
@@ -1163,6 +1177,10 @@ def load_genotype_chunks(
     snp_indices: Union[list[int] , None] = None,
     bim_range: Union[tuple[str, int, int] , None] = None,
     snp_sites: Union[list[tuple[str, int]], None] = None,
+    chr_keys: Union[list[str], None] = None,
+    bp_min: Union[int, None] = None,
+    bp_max: Union[int, None] = None,
+    ranges: Union[list[tuple[str, int, int]], None] = None,
     sample_ids: Union[list[str] , None] = None,
     sample_indices: Union[list[int] , None] = None,
     mmap_window_mb: Union[int , None] = None,
@@ -1288,6 +1306,10 @@ def load_genotype_chunks(
                 snp_indices=snp_indices,
                 bim_range=bim_range,
                 snp_sites=snp_sites,
+                chr_keys=chr_keys,
+                bp_min=bp_min,
+                bp_max=bp_max,
+                ranges=ranges,
                 sample_ids=sample_ids,
                 sample_indices=sample_indices,
                 mmap_window_mb=mmap_window_mb,
@@ -1333,6 +1355,10 @@ def load_genotype_chunks(
             snp_indices=snp_indices,
             bim_range=bim_range,
             snp_sites=snp_sites,
+            chr_keys=chr_keys,
+            bp_min=bp_min,
+            bp_max=bp_max,
+            ranges=ranges,
             sample_ids=sample_ids,
             sample_indices=sample_indices,
             mmap_window_mb=mmap_window_mb,
@@ -1366,6 +1392,10 @@ def load_genotype_chunks(
                     snp_indices=snp_indices,
                     bim_range=bim_range,
                     snp_sites=snp_sites,
+                    chr_keys=chr_keys,
+                    bp_min=bp_min,
+                    bp_max=bp_max,
+                    ranges=ranges,
                     sample_ids=sample_ids,
                     sample_indices=sample_indices,
                     mmap_window_mb=mmap_window_mb,

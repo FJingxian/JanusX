@@ -4,8 +4,8 @@ JanusX: Genomic Selection Command-Line Interface
 
 Supported models
 ----------------
-  - GBLUP  : Genomic Best Linear Unbiased Prediction (GBLUP, kinship = 1)
-  - adBLUP : Additive + dominance kernel BLUP (pyBLUP/JAX backend)
+  - GBLUP  : Genomic Best Linear Unbiased Prediction.
+             Kernels: additive(a), dominance(d), additive+dominance(ad)
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
@@ -182,6 +182,95 @@ _RRBLUP_AUTO_PCG_MIN_N = 10_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MIN_N = 2_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N = 5_000
 _RRBLUP_LAMBDA_SUBSAMPLE_REPEATS = 9
+
+_GBLUP_METHOD_ADD = "GBLUP"
+_GBLUP_METHOD_DOM = "GBLUP_D"
+_GBLUP_METHOD_AD = "GBLUP_AD"
+_GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
+
+
+def _is_gblup_method(method: str) -> bool:
+    return str(method) in _GBLUP_METHOD_SET
+
+
+def _gblup_method_kernel_mode(method: str) -> str:
+    m = str(method)
+    if m == _GBLUP_METHOD_DOM:
+        return "d"
+    if m == _GBLUP_METHOD_AD:
+        return "ad"
+    return "a"
+
+
+def _gblup_method_display(method: str) -> str:
+    mode = _gblup_method_kernel_mode(str(method))
+    if mode == "a":
+        return "GBLUP"
+    return f"GBLUP({mode})"
+
+
+def _method_display_name(method: str) -> str:
+    m = str(method)
+    if _is_gblup_method(m):
+        return _gblup_method_display(m)
+    return m
+
+
+def _gblup_mode_label(mode: str) -> str:
+    m = str(mode).strip().lower()
+    if m == "d":
+        return "dominance"
+    if m == "ad":
+        return "additive+dominance"
+    return "additive"
+
+
+def _normalize_gblup_kernel_token(token: str) -> str:
+    t = str(token).strip().lower()
+    if t in {"a", "add", "additive"}:
+        return "a"
+    if t in {"d", "dom", "dominance"}:
+        return "d"
+    if t in {"ad", "da", "adddom", "add+dom", "additive+dominance", "both"}:
+        return "ad"
+    raise ValueError(
+        f"Invalid -GBLUP kernel token: {token!r}. "
+        "Allowed: a, d, ad."
+    )
+
+
+def _parse_gblup_kernel_modes(raw: list[list[str]] | None) -> list[str]:
+    if raw is None:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in raw:
+        vals = [str(x).strip() for x in (group or []) if str(x).strip() != ""]
+        if len(vals) == 0:
+            vals = ["a"]
+        for tok in vals:
+            mode = _normalize_gblup_kernel_token(tok)
+            if mode in seen:
+                continue
+            seen.add(mode)
+            out.append(mode)
+    return out
+
+
+def _gblup_mode_to_method(mode: str) -> str:
+    m = str(mode).strip().lower()
+    if m == "d":
+        return _GBLUP_METHOD_DOM
+    if m == "ad":
+        return _GBLUP_METHOD_AD
+    return _GBLUP_METHOD_ADD
+
+
+def _methods_need_additive_dense(methods: list[str]) -> bool:
+    return any(
+        _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
+        for m in methods
+    )
 
 
 @dataclass
@@ -416,7 +505,9 @@ def configure_thread_runtime(
     policy_raw = str(os.getenv("JX_THREAD_POLICY", "rust")).strip().lower() or "rust"
     explicit_blas = _parse_nonnegative_int(os.getenv("JX_MLM_BLAS_THREADS", "").strip())
     explicit_rust = _parse_nonnegative_int(os.getenv("JX_MLM_RUST_THREADS", "").strip())
-    gblup_only = bool(len(methods) > 0 and all(m in {"GBLUP", "rrBLUP"} for m in methods))
+    gblup_only = bool(
+        len(methods) > 0 and all(m in {_GBLUP_METHOD_ADD, "rrBLUP"} for m in methods)
+    )
 
     plan: dict[str, object] = {
         "enabled": bool(enabled),
@@ -1141,6 +1232,129 @@ def _cfg_truthy(value: typing.Any, *, default: bool = False) -> bool:
     return bool(default)
 
 
+def _estimate_bayes_auto_r2_from_blup(
+    *,
+    y: np.ndarray,
+    Xtrain: typing.Any,
+    packed_train_indices: np.ndarray | None = None,
+    cfg: dict[str, typing.Any] | None = None,
+    seed_offset: int = 0,
+) -> tuple[float, str, int, int]:
+    """
+    Estimate Bayes auto-r2 (BLUP PVE) with optional large-n subsampling.
+
+    Returns
+    -------
+    r2_blup : float
+        Estimated BLUP PVE before clipping.
+    source : str
+        Estimation source label.
+    n_used : int
+        Number of samples used in BLUP fit.
+    n_total : int
+        Total training sample size.
+    """
+    y_vec = np.ascontiguousarray(np.asarray(y, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n_total = int(y_vec.shape[0])
+    if n_total <= 1:
+        return float("nan"), "blup_auto", int(max(0, n_total)), int(max(0, n_total))
+
+    cfg_use = dict(cfg or {})
+    sub_trigger_n = int(max(2, int(cfg_use.get("subsample_min_n", 10000))))
+    sub_min = int(max(16, int(cfg_use.get("subsample_min_samples", _RRBLUP_LAMBDA_SUBSAMPLE_MIN_N))))
+    sub_max = int(max(sub_min, int(cfg_use.get("subsample_max_n", _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N))))
+    sub_target = int(max(sub_min, int(cfg_use.get("subsample_n", _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N))))
+    rep_cfg = int(cfg_use.get("subsample_repeats", _RRBLUP_LAMBDA_SUBSAMPLE_REPEATS))
+    repeats = int(min(20, max(5, rep_cfg)))
+    sub_seed = int(cfg_use.get("subsample_seed", 42))
+
+    is_packed = _looks_like_packed_payload(Xtrain)
+    packed_train: dict[str, typing.Any] | None = None
+    base_abs: np.ndarray | None = None
+    dense: np.ndarray | None = None
+    if is_packed:
+        packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+        n_samples_full = int(packed_train["n_samples"])
+        if packed_train_indices is None:
+            if n_samples_full != n_total:
+                raise ValueError(
+                    "Packed Bayes auto-r2 requires packed_train_indices when "
+                    "len(y) differs from packed n_samples."
+                )
+            base_abs = np.ascontiguousarray(np.arange(n_samples_full, dtype=np.int64), dtype=np.int64)
+        else:
+            base_abs = np.ascontiguousarray(
+                np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            if int(base_abs.shape[0]) != n_total:
+                raise ValueError(
+                    "Packed Bayes auto-r2 index length mismatch: "
+                    f"indices={base_abs.shape[0]}, y={n_total}."
+                )
+    else:
+        dense = np.asarray(Xtrain)
+        if dense.ndim != 2:
+            raise ValueError(f"Bayes auto-r2 expects 2D dense genotype matrix, got {dense.shape}")
+        if int(dense.shape[1]) != n_total:
+            raise ValueError(
+                f"Bayes auto-r2 dense genotype sample mismatch: X n={dense.shape[1]}, y n={n_total}."
+            )
+
+    def _fit_once(local_idx: np.ndarray | None) -> float:
+        if local_idx is None:
+            y_fit = np.ascontiguousarray(y_vec.reshape(-1, 1), dtype=np.float64)
+        else:
+            y_fit = np.ascontiguousarray(y_vec[local_idx].reshape(-1, 1), dtype=np.float64)
+
+        if is_packed:
+            assert packed_train is not None
+            assert base_abs is not None
+            fit_abs = (
+                base_abs
+                if local_idx is None
+                else np.ascontiguousarray(base_abs[local_idx], dtype=np.int64)
+            )
+            model = MLMBLUP(y_fit, packed_train, kinship=1, sample_indices=fit_abs)
+        else:
+            assert dense is not None
+            x_fit = dense if local_idx is None else np.asarray(dense)[:, local_idx]
+            model = MLMBLUP(y_fit, x_fit, kinship=1)
+        return float(model.pve)
+
+    use_subsample = bool(n_total > sub_trigger_n and sub_target < n_total)
+    if (not use_subsample) or (sub_target <= 0):
+        r2 = float(_fit_once(None))
+        return r2, "blup_auto", int(n_total), int(n_total)
+
+    n_sub = int(min(max(1, n_total), min(sub_max, max(sub_min, sub_target))))
+    if n_sub >= n_total:
+        r2 = float(_fit_once(None))
+        return r2, "blup_auto", int(n_total), int(n_total)
+
+    rng = np.random.default_rng(int(sub_seed) + int(seed_offset) + int(n_total) * 17)
+    vals: list[float] = []
+    for _rep in range(int(repeats)):
+        local_idx = np.asarray(
+            rng.choice(int(n_total), size=int(n_sub), replace=False),
+            dtype=np.int64,
+        )
+        local_idx.sort()
+        try:
+            v = float(_fit_once(local_idx))
+        except Exception:
+            v = float("nan")
+        if np.isfinite(v):
+            vals.append(float(v))
+
+    if len(vals) == 0:
+        r2 = float(_fit_once(None))
+        return r2, "blup_auto_fallback", int(n_total), int(n_total)
+
+    r2 = float(np.median(np.asarray(vals, dtype=np.float64)))
+    return r2, f"blup_subsample(n={int(n_sub)},rep={len(vals)}/{int(repeats)})", int(n_sub), int(n_total)
+
+
 def _build_rrblup_adamw_grid(
     cfg: dict[str, typing.Any] | None,
 ) -> list[tuple[float, float]]:
@@ -1303,6 +1517,125 @@ def _decode_packed_block_standardized(
     return x
 
 
+def _ensure_packed_standard_stats_cached(
+    packed_ctx: dict[str, typing.Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    mean_raw = packed_ctx.get("__std_row_mean__", None)
+    inv_raw = packed_ctx.get("__std_row_inv_sd__", None)
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    m = int(packed.shape[0])
+    if mean_raw is not None and inv_raw is not None:
+        mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        if int(mean.shape[0]) == m and int(inv.shape[0]) == m:
+            return mean, inv
+
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    if int(maf.shape[0]) != m:
+        raise ValueError("Packed context mismatch: maf length != packed rows.")
+    n_samples = int(packed_ctx["n_samples"])
+    if n_samples <= 0:
+        raise ValueError("Packed context invalid: n_samples must be > 0.")
+
+    mean_f64: np.ndarray
+    var_f64: np.ndarray
+    use_rust_stats = bool(_jxrs is not None and hasattr(_jxrs, "bed_packed_decode_stats_f64"))
+    if use_rust_stats:
+        row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+        sum_rows = np.zeros((m,), dtype=np.float64)
+        sq_rows = np.zeros((m,), dtype=np.float64)
+        step = int(max(1, min(8192, n_samples)))
+        threads_raw = os.getenv("JX_MLM_RUST_THREADS", "").strip()
+        try:
+            rust_threads = int(threads_raw) if threads_raw != "" else 0
+        except Exception:
+            rust_threads = 0
+        for st in range(0, n_samples, step):
+            ed = min(st + step, n_samples)
+            sidx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
+            _blk, sum_blk, sq_blk = _jxrs.bed_packed_decode_stats_f64(  # type: ignore[union-attr]
+                packed,
+                int(n_samples),
+                row_flip,
+                maf,
+                sidx,
+                threads=int(rust_threads),
+            )
+            sum_rows += np.asarray(sum_blk, dtype=np.float64).reshape(-1)
+            sq_rows += np.asarray(sq_blk, dtype=np.float64).reshape(-1)
+        mean_f64 = np.asarray(sum_rows / float(n_samples), dtype=np.float64)
+        var_f64 = np.asarray((sq_rows / float(n_samples)) - mean_f64 * mean_f64, dtype=np.float64)
+    else:
+        mean_f64 = np.asarray(2.0 * maf, dtype=np.float64)
+        var_f64 = np.asarray(2.0 * maf * (1.0 - maf), dtype=np.float64)
+
+    # Match dense GS standardization exactly:
+    #   z = (x - mean) / (std + 1e-6)
+    # where std = sqrt(var) computed on the full cohort.
+    var_f64 = np.maximum(var_f64, 0.0)
+    std_f64 = np.sqrt(var_f64, dtype=np.float64)
+    inv_f64 = 1.0 / (std_f64 + 1e-6)
+    inv_f64 = np.asarray(np.where(np.isfinite(inv_f64), inv_f64, 0.0), dtype=np.float64)
+    mean = np.ascontiguousarray(np.asarray(mean_f64, dtype=np.float32), dtype=np.float32)
+    inv = np.ascontiguousarray(np.asarray(inv_f64, dtype=np.float32), dtype=np.float32)
+    packed_ctx["__std_row_mean__"] = mean
+    packed_ctx["__std_row_inv_sd__"] = inv
+    return mean, inv
+
+
+def _decode_packed_subset_to_dense_standardized(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    row_mean: np.ndarray,
+    row_inv_sd: np.ndarray,
+    row_block_size: int = 2048,
+    out_dtype: typing.Any = np.float32,
+) -> np.ndarray:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    m = int(packed.shape[0])
+    n_samples = int(packed_ctx["n_samples"])
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    if int(maf.shape[0]) != m:
+        raise ValueError("Packed context mismatch: maf length != packed rows.")
+    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_out = int(sidx.shape[0])
+    dtype_out = np.dtype(out_dtype)
+    if dtype_out != np.dtype(np.float64):
+        dtype_out = np.dtype(np.float32)
+    out = np.empty((m, n_out), dtype=dtype_out)
+    blk_step = int(max(1, int(row_block_size)))
+    for st in range(0, m, blk_step):
+        ed = min(st + blk_step, m)
+        ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
+        blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+            packed,
+            int(n_samples),
+            ridx,
+            row_flip,
+            maf,
+            sidx,
+        )
+        x = np.ascontiguousarray(np.asarray(blk, dtype=dtype_out), dtype=dtype_out)
+        mu = np.ascontiguousarray(
+            np.asarray(row_mean[st:ed], dtype=dtype_out).reshape(-1, 1),
+            dtype=dtype_out,
+        )
+        inv_sd = np.ascontiguousarray(
+            np.asarray(row_inv_sd[st:ed], dtype=dtype_out).reshape(-1, 1),
+            dtype=dtype_out,
+        )
+        x -= mu
+        x *= inv_sd
+        out[st:ed, :] = x
+    return np.ascontiguousarray(out, dtype=dtype_out)
+
+
 def _predict_rrblup_dense_from_beta(
     *,
     X: np.ndarray,
@@ -1361,6 +1694,49 @@ def _predict_rrblup_packed_from_beta(
                 row_inv_sd=row_inv_sd,
             )
             pred += np.asarray(x.T @ b[st:ed], dtype=np.float32).reshape(-1)
+        out[cst:ced] = pred
+    return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
+def _predict_bayes_packed_from_effects(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    alpha0: float,
+    beta: np.ndarray,
+    row_mean: np.ndarray,
+    row_inv_sd: np.ndarray,
+    snp_block_size: int,
+    sample_chunk_size: int,
+) -> np.ndarray:
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_out = int(sidx.shape[0])
+    if n_out == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+
+    m = int(np.asarray(packed_ctx["packed"]).shape[0])
+    b = np.ascontiguousarray(np.asarray(beta, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if int(b.shape[0]) != m:
+        raise ValueError(f"Bayes beta length mismatch: got {b.shape[0]}, expected {m}.")
+
+    out = np.zeros((n_out,), dtype=np.float64)
+    row_blocks = _iter_row_blocks(m, snp_block_size)
+    chunk = int(max(1, int(sample_chunk_size)))
+    alpha = float(alpha0)
+    for cst in range(0, n_out, chunk):
+        ced = min(cst + chunk, n_out)
+        blk_idx = np.ascontiguousarray(sidx[cst:ced], dtype=np.int64)
+        pred = np.full((int(blk_idx.shape[0]),), alpha, dtype=np.float64)
+        for st, ed, ridx in row_blocks:
+            x = _decode_packed_block_standardized(
+                packed_ctx=packed_ctx,
+                row_idx=ridx,
+                sample_indices=blk_idx,
+                row_mean=row_mean,
+                row_inv_sd=row_inv_sd,
+            )
+            x64 = np.ascontiguousarray(np.asarray(x, dtype=np.float64), dtype=np.float64)
+            pred += np.asarray(x64.T @ b[st:ed], dtype=np.float64).reshape(-1)
         out[cst:ced] = pred
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
@@ -1999,7 +2375,7 @@ def GSapi(
     Y: np.ndarray,
     Xtrain: typing.Any,
     Xtest: typing.Any,
-    method: typing.Literal["GBLUP", "adBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
+    method: typing.Literal["GBLUP", "GBLUP_D", "GBLUP_AD", "rrBLUP", "BayesA", "BayesB", "BayesCpi", "RF", "ET", "GBDT", "XGB", "SVM", "ENET"],
     PCAdec: bool = False,
     n_jobs: int = 1,
     force_fast: bool = False,
@@ -2012,6 +2388,9 @@ def GSapi(
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     rrblup_runtime_state: dict[str, typing.Any] | None = None,
     rrblup_progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
+    bayes_auto_r2: float | None = None,
+    bayes_runtime_state: dict[str, typing.Any] | None = None,
+    bayes_auto_cfg: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -2024,7 +2403,7 @@ def GSapi(
         Genotype matrix for training individuals, shape (m_markers, n_train).
     Xtest : np.ndarray
         Genotype matrix for test individuals, shape (m_markers, n_test).
-    method : {'GBLUP', 'adBLUP', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
+    method : {'GBLUP', 'GBLUP_D', 'GBLUP_AD', 'rrBLUP', 'BayesA', 'BayesB', 'BayesCpi', 'RF', 'ET', 'GBDT', 'XGB', 'SVM', 'ENET'}
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
@@ -2046,6 +2425,14 @@ def GSapi(
         Mutable runtime state sink for rrBLUP AdamW (selected tuning params, diagnostics).
     rrblup_progress_hook : callable, optional
         Progress callback for rrBLUP AdamW epochs and auto-grid trials.
+    bayes_auto_r2 : float, optional
+        Optional precomputed BLUP PVE used as Bayes `r2` prior. When omitted,
+        Bayes models estimate it internally from BLUP.
+    bayes_runtime_state : dict, optional
+        Mutable state sink for Bayes diagnostics (e.g. resolved `r2` source/value).
+    bayes_auto_cfg : dict, optional
+        Bayes auto-r2 configuration. Supports optional BLUP subsampling on
+        large sample sizes to reduce memory usage.
 
     Returns
     -------
@@ -2072,42 +2459,52 @@ def GSapi(
             enabled=PCAdec,
         )
 
-    # Multi-kernel additive+dominance BLUP (pyBLUP/JAX backend)
-    if method == "adBLUP":
+    # Dominance-kernel and additive+dominance GBLUP variants (pyBLUP/JAX backend)
+    if _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
+        mode = _gblup_method_kernel_mode(str(method))
         if (not _HAS_ADBLUP_PY) or KernelBLUP is None or Gmatrix is None:
             raise ImportError(
-                "adBLUP (JAX backend) is unavailable. "
+                "GBLUP(d/ad) (JAX backend) is unavailable. "
                 f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
             )
         gadd_train = np.asarray(Xtrain, dtype=np.float32)
         gadd_test = np.asarray(Xtest, dtype=np.float32)
         if gadd_train.ndim != 2 or gadd_test.ndim != 2:
             raise ValueError(
-                f"adBLUP expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
+                f"GBLUP(d/ad) expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
             )
         if gadd_train.shape[0] != gadd_test.shape[0]:
             raise ValueError(
-                f"adBLUP marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
+                f"GBLUP(d/ad) marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
             )
 
         ghet_train = (gadd_train == 1.0).astype(np.float32, copy=False)
-        Gadd_train = Gmatrix(gadd_train)
         Ghet_train = Gmatrix(ghet_train)
-        model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
+        if mode == "d":
+            model = KernelBLUP(Y.reshape(-1, 1), G=[Ghet_train], progress=False)
+        else:
+            Gadd_train = Gmatrix(gadd_train)
+            model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
 
         if need_train_pred:
-            yhat_train = model.predict(G=[Gadd_train, Ghet_train])
+            if mode == "d":
+                yhat_train = model.predict(G=[Ghet_train])
+            else:
+                yhat_train = model.predict(G=[Gadd_train, Ghet_train])
         else:
             yhat_train = np.zeros((0, 1), dtype=float)
         n_train = int(gadd_train.shape[1])
         if int(gadd_test.shape[1]) > 0:
             gadd_all = np.concatenate([gadd_train, gadd_test], axis=1)
             ghet_all = (gadd_all == 1.0).astype(np.float32, copy=False)
-            Gadd_all = Gmatrix(gadd_all)
             Ghet_all = Gmatrix(ghet_all)
-            Gadd_cross = Gadd_all[n_train:, :n_train]
             Ghet_cross = Ghet_all[n_train:, :n_train]
-            yhat_test = model.predict(G=[Gadd_cross, Ghet_cross])
+            if mode == "d":
+                yhat_test = model.predict(G=[Ghet_cross])
+            else:
+                Gadd_all = Gmatrix(gadd_all)
+                Gadd_cross = Gadd_all[n_train:, :n_train]
+                yhat_test = model.predict(G=[Gadd_cross, Ghet_cross])
         else:
             yhat_test = np.zeros((0, 1), dtype=float)
 
@@ -2779,8 +3176,287 @@ def GSapi(
         return pred_train, pred_test, model.pve
 
     if method in ("BayesA", "BayesB", "BayesCpi"):
-        model = BAYES(Y.reshape(-1, 1), Xtrain, method=method)
+        resolved_bayes_r2: float | None = None
+        if bayes_auto_r2 is not None:
+            try:
+                cand_r2 = float(bayes_auto_r2)
+            except Exception:
+                cand_r2 = float("nan")
+            if np.isfinite(cand_r2):
+                resolved_bayes_r2 = float(cand_r2)
+        if is_packed_input:
+            if not _looks_like_packed_payload(Xtrain):
+                raise ValueError("Packed Bayes requires packed train payload.")
+            packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+            if packed_train_indices is None:
+                n_total = int(packed_train["n_samples"])
+                if n_total != int(np.asarray(Y).reshape(-1).shape[0]):
+                    raise ValueError(
+                        "Packed Bayes requires packed_train_indices when n_train differs from packed n_samples."
+                    )
+                train_abs = np.ascontiguousarray(np.arange(n_total, dtype=np.int64), dtype=np.int64)
+            else:
+                train_abs = np.ascontiguousarray(
+                    np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            if int(train_abs.shape[0]) != int(np.asarray(Y).reshape(-1).shape[0]):
+                raise ValueError(
+                    f"Packed Bayes train index mismatch: got {train_abs.shape[0]}, "
+                    f"expected {np.asarray(Y).reshape(-1).shape[0]}."
+                )
+            if packed_test_indices is None:
+                test_abs = np.zeros((0,), dtype=np.int64)
+            else:
+                test_abs = np.ascontiguousarray(
+                    np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+
+            row_mean, row_inv_sd = _ensure_packed_standard_stats_cached(packed_train)
+            row_flip = _ensure_packed_row_flip_cached(packed_train)
+            packed = np.ascontiguousarray(np.asarray(packed_train["packed"], dtype=np.uint8))
+            maf = np.ascontiguousarray(np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+            n_total_samples = int(packed_train["n_samples"])
+            train_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
+
+            bayes_snp_block = _parse_nonnegative_int(
+                os.getenv("JX_BAYES_PACKED_SNP_BLOCK", "2048")
+            )
+            bayes_sample_chunk = _parse_nonnegative_int(
+                os.getenv("JX_BAYES_PACKED_SAMPLE_CHUNK", "4096")
+            )
+            bayes_snp_block = int(max(1, int(2048 if bayes_snp_block is None else bayes_snp_block)))
+            bayes_sample_chunk = int(max(1, int(4096 if bayes_sample_chunk is None else bayes_sample_chunk)))
+
+            packed_func_name = {
+                "BayesA": "bayesa_packed",
+                "BayesB": "bayesb_packed",
+                "BayesCpi": "bayescpi_packed",
+            }.get(str(method))
+            use_packed_native = bool(
+                (_jxrs is not None)
+                and (packed_func_name is not None)
+                and hasattr(_jxrs, str(packed_func_name))
+            )
+
+            if use_packed_native:
+                y_vec = np.ascontiguousarray(np.asarray(Y, dtype=np.float64).reshape(-1), dtype=np.float64)
+                r2_blup = float("nan")
+                r2_source = "provided"
+                r2_n_used = int(y_vec.shape[0])
+                r2_n_total = int(y_vec.shape[0])
+                if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
+                    r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
+                        y=y_vec,
+                        Xtrain=packed_train,
+                        packed_train_indices=train_abs,
+                        cfg=bayes_auto_cfg,
+                        seed_offset=int(train_abs.shape[0]),
+                    )
+                    r2_fit = float(r2_blup)
+                else:
+                    r2_fit = float(resolved_bayes_r2)
+                r2_used = float(min(0.95, max(0.05, float(r2_fit))))
+
+                packed_kwargs: dict[str, typing.Any] = {
+                    "y": y_vec,
+                    "packed": packed,
+                    "n_samples": int(n_total_samples),
+                    "row_flip": np.ascontiguousarray(np.asarray(row_flip, dtype=np.bool_).reshape(-1), dtype=np.bool_),
+                    "row_maf": maf,
+                    "row_mean": np.ascontiguousarray(np.asarray(row_mean, dtype=np.float32).reshape(-1), dtype=np.float32),
+                    "row_inv_sd": np.ascontiguousarray(np.asarray(row_inv_sd, dtype=np.float32).reshape(-1), dtype=np.float32),
+                    "sample_indices": train_abs,
+                    "x": None,
+                    "n_iter": 400,
+                    "burnin": 200,
+                    "thin": 1,
+                    "r2": float(r2_used),
+                    "seed": None,
+                }
+                if str(method) in {"BayesB", "BayesCpi"}:
+                    packed_kwargs["prob_in"] = 0.5
+                    packed_kwargs["counts"] = 5.0
+                if str(method) == "BayesA":
+                    packed_kwargs["min_abs_beta"] = 1e-9
+
+                packed_fit_fn = getattr(_jxrs, str(packed_func_name))
+                packed_fit_ret = packed_fit_fn(**packed_kwargs)
+                if str(method) == "BayesCpi":
+                    beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2 = packed_fit_ret
+                else:
+                    beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2 = packed_fit_ret
+
+                pve = float(h2_mean)
+                bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+                bayes_alpha = np.ascontiguousarray(np.asarray(alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+                bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
+
+                if bayes_runtime_state is not None:
+                    bayes_runtime_state["r2_used"] = float(r2_used)
+                    bayes_runtime_state["r2_blup"] = float(r2_blup)
+                    bayes_runtime_state["r2_source"] = str(r2_source)
+                    bayes_runtime_state["r2_n_used"] = int(r2_n_used)
+                    bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+
+                if need_train_pred:
+                    if train_pred_idx is None:
+                        train_pred_abs = train_abs
+                    elif int(train_pred_idx.size) == 0:
+                        train_pred_abs = np.zeros((0,), dtype=np.int64)
+                    else:
+                        train_pred_abs = np.ascontiguousarray(
+                            train_abs[np.asarray(train_pred_idx, dtype=np.int64).reshape(-1)],
+                            dtype=np.int64,
+                        )
+                    if int(train_pred_abs.size) > 0:
+                        train_pred = _predict_bayes_packed_from_effects(
+                            packed_ctx=packed_train,
+                            sample_indices=train_pred_abs,
+                            alpha0=bayes_alpha0,
+                            beta=bayes_beta,
+                            row_mean=row_mean,
+                            row_inv_sd=row_inv_sd,
+                            snp_block_size=bayes_snp_block,
+                            sample_chunk_size=bayes_sample_chunk,
+                        )
+                    else:
+                        train_pred = np.zeros((0, 1), dtype=float)
+                else:
+                    train_pred = np.zeros((0, 1), dtype=float)
+
+                if int(test_abs.size) > 0:
+                    test_pred = _predict_bayes_packed_from_effects(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
+                        sample_indices=test_abs,
+                        alpha0=bayes_alpha0,
+                        beta=bayes_beta,
+                        row_mean=row_mean,
+                        row_inv_sd=row_inv_sd,
+                        snp_block_size=bayes_snp_block,
+                        sample_chunk_size=bayes_sample_chunk,
+                    )
+                else:
+                    test_pred = np.zeros((0, 1), dtype=float)
+                return (
+                    np.asarray(train_pred, dtype=float).reshape(-1, 1),
+                    np.asarray(test_pred, dtype=float).reshape(-1, 1),
+                    pve,
+                )
+
+            # Fallback for old extension builds without packed Bayes kernels.
+            r2_blup_fb = float("nan")
+            r2_source_fb = "provided"
+            r2_n_used_fb = int(np.asarray(Y).reshape(-1).shape[0])
+            r2_n_total_fb = int(np.asarray(Y).reshape(-1).shape[0])
+            if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
+                r2_blup_fb, r2_source_fb, r2_n_used_fb, r2_n_total_fb = _estimate_bayes_auto_r2_from_blup(
+                    y=Y,
+                    Xtrain=packed_train,
+                    packed_train_indices=train_abs,
+                    cfg=bayes_auto_cfg,
+                    seed_offset=int(train_abs.shape[0]) + 17,
+                )
+                resolved_bayes_r2 = float(r2_blup_fb)
+            dense_train = _decode_packed_subset_to_dense_standardized(
+                packed_ctx=packed_train,
+                sample_indices=train_abs,
+                row_mean=row_mean,
+                row_inv_sd=row_inv_sd,
+                out_dtype=np.float64,
+            )
+            model = BAYES(Y.reshape(-1, 1), dense_train, method=method, r2=resolved_bayes_r2)
+            pve = model.pve
+            if bayes_runtime_state is not None:
+                bayes_runtime_state["r2_used"] = float(getattr(model, "r2_used", np.nan))
+                model_r2_blup = float(getattr(model, "r2_blup", np.nan))
+                bayes_runtime_state["r2_blup"] = (
+                    float(model_r2_blup)
+                    if np.isfinite(model_r2_blup)
+                    else float(r2_blup_fb)
+                )
+                model_r2_source = str(getattr(model, "r2_source", "")).strip()
+                bayes_runtime_state["r2_source"] = (
+                    model_r2_source
+                    if model_r2_source != ""
+                    else str(r2_source_fb)
+                )
+                bayes_runtime_state["r2_n_used"] = int(r2_n_used_fb)
+                bayes_runtime_state["r2_n_total"] = int(r2_n_total_fb)
+            bayes_beta = np.ascontiguousarray(
+                np.asarray(getattr(model, "beta_hat", np.zeros((0, 1))), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            bayes_alpha = np.ascontiguousarray(
+                np.asarray(getattr(model, "alpha_hat", np.asarray([[0.0]], dtype=np.float64)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            bayes_alpha0 = float(bayes_alpha[0]) if int(bayes_alpha.shape[0]) > 0 else 0.0
+
+            if need_train_pred:
+                if train_pred_idx is None:
+                    train_pred = model.predict(dense_train)
+                elif int(train_pred_idx.size) == 0:
+                    train_pred = np.zeros((0, 1), dtype=float)
+                else:
+                    train_pred = model.predict(np.asarray(dense_train)[:, train_pred_idx])
+            else:
+                train_pred = np.zeros((0, 1), dtype=float)
+
+            del dense_train
+            gc.collect()
+
+            if int(test_abs.size) > 0:
+                test_pred = _predict_bayes_packed_from_effects(
+                    packed_ctx=typing.cast(dict[str, typing.Any], Xtest),
+                    sample_indices=test_abs,
+                    alpha0=bayes_alpha0,
+                    beta=bayes_beta,
+                    row_mean=row_mean,
+                    row_inv_sd=row_inv_sd,
+                    snp_block_size=bayes_snp_block,
+                    sample_chunk_size=bayes_sample_chunk,
+                )
+            else:
+                test_pred = np.zeros((0, 1), dtype=float)
+            return (
+                np.asarray(train_pred, dtype=float).reshape(-1, 1),
+                np.asarray(test_pred, dtype=float).reshape(-1, 1),
+                pve,
+            )
+
+        if resolved_bayes_r2 is None or (not np.isfinite(float(resolved_bayes_r2))):
+            r2_blup, r2_source, r2_n_used, r2_n_total = _estimate_bayes_auto_r2_from_blup(
+                y=Y,
+                Xtrain=Xtrain,
+                packed_train_indices=None,
+                cfg=bayes_auto_cfg,
+                seed_offset=int(np.asarray(Y).reshape(-1).shape[0]),
+            )
+            resolved_bayes_r2 = float(r2_blup)
+        else:
+            r2_blup = float("nan")
+            r2_source = "provided"
+            r2_n_used = int(np.asarray(Y).reshape(-1).shape[0])
+            r2_n_total = int(np.asarray(Y).reshape(-1).shape[0])
+        model = BAYES(Y.reshape(-1, 1), Xtrain, method=method, r2=resolved_bayes_r2)
         pve = model.pve
+        if bayes_runtime_state is not None:
+            bayes_runtime_state["r2_used"] = float(getattr(model, "r2_used", np.nan))
+            model_r2_blup = float(getattr(model, "r2_blup", np.nan))
+            if np.isfinite(model_r2_blup):
+                bayes_runtime_state["r2_blup"] = float(model_r2_blup)
+            else:
+                bayes_runtime_state["r2_blup"] = float(r2_blup)
+            model_r2_source = str(getattr(model, "r2_source", "")).strip()
+            bayes_runtime_state["r2_source"] = (
+                model_r2_source
+                if model_r2_source != ""
+                else str(r2_source)
+            )
+            bayes_runtime_state["r2_n_used"] = int(r2_n_used)
+            bayes_runtime_state["r2_n_total"] = int(r2_n_total)
         if need_train_pred:
             if train_pred_idx is None:
                 train_pred = model.predict(Xtrain)
@@ -2860,10 +3536,19 @@ def _run_method_task(
     limit_predtrain: int | None = None,
     rrblup_solver: str = "auto",
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    bayes_auto_r2_cache: dict[str, float] | None = None,
+    bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
 ) -> dict[str, typing.Any]:
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     rrblup_pve_rows: list[dict[str, typing.Any]] = []
     rrblup_pve_final: dict[str, typing.Any] | None = None
+    rrblup_final_state: dict[str, typing.Any] | None = None
+    rrblup_final_cfg: dict[str, typing.Any] | None = None
+    bayes_r2_rows: list[float] = []
+    bayes_r2_final = float("nan")
+    bayes_r2_source_final = ""
+    bayes_r2_n_used_final = 0
+    bayes_r2_n_total_final = 0
     best_test = None
     best_train = None
     best_r2 = -np.inf
@@ -2871,6 +3556,59 @@ def _run_method_task(
     rrblup_cfg_base = dict(rrblup_adamw_cfg or {})
     if method == "rrBLUP":
         rrblup_cfg_base["auto_pcg_ref_n"] = int(np.asarray(train_pheno).reshape(-1).shape[0])
+    packed_lmm_methods = {"GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"}
+    bayes_methods = {"BayesA", "BayesB", "BayesCpi"}
+    bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
+    bayes_cv_reuse_enabled = bool(
+        method in bayes_methods
+        and cv_splits is not None
+        and _cfg_truthy(bayes_cfg_base.get("cv_reuse", "on"), default=True)
+    )
+    bayes_cv_shared_key = f"{method}:cv_shared"
+    bayes_cv_shared_r2 = float("nan")
+    bayes_cv_shared_source = ""
+    bayes_cv_shared_n_used = 0
+    bayes_cv_shared_n_total = 0
+    if bayes_cv_reuse_enabled:
+        if bayes_auto_r2_cache is not None:
+            cached_shared = float(bayes_auto_r2_cache.get(bayes_cv_shared_key, np.nan))
+            if np.isfinite(cached_shared):
+                bayes_cv_shared_r2 = float(cached_shared)
+                bayes_cv_shared_source = "cache"
+        if not np.isfinite(bayes_cv_shared_r2):
+            try:
+                if (packed_ctx is not None) and _looks_like_packed_payload(packed_ctx):
+                    if train_sample_indices is None:
+                        raise ValueError("Packed Bayes CV-r2 reuse requires train_sample_indices.")
+                    bayes_cv_shared_r2, _src, _n_used, _n_total = _estimate_bayes_auto_r2_from_blup(
+                        y=train_pheno,
+                        Xtrain=typing.cast(dict[str, typing.Any], packed_ctx),
+                        packed_train_indices=np.ascontiguousarray(
+                            np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        ),
+                        cfg=bayes_cfg_base,
+                        seed_offset=int(np.asarray(train_pheno).reshape(-1).shape[0]) + 101,
+                    )
+                else:
+                    if train_snp is None:
+                        raise ValueError("Bayes CV-r2 reuse requires train_snp when packed context is absent.")
+                    bayes_cv_shared_r2, _src, _n_used, _n_total = _estimate_bayes_auto_r2_from_blup(
+                        y=train_pheno,
+                        Xtrain=train_snp,
+                        packed_train_indices=None,
+                        cfg=bayes_cfg_base,
+                        seed_offset=int(np.asarray(train_pheno).reshape(-1).shape[0]) + 101,
+                    )
+                bayes_cv_shared_source = str(_src)
+                bayes_cv_shared_n_used = int(_n_used)
+                bayes_cv_shared_n_total = int(_n_total)
+                if np.isfinite(bayes_cv_shared_r2) and bayes_auto_r2_cache is not None:
+                    bayes_auto_r2_cache[bayes_cv_shared_key] = float(bayes_cv_shared_r2)
+            except Exception:
+                # Fail-open: if shared pre-estimation fails, fallback to fold-level auto-r2.
+                bayes_cv_shared_r2 = float("nan")
+
     rrblup_cv_reuse_enabled = bool(
         method == "rrBLUP"
         and cv_splits is not None
@@ -2942,11 +3680,16 @@ def _run_method_task(
         )
         return {
             "method": method,
+            "method_display": _method_display_name(method),
             "fold_rows": [],
             "best_test": None,
             "best_train": None,
             "test_pred": pred,
             "pve_final": float(pve_final),
+            "ml_tuning": None,
+            "rrblup_final_state": None,
+            "rrblup_final_cfg": None,
+            "rrblup_cv_selected": None,
         }
 
     if method in _ML_METHOD_MAP and (not strict_cv):
@@ -3192,7 +3935,7 @@ def _run_method_task(
                 else:
                     yhat_train = np.zeros((0, 1), dtype=float)
             else:
-                if (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
+                if (packed_payload is not None) and (method in packed_lmm_methods):
                     if train_sample_indices is None:
                         raise ValueError("Packed LMM requires train sample indices.")
                     fold_train = packed_payload
@@ -3200,7 +3943,7 @@ def _run_method_task(
                     fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[fold_train_idx], dtype=np.int64)
                     fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[fold_test_idx], dtype=np.int64)
                     fold_pca = False
-                elif method == "adBLUP":
+                elif _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
                     if train_snp_add is None:
                         raise ValueError(f"{method} requires additive raw genotype matrix.")
                     fold_train = train_snp_add[:, fold_train_idx]
@@ -3229,12 +3972,26 @@ def _run_method_task(
                         rr_cfg_call["auto_grid"] = "off"
                     rr_state_call = {}
                 rr_progress_call = None
+                bayes_r2_call: float | None = None
+                bayes_state_call: dict[str, typing.Any] | None = None
+                bayes_r2_cache_key: str | None = None
                 if method == "rrBLUP" and rrblup_progress_hook is not None:
                     def _fold_rr_progress(event: str, payload: dict[str, typing.Any], *, _fold_id: int = int(fold_id), _cv_total: int = int(cv_total)) -> None:
                         pp = dict(payload)
                         pp.setdefault("phase_label", f"fold {_fold_id}/{_cv_total}")
                         rrblup_progress_hook(str(event), pp)
                     rr_progress_call = _fold_rr_progress
+                if method in {"BayesA", "BayesB", "BayesCpi"}:
+                    if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
+                        bayes_r2_call = float(bayes_cv_shared_r2)
+                        bayes_r2_cache_key = bayes_cv_shared_key
+                    else:
+                        bayes_r2_cache_key = f"cv:{int(fold_id)}"
+                        if bayes_auto_r2_cache is not None:
+                            cached_r2 = float(bayes_auto_r2_cache.get(bayes_r2_cache_key, np.nan))
+                            if np.isfinite(cached_r2):
+                                bayes_r2_call = float(cached_r2)
+                    bayes_state_call = {}
                 yhat_train, yhat_test, pve = GSapi(
                     train_pheno[fold_train_idx],
                     fold_train,
@@ -3252,7 +4009,20 @@ def _run_method_task(
                     rrblup_adamw_cfg=rr_cfg_call,
                     rrblup_runtime_state=rr_state_call,
                     rrblup_progress_hook=rr_progress_call,
+                    bayes_auto_r2=bayes_r2_call,
+                    bayes_runtime_state=bayes_state_call,
+                    bayes_auto_cfg=bayes_auto_r2_cfg,
                 )
+                if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_call is not None:
+                    r2_used = float(bayes_state_call.get("r2_used", np.nan))
+                    if np.isfinite(r2_used):
+                        bayes_r2_rows.append(float(r2_used))
+                        if (
+                            (bayes_auto_r2_cache is not None)
+                            and (bayes_r2_cache_key is not None)
+                            and (not (bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2)))
+                        ):
+                            bayes_auto_r2_cache[bayes_r2_cache_key] = float(r2_used)
                 if (
                     method == "rrBLUP"
                     and rrblup_cv_reuse_enabled
@@ -3398,16 +4168,21 @@ def _run_method_task(
                 )
         return {
             "method": method,
+            "method_display": _method_display_name(method),
             "fold_rows": fold_rows,
             "best_test": best_test,
             "best_train": best_train,
             "test_pred": np.asarray(test_pred, dtype=float).reshape(-1, 1),
             "pve_final": float(fit_final["pve"]),
+            "ml_tuning": ml_tuning_cache,
+            "rrblup_final_state": None,
+            "rrblup_final_cfg": None,
+            "rrblup_cv_selected": None,
         }
 
     final_train_idx_arg = None
     final_test_idx_arg = None
-    if (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
+    if (packed_payload is not None) and (method in packed_lmm_methods):
         if train_sample_indices is None or test_sample_indices is None:
             raise ValueError("Packed LMM requires train/test sample indices.")
         final_train = packed_payload
@@ -3415,7 +4190,7 @@ def _run_method_task(
         final_pca = False
         final_train_idx_arg = np.ascontiguousarray(train_sample_indices, dtype=np.int64)
         final_test_idx_arg = np.ascontiguousarray(test_sample_indices, dtype=np.int64)
-    elif method == "adBLUP":
+    elif _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
         if train_snp_add is None or test_snp_add is None:
             raise ValueError(f"{method} requires additive raw genotype matrices.")
         final_train = train_snp_add
@@ -3436,7 +4211,7 @@ def _run_method_task(
     # full-data fit does not contribute to fold metrics and only adds runtime.
     # Keep default behavior for all other cases.
     final_test_n = 0
-    if (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
+    if (packed_payload is not None) and (method in packed_lmm_methods):
         final_test_n = int(0 if final_test_idx_arg is None else int(final_test_idx_arg.size))
     elif hasattr(final_test, "shape") and len(getattr(final_test, "shape")) >= 2:
         final_test_n = int(final_test.shape[1])
@@ -3464,7 +4239,7 @@ def _run_method_task(
                 gblup_final_test_train is None
                 or int(gblup_final_test_train.shape[0]) == 0
             )
-        elif (packed_payload is not None) and (method in ("GBLUP", "rrBLUP")):
+        elif (packed_payload is not None) and (method in packed_lmm_methods):
             skip_final_fit = bool(final_test_idx_arg is not None and int(final_test_idx_arg.size) == 0)
         else:
             skip_final_fit = bool(
@@ -3480,6 +4255,14 @@ def _run_method_task(
         else:
             pve_final = float("nan")
         if method == "rrBLUP":
+            rrblup_final_cfg = dict(rrblup_cfg_base)
+            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+                rrblup_final_cfg["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
+                rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
+                if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
+                    rrblup_final_cfg["lr"] = float(rr_sel_lr)
+                rrblup_final_cfg["lambda_auto"] = "off"
+                rrblup_final_cfg["auto_grid"] = "off"
             tv = np.asarray(
                 [float(x.get("pve_trainvar", np.nan)) for x in rrblup_pve_rows],
                 dtype=np.float64,
@@ -3527,6 +4310,9 @@ def _run_method_task(
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
         rr_state_final: dict[str, typing.Any] | None = None
         rr_progress_final = None
+        bayes_r2_final_call: float | None = None
+        bayes_state_final: dict[str, typing.Any] | None = None
+        bayes_r2_final_key: str | None = None
         if method == "rrBLUP":
             rr_cfg_final = dict(rrblup_cfg_base)
             if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
@@ -3536,6 +4322,7 @@ def _run_method_task(
                     rr_cfg_final["lr"] = float(rr_sel_lr)
                 rr_cfg_final["lambda_auto"] = "off"
                 rr_cfg_final["auto_grid"] = "off"
+            rrblup_final_cfg = dict(rr_cfg_final)
             rr_state_final = {}
             if rrblup_progress_hook is not None:
                 def _final_rr_progress(event: str, payload: dict[str, typing.Any]) -> None:
@@ -3543,6 +4330,17 @@ def _run_method_task(
                     pp.setdefault("phase_label", "final")
                     rrblup_progress_hook(str(event), pp)
                 rr_progress_final = _final_rr_progress
+        if method in {"BayesA", "BayesB", "BayesCpi"}:
+            if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
+                bayes_r2_final_key = bayes_cv_shared_key
+                bayes_r2_final_call = float(bayes_cv_shared_r2)
+            else:
+                bayes_r2_final_key = "final"
+                if bayes_auto_r2_cache is not None:
+                    cached_r2 = float(bayes_auto_r2_cache.get(bayes_r2_final_key, np.nan))
+                    if np.isfinite(cached_r2):
+                        bayes_r2_final_call = float(cached_r2)
+            bayes_state_final = {}
         _, test_pred, pve_final = GSapi(
             train_pheno,
             final_train,
@@ -3559,7 +4357,35 @@ def _run_method_task(
             rrblup_adamw_cfg=rr_cfg_final,
             rrblup_runtime_state=rr_state_final,
             rrblup_progress_hook=rr_progress_final,
+            bayes_auto_r2=bayes_r2_final_call,
+            bayes_runtime_state=bayes_state_final,
+            bayes_auto_cfg=bayes_auto_r2_cfg,
         )
+        if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_final is not None:
+            r2_used_final = float(bayes_state_final.get("r2_used", np.nan))
+            if np.isfinite(r2_used_final):
+                bayes_r2_final = float(r2_used_final)
+                bayes_r2_source_final = str(bayes_state_final.get("r2_source", "")).strip()
+                try:
+                    bayes_r2_n_used_final = int(bayes_state_final.get("r2_n_used", 0))
+                except Exception:
+                    bayes_r2_n_used_final = 0
+                try:
+                    bayes_r2_n_total_final = int(bayes_state_final.get("r2_n_total", 0))
+                except Exception:
+                    bayes_r2_n_total_final = 0
+                if bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2):
+                    bayes_r2_source_final = "cv_shared_reuse"
+                    if bayes_cv_shared_n_used > 0:
+                        bayes_r2_n_used_final = int(bayes_cv_shared_n_used)
+                    if bayes_cv_shared_n_total > 0:
+                        bayes_r2_n_total_final = int(bayes_cv_shared_n_total)
+                if (
+                    (bayes_auto_r2_cache is not None)
+                    and (bayes_r2_final_key is not None)
+                    and (not (bayes_cv_reuse_enabled and np.isfinite(bayes_cv_shared_r2)))
+                ):
+                    bayes_auto_r2_cache[bayes_r2_final_key] = float(r2_used_final)
         if method == "rrBLUP" and rr_state_final is not None:
             mode_used = str((rr_cfg_final or {}).get("pve_mode", "trainvar")).strip().lower()
             if mode_used not in {"lambda", "trainvar"}:
@@ -3586,10 +4412,33 @@ def _run_method_task(
                     )
                 ),
             }
+            rrblup_final_state = dict(rr_state_final)
         if ml_tuning_cache is not None:
             pve_final = float(ml_tuning_cache.get("pve", np.nan))
+    if (
+        method in {"BayesA", "BayesB", "BayesCpi"}
+        and (not np.isfinite(bayes_r2_final))
+        and len(bayes_r2_rows) > 0
+    ):
+        bayes_r2_final = float(np.nanmean(np.asarray(bayes_r2_rows, dtype=np.float64)))
+    if (
+        method in {"BayesA", "BayesB", "BayesCpi"}
+        and (bayes_r2_source_final == "")
+        and bayes_cv_reuse_enabled
+        and np.isfinite(bayes_cv_shared_r2)
+    ):
+        bayes_r2_source_final = (
+            "cv_shared_reuse"
+            if bayes_cv_shared_source == ""
+            else f"cv_shared_reuse:{bayes_cv_shared_source}"
+        )
+        if bayes_r2_n_used_final <= 0 and bayes_cv_shared_n_used > 0:
+            bayes_r2_n_used_final = int(bayes_cv_shared_n_used)
+        if bayes_r2_n_total_final <= 0 and bayes_cv_shared_n_total > 0:
+            bayes_r2_n_total_final = int(bayes_cv_shared_n_total)
     return {
         "method": method,
+        "method_display": _method_display_name(method),
         "fold_rows": fold_rows,
         "rrblup_pve_rows": rrblup_pve_rows,
         "rrblup_pve_final": rrblup_pve_final,
@@ -3597,6 +4446,14 @@ def _run_method_task(
         "best_train": best_train,
         "test_pred": test_pred,
         "pve_final": float(pve_final),
+        "bayes_r2_final": float(bayes_r2_final),
+        "bayes_r2_source_final": str(bayes_r2_source_final),
+        "bayes_r2_n_used_final": int(bayes_r2_n_used_final),
+        "bayes_r2_n_total_final": int(bayes_r2_n_total_final),
+        "ml_tuning": ml_tuning_cache,
+        "rrblup_final_state": rrblup_final_state,
+        "rrblup_final_cfg": rrblup_final_cfg,
+        "rrblup_cv_selected": rrblup_cv_selected,
     }
 
 
@@ -3621,18 +4478,175 @@ def _run_methods_parallel(
     elapsed_offset_by_method: dict[str, float] | None = None,
     rrblup_solver: str = "auto",
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
+    bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
 
     model_n_jobs = max(1, int(n_jobs))
     offset_map = dict(elapsed_offset_by_method or {})
+    method_display_map = {
+        str(m): _method_display_name(str(m))
+        for m in methods
+    }
+
+    def _method_display(name: str) -> str:
+        return str(method_display_map.get(str(name), str(name)))
 
     def _method_offset(name: str) -> float:
         try:
             return max(0.0, float(offset_map.get(str(name), 0.0)))
         except Exception:
             return 0.0
+
+    def _method_detail_rows(
+        method: str,
+        result: dict[str, typing.Any],
+    ) -> list[tuple[str, str]]:
+        m = str(method)
+        rows: list[tuple[str, str]] = []
+        if _is_gblup_method(m):
+            mode = _gblup_method_kernel_mode(m)
+            rows.append(("kernel", _gblup_mode_label(mode)))
+            rows.append(("variance component", "REML/FaST"))
+            if mode in {"d", "ad"}:
+                rows.append(("backend", "pyBLUP/JAX"))
+            else:
+                rows.append(
+                    (
+                        "backend",
+                        ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense"),
+                    )
+                )
+            return rows
+
+        if m == "rrBLUP":
+            rr_state = dict(
+                typing.cast(
+                    dict[str, typing.Any] | None,
+                    result.get("rrblup_final_state"),
+                )
+                or {}
+            )
+            rr_cfg = dict(
+                typing.cast(
+                    dict[str, typing.Any] | None,
+                    result.get("rrblup_final_cfg"),
+                )
+                or dict(rrblup_adamw_cfg or {})
+            )
+            solver_req = str(rrblup_solver).strip().lower()
+            solver_used = str(rr_state.get("solver", solver_req)).strip().lower()
+            if solver_req != solver_used:
+                rows.append(("solver", f"{solver_req} -> {solver_used.upper()}"))
+            else:
+                rows.append(("solver", solver_used.upper()))
+
+            if solver_used == "pcg":
+                lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
+                if np.isfinite(lam_raw):
+                    lam_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
+                    rows.append(("lambda", f"{lam_raw:.6g} ({lam_scale})"))
+                rows.append(
+                    (
+                        "PCG",
+                        (
+                            f"tol={float(rr_cfg.get('pcg_tol', np.nan)):.1e}, "
+                            f"max_iter={int(max(1, int(rr_cfg.get('pcg_max_iter', 0))))}"
+                        ),
+                    )
+                )
+            elif solver_used == "adamw":
+                lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
+                if np.isfinite(lam_raw):
+                    lam_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
+                    rows.append(("lambda", f"{lam_raw:.6g} ({lam_scale})"))
+                rows.append(
+                    (
+                        "AdamW",
+                        (
+                            f"lr={float(rr_cfg.get('lr', np.nan)):.6g}, "
+                            f"batch={int(max(1, int(rr_cfg.get('batch_size', 0))))}, "
+                            f"epochs={int(max(1, int(rr_cfg.get('epochs', 0))))}"
+                        ),
+                    )
+                )
+
+            pve_mode = str(rr_state.get("pve_mode_used", rr_cfg.get("pve_mode", "trainvar"))).strip().lower()
+            if pve_mode != "":
+                rows.append(("PVE mode", pve_mode))
+            return rows
+
+        if m in {"BayesA", "BayesB", "BayesCpi"}:
+            rows.append(("n_iter/burnin/thin", "400/200/1"))
+            r2_blup = float(result.get("bayes_r2_final", np.nan))
+            r2_src = str(result.get("bayes_r2_source_final", "")).strip()
+            r2_n_used = int(max(0, int(result.get("bayes_r2_n_used_final", 0) or 0)))
+            r2_n_total = int(max(0, int(result.get("bayes_r2_n_total_final", 0) or 0)))
+            if np.isfinite(r2_blup):
+                if r2_n_total > 0 and r2_n_used > 0 and r2_n_used < r2_n_total:
+                    rows.append(
+                        ("r2", f"auto (BLUP pve={r2_blup:.6g}, n={r2_n_used}/{r2_n_total})")
+                    )
+                elif r2_src.startswith("cv_shared_reuse"):
+                    rows.append(("r2", f"auto (BLUP pve={r2_blup:.6g}, cv-shared)"))
+                else:
+                    rows.append(("r2", f"auto (BLUP pve={r2_blup:.6g})"))
+            else:
+                rows.append(("r2", "auto (BLUP pve=NA)"))
+            if m in {"BayesB", "BayesCpi"}:
+                rows.append(("prob_in/counts", "0.5/5.0"))
+            return rows
+
+        if m in _ML_METHOD_MAP:
+            tune = typing.cast(dict[str, typing.Any] | None, result.get("ml_tuning"))
+            if tune is None:
+                return rows
+            params = dict(typing.cast(dict[str, typing.Any], tune.get("params", {})))
+            key_pref = {
+                "RF": ["n_estimators", "max_features", "max_depth"],
+                "ET": ["n_estimators", "max_features", "max_depth"],
+                "GBDT": ["max_iter", "learning_rate", "max_depth"],
+                "XGB": ["n_estimators", "learning_rate", "max_depth"],
+                "SVM": ["C", "gamma", "epsilon"],
+                "ENET": ["alpha", "l1_ratio"],
+            }
+            shown = 0
+            for k in key_pref.get(m, []):
+                if k in params:
+                    rows.append((str(k), str(params.get(k))))
+                    shown += 1
+            if shown == 0:
+                for k, v in list(sorted(params.items(), key=lambda kv: str(kv[0])))[:3]:
+                    rows.append((str(k), str(v)))
+            return rows
+
+        return rows
+
+    # Keep detail value column aligned across methods in the same run.
+    # Example: GBLUP `additive`, rrBLUP `auto -> EXACT`, Bayes `400/200/1`
+    # should start from one shared column.
+    detail_key_width = 0
+    for _m in methods:
+        try:
+            for _k, _v in _method_detail_rows(str(_m), {}):
+                detail_key_width = max(detail_key_width, len(str(_k)))
+        except Exception:
+            continue
+    detail_key_width = max(8, int(detail_key_width))
+
+    def _emit_method_details_plain(
+        method: str,
+        result: dict[str, typing.Any],
+        *,
+        line_printer: typing.Callable[[str], None],
+    ) -> None:
+        rows = _method_detail_rows(str(method), result)
+        if len(rows) == 0:
+            return
+        key_w = max(int(detail_key_width), max(len(str(k)) for k, _ in rows))
+        for k, v in rows:
+            line_printer(f"{str(k):<{key_w}}  {str(v)}")
 
     def _method_expects_rrblup_iter_progress(name: str) -> bool:
         if str(name) != "rrBLUP":
@@ -3678,6 +4692,7 @@ def _run_methods_parallel(
     # Force serial execution for all GS methods to avoid cross-method contention
     # and keep runtime behavior consistent.
     method_parallel_jobs = 1
+    bayes_auto_r2_cache_shared: dict[str, float] = {}
     if method_parallel_jobs <= 1:
         out: list[dict[str, typing.Any]] = []
         fold_total_map = {
@@ -3700,6 +4715,7 @@ def _run_methods_parallel(
             assert progress is not None
             with progress:
                 for m in methods:
+                    m_disp = _method_display(str(m))
                     cv_total = int(max(1, fold_total_map.get(m, 1)))
                     has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
                     has_rrblup_iter_progress = bool(
@@ -3732,7 +4748,7 @@ def _run_methods_parallel(
                             progress.update(
                                 search_task_id,
                                 advance=left,
-                                label=f"{m} search {int(search_total)}/{int(search_total)}",
+                                label=f"{m_disp} search {int(search_total)}/{int(search_total)}",
                             )
                         try:
                             progress.remove_task(search_task_id)
@@ -3748,7 +4764,7 @@ def _run_methods_parallel(
                             cv_task_id = progress.add_task(
                                 description="",
                                 total=cv_total,
-                                label=f"{m} cv",
+                                label=f"{m_disp} cv",
                                 counter=f"{cv_done}/{cv_total}",
                             )
 
@@ -3760,10 +4776,10 @@ def _run_methods_parallel(
 
                     def _adam_label(stage: str, done: int, total: int) -> str:
                         if str(stage) == "grid":
-                            return f"{m} adam search"
+                            return f"{m_disp} adam search"
                         if str(stage) == "pcg":
-                            return f"{m} pcg"
-                        return f"{m} adam"
+                            return f"{m_disp} pcg"
+                        return f"{m_disp} adam"
 
                     def _adam_counter(done: int, total: int) -> str:
                         return f"{int(done)}/{int(total)}"
@@ -3911,14 +4927,14 @@ def _run_methods_parallel(
                             lambda_task_id = progress.add_task(
                                 description="",
                                 total=lambda_total,
-                                label=f"{m} lambda search",
+                                label=f"{m_disp} lambda search",
                                 counter=f"{lambda_done}/{lambda_total}",
                             )
                         progress.update(
                             lambda_task_id,
                             total=lambda_total,
                             completed=min(lambda_done, lambda_total),
-                            label=f"{m} lambda search",
+                            label=f"{m_disp} lambda search",
                             counter=f"{lambda_done}/{lambda_total}",
                         )
 
@@ -3930,7 +4946,7 @@ def _run_methods_parallel(
                                     lambda_task_id,
                                     total=max(1, int(lambda_total)),
                                     completed=max(0, int(lambda_total)),
-                                    label=f"{m} lambda search",
+                                    label=f"{m_disp} lambda search",
                                     counter=f"{int(max(0, lambda_total))}/{int(max(1, lambda_total))}",
                                 )
                             try:
@@ -3954,14 +4970,14 @@ def _run_methods_parallel(
                                 search_task_id = progress.add_task(
                                     description="",
                                     total=int(max(1, search_total)),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                     counter="",
                                 )
                             else:
                                 progress.update(
                                     search_task_id,
                                     total=int(max(1, search_total)),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                 )
                             return
                         if ev == "search_plan":
@@ -3976,14 +4992,14 @@ def _run_methods_parallel(
                                 search_task_id = progress.add_task(
                                     description="",
                                     total=int(max(1, search_total)),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                     counter="",
                                 )
                             else:
                                 progress.update(
                                     search_task_id,
                                     total=int(max(1, search_total)),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                 )
                             return
                         if ev == "search_advance":
@@ -3996,7 +5012,7 @@ def _run_methods_parallel(
                                 search_task_id = progress.add_task(
                                     description="",
                                     total=int(max(1, search_total)),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                     counter="",
                                 )
                             left = max(0, int(search_total) - int(search_done))
@@ -4007,7 +5023,7 @@ def _run_methods_parallel(
                                     search_task_id,
                                     total=int(max(1, search_total)),
                                     advance=int(adv),
-                                    label=f"{m} search {search_done}/{search_total}",
+                                    label=f"{m_disp} search {search_done}/{search_total}",
                                 )
 
                     def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
@@ -4076,6 +5092,10 @@ def _run_methods_parallel(
                                 label=_adam_label(adam_stage, adam_done, adam_total),
                                 counter=_adam_counter(adam_done, adam_total),
                             )
+                            # Reset per-round PCG sub-progress elapsed timer:
+                            # close current task at round end so next round creates
+                            # a fresh task with elapsed starting from 0.
+                            _close_adam_task()
                             return
                         if ev == "adam_start":
                             _ensure_adam_task(payload, event="start")
@@ -4126,7 +5146,7 @@ def _run_methods_parallel(
                             progress.update(
                                 cv_task_id,
                                 advance=adv,
-                                label=f"{m} cv",
+                                label=f"{m_disp} cv",
                                 counter=f"{cv_done}/{cv_total}",
                             )
 
@@ -4158,6 +5178,8 @@ def _run_methods_parallel(
                             limit_predtrain=limit_predtrain,
                             rrblup_solver=rrblup_solver,
                             rrblup_adamw_cfg=rrblup_adamw_cfg,
+                            bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
+                            bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                         )
                     except Exception:
                         _close_search_task()
@@ -4170,7 +5192,7 @@ def _run_methods_parallel(
                                 pass
                         elapsed = format_elapsed(time.monotonic() - t0)
                         progress.console.print(
-                            f"[red]{failure_symbol()} {m} ...Failed [{elapsed}][/red]"
+                            f"[red]{failure_symbol()} {m_disp} ...Failed [{elapsed}][/red]"
                         )
                         raise
                     _close_search_task()
@@ -4183,7 +5205,7 @@ def _run_methods_parallel(
                             progress.update(
                                 cv_task_id,
                                 advance=left_cv,
-                                label=f"{m} cv",
+                                label=f"{m_disp} cv",
                                 counter=f"{cv_done}/{cv_total}",
                             )
                         if cv_task_id is not None:
@@ -4196,12 +5218,18 @@ def _run_methods_parallel(
                     out.append(res)
                     elapsed = format_elapsed(time.monotonic() - t0)
                     progress.console.print(
-                        f"[green]{success_symbol()} {m} ...Finished [{elapsed}][/green]"
+                        f"[green]{success_symbol()} {m_disp} ...Finished [{elapsed}][/green]"
+                    )
+                    _emit_method_details_plain(
+                        m,
+                        res,
+                        line_printer=lambda s: progress.console.print(s, highlight=False),
                     )
             return out
         for m in methods:
             t0 = time.monotonic()
             method_offset = _method_offset(str(m))
+            m_disp = _method_display(str(m))
             cv_total = int(max(1, fold_total_map.get(m, 1)))
             has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
             has_rrblup_iter_progress = bool(
@@ -4256,7 +5284,7 @@ def _run_methods_parallel(
                 assert tqdm is not None
                 cv_bar = tqdm(
                     total=cv_total,
-                    desc=f"{m} cv",
+                    desc=f"{m_disp} cv",
                     unit="fold",
                     leave=False,
                     dynamic_ncols=True,
@@ -4273,10 +5301,10 @@ def _run_methods_parallel(
 
             def _adam_desc(stage: str, done: int, total: int) -> str:
                 if str(stage) == "grid":
-                    return f"{m} adam search"
+                    return f"{m_disp} adam search"
                 if str(stage) == "pcg":
-                    return f"{m} pcg"
-                return f"{m} adam"
+                    return f"{m_disp} pcg"
+                return f"{m_disp} adam"
 
             def _adam_progress_values(
                 event: str,
@@ -4427,7 +5455,7 @@ def _run_methods_parallel(
                     assert tqdm is not None
                     lambda_bar = tqdm(
                         total=lambda_total,
-                        desc=f"{m} lambda search",
+                        desc=f"{m_disp} lambda search",
                         unit="cfg",
                         leave=False,
                         dynamic_ncols=True,
@@ -4438,7 +5466,7 @@ def _run_methods_parallel(
                 lambda_bar.total = int(max(1, lambda_total))
                 lambda_bar.n = int(min(max(0, lambda_done), max(1, lambda_total)))
                 lambda_bar.set_description_str(
-                    f"{m} lambda search",
+                    f"{m_disp} lambda search",
                     refresh=False,
                 )
                 lambda_bar.set_postfix_str("", refresh=False)
@@ -4459,7 +5487,7 @@ def _run_methods_parallel(
                 assert tqdm is not None
                 search_bar = tqdm(
                     total=int(max(1, search_total)),
-                    desc=f"{m} search {search_done}/{max(1, int(search_total))}",
+                    desc=f"{m_disp} search {search_done}/{max(1, int(search_total))}",
                     unit="cfg",
                     leave=False,
                     dynamic_ncols=True,
@@ -4483,7 +5511,7 @@ def _run_methods_parallel(
                     if search_bar is not None:
                         search_bar.total = int(max(1, search_total))
                         search_bar.set_description_str(
-                            f"{m} search {search_done}/{max(1, int(search_total))}",
+                            f"{m_disp} search {search_done}/{max(1, int(search_total))}",
                             refresh=False,
                         )
                         search_bar.refresh()
@@ -4500,7 +5528,7 @@ def _run_methods_parallel(
                     if search_bar is not None:
                         search_bar.total = int(max(1, search_total))
                         search_bar.set_description_str(
-                            f"{m} search {search_done}/{max(1, int(search_total))}",
+                            f"{m_disp} search {search_done}/{max(1, int(search_total))}",
                             refresh=False,
                         )
                         if stage != "":
@@ -4522,7 +5550,7 @@ def _run_methods_parallel(
                         search_done += adv
                         search_bar.total = int(max(1, search_total))
                         search_bar.set_description_str(
-                            f"{m} search {search_done}/{max(1, int(search_total))}",
+                            f"{m_disp} search {search_done}/{max(1, int(search_total))}",
                             refresh=False,
                         )
                         if stage != "":
@@ -4591,6 +5619,9 @@ def _run_methods_parallel(
                     )
                     adam_bar.set_postfix_str("", refresh=False)
                     adam_bar.refresh()
+                    # Reset per-round PCG sub-progress elapsed timer by closing
+                    # this bar at the end of each PCG round.
+                    _close_adam_bar()
                     return
                 if ev == "adam_start":
                     _ensure_adam_bar(payload, event="start")
@@ -4644,7 +5675,7 @@ def _run_methods_parallel(
                     cv_done += adv
                     cv_bar.update(adv)
                     cv_bar.set_description_str(
-                        f"{m} cv",
+                        f"{m_disp} cv",
                         refresh=True,
                     )
 
@@ -4652,7 +5683,7 @@ def _run_methods_parallel(
                 _ensure_cv_bar()
 
             method_status = (
-                CliStatus(f"Loading {m}...", enabled=True, use_process=True)
+                CliStatus(f"Loading {m_disp}...", enabled=True, use_process=True)
                 if enable_method_spinner
                 else None
             )
@@ -4688,6 +5719,8 @@ def _run_methods_parallel(
                         limit_predtrain=limit_predtrain,
                         rrblup_solver=rrblup_solver,
                         rrblup_adamw_cfg=rrblup_adamw_cfg,
+                        bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
+                        bayes_auto_r2_cfg=bayes_auto_r2_cfg,
                     )
                 except Exception:
                     _close_search_bar()
@@ -4696,9 +5729,9 @@ def _run_methods_parallel(
                     _close_cv_bar()
                     elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                     if method_status is not None:
-                        method_status.fail(f"{m} ...Failed")
+                        method_status.fail(f"{m_disp} ...Failed")
                     else:
-                        print_failure(f"{m} ...Failed [{elapsed}]", force_color=True)
+                        print_failure(f"{m_disp} ...Failed [{elapsed}]", force_color=True)
                     raise
 
                 _close_search_bar()
@@ -4711,7 +5744,7 @@ def _run_methods_parallel(
                             cv_done += left_cv
                             cv_bar.update(left_cv)
                         cv_bar.set_description_str(
-                            f"{m} cv",
+                            f"{m_disp} cv",
                             refresh=True,
                         )
                 _close_adam_bar()
@@ -4721,9 +5754,14 @@ def _run_methods_parallel(
                 out.append(res)
                 elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                 if method_status is not None:
-                    method_status.complete(f"{m} ...Finished")
+                    method_status.complete(f"{m_disp} ...Finished")
                 else:
-                    print_success(f"{m} ...Finished [{elapsed}]", force_color=True)
+                    print_success(f"{m_disp} ...Finished [{elapsed}]", force_color=True)
+                _emit_method_details_plain(
+                    m,
+                    res,
+                    line_printer=lambda s: print(s, flush=True),
+                )
             finally:
                 if method_status is not None:
                     method_status.__exit__(None, None, None)
@@ -4779,8 +5817,9 @@ def _run_methods_parallel(
                         (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                         + _method_offset(str(method))
                     )
+                    method_disp = _method_display(str(method))
                     print_failure(
-                        f"{method} ...Failed [{elapsed}]",
+                        f"{method_disp} ...Failed [{elapsed}]",
                         force_color=True,
                     )
                     raise
@@ -4788,9 +5827,15 @@ def _run_methods_parallel(
                     (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                     + _method_offset(str(method))
                 )
+                method_disp = _method_display(str(method))
                 print_success(
-                    f"{method} ...Finished [{elapsed}]",
+                    f"{method_disp} ...Finished [{elapsed}]",
                     force_color=True,
+                )
+                _emit_method_details_plain(
+                    method,
+                    results_by_method[method],
+                    line_printer=lambda s: print(s, flush=True),
                 )
     elif bool(show_method_progress and rich_progress_available()):
         progress = build_rich_progress(
@@ -4817,10 +5862,11 @@ def _run_methods_parallel(
             task_map: dict[str, int] = {}
             method_start_ts: dict[str, float] = {}
             for method in methods:
+                method_disp = _method_display(str(method))
                 task_map[method] = progress.add_task(
                     description="",
                     total=task_total_map[method],
-                    method=method,
+                    method=method_disp,
                     fold_done=0,
                     fold_total=fold_total_map[method],
                     suffix="",
@@ -4901,7 +5947,12 @@ def _run_methods_parallel(
                                 (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                                 + _method_offset(str(method))
                             )
-                            _rich_print_success(method, elapsed)
+                            _rich_print_success(_method_display(str(method)), elapsed)
+                            _emit_method_details_plain(
+                                method,
+                                res,
+                                line_printer=lambda s: progress.console.print(s, highlight=False),
+                            )
             except Exception:
                 for method, tid in task_map.items():
                     try:
@@ -4912,7 +5963,7 @@ def _run_methods_parallel(
                         (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                         + _method_offset(str(method))
                     )
-                    _rich_print_failure(method, elapsed)
+                    _rich_print_failure(_method_display(str(method)), elapsed)
                 raise
             finally:
                 try:
@@ -4980,14 +6031,19 @@ def _run_methods_parallel(
                             f"Methods {methods_done}/{method_total}",
                             refresh=True,
                         )
-                        pbar.set_postfix(method=method)
+                        pbar.set_postfix(method=_method_display(str(method)))
                         elapsed = format_elapsed(
                             (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                             + _method_offset(str(method))
                         )
                         print_success(
-                            f"{method} ...Finished [{elapsed}]",
+                            f"{_method_display(str(method))} ...Finished [{elapsed}]",
                             force_color=True,
+                        )
+                        _emit_method_details_plain(
+                            method,
+                            res,
+                            line_printer=lambda s: print(s, flush=True),
                         )
         finally:
             pbar.close()
@@ -6442,7 +7498,7 @@ def main(log: bool = True) -> None:
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5",
             "jx gs -hmp geno.hmp.gz -p pheno.tsv -GBLUP -cv 5",
             "jx gs -file geno_prefix -p pheno.tsv -GBLUP -cv 5",
-            "jx gs -vcf geno.vcf.gz -p pheno.tsv -adBLUP -cv 5",
+            "jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP ad -cv 5",
             "jx gs -vcf geno.vcf.gz -p pheno.tsv -RF -ET -GBDT -SVM -ENET -cv 5",
             "jx gs -bfile geno_prefix -p pheno.tsv -GBLUP -rrBLUP",
         ]),
@@ -6491,17 +7547,21 @@ def main(log: bool = True) -> None:
     model_group = parser.add_argument_group("Model Arguments")
     model_group.add_argument(
         "-GBLUP", "--GBLUP",
-        action="store_true",
-        default=False,
-        help="Use GBLUP model for training and prediction "
-             "(default: %(default)s).",
+        action="append",
+        nargs="*",
+        metavar="KERNEL",
+        default=None,
+        help=(
+            "Use GBLUP model for training and prediction. Optional kernel token(s): "
+            "a|d|ad. Example: -GBLUP, -GBLUP a, -GBLUP d, -GBLUP ad. "
+            "No token defaults to additive (a)."
+        ),
     )
     model_group.add_argument(
         "-adBLUP", "--adBLUP",
         action="store_true",
         default=False,
-        help="Use additive+dominance kernel BLUP via pyBLUP/JAX backend "
-             "(default: %(default)s).",
+        help=argparse.SUPPRESS,
     )
     model_group.add_argument(
         "-rrBLUP", "--rrBLUP",
@@ -6892,6 +7952,43 @@ def main(log: bool = True) -> None:
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
+        "--bayes-r2-cv-reuse",
+        type=str,
+        choices=("on", "off"),
+        default="on",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--bayes-r2-subsample-min-n",
+        type=int,
+        default=10000,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--bayes-r2-subsample-n",
+        type=int,
+        default=2000,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--bayes-r2-subsample-max-n",
+        type=int,
+        default=_RRBLUP_LAMBDA_SUBSAMPLE_MAX_N,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--bayes-r2-subsample-repeats",
+        type=int,
+        default=_RRBLUP_LAMBDA_SUBSAMPLE_REPEATS,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--bayes-r2-subsample-seed",
+        type=int,
+        default=42,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
         "-pcd", "--pcd",
         action="store_true",
         default=False,
@@ -7035,6 +8132,14 @@ def main(log: bool = True) -> None:
         parser.error("--rrblup-pcg-std-eps must be a finite value > 0.")
     if int(args.packed_lmm_auto_min_cells) <= 0:
         parser.error("--packed-lmm-auto-min-cells must be > 0.")
+    if int(args.bayes_r2_subsample_min_n) <= 1:
+        parser.error("--bayes-r2-subsample-min-n must be > 1.")
+    if int(args.bayes_r2_subsample_n) <= 1:
+        parser.error("--bayes-r2-subsample-n must be > 1.")
+    if int(args.bayes_r2_subsample_max_n) <= 1:
+        parser.error("--bayes-r2-subsample-max-n must be > 1.")
+    if int(args.bayes_r2_subsample_repeats) <= 0:
+        parser.error("--bayes-r2-subsample-repeats must be > 0.")
     try:
         args.ldprune_spec = _parse_ld_prune_args(args.ldprune)
     except ValueError as e:
@@ -7074,6 +8179,21 @@ def main(log: bool = True) -> None:
 
     if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
         parser.error("--hash dim must be > 0.")
+
+    gblup_modes = _parse_gblup_kernel_modes(
+        typing.cast(list[list[str]] | None, args.GBLUP)
+    )
+    if bool(args.adBLUP):
+        if "ad" not in gblup_modes:
+            gblup_modes.append("ad")
+        try:
+            # Use stderr warning before logging setup.
+            sys.stderr.write(
+                "[warn] -adBLUP is deprecated; use -GBLUP ad instead.\n"
+            )
+        except Exception:
+            pass
+    gblup_methods = [_gblup_mode_to_method(m) for m in gblup_modes]
 
     rrblup_solver = str(args.rrblup_solver).strip().lower()
     rrblup_adamw_cfg: dict[str, typing.Any] = {
@@ -7116,6 +8236,15 @@ def main(log: bool = True) -> None:
         "pcg_max_iter": int(args.rrblup_pcg_max_iter),
         "pcg_std_eps": float(args.rrblup_pcg_std_eps),
         "pcg_block_rows": int(args.rrblup_snp_block_size),
+    }
+    bayes_auto_r2_cfg: dict[str, typing.Any] = {
+        "cv_reuse": str(args.bayes_r2_cv_reuse),
+        "subsample_min_n": int(args.bayes_r2_subsample_min_n),
+        "subsample_n": int(args.bayes_r2_subsample_n),
+        "subsample_min_samples": int(_RRBLUP_LAMBDA_SUBSAMPLE_MIN_N),
+        "subsample_max_n": int(args.bayes_r2_subsample_max_n),
+        "subsample_repeats": int(args.bayes_r2_subsample_repeats),
+        "subsample_seed": int(args.bayes_r2_subsample_seed),
     }
 
     # ------------------------------------------------------------------
@@ -7186,12 +8315,13 @@ def main(log: bool = True) -> None:
         bool(args.rrBLUP) and (rr_solver_mode == "pcg")
     )
     gfile_is_plink = _is_plink_prefix(str(gfile))
-    lmm_only_requested = bool(
-        (bool(args.GBLUP) or bool(args.rrBLUP))
-        and (not bool(args.adBLUP))
-        and (not bool(args.BayesA))
-        and (not bool(args.BayesB))
-        and (not bool(args.BayesCpi))
+    gblup_add_requested = bool("a" in gblup_modes)
+    gblup_nonadd_requested = bool(any(m in {"d", "ad"} for m in gblup_modes))
+    bayes_requested = bool(bool(args.BayesA) or bool(args.BayesB) or bool(args.BayesCpi))
+    packed_model_requested = bool(gblup_add_requested or bool(args.rrBLUP) or bayes_requested)
+    packed_only_requested = bool(
+        packed_model_requested
+        and (not gblup_nonadd_requested)
         and (not bool(args.RF))
         and (not bool(args.ET))
         and (not bool(args.GBDT))
@@ -7206,27 +8336,33 @@ def main(log: bool = True) -> None:
     if (
         (not gfile_is_plink)
         and _cfg_truthy(getattr(args, "packed_lmm_auto", "on"), default=True)
-        and lmm_only_requested
+        and packed_only_requested
         and (bool(args.vcf) or bool(args.hmp) or bool(args.file))
     ):
-        try:
-            _probe_ids, _probe_m = inspect_genotype_file(
-                str(gfile),
-                snps_only=False,
-                maf=float(args.maf),
-                missing_rate=float(args.geno),
-            )
-            probe_n_samples = int(len(_probe_ids))
-            packed_auto_cells = int(max(0, len(_probe_ids))) * int(max(0, int(_probe_m)))
-            auto_packed_lmm_requested = bool(packed_auto_cells >= packed_auto_min_cells)
-        except Exception as ex:
-            # Fail open for memory-safety: if probing fails, prefer packed fallback.
+        # For Bayes on VCF/HMP inputs, prefer packed path by default to avoid
+        # dense genotype peak memory. Keep legacy size-threshold probing for
+        # other packed-eligible model combinations.
+        if bayes_requested and (bool(args.vcf) or bool(args.hmp)):
             auto_packed_lmm_requested = True
-            if bool(debug_mode):
-                logger.warning(
-                    "Packed LMM auto probe failed; defaulting to packed-preprocess path. "
-                    f"reason: {ex}"
+        else:
+            try:
+                _probe_ids, _probe_m = inspect_genotype_file(
+                    str(gfile),
+                    snps_only=False,
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
                 )
+                probe_n_samples = int(len(_probe_ids))
+                packed_auto_cells = int(max(0, len(_probe_ids))) * int(max(0, int(_probe_m)))
+                auto_packed_lmm_requested = bool(packed_auto_cells >= packed_auto_min_cells)
+            except Exception as ex:
+                # Fail open for memory-safety: if probing fails, prefer packed fallback.
+                auto_packed_lmm_requested = True
+                if bool(debug_mode):
+                    logger.warning(
+                        "Packed LMM auto probe failed; defaulting to packed-preprocess path. "
+                        f"reason: {ex}"
+                    )
     if (
         (not pcg_requested)
         and bool(args.rrBLUP)
@@ -7333,119 +8469,6 @@ def main(log: bool = True) -> None:
                 "Auto packed LMM cache requested but input is not convertible; fallback to dense path."
             )
 
-    # Configuration summary
-    if log:
-        ncol_cfg = (
-            "All"
-            if args.ncol is None
-            else ",".join(str(int(i)) for i in args.ncol)
-        )
-        cfg_rows: list[tuple[str, object]] = [
-            ("Genotype file", gfile),
-            ("Phenotype file", args.pheno),
-            ("Analysis Pcol", ncol_cfg),
-        ]
-        model_count = 0
-        if args.GBLUP:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "GBLUP"))
-        if args.adBLUP:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "adBLUP"))
-        if args.rrBLUP:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "rrBLUP"))
-        if args.BayesA:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "BayesA"))
-        if args.BayesB:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "BayesB"))
-        if args.BayesCpi:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "BayesCpi"))
-        if args.RF:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "RF"))
-        if args.ET:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "ET"))
-        if args.GBDT:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "GBDT"))
-        if args.XGB:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "XGB"))
-        if args.SVM:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "SVM"))
-        if args.ENET:
-            model_count += 1
-            cfg_rows.append((f"Used model{model_count}", "ENET"))
-        cfg_rows.extend(
-            [
-                ("Use PCA", args.pcd),
-                ("MAF threshold", args.maf),
-                ("Missing rate", args.geno),
-                (
-                    "LD prune",
-                    (
-                        args.ldprune_spec.label()
-                        if getattr(args, "ldprune_spec", None) is not None
-                        else "off"
-                    ),
-                ),
-                ("Hash dim", ("off" if args.hash_dim is None else int(args.hash_dim))),
-                (
-                    "Hash standardize",
-                    ("n/a" if args.hash_dim is None else (not bool(args.hash_raw))),
-                ),
-                ("Hash seed", ("" if args.hash_dim is None else int(args.hash_seed))),
-                ("Threads", f"{args.thread} ({detected_threads} available)"),
-                ("Limit train-pred", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
-                ("Strict CV", args.strict_cv),
-                ("Force fast Gram", args.force_fast),
-                ("Packed LMM auto", str(args.packed_lmm_auto)),
-                ("Packed LMM auto min-cells", int(packed_auto_min_cells)),
-                (
-                    "Packed LMM probed cells",
-                    ("" if packed_auto_cells is None else int(packed_auto_cells)),
-                ),
-                ("Packed LMM active", bool(gfile_is_plink and lmm_only_requested)),
-            ]
-        )
-        if bool(args.rrBLUP):
-            cfg_rows.extend(
-                [
-                    ("rrBLUP solver", rrblup_solver),
-                    ("rrBLUP lambda", float(args.rrblup_lambda)),
-                    ("rrBLUP lambda-scale", str(args.rrblup_lambda_scale)),
-                    ("rrBLUP lambda-auto", str(args.rrblup_lambda_auto)),
-                    ("rrBLUP auto PCG min-n", int(args.rrblup_auto_pcg_min_n)),
-                    ("rrBLUP lambda subsample n", int(args.rrblup_lambda_subsample_n)),
-                    ("rrBLUP lambda subsample repeats", int(args.rrblup_lambda_subsample_repeats)),
-                    ("rrBLUP AdamW lr", float(args.rrblup_lr)),
-                    ("rrBLUP AdamW epochs", int(args.rrblup_epochs)),
-                    ("rrBLUP AdamW batch", int(args.rrblup_batch_size)),
-                    ("rrBLUP AdamW batch-threads", int(args.rrblup_batch_threads)),
-                    ("rrBLUP AdamW snp-block", int(args.rrblup_snp_block_size)),
-                    ("rrBLUP PCG tol", float(args.rrblup_pcg_tol)),
-                    ("rrBLUP PCG max-iter", int(args.rrblup_pcg_max_iter)),
-                    ("rrBLUP PVE mode", str(args.rrblup_pve_mode)),
-                    ("rrBLUP auto-grid", str(args.rrblup_auto_grid)),
-                    ("rrBLUP grid-reuse-cv", str(args.rrblup_grid_reuse_cv)),
-                ]
-            )
-        emit_cli_configuration(
-            logger,
-            app_title="JanusX - GS",
-            config_title="GS CONFIG",
-            host=socket.gethostname(),
-            sections=[("General", cfg_rows)],
-            footer_rows=[("Output prefix", outprefix)],
-            line_max_chars=60,
-        )
-
     checks: list[bool] = []
     if gfile_is_plink:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
@@ -7456,6 +8479,174 @@ def main(log: bool = True) -> None:
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
+
+    # ------------------------------------------------------------------
+    # Collect methods to run
+    # ------------------------------------------------------------------
+    methods: list[str] = []
+    methods.extend(list(gblup_methods))
+    if args.rrBLUP:
+        methods.append("rrBLUP")
+    if args.BayesA:
+        methods.append("BayesA")
+    if args.BayesB:
+        methods.append("BayesB")
+    if args.BayesCpi:
+        methods.append("BayesCpi")
+    if args.RF:
+        methods.append("RF")
+    if args.ET:
+        methods.append("ET")
+    if args.GBDT:
+        methods.append("GBDT")
+    if args.XGB:
+        methods.append("XGB")
+    if args.SVM:
+        methods.append("SVM")
+    if args.ENET:
+        methods.append("ENET")
+    # keep order, drop duplicates
+    if len(methods) > 1:
+        _seen_methods: set[str] = set()
+        _uniq_methods: list[str] = []
+        for _m in methods:
+            if _m in _seen_methods:
+                continue
+            _seen_methods.add(_m)
+            _uniq_methods.append(_m)
+        methods = _uniq_methods
+    if len(methods) == 0:
+        logger.error(
+            "No model selected. Use "
+            "--GBLUP [a|d|ad]/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET."
+        )
+        raise SystemExit(1)
+    ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
+    gblup_d_like_methods = [
+        m for m in methods
+        if _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
+    ]
+    if (len(gblup_d_like_methods) > 0) and (not _HAS_ADBLUP_PY):
+        methods = [m for m in methods if m not in set(gblup_d_like_methods)]
+        logger.warning(
+            "Skip GBLUP(d/ad) because JAX backend dependency is unavailable. "
+            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
+        )
+
+    if any(m in ml_methods for m in methods) and (not _HAS_SKLEARN):
+        skipped_ml = [m for m in methods if m in ml_methods]
+        methods = [m for m in methods if m not in ml_methods]
+        logger.warning(
+            format_missing_dependency_message(
+                "Skip ML models (RF/ET/GBDT/SVM/ENET/XGB) because scikit-learn is unavailable.",
+                packages=("scikit-learn",),
+                extra="ml",
+                original_error=_SKLEARN_IMPORT_ERROR,
+            )
+        )
+        logger.warning("Skipped models: " + ", ".join(skipped_ml))
+
+    if ("XGB" in methods) and (not _HAS_XGBOOST):
+        methods = [m for m in methods if m != "XGB"]
+        logger.warning(
+            format_missing_dependency_message(
+                "Skip model XGB because xgboost could not be imported.",
+                packages=("xgboost",),
+                extra="ml",
+                original_error=_XGBOOST_IMPORT_ERROR,
+            )
+        )
+
+    if len(methods) == 0:
+        logger.error(
+            "All selected models were skipped due to missing optional dependencies."
+        )
+        raise SystemExit(1)
+
+    if log:
+        ncol_cfg = (
+            "All"
+            if args.ncol is None
+            else ",".join(str(int(i)) for i in args.ncol)
+        )
+        cv_cfg = (
+            "off"
+            if args.cv is None
+            else f"{int(args.cv)}-fold, strict={bool(args.strict_cv)}"
+        )
+        ld_cfg = (
+            args.ldprune_spec.label()
+            if getattr(args, "ldprune_spec", None) is not None
+            else "off"
+        )
+        if args.hash_dim is None:
+            hash_cfg = "off"
+        else:
+            hash_cfg = (
+                f"k={int(args.hash_dim)}, seed={int(args.hash_seed)}, "
+                f"std={'on' if (not bool(args.hash_raw)) else 'off'}"
+            )
+        model_rows: list[tuple[str, object]] = []
+        for i, m in enumerate(methods, start=1):
+            detail = ""
+            if _is_gblup_method(str(m)):
+                detail = f"kernel={_gblup_mode_label(_gblup_method_kernel_mode(str(m)))}"
+            elif str(m) == "rrBLUP":
+                solver_txt = str(rrblup_solver).strip().lower()
+                if solver_txt == "auto":
+                    n_hint = probe_n_samples
+                    if n_hint is not None:
+                        solver_txt = (
+                            "auto->PCG"
+                            if int(n_hint) > int(max(2, int(args.rrblup_auto_pcg_min_n)))
+                            else "auto->exact"
+                        )
+                    else:
+                        solver_txt = "auto"
+                detail = f"solver={solver_txt}"
+            elif str(m) in {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}:
+                detail = "compact tuning=on"
+            elif str(m) in {"BayesA", "BayesB", "BayesCpi"}:
+                detail = "bayesian marker model"
+            model_rows.append((f"{i}. {_method_display_name(str(m))}", detail))
+
+        emit_cli_configuration(
+            logger,
+            app_title="JanusX GS configuration",
+            config_title="GS configuration",
+            host=socket.gethostname(),
+            sections=[
+                (
+                    "Input",
+                    [
+                        ("Genotype", gfile),
+                        ("Phenotype", args.pheno),
+                        ("Trait/Pcol", ncol_cfg),
+                    ],
+                ),
+                (
+                    "Data filters",
+                    [
+                        ("MAF", float(args.maf)),
+                        ("Missing", float(args.geno)),
+                        ("LD prune", ld_cfg),
+                        ("Hash", hash_cfg),
+                        ("PCA", ("on" if bool(args.pcd) else "off")),
+                    ],
+                ),
+                (
+                    "Runtime",
+                    [
+                        ("Threads", int(args.thread)),
+                        ("CV", cv_cfg),
+                        ("Train prediction", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
+                    ],
+                ),
+                ("Enabled models", model_rows),
+            ],
+            footer_rows=[("Output prefix", outprefix)],
+            line_max_chars=62,
+        )
 
     # ------------------------------------------------------------------
     # Load phenotype
@@ -7498,101 +8689,21 @@ def main(log: bool = True) -> None:
                 seen.add(i)
         pheno = pheno.iloc[:, unique_cols]
 
-    # ------------------------------------------------------------------
-    # Collect methods to run
-    # ------------------------------------------------------------------
-    methods: list[str] = []
-    if args.GBLUP:
-        methods.append("GBLUP")
-    if args.adBLUP:
-        methods.append("adBLUP")
-    if args.rrBLUP:
-        methods.append("rrBLUP")
-    if args.BayesA:
-        methods.append("BayesA")
-    if args.BayesB:
-        methods.append("BayesB")
-    if args.BayesCpi:
-        methods.append("BayesCpi")
-    if args.RF:
-        methods.append("RF")
-    if args.ET:
-        methods.append("ET")
-    if args.GBDT:
-        methods.append("GBDT")
-    if args.XGB:
-        methods.append("XGB")
-    if args.SVM:
-        methods.append("SVM")
-    if args.ENET:
-        methods.append("ENET")
-    # keep order, drop duplicates
-    if len(methods) > 1:
-        _seen_methods: set[str] = set()
-        _uniq_methods: list[str] = []
-        for _m in methods:
-            if _m in _seen_methods:
-                continue
-            _seen_methods.add(_m)
-            _uniq_methods.append(_m)
-        methods = _uniq_methods
-    if len(methods) == 0:
-        logger.error(
-            "No model selected. Use "
-            "--GBLUP/--adBLUP/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET."
-        )
-        raise SystemExit(1)
-    ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
-
-    if ("adBLUP" in methods) and (not _HAS_ADBLUP_PY):
-        methods = [m for m in methods if m != "adBLUP"]
-        logger.warning(
-            "Skip model adBLUP because backend dependency is unavailable. "
-            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
-        )
-
-    if any(m in ml_methods for m in methods) and (not _HAS_SKLEARN):
-        skipped_ml = [m for m in methods if m in ml_methods]
-        methods = [m for m in methods if m not in ml_methods]
-        logger.warning(
-            format_missing_dependency_message(
-                "Skip ML models (RF/ET/GBDT/SVM/ENET/XGB) because scikit-learn is unavailable.",
-                packages=("scikit-learn",),
-                extra="ml",
-                original_error=_SKLEARN_IMPORT_ERROR,
-            )
-        )
-        logger.warning("Skipped models: " + ", ".join(skipped_ml))
-
-    if ("XGB" in methods) and (not _HAS_XGBOOST):
-        methods = [m for m in methods if m != "XGB"]
-        logger.warning(
-            format_missing_dependency_message(
-                "Skip model XGB because xgboost could not be imported.",
-                packages=("xgboost",),
-                extra="ml",
-                original_error=_XGBOOST_IMPORT_ERROR,
-            )
-        )
-
-    if len(methods) == 0:
-        logger.error(
-            "All selected models were skipped due to missing optional dependencies."
-        )
-        raise SystemExit(1)
-
     # Runtime-thread default tuning for packed GBLUP/rrBLUP:
     # When users do not explicitly set a policy, prefer aligned caps so
     # `-t` applies to both BLAS and Rust runtimes consistently.
     policy_env_raw = str(os.getenv("JX_THREAD_POLICY", "")).strip()
-    gblup_only_models = bool(len(methods) > 0 and all(m in {"GBLUP", "rrBLUP"} for m in methods))
-    if (args.hash_dim is not None) and ("adBLUP" in methods):
-        logger.error("--hash is currently not supported together with adBLUP.")
+    gblup_only_models = bool(len(methods) > 0 and all(m in {_GBLUP_METHOD_ADD, "rrBLUP"} for m in methods))
+    if (args.hash_dim is not None) and any(
+        _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
+        for m in methods
+    ):
+        logger.error("--hash is currently not supported together with -GBLUP d/ad.")
         raise SystemExit(1)
     hash_gblup_only_mode = bool(
         (args.hash_dim is not None)
         and (len(methods) == 1)
-        and (methods[0] == "GBLUP")
+        and (methods[0] == _GBLUP_METHOD_ADD)
     )
     if (policy_env_raw == "") and bool(gfile_is_plink) and gblup_only_models:
         os.environ["JX_THREAD_POLICY"] = "align"
@@ -7620,17 +8731,27 @@ def main(log: bool = True) -> None:
 
     if bool(debug_mode):
         logger.info("Effective models: " + ", ".join(methods))
-    if ("adBLUP" in methods) and args.pcd:
-        logger.info("Note: --pcd is ignored for adBLUP.")
+    if any(
+        _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
+        for m in methods
+    ) and args.pcd:
+        logger.info("Note: --pcd is ignored for -GBLUP d/ad.")
 
     # ------------------------------------------------------------------
     # Load genotype
     # ------------------------------------------------------------------
     gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
+    packed_eligible_methods = {
+        _GBLUP_METHOD_ADD,
+        "rrBLUP",
+        "BayesA",
+        "BayesB",
+        "BayesCpi",
+    }
     use_packed_lmm = bool(
         gfile_is_plink
         and len(methods) > 0
-        and all(m in {"GBLUP", "rrBLUP"} for m in methods)
+        and all(m in packed_eligible_methods for m in methods)
     )
     ldprune_spec = typing.cast(
         _GsLdPruneSpec | None,
@@ -7791,13 +8912,14 @@ def main(log: bool = True) -> None:
                 need_std_geno = bool(
                     any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods)
                 )
-                need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+                need_add_raw = _methods_need_additive_dense(methods)
+                need_raw_geno = bool(need_add_raw or any(m in ml_methods for m in methods))
                 geno_raw = (
                     np.asarray(geno, dtype=np.float32, copy=need_std_geno)
                     if need_raw_geno
                     else None
                 )
-                geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+                geno_add_raw = geno_raw if need_add_raw else None
                 geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
                 if need_std_geno:
                     geno = (geno - geno.mean(axis=1, keepdims=True)) / (
@@ -7951,13 +9073,14 @@ def main(log: bool = True) -> None:
         use_packed_lmm = False
 
         need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
-        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        need_add_raw = _methods_need_additive_dense(methods)
+        need_raw_geno = bool(need_add_raw or any(m in ml_methods for m in methods))
         geno_raw = (
             np.asarray(geno, dtype=np.float32, copy=need_std_geno)
             if need_raw_geno
             else None
         )
-        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_add_raw = geno_raw if need_add_raw else None
         geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
         if need_std_geno:
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
@@ -8056,13 +9179,14 @@ def main(log: bool = True) -> None:
         use_packed_lmm = False
 
         need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
-        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        need_add_raw = _methods_need_additive_dense(methods)
+        need_raw_geno = bool(need_add_raw or any(m in ml_methods for m in methods))
         geno_raw = (
             np.asarray(geno, dtype=np.float32, copy=need_std_geno)
             if need_raw_geno
             else None
         )
-        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_add_raw = geno_raw if need_add_raw else None
         geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
         if need_std_geno:
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
@@ -8086,13 +9210,14 @@ def main(log: bool = True) -> None:
         # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
         # so we skip global z-score standardization here to avoid redundant work.
         need_std_geno = bool(any(m in {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} for m in methods))
-        need_raw_geno = bool(("adBLUP" in methods) or any(m in ml_methods for m in methods))
+        need_add_raw = _methods_need_additive_dense(methods)
+        need_raw_geno = bool(need_add_raw or any(m in ml_methods for m in methods))
         geno_raw = (
             np.asarray(geno, dtype=np.float32, copy=need_std_geno)
             if need_raw_geno
             else None
         )
-        geno_add_raw = geno_raw if ("adBLUP" in methods) else None
+        geno_add_raw = geno_raw if need_add_raw else None
         geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
         if need_std_geno:
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
@@ -8751,9 +9876,11 @@ def main(log: bool = True) -> None:
                     f"shape={test_snp.shape} bytes={int(test_snp.nbytes)} "
                     f"elapsed={time.time() - t_stage:.3f}s"
                 )
-            if "adBLUP" in methods:
+            if _methods_need_additive_dense(methods):
                 if geno_add_raw is None:
-                    raise RuntimeError("Internal error: additive genotype matrix for adBLUP is missing.")
+                    raise RuntimeError(
+                        "Internal error: additive genotype matrix for GBLUP(d/ad) is missing."
+                    )
                 train_snp_add = geno_add_raw[:, trainmask]
                 test_snp_add = geno_add_raw[:, testmask]
             if any(m in ml_methods for m in methods):
@@ -8780,7 +9907,7 @@ def main(log: bool = True) -> None:
                 if (trait_use_packed_lmm and trait_packed_ctx is not None)
                 else int(train_snp.shape[0] if train_snp is not None else 0)
             )
-        if gblup_backend_label is None and ("GBLUP" in methods) and (train_snp is not None):
+        if gblup_backend_label is None and (_GBLUP_METHOD_ADD in methods) and (train_snp is not None):
             gblup_backend_n = int(train_pheno.shape[0])
             gblup_backend_m = int(train_snp.shape[0])
             gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
@@ -8823,6 +9950,7 @@ def main(log: bool = True) -> None:
             elapsed_offset_by_method=method_elapsed_offsets,
             rrblup_solver=rrblup_solver,
             rrblup_adamw_cfg=rrblup_adamw_cfg,
+            bayes_auto_r2_cfg=bayes_auto_r2_cfg,
         )
         if _GS_DEBUG_STAGE:
             logger.info(
@@ -8830,6 +9958,7 @@ def main(log: bool = True) -> None:
                 f"elapsed={time.time() - t_stage:.3f}s"
             )
         method_result_map = {str(x["method"]): x for x in method_results}
+        method_display_map = {str(m): _method_display_name(str(m)) for m in methods}
 
         if args.cv is not None:
             logger.info("-" * 60)
@@ -8873,7 +10002,7 @@ def main(log: bool = True) -> None:
                 logger.info(
                     row_fmt.format(
                         fold=int(fold_id),
-                        method=str(m_name),
+                        method=method_display_map.get(str(m_name), str(m_name)),
                         pear=f"{float(pear):.3f}",
                         spear=f"{float(spear):.3f}",
                         r2=f"{float(r2):.3f}",
@@ -8894,7 +10023,9 @@ def main(log: bool = True) -> None:
                 gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
                 for ax in fig.axes:
                     if str(ax.get_ylabel()).strip() == "Predicted Value":
-                        ax.set_ylabel(f"Predicted Value ({method})")
+                        ax.set_ylabel(
+                            f"Predicted Value ({method_display_map.get(str(method), str(method))})"
+                        )
                         break
                 out_svg = f"{outprefix}.{trait_name}.gs.{method}.svg"
                 # Avoid tight_layout warnings on dense decorations.
@@ -8935,7 +10066,7 @@ def main(log: bool = True) -> None:
         # Stack predictions from all models: shape (n_test, n_methods)
         outpred = pd.DataFrame(
             np.concatenate(outpred_list, axis=1),
-            columns=methods,
+            columns=[method_display_map.get(str(m), str(m)) for m in methods],
             index=samples[testmask],
         )
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"

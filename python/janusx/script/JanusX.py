@@ -48,6 +48,7 @@ Modules:
     simulation    Extended simulation and benchmarking workflow
     benchmark     FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)
     gblupbench    GBLUP benchmark workflow (JanusX/sommer/rrBLUP)
+    bayesbench    Packed Bayes kernel benchmark workflow
 '''
 import sys
 import subprocess
@@ -107,7 +108,7 @@ __version__ = (
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gs", "reml",
-    "sim", "simulation", "benchmark", "gblupbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
 ]
 _LAUNCHER_ONLY_FLAGS = {
@@ -272,6 +273,7 @@ def _print_cli_help() -> None:
     _print_help_entry(4, "simulation", "Extended simulation and benchmarking workflow", 12, width)
     _print_help_entry(4, "benchmark", "FarmCPU benchmark workflow (JanusX/GAPIT/rMVP)", 12, width)
     _print_help_entry(4, "gblupbench", "GBLUP benchmark workflow (JanusX/sommer/rrBLUP)", 12, width)
+    _print_help_entry(4, "bayesbench", "Packed Bayes kernel benchmark workflow", 12, width)
 
 
 def _print_help() -> None:

@@ -63,7 +63,7 @@ use assoc::{
     lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
     packed_malpha_f64, packed_prune_kernel_stats, rrblup_pcg_bed, rust_sgemm_backend,
 };
-use bayes::{bayesa, bayesb, bayescpi};
+use bayes::{bayesa, bayesa_packed, bayesb, bayesb_packed, bayescpi, bayescpi_packed};
 use beam::{
     beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
     beam_search_and_binary_mcc_bin_indices_py, beam_search_and_binary_mcc_bin_py,
@@ -180,6 +180,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
     m.add_function(wrap_pyfunction!(bayescpi, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesa_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayesb_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(bayescpi_packed, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
     m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;

@@ -2295,6 +2295,273 @@ pub fn load_bed_2bit_packed<'py>(
     Ok((packed_arr, miss_arr, maf_arr, denom_arr, n_samples))
 }
 
+#[inline]
+fn _is_simple_snp_allele(a: &str) -> bool {
+    let t = a.trim().to_ascii_uppercase();
+    if t.len() != 1 {
+        return false;
+    }
+    matches!(t.as_bytes()[0], b'A' | b'C' | b'G' | b'T')
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    snps_only=false,
+))]
+pub fn prepare_bed_2bit_packed<'py>(
+    py: Python<'py>,
+    prefix: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    snps_only: bool,
+) -> PyResult<(
+    Bound<'py, PyArray2<u8>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<bool>>,
+    usize,
+    usize,
+)> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+
+    let mut bed_prefix = prefix;
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep, site_keep, n_samples, n_snps, bytes_per_snp) = py
+        .detach(move || -> Result<
+            (
+                Vec<u8>,
+                Vec<f32>,
+                Vec<f32>,
+                Vec<f32>,
+                Vec<bool>,
+                Vec<bool>,
+                usize,
+                usize,
+                usize,
+            ),
+            String,
+        > {
+            let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+            let n_samples = samples.len();
+            if n_samples == 0 {
+                return Err("no samples found in PLINK input".to_string());
+            }
+            let sites = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
+            let n_snps = sites.len();
+            if n_snps == 0 {
+                return Err("no SNP sites found in PLINK BIM input".to_string());
+            }
+
+            let bed_path = format!("{bed_prefix}.bed");
+            let mut bed_file = File::open(&bed_path)
+                .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+            let bed_len = bed_file
+                .metadata()
+                .map_err(|e| format!("failed to stat {bed_path}: {e}"))?
+                .len() as usize;
+            if bed_len < 3 {
+                return Err("BED too small".to_string());
+            }
+
+            let mut header = [0u8; 3];
+            bed_file
+                .read_exact(&mut header)
+                .map_err(|e| format!("failed to read BED header: {e}"))?;
+            if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+                return Err("Only SNP-major BED supported".to_string());
+            }
+
+            let bytes_per_snp = (n_samples + 3) / 4;
+            let data_len = bed_len - 3;
+            if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+                ));
+            }
+            let n_snps_bed = data_len / bytes_per_snp;
+            if n_snps_bed != n_snps {
+                return Err(format!(
+                    "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={n_snps}"
+                ));
+            }
+
+            let mut packed_full: Vec<u8> = vec![0u8; data_len];
+            bed_file
+                .read_exact(&mut packed_full)
+                .map_err(|e| format!("failed to read BED payload: {e}"))?;
+
+            let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
+            let mut maf: Vec<f32> = vec![0.0; n_snps];
+            let mut std_denom: Vec<f32> = vec![0.0; n_snps];
+            let mut row_flip: Vec<bool> = vec![false; n_snps];
+            let n_samples_f = n_samples as f32;
+            let full_bytes = n_samples / 4;
+            let rem = n_samples % 4;
+
+            for snp_idx in 0..n_snps {
+                let row = &packed_full[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                let mut non_missing: usize = 0;
+                let mut alt_sum: usize = 0;
+
+                for &byte in row.iter().take(full_bytes) {
+                    for within in 0..4 {
+                        let code = (byte >> (within * 2)) & 0b11;
+                        match code {
+                            0b00 => {
+                                non_missing += 1;
+                            }
+                            0b10 => {
+                                non_missing += 1;
+                                alt_sum += 1;
+                            }
+                            0b11 => {
+                                non_missing += 1;
+                                alt_sum += 2;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if rem > 0 {
+                    let byte = row[full_bytes];
+                    for within in 0..rem {
+                        let code = (byte >> (within * 2)) & 0b11;
+                        match code {
+                            0b00 => {
+                                non_missing += 1;
+                            }
+                            0b10 => {
+                                non_missing += 1;
+                                alt_sum += 1;
+                            }
+                            0b11 => {
+                                non_missing += 1;
+                                alt_sum += 2;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                missing_rate[snp_idx] = 1.0_f32 - (non_missing as f32 / n_samples_f);
+                if non_missing > 0 {
+                    let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
+                    row_flip[snp_idx] = p > 0.5_f64;
+                    let maf_v = p.min(1.0_f64 - p) as f32;
+                    maf[snp_idx] = maf_v;
+                    let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
+                    std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
+                } else {
+                    row_flip[snp_idx] = false;
+                    maf[snp_idx] = 0.0_f32;
+                    std_denom[snp_idx] = 0.0_f32;
+                }
+            }
+
+            let mut keep: Vec<bool> = vec![true; n_snps];
+            for i in 0..n_snps {
+                let maf_i = maf[i];
+                let miss_i = missing_rate[i];
+                let pass_num = (maf_i >= maf_threshold)
+                    && (maf_i <= (1.0_f32 - maf_threshold))
+                    && (miss_i <= max_missing_rate);
+                let pass_snp = if snps_only {
+                    _is_simple_snp_allele(&sites[i].ref_allele)
+                        && _is_simple_snp_allele(&sites[i].alt_allele)
+                } else {
+                    true
+                };
+                keep[i] = pass_num && pass_snp;
+            }
+
+            let kept_n = keep.iter().filter(|&&x| x).count();
+            if kept_n == 0 {
+                return Err(
+                    "No SNPs left after packed BED filtering. Please relax thresholds."
+                        .to_string(),
+                );
+            }
+
+            let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
+            let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut std_keep = Vec::<f32>::with_capacity(kept_n);
+            let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+            let mut dst = 0usize;
+            for i in 0..n_snps {
+                if !keep[i] {
+                    continue;
+                }
+                let src_off = i * bytes_per_snp;
+                let dst_off = dst * bytes_per_snp;
+                packed_keep[dst_off..dst_off + bytes_per_snp]
+                    .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
+                miss_keep.push(missing_rate[i]);
+                maf_keep.push(maf[i]);
+                std_keep.push(std_denom[i]);
+                row_flip_keep.push(row_flip[i]);
+                dst = dst.saturating_add(1);
+            }
+            debug_assert_eq!(dst, kept_n);
+
+            Ok((
+                packed_keep,
+                miss_keep,
+                maf_keep,
+                std_keep,
+                row_flip_keep,
+                keep,
+                n_samples,
+                n_snps,
+                bytes_per_snp,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    let packed_mat = Array2::from_shape_vec((maf_keep.len(), bytes_per_snp), packed_keep)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    #[allow(deprecated)]
+    let packed_arr = PyArray2::from_owned_array(py, packed_mat).into_bound();
+    #[allow(deprecated)]
+    let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(miss_keep)).into_bound();
+    #[allow(deprecated)]
+    let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
+    #[allow(deprecated)]
+    let denom_arr = PyArray1::from_owned_array(py, Array1::from_vec(std_keep)).into_bound();
+    #[allow(deprecated)]
+    let row_flip_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_flip_keep)).into_bound();
+    #[allow(deprecated)]
+    let site_keep_arr = PyArray1::from_owned_array(py, Array1::from_vec(site_keep)).into_bound();
+    Ok((
+        packed_arr,
+        miss_arr,
+        maf_arr,
+        denom_arr,
+        row_flip_arr,
+        site_keep_arr,
+        n_samples,
+        n_snps,
+    ))
+}
+
 #[pyfunction]
 #[pyo3(signature = (prefix, maf_threshold=None, max_missing_rate=None, fill_missing=None))]
 pub fn load_bed_u8_matrix<'py>(

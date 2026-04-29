@@ -7370,71 +7370,18 @@ pub fn grm_packed_bed_f32<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f32>>, usize, usize)> {
-    let (packed_arr, miss_arr, maf_arr, _std_arr, n_samples) =
-        crate::gfreader::load_bed_2bit_packed(py, prefix)?;
-
-    let miss_ro = miss_arr.readonly();
-    let miss_vec: Vec<f32> = match miss_ro.as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => miss_ro.as_array().iter().copied().collect(),
-    };
-    let maf_ro = maf_arr.readonly();
-    let maf_vec: Vec<f32> = match maf_ro.as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
-    };
-    if miss_vec.len() != maf_vec.len() {
-        return Err(PyRuntimeError::new_err(format!(
-            "packed BED stat length mismatch: miss={}, maf={}",
-            miss_vec.len(),
-            maf_vec.len()
-        )));
-    }
-    let m_total = maf_vec.len();
-    if m_total == 0 {
-        return Err(PyRuntimeError::new_err(
-            "No SNPs found in packed BED input.",
-        ));
-    }
-
     let maf_thr = maf_threshold.clamp(0.0, 0.5);
     let miss_thr = max_missing_rate.clamp(0.0, 1.0);
-    let mut keep_idx: Vec<usize> = Vec::with_capacity(m_total);
-    for i in 0..m_total {
-        let maf_i = maf_vec[i];
-        if maf_i < maf_thr || maf_i > (1.0 - maf_thr) {
-            continue;
-        }
-        if miss_vec[i] > miss_thr {
-            continue;
-        }
-        keep_idx.push(i);
-    }
-    if keep_idx.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "No SNPs remained after packed BED filtering; GRM is empty.",
-        ));
-    }
-    let eff_m = keep_idx.len();
-
-    if eff_m == m_total {
-        let row_flip = bed_packed_row_flip_mask(py, packed_arr.readonly(), n_samples)?;
-        let grm = grm_packed_f32(
-            py,
-            packed_arr.readonly(),
-            n_samples,
-            row_flip.readonly(),
-            maf_arr.readonly(),
-            None,
-            method,
-            block_cols,
-            threads,
-            progress_callback,
-            progress_every,
-        )?;
-        return Ok((grm, eff_m, n_samples));
-    }
-
+    let (
+        packed_arr,
+        _miss_arr,
+        maf_arr,
+        _std_arr,
+        row_flip_arr,
+        _site_keep_arr,
+        n_samples,
+        _n_total_sites,
+    ) = crate::gfreader::prepare_bed_2bit_packed(py, prefix, maf_thr, miss_thr, false)?;
     let packed_ro = packed_arr.readonly();
     let packed_view = packed_ro.as_array();
     if packed_view.ndim() != 2 {
@@ -7442,36 +7389,28 @@ pub fn grm_packed_bed_f32<'py>(
             "packed BED payload must be 2D (m, bytes_per_snp).",
         ));
     }
-    let bytes_per_snp = packed_view.shape()[1];
-    let packed_slice: Cow<[u8]> = match packed_ro.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-    };
-
-    let mut packed_keep = vec![0_u8; eff_m * bytes_per_snp];
-    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-        let src_off = src_row * bytes_per_snp;
-        let dst_off = dst_row * bytes_per_snp;
-        packed_keep[dst_off..dst_off + bytes_per_snp]
-            .copy_from_slice(&packed_slice[src_off..src_off + bytes_per_snp]);
+    let eff_m = packed_view.shape()[0];
+    if eff_m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "No SNPs remained after packed BED filtering; GRM is empty.",
+        ));
     }
-    let maf_keep: Vec<f32> = keep_idx.iter().map(|&i| maf_vec[i]).collect();
+    let maf_ro = maf_arr.readonly();
+    let row_flip_ro = row_flip_arr.readonly();
+    if maf_ro.len() != eff_m || row_flip_ro.len() != eff_m {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed BED metadata length mismatch: packed_rows={eff_m}, maf={}, row_flip={}",
+            maf_ro.len(),
+            row_flip_ro.len()
+        )));
+    }
 
-    let packed_keep_arr = PyArray2::from_owned_array(
-        py,
-        Array2::from_shape_vec((eff_m, bytes_per_snp), packed_keep)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    )
-    .into_bound();
-    let maf_keep_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
-
-    let row_flip = bed_packed_row_flip_mask(py, packed_keep_arr.readonly(), n_samples)?;
     let grm = grm_packed_f32(
         py,
-        packed_keep_arr.readonly(),
+        packed_ro,
         n_samples,
-        row_flip.readonly(),
-        maf_keep_arr.readonly(),
+        row_flip_ro,
+        maf_ro,
         None,
         method,
         block_cols,

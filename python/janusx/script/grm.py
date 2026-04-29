@@ -485,7 +485,10 @@ def main(log: bool = True):
         and (_grm_packed_bed_f32 is not None)
     )
     if use_packed_kernel:
-        logger.info("GRM backend: packed BED kernel (Rust grm_packed_bed_f32).")
+        logger.info(
+            "GRM backend: packed BED kernel "
+            "(Rust grm_packed_bed_f32 + unified prepare_bed_2bit_packed filtering)."
+        )
         if args.block_target_mb is not None:
             logger.info(f"Packed GRM block target override: {float(args.block_target_mb):.6g} MB.")
         if bool(args.stage_timing):

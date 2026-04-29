@@ -20,6 +20,10 @@ from janusx.janusx import (
     VcfStreamWriter,
     SiteInfo,
 )
+try:
+    from janusx.janusx import prepare_bed_2bit_packed as _prepare_bed_2bit_packed
+except Exception:
+    _prepare_bed_2bit_packed = None
 
 try:
     from rich.progress import (
@@ -83,6 +87,40 @@ def load_bed_2bit_packed(prefix: str):
     n_samples : int
     """
     return _load_bed_2bit_packed(str(prefix))
+
+
+def prepare_bed_2bit_packed(
+    prefix: str,
+    *,
+    maf_threshold: float = 0.0,
+    max_missing_rate: float = 1.0,
+    snps_only: bool = False,
+):
+    """
+    Load PLINK BED packed matrix and apply Rust-side filtering once.
+
+    Returns
+    -------
+    packed : np.ndarray[uint8], shape (n_kept, ceil(n_samples/4))
+    missing_rate : np.ndarray[float32], shape (n_kept,)
+    maf : np.ndarray[float32], shape (n_kept,)
+    std_denom : np.ndarray[float32], shape (n_kept,)
+    row_flip : np.ndarray[bool], shape (n_kept,)
+    site_keep : np.ndarray[bool], shape (n_total_sites,)
+    n_samples : int
+    n_total_sites : int
+    """
+    if _prepare_bed_2bit_packed is None:
+        raise RuntimeError(
+            "prepare_bed_2bit_packed is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    return _prepare_bed_2bit_packed(
+        str(prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        snps_only=bool(snps_only),
+    )
 
 
 def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:

@@ -73,8 +73,9 @@ use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py
 use bsa::preprocess_bsa;
 use gfreader::{
     bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
-    load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, BedChunkReader, HmpChunkReader,
-    HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
+    load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
+    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
+    VcfChunkReader, VcfStreamWriter,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gwasio::load_gwas_triplet_fast;
@@ -137,6 +138,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;

@@ -84,7 +84,6 @@ import psutil
 from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 from janusx.gfreader import (
     load_genotype_chunks,
-    load_bed_2bit_packed,
     inspect_genotype_file,
     auto_mmap_window_mb,
 )
@@ -127,6 +126,7 @@ from ._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
 )
+from ._common.packedctx import prepare_packed_ctx_from_plink
 
 try:
     from threadpoolctl import threadpool_limits as _threadpool_limits
@@ -2123,37 +2123,25 @@ def build_grm_streaming(
                 pbar.set_postfix(memory=f"{mem:.2f}GB")
 
         try:
-            packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(packed_prefix)
-            if int(packed_n) != int(n_samples):
-                raise RuntimeError(
-                    f"Packed sample count mismatch: packed={int(packed_n)}, expected={int(n_samples)}"
-                )
-            packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-            miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-            maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-            keep = np.ones(maf.shape[0], dtype=np.bool_)
-            maf_thr = float(maf_threshold)
-            if maf_thr > 0.0:
-                keep &= (maf >= maf_thr) & (maf <= (1.0 - maf_thr))
-            keep &= (miss <= float(max_missing_rate))
-            if bool(snps_only):
-                snp_mask = _plink_snp_mask(packed_prefix)
-                if snp_mask.shape[0] != keep.shape[0]:
-                    raise RuntimeError(
-                        f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
-                    )
-                keep &= snp_mask
-            if not np.any(keep):
-                raise RuntimeError("No SNPs remained after packed BED filtering; GRM is empty.")
-            if not bool(np.all(keep)):
-                packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
-                maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
+            _sample_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(packed_prefix),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                snps_only=bool(snps_only),
+                expected_n_samples=int(n_samples),
+            )
+            packed = np.ascontiguousarray(
+                np.asarray(packed_ctx["packed"], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            maf = np.ascontiguousarray(
+                np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
             eff_m = int(packed.shape[0])
             row_flip = np.ascontiguousarray(
-                np.asarray(
-                    jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
-                    dtype=np.bool_,
-                ).reshape(-1)
+                np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
             )
             grm = np.ascontiguousarray(
                 np.asarray(
@@ -2917,28 +2905,6 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str]]:
     return out
 
 
-def _is_simple_snp_allele(allele: str) -> bool:
-    a = str(allele).strip().upper()
-    return (len(a) == 1) and (a in {"A", "C", "G", "T"})
-
-
-def _plink_snp_mask(prefix: str) -> np.ndarray:
-    mask: list[bool] = []
-    bim_path = f"{prefix}.bim"
-    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
-        for ln, line in enumerate(fh, start=1):
-            s = line.strip()
-            if s == "":
-                continue
-            toks = s.split()
-            if len(toks) < 6:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
-            a0 = str(toks[4])
-            a1 = str(toks[5])
-            mask.append(_is_simple_snp_allele(a0) and _is_simple_snp_allele(a1))
-    return np.asarray(mask, dtype=np.bool_)
-
-
 def _resolve_lrlmm_rank(rank_opt: Union[int, None], n_samples: int) -> int:
     n = max(1, int(n_samples))
     if rank_opt is None or int(rank_opt) <= 0:
@@ -3232,29 +3198,15 @@ def run_lrlmm_packed(
                     f"BIM row count mismatch with packed BED: bim={len(sites_all)}, packed={packed.shape[0]}"
                 )
     else:
-        full_ids, _ = inspect_genotype_file(
-            prefix,
-            snps_only=False,
-            maf=0.0,
-            missing_rate=1.0,
-            het=0.0,
-        )
-        full_ids = np.asarray(full_ids, dtype=str)
-        id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
-        try:
-            sample_map = np.asarray(
-                [id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)],
-                dtype=np.int64,
-            )
-        except KeyError as e:
-            raise ValueError(
-                "Some aligned sample IDs are not present in packed BED sample order."
-            ) from e
-
         packed_t0 = time.monotonic()
         with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
             try:
-                packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(prefix)
+                full_ids, packed_ctx_raw = prepare_packed_ctx_from_plink(
+                    str(prefix),
+                    maf=float(maf_threshold),
+                    missing_rate=float(max_missing_rate),
+                    snps_only=False,
+                )
             except Exception:
                 task.fail("Loading packed BED genotype ...Failed")
                 raise
@@ -3267,38 +3219,57 @@ def run_lrlmm_packed(
             use_spinner=bool(use_spinner),
         )
 
-        packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-        miss = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-        maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-        packed_n = int(packed_n)
+        full_ids = np.asarray(full_ids, dtype=str)
+        id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+        try:
+            sample_map = np.asarray(
+                [id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)],
+                dtype=np.int64,
+            )
+        except KeyError as e:
+            raise ValueError(
+                "Some aligned sample IDs are not present in packed BED sample order."
+            ) from e
+
+        packed = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
+        miss = np.ascontiguousarray(
+            np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1)
+        )
+        maf = np.ascontiguousarray(np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1))
+        packed_n = int(packed_ctx_raw["n_samples"])
         if packed_n <= 0:
             raise ValueError("Packed BED reported invalid sample count.")
         if packed.shape[0] != maf.shape[0] or packed.shape[0] != miss.shape[0]:
             raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
-        sites_all = _read_bim_sites(prefix)
-        if len(sites_all) != int(packed.shape[0]):
+        sites_all_full = _read_bim_sites(prefix)
+        keep_numeric = np.ascontiguousarray(
+            np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
+        )
+        if len(sites_all_full) != int(keep_numeric.shape[0]):
             raise ValueError(
-                f"BIM row count mismatch with packed BED: bim={len(sites_all)}, packed={packed.shape[0]}"
+                "BIM row count mismatch with packed BED filtering mask: "
+                f"bim={len(sites_all_full)}, mask={keep_numeric.shape[0]}"
             )
-
-        keep = (maf >= float(maf_threshold)) & (miss <= float(max_missing_rate))
+        keep_final = np.ascontiguousarray(keep_numeric, dtype=np.bool_)
         if bool(snps_only):
             snp_mask = np.asarray(
                 [
                     (len(str(a0)) == 1 and len(str(a1)) == 1)
-                    for (_c, _p, a0, a1) in sites_all
+                    for (_c, _p, a0, a1) in sites_all_full
                 ],
                 dtype=bool,
             )
-            keep &= snp_mask
-        if not np.any(keep):
+            keep_final &= snp_mask
+        if not np.any(keep_final):
             raise ValueError("No SNP remains after LRLMM packed-bed filtering.")
-        if not np.all(keep):
-            packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
-            miss = np.ascontiguousarray(miss[keep], dtype=np.float32)
-            maf = np.ascontiguousarray(maf[keep], dtype=np.float32)
-            sites_all = [s for s, k in zip(sites_all, keep) if bool(k)]
+        if not np.array_equal(keep_final, keep_numeric):
+            kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
+            keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
+            packed = np.ascontiguousarray(packed[keep_local], dtype=np.uint8)
+            miss = np.ascontiguousarray(miss[keep_local], dtype=np.float32)
+            maf = np.ascontiguousarray(maf[keep_local], dtype=np.float32)
+        sites_all = [s for s, k in zip(sites_all_full, keep_final) if bool(k)]
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -5431,8 +5402,12 @@ def run_farmcpu_fullmem(
             )
             with packed_status as task:
                 try:
-                    packed_raw, miss_raw, maf_raw, _std_raw, packed_n = load_bed_2bit_packed(
-                        str(packed_prefix)
+                    _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
+                        str(packed_prefix),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                        snps_only=False,
+                        expected_n_samples=int(famid.shape[0]),
                     )
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
@@ -5443,44 +5418,47 @@ def run_farmcpu_fullmem(
                 f"Loading genotype (Full, {int(n_snps)} SNPs) "
                 f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
             )
-            if int(packed_n) != int(famid.shape[0]):
-                raise ValueError(
-                    f"Packed sample size mismatch: packed n={packed_n}, expected {famid.shape[0]}"
-                )
 
-            miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-            maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-            keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
-            maf_thr = float(args.maf)
-            if maf_thr > 0.0:
-                keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
-            miss_thr = float(args.geno)
-            if miss_thr < 1.0:
-                keep &= miss_arr <= miss_thr
+            keep_numeric = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
+            )
 
             ref_alt, keep_final = _load_bim_ref_alt_filtered(
                 str(packed_prefix),
-                keep,
+                keep_numeric,
                 snps_only_mode=bool(snps_only),
             )
             if not np.any(keep_final):
                 raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
 
-            if np.all(keep_final):
-                packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-                miss_arr = np.ascontiguousarray(miss_arr, dtype=np.float32)
-                maf_arr = np.ascontiguousarray(maf_arr, dtype=np.float32)
+            packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
+            miss_num = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            maf_num = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            if np.array_equal(keep_final, keep_numeric):
+                packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
+                miss_arr = np.ascontiguousarray(miss_num, dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_num, dtype=np.float32)
             else:
-                packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)[keep_final])
-                miss_arr = np.ascontiguousarray(miss_arr[keep_final], dtype=np.float32)
-                maf_arr = np.ascontiguousarray(maf_arr[keep_final], dtype=np.float32)
+                kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
+                keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
+                packed = np.ascontiguousarray(packed_num[keep_local], dtype=np.uint8)
+                miss_arr = np.ascontiguousarray(miss_num[keep_local], dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_num[keep_local], dtype=np.float32)
 
             loaded_snps = int(ref_alt.shape[0])
             packed_ctx = {
                 "packed": packed,
                 "missing_rate": miss_arr,
                 "maf": maf_arr,
-                "n_samples": int(packed_n),
+                "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
+                "n_samples": int(packed_ctx_raw["n_samples"]),
+                "source_prefix": str(packed_prefix),
             }
         else:
             geno_chunks = []

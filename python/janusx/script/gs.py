@@ -150,6 +150,7 @@ from ._common.status import (
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.colspec import parse_zero_based_index_specs
 from ._common.threads import maybe_warn_non_openblas, require_openblas_by_default
+from ._common.packedctx import prepare_packed_ctx_from_plink
 
 try:
     from janusx import janusx as _jxrs
@@ -6144,41 +6145,12 @@ def _load_plink_packed_for_lmm(
     packed_ctx : dict
         Keys: packed(uint8), missing_rate(float32), maf(float32), n_samples(int)
     """
-    sample_ids, _ = inspect_genotype_file(str(genotype_prefix))
-    packed_raw, miss_raw, maf_raw, _std_raw, n_samples = load_bed_2bit_packed(str(genotype_prefix))
-    packed_n = int(n_samples)
-    sample_ids_arr = np.asarray(sample_ids, dtype=str)
-    if packed_n != int(sample_ids_arr.shape[0]):
-        raise ValueError(
-            f"Packed sample size mismatch: packed n={packed_n}, expected {sample_ids_arr.shape[0]}"
-        )
-    miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
-    maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
-    keep = np.ones(maf_arr.shape[0], dtype=np.bool_)
-    maf_thr = float(maf)
-    if maf_thr > 0.0:
-        keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
-    miss_thr = float(missing_rate)
-    if miss_thr < 1.0:
-        keep &= miss_arr <= miss_thr
-    if not np.any(keep):
-        raise ValueError(
-            "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
-        )
-    site_keep = np.ascontiguousarray(np.asarray(keep, dtype=np.bool_).reshape(-1))
-    packed = np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8))
-    if not np.all(keep):
-        packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
-        miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
-        maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
-    packed_ctx = {
-        "packed": packed,
-        "missing_rate": miss_arr,
-        "maf": maf_arr,
-        "n_samples": int(packed_n),
-        "site_keep": site_keep,
-        "source_prefix": str(genotype_prefix),
-    }
+    sample_ids_arr, packed_ctx = prepare_packed_ctx_from_plink(
+        str(genotype_prefix),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        snps_only=False,
+    )
     return sample_ids_arr, packed_ctx
 
 

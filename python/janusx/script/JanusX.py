@@ -1,5 +1,7 @@
 #!/user/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 '''
 Usage:
     jx <module> [options]
@@ -55,11 +57,13 @@ import subprocess
 import importlib
 import os
 import textwrap
+import re
 from datetime import date
 from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 from janusx._optional_deps import format_missing_dependency_for_module
 from ._common.interrupt import install_interrupt_handlers, force_exit
+from ._common.threads import apply_outer_thread_cap, detect_effective_threads
 try:
     v = version("janusx")
 except PackageNotFoundError:
@@ -111,6 +115,12 @@ _MODULE_NAMES = [
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
 ]
+_SCRIPT_MODULE_ALIASES = {
+    # Keep CLI surface stable (`jx gwas` / `jx gs`) while routing heavy
+    # implementations to workflow modules.
+    "gwas": "janusx.assoc.workflow",
+    "gs": "janusx.gs.workflow",
+}
 _LAUNCHER_ONLY_FLAGS = {
     "-update", "--update",
     "-clean", "--clean",
@@ -120,8 +130,74 @@ _LAUNCHER_ONLY_FLAGS = {
 }
 _LAUNCHER_ONLY_MODULES = set()
 
+_THREAD_FLAG_ALIASES = ("-t", "--thread", "--threads", "-threads")
+
+
+def _parse_cli_thread_value(argv_tail: list[str]) -> int | None:
+    """
+    Best-effort parse for common thread flags before heavy module imports.
+
+    Supported forms:
+      - `-t 16`
+      - `--thread 16`
+      - `--threads=16`
+      - `-threads=16`
+    """
+    if len(argv_tail) == 0:
+        return None
+
+    for i, tok in enumerate(argv_tail):
+        t = str(tok).strip()
+        if t == "":
+            continue
+
+        # key=value forms
+        for alias in _THREAD_FLAG_ALIASES:
+            prefix = f"{alias}="
+            if t.startswith(prefix):
+                raw = t[len(prefix):].strip()
+                try:
+                    v = int(raw)
+                except Exception:
+                    return None
+                return v if v > 0 else None
+
+        # separated forms: --thread 16
+        if t in _THREAD_FLAG_ALIASES:
+            if i + 1 >= len(argv_tail):
+                return None
+            raw = str(argv_tail[i + 1]).strip()
+            # Accept plain positive integer only for early env config.
+            if re.fullmatch(r"[+]?\d+", raw) is None:
+                return None
+            v = int(raw)
+            return v if v > 0 else None
+    return None
+
+
+def _apply_early_thread_env_from_cli(module_name: str, argv_tail: list[str]) -> None:
+    """
+    Pre-apply thread env vars before loading target submodule.
+
+    This helps BLAS backends (especially Accelerate on macOS) pick up user
+    thread limits before NumPy/SciPy are imported in submodule top-level code.
+    """
+    _ = module_name  # reserved for module-specific overrides if needed later
+    t = _parse_cli_thread_value(argv_tail)
+    if t is None:
+        # Important for macOS Accelerate: set thread env before NumPy/SciPy import
+        # even when user does not pass -t explicitly.
+        try:
+            t = int(detect_effective_threads())
+        except Exception:
+            t = 1
+    _ = apply_outer_thread_cap(max(1, int(t)), set_jx_threads=True, set_max_keys=True)
+
 def _load_script_module(name: str):
-    return importlib.import_module(f"janusx.script.{name}")
+    target = _SCRIPT_MODULE_ALIASES.get(str(name), str(name))
+    if str(target).startswith("janusx."):
+        return importlib.import_module(str(target))
+    return importlib.import_module(f"janusx.script.{target}")
 
 
 def _supports_color() -> bool:
@@ -282,6 +358,14 @@ def _print_help() -> None:
 
 def main():
     install_interrupt_handlers()
+    if sys.version_info < (3, 10):
+        print(
+            _style_yellow(
+                f"Python {sys.version_info.major}.{sys.version_info.minor} is not supported. "
+                "JanusX requires Python >= 3.10."
+            )
+        )
+        raise SystemExit(1)
     if str(os.environ.get("JANUSX_ENTRYPOINT", "")).strip() == "":
         prog = Path(sys.argv[0]).name.lower() if len(sys.argv) > 0 else ""
         if prog.startswith("jxpy"):
@@ -306,6 +390,7 @@ def main():
                 print(_style_yellow(f"Please use launcher command: `{launcher_cmd}`"))
                 return
             if module_name in _MODULE_NAMES:
+                _apply_early_thread_env_from_cli(module_name, sys.argv[2:])
                 # Keep argparse usage as "jx <module> ..."
                 sys.argv[0] = f"jx {module_name}"
                 del sys.argv[1]

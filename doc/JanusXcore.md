@@ -40,6 +40,8 @@ JanusX usually follows this execution path:
 ### 2.2 Main Python packages
 
 - `janusx.gfreader`: genotype IO, chunk streaming, format conversion, packed BED access.
+- `janusx.assoc`: GWAS entry wrappers (`run_gwas_*`) and config/result models.
+- `janusx.gs`: GS entry wrappers (`run_gs_*`) and config/result models.
 - `janusx.pyBLUP`: GRM, LM/LMM/FaST-LMM, FarmCPU, BLUP, MLGS, Bayes prediction.
 - `janusx.adamixture`: RSVD + ADAMixture ancestry inference.
 - `janusx.gtools`: GFF/BED readers and range query helpers.
@@ -281,7 +283,7 @@ print(format_report(r2))
 
 ```python
 import numpy as np
-from janusx.script.gs import GSapi
+from janusx.gs.workflow import GSapi
 
 rng = np.random.default_rng(42)
 Xtrain = rng.normal(size=(500, 240)).astype(np.float32)  # SNP-major
@@ -421,18 +423,37 @@ This appendix helps with code tracing and backend debugging.
 
 ### 6.3 Association and prediction kernels
 
-- `src/stats/assoc.rs`
+- `src/stats/glm.rs`
 - Fixed-effect kernels: `glmf32`, `glmf32_full`, `glmf32_packed`.
-- LMM kernels: `lmm_reml_null_f32`, `lmm_assoc_chunk_f32`, `lmm_reml_chunk_f32`, `lmm_reml_chunk_from_snp_f32`, `lmm_assoc_chunk_from_snp_f32`.
-- FaST-LMM kernels: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`, `fastlmm_assoc_chunk_f32`, `fastlmm_assoc_packed_f32`.
-- GRM/FarmCPU/REML helpers: `grm_packed_bed_f32`, `grm_packed_f32`, `grm_packed_f32_with_stats`, `bed_packed_row_flip_mask`, `bed_packed_decode_rows_f32`, `bed_packed_decode_stats_f64`, `cross_grm_times_alpha_packed_f64`, `packed_malpha_f64`, `farmcpu_rem_dense`, `farmcpu_rem_packed`, `farmcpu_super_dense`, `farmcpu_super_packed`, `ai_reml_null_f64`, `ai_reml_multi_f64`, `ml_loglike_null_f32`, `rust_sgemm_backend`, `bed_prune_to_plink_rust`, `packed_prune_kernel_stats`.
-- Python entries: `janusx.pyBLUP.assoc` APIs (`LM/LMM/FastLMM`, `farmcpu`, etc.).
-- `gformat` uses `bed_filter_to_plink_rust` / `bed_prune_to_plink_rust` for packed, chromosome-sorted
-  `PLINK -> PLINK` direct paths, including streaming LD prune without materializing the whole
-  packed BED matrix; the prune direct path also supports thread hints and progress callbacks.
+- Python entries: `janusx.pyBLUP.assoc` fixed-effect GWAS paths.
+
+- `src/stats/gs_native.rs`
+- Packed GS/GRM kernels: `gblup_reml_packed_bed`, `rrblup_pcg_bed`, `grm_packed_bed_f32`,
+  `grm_packed_f32`, `grm_packed_f32_with_stats`, `grm_packed_f64_with_stats`.
+- Python entries: `janusx.gs.workflow` packed GBLUP/rrBLUP paths.
+
+- `src/stats/lmm_scan.rs`
+- LMM/FaST-LMM/AI-REML kernels: `lmm_reml_null_f32`, `ml_loglike_null_f32`, `ai_reml_null_f64`,
+  `ai_reml_multi_f64`, `lmm_reml_chunk_f32`, `lmm_reml_chunk_from_snp_f32`,
+  `lmm_assoc_chunk_f32`, `lmm_assoc_chunk_from_snp_f32`, `lmm_reml_assoc_packed_f32`,
+  `fastlmm_assoc_chunk_f32`, `fastlmm_assoc_packed_f32`.
+- Python entries: `janusx.pyBLUP.assoc` mixed-model scan paths.
+
+- `src/stats/assoc.rs`
+- FarmCPU shell exports: `farmcpu_rem_dense`, `farmcpu_rem_packed`, `farmcpu_super_dense`,
+  `farmcpu_super_packed`.
+
+- `src/stats/packed.rs`
+- Packed decode/hash/projection exports: `bed_packed_row_flip_mask`, `bed_packed_decode_rows_f32`,
+  `bed_packed_decode_stats_f64`, `bed_packed_signed_hash_*`, `cross_grm_times_alpha_packed_f64`,
+  `packed_malpha_f64`.
+
+- `src/stats/ld.rs` + `src/math/ld.rs`
+- Packed LD prune/filters (`bed_packed_ld_prune_maf_priority`, `packed_prune_kernel_stats`,
+  `bed_prune_to_plink_rust`) used by `jx gformat` packed direct prune path.
 
 - `src/stats/lmm.rs`
-- Rust exports: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`.
+- Fast null/chunk helpers: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`.
 - Python wrappers: FaST-LMM paths in `pyBLUP.assoc`.
 
 - `src/stats/bayes.rs`
@@ -477,7 +498,7 @@ This appendix helps with code tracing and backend debugging.
 | LMM GWAS | `janusx.pyBLUP.assoc.lmm_reml` / `LMM.gwas()` | `lmm_reml_chunk_f32` / `lmm_reml_null_f32` |
 | FaST-LMM | `janusx.pyBLUP.assoc.fastlmm_reml` / `FastLMM.gwas()` | `fastlmm_reml_chunk_f32` / `fastlmm_reml_null_f32` |
 | FarmCPU | `janusx.pyBLUP.assoc.farmcpu` | `farmcpu_rem_*` / `farmcpu_super_*` |
-| GS rrBLUP / GBLUP | `janusx.script.gs.GSapi` | `pyBLUP` selection flows + packed decode / LMM helper kernels |
+| GS rrBLUP / GBLUP | `janusx.gs.workflow.GSapi` / `janusx.gs.run_gs_*` | `stats/gs_native.rs` + `stats/packed.rs` |
 | Bayes prediction | `janusx.pyBLUP.bayes.BayesA/BayesB/BayesCpi` | `bayesa` / `bayesb` / `bayescpi` |
 | Ancestry inference | `janusx.adamixture.train_adamixture` | `admx_*` family |
 | GFF/gene queries | `janusx.gtools.GFFQuery` | pure Python |

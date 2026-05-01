@@ -10,7 +10,7 @@ source:
 
 build:
   number: 0
-  skip: true  # [py<39]
+  skip: true  # [py<310]
   script_env:
     - JANUSX_NET_MODE
     - JANUSX_CARGO_REGISTRY
@@ -42,6 +42,7 @@ requirements:
     - python
     - pip
     - maturin >=1.7,<2
+    - openblas
   run:
     - python
     - numpy

@@ -94,6 +94,7 @@ def prepare_bed_2bit_packed(
     *,
     maf_threshold: float = 0.0,
     max_missing_rate: float = 1.0,
+    het_threshold: float = 0.0,
     snps_only: bool = False,
 ):
     """
@@ -115,12 +116,26 @@ def prepare_bed_2bit_packed(
             "prepare_bed_2bit_packed is unavailable in Rust extension. "
             "Please rebuild/install JanusX."
         )
-    return _prepare_bed_2bit_packed(
-        str(prefix),
-        maf_threshold=float(maf_threshold),
-        max_missing_rate=float(max_missing_rate),
-        snps_only=bool(snps_only),
-    )
+    try:
+        return _prepare_bed_2bit_packed(
+            str(prefix),
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+        )
+    except TypeError as ex:
+        # Backward compatibility with older extension builds that don't expose
+        # het_threshold in prepare_bed_2bit_packed.
+        msg = str(ex).lower()
+        if ("keyword" not in msg) and ("argument" not in msg) and ("unexpected" not in msg):
+            raise
+        return _prepare_bed_2bit_packed(
+            str(prefix),
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            snps_only=bool(snps_only),
+        )
 
 
 def set_genotype_cache_dir(cache_dir: Union[str, None]) -> Union[str, None]:

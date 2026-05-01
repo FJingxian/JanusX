@@ -18,6 +18,12 @@ Important boundary:
 - Extra modules `kmerge/view/treeplot/gblupbench` are available in Python dispatcher mode but not in launcher module whitelist.
 - `beam` script exists in repository but is not wired into launcher or Python dispatcher; run it directly via `python -m janusx.script.beam ...`.
 
+Current routing (post-structure refactor):
+
+- `jx gwas` routes to `janusx.assoc.workflow` (via `python/janusx/assoc/runner.py`).
+- `jx gs` routes to `janusx.gs.workflow` (via `python/janusx/gs/runner.py`).
+- `python/janusx/script/JanusX.py` is the dispatcher shell; heavy GWAS/GS workflow code lives in `assoc/` and `gs/`.
+
 Quick checks:
 
 ```bash
@@ -25,6 +31,24 @@ jx -h
 jx -v
 jx -list module
 jx <module> -h
+```
+
+Optional one-pass module smoke check:
+
+```bash
+python - <<'PY'
+import subprocess
+mods = [
+    'grm','pca','gwas','postgwas','gs','reml',
+    'garfield','postgarfield','postbsa',
+    'fastq2vcf','fastq2count','kmer','kmerge','view','tree','treeplot',
+    'adamixture','hybrid','gformat','gmerge','webui',
+    'sim','simulation','benchmark','gblupbench','bayesbench'
+]
+for m in mods:
+    p = subprocess.run(['jx', m, '-h'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"{m:12s} {'OK' if p.returncode == 0 else 'FAIL'}")
+PY
 ```
 
 ## 2. Launcher global flags (`jx`)
@@ -519,9 +543,8 @@ Key options:
 - LD prune: `-prune/--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>`  
   Numeric window defaults to `kb` (`1` = `1kb`, `0.1` = `100bp`)
 - filter pushdown: `--keep/--extract/--chr/--from-bp/--to-bp/-maf/-geno/-het` are evaluated in Rust readers/kernels (Python CLI parses and forwards arguments)
-- prune mode (default): fast anchor-stepped scan optimized for runtime and memory
-- strict mode (optional): set env `JX_LD_PRUNE_MODE=strict` to enable strict
-  sliding-window + window-local greedy pruning semantics (slower)
+- prune mode (default): strict sliding-window + window-local greedy pruning
+  semantics (PLINK-aligned behavior)
 - external backend (optional): set env `JX_LD_PRUNE_BACKEND=plink` to delegate
   `--prune` to an external PLINK binary in prune-only `-bfile -> -fmt plink` path;
   override binary with `JX_PLINK_BIN=/path/to/plink`

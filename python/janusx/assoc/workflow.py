@@ -90,10 +90,10 @@ from janusx.gfreader import (
 from janusx.pyBLUP.QK2 import QK
 from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
 from janusx import janusx as jxrs
-from ._common.log import setup_logging
-from ._common.config_render import emit_cli_configuration
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.pathcheck import (
+from janusx.script._common.log import setup_logging
+from janusx.script._common.config_render import emit_cli_configuration
+from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
@@ -101,8 +101,8 @@ from ._common.pathcheck import (
     safe_expanduser,
     safe_resolve,
 )
-from ._common.prefetch import prefetch_iter
-from ._common.status import (
+from janusx.script._common.prefetch import prefetch_iter
+from janusx.script._common.status import (
     CliStatus,
     is_skip_status_text,
     print_success,
@@ -111,28 +111,25 @@ from ._common.status import (
     should_animate_status,
     stdout_is_tty,
 )
-from ._common.progress import build_rich_progress, rich_progress_available
-from ._common.threads import (
-    apply_blas_thread_env,
+from janusx.script._common.progress import build_rich_progress, rich_progress_available
+from janusx.script._common.threads import (
+    apply_outer_thread_cap,
     detect_effective_threads,
     maybe_warn_non_openblas,
+    runtime_thread_stage,
     require_openblas_by_default,
 )
-from ._common.gwas_history import record_gwas_run
-from ._common.genocache import configure_genotype_cache_from_out
-from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
-from ._common.genoio import (
+from janusx.script._common.gwas_history import record_gwas_run
+from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
+from janusx.script._common.genoio import (
     basename_only as _basename_only,
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
 )
-from ._common.packedctx import prepare_packed_ctx_from_plink
+from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
 
-try:
-    from threadpoolctl import threadpool_limits as _threadpool_limits
-except Exception:
-    _threadpool_limits = None
-from ._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.colspec import parse_zero_based_index_specs
 
 try:
     from tqdm.auto import tqdm
@@ -2406,8 +2403,12 @@ def build_pcs_from_grm(
     if use_spinner:
         with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
             try:
-                with _gwas_evd_stage_ctx(int(threads)):
-                    _eigval, eigvec = np.linalg.eigh(grm)
+                _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                    grm,
+                    threads=int(threads),
+                    logger=logger,
+                    stage_label="GWAS-PCA",
+                )
                 pcs = eigvec[:, -dim:]
             except Exception:
                 task.fail(f"Computing top {dim} PCs from GRM ...Failed")
@@ -2420,8 +2421,12 @@ def build_pcs_from_grm(
         return pcs
 
     logger.info(f"Computing top {dim} PCs from GRM...")
-    with _gwas_evd_stage_ctx(int(threads)):
-        _eigval, eigvec = np.linalg.eigh(grm)
+    _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+        grm,
+        threads=int(threads),
+        logger=logger,
+        stage_label="GWAS-PCA",
+    )
     pcs = eigvec[:, -dim:]
     logger.info("PC computation finished.")
     return pcs
@@ -2491,8 +2496,12 @@ def load_or_build_q_with_cache(
                         "Q cache not found and GRM is unavailable; cannot generate PCA covariates."
                     )
                 pc_calc_t0 = time.monotonic()
-                with _gwas_evd_stage_ctx(int(threads)):
-                    eigval, eigvec = np.linalg.eigh(grm)
+                eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                    grm,
+                    threads=int(threads),
+                    logger=logger,
+                    stage_label="GWAS-Q-build",
+                )
                 qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
                 pc_msg = (
                     f"Calculating PCs from GRM (n={qmatrix.shape[0]}, nPC={qmatrix.shape[1]}) "
@@ -2736,6 +2745,19 @@ def prepare_streaming_context(
             if _is_cache_warning_message(msg):
                 deferred_cache_warnings.append(msg)
 
+    # For VCF/HMP inputs, cache BED may be generated during GRM/Q stage.
+    # Re-check once so downstream full-rust packed routes can use it.
+    if _as_plink_prefix(stream_genofile) is None and len(cache_candidates) > 0:
+        for cp in cache_candidates:
+            if all(os.path.isfile(f"{cp}.{ext}") for ext in ("bed", "bim", "fam")):
+                stream_genofile = str(cp)
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"Streaming genotype switched to packed cache: {stream_genofile}",
+                )
+                break
+
     # -----------------------------------------
     # Align all data sources to shared IDs
     # -----------------------------------------
@@ -2936,80 +2958,15 @@ def _status_stage_thread_budget(threads: int) -> int:
     return max(1, t - 1) if t > 1 else 1
 
 
-_BLAS_THREAD_ENV_KEYS = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "BLIS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
-
-
-@contextmanager
-def _native_thread_limit_ctx(limit: int):
-    """
-    Limit BLAS/OpenMP threadpools during long linear algebra stages.
-    """
-    lim = max(1, int(limit))
-    if _threadpool_limits is None:
-        yield
-        return
-    try:
-        with _threadpool_limits(limits=lim, user_api="blas"):
-            yield
-    except TypeError:
-        with _threadpool_limits(limits=lim):
-            yield
-
-
-@contextmanager
-def _thread_env_stage_ctx(
-    *,
-    blas_threads: Union[int, None],
-    rayon_threads: Union[int, None],
-):
-    """
-    Stage-scoped thread policy:
-    - BLAS/OpenMP caps via env + threadpoolctl.
-    - Rayon cap via RAYON_NUM_THREADS env (for kernels using default pool).
-    """
-    updates: dict[str, str] = {}
-    if blas_threads is not None:
-        bt = str(max(1, int(blas_threads)))
-        for key in _BLAS_THREAD_ENV_KEYS:
-            updates[key] = bt
-    if rayon_threads is not None:
-        updates["RAYON_NUM_THREADS"] = str(max(1, int(rayon_threads)))
-
-    old_env: dict[str, Union[str, None]] = {}
-    for key, val in updates.items():
-        old_env[key] = os.environ.get(key)
-        os.environ[key] = str(val)
-
-    try:
-        if blas_threads is not None:
-            with _native_thread_limit_ctx(int(blas_threads)):
-                yield
-        else:
-            yield
-    finally:
-        for key, old_val in old_env.items():
-            if old_val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = str(old_val)
-
-
 @contextmanager
 def _gwas_evd_stage_ctx(threads: int):
     """
-    EVD / heavy dense linear algebra stage:
-    - BLAS uses full `-t`
-    - Rayon is kept minimal to avoid contention.
+    EVD / heavy dense linear algebra stage.
+
+    In outer-cap mode, keep both BLAS and Rayon at full `-t`.
     """
     t = max(1, int(threads))
-    with _thread_env_stage_ctx(blas_threads=t, rayon_threads=1):
+    with runtime_thread_stage(blas_threads=t, rayon_threads=t):
         yield
 
 
@@ -3021,8 +2978,87 @@ def _gwas_scan_stage_ctx(threads: int):
     - BLAS pinned to 1 to avoid oversubscription.
     """
     t = max(1, int(threads))
-    with _thread_env_stage_ctx(blas_threads=1, rayon_threads=t):
+    with runtime_thread_stage(blas_threads=1, rayon_threads=t):
         yield
+
+
+def _gwas_eigh_from_grm(
+    grm: np.ndarray,
+    *,
+    threads: int,
+    logger: Union[logging.Logger, None] = None,
+    stage_label: str = "GWAS",
+    require_rust: bool = False,
+) -> tuple[np.ndarray, np.ndarray, str, float]:
+    """
+    Eigen-decomposition for symmetric GRM with Rust-first backend.
+
+    Returns
+    -------
+    eigvals, eigvecs, backend_label, elapsed_seconds
+    """
+    g = np.ascontiguousarray(np.asarray(grm, dtype=np.float64))
+    t = max(1, int(threads))
+
+    if hasattr(jxrs, "rust_eigh_from_array_f64"):
+        try:
+            with _gwas_evd_stage_ctx(t):
+                (
+                    eval_raw,
+                    evec_raw,
+                    _blas_backend,
+                    evd_backend,
+                    _n,
+                    _tb,
+                    _ti,
+                    _ta,
+                    _lapack_used,
+                    elapsed,
+                ) = jxrs.rust_eigh_from_array_f64(
+                    g,
+                    threads=int(t),
+                    driver="auto",
+                    jobz="V",
+                    require_lapack=False,
+                )
+            if evec_raw is None:
+                raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors for jobz=V.")
+            eigvals = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
+            eigvecs = np.asarray(evec_raw, dtype=np.float64)
+            backend = str(evd_backend)
+            if logger is not None:
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"{stage_label} eigh backend={backend} elapsed={float(elapsed):.3f}s",
+                )
+            return eigvals, eigvecs, backend, float(elapsed)
+        except Exception as ex:
+            if bool(require_rust):
+                raise RuntimeError(
+                    f"{stage_label} rust eigh failed under require_rust mode: {ex}"
+                ) from ex
+            if logger is not None:
+                _log_file_only(
+                    logger,
+                    logging.WARNING,
+                    f"{stage_label} rust eigh failed -> fallback numpy eigh. reason={ex}",
+                )
+    elif bool(require_rust):
+        raise RuntimeError(
+            f"{stage_label} requires rust_eigh_from_array_f64, but the symbol is unavailable."
+        )
+
+    t0 = time.monotonic()
+    with _gwas_evd_stage_ctx(t):
+        eigvals, eigvecs = np.linalg.eigh(g)
+    elapsed = max(time.monotonic() - t0, 0.0)
+    return (
+        np.asarray(eigvals, dtype=np.float64),
+        np.asarray(eigvecs, dtype=np.float64),
+        "numpy_eigh",
+        float(elapsed),
+    )
 
 
 def _calibrate_lrlmm_spectrum(
@@ -3632,6 +3668,1007 @@ def run_lrlmm_packed(
             logger.info("")
 
 
+def run_fastlmm_packed_fullrank(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+) -> None:
+    required_symbols = [
+        "grm_packed_f64_with_stats",
+        "rust_eigh_from_array_f64",
+        "fastlmm_assoc_packed_f32",
+    ]
+    missing_symbols = [s for s in required_symbols if not hasattr(jxrs, s)]
+    if len(missing_symbols) > 0:
+        raise RuntimeError(
+            "Rust extension missing required GWAS full-rust symbols: "
+            + ", ".join(missing_symbols)
+        )
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError(
+            "FastLMM full-rust packed path requires PLINK BED input "
+            "(prefix with .bed/.bim/.fam)."
+        )
+
+    with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
+        try:
+            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(prefix),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+            )
+        except Exception:
+            task.fail("Loading packed BED genotype ...Failed")
+            raise
+        task.complete("Loading packed BED genotype ...Finished")
+
+    full_ids = np.asarray(full_ids, dtype=str)
+    id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+    try:
+        sample_map = np.asarray([id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)], dtype=np.int64)
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip = np.ascontiguousarray(
+        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_n = int(packed_ctx["n_samples"])
+    if packed_n <= 0:
+        raise ValueError("Packed BED reported invalid sample count.")
+    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+        raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+
+    sites_all_full = _read_bim_sites(prefix)
+    site_keep = np.asarray(packed_ctx.get("site_keep", np.ones((len(sites_all_full),), dtype=np.bool_)), dtype=np.bool_)
+    if int(site_keep.shape[0]) != int(len(sites_all_full)):
+        raise ValueError("Packed site_keep length mismatch with BIM rows.")
+    sites_all = [s for s, keep in zip(sites_all_full, site_keep) if bool(keep)]
+    if int(len(sites_all)) != int(packed.shape[0]):
+        raise ValueError(
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+        )
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    multi_trait_mode = len(trait_iter) > 1
+
+    for trait_idx, pname in enumerate(trait_iter):
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = qmatrix[keep_idx]
+        if cov_all is not None:
+            x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
+        x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
+        x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
+        sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
+
+        grm_t0 = time.monotonic()
+        with CliStatus(
+            "Building packed GRM (Rust)...",
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                grm_raw, _row_sum, _varsum = jxrs.grm_packed_f64_with_stats(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    sample_idx_trait,
+                    1,
+                    max(1, int(chunk_size)),
+                    int(threads),
+                    None,
+                    0,
+                )
+            except Exception:
+                task.fail("Packed GRM (Rust) ...Failed")
+                raise
+            task.complete("Packed GRM (Rust) ...Finished")
+        grm_secs = max(time.monotonic() - grm_t0, 0.0)
+        grm_fit = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64), dtype=np.float64)
+        if grm_fit.ndim != 2 or grm_fit.shape[0] != grm_fit.shape[1] or grm_fit.shape[0] != n_idv:
+            raise ValueError(
+                f"Trait GRM shape mismatch: got {grm_fit.shape}, expected ({n_idv}, {n_idv})."
+            )
+        np.fill_diagonal(grm_fit, np.diag(grm_fit) + 1e-6)
+
+        eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
+            grm_fit,
+            threads=max(1, int(threads)),
+            logger=logger,
+            stage_label=f"FastLMM-fullrank:{pname}",
+            require_rust=True,
+        )
+        s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
+        u_sub = np.ascontiguousarray(eigvecs, dtype=np.float32)
+        if u_sub.shape != (n_idv, n_idv):
+            raise ValueError(
+                f"Trait eigenvector shape mismatch: got {u_sub.shape}, expected ({n_idv}, {n_idv})."
+            )
+        u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
+        u_trait[sample_idx_trait, :] = u_sub
+
+        gwas_t0 = time.monotonic()
+        gwas_total = int(len(sites_all))
+        gwas_last_done = 0
+        gwas_pbar: Optional[_ProgressAdapter] = None
+        if bool(use_spinner):
+            gwas_pbar = _ProgressAdapter(
+                total=max(1, gwas_total),
+                desc="FastLMM",
+                force_animate=True,
+            )
+
+        def _fastlmm_progress(done: int, total: int) -> None:
+            nonlocal gwas_last_done, gwas_total, gwas_pbar
+            if gwas_pbar is None:
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t > 0 and t != gwas_total and gwas_last_done == 0:
+                try:
+                    gwas_pbar.close(show_done=False)
+                except Exception:
+                    pass
+                gwas_total = int(max(1, t))
+                gwas_pbar = _ProgressAdapter(
+                    total=gwas_total,
+                    desc="FastLMM",
+                    force_animate=True,
+                )
+                gwas_last_done = 0
+            d = int(max(0, min(d, max(1, gwas_total))))
+            step = int(max(0, d - gwas_last_done))
+            if step > 0 and gwas_pbar is not None:
+                gwas_pbar.update(step)
+                gwas_last_done = d
+
+        gwas_ok = False
+        try:
+            progress_kwargs: dict[str, object] = {}
+            if gwas_pbar is not None:
+                progress_kwargs = {
+                    "progress_callback": _fastlmm_progress,
+                    "progress_every": int(max(1, int(chunk_size))),
+                }
+            with _gwas_scan_stage_ctx(max(1, int(threads))):
+                lbd, _ml0, _reml0, res_raw = jxrs.fastlmm_assoc_packed_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    u_trait,
+                    s_trait,
+                    y_vec,
+                    x_arg,
+                    sample_idx_trait,
+                    -5.0,
+                    5.0,
+                    50,
+                    1e-2,
+                    0.0,
+                    int(threads),
+                    str(genetic_model),
+                    **progress_kwargs,
+                )
+            gwas_ok = True
+        finally:
+            if gwas_pbar is not None:
+                try:
+                    if gwas_ok:
+                        if int(gwas_last_done) < int(max(1, gwas_total)):
+                            gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
+                        gwas_pbar.finish()
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+                gwas_pbar.close(show_done=False)
+
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
+            raise ValueError(
+                f"Unexpected FastLMM full-rust result shape: {res.shape}, expected ({len(sites_all)}, >=3)"
+            )
+
+        pve = None
+        try:
+            vg = float(np.mean(np.asarray(s_trait, dtype=np.float64)))
+            lbd_v = float(lbd)
+            if np.isfinite(vg) and np.isfinite(lbd_v) and (vg + lbd_v) > 0:
+                pve = vg / (vg + lbd_v)
+        except Exception:
+            pve = None
+
+        chrom = [str(c) for (c, _p, _a0, _a1) in sites_all]
+        pos = [int(p) for (_c, p, _a0, _a1) in sites_all]
+        a0 = [str(v) for (_c, _p, v, _a1) in sites_all]
+        a1 = [str(v) for (_c, _p, _a0, v) in sites_all]
+        res_df = pd.DataFrame(
+            {
+                "chrom": chrom,
+                "pos": pos,
+                "allele0": a0,
+                "allele1": a1,
+                "maf": np.asarray(maf, dtype=np.float32),
+                "beta": np.asarray(res[:, 0], dtype=np.float64),
+                "se": np.asarray(res[:, 1], dtype=np.float64),
+                "pwald": np.asarray(res[:, 2], dtype=np.float64),
+            }
+        )
+        if res.shape[1] > 3:
+            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+
+        gm_tag = str(genetic_model).lower()
+        if gm_tag == "add":
+            out_tsv = f"{outprefix}.{pname}.fastlmm.tsv"
+        else:
+            out_tsv = f"{outprefix}.{pname}.{gm_tag}.fastlmm.tsv"
+        viz_secs = 0.0
+        if plot:
+            viz_t0 = time.time()
+            fastplot(
+                res_df[["chrom", "pos", "pwald"]],
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+            )
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        cast_map: dict[str, object] = {"pwald": "object", "pos": int}
+        if "plrt" in res_df.columns:
+            cast_map["plrt"] = "object"
+        res_df = res_df.astype(cast_map)
+        res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+        if "plrt" in res_df.columns:
+            res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
+        res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        saved_paths.append(str(out_tsv))
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+        _log_model_line(
+            logger,
+            "FastLMM",
+            f"full-rust; lambda={float(lbd):.4g}; eig_backend={evd_backend}",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "FastLMM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "FastLMM",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(sites_all))
+        eff_snp_by_trait[pname] = eff_snp
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "FastLMM",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": (float(pve) if pve is not None else None),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(grm_secs + evd_secs + gwas_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv),
+            }
+        )
+
+        done_times = [format_elapsed(grm_secs), format_elapsed(evd_secs), format_elapsed(gwas_secs)]
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            f"FastLMM(full-rust) ...Finished [{'/'.join(done_times)}]",
+            use_spinner=bool(use_spinner),
+        )
+        if pve is not None and np.isfinite(float(pve)):
+            _emit_plain_info_line(
+                logger,
+                f"pve={float(pve):.3f} (from FastLMM)",
+                use_spinner=bool(use_spinner),
+            )
+        if multi_trait_mode:
+            logger.info("")
+
+
+def run_lm_packed_fullrank(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+) -> None:
+    if not hasattr(jxrs, "glmf32_packed"):
+        raise RuntimeError(
+            "Rust extension missing glmf32_packed. Rebuild/install JanusX extension first."
+        )
+    if str(genetic_model).lower() != "add":
+        raise ValueError(
+            "LM full-rust packed route currently supports additive coding only (--model add)."
+        )
+
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError(
+            "LM full-rust packed path requires PLINK BED input "
+            "(prefix with .bed/.bim/.fam)."
+        )
+
+    with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
+        try:
+            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(prefix),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+            )
+        except Exception:
+            task.fail("Loading packed BED genotype ...Failed")
+            raise
+        task.complete("Loading packed BED genotype ...Finished")
+
+    full_ids = np.asarray(full_ids, dtype=str)
+    id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+    try:
+        sample_map = np.asarray([id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)], dtype=np.int64)
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip = np.ascontiguousarray(
+        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_n = int(packed_ctx["n_samples"])
+    if packed_n <= 0:
+        raise ValueError("Packed BED reported invalid sample count.")
+    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+        raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+
+    sites_all_full = _read_bim_sites(prefix)
+    site_keep = np.asarray(packed_ctx.get("site_keep", np.ones((len(sites_all_full),), dtype=np.bool_)), dtype=np.bool_)
+    if int(site_keep.shape[0]) != int(len(sites_all_full)):
+        raise ValueError("Packed site_keep length mismatch with BIM rows.")
+    sites_all = [s for s, keep in zip(sites_all_full, site_keep) if bool(keep)]
+    if int(len(sites_all)) != int(packed.shape[0]):
+        raise ValueError(
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+        )
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    multi_trait_mode = len(trait_iter) > 1
+
+    for pname in trait_iter:
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = qmatrix[keep_idx]
+        if cov_all is not None:
+            x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
+        x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
+        x_design = np.ascontiguousarray(
+            np.concatenate(
+                [np.ones((int(x_cov.shape[0]), 1), dtype=np.float64), x_cov],
+                axis=1,
+            ),
+            dtype=np.float64,
+        )
+        ixx = np.ascontiguousarray(np.linalg.pinv(x_design.T @ x_design), dtype=np.float64)
+        q0 = int(x_design.shape[1])
+        p_snp_col = int(q0 + 2)
+        sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
+
+        gwas_t0 = time.monotonic()
+        with CliStatus("Running LM full-rust scan...", enabled=bool(use_spinner), use_process=True) as task:
+            try:
+                with _gwas_scan_stage_ctx(max(1, int(threads))):
+                    res_raw = jxrs.glmf32_packed(
+                        y_vec,
+                        x_design,
+                        ixx,
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        sample_idx_trait,
+                        int(max(1, int(chunk_size))),
+                        int(threads),
+                    )
+            except Exception:
+                task.fail("LM full-rust scan ...Failed")
+                raise
+            task.complete("LM full-rust scan ...Finished")
+
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] <= p_snp_col:
+            raise ValueError(
+                f"Unexpected LM full-rust result shape: {res.shape}, expected ({len(sites_all)}, >{p_snp_col})"
+            )
+
+        chrom = [str(c) for (c, _p, _a0, _a1) in sites_all]
+        pos = [int(p) for (_c, p, _a0, _a1) in sites_all]
+        a0 = [str(v) for (_c, _p, v, _a1) in sites_all]
+        a1 = [str(v) for (_c, _p, _a0, v) in sites_all]
+        res_df = pd.DataFrame(
+            {
+                "chrom": chrom,
+                "pos": pos,
+                "allele0": a0,
+                "allele1": a1,
+                "maf": np.asarray(maf, dtype=np.float32),
+                "beta": np.asarray(res[:, 0], dtype=np.float64),
+                "se": np.asarray(res[:, 1], dtype=np.float64),
+                "pwald": np.asarray(res[:, p_snp_col], dtype=np.float64),
+            }
+        )
+
+        gm_tag = str(genetic_model).lower()
+        if gm_tag == "add":
+            out_tsv = f"{outprefix}.{pname}.lm.tsv"
+        else:
+            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lm.tsv"
+        viz_secs = 0.0
+        if plot:
+            viz_t0 = time.time()
+            fastplot(
+                res_df[["chrom", "pos", "pwald"]],
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+            )
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        res_df = res_df.astype({"pwald": "object", "pos": int})
+        res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+        res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        saved_paths.append(str(out_tsv))
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+        _log_model_line(
+            logger,
+            "LM",
+            "full-rust packed scan",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LM",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(sites_all))
+        eff_snp_by_trait[pname] = eff_snp
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "LM",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": None,
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(gwas_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv),
+            }
+        )
+
+        done_times = [format_elapsed(gwas_secs)]
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            f"LM(full-rust) ...Finished [{'/'.join(done_times)}]",
+            use_spinner=bool(use_spinner),
+        )
+        if multi_trait_mode:
+            logger.info("")
+
+
+def run_lmm_packed_fullrank(
+    *,
+    genofile: str,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    grm: np.ndarray,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    genetic_model: str,
+    het_threshold: float,
+    chunk_size: int,
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    plot: bool,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    snps_only: bool = True,
+    eff_snp_by_trait: Union[dict[str, int], None] = None,
+    summary_rows: Union[list[dict[str, object]], None] = None,
+    saved_paths: Union[list[str], None] = None,
+    trait_names: Union[list[str], None] = None,
+    emit_trait_header: bool = True,
+) -> None:
+    if not hasattr(jxrs, "lmm_reml_assoc_packed_f32"):
+        raise RuntimeError(
+            "Rust extension missing lmm_reml_assoc_packed_f32. Rebuild/install JanusX extension first."
+        )
+    if str(genetic_model).lower() != "add":
+        raise ValueError(
+            "LMM full-rust packed route currently supports additive coding only (--model add)."
+        )
+    if grm is None:
+        raise ValueError("LMM full-rust packed route requires a prepared GRM.")
+
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError(
+            "LMM full-rust packed path requires PLINK BED input "
+            "(prefix with .bed/.bim/.fam)."
+        )
+
+    with CliStatus("Loading packed BED genotype...", enabled=bool(use_spinner)) as task:
+        try:
+            full_ids, packed_ctx = prepare_packed_ctx_from_plink(
+                str(prefix),
+                maf=float(maf_threshold),
+                missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+            )
+        except Exception:
+            task.fail("Loading packed BED genotype ...Failed")
+            raise
+        task.complete("Loading packed BED genotype ...Finished")
+
+    full_ids = np.asarray(full_ids, dtype=str)
+    id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
+    try:
+        sample_map = np.asarray([id_to_idx[str(sid)] for sid in np.asarray(ids, dtype=str)], dtype=np.int64)
+    except KeyError as e:
+        raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    row_flip = np.ascontiguousarray(
+        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    packed_n = int(packed_ctx["n_samples"])
+    if packed_n <= 0:
+        raise ValueError("Packed BED reported invalid sample count.")
+    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+        raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
+
+    sites_all_full = _read_bim_sites(prefix)
+    site_keep = np.asarray(packed_ctx.get("site_keep", np.ones((len(sites_all_full),), dtype=np.bool_)), dtype=np.bool_)
+    if int(site_keep.shape[0]) != int(len(sites_all_full)):
+        raise ValueError("Packed site_keep length mismatch with BIM rows.")
+    sites_all = [s for s, keep in zip(sites_all_full, site_keep) if bool(keep)]
+    if int(len(sites_all)) != int(packed.shape[0]):
+        raise ValueError(
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+        )
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    if eff_snp_by_trait is None:
+        eff_snp_by_trait = {}
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns) if trait_names is None else [t for t in trait_names if t in pheno_aligned.columns]
+    multi_trait_mode = len(trait_iter) > 1
+
+    for pname in trait_iter:
+        cpu_t0 = process.cpu_times()
+        t0 = time.time()
+        peak_rss = process.memory_info().rss
+
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if pname not in eff_snp_by_trait:
+                eff_snp_by_trait[pname] = 0
+            if multi_trait_mode:
+                logger.info("")
+            continue
+
+        if bool(emit_trait_header):
+            _emit_trait_header(
+                logger,
+                str(pname),
+                int(n_idv),
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = qmatrix[keep_idx]
+        if cov_all is not None:
+            x_cov = np.concatenate([x_cov, cov_all[keep_idx]], axis=1)
+
+        Ksub = grm[np.ix_(keep_idx, keep_idx)]
+        evd_t0 = time.monotonic()
+        with CliStatus(
+            "Running LMM Eigen-Decomposition...",
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                stage_threads = max(1, int(threads))
+                with _gwas_evd_stage_ctx(stage_threads):
+                    mod = LMM(y=y_vec, X=x_cov, kinship=Ksub)
+            except Exception:
+                task.fail("LMM Eigen-Decomposition ...Failed")
+                raise
+        evd_secs = max(time.monotonic() - evd_t0, 0.0)
+        header_pve: Optional[float] = None
+        try:
+            pve_tmp = float(mod.pve)
+            if np.isfinite(pve_tmp):
+                header_pve = pve_tmp
+        except Exception:
+            header_pve = None
+        _log_model_line(
+            logger,
+            "LMM",
+            f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{format_elapsed(evd_secs)}]",
+            use_spinner=bool(use_spinner),
+        )
+
+        sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
+        s_vec = np.ascontiguousarray(np.asarray(mod.S, dtype=np.float64).reshape(-1), dtype=np.float64)
+        xcov_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
+        y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
+        u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
+        lbd_low = float(mod.bounds[0])
+        lbd_high = float(mod.bounds[1])
+        null_ml = float(mod.ML0)
+
+        gwas_t0 = time.monotonic()
+        gwas_total = int(len(sites_all))
+        gwas_last_done = 0
+        gwas_pbar: Optional[_ProgressAdapter] = None
+        if bool(use_spinner):
+            gwas_pbar = _ProgressAdapter(
+                total=max(1, gwas_total),
+                desc="LMM",
+                force_animate=True,
+            )
+
+        def _lmm_progress(done: int, total: int) -> None:
+            nonlocal gwas_last_done, gwas_total, gwas_pbar
+            if gwas_pbar is None:
+                return
+            try:
+                d = int(done)
+                t = int(total)
+            except Exception:
+                return
+            if t > 0 and t != gwas_total and gwas_last_done == 0:
+                try:
+                    gwas_pbar.close(show_done=False)
+                except Exception:
+                    pass
+                gwas_total = int(max(1, t))
+                gwas_pbar = _ProgressAdapter(
+                    total=gwas_total,
+                    desc="LMM",
+                    force_animate=True,
+                )
+                gwas_last_done = 0
+            d = int(max(0, min(d, max(1, gwas_total))))
+            step = int(max(0, d - gwas_last_done))
+            if step > 0 and gwas_pbar is not None:
+                gwas_pbar.update(step)
+                gwas_last_done = d
+
+        gwas_ok = False
+        try:
+            progress_kwargs: dict[str, object] = {}
+            if gwas_pbar is not None:
+                progress_kwargs = {
+                    "progress_callback": _lmm_progress,
+                    "progress_every": int(max(1, int(chunk_size))),
+                }
+            with _gwas_scan_stage_ctx(max(1, int(threads))):
+                res_raw = jxrs.lmm_reml_assoc_packed_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    s_vec,
+                    xcov_rot,
+                    y_rot,
+                    u_t,
+                    sample_idx_trait,
+                    float(lbd_low),
+                    float(lbd_high),
+                    30,
+                    1e-2,
+                    int(threads),
+                    "add",
+                    **progress_kwargs,
+                    nullml=float(null_ml),
+                    rotate_block_rows=int(max(16, min(512, int(chunk_size)))),
+                )
+            gwas_ok = True
+        finally:
+            if gwas_pbar is not None:
+                try:
+                    if gwas_ok:
+                        if int(gwas_last_done) < int(max(1, gwas_total)):
+                            gwas_pbar.update(int(max(1, gwas_total)) - int(gwas_last_done))
+                        gwas_pbar.finish()
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+                gwas_pbar.close(show_done=False)
+
+        gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
+            raise ValueError(
+                f"Unexpected LMM full-rust result shape: {res.shape}, expected ({len(sites_all)}, >=3)"
+            )
+
+        chrom = [str(c) for (c, _p, _a0, _a1) in sites_all]
+        pos = [int(p) for (_c, p, _a0, _a1) in sites_all]
+        a0 = [str(v) for (_c, _p, v, _a1) in sites_all]
+        a1 = [str(v) for (_c, _p, _a0, v) in sites_all]
+        res_df = pd.DataFrame(
+            {
+                "chrom": chrom,
+                "pos": pos,
+                "allele0": a0,
+                "allele1": a1,
+                "maf": np.asarray(maf, dtype=np.float32),
+                "beta": np.asarray(res[:, 0], dtype=np.float64),
+                "se": np.asarray(res[:, 1], dtype=np.float64),
+                "pwald": np.asarray(res[:, 2], dtype=np.float64),
+            }
+        )
+        if res.shape[1] > 3:
+            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+
+        gm_tag = str(genetic_model).lower()
+        if gm_tag == "add":
+            out_tsv = f"{outprefix}.{pname}.lmm.tsv"
+        else:
+            out_tsv = f"{outprefix}.{pname}.{gm_tag}.lmm.tsv"
+        viz_secs = 0.0
+        if plot:
+            viz_t0 = time.time()
+            fastplot(
+                res_df[["chrom", "pos", "pwald"]],
+                y_vec,
+                xlabel=str(pname),
+                outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+            )
+            viz_secs = max(time.time() - viz_t0, 0.0)
+
+        cast_map: dict[str, object] = {"pwald": "object", "pos": int}
+        if "plrt" in res_df.columns:
+            cast_map["plrt"] = "object"
+        res_df = res_df.astype(cast_map)
+        res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+        if "plrt" in res_df.columns:
+            res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
+        res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+        saved_paths.append(str(out_tsv))
+
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        cpu_t1 = process.cpu_times()
+        t1 = time.time()
+        wall = max(t1 - t0, 1e-12)
+        cpu_used = (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+        avg_cpu = 100.0 * cpu_used / (wall * max(1, n_cores))
+        peak_rss_gb = peak_rss / (1024 ** 3)
+        _log_model_line(
+            logger,
+            "LMM",
+            "full-rust packed scan",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LMM",
+            f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+            use_spinner=bool(use_spinner),
+        )
+        _log_model_line(
+            logger,
+            "LMM",
+            f"Results saved to {_display_path(str(out_tsv))}",
+            use_spinner=bool(use_spinner),
+        )
+
+        eff_snp = int(len(sites_all))
+        eff_snp_by_trait[pname] = eff_snp
+        summary_rows.append(
+            {
+                "phenotype": str(pname),
+                "model": "LMM",
+                "nidv": int(n_idv),
+                "eff_snp": int(eff_snp),
+                "pve": (float(header_pve) if header_pve is not None else None),
+                "avg_cpu": float(avg_cpu),
+                "peak_rss_gb": float(peak_rss_gb),
+                "gwas_time_s": float(evd_secs + gwas_secs),
+                "viz_time_s": float(viz_secs),
+                "result_file": str(out_tsv),
+            }
+        )
+
+        done_times = [format_elapsed(evd_secs), format_elapsed(gwas_secs)]
+        if plot:
+            done_times.append(format_elapsed(viz_secs))
+        _rich_success(
+            logger,
+            f"LMM(full-rust) ...Finished [{'/'.join(done_times)}]",
+            use_spinner=bool(use_spinner),
+        )
+        if header_pve is not None and np.isfinite(float(header_pve)):
+            _emit_plain_info_line(
+                logger,
+                f"pve={float(header_pve):.3f} (from LMM)",
+                use_spinner=bool(use_spinner),
+            )
+        if multi_trait_mode:
+            logger.info("")
+
+
 def run_chunked_gwas_lmm_lm(
     model_name: str,
     genofile: str,
@@ -3681,6 +4718,159 @@ def run_chunked_gwas_lmm_lm(
     }[model_key]
     # Keep output file suffixes consistent and lowercase.
     base_model_tag = base_model_label.lower()
+
+    # FastLMM packed full-rust route:
+    # packed BED -> Rust GRM -> Rust EVD -> Rust full SNP scan.
+    if model_key == "fastlmm":
+        can_packed = _as_plink_prefix(genofile) is not None
+        has_symbols = all(
+            hasattr(jxrs, s)
+            for s in (
+                "grm_packed_f64_with_stats",
+                "rust_eigh_from_array_f64",
+                "fastlmm_assoc_packed_f32",
+            )
+        )
+        if can_packed and has_symbols:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "FastLMM route: using full-rust packed pipeline (GRM+EVD+scan).",
+            )
+            run_fastlmm_packed_fullrank(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=trait_names,
+                emit_trait_header=emit_trait_header,
+            )
+            return
+        if model_key == "fastlmm":
+            reasons: list[str] = []
+            if not can_packed:
+                reasons.append("input is not PLINK BED prefix")
+            if not has_symbols:
+                reasons.append("required rust symbols unavailable")
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "FastLMM route: fallback to streaming Python orchestrator "
+                f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
+            )
+    if model_key == "lm":
+        can_packed = _as_plink_prefix(genofile) is not None
+        has_symbols = hasattr(jxrs, "glmf32_packed")
+        is_add = str(genetic_model).lower() == "add"
+        if can_packed and has_symbols and is_add:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "LM route: using full-rust packed pipeline (single-entry scan).",
+            )
+            run_lm_packed_fullrank(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=trait_names,
+                emit_trait_header=emit_trait_header,
+            )
+            return
+        reasons: list[str] = []
+        if not can_packed:
+            reasons.append("input is not PLINK BED prefix")
+        if not has_symbols:
+            reasons.append("required rust symbols unavailable")
+        if not is_add:
+            reasons.append("non-additive model is not yet supported by LM full-rust route")
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "LM route: fallback to streaming Python orchestrator "
+            f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
+        )
+    if model_key == "lmm":
+        can_packed = _as_plink_prefix(genofile) is not None
+        has_symbols = hasattr(jxrs, "lmm_reml_assoc_packed_f32")
+        has_grm = grm is not None
+        is_add = str(genetic_model).lower() == "add"
+        if can_packed and has_symbols and has_grm and is_add:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "LMM route: using full-rust packed pipeline (EVD+single-entry scan).",
+            )
+            run_lmm_packed_fullrank(
+                genofile=genofile,
+                pheno=pheno,
+                ids=ids,
+                grm=grm,
+                outprefix=outprefix,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                genetic_model=genetic_model,
+                het_threshold=het_threshold,
+                chunk_size=chunk_size,
+                qmatrix=qmatrix,
+                cov_all=cov_all,
+                plot=plot,
+                threads=threads,
+                logger=logger,
+                use_spinner=use_spinner,
+                snps_only=bool(snps_only),
+                eff_snp_by_trait=eff_snp_by_trait,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=trait_names,
+                emit_trait_header=emit_trait_header,
+            )
+            return
+        reasons: list[str] = []
+        if not can_packed:
+            reasons.append("input is not PLINK BED prefix")
+        if not has_symbols:
+            reasons.append("required rust symbols unavailable")
+        if not has_grm:
+            reasons.append("GRM is unavailable")
+        if not is_add:
+            reasons.append("non-additive model is not yet supported by LMM full-rust route")
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "LMM route: fallback to streaming Python orchestrator "
+            f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
+        )
 
     def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
         m = model.lower()
@@ -5166,8 +6356,12 @@ def build_qmatrix_farmcpu(
             else:
                 _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
                 grm = _load_or_build_grm_cache_for_pca()
-                with _gwas_evd_stage_ctx(max(1, int(threads))):
-                    eigval, eigvec = np.linalg.eigh(grm)
+                eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                    grm,
+                    threads=max(1, int(threads)),
+                    logger=logger,
+                    stage_label="FarmCPU-Q-build",
+                )
                 qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
@@ -6059,14 +7253,21 @@ def parse_args(argv: Optional[list[str]] = None):
     return args
 
 
-def main(log: bool = True):
+def _run_gwas_pipeline(
+    args=None,
+    *,
+    argv: Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+):
     t_start = time.time()
     use_spinner = bool(getattr(sys.stdout, "isatty", lambda: False)())
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     run_status = "done"
     run_error = ""
-    args = parse_args()
+    if args is None:
+        args = parse_args(argv)
     # Plotting is always enabled for GWAS CLI.
     args.plot = True
     args.cov = _normalize_cov_inputs(args.cov)
@@ -6096,13 +7297,14 @@ def main(log: bool = True):
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
             f"using {int(args.thread)}."
         )
-    apply_blas_thread_env(int(args.thread))
+    apply_outer_thread_cap(int(args.thread))
     maybe_warn_non_openblas(
         logger=logger,
         strict=require_openblas_by_default(),
     )
     gwas_summary_rows: list[dict[str, object]] = []
     saved_result_paths: list[str] = []
+    ordered_result_paths: list[str] = []
     trait_order: list[str] = []
 
     if log:
@@ -6278,6 +7480,73 @@ def main(log: bool = True):
         # 1) Streaming models first
         # -------------------------------
         if len(stream_models) > 0:
+            # If some models can use packed full-rust single-entry routes, run
+            # them separately first to avoid being merged into shared streaming.
+            if len(stream_models) > 1:
+                packed_prefix_ok = _as_plink_prefix(genofile_stream) is not None
+
+                def _can_fullrust_model(mkey: str) -> bool:
+                    mk = str(mkey).lower().strip()
+                    if not packed_prefix_ok:
+                        return False
+                    if mk == "fastlmm":
+                        return all(
+                            hasattr(jxrs, s)
+                            for s in (
+                                "grm_packed_f64_with_stats",
+                                "rust_eigh_from_array_f64",
+                                "fastlmm_assoc_packed_f32",
+                            )
+                        )
+                    if mk == "lmm":
+                        return (
+                            str(args.model).lower() == "add"
+                            and (grm is not None)
+                            and hasattr(jxrs, "lmm_reml_assoc_packed_f32")
+                        )
+                    if mk == "lm":
+                        return (
+                            str(args.model).lower() == "add"
+                            and hasattr(jxrs, "glmf32_packed")
+                        )
+                    return False
+
+                for model_sep in ("fastlmm", "lmm", "lm"):
+                    if (model_sep not in stream_models) or (not _can_fullrust_model(model_sep)):
+                        continue
+                    run_chunked_gwas_lmm_lm(
+                        model_name=model_sep,
+                        genofile=genofile_stream,
+                        pheno=pheno,
+                        ids=ids,
+                        n_snps=n_snps,
+                        outprefix=outprefix,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        genetic_model=args.model,
+                        het_threshold=args.het,
+                        chunk_size=args.chunksize,
+                        mmap_limit=args.mmap_limit,
+                        grm=grm,
+                        qmatrix=qmatrix,
+                        cov_all=cov_all,
+                        eff_m=eff_m,
+                        plot=args.plot,
+                        threads=args.thread,
+                        logger=logger,
+                        use_spinner=use_spinner,
+                        snps_only=bool(args.snps_only),
+                        eff_snp_by_trait=eff_snp_by_trait,
+                        summary_rows=gwas_summary_rows,
+                        saved_paths=saved_result_paths,
+                        trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
+                        show_npve_line=True,
+                        emit_trait_header=True,
+                    )
+                    stream_models = [m for m in stream_models if str(m).lower() != model_sep]
+                    if len(stream_models) > 0:
+                        logger.info("")
+
             if len(stream_models) == 1:
                 model_key = stream_models[0]
                 pve_line_model = model_key if model_key in {"lmm", "fastlmm"} else None
@@ -6310,7 +7579,7 @@ def main(log: bool = True):
                     show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
                     emit_trait_header=True,
                 )
-            else:
+            elif len(stream_models) > 1:
                 for trait_idx, pname in enumerate(trait_order):
                     run_chunked_gwas_streaming_shared(
                         model_names=stream_models,
@@ -6623,6 +7892,29 @@ def main(log: bool = True):
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
     _rich_success(logger, endinfo)
+
+    if bool(return_result):
+        return {
+            "status": str(run_status),
+            "error": str(run_error),
+            "genofile": str(gfile),
+            "outprefix": str(outprefix),
+            "log_file": str(log_path),
+            "summary_rows": [dict(x) for x in _ordered_gwas_summary_rows(gwas_summary_rows)],
+            "result_files": [str(x) for x in ordered_result_paths],
+            "elapsed_sec": float(max(time.time() - t_start, 0.0)),
+            "traits": [str(x) for x in trait_order],
+        }
+
+
+def main(
+    argv: Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+):
+    args = parse_args(argv)
+    from janusx.assoc.runner import run_gwas_args
+    return run_gwas_args(args, log=log, return_result=return_result)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,14 @@ import os
 import platform
 import re
 import warnings
+from contextlib import contextmanager, nullcontext
 from contextlib import redirect_stdout
 from typing import Any
+
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    _threadpool_limits = None
 
 
 _BLAS_THREAD_ENV_KEYS = (
@@ -146,6 +152,96 @@ def apply_blas_thread_env(
     # Keep MLM runtime knobs aligned with global thread cap by default.
     os.environ["JX_MLM_BLAS_THREADS"] = text
     return t
+
+
+def apply_outer_thread_cap(
+    threads: int,
+    *,
+    set_jx_threads: bool = True,
+    set_max_keys: bool = True,
+) -> int:
+    """
+    Apply a unified outer thread cap for both BLAS/OpenMP and Rust/Rayon.
+
+    This is the preferred "single knob" mode where CLI `-t` acts as a total
+    process-level cap, and inner stages may temporarily override sub-runtimes.
+    """
+    t = apply_blas_thread_env(
+        threads,
+        set_jx_threads=bool(set_jx_threads),
+        set_max_keys=bool(set_max_keys),
+    )
+    text = str(int(t))
+    os.environ["RAYON_NUM_THREADS"] = text
+    os.environ["JX_MLM_RUST_THREADS"] = text
+    return t
+
+
+@contextmanager
+def native_blas_thread_limit(limit: int):
+    """
+    Best-effort BLAS threadpool limit context (threadpoolctl-backed).
+    """
+    lim = max(1, int(limit))
+    if _threadpool_limits is None:
+        yield
+        return
+    try:
+        with _threadpool_limits(limits=lim, user_api="blas"):
+            yield
+    except TypeError:
+        with _threadpool_limits(limits=lim):
+            yield
+
+
+@contextmanager
+def runtime_thread_stage(
+    *,
+    blas_threads: int | None = None,
+    rayon_threads: int | None = None,
+):
+    """
+    Stage-scoped runtime thread control.
+
+    - `blas_threads`: caps BLAS/OpenMP env + threadpoolctl limit.
+    - `rayon_threads`: caps Rust/Rayon default pool via env.
+    """
+    updates: dict[str, str] = {}
+    if blas_threads is not None:
+        bt = str(max(1, int(blas_threads)))
+        for key in _BLAS_THREAD_ENV_KEYS:
+            updates[key] = bt
+        updates["JX_MLM_BLAS_THREADS"] = bt
+    if rayon_threads is not None:
+        rt = str(max(1, int(rayon_threads)))
+        updates["RAYON_NUM_THREADS"] = rt
+        updates["JX_MLM_RUST_THREADS"] = rt
+
+    old_env: dict[str, str | None] = {}
+    prev_rust_blas_threads: int | None = None
+    for key, val in updates.items():
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = str(val)
+
+    try:
+        if blas_threads is not None:
+            prev_rust_blas_threads = get_rust_blas_threads()
+            set_rust_blas_threads(int(blas_threads))
+        stage_ctx = (
+            native_blas_thread_limit(int(blas_threads))
+            if blas_threads is not None
+            else nullcontext()
+        )
+        with stage_ctx:
+            yield
+    finally:
+        if prev_rust_blas_threads is not None and prev_rust_blas_threads > 0:
+            set_rust_blas_threads(int(prev_rust_blas_threads))
+        for key, old_val in old_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_val
 
 
 def detect_blas_backend() -> str:
@@ -302,6 +398,65 @@ def detect_blas_backend() -> str:
         pass
 
     return "unknown"
+
+
+def detect_rust_blas_backend() -> str:
+    """
+    Best-effort Rust BLAS/LAPACK backend detection from JanusX extension.
+
+    Returns one of:
+      openblas / accelerate / blas / rust / unknown
+    """
+    try:
+        from janusx import janusx as _jx  # type: ignore
+
+        probe = getattr(_jx, "rust_sgemm_backend", None)
+        if callable(probe):
+            backend = str(probe()).strip().lower()
+            if backend != "":
+                return backend
+    except Exception:
+        pass
+    return "unknown"
+
+
+def set_rust_blas_threads(threads: int) -> bool:
+    """
+    Best-effort direct BLAS thread update for Rust JanusX backend.
+    We first sync process-level OpenMP/BLAS env caps, then try the direct
+    Rust OpenBLAS setter (when available) for immediate effect.
+    """
+    t = apply_blas_thread_env(
+        max(1, int(threads)),
+        set_jx_threads=False,
+        set_max_keys=True,
+    )
+    try:
+        from janusx import janusx as _jx  # type: ignore
+
+        setter = getattr(_jx, "rust_blas_set_num_threads", None)
+        if callable(setter):
+            return bool(setter(int(t)))
+    except Exception:
+        pass
+    return False
+
+
+def get_rust_blas_threads() -> int | None:
+    """
+    Best-effort query of BLAS thread count used by Rust JanusX backend.
+    Returns None when unavailable.
+    """
+    try:
+        from janusx import janusx as _jx  # type: ignore
+
+        getter = getattr(_jx, "rust_blas_get_num_threads", None)
+        if callable(getter):
+            raw = int(getter())
+            return raw if raw > 0 else None
+    except Exception:
+        pass
+    return None
 
 
 def preferred_blas_backends() -> tuple[str, ...]:

@@ -26,7 +26,7 @@ from janusx.script._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from janusx.script.gwas import load_phenotype
+from janusx.assoc.workflow import load_phenotype
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus, log_success, stdout_is_tty

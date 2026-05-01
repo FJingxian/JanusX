@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -9,6 +10,72 @@ fn env_flag(name: &str) -> bool {
             matches!(s.as_str(), "1" | "true" | "yes" | "on")
         }
         Err(_) => false,
+    }
+}
+
+fn env_flag_default_true(name: &str) -> bool {
+    match env::var(name) {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !matches!(s.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+fn has_library_with_prefix(lib_dir_s: &str, prefix: &str) -> bool {
+    let Ok(entries) = fs::read_dir(lib_dir_s) else {
+        return false;
+    };
+    let pfx = prefix.to_ascii_lowercase();
+    for entry in entries.flatten() {
+        let Some(name_raw) = entry.file_name().to_str().map(|s| s.to_ascii_lowercase()) else {
+            continue;
+        };
+        if !name_raw.starts_with(&pfx) {
+            continue;
+        }
+        let is_lib = name_raw.ends_with(".dylib")
+            || name_raw.contains(".dylib.")
+            || name_raw.ends_with(".so")
+            || name_raw.contains(".so.")
+            || name_raw.ends_with(".a")
+            || name_raw.ends_with(".lib")
+            || name_raw.ends_with(".dll")
+            || name_raw.ends_with(".dll.a");
+        if is_lib {
+            return true;
+        }
+    }
+    false
+}
+
+fn maybe_link_blas_family_from_dir(lib_dir_s: &str, source_label: &str) {
+    // Explicitly link liblapack/libblas when available in the same prefix
+    // (typically conda's lib directory). OpenBLAS itself is still linked by
+    // the Rust extern blocks, including versioned-soname handling.
+    if !env_flag_default_true("JANUSX_LINK_BLAS_FAMILY") {
+        return;
+    }
+    let has_lapack = has_library_with_prefix(lib_dir_s, "liblapack")
+        || has_library_with_prefix(lib_dir_s, "lapack");
+    let has_blas =
+        has_library_with_prefix(lib_dir_s, "libblas") || has_library_with_prefix(lib_dir_s, "blas");
+
+    let mut linked: Vec<&str> = Vec::new();
+    if has_lapack {
+        println!("cargo:rustc-link-lib=dylib=lapack");
+        linked.push("lapack");
+    }
+    if has_blas {
+        println!("cargo:rustc-link-lib=dylib=blas");
+        linked.push("blas");
+    }
+    if !linked.is_empty() {
+        println!(
+            "cargo:warning=BLAS family linkage via {source_label}: openblas + {}.",
+            linked.join(" + ")
+        );
     }
 }
 
@@ -137,6 +204,7 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
         // (e.g. libopenblas.0.dylib -> libiconv.2.dylib in conda environments).
         println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
     }
+    maybe_link_blas_family_from_dir(lib_dir_s, source_label);
     println!("cargo:rustc-cfg=jx_openblas_available");
     if cfg!(target_os = "windows") && has_win_openblas && !has_win_libopenblas {
         println!("cargo:rustc-cfg=jx_openblas_link_openblas_plain");
@@ -169,6 +237,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BLAS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+    println!("cargo:rerun-if-env-changed=JANUSX_LINK_BLAS_FAMILY");
     let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
 
     // Only probe OpenBLAS when user explicitly enabled the feature.

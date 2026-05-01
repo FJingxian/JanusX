@@ -3,6 +3,12 @@ pyBLUP public API.
 
 Keep this surface explicit to avoid wildcard pollution and accidental
 shadowing by duplicated helper names across modules.
+
+Note:
+`janusx.pyBLUP` is maintained as a compatibility layer.
+For new code, prefer the thin wrappers under:
+  - `janusx.assoc` (GWAS/association)
+  - `janusx.gs` (genomic selection)
 """
 
 from .QK2 import QK, GRM

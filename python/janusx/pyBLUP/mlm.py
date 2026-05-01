@@ -34,6 +34,7 @@ try:
         packed_malpha_f64 as _packed_malpha_f64,
         grm_packed_f32 as _grm_packed_f32,
         grm_packed_f32_with_stats as _grm_packed_f32_with_stats,
+        grm_packed_f64_with_stats as _grm_packed_f64_with_stats,
     )
 except Exception:
     _bed_packed_row_flip_mask = None
@@ -42,12 +43,12 @@ except Exception:
     _packed_malpha_f64 = None
     _grm_packed_f32 = None
     _grm_packed_f32_with_stats = None
+    _grm_packed_f64_with_stats = None
 
 try:
     from janusx.janusx import bed_packed_decode_stats_f64 as _bed_packed_decode_stats_f64
 except Exception:
     _bed_packed_decode_stats_f64 = None
-
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = str(os.getenv(name, default)).strip().lower()
@@ -612,6 +613,9 @@ class BLUP:
         self._fast_inv_s = None
         self._fast_svals = None
         self._fast_projected = False
+        self._fast_centered_kinship = False
+        self._fast_intercept = float(np.mean(self.y, dtype=np.float64))
+        self._fast_centered_y_ss: float | None = None
         if self._packed_ctx is not None:
             self._fit_with_packed(
                 Z=Z,
@@ -675,12 +679,41 @@ class BLUP:
             self.Z = self.M.T if z_is_identity else Z @ self.M.T
         # Simplify inverse matrix
         self.Dh = None
+        fast_marker_scale = 1.0
         if usefastlmm and z_is_identity:
             # Memory-lean FaST projection:
             # do eigendecomposition on m x m Gram (M M^T) instead of SVD on n x m.
             # This avoids materializing U of size n x m for large n.
             t_svd = time.time()
-            gram = self.M @ self.M.T
+            gram = np.asarray(self.M @ self.M.T, dtype=np.float64)
+            mx = np.asarray(self.M @ self.X, dtype=np.float64)
+            my = np.asarray(self.M @ self.y, dtype=np.float64)
+            if self.kinship is not None:
+                # Keep FaST path on the same GRM scale as the explicit-kinship path:
+                # G = (M_c^T M_c) / sum(var_train).
+                if self._m_mean is None:
+                    raise RuntimeError("Internal error: marker mean is missing for kinship FaST fit.")
+                m_mean64 = np.ascontiguousarray(
+                    np.asarray(self._m_mean, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                m_var_sum = float(self._m_var_sum) if self._m_var_sum is not None else float("nan")
+                if (not np.isfinite(m_var_sum)) or (m_var_sum <= 0.0):
+                    m_var_sum = 1e-12
+                x_sum = np.ascontiguousarray(
+                    np.sum(self.X, axis=0, dtype=np.float64, keepdims=True),
+                    dtype=np.float64,
+                )
+                y_sum = float(np.sum(self.y, dtype=np.float64))
+                gram -= float(self.n) * (m_mean64 @ m_mean64.T)
+                gram /= float(m_var_sum)
+                fast_marker_scale = float(np.sqrt(m_var_sum))
+                mx = (mx - (m_mean64 @ x_sum)) / float(fast_marker_scale)
+                my = (my - (m_mean64 * float(y_sum))) / float(fast_marker_scale)
+                self._fast_centered_kinship = True
+                self._fast_intercept = float(np.mean(self.y, dtype=np.float64))
+                yc = np.asarray(self.y, dtype=np.float64).reshape(-1) - float(self._fast_intercept)
+                self._fast_centered_y_ss = float(np.sum(yc * yc, dtype=np.float64))
             gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
                 n=int(self.n),
                 m=int(self.M.shape[0]),
@@ -715,8 +748,6 @@ class BLUP:
             del gram
             svals = np.sqrt(eigvals.astype(np.float64, copy=False))
             inv_s = 1.0 / svals
-            mx = self.M @ self.X
-            my = self.M @ self.y
             self.X = (eigvec.T @ mx) * inv_s[:, None]
             self.y = (eigvec.T @ my) * inv_s[:, None]
             self.S = svals ** 2
@@ -801,8 +832,17 @@ class BLUP:
             if self._fast_v is not None and self._fast_inv_s is not None:
                 proj_alpha = self._fast_v @ (self._fast_inv_s[:, None] * vr)
                 proj_u = self._fast_v @ (self._fast_inv_s[:, None] * spectral * vr)
-                self.alpha = self.M.T @ proj_alpha
-                self.u = self.M.T @ proj_u
+                if self._m_mean is None:
+                    raise RuntimeError("Internal error: marker mean is missing for kinship FaST fit.")
+                scale = float(max(np.finfo(np.float64).eps, float(fast_marker_scale)))
+                m_mean64 = np.ascontiguousarray(
+                    np.asarray(self._m_mean, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                mu_dot_alpha = float((m_mean64.T @ proj_alpha)[0, 0])
+                mu_dot_u = float((m_mean64.T @ proj_u)[0, 0])
+                self.alpha = (self.M.T @ proj_alpha - mu_dot_alpha) / scale
+                self.u = (self.M.T @ proj_u - mu_dot_u) / scale
             else:
                 self.alpha = self.Dh.T @ vr
                 self.u = self.Dh.T @ (spectral * vr)
@@ -819,18 +859,36 @@ class BLUP:
             # Cache compact terms for prediction:
             # cross(M_new, M_train) @ alpha without materializing cross kernel.
             self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
-            self._m_alpha = self.M @ self.alpha
+            if self._fast_projected and self._implicit_kinship_fast and self._fast_v is not None and self._fast_svals is not None:
+                scale = float(max(np.finfo(np.float64).eps, float(fast_marker_scale)))
+                centered_malpha = scale * (self._fast_v @ (self._fast_svals[:, None] * vr))
+                if self._m_mean is None:
+                    raise RuntimeError("Internal error: marker mean is missing for kinship FaST fit.")
+                m_mean64 = np.ascontiguousarray(
+                    np.asarray(self._m_mean, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                self._m_alpha = centered_malpha + m_mean64 * self._alpha_sum
+            else:
+                self._m_alpha = self.M @ self.alpha
             self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0]) if self._m_mean is not None else None
             self._mean_malpha = (
                 float((self._m_mean.T @ self._m_alpha)[0, 0]) if self._m_mean is not None else None
             )
+            if self._fast_projected and self._implicit_kinship_fast and self._fast_centered_kinship:
+                self.beta = np.array([[float(self._fast_intercept)]], dtype=np.float64)
         sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2
         if self.kinship is None:
             g = self.M.T @ self.u
             var_g = float(np.var(g, ddof=1))
         else:
-            mean_s = float(np.mean(self.S))
+            if self._fast_projected and self._implicit_kinship_fast:
+                # In low-rank FaST mode, `self.S` only stores non-zero spectrum.
+                # Use trace(K)/n to keep h2/PVE scale consistent with full-rank GRM.
+                mean_s = float(np.sum(self.S, dtype=np.float64) / float(max(1, self.n)))
+            else:
+                mean_s = float(np.mean(self.S))
             var_g = sigma_g2 * mean_s
         self.pve = var_g / (var_g + sigma_e2)
         if self._debug_stage:
@@ -967,6 +1025,29 @@ class BLUP:
         self._m_var_sum = float(np.sum(m_var, dtype=np.float64))
         if self._m_var_sum <= 0.0:
             self._m_var_sum = 1e-12
+        fast_marker_scale = 1.0
+        if self.kinship is not None:
+            # Keep packed FaST kinship scaling consistent with explicit GRM:
+            # G = (M_c^T M_c) / sum(var_train)
+            m_mean64 = np.ascontiguousarray(
+                np.asarray(self._m_mean, dtype=np.float64).reshape(-1, 1),
+                dtype=np.float64,
+            )
+            m_var_sum = float(max(np.finfo(np.float64).eps, float(self._m_var_sum)))
+            x_sum = np.ascontiguousarray(
+                np.sum(self.X, axis=0, dtype=np.float64, keepdims=True),
+                dtype=np.float64,
+            )
+            y_sum = float(np.sum(self.y, dtype=np.float64))
+            gram -= float(self.n) * (m_mean64 @ m_mean64.T)
+            gram /= float(m_var_sum)
+            fast_marker_scale = float(np.sqrt(m_var_sum))
+            mx = (mx - (m_mean64 @ x_sum)) / float(fast_marker_scale)
+            my = (my - (m_mean64 * float(y_sum))) / float(fast_marker_scale)
+            self._fast_centered_kinship = True
+            self._fast_intercept = float(np.mean(self.y, dtype=np.float64))
+            yc = np.asarray(self.y, dtype=np.float64).reshape(-1) - float(self._fast_intercept)
+            self._fast_centered_y_ss = float(np.sum(yc * yc, dtype=np.float64))
         self._implicit_kinship_fast = bool(self.kinship is not None)
         self.G = None
         self.Z = None
@@ -1034,6 +1115,13 @@ class BLUP:
             spectral = (self.S + self._g_eps).reshape(-1, 1)
             q_alpha = self._fast_v @ (self._fast_inv_s[:, None] * rhs)
             q_u = self._fast_v @ (self._fast_inv_s[:, None] * spectral * rhs)
+            m_mean64 = np.ascontiguousarray(
+                np.asarray(self._m_mean, dtype=np.float64).reshape(-1, 1),
+                dtype=np.float64,
+            )
+            mu_dot_alpha = float((m_mean64.T @ q_alpha)[0, 0])
+            mu_dot_u = float((m_mean64.T @ q_u)[0, 0])
+            scale = float(max(np.finfo(np.float64).eps, float(fast_marker_scale)))
             self.alpha = np.empty((self.n, 1), dtype=np.float64)
             self.u = np.empty((self.n, 1), dtype=np.float64)
             for st in range(0, n_train, step):
@@ -1041,13 +1129,17 @@ class BLUP:
                 sidx_blk = np.ascontiguousarray(self._packed_sample_indices[st:ed], dtype=np.int64)
                 blk = _decode_packed_rows_f32(self._packed_ctx, self._packed_all_rows, sidx_blk)
                 blk64 = np.asarray(blk, dtype=np.float64)
-                self.alpha[st:ed] = blk64.T @ q_alpha
-                self.u[st:ed] = blk64.T @ q_u
+                self.alpha[st:ed] = (blk64.T @ q_alpha - mu_dot_alpha) / scale
+                self.u[st:ed] = (blk64.T @ q_u - mu_dot_u) / scale
             self._alpha_sum = float(np.sum(self.alpha, dtype=np.float64))
-            self._m_alpha = self._fast_v @ (self._fast_svals[:, None] * rhs)
+            centered_malpha = float(scale) * (self._fast_v @ (self._fast_svals[:, None] * rhs))
+            self._m_alpha = centered_malpha + m_mean64 * self._alpha_sum
             self._mean_sq = float((self._m_mean.T @ self._m_mean)[0, 0])
             self._mean_malpha = float((self._m_mean.T @ self._m_alpha)[0, 0])
-            var_g = float((self.rTV_invr / (self.n - self.p)) * np.mean(self.S))
+            if self._fast_centered_kinship:
+                self.beta = np.array([[float(self._fast_intercept)]], dtype=np.float64)
+            mean_s = float(np.sum(self.S, dtype=np.float64) / float(max(1, self.n)))
+            var_g = float((self.rTV_invr / (self.n - self.p)) * mean_s)
         else:
             self.u = self._fast_v @ (self._fast_svals[:, None] * rhs)
             self.alpha = None
@@ -1102,7 +1194,9 @@ class BLUP:
             )
         )
         use_rust_grm = bool(
-            (_grm_packed_f32_with_stats is not None) or (_grm_packed_f32 is not None)
+            (_grm_packed_f64_with_stats is not None)
+            or (_grm_packed_f32_with_stats is not None)
+            or (_grm_packed_f32 is not None)
         )
         use_rust_row_stats = False
         rust_sample_indices = (
@@ -1111,9 +1205,13 @@ class BLUP:
             else np.ascontiguousarray(self._packed_sample_indices, dtype=np.int64)
         )
         rust_backend = (
-            "rust_grm_packed_f32_with_stats"
-            if _grm_packed_f32_with_stats is not None
-            else ("rust_grm_packed_f32" if _grm_packed_f32 is not None else "python_fallback")
+            "rust_grm_packed_f64_with_stats"
+            if _grm_packed_f64_with_stats is not None
+            else (
+                "rust_grm_packed_f32_with_stats"
+                if _grm_packed_f32_with_stats is not None
+                else ("rust_grm_packed_f32" if _grm_packed_f32 is not None else "python_fallback")
+            )
         )
         if self._debug_stage:
             print(
@@ -1124,7 +1222,40 @@ class BLUP:
 
         if use_rust_grm:
             try:
-                if _grm_packed_f32_with_stats is not None:
+                if _grm_packed_f64_with_stats is not None:
+                    grm_raw, row_sum_raw, var_sum_raw = _grm_packed_f64_with_stats(
+                        self._packed_ctx["packed"],
+                        int(self._packed_ctx["n_samples"]),
+                        self._packed_ctx["row_flip"],
+                        self._packed_ctx["maf"],
+                        sample_indices=rust_sample_indices,
+                        method=1,
+                        block_cols=max(1, row_step),
+                        threads=int(self._rust_threads),
+                        progress_callback=None,
+                        progress_every=0,
+                    )
+                    self.G = np.asarray(grm_raw, dtype=np.float64)
+                    sum_rows = np.ascontiguousarray(
+                        np.asarray(row_sum_raw, dtype=np.float64).reshape(-1, 1),
+                        dtype=np.float64,
+                    )
+                    if int(sum_rows.shape[0]) != int(m):
+                        raise RuntimeError(
+                            f"Rust GRM row_sum length mismatch: got {sum_rows.shape[0]}, expected {m}"
+                        )
+                    var_sum = float(var_sum_raw)
+                    if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
+                        raise RuntimeError(
+                            f"Rust GRM invalid var_sum={var_sum!r}; expected finite > 0"
+                        )
+                    use_rust_row_stats = True
+                    if self._debug_stage:
+                        print(
+                            "[MLM-DEBUG] packed_grm_rowstats source=rust_fused_f64",
+                            flush=True,
+                        )
+                elif _grm_packed_f32_with_stats is not None:
                     grm_raw, row_sum_raw, var_sum_raw = _grm_packed_f32_with_stats(
                         self._packed_ctx["packed"],
                         int(self._packed_ctx["n_samples"]),
@@ -1173,7 +1304,9 @@ class BLUP:
                     self.G = np.asarray(grm_raw, dtype=np.float32)
             except Exception:
                 # Try legacy Rust GRM if stats-enabled variant failed.
-                if (_grm_packed_f32 is not None) and (_grm_packed_f32_with_stats is not None):
+                if (_grm_packed_f32 is not None) and (
+                    (_grm_packed_f32_with_stats is not None) or (_grm_packed_f64_with_stats is not None)
+                ):
                     try:
                         grm_raw = _grm_packed_f32(
                             self._packed_ctx["packed"],
@@ -1658,6 +1791,58 @@ class BLUP:
     def _REML(self, lbd: float):
         """Restricted maximum likelihood (REML) for the null model."""
         self._reml_calls += 1
+        # Low-rank FaST kinship (intercept-only): include null-space terms
+        # to keep REML lambda/PVE on the same scale as explicit-kinship path.
+        if (
+            bool(getattr(self, "_fast_centered_kinship", False))
+            and bool(getattr(self, "_fast_projected", False))
+            and bool(getattr(self, "_implicit_kinship_fast", False))
+            and int(getattr(self, "p", 0)) == 1
+            and int(self.X.shape[1]) == 1
+        ):
+            v_floor = max(float(self._reml_v_floor), float(np.finfo(np.float64).tiny))
+            lam = float(max(v_floor, float(lbd)))
+            s = np.asarray(self.S, dtype=np.float64).reshape(-1)
+            v_main = np.maximum(s + lam, v_floor)
+            v_inv = 1.0 / v_main
+
+            y1 = np.asarray(self.y, dtype=np.float64).reshape(-1)
+            y1_sq = float(np.sum(y1 * y1, dtype=np.float64))
+            quad_main = float(np.sum((y1 * y1) * v_inv, dtype=np.float64))
+
+            y_center_ss = float(getattr(self, "_fast_centered_y_ss", np.nan))
+            if np.isfinite(y_center_ss):
+                etas2_sq = float(max(0.0, y_center_ss - y1_sq))
+            else:
+                etas2_sq = 0.0
+
+            n_full = int(self.n)
+            r = int(s.shape[0])
+            n_null = int(max(0, n_full - r - 1))
+            quad_null = (float(etas2_sq) / float(lam)) if n_null > 0 else 0.0
+            rTV_invr = float(quad_main + quad_null)
+            if (not np.isfinite(rTV_invr)) or (rTV_invr <= v_floor):
+                if self._debug_stage:
+                    print(
+                        f"[MLM-DEBUG] reml_rTV_invr_floor_applied old={rTV_invr!r} floor={v_floor:.3e}",
+                        flush=True,
+                    )
+                rTV_invr = float(v_floor)
+
+            log_detV = float(np.sum(np.log(v_main), dtype=np.float64))
+            if n_null > 0:
+                log_detV += float(n_null) * float(np.log(lam))
+
+            n_eff = int(max(1, n_full - 1))
+            total_log = float(n_eff) * float(np.log(rTV_invr)) + float(log_detV)
+            c = float(n_eff) * (float(np.log(float(n_eff))) - 1.0 - float(np.log(2.0 * np.pi))) / 2.0
+
+            self.V_inv = v_inv
+            self.rTV_invr = float(rTV_invr)
+            self.r = np.ascontiguousarray(self.y, dtype=np.float64)
+            self.beta = np.zeros((1, 1), dtype=np.float64)
+            return float(c - total_log / 2.0)
+
         n, p_cov = self.X.shape
         p = p_cov
         v_floor = max(float(self._reml_v_floor), float(np.finfo(np.float64).tiny))
@@ -1673,7 +1858,29 @@ class BLUP:
         X_cov_snp = self.X
         XTV_invX = V_inv * X_cov_snp.T @ X_cov_snp
         XTV_invy = V_inv * X_cov_snp.T @ self.y
-        beta = np.linalg.solve(XTV_invX, XTV_invy)
+        if int(p) == 1:
+            xtvx = float(XTV_invX[0, 0]) if XTV_invX.size > 0 else 0.0
+            xtvy = float(XTV_invy[0, 0]) if XTV_invy.size > 0 else 0.0
+            if bool(getattr(self, "_fast_centered_kinship", False)):
+                # In centered FaST-kinship mode, the intercept lives in the
+                # dropped null-space; solve in projected space with beta=0 and
+                # add intercept back after fit.
+                beta = np.zeros((1, 1), dtype=np.float64)
+                xtvx = v_floor
+            else:
+                if (not np.isfinite(xtvx)) or (xtvx <= v_floor):
+                    xtvx = float(v_floor)
+                beta = np.array([[xtvy / xtvx]], dtype=np.float64)
+            log_detXTV_invX = float(np.log(max(v_floor, xtvx)))
+        else:
+            try:
+                beta = np.linalg.solve(XTV_invX, XTV_invy)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.pinv(XTV_invX, rcond=1e-12) @ XTV_invy
+            sign_xtv, log_det_xtv = np.linalg.slogdet(XTV_invX)
+            if (not np.isfinite(log_det_xtv)) or (sign_xtv <= 0):
+                log_det_xtv = float(np.log(v_floor))
+            log_detXTV_invX = float(log_det_xtv)
         r = self.y - X_cov_snp @ beta
         rTV_invr = float((V_inv * r.T @ r)[0, 0])
         if (not np.isfinite(rTV_invr)) or (rTV_invr <= v_floor):
@@ -1684,7 +1891,6 @@ class BLUP:
                 )
             rTV_invr = float(v_floor)
         log_detV = np.sum(np.log(V))
-        _, log_detXTV_invX = np.linalg.slogdet(XTV_invX)
         total_log = (n - p) * np.log(rTV_invr) + log_detV + log_detXTV_invX  # log items
         c = (n - p) * (np.log(n - p) - 1 - np.log(2 * np.pi)) / 2  # Constant
         self.V_inv = V_inv

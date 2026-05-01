@@ -71,6 +71,11 @@ except Exception:
     _lmm_assoc_chunk_from_snp_f32 = None
 
 try:
+    from janusx.janusx import rust_eigh_from_array_f64 as _rust_eigh_from_array_f64
+except Exception:
+    _rust_eigh_from_array_f64 = None
+
+try:
     from janusx.janusx import (
         glmf32_packed as _glmf32_packed,
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
@@ -1077,7 +1082,28 @@ class LMM:
         # Eigen decomposition of kinship (stabilized)
         kinship.flat[::kinship.shape[0]+1] += 1e-6
         t_start = time.time()
-        self.S, self.Dh = eigh(kinship, overwrite_a=True, check_finite=False)
+        eig_done = False
+        if _rust_eigh_from_array_f64 is not None:
+            try:
+                eig_thr = int(_infer_blas_threads_from_env() or 0)
+                eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
+                    _rust_eigh_from_array_f64(
+                        np.ascontiguousarray(kinship, dtype=np.float64),
+                        threads=eig_thr,
+                        driver="auto",
+                        jobz="V",
+                        require_lapack=False,
+                    )
+                )
+                if evec_raw is None:
+                    raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
+                self.S = np.asarray(eval_raw, dtype=np.float64)
+                self.Dh = np.asarray(evec_raw, dtype=np.float64)
+                eig_done = True
+            except Exception:
+                eig_done = False
+        if not eig_done:
+            self.S, self.Dh = eigh(kinship, overwrite_a=True, check_finite=False)
         self.evd_secs = float(time.time() - t_start)
         # Drop kinship to save memory
         del kinship

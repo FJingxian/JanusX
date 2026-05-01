@@ -318,10 +318,26 @@ echo "[build.sh] project cargo config:"
 cat "${project_cargo_config}"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
+export JANUSX_REQUIRE_OPENBLAS=1
+if [[ -n "${PREFIX:-}" ]]; then
+  export OPENBLAS_LIB_DIR="${PREFIX}/lib"
+  export OPENBLAS_INCLUDE_DIR="${PREFIX}/include"
+fi
 python -m pip install . \
   --no-deps \
   --no-build-isolation \
   -vv
+
+# Strict post-build backend gate: fail when Rust backend is not OpenBLAS.
+python - <<'PY'
+import janusx.janusx as _jx
+backend = str(_jx.rust_sgemm_backend())
+print(f"[build.sh] rust_sgemm_backend={backend}")
+if backend != "openblas":
+    raise SystemExit(
+        f"Strict mode failed: expected openblas backend, got {backend!r}"
+    )
+PY
 
 # Collect Rust dependency licenses for Bioconda license compliance checks.
 cargo-bundle-licenses --format yaml --output THIRDPARTY.yml

@@ -74,7 +74,7 @@ from janusx.script._common.colspec import parse_zero_based_index_specs  # noqa: 
 from janusx.script._common.status import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
-from janusx.script.gs import build_cv_splits  # noqa: E402
+from janusx.gs.workflow import build_cv_splits  # noqa: E402
 
 
 _SUMMARY_TAG = "gblupbench"
@@ -2543,7 +2543,7 @@ def _run_engine_janusx(
     cmd = [
         sys.executable,
         "-m",
-        "janusx.script.gs",
+        "janusx.gs.workflow",
         "-bfile",
         str(bfile),
         "-p",

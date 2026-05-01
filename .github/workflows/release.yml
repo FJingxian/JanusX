@@ -426,6 +426,28 @@ jobs:
               raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
           PY
 
+      - name: Verify macOS wheel links OpenBLAS only
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          EXT_PATH="$("$PY" - <<'PY'
+          import janusx.janusx as _jx
+          print(_jx.__file__)
+          PY
+          )"
+          echo "[janusx] extension path: ${EXT_PATH}"
+          otool -L "${EXT_PATH}"
+          if ! otool -L "${EXT_PATH}" | grep -qi "libopenblas"; then
+            echo "ERROR: Expected OpenBLAS linkage in macOS wheel."
+            exit 1
+          fi
+          if otool -L "${EXT_PATH}" | grep -q "Accelerate.framework"; then
+            echo "ERROR: Accelerate linkage detected in macOS wheel; expected OpenBLAS-only runtime path."
+            exit 1
+          fi
+
       - name: Sanity check wheel artifact (windows-arm64 cross-build)
         if: ${{ matrix.label == 'windows-arm64' }}
         shell: bash

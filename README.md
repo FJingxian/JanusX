@@ -2,7 +2,7 @@
 
 [CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
 
-![Python](https://img.shields.io/badge/Python-3.9+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 
 ## Overview
 
@@ -175,7 +175,37 @@ Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
 
 **See full usages in [CLI Guide](./doc/JanusXcli.md).**
 
-### 4) Get module help
+### 4) Python thin wrappers
+
+```python
+from janusx.assoc import LinearModel
+from janusx.gs import GenomicSelection
+
+# GWAS (file mode; internally reuses janusx.script.gwas)
+lm = LinearModel(
+    genotype="test/bench4k5k",
+    phenotype="test/bench4k5k.pheno.txt",
+    traits=[0],
+    threads=4,
+    out="tmp_assoc",
+    prefix="bench",
+)
+assoc_res = lm.lm(log=False)
+
+# GS (file mode; internally reuses janusx.script.gs)
+gs = GenomicSelection(
+    genotype="test/bench4k5k",
+    phenotype="test/bench4k5k.pheno.txt",
+    traits=[0],
+    cv=2,
+    threads=4,
+    out="tmp_gs",
+    prefix="bench",
+)
+gs_res = gs.gblup(log=False)
+```
+
+### 5) Get module help
 
 ```bash
 jx <module> -h

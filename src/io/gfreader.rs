@@ -2309,6 +2309,7 @@ fn _is_simple_snp_allele(a: &str) -> bool {
     prefix,
     maf_threshold=0.0,
     max_missing_rate=1.0,
+    het_threshold=0.0,
     snps_only=false,
 ))]
 pub fn prepare_bed_2bit_packed<'py>(
@@ -2316,6 +2317,7 @@ pub fn prepare_bed_2bit_packed<'py>(
     prefix: String,
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
     snps_only: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<u8>>,
@@ -2335,6 +2337,11 @@ pub fn prepare_bed_2bit_packed<'py>(
     if !(0.0..=1.0).contains(&max_missing_rate) {
         return Err(PyValueError::new_err(
             "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=0.5).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 0.5]",
         ));
     }
 
@@ -2411,6 +2418,7 @@ pub fn prepare_bed_2bit_packed<'py>(
             let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
             let mut maf: Vec<f32> = vec![0.0; n_snps];
             let mut std_denom: Vec<f32> = vec![0.0; n_snps];
+            let mut het_rate: Vec<f32> = vec![0.0; n_snps];
             let mut row_flip: Vec<bool> = vec![false; n_snps];
             let n_samples_f = n_samples as f32;
             let full_bytes = n_samples / 4;
@@ -2420,6 +2428,7 @@ pub fn prepare_bed_2bit_packed<'py>(
                 let row = &packed_full[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
                 let mut non_missing: usize = 0;
                 let mut alt_sum: usize = 0;
+                let mut het_count: usize = 0;
 
                 for &byte in row.iter().take(full_bytes) {
                     for within in 0..4 {
@@ -2431,6 +2440,7 @@ pub fn prepare_bed_2bit_packed<'py>(
                             0b10 => {
                                 non_missing += 1;
                                 alt_sum += 1;
+                                het_count += 1;
                             }
                             0b11 => {
                                 non_missing += 1;
@@ -2451,6 +2461,7 @@ pub fn prepare_bed_2bit_packed<'py>(
                             0b10 => {
                                 non_missing += 1;
                                 alt_sum += 1;
+                                het_count += 1;
                             }
                             0b11 => {
                                 non_missing += 1;
@@ -2467,11 +2478,13 @@ pub fn prepare_bed_2bit_packed<'py>(
                     row_flip[snp_idx] = p > 0.5_f64;
                     let maf_v = p.min(1.0_f64 - p) as f32;
                     maf[snp_idx] = maf_v;
+                    het_rate[snp_idx] = het_count as f32 / non_missing as f32;
                     let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
                     std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
                 } else {
                     row_flip[snp_idx] = false;
                     maf[snp_idx] = 0.0_f32;
+                    het_rate[snp_idx] = 0.0_f32;
                     std_denom[snp_idx] = 0.0_f32;
                 }
             }
@@ -2482,7 +2495,13 @@ pub fn prepare_bed_2bit_packed<'py>(
                 let miss_i = missing_rate[i];
                 let pass_num = (maf_i >= maf_threshold)
                     && (maf_i <= (1.0_f32 - maf_threshold))
-                    && (miss_i <= max_missing_rate);
+                    && (miss_i <= max_missing_rate)
+                    && (if het_threshold > 0.0_f32 {
+                        let h = het_rate[i];
+                        h >= het_threshold && h <= (1.0_f32 - het_threshold)
+                    } else {
+                        true
+                    });
                 let pass_snp = if snps_only {
                     _is_simple_snp_allele(&sites[i].ref_allele)
                         && _is_simple_snp_allele(&sites[i].alt_allele)

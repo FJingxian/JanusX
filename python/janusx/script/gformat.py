@@ -1597,8 +1597,7 @@ def build_parser() -> CliArgumentParser:
         help=(
             "LD prune with MAF-priority rule. Usage: "
             "--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
-            "Default mode is fast (anchor-stepped window scan). "
-            "Set env JX_LD_PRUNE_MODE=strict for strict sliding-window + greedy semantics. "
+            "Built-in backend uses strict sliding-window + greedy semantics. "
             "Set env JX_LD_PRUNE_BACKEND=plink to run external PLINK backend "
             "(PLINK input/output prune-only path). "
             "Numeric window defaults to kb (1=1kb, 0.1=100bp). "

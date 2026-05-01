@@ -12,14 +12,26 @@ mod bayes;
 pub mod beam;
 #[path = "stats/bsa.rs"]
 mod bsa;
+#[path = "stats/glm.rs"]
+mod glm;
+#[path = "stats/gs_native.rs"]
+pub(crate) mod gs_native;
+#[path = "stats/ld.rs"]
+mod ld;
 #[path = "stats/lmm.rs"]
 mod lmm;
+#[path = "stats/lmm_scan.rs"]
+mod lmm_scan;
 #[path = "stats/logreg.rs"]
 mod logreg;
+#[path = "stats/packed.rs"]
+mod packed;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
 #[path = "stats/score.rs"]
 pub mod score;
+#[path = "stats/common.rs"]
+mod stats_common;
 #[path = "stats/tree.rs"]
 mod tree;
 
@@ -35,13 +47,27 @@ mod gwasio;
 #[path = "io/vcfout.rs"]
 mod vcfout;
 
+// workflow (structural layer; currently type-only skeleton)
+#[path = "workflow/mod.rs"]
+mod workflow;
+
 // math
+#[path = "math/bedmath.rs"]
+mod bedmath;
 #[path = "math/bitwise.rs"]
 mod bitwise;
+#[path = "math/blas.rs"]
+mod blas;
 #[path = "math/brent.rs"]
 mod brent;
+#[path = "math/eigh.rs"]
+mod eigh;
 #[path = "math/linalg.rs"]
 mod linalg;
+#[path = "math/farmcpu.rs"]
+mod math_farmcpu;
+#[path = "math/ld.rs"]
+mod math_ld;
 
 use admixture::{
     admx_adam_optimize_f32, admx_adam_update_p, admx_adam_update_p_inplace,
@@ -52,17 +78,7 @@ use admixture::{
     admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
     admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
-use assoc::{
-    ai_reml_multi_f64, ai_reml_null_f64, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
-    bed_packed_ld_prune_maf_priority, bed_packed_row_flip_mask, bed_packed_signed_hash_f32,
-    bed_packed_signed_hash_kernels_f64, bed_packed_signed_hash_ztz_stats_f64,
-    bed_prune_to_plink_rust, cross_grm_times_alpha_packed_f64, farmcpu_rem_dense,
-    farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed, fastlmm_assoc_chunk_f32,
-    fastlmm_assoc_packed_f32, glmf32, glmf32_full, glmf32_packed, grm_packed_bed_f32,
-    grm_packed_f32, grm_packed_f32_with_stats, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
-    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
-    packed_malpha_f64, packed_prune_kernel_stats, rrblup_pcg_bed, rust_sgemm_backend,
-};
+use assoc::{farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed};
 use bayes::{bayesa, bayesa_packed, bayesb, bayesb_packed, bayescpi, bayescpi_packed};
 use beam::{
     beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
@@ -70,17 +86,35 @@ use beam::{
     beam_search_and_continuous_corr_bin_indices_py, beam_search_and_continuous_corr_bin_py,
 };
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
+use blas::{rust_blas_get_num_threads, rust_blas_set_num_threads, rust_sgemm_backend};
 use bsa::preprocess_bsa;
+use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64};
 use gfreader::{
     bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
     load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
     BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
     VcfChunkReader, VcfStreamWriter,
 };
+use glm::{glmf32, glmf32_full, glmf32_packed};
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
+use gs_native::{
+    gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats,
+    grm_packed_f64_with_stats, rrblup_pcg_bed,
+};
 use gwasio::load_gwas_triplet_fast;
+use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune_kernel_stats};
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
+use lmm_scan::{
+    ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
+    lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_packed_f32,
+    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
+};
 use logreg::fit_best_and_not_py;
+use packed::{
+    bed_packed_decode_rows_f32, bed_packed_decode_stats_f64, bed_packed_row_flip_mask,
+    bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
+    bed_packed_signed_hash_ztz_stats_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
+};
 use rsvd::py_rsvd_packed_subset;
 use score::{
     score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
@@ -159,10 +193,16 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
+    m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
@@ -175,6 +215,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_from_snp_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;

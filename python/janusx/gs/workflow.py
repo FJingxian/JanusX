@@ -126,18 +126,18 @@ except Exception as _adblup_py_exc:
     Gmatrix = None  # type: ignore[assignment]
     _HAS_ADBLUP_PY = False
     _ADBLUP_PY_IMPORT_ERROR = _adblup_py_exc
-from ._common.log import setup_logging
-from ._common.config_render import emit_cli_configuration
-from ._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.pathcheck import (
+from janusx.script._common.log import setup_logging
+from janusx.script._common.config_render import emit_cli_configuration
+from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
-from ._common.status import (
+from janusx.script._common.progress import ProgressAdapter, build_rich_progress, rich_progress_available
+from janusx.script._common.status import (
     CliStatus,
     failure_symbol,
     log_success,
@@ -147,10 +147,16 @@ from ._common.status import (
     stdout_is_tty,
     success_symbol,
 )
-from ._common.genocache import configure_genotype_cache_from_out
-from ._common.colspec import parse_zero_based_index_specs
-from ._common.threads import maybe_warn_non_openblas, require_openblas_by_default
-from ._common.packedctx import prepare_packed_ctx_from_plink
+from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.threads import (
+    detect_rust_blas_backend,
+    get_rust_blas_threads,
+    maybe_warn_non_openblas,
+    require_openblas_by_default,
+    runtime_thread_stage,
+)
+from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
 
 try:
     from janusx import janusx as _jxrs
@@ -183,11 +189,26 @@ _RRBLUP_AUTO_PCG_MIN_N = 10_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MIN_N = 2_000
 _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N = 5_000
 _RRBLUP_LAMBDA_SUBSAMPLE_REPEATS = 9
+_RUST_GBLUP_BACKEND_WARN_LOCK = threading.Lock()
+_RUST_GBLUP_BACKEND_WARNED: set[str] = set()
 
 _GBLUP_METHOD_ADD = "GBLUP"
 _GBLUP_METHOD_DOM = "GBLUP_D"
 _GBLUP_METHOD_AD = "GBLUP_AD"
 _GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
+
+
+def _warn_rust_gblup_backend_fallback_once(backend: str) -> None:
+    b = str(backend).strip().lower() or "unknown"
+    with _RUST_GBLUP_BACKEND_WARN_LOCK:
+        if b in _RUST_GBLUP_BACKEND_WARNED:
+            return
+        _RUST_GBLUP_BACKEND_WARNED.add(b)
+    logging.getLogger(__name__).warning(
+        "Warning: Packed Rust GBLUP detected rust BLAS backend='%s' (OpenBLAS preferred). "
+        "Falling back to compatibility GS path; this may run slower.",
+        b,
+    )
 
 
 def _is_gblup_method(method: str) -> bool:
@@ -473,9 +494,9 @@ def _parse_nonnegative_int(raw: object) -> int | None:
 def _split_runtime_threads(total_threads: int, policy: str) -> tuple[int, int, str]:
     total = max(1, int(total_threads))
     p = str(policy).strip().lower()
-    if p not in {"auto", "align", "blas", "balanced", "split", "rust"}:
+    if p not in {"auto", "align", "outer", "blas", "balanced", "split", "rust"}:
         p = "auto"
-    if p == "align":
+    if p in {"align", "outer"}:
         # Keep BLAS and Rust thread caps identical to `-t`.
         return total, total, p
     if p == "auto":
@@ -502,8 +523,9 @@ def configure_thread_runtime(
     logger: logging.Logger | None = None,
 ) -> dict[str, object]:
     enabled = _env_truthy("JX_THREAD_COORDINATE", "1")
-    # Default to rust-priority runtime split for better stability on large packed-BED workloads.
-    policy_raw = str(os.getenv("JX_THREAD_POLICY", "rust")).strip().lower() or "rust"
+    # Default to outer-cap mode: one global `-t` cap for both BLAS and Rayon.
+    policy_env_raw = str(os.getenv("JX_THREAD_POLICY", "")).strip()
+    policy_raw = str(policy_env_raw or "outer").strip().lower() or "outer"
     explicit_blas = _parse_nonnegative_int(os.getenv("JX_MLM_BLAS_THREADS", "").strip())
     explicit_rust = _parse_nonnegative_int(os.getenv("JX_MLM_RUST_THREADS", "").strip())
     gblup_only = bool(
@@ -522,7 +544,12 @@ def configure_thread_runtime(
     if not enabled:
         plan["reason"] = "disabled_by_env"
         return plan
-    if (not gblup_only) and (not bool(plan["explicit"])):
+    if (
+        (not gblup_only)
+        and (not bool(plan["explicit"]))
+        and (policy_env_raw == "")
+        and (policy_raw != "outer")
+    ):
         plan["reason"] = "skipped_non_gblup_mixed_models"
         return plan
 
@@ -2389,6 +2416,7 @@ def GSapi(
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     rrblup_runtime_state: dict[str, typing.Any] | None = None,
     rrblup_progress_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
+    gblup_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_r2: float | None = None,
     bayes_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_cfg: dict[str, typing.Any] | None = None,
@@ -2426,6 +2454,9 @@ def GSapi(
         Mutable runtime state sink for rrBLUP AdamW (selected tuning params, diagnostics).
     rrblup_progress_hook : callable, optional
         Progress callback for rrBLUP AdamW epochs and auto-grid trials.
+    gblup_runtime_state : dict, optional
+        Mutable runtime state sink for packed Rust GBLUP diagnostics
+        (eigh backend/time, REML lambda/likelihood).
     bayes_auto_r2 : float, optional
         Optional precomputed BLUP PVE used as Bayes `r2` prior. When omitted,
         Bayes models estimate it internally from BLUP.
@@ -2571,6 +2602,158 @@ def GSapi(
                 f"force_fast={int(bool(force_fast))} rr_solver={resolved_rr_solver}",
                 flush=True,
             )
+        if method == "GBLUP":
+            can_use_rust_gblup = bool(
+                is_packed_input
+                and _looks_like_packed_payload(Xtrain)
+                and (_jxrs is not None)
+                and hasattr(_jxrs, "gblup_reml_packed_bed")
+            )
+            rust_backend = str(detect_rust_blas_backend()).strip().lower() if can_use_rust_gblup else "unknown"
+            if can_use_rust_gblup and (rust_backend != "openblas"):
+                _warn_rust_gblup_backend_fallback_once(rust_backend)
+                can_use_rust_gblup = False
+            if can_use_rust_gblup:
+                packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+                source_prefix_raw = packed_train.get("source_prefix", None)
+                if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+                    raise ValueError(
+                        "Packed GBLUP Rust backend requires source PLINK prefix in packed context."
+                    )
+                source_prefix = str(source_prefix_raw)
+
+                site_keep_raw = packed_train.get("site_keep", None)
+                site_keep_arg = None
+                if site_keep_raw is not None:
+                    site_keep_arg = np.ascontiguousarray(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+
+                n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
+                if packed_train_indices is None:
+                    if int(packed_train["n_samples"]) != n_train_expected:
+                        raise ValueError(
+                            "Packed GBLUP Rust backend requires packed_train_indices when "
+                            "n_train differs from packed n_samples."
+                        )
+                    train_abs = np.ascontiguousarray(
+                        np.arange(int(packed_train["n_samples"]), dtype=np.int64),
+                        dtype=np.int64,
+                    )
+                else:
+                    train_abs = np.ascontiguousarray(
+                        np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                if int(train_abs.shape[0]) != n_train_expected:
+                    raise ValueError(
+                        f"Packed GBLUP Rust backend train index mismatch: got {train_abs.shape[0]}, "
+                        f"expected {n_train_expected}."
+                    )
+
+                test_abs: np.ndarray | None
+                if (packed_test_indices is None) or (int(np.asarray(packed_test_indices).size) == 0):
+                    test_abs = None
+                else:
+                    test_abs = np.ascontiguousarray(
+                        np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+
+                if need_train_pred:
+                    if train_pred_idx is None:
+                        train_pred_local_arg = None
+                    else:
+                        train_pred_local_arg = np.ascontiguousarray(
+                            np.asarray(train_pred_idx, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        )
+                else:
+                    train_pred_local_arg = np.zeros((0,), dtype=np.int64)
+
+                y_train_vec = np.ascontiguousarray(
+                    np.asarray(Y, dtype=np.float64).reshape(-1),
+                    dtype=np.float64,
+                )
+                gblup_g_eps = float(max(0.0, float(np.finfo(np.float64).eps)))
+                gblup_reml_low = -6.0
+                gblup_reml_high = 6.0
+                gblup_reml_max_iter = 50
+                gblup_reml_tol = 1e-4
+                gblup_block_rows = _parse_nonnegative_int(
+                    os.getenv("JX_GBLUP_PACKED_BLOCK_ROWS", "4096")
+                )
+                gblup_block_rows = int(max(1, int(4096 if gblup_block_rows is None else gblup_block_rows)))
+
+                if _GS_DEBUG_STAGE:
+                    rust_blas_before = get_rust_blas_threads()
+                    print(
+                        "[GS-DEBUG] GBLUP additive packed route=rust_gblup_reml_packed_bed "
+                        f"threads={int(max(1, int(n_jobs)))}, "
+                        f"stage_threads=(blas={int(max(1, int(n_jobs)))},rayon=1), "
+                        f"rust_blas_threads_before={rust_blas_before}",
+                        flush=True,
+                    )
+                rust_blas_in_stage: int | None = None
+                with runtime_thread_stage(
+                    blas_threads=int(max(1, int(n_jobs))),
+                    rayon_threads=1,
+                ):
+                    rust_blas_in_stage = get_rust_blas_threads()
+                    (
+                        pred_train_raw,
+                        pred_test_raw,
+                        pve,
+                        _lambda_opt,
+                        _ml,
+                        _reml,
+                        _eigh_backend,
+                        _eigh_elapsed,
+                        _m_eff,
+                    ) = (
+                        _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            site_keep_arg,
+                            float(gblup_g_eps),
+                            float(gblup_reml_low),
+                            float(gblup_reml_high),
+                            int(gblup_reml_max_iter),
+                            float(gblup_reml_tol),
+                            int(gblup_block_rows),
+                            int(max(1, int(n_jobs))),
+                        )
+                    )
+                if gblup_runtime_state is not None:
+                    gblup_runtime_state["rust_backend"] = str(rust_backend)
+                    gblup_runtime_state["eigh_backend"] = str(_eigh_backend)
+                    gblup_runtime_state["eigh_sec"] = float(_eigh_elapsed)
+                    gblup_runtime_state["lambda_reml"] = float(_lambda_opt)
+                    gblup_runtime_state["ml"] = float(_ml)
+                    gblup_runtime_state["reml"] = float(_reml)
+                    gblup_runtime_state["m_effective"] = int(_m_eff)
+                pred_train = (
+                    np.zeros((0, 1), dtype=float)
+                    if (not need_train_pred)
+                    else np.asarray(pred_train_raw, dtype=float).reshape(-1, 1)
+                )
+                pred_test = np.asarray(pred_test_raw, dtype=float).reshape(-1, 1)
+                if _GS_DEBUG_STAGE:
+                    rust_blas_after = get_rust_blas_threads()
+                    print(
+                        f"[GS-DEBUG] GSapi model_fit_done method={method}(rust-packed) "
+                        f"elapsed={time.time() - t_fit:.3f}s "
+                        f"eigh_backend={str(_eigh_backend)} "
+                        f"eigh_sec={float(_eigh_elapsed):.3f} "
+                        f"rust_blas_threads_in_stage={rust_blas_in_stage} "
+                        f"rust_blas_threads_after={rust_blas_after}",
+                        flush=True,
+                    )
+                return pred_train, pred_test, float(pve)
         if method == "rrBLUP" and resolved_rr_solver == "pcg":
             requested_solver = str(rrblup_solver).strip().lower()
             if not is_packed_input:
@@ -3545,6 +3728,7 @@ def _run_method_task(
     rrblup_pve_final: dict[str, typing.Any] | None = None
     rrblup_final_state: dict[str, typing.Any] | None = None
     rrblup_final_cfg: dict[str, typing.Any] | None = None
+    gblup_final_state: dict[str, typing.Any] | None = None
     bayes_r2_rows: list[float] = []
     bayes_r2_final = float("nan")
     bayes_r2_source_final = ""
@@ -3664,6 +3848,12 @@ def _run_method_task(
     gblup_cv_grm_full: np.ndarray | None = None
     gblup_final_test_train: np.ndarray | None = None
     gblup_force_kinship = False
+    prefer_rust_packed_gblup = bool(
+        method == "GBLUP"
+        and packed_payload is not None
+        and (_jxrs is not None)
+        and hasattr(_jxrs, "gblup_reml_packed_bed")
+    )
 
     if (
         method == "GBLUP"
@@ -3706,7 +3896,15 @@ def _run_method_task(
         )
 
     if method == "GBLUP":
-        if precomputed_train_grm is not None:
+        if prefer_rust_packed_gblup:
+            gblup_force_kinship = False
+            if _GS_DEBUG_STAGE:
+                print(
+                    "[GS-DEBUG] GBLUP packed policy: route via GSapi->rust_gblup_reml_packed_bed "
+                    "(skip CV GRM prebuild).",
+                    flush=True,
+                )
+        elif precomputed_train_grm is not None:
             gblup_cv_grm_full = np.asarray(precomputed_train_grm, dtype=np.float64)
             if precomputed_test_train_grm is not None:
                 gblup_final_test_train = np.asarray(
@@ -3973,9 +4171,12 @@ def _run_method_task(
                         rr_cfg_call["auto_grid"] = "off"
                     rr_state_call = {}
                 rr_progress_call = None
+                gblup_state_call: dict[str, typing.Any] | None = None
                 bayes_r2_call: float | None = None
                 bayes_state_call: dict[str, typing.Any] | None = None
                 bayes_r2_cache_key: str | None = None
+                if method == "GBLUP":
+                    gblup_state_call = {}
                 if method == "rrBLUP" and rrblup_progress_hook is not None:
                     def _fold_rr_progress(event: str, payload: dict[str, typing.Any], *, _fold_id: int = int(fold_id), _cv_total: int = int(cv_total)) -> None:
                         pp = dict(payload)
@@ -4010,6 +4211,7 @@ def _run_method_task(
                     rrblup_adamw_cfg=rr_cfg_call,
                     rrblup_runtime_state=rr_state_call,
                     rrblup_progress_hook=rr_progress_call,
+                    gblup_runtime_state=gblup_state_call,
                     bayes_auto_r2=bayes_r2_call,
                     bayes_runtime_state=bayes_state_call,
                     bayes_auto_cfg=bayes_auto_r2_cfg,
@@ -4311,6 +4513,7 @@ def _run_method_task(
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
         rr_state_final: dict[str, typing.Any] | None = None
         rr_progress_final = None
+        gblup_state_final: dict[str, typing.Any] | None = None
         bayes_r2_final_call: float | None = None
         bayes_state_final: dict[str, typing.Any] | None = None
         bayes_r2_final_key: str | None = None
@@ -4342,6 +4545,8 @@ def _run_method_task(
                     if np.isfinite(cached_r2):
                         bayes_r2_final_call = float(cached_r2)
             bayes_state_final = {}
+        if method == "GBLUP":
+            gblup_state_final = {}
         _, test_pred, pve_final = GSapi(
             train_pheno,
             final_train,
@@ -4358,10 +4563,13 @@ def _run_method_task(
             rrblup_adamw_cfg=rr_cfg_final,
             rrblup_runtime_state=rr_state_final,
             rrblup_progress_hook=rr_progress_final,
+            gblup_runtime_state=gblup_state_final,
             bayes_auto_r2=bayes_r2_final_call,
             bayes_runtime_state=bayes_state_final,
             bayes_auto_cfg=bayes_auto_r2_cfg,
         )
+        if method == "GBLUP" and gblup_state_final is not None:
+            gblup_final_state = dict(gblup_state_final)
         if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_final is not None:
             r2_used_final = float(bayes_state_final.get("r2_used", np.nan))
             if np.isfinite(r2_used_final):
@@ -4455,6 +4663,7 @@ def _run_method_task(
         "rrblup_final_state": rrblup_final_state,
         "rrblup_final_cfg": rrblup_final_cfg,
         "rrblup_cv_selected": rrblup_cv_selected,
+        "gblup_final_state": gblup_final_state,
     }
 
 
@@ -4519,6 +4728,22 @@ def _run_methods_parallel(
                         ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense"),
                     )
                 )
+                gblup_state = dict(
+                    typing.cast(
+                        dict[str, typing.Any] | None,
+                        result.get("gblup_final_state"),
+                    )
+                    or {}
+                )
+                eigh_backend = str(gblup_state.get("eigh_backend", "")).strip()
+                if eigh_backend != "":
+                    rows.append(("eigh backend", eigh_backend))
+                try:
+                    eigh_sec = float(gblup_state.get("eigh_sec", np.nan))
+                except Exception:
+                    eigh_sec = float("nan")
+                if np.isfinite(eigh_sec):
+                    rows.append(("eigh time", f"{eigh_sec:.3f}s"))
             return rows
 
         if m == "rrBLUP":
@@ -4587,7 +4812,7 @@ def _run_methods_parallel(
             if np.isfinite(r2_blup):
                 if r2_n_total > 0 and r2_n_used > 0 and r2_n_used < r2_n_total:
                     rows.append(
-                        ("r2", f"auto (BLUP pve={r2_blup:.6g}, n={r2_n_used}/{r2_n_total})")
+                        ("r2", f"auto (BLUP pve={r2_blup:.3g}, n={r2_n_used}/{r2_n_total})")
                     )
                 elif r2_src.startswith("cv_shared_reuse"):
                     rows.append(("r2", f"auto (BLUP pve={r2_blup:.6g}, cv-shared)"))
@@ -7460,9 +7685,7 @@ def _predict_hashed_gblup_test_from_compact(
 # CLI
 # ======================================================================
 
-def main(log: bool = True) -> None:
-    t_start = time.time()
-    use_spinner = stdout_is_tty()
+def parse_args(argv: typing.Optional[list[str]] = None):
     parser = CliArgumentParser(
         prog="jx gs",
         formatter_class=cli_help_formatter(),
@@ -8020,7 +8243,7 @@ def main(log: bool = True) -> None:
              "(default: genotype basename).",
     )
 
-    args, extras = parser.parse_known_args()
+    args, extras = parser.parse_known_args(argv)
     has_genotype = bool(args.vcf or args.hmp or args.bfile or args.file)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
@@ -8034,7 +8257,6 @@ def main(log: bool = True) -> None:
         parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
-    debug_mode = bool(getattr(args, "debug", False))
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
@@ -8151,6 +8373,21 @@ def main(log: bool = True) -> None:
 
     if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
         parser.error("--hash dim must be > 0.")
+    return args
+
+
+def _run_gs_pipeline(
+    args=None,
+    *,
+    argv: typing.Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+) -> typing.Optional[dict[str, typing.Any]]:
+    t_start = time.time()
+    use_spinner = stdout_is_tty()
+    if args is None:
+        args = parse_args(argv)
+    debug_mode = bool(getattr(args, "debug", False))
 
     gblup_modes = _parse_gblup_kernel_modes(
         typing.cast(list[list[str]] | None, args.GBLUP)
@@ -8661,9 +8898,9 @@ def main(log: bool = True) -> None:
                 seen.add(i)
         pheno = pheno.iloc[:, unique_cols]
 
-    # Runtime-thread default tuning for packed GBLUP/rrBLUP:
-    # When users do not explicitly set a policy, prefer aligned caps so
-    # `-t` applies to both BLAS and Rust runtimes consistently.
+    # Runtime-thread default tuning:
+    # when policy is not explicitly set, prefer outer-cap mode so `-t`
+    # consistently bounds both BLAS and Rust runtimes.
     policy_env_raw = str(os.getenv("JX_THREAD_POLICY", "")).strip()
     gblup_only_models = bool(len(methods) > 0 and all(m in {_GBLUP_METHOD_ADD, "rrBLUP"} for m in methods))
     if (args.hash_dim is not None) and any(
@@ -8678,11 +8915,11 @@ def main(log: bool = True) -> None:
         and (methods[0] == _GBLUP_METHOD_ADD)
     )
     if (policy_env_raw == "") and bool(gfile_is_plink) and gblup_only_models:
-        os.environ["JX_THREAD_POLICY"] = "align"
+        os.environ["JX_THREAD_POLICY"] = "outer"
         if bool(debug_mode):
             logger.info(
                 "Thread runtime hint: packed GBLUP/rrBLUP detected; "
-                "using align policy by default (set JX_THREAD_POLICY to override)."
+                "using outer policy by default (set JX_THREAD_POLICY to override)."
             )
 
     thread_plan = configure_thread_runtime(
@@ -8696,10 +8933,20 @@ def main(log: bool = True) -> None:
             f"skipped ({str(thread_plan.get('reason', 'unknown'))})."
         )
     if bool(debug_mode):
-        maybe_warn_non_openblas(
+        np_blas_backend = maybe_warn_non_openblas(
             logger=logger,
             strict=require_openblas_by_default(),
         )
+        rust_blas_backend = str(detect_rust_blas_backend()).strip().lower()
+        if rust_blas_backend != "unknown":
+            logger.info(f"Rust BLAS backend: {rust_blas_backend}.")
+            if (str(np_blas_backend).strip().lower() != "openblas") and (
+                rust_blas_backend == "openblas"
+            ):
+                logger.info(
+                    "NumPy/SciPy BLAS is non-openblas, but packed Rust kernels "
+                    "will use OpenBLAS."
+                )
 
     if bool(debug_mode):
         logger.info("Effective models: " + ", ".join(methods))
@@ -9307,6 +9554,9 @@ def main(log: bool = True) -> None:
     # Genomic Selection for each phenotype
     # ------------------------------------------------------------------
     single_trait_mode = (pheno.shape[1] == 1)
+    trait_order = [str(x) for x in list(pheno.columns)]
+    gs_summary_rows: list[dict[str, typing.Any]] = []
+    saved_result_paths: list[str] = []
     for trait_name in pheno.columns:
         t_trait = time.time()
         if _GS_DEBUG_STAGE:
@@ -10034,6 +10284,41 @@ def main(log: bool = True) -> None:
                 f"Prediction length mismatch for method={m}: "
                 f"got n_pred={n_pred}, expected n_test={expected_test_n}."
             )
+        for m in methods:
+            res = method_result_map.get(m)
+            if res is None:
+                continue
+            fold_rows = list(res.get("fold_rows", []))
+            if len(fold_rows) > 0:
+                pear_mean = float(np.nanmean([float(x[2]) for x in fold_rows]))
+                spear_mean = float(np.nanmean([float(x[3]) for x in fold_rows]))
+                r2_mean = float(np.nanmean([float(x[4]) for x in fold_rows]))
+                elapsed_mean = float(np.nanmean([float(x[6]) for x in fold_rows]))
+            else:
+                pear_mean = float("nan")
+                spear_mean = float("nan")
+                r2_mean = float("nan")
+                elapsed_mean = float("nan")
+            pve_raw = res.get("pve_final")
+            try:
+                pve_val = float(pve_raw)
+                if not np.isfinite(pve_val):
+                    pve_val = float("nan")
+            except Exception:
+                pve_val = float("nan")
+            gs_summary_rows.append(
+                {
+                    "trait": str(trait_name),
+                    "model": str(method_display_map.get(str(m), str(m))),
+                    "n_train": int(np.sum(trainmask)),
+                    "n_test": int(expected_test_n),
+                    "pearsonr_cv_mean": pear_mean,
+                    "spearmanr_cv_mean": spear_mean,
+                    "r2_cv_mean": r2_mean,
+                    "pve_final": pve_val,
+                    "time_cv_mean_sec": elapsed_mean,
+                }
+            )
         logger.info(f"-"*60) if args.cv is not None else None
         # Stack predictions from all models: shape (n_test, n_methods)
         outpred = pd.DataFrame(
@@ -10043,6 +10328,7 @@ def main(log: bool = True) -> None:
         )
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
+        saved_result_paths.append(str(out_tsv))
         log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
         log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
 
@@ -10056,6 +10342,29 @@ def main(log: bool = True) -> None:
         f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}"
     )
     log_success(logger, endinfo)
+    if bool(return_result):
+        return {
+            "status": "done",
+            "error": "",
+            "genofile": str(gfile),
+            "outprefix": str(outprefix),
+            "log_file": str(log_path),
+            "summary_rows": [dict(x) for x in gs_summary_rows],
+            "result_files": [str(x) for x in saved_result_paths],
+            "elapsed_sec": float(max(time.time() - t_start, 0.0)),
+            "traits": [str(x) for x in trait_order],
+            "methods": [str(_method_display_name(str(x))) for x in methods],
+        }
+
+
+def main(
+    argv: typing.Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+) -> typing.Optional[dict[str, typing.Any]]:
+    args = parse_args(argv)
+    from janusx.gs.runner import run_gs_args
+    return run_gs_args(args, log=log, return_result=return_result)
 
 
 if __name__ == "__main__":

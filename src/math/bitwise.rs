@@ -834,7 +834,13 @@ fn choose_mutate_backend() -> MutateBackend {
 
     match resolve_reduce_backend() {
         #[cfg(target_arch = "x86_64")]
-        ReduceBackend::Avx2 | ReduceBackend::Avx512 => {
+        ReduceBackend::Avx2 => {
+            if simd.contains(&MutateBackend::Avx2) {
+                return MutateBackend::Avx2;
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => {
             if simd.contains(&MutateBackend::Avx2) {
                 return MutateBackend::Avx2;
             }

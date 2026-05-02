@@ -7,6 +7,10 @@ from typing import Iterable, Iterator, List, Optional
 import numpy as np
 
 from janusx.gfreader import SiteInfo, save_genotype_streaming
+try:
+    from janusx import janusx as _jxrs
+except Exception:
+    _jxrs = None
 
 DEFAULT_MAF_LOW = 0.02
 DEFAULT_MAF_HIGH = 0.45
@@ -126,7 +130,7 @@ def _build_family_layout(
     )
 
 
-def simulate_chunks(
+def _simulate_chunks_python(
     nsnp: int,
     nidv: int,
     chunk_size: int = 50_000,
@@ -172,6 +176,79 @@ def simulate_chunks(
         n_done += m
 
 
+def _simulate_chunks_rust(
+    nsnp: int,
+    nidv: int,
+    chunk_size: int = 50_000,
+    maf_low: float = 0.02,
+    maf_high: float = 0.45,
+    seed: int = 1,
+    layout: Optional[FamilyLayout] = None,
+    homo: bool = False,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    if _jxrs is None or not hasattr(_jxrs, "SimChunkGenerator"):
+        raise AttributeError("SimChunkGenerator is unavailable")
+    layout = layout or _build_family_layout(nidv, "unrelated", 0.0, 4)
+    gen = _jxrs.SimChunkGenerator(
+        nsnp=int(nsnp),
+        nidv=int(nidv),
+        chunk_size=int(chunk_size),
+        maf_low=float(maf_low),
+        maf_high=float(maf_high),
+        seed=int(seed),
+        homo=bool(homo),
+        sire_idx=np.asarray(layout.sire_idx, dtype=np.int64).tolist(),
+        dam_idx=np.asarray(layout.dam_idx, dtype=np.int64).tolist(),
+        child_groups=[np.asarray(g, dtype=np.int64).tolist() for g in layout.child_groups],
+        unrelated_idx=np.asarray(layout.unrelated_idx, dtype=np.int64).tolist(),
+    )
+    while True:
+        out = gen.next_chunk()
+        if out is None:
+            break
+        g, sites = out
+        yield np.asarray(g, dtype=np.int8), sites
+
+
+def simulate_chunks(
+    nsnp: int,
+    nidv: int,
+    chunk_size: int = 50_000,
+    maf_low: float = 0.02,
+    maf_high: float = 0.45,
+    seed: int = 1,
+    layout: Optional[FamilyLayout] = None,
+    homo: bool = False,
+) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+    layout = layout or _build_family_layout(nidv, "unrelated", 0.0, 4)
+    if _jxrs is not None and hasattr(_jxrs, "SimChunkGenerator"):
+        try:
+            yield from _simulate_chunks_rust(
+                nsnp=nsnp,
+                nidv=nidv,
+                chunk_size=chunk_size,
+                maf_low=maf_low,
+                maf_high=maf_high,
+                seed=seed,
+                layout=layout,
+                homo=homo,
+            )
+            return
+        except TypeError:
+            # ABI mismatch with older wheels: fall back to Python path.
+            pass
+    yield from _simulate_chunks_python(
+        nsnp=nsnp,
+        nidv=nidv,
+        chunk_size=chunk_size,
+        maf_low=maf_low,
+        maf_high=maf_high,
+        seed=seed,
+        layout=layout,
+        homo=homo,
+    )
+
+
 def _simulate_trait(
     chunks: Iterable[tuple[np.ndarray, list[SiteInfo]]],
     nsnp: int,
@@ -181,22 +258,135 @@ def _simulate_trait(
     seed: int,
     trait_mean: float = 100.0,
 ) -> np.ndarray:
+    y, rng, beta_sd = _init_trait_state(
+        nsnp=nsnp,
+        nidv=nidv,
+        pve=pve,
+        ve=ve,
+        seed=seed,
+        trait_mean=trait_mean,
+    )
+    trait_state, _ = _make_trait_accumulator(
+        nsnp=nsnp,
+        pve=pve,
+        ve=ve,
+        seed=seed,
+    )
+    for g, _ in chunks:
+        _accumulate_trait_chunk(y, g, rng, beta_sd, trait_state=trait_state)
+    return y[:, None]
+
+
+def _init_trait_state(
+    nsnp: int,
+    nidv: int,
+    pve: float,
+    ve: float,
+    seed: int,
+    trait_mean: float = 100.0,
+) -> tuple[np.ndarray, np.random.Generator, float]:
+    """
+    Initialize phenotype state for streaming one-pass simulation.
+
+    Returns
+    -------
+    y : (nidv,) float32
+        Current phenotype vector initialized with environmental component.
+    rng : np.random.Generator
+        RNG used for per-chunk marker effects.
+    beta_sd : float
+        Standard deviation for chunk-wise marker effects.
+        Zero means no genetic contribution (pve == 0).
+    """
     if not (0.0 <= pve < 1.0):
         raise ValueError("pve must satisfy 0 <= pve < 1.")
     if ve <= 0.0:
         raise ValueError("ve must be > 0.")
-
     rng = np.random.default_rng(seed + 100_003)
-    y = rng.normal(loc=trait_mean, scale=np.sqrt(ve), size=(nidv, 1)).astype(np.float32)
+    y = rng.normal(loc=trait_mean, scale=np.sqrt(ve), size=(nidv,)).astype(np.float32)
     if pve == 0.0:
-        return y
-
+        return y, rng, 0.0
     vg = pve * ve / (1.0 - pve)
-    beta_sd = np.sqrt(vg / max(1, int(nsnp)))
-    for g, _ in chunks:
-        beta = rng.normal(0.0, beta_sd, size=(g.shape[0], 1)).astype(np.float32)
-        y += g.T.astype(np.float32, copy=False) @ beta
-    return y
+    beta_sd = float(np.sqrt(vg / max(1, int(nsnp))))
+    return y, rng, beta_sd
+
+
+def _make_trait_accumulator(
+    nsnp: int,
+    pve: float,
+    ve: float,
+    seed: int,
+) -> tuple[Optional[object], float]:
+    if not (0.0 <= pve < 1.0):
+        raise ValueError("pve must satisfy 0 <= pve < 1.")
+    if ve <= 0.0:
+        raise ValueError("ve must be > 0.")
+    vg = pve * ve / (1.0 - pve) if pve > 0.0 else 0.0
+    beta_sd = float(np.sqrt(vg / max(1, int(nsnp)))) if pve > 0.0 else 0.0
+    if _jxrs is not None and hasattr(_jxrs, "SimTraitAccumulator"):
+        return _jxrs.SimTraitAccumulator(seed=int(seed) + 100_003, beta_sd=beta_sd), beta_sd
+    return None, beta_sd
+
+
+def _make_sim_engine(
+    nsnp: int,
+    nidv: int,
+    chunk_size: int,
+    maf_low: float,
+    maf_high: float,
+    seed: int,
+    layout: FamilyLayout,
+    homo: bool,
+    beta_sd: float,
+) -> Optional[object]:
+    if _jxrs is None or not hasattr(_jxrs, "SimEngine"):
+        return None
+    try:
+        return _jxrs.SimEngine(
+            nsnp=int(nsnp),
+            nidv=int(nidv),
+            chunk_size=int(chunk_size),
+            maf_low=float(maf_low),
+            maf_high=float(maf_high),
+            seed=int(seed),
+            homo=bool(homo),
+            sire_idx=np.asarray(layout.sire_idx, dtype=np.int64).tolist(),
+            dam_idx=np.asarray(layout.dam_idx, dtype=np.int64).tolist(),
+            child_groups=[np.asarray(g, dtype=np.int64).tolist() for g in layout.child_groups],
+            unrelated_idx=np.asarray(layout.unrelated_idx, dtype=np.int64).tolist(),
+            beta_seed=int(seed) + 100_003,
+            beta_sd=float(beta_sd),
+        )
+    except TypeError:
+        # ABI mismatch with older wheels.
+        return None
+
+
+def _accumulate_trait_chunk(
+    y: np.ndarray,
+    g: np.ndarray,
+    rng: np.random.Generator,
+    beta_sd: float,
+    trait_state: Optional[object] = None,
+) -> None:
+    """
+    In-place phenotype accumulation from one SNP-major genotype chunk.
+    """
+    if beta_sd <= 0.0:
+        return
+    g_i8 = np.asarray(g, dtype=np.int8, order="C")
+    if g_i8.ndim != 2:
+        raise ValueError("g must be a 2D genotype chunk.")
+
+    if trait_state is not None and hasattr(trait_state, "accumulate_chunk"):
+        try:
+            trait_state.accumulate_chunk(y, g_i8)
+            return
+        except TypeError:
+            # ABI mismatch with older wheels: fall back to NumPy path.
+            pass
+    beta = rng.normal(0.0, beta_sd, size=(g_i8.shape[0],)).astype(np.float32)
+    y += g_i8.T.astype(np.float32, copy=False) @ beta
 
 
 def _write_phenotypes(
@@ -359,36 +549,62 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"{auto_structure_note}..."
     )
 
-    chunks_for_trait = simulate_chunks(
-        nsnp,
-        nidv,
-        chunk_size=chunk_size,
-        maf_low=maf_low,
-        maf_high=maf_high,
-        seed=int(args.seed),
-        layout=layout,
-        homo=bool(args.homo),
-    )
-    y = _simulate_trait(
-        chunks_for_trait,
+    y, trait_rng, trait_beta_sd = _init_trait_state(
         nsnp=nsnp,
         nidv=nidv,
         pve=float(args.pve),
         ve=float(args.ve),
         seed=int(args.seed),
     )
-
-    chunks_for_write = simulate_chunks(
-        nsnp,
-        nidv,
+    sim_engine = _make_sim_engine(
+        nsnp=nsnp,
+        nidv=nidv,
         chunk_size=chunk_size,
         maf_low=maf_low,
         maf_high=maf_high,
         seed=int(args.seed),
         layout=layout,
         homo=bool(args.homo),
+        beta_sd=trait_beta_sd,
     )
-    save_genotype_streaming(outprefix, sample_ids.tolist(), chunks_for_write, total_snps=nsnp)
+
+    if sim_engine is not None:
+        def _iter_chunks_with_trait() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+            while True:
+                out = sim_engine.next_chunk(y)
+                if out is None:
+                    break
+                g, sites = out
+                yield np.asarray(g, dtype=np.int8), sites
+    else:
+        trait_state, _trait_beta_sd_rust = _make_trait_accumulator(
+            nsnp=nsnp,
+            pve=float(args.pve),
+            ve=float(args.ve),
+            seed=int(args.seed),
+        )
+
+        def _iter_chunks_with_trait() -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
+            chunks = simulate_chunks(
+                nsnp,
+                nidv,
+                chunk_size=chunk_size,
+                maf_low=maf_low,
+                maf_high=maf_high,
+                seed=int(args.seed),
+                layout=layout,
+                homo=bool(args.homo),
+            )
+            for g, sites in chunks:
+                _accumulate_trait_chunk(y, g, trait_rng, trait_beta_sd, trait_state=trait_state)
+                yield g, sites
+
+    save_genotype_streaming(
+        outprefix,
+        sample_ids.tolist(),
+        _iter_chunks_with_trait(),
+        total_snps=nsnp,
+    )
     _write_phenotypes(
         outprefix,
         sample_ids,

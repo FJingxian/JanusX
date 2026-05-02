@@ -40,6 +40,8 @@ mod tree;
 mod gfcore;
 #[path = "io/gfreader.rs"]
 mod gfreader;
+#[path = "io/sim.rs"]
+mod sim;
 #[path = "io/gmerge.rs"]
 mod gmerge;
 #[path = "io/gwasio.rs"]
@@ -92,8 +94,8 @@ use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64};
 use gfreader::{
     bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
     load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
-    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
-    VcfChunkReader, VcfStreamWriter,
+    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo,
+    TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use glm::{glmf32, glmf32_full, glmf32_packed};
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
@@ -120,6 +122,7 @@ use score::{
     score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
 };
+use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
     geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
@@ -138,6 +141,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PlinkStreamWriter>()?;
     m.add_class::<VcfStreamWriter>()?;
     m.add_class::<HmpStreamWriter>()?;
+    m.add_class::<SimChunkGenerator>()?;
+    m.add_class::<SimEngine>()?;
+    m.add_class::<SimTraitAccumulator>()?;
     m.add_class::<SiteInfo>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
@@ -176,6 +182,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(gfd_packbits_from_dosage_block, m)?)?;
+    m.add_function(wrap_pyfunction!(sim_trait_accumulate_i8_f32, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;

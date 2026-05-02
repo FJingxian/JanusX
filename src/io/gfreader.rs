@@ -4,7 +4,6 @@ use pyo3::BoundObject;
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2};
-
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

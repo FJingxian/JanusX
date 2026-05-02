@@ -23,6 +23,12 @@ fn env_flag_default_true(name: &str) -> bool {
     }
 }
 
+fn emit_verbose_note(msg: impl AsRef<str>) {
+    if env_flag("JANUSX_BUILD_VERBOSE") {
+        println!("cargo:warning={}", msg.as_ref());
+    }
+}
+
 fn has_library_with_prefix(lib_dir_s: &str, prefix: &str) -> bool {
     let Ok(entries) = fs::read_dir(lib_dir_s) else {
         return false;
@@ -72,10 +78,10 @@ fn maybe_link_blas_family_from_dir(lib_dir_s: &str, source_label: &str) {
         linked.push("blas");
     }
     if !linked.is_empty() {
-        println!(
-            "cargo:warning=BLAS family linkage via {source_label}: openblas + {}.",
+        emit_verbose_note(format!(
+            "BLAS family linkage via {source_label}: openblas + {}.",
             linked.join(" + ")
-        );
+        ));
     }
 }
 
@@ -92,7 +98,7 @@ fn maybe_prebuild_kmc_bind() {
     println!("cargo:rerun-if-changed=python/janusx/native/kmc_count_bind.cpp");
 
     if matches!(env::var("JANUSX_PREBUILD_KMC_BIND"), Ok(v) if v.trim() == "0") {
-        println!("cargo:warning=Skip KMC prebuild (JANUSX_PREBUILD_KMC_BIND=0).");
+        emit_verbose_note("Skip KMC prebuild (JANUSX_PREBUILD_KMC_BIND=0).");
         return;
     }
 
@@ -131,12 +137,12 @@ fn maybe_prebuild_kmc_bind() {
 
     match cmd.output() {
         Ok(out) if out.status.success() => {
-            println!("cargo:warning=KMC bind prebuild finished.");
+            emit_verbose_note("KMC bind prebuild finished.");
             let stdout = String::from_utf8_lossy(&out.stdout);
             let msg = stdout.trim();
             if !msg.is_empty() {
                 for line in msg.lines() {
-                    println!("cargo:warning={line}");
+                    emit_verbose_note(line);
                 }
             }
         }
@@ -211,14 +217,13 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
     }
     if !has_generic && has_versioned {
         println!("cargo:rustc-cfg=jx_openblas_link_openblas0");
-        println!(
-            "cargo:warning=OpenBLAS detected via {source_label} with versioned soname \
-only; linking as openblas.0."
-        );
+        emit_verbose_note(format!(
+            "OpenBLAS detected via {source_label} with versioned soname only; linking as openblas.0."
+        ));
     } else {
-        println!(
-            "cargo:warning=OpenBLAS enabled via {source_label}; backend auto can use openblas."
-        );
+        emit_verbose_note(format!(
+            "OpenBLAS enabled via {source_label}; backend auto can use openblas."
+        ));
     }
     true
 }

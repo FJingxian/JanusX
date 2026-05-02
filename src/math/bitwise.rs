@@ -34,6 +34,7 @@ fn force_simd_reduce_runtime() -> bool {
     *FORCE_SIMD_REDUCE.get_or_init(|| parse_env_bool("JANUSX_BITWISE_FORCE_SIMD_REDUCE"))
 }
 
+#[cfg(any(target_arch = "aarch64", test))]
 #[inline]
 fn force_simd_mutate_runtime() -> bool {
     static FORCE_SIMD_MUTATE: OnceLock<bool> = OnceLock::new();
@@ -47,7 +48,7 @@ fn avx2_runtime_available() -> bool {
     *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[inline]
 fn avx512_vpopcntdq_runtime_available() -> bool {
     static AVX512_VPOPCNT: OnceLock<bool> = OnceLock::new();
@@ -153,7 +154,7 @@ unsafe fn popcount_u8x32_avx2(
         + (_mm256_extract_epi64(sum64, 3) as u64)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
 unsafe fn popcount_simd_avx512(words: &[u64]) -> u64 {
     use core::arch::x86_64::*;
@@ -171,7 +172,7 @@ unsafe fn popcount_simd_avx512(words: &[u64]) -> u64 {
     lanes.iter().copied().sum::<u64>() + popcount_serial(&words[i..])
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
 unsafe fn and_popcount_simd_avx512(lhs: &[u64], rhs: &[u64]) -> u64 {
     use core::arch::x86_64::*;
@@ -368,6 +369,7 @@ fn popcount_chunk(words: &[u64], use_simd: bool) -> u64 {
     if use_simd {
         #[cfg(target_arch = "x86_64")]
         {
+            #[cfg(feature = "simd-avx512")]
             if avx512_vpopcntdq_runtime_available() {
                 // SAFETY: gated by runtime AVX-512 VPOPCNTDQ detection.
                 return unsafe { popcount_simd_avx512(words) };
@@ -393,6 +395,7 @@ fn and_popcount_chunk(lhs: &[u64], rhs: &[u64], use_simd: bool) -> u64 {
     if use_simd {
         #[cfg(target_arch = "x86_64")]
         {
+            #[cfg(feature = "simd-avx512")]
             if avx512_vpopcntdq_runtime_available() {
                 // SAFETY: gated by runtime AVX-512 VPOPCNTDQ detection.
                 return unsafe { and_popcount_simd_avx512(lhs, rhs) };

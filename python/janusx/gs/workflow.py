@@ -1170,6 +1170,25 @@ def _estimate_rrblup_lambda_subsample_reml(
     seed = int(cfg_use.get("lambda_subsample_seed", 42))
     rng = np.random.default_rng(seed)
     log10_vals: list[float] = []
+    std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("pcg_std_eps", 1e-12))))
+
+    maf_all = np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None and int(maf_all.size) > 0:
+        site_keep = np.asarray(site_keep_raw, dtype=bool).reshape(-1)
+        if int(site_keep.size) == int(maf_all.size):
+            maf_use = maf_all[site_keep]
+        else:
+            maf_use = maf_all
+    else:
+        maf_use = maf_all
+    if int(maf_use.size) > 0:
+        p_use = np.clip(maf_use, 0.0, 0.5)
+        var_use = 2.0 * p_use * (1.0 - p_use)
+        m_effective = int(np.count_nonzero(np.isfinite(var_use) & (var_use > float(std_eps))))
+    else:
+        m_effective = 0
+    m_scale = float(max(1, int(m_effective)))
 
     def _emit(event: str, **payload: typing.Any) -> None:
         if progress_hook is None:
@@ -1206,16 +1225,19 @@ def _estimate_rrblup_lambda_subsample_reml(
             if grm_sub is None:
                 raise RuntimeError("Packed GRM builder returned None.")
             fit_sub = _fit_gblup_reml_from_grm(y_sub, grm_sub)
-            lam_sub = float(fit_sub.get("lambda_reml", np.nan))
+            lam_sub_k = float(fit_sub.get("lambda_reml", np.nan))
         except Exception:
-            lam_sub = float("nan")
-        if np.isfinite(lam_sub) and lam_sub > 0.0:
-            log10_vals.append(float(np.log10(lam_sub)))
+            lam_sub_k = float("nan")
+        lam_sub_eq = float(lam_sub_k * m_scale) if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0) else float("nan")
+        if np.isfinite(lam_sub_eq) and lam_sub_eq > 0.0:
+            log10_vals.append(float(np.log10(lam_sub_eq)))
         _emit(
             "pcg_lambda_subsample_iter",
             iter=int(rep + 1),
             total=int(repeats),
-            lambda_equation=float(lam_sub),
+            lambda_equation=float(lam_sub_eq),
+            lambda_k=float(lam_sub_k),
+            m_effective=int(m_effective),
         )
     if len(log10_vals) == 0:
         _emit(
@@ -1236,12 +1258,14 @@ def _estimate_rrblup_lambda_subsample_reml(
         repeats=int(repeats),
         ok_repeats=int(len(log10_vals)),
         lambda_equation=float(lam_eq),
+        m_effective=int(m_effective),
     )
     return {
         "lambda_equation": float(lam_eq),
         "n_sub": int(n_sub),
         "repeats": int(repeats),
         "ok_repeats": int(len(log10_vals)),
+        "m_effective": int(m_effective),
     }
 
 
@@ -2910,15 +2934,7 @@ def GSapi(
                 pcg_progress_cb = _on_pcg_progress if rrblup_progress_hook is not None else None
                 pcg_progress_every = 1 if pcg_progress_cb is not None else 0
                 try:
-                    (
-                        pred_train_raw,
-                        pred_test_raw,
-                        pve_trainvar,
-                        pcg_converged,
-                        pcg_iters,
-                        pcg_rel_res,
-                        m_effective,
-                    ) = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                    rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
                         source_prefix,
                         train_abs,
                         y_train_vec,
@@ -2935,15 +2951,7 @@ def GSapi(
                         progress_every=int(pcg_progress_every),
                     )
                 except TypeError:
-                    (
-                        pred_train_raw,
-                        pred_test_raw,
-                        pve_trainvar,
-                        pcg_converged,
-                        pcg_iters,
-                        pcg_rel_res,
-                        m_effective,
-                    ) = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                    rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
                         source_prefix,
                         train_abs,
                         y_train_vec,
@@ -2956,6 +2964,36 @@ def GSapi(
                         int(pcg_block_rows),
                         float(pcg_std_eps),
                         int(max(1, int(n_jobs))),
+                    )
+                rr_out_t = tuple(rr_out)
+                if len(rr_out_t) >= 9:
+                    (
+                        pred_train_raw,
+                        pred_test_raw,
+                        pve_trainvar,
+                        pcg_converged,
+                        pcg_iters,
+                        pcg_rel_res,
+                        m_effective,
+                        pve_lambda_trace,
+                        k_trace_mean,
+                    ) = rr_out_t[:9]
+                elif len(rr_out_t) == 7:
+                    (
+                        pred_train_raw,
+                        pred_test_raw,
+                        pve_trainvar,
+                        pcg_converged,
+                        pcg_iters,
+                        pcg_rel_res,
+                        m_effective,
+                    ) = rr_out_t
+                    pve_lambda_trace = float("nan")
+                    k_trace_mean = float("nan")
+                else:
+                    raise RuntimeError(
+                        "rrblup_pcg_bed returned unexpected payload size: "
+                        f"{len(rr_out_t)}"
                     )
                 _emit_rrblup_progress(
                     "pcg_end",
@@ -2973,10 +3011,15 @@ def GSapi(
                 pred_test = np.asarray(pred_test_raw, dtype=float).reshape(-1, 1)
 
                 m_eff = int(max(1, int(m_effective)))
-                pve_lambda = float(m_eff / (m_eff + float(lambda_equation)))
-                pve_mode = str(rr_cfg.get("pve_mode", "trainvar")).strip().lower()
+                pve_lambda_formula = float(m_eff / (m_eff + float(lambda_equation)))
+                pve_lambda = (
+                    float(pve_lambda_trace)
+                    if np.isfinite(float(pve_lambda_trace))
+                    else float(pve_lambda_formula)
+                )
+                pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
                 if pve_mode not in {"lambda", "trainvar"}:
-                    pve_mode = "trainvar"
+                    pve_mode = "lambda"
                 pve = float(pve_lambda if pve_mode == "lambda" else float(pve_trainvar))
 
                 if rrblup_runtime_state is not None:
@@ -3002,7 +3045,10 @@ def GSapi(
                     rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
                     rrblup_runtime_state["pve_used"] = float(pve)
                     rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
+                    rrblup_runtime_state["pve_lambda_formula"] = float(pve_lambda_formula)
+                    rrblup_runtime_state["pve_lambda_trace"] = float(pve_lambda_trace)
                     rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
+                    rrblup_runtime_state["k_trace_mean"] = float(k_trace_mean)
 
                 if _GS_DEBUG_STAGE:
                     print(
@@ -3270,9 +3316,9 @@ def GSapi(
             if np.isfinite(lambda_eq) and lambda_eq >= 0.0:
                 pve_lambda = float(m_eff / (m_eff + lambda_eq))
             rr_cfg = rrblup_adamw_cfg or {}
-            pve_mode = str(rr_cfg.get("pve_mode", "trainvar")).strip().lower()
+            pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
             if pve_mode not in {"lambda", "trainvar"}:
-                pve_mode = "trainvar"
+                pve_mode = "lambda"
             pve = pve_lambda if (pve_mode == "lambda") else pve_trainvar
 
             if rrblup_runtime_state is not None:
@@ -4253,11 +4299,11 @@ def _run_method_task(
                     rr_cfg_mode = str(
                         rr_state_call.get(
                             "pve_mode_used",
-                            (rr_cfg_call or {}).get("pve_mode", "trainvar"),
+                            (rr_cfg_call or {}).get("pve_mode", "lambda"),
                         )
                     ).strip().lower()
                     if rr_cfg_mode not in {"lambda", "trainvar"}:
-                        rr_cfg_mode = "trainvar"
+                        rr_cfg_mode = "lambda"
                     pve_used_f = _float_or_nan(pve)
                     pve_trainvar_f = _float_or_nan(rr_state_call.get("pve_trainvar", np.nan))
                     pve_lambda_f = _float_or_nan(rr_state_call.get("pve_lambda", np.nan))
@@ -4481,7 +4527,7 @@ def _run_method_task(
             rrblup_pve_final = {
                 "phase": "final(skipped)",
                 "solver": str(rrblup_solver).strip().lower(),
-                "pve_mode": str(rrblup_cfg_base.get("pve_mode", "trainvar")).strip().lower(),
+                "pve_mode": str(rrblup_cfg_base.get("pve_mode", "lambda")).strip().lower(),
                 "pve_used": _float_or_nan(pve_final),
                 "pve_trainvar": (
                     float(np.nanmean(tv)) if int(tv.size) > 0 and np.any(np.isfinite(tv)) else float("nan")
@@ -4596,9 +4642,9 @@ def _run_method_task(
                 ):
                     bayes_auto_r2_cache[bayes_r2_final_key] = float(r2_used_final)
         if method == "rrBLUP" and rr_state_final is not None:
-            mode_used = str((rr_cfg_final or {}).get("pve_mode", "trainvar")).strip().lower()
+            mode_used = str((rr_cfg_final or {}).get("pve_mode", "lambda")).strip().lower()
             if mode_used not in {"lambda", "trainvar"}:
-                mode_used = "trainvar"
+                mode_used = "lambda"
             pve_used_f = _float_or_nan(pve_final)
             pve_trainvar_f = _float_or_nan(rr_state_final.get("pve_trainvar", np.nan))
             pve_lambda_f = _float_or_nan(rr_state_final.get("pve_lambda", np.nan))
@@ -4798,7 +4844,7 @@ def _run_methods_parallel(
                     )
                 )
 
-            pve_mode = str(rr_state.get("pve_mode_used", rr_cfg.get("pve_mode", "trainvar"))).strip().lower()
+            pve_mode = str(rr_state.get("pve_mode_used", rr_cfg.get("pve_mode", "lambda"))).strip().lower()
             if pve_mode != "":
                 rows.append(("PVE mode", pve_mode))
             return rows
@@ -8032,7 +8078,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         "--rrblup-pve-mode",
         type=str,
         choices=("lambda", "trainvar"),
-        default="trainvar",
+        default="lambda",
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(

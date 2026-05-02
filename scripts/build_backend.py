@@ -19,6 +19,20 @@ def _env_flag(name: str) -> bool:
     raw = str(os.environ.get(name, "")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
+def _env_flag_optional(name: str) -> bool | None:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if raw == "":
+        return None
+    return raw in {"1", "true", "yes", "on"}
+
+def _strict_kmc_bind_mode() -> bool:
+    explicit = _env_flag_optional("JANUSX_STRICT_KMC_BIND")
+    if explicit is not None:
+        return bool(explicit)
+    # Default strict on Linux/macOS wheel builds to avoid publishing wheels
+    # that require runtime C++ compilation for `jx kmer`.
+    return sys.platform.startswith("linux") or (sys.platform == "darwin")
+
 
 def _project_root() -> Path:
     here = Path(__file__).resolve()
@@ -47,7 +61,7 @@ def _build_kmc_extension_for_wheel() -> Path | None:
         )
         return Path(ext_path)
     except Exception as exc:
-        if _env_flag("JANUSX_STRICT_KMC_BIND"):
+        if _strict_kmc_bind_mode():
             raise
         print(
             f"[build-backend] warning: prebuild _kmc_count failed ({exc}); "

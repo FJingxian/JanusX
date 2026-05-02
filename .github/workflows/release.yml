@@ -252,44 +252,44 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # abi3 wheel (cp39-abi3) covers CPython 3.9-3.14 on each platform/arch.
+          # abi3 wheel (cp310-abi3) covers CPython 3.10+ on each platform/arch.
           - label: linux-x86_64
             runner: ubuntu-latest
             platform: linux
-            python-version: "3.9"
+            python-version: "3.10"
             manylinux: "2014"
             manylinux_image: quay.io/pypa/manylinux2014_x86_64:latest
-            interpreter: /opt/python/cp39-cp39/bin/python
+            interpreter: /opt/python/cp310-cp310/bin/python
             target: x86_64-unknown-linux-gnu
           - label: linux-aarch64
             runner: ubuntu-24.04-arm
             platform: linux
-            python-version: "3.9"
+            python-version: "3.10"
             manylinux: "2014"
             manylinux_image: quay.io/pypa/manylinux2014_aarch64:latest
-            interpreter: /opt/python/cp39-cp39/bin/python
+            interpreter: /opt/python/cp310-cp310/bin/python
             target: aarch64-unknown-linux-gnu
           - label: macos-x86_64
             runner: macos-15-intel
             platform: macos
-            python-version: "3.9"
+            python-version: "3.10"
             target: x86_64-apple-darwin
           - label: macos-arm64
             runner: macos-14
             platform: macos
-            python-version: "3.9"
+            python-version: "3.10"
             target: aarch64-apple-darwin
           - label: windows-x86_64
             runner: windows-latest
             platform: windows
-            python-version: "3.9"
+            python-version: "3.10"
             target: x86_64-pc-windows-msvc
           # Build Windows ARM64 wheel via cross-target on windows-latest.
           # If your org has native ARM runners, you can switch runner to windows-11-arm.
           - label: windows-arm64
             runner: windows-latest
             platform: windows
-            python-version: "3.9"
+            python-version: "3.10"
             target: aarch64-pc-windows-msvc
     steps:
       - name: Checkout
@@ -327,7 +327,7 @@ jobs:
         if: ${{ matrix.platform != 'linux' }}
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin==1.9.4
+          python -m pip install maturin==1.9.4 build "pybind11>=2.13"
 
       - name: Install OpenBLAS (macOS)
         if: ${{ matrix.platform == 'macos' }}
@@ -380,31 +380,61 @@ jobs:
               set -euo pipefail
               yum install -y epel-release || true
               yum install -y openblas-devel pkgconfig curl
+              THREAD_LIB=\"\$(ls -1 /usr/lib64/libopenblasp-r*.so /usr/lib/libopenblasp-r*.so 2>/dev/null | head -n1 || true)\"
+              if [[ -z \"\${THREAD_LIB}\" ]]; then
+                echo \"ERROR: pthread OpenBLAS candidate not found (expected libopenblasp-r*.so).\"
+                exit 1
+              fi
+              rm -rf dist dist_raw
+              mkdir -p dist dist_raw
+              mkdir -p /tmp/openblas_threaded
+              ln -sf \"\${THREAD_LIB}\" /tmp/openblas_threaded/libopenblas.so
+              ln -sf \"\${THREAD_LIB}\" /tmp/openblas_threaded/libopenblas.so.0
+              # Ensure auditwheel can resolve SONAME libopenblasp.so.0 when only versioned file exists.
+              if [[ -d /usr/lib64 ]]; then
+                ln -sf \"\${THREAD_LIB}\" /usr/lib64/libopenblasp.so
+                ln -sf \"\${THREAD_LIB}\" /usr/lib64/libopenblasp.so.0
+              fi
+              if [[ -d /usr/lib ]]; then
+                ln -sf \"\${THREAD_LIB}\" /usr/lib/libopenblasp.so
+                ln -sf \"\${THREAD_LIB}\" /usr/lib/libopenblasp.so.0
+              fi
+              export LD_LIBRARY_PATH=/tmp/openblas_threaded:/usr/lib64:/usr/lib:\${LD_LIBRARY_PATH:-}
+              echo \"[linux build container] threaded OpenBLAS candidate: \${THREAD_LIB}\"
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
               source /root/.cargo/env
               ${INTERP} -m pip install -U pip
-              ${INTERP} -m pip install maturin==1.9.4
+              ${INTERP} -m pip install maturin==1.9.4 build "pybind11>=2.13" auditwheel
               export JANUSX_REQUIRE_OPENBLAS=1
-              export OPENBLAS_LIB_DIR=/usr/lib64
+              export JANUSX_STRICT_KMC_BIND=1
+              export OPENBLAS_LIB_DIR=/tmp/openblas_threaded
               export OPENBLAS_INCLUDE_DIR=/usr/include/openblas
-              ${INTERP} -m maturin build \
-                --release \
-                --out dist \
-                --target ${TARGET} \
-                --interpreter ${INTERP} \
-                --features blas-openblas
+              ${INTERP} -m build --wheel --outdir dist_raw --no-isolation
+              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist_raw/*.whl
+              auditwheel show dist_raw/*.whl
+              auditwheel repair dist_raw/*.whl -w dist
+              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
               ${INTERP} -m pip install --force-reinstall --no-deps dist/*.whl
-              ${INTERP} -c 'import janusx.janusx as _jx; backend=_jx.rust_sgemm_backend(); print(f\"[linux build container] rust_sgemm_backend={backend}\"); import sys; sys.exit(0 if backend == \"openblas\" else 1)'
+              CXX=/bin/false ${INTERP} /io/scripts/ci/check_installed_runtime.py \
+                --require-openblas \
+                --require-threaded-openblas \
+                --check-kmc-load
             "
 
       - name: Build wheels (macOS/Windows)
         if: ${{ matrix.platform != 'linux' }}
         shell: bash
         run: |
-          if [[ "${{ matrix.label }}" == "windows-arm64" ]]; then
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            export JANUSX_STRICT_KMC_BIND=1
+            python -m build --wheel --outdir dist --no-isolation
+          elif [[ "${{ matrix.label }}" == "windows-x86_64" ]]; then
+            export JANUSX_STRICT_KMC_BIND=1
+            python -m build --wheel --outdir dist --no-isolation
+          elif [[ "${{ matrix.label }}" == "windows-arm64" ]]; then
             # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
             export PYO3_CROSS=1
-            export PYO3_CROSS_PYTHON_VERSION=3.9
+            export PYO3_CROSS_PYTHON_VERSION=3.10
             maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas
           else
             maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas
@@ -425,6 +455,36 @@ jobs:
           if backend != "openblas":
               raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
           PY
+
+      - name: Verify KMC prebuilt in wheel (all except windows-arm64)
+        if: ${{ matrix.label != 'windows-arm64' }}
+        shell: bash
+        run: |
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
+          "$PY" - <<'PY'
+          import glob
+          import zipfile
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Strict mode failed: expected one wheel, got {len(wheels)}")
+          wheel = wheels[0]
+          with zipfile.ZipFile(wheel, "r") as zf:
+              names = zf.namelist()
+          kmc_entries = [
+              n for n in names
+              if n.startswith("janusx/_kmc_count")
+              and (n.endswith(".so") or n.endswith(".pyd") or ".so." in n)
+          ]
+          print(f"[janusx] wheel={wheel}")
+          print(f"[janusx] kmc_entries={kmc_entries}")
+          if not kmc_entries:
+              raise SystemExit("Strict mode failed: wheel does not include janusx/_kmc_count extension")
+          PY
+          "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
 
       - name: Verify macOS wheel links OpenBLAS only
         if: ${{ matrix.platform == 'macos' }}

@@ -1284,6 +1284,8 @@ pub fn rrblup_pcg_bed<'py>(
     usize,
     f64,
     usize,
+    f64,
+    f64,
 )> {
     if max_iter == 0 {
         return Err(PyRuntimeError::new_err("max_iter must be > 0"));
@@ -1476,13 +1478,14 @@ pub fn rrblup_pcg_bed<'py>(
     let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
     let y_center_f32: Vec<f32> = y_vec_f64.iter().map(|v| (*v - y_mean) as f32).collect();
 
-    let (pred_train_ret, pred_test_ret, pve_trainvar, converged, iters, rel_res) = py
+    let (pred_train_ret, pred_test_ret, pve_trainvar, converged, iters, rel_res, pve_lambda_vc, k_trace_mean) = py
         .detach(
-            move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64), String> {
+            move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64), String> {
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];
                 let mut block = vec![0.0_f32; row_step * n_train];
                 let mut dot_blk = vec![0.0_f32; row_step];
+                let mut sum_ss_global = 0.0_f64;
                 let mut tick = 0usize;
                 for st in (0..m).step_by(row_step) {
                     let ed = (st + row_step).min(m);
@@ -1511,9 +1514,10 @@ pub fn rrblup_pcg_bed<'py>(
                     );
                     for r in 0..cur_rows {
                         let row = &blk_slice[r * n_train..(r + 1) * n_train];
-                        let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() as f32;
+                        let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
+                        sum_ss_global += ss;
                         b[st + r] = dot_blk[r];
-                        let d = (ss + lambda_use).max(1e-12_f32);
+                        let d = ((ss as f32) + lambda_use).max(1e-12_f32);
                         diag_inv[st + r] = 1.0_f32 / d;
                     }
                     tick += cur_rows;
@@ -1657,6 +1661,22 @@ pub fn rrblup_pcg_bed<'py>(
                 } else {
                     f64::NAN
                 };
+                let mean_k_trace = if n_train > 0 && m_effective > 0 {
+                    sum_ss_global / ((m_effective as f64) * (n_train as f64))
+                } else {
+                    f64::NAN
+                };
+                let pve_lambda_vc = if mean_k_trace.is_finite() && mean_k_trace > 0.0 && m_effective > 0 {
+                    let lambda_k = (lambda_use as f64) / (m_effective as f64);
+                    let denom_vc = mean_k_trace + lambda_k;
+                    if denom_vc.is_finite() && denom_vc > 0.0 {
+                        mean_k_trace / denom_vc
+                    } else {
+                        f64::NAN
+                    }
+                } else {
+                    f64::NAN
+                };
 
                 let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
                     local_idx.iter().map(|&i| pred_train_f64[i]).collect()
@@ -1690,6 +1710,8 @@ pub fn rrblup_pcg_bed<'py>(
                     converged,
                     iters_done,
                     rel_res,
+                    pve_lambda_vc,
+                    mean_k_trace,
                 ))
             },
         )
@@ -1716,6 +1738,8 @@ pub fn rrblup_pcg_bed<'py>(
         iters,
         rel_res,
         m_effective,
+        pve_lambda_vc,
+        k_trace_mean,
     ))
 }
 

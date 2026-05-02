@@ -14,9 +14,12 @@ default = ["blas-openblas"]
 # - macOS default uses Accelerate.
 # - enable `blas-openblas` to link OpenBLAS and prefer it at runtime.
 blas-openblas = []
+# Optional AVX-512 bitwise kernels (nightly-only intrinsics on many stable toolchains).
+# Keep off by default so release wheels build on stable Rust.
+simd-avx512 = []
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py39", "generate-import-lib"] }
+pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
 numpy = "0.27.1"
 csv = "1.4.0"
 flate2 = "1.1.8"

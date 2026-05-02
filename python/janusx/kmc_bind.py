@@ -33,6 +33,11 @@ _PREBUILT_BLOB = f"{_MODULE_BASENAME}.prebuilt.bin"
 _LOADED: dict[str, ModuleType] = {}
 
 
+def _env_true(name: str) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
 def _norm_path(path: str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(path)))
 
@@ -155,16 +160,76 @@ def _resolve_ext_suffix() -> str:
     return ".so"
 
 
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+def _is_msvc_like_driver(cxx: str) -> bool:
+    name = Path(cxx).name.lower()
+    return name in {"cl", "cl.exe", "clang-cl", "clang-cl.exe"}
+
+
 def _pick_cxx() -> str:
     pref = str(os.environ.get("CXX", "")).strip()
-    candidates = [pref, "clang++", "g++", "c++"] if pref else ["clang++", "g++", "c++"]
+    if pref:
+        exe = shutil.which(pref)
+        if exe:
+            return exe
+        p = Path(pref)
+        if p.is_file():
+            return str(p)
+        raise RuntimeError(
+            f"CXX is set to '{pref}', but compiler not found in PATH (or file does not exist)."
+        )
+
+    if _is_windows():
+        candidates = ["cl", "clang-cl", "clang++", "g++", "c++"]
+    else:
+        candidates = ["clang++", "g++", "c++"]
     for cand in candidates:
         if not cand:
             continue
         exe = shutil.which(cand)
         if exe:
             return exe
-    raise RuntimeError("No C++ compiler found. Please install clang++/g++ and ensure it is in PATH.")
+    raise RuntimeError(
+        "No C++ compiler found. Please install a supported compiler "
+        "(Windows: cl/clang-cl; Linux/macOS: clang++/g++) and ensure it is in PATH."
+    )
+
+
+def _resolve_python_link_for_windows() -> tuple[Path, str]:
+    vi = sys.version_info
+    cand_dirs: list[Path] = []
+    for raw in (
+        sysconfig.get_config_var("LIBDIR"),
+        sysconfig.get_config_var("LIBPL"),
+        str(Path(sys.base_prefix) / "libs"),
+        str(Path(sys.executable).resolve().parent / "libs"),
+    ):
+        if raw:
+            p = Path(str(raw))
+            if p.is_dir():
+                cand_dirs.append(p)
+
+    lib_names = [
+        str(sysconfig.get_config_var("LIBRARY") or "").strip(),
+        str(sysconfig.get_config_var("LDLIBRARY") or "").strip(),
+        f"python{vi.major}{vi.minor}.lib",
+    ]
+    lib_names = [x for x in lib_names if x]
+
+    for d in cand_dirs:
+        for n in lib_names:
+            p = d / n
+            if p.is_file():
+                return d, n
+    dirs_s = ", ".join(str(x) for x in cand_dirs) if cand_dirs else "<none>"
+    names_s = ", ".join(lib_names) if lib_names else "<none>"
+    raise RuntimeError(
+        "Cannot locate Python import library for Windows link step. "
+        f"searched_dirs=[{dirs_s}] searched_names=[{names_s}]"
+    )
 
 
 def _build_cache_root() -> Path:
@@ -312,23 +377,37 @@ def _compile_objects(
     verbose: bool,
 ) -> list[Path]:
     objs: list[Path] = []
-    common = ["-O3", "-DNDEBUG", "-std=c++14", "-fPIC", "-Wall"]
-    inc_flags = [f"-I{d}" for d in include_dirs]
+    msvc_like = _is_windows() and _is_msvc_like_driver(cxx)
+    if msvc_like:
+        common = ["/nologo", "/O2", "/DNDEBUG", "/EHsc", "/std:c++14", "/MD", "/bigobj", "/DNOMINMAX"]
+        inc_flags = [f"/I{d}" for d in include_dirs]
+    else:
+        common = ["-O3", "-DNDEBUG", "-std=c++14", "-fPIC", "-Wall"]
+        inc_flags = [f"-I{d}" for d in include_dirs]
     for src in sources:
         if not src.is_file():
             raise FileNotFoundError(f"KMC source file not found: {src}")
         obj = obj_dir / f"{src.stem}.o"
         extra: list[str] = []
         name = src.name
-        if name == "raduls_sse2.cpp":
-            extra = ["-msse2"]
-        elif name == "raduls_sse41.cpp":
-            extra = ["-msse4.1"]
-        elif name == "raduls_avx.cpp":
-            extra = ["-mavx"]
-        elif name == "raduls_avx2.cpp":
-            extra = ["-mavx2"]
-        cmd = [cxx, *common, *extra, *inc_flags, "-c", str(src), "-o", str(obj)]
+        if msvc_like:
+            if name == "raduls_avx.cpp":
+                extra = ["/arch:AVX"]
+            elif name == "raduls_avx2.cpp":
+                extra = ["/arch:AVX2"]
+            elif name == "raduls_sse41.cpp":
+                extra = ["/arch:AVX"]
+            cmd = [cxx, *common, *extra, *inc_flags, "/c", str(src), f"/Fo{obj}"]
+        else:
+            if name == "raduls_sse2.cpp":
+                extra = ["-msse2"]
+            elif name == "raduls_sse41.cpp":
+                extra = ["-msse4.1"]
+            elif name == "raduls_avx.cpp":
+                extra = ["-mavx"]
+            elif name == "raduls_avx2.cpp":
+                extra = ["-mavx2"]
+            cmd = [cxx, *common, *extra, *inc_flags, "-c", str(src), "-o", str(obj)]
         _run(cmd, verbose=verbose)
         objs.append(obj)
     return objs
@@ -344,9 +423,6 @@ def build_kmc_bind_module(
     rebuild: bool = False,
     verbose: bool = False,
 ) -> Path:
-    if platform.system() == "Windows":
-        raise RuntimeError("KMC pybind builder currently supports Linux/macOS only.")
-
     kmc_src_dir = resolve_kmc_source(kmc_src)
     wrapper_cpp = _norm_path(str(Path(__file__).resolve().parent / "native" / "kmc_count_bind.cpp"))
     if not wrapper_cpp.is_file():
@@ -394,9 +470,36 @@ def build_kmc_bind_module(
         verbose=verbose,
     )
 
-    link_cmd = [cxx, "-shared", "-o", str(out), *(str(x) for x in (kmc_objs + wrapper_obj)), "-lpthread", "-lz", "-lm"]
-    if platform.system() == "Darwin":
-        link_cmd.extend(["-undefined", "dynamic_lookup"])
+    if _is_windows() and _is_msvc_like_driver(cxx):
+        py_lib_dir, py_lib_name = _resolve_python_link_for_windows()
+        link_cmd = [
+            cxx,
+            "/nologo",
+            "/LD",
+            f"/Fe{out}",
+            *(str(x) for x in (kmc_objs + wrapper_obj)),
+            "/link",
+            f"/LIBPATH:{py_lib_dir}",
+            py_lib_name,
+        ]
+        zlib_static = kmc_src_dir / "kmc_core" / "libs" / "zlibstat.lib"
+        if zlib_static.is_file():
+            link_cmd.append(str(zlib_static))
+        else:
+            link_cmd.append("zlib.lib")
+    else:
+        link_cmd = [
+            cxx,
+            "-shared",
+            "-o",
+            str(out),
+            *(str(x) for x in (kmc_objs + wrapper_obj)),
+            "-lpthread",
+            "-lz",
+            "-lm",
+        ]
+        if platform.system() == "Darwin":
+            link_cmd.extend(["-undefined", "dynamic_lookup"])
     _run(link_cmd, verbose=verbose)
     return out
 
@@ -472,6 +575,10 @@ def load_kmc_bind_module(
         if packaged is not None:
             _LOADED[cache_key] = packaged
             return packaged
+    if _env_true("JANUSX_KMC_BIND_NO_BUILD"):
+        raise RuntimeError(
+            "KMC prebuilt extension not found/loadable and JANUSX_KMC_BIND_NO_BUILD=1 blocks source build fallback."
+        )
     so_path = build_kmc_bind_module(kmc_src=kmc_src, rebuild=rebuild, verbose=verbose)
     spec = importlib.util.spec_from_file_location(_MODULE_BASENAME, so_path)
     if spec is None or spec.loader is None:

@@ -2672,7 +2672,17 @@ pub fn gfd_packbits_from_dosage_block<'py>(
     let input: &[f32] = if let Some(s) = x.as_slice_memory_order() {
         s
     } else {
-        input_owned = x.to_owned().into_raw_vec();
+        let (raw, offset) = x.to_owned().into_raw_vec_and_offset();
+        let total = n_rows.saturating_mul(n_samples);
+        let start = offset.unwrap_or(0);
+        let end = start.saturating_add(total);
+        if end > raw.len() {
+            return Err(PyValueError::new_err(format!(
+                "block copy layout error: start={}, total={}, raw_len={}",
+                start, total, raw.len()
+            )));
+        }
+        input_owned = raw[start..end].to_vec();
         &input_owned
     };
 
@@ -2692,7 +2702,7 @@ pub fn gfd_packbits_from_dosage_block<'py>(
         }
     }
 
-    py.allow_threads(|| {
+    py.detach(|| {
         out.par_chunks_mut(2 * packed_cols)
             .enumerate()
             .for_each(|(r, out_rows2)| {

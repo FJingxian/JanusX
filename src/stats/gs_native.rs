@@ -775,7 +775,11 @@ pub fn gblup_reml_packed_bed<'py>(
         )));
     }
 
-    let keep_idx: Vec<usize> = if let Some(mask) = site_keep {
+    let mut eff_m = m_total;
+    let mut packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
+    let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
+    let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
+    if let Some(mask) = site_keep {
         let mask_vec: Vec<bool> = match mask.as_slice() {
             Ok(s) => s.to_vec(),
             Err(_) => mask.as_array().iter().copied().collect(),
@@ -786,31 +790,38 @@ pub fn gblup_reml_packed_bed<'py>(
                 mask_vec.len()
             )));
         }
-        mask_vec
+        let keep_idx: Vec<usize> = mask_vec
             .iter()
             .enumerate()
             .filter_map(|(i, &k)| if k { Some(i) } else { None })
-            .collect()
-    } else {
-        (0..m_total).collect()
-    };
-    if keep_idx.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "No SNPs remained after applying site_keep mask.",
-        ));
-    }
-
-    let eff_m = keep_idx.len();
-    let mut packed_keep = vec![0_u8; eff_m * bytes_per_snp];
-    let mut maf_keep = vec![0.0_f32; eff_m];
-    let mut row_flip_keep = vec![false; eff_m];
-    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-        let src_off = src_row * bytes_per_snp;
-        let dst_off = dst_row * bytes_per_snp;
-        packed_keep[dst_off..dst_off + bytes_per_snp]
-            .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
-        maf_keep[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
-        row_flip_keep[dst_row] = row_flip_full[src_row];
+            .collect();
+        if keep_idx.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "No SNPs remained after applying site_keep mask.",
+            ));
+        }
+        let keep_is_identity = (keep_idx.len() == m_total)
+            && keep_idx
+                .iter()
+                .enumerate()
+                .all(|(dst_row, &src_row)| dst_row == src_row);
+        if !keep_is_identity {
+            eff_m = keep_idx.len();
+            let mut packed_subset = vec![0_u8; eff_m * bytes_per_snp];
+            let mut maf_subset = vec![0.0_f32; eff_m];
+            let mut row_flip_subset = vec![false; eff_m];
+            for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+                let src_off = src_row * bytes_per_snp;
+                let dst_off = dst_row * bytes_per_snp;
+                packed_subset[dst_off..dst_off + bytes_per_snp]
+                    .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
+                maf_subset[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
+                row_flip_subset[dst_row] = row_flip_full[src_row];
+            }
+            packed_keep = Cow::Owned(packed_subset);
+            maf_keep = Cow::Owned(maf_subset);
+            row_flip_keep = Cow::Owned(row_flip_subset);
+        }
     }
 
     let train_idx = parse_index_vec_i64(
@@ -928,13 +939,14 @@ pub fn gblup_reml_packed_bed<'py>(
 
     let packed_keep_arr = PyArray2::from_owned_array(
         py,
-        Array2::from_shape_vec((eff_m, bytes_per_snp), packed_keep)
+        Array2::from_shape_vec((eff_m, bytes_per_snp), packed_keep.into_owned())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .into_bound();
     let row_flip_keep_arr =
-        PyArray1::from_owned_array(py, Array1::from_vec(row_flip_keep)).into_bound();
-    let maf_keep_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf_keep)).into_bound();
+        PyArray1::from_owned_array(py, Array1::from_vec(row_flip_keep.into_owned())).into_bound();
+    let maf_keep_arr =
+        PyArray1::from_owned_array(py, Array1::from_vec(maf_keep.into_owned())).into_bound();
 
     let train_idx_i64: Vec<i64> = train_idx.iter().map(|&v| v as i64).collect();
     let train_idx_arr =
@@ -1360,7 +1372,11 @@ pub fn rrblup_pcg_bed<'py>(
         )));
     }
 
-    let keep_idx: Vec<usize> = if let Some(mask) = site_keep {
+    let mut eff_m = m_total;
+    let mut packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
+    let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
+    let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
+    if let Some(mask) = site_keep {
         let mask_vec: Vec<bool> = match mask.as_slice() {
             Ok(s) => s.to_vec(),
             Err(_) => mask.as_array().iter().copied().collect(),
@@ -1371,31 +1387,38 @@ pub fn rrblup_pcg_bed<'py>(
                 mask_vec.len()
             )));
         }
-        mask_vec
+        let keep_idx: Vec<usize> = mask_vec
             .iter()
             .enumerate()
             .filter_map(|(i, &k)| if k { Some(i) } else { None })
-            .collect()
-    } else {
-        (0..m_total).collect()
-    };
-    if keep_idx.is_empty() {
-        return Err(PyRuntimeError::new_err(
-            "No SNPs remained after applying site_keep mask.",
-        ));
-    }
-
-    let eff_m = keep_idx.len();
-    let mut packed_keep = vec![0_u8; eff_m * bytes_per_snp];
-    let mut maf_keep = vec![0.0_f32; eff_m];
-    let mut row_flip_keep = vec![false; eff_m];
-    for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-        let src_off = src_row * bytes_per_snp;
-        let dst_off = dst_row * bytes_per_snp;
-        packed_keep[dst_off..dst_off + bytes_per_snp]
-            .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
-        maf_keep[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
-        row_flip_keep[dst_row] = row_flip_full[src_row];
+            .collect();
+        if keep_idx.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "No SNPs remained after applying site_keep mask.",
+            ));
+        }
+        let keep_is_identity = (keep_idx.len() == m_total)
+            && keep_idx
+                .iter()
+                .enumerate()
+                .all(|(dst_row, &src_row)| dst_row == src_row);
+        if !keep_is_identity {
+            eff_m = keep_idx.len();
+            let mut packed_subset = vec![0_u8; eff_m * bytes_per_snp];
+            let mut maf_subset = vec![0.0_f32; eff_m];
+            let mut row_flip_subset = vec![false; eff_m];
+            for (dst_row, &src_row) in keep_idx.iter().enumerate() {
+                let src_off = src_row * bytes_per_snp;
+                let dst_off = dst_row * bytes_per_snp;
+                packed_subset[dst_off..dst_off + bytes_per_snp]
+                    .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
+                maf_subset[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
+                row_flip_subset[dst_row] = row_flip_full[src_row];
+            }
+            packed_keep = Cow::Owned(packed_subset);
+            maf_keep = Cow::Owned(maf_subset);
+            row_flip_keep = Cow::Owned(row_flip_subset);
+        }
     }
 
     let train_idx = parse_index_vec_i64(
@@ -1501,10 +1524,10 @@ pub fn rrblup_pcg_bed<'py>(
                     let cur_rows = ed - st;
                     let blk_slice = &mut block[..cur_rows * n_train];
                     decode_standardized_block_f32(
-                        &packed_keep,
+                        packed_keep.as_ref(),
                         bytes_per_snp,
                         n_samples,
-                        &row_flip_keep,
+                        row_flip_keep.as_ref(),
                         &row_mean,
                         &row_inv_sd,
                         &train_idx,
@@ -1558,10 +1581,10 @@ pub fn rrblup_pcg_bed<'py>(
 
                 for it in 0..max_iter {
                     let xp = pcg_x_mul_samples(
-                        &packed_keep,
+                        packed_keep.as_ref(),
                         bytes_per_snp,
                         n_samples,
-                        &row_flip_keep,
+                        row_flip_keep.as_ref(),
                         &row_mean,
                         &row_inv_sd,
                         &train_idx,
@@ -1572,10 +1595,10 @@ pub fn rrblup_pcg_bed<'py>(
                         pool_ref,
                     )?;
                     let mut ap = pcg_xt_mul_rows(
-                        &packed_keep,
+                        packed_keep.as_ref(),
                         bytes_per_snp,
                         n_samples,
-                        &row_flip_keep,
+                        row_flip_keep.as_ref(),
                         &row_mean,
                         &row_inv_sd,
                         &train_idx,
@@ -1635,10 +1658,10 @@ pub fn rrblup_pcg_bed<'py>(
                 }
 
                 let mut pred_train_full = pcg_x_mul_samples(
-                    &packed_keep,
+                    packed_keep.as_ref(),
                     bytes_per_snp,
                     n_samples,
-                    &row_flip_keep,
+                    row_flip_keep.as_ref(),
                     &row_mean,
                     &row_inv_sd,
                     &train_idx,
@@ -1697,10 +1720,10 @@ pub fn rrblup_pcg_bed<'py>(
                 let mut pred_test_ret: Vec<f64> = Vec::new();
                 if !test_idx.is_empty() {
                     let test_pred_f32 = pcg_x_mul_samples(
-                        &packed_keep,
+                        packed_keep.as_ref(),
                         bytes_per_snp,
                         n_samples,
-                        &row_flip_keep,
+                        row_flip_keep.as_ref(),
                         &row_mean,
                         &row_inv_sd,
                         &test_idx,

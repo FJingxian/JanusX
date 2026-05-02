@@ -2593,7 +2593,29 @@ def GSapi(
             if method == "rrBLUP"
             else "exact"
         )
+        requested_rr_solver = str(rrblup_solver).strip().lower()
+        if requested_rr_solver not in {"exact", "adamw", "pcg", "auto"}:
+            requested_rr_solver = "auto"
         kinship = 1 if method == "GBLUP" else None
+
+        def _set_rrblup_solver_state(
+            solver_name: str,
+            fallback_reason: str | None = None,
+        ) -> None:
+            nonlocal resolved_rr_solver
+            resolved_rr_solver = str(solver_name).strip().lower()
+            if (method != "rrBLUP") or (rrblup_runtime_state is None):
+                return
+            rrblup_runtime_state["solver_requested"] = str(requested_rr_solver)
+            rrblup_runtime_state["solver_effective"] = str(resolved_rr_solver)
+            rrblup_runtime_state["solver"] = str(resolved_rr_solver)
+            if fallback_reason is not None and str(fallback_reason).strip() != "":
+                rrblup_runtime_state["solver_fallback_reason"] = str(fallback_reason).strip()
+            elif "solver_fallback_reason" in rrblup_runtime_state:
+                rrblup_runtime_state.pop("solver_fallback_reason", None)
+
+        if method == "rrBLUP":
+            _set_rrblup_solver_state(str(resolved_rr_solver))
 
         def _emit_rrblup_progress(event: str, **payload: typing.Any) -> None:
             if rrblup_progress_hook is None:
@@ -2779,19 +2801,18 @@ def GSapi(
                     )
                 return pred_train, pred_test, float(pve)
         if method == "rrBLUP" and resolved_rr_solver == "pcg":
-            requested_solver = str(rrblup_solver).strip().lower()
             if not is_packed_input:
-                if requested_solver == "pcg":
+                if requested_rr_solver == "pcg":
                     raise ValueError(
                         "rrBLUP solver=pcg requires packed PLINK input (bfile) in this build."
                     )
-                resolved_rr_solver = "exact"
+                _set_rrblup_solver_state("exact", "packed_input_required_for_pcg")
             elif (_jxrs is None) or (not hasattr(_jxrs, "rrblup_pcg_bed")):
-                if requested_solver == "pcg":
+                if requested_rr_solver == "pcg":
                     raise RuntimeError(
                         "Rust rrBLUP-PCG kernel is unavailable. Rebuild/install JanusX extension."
                     )
-                resolved_rr_solver = "exact"
+                _set_rrblup_solver_state("exact", "rust_rrblup_pcg_kernel_unavailable")
             else:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
                 source_prefix_raw = packed_train.get("source_prefix", None)
@@ -2861,7 +2882,7 @@ def GSapi(
                 auto_pcg_ref_n = int(max(0, int(rr_cfg.get("auto_pcg_ref_n", n_train_local))))
                 lambda_auto_enabled = _cfg_truthy(rr_cfg.get("lambda_auto", "on"), default=True)
                 if (
-                    str(requested_solver) == "auto"
+                    str(requested_rr_solver) == "auto"
                     and int(auto_pcg_ref_n) > int(auto_pcg_min_n)
                     and bool(lambda_auto_enabled)
                 ):
@@ -3022,8 +3043,8 @@ def GSapi(
                     pve_mode = "lambda"
                 pve = float(pve_lambda if pve_mode == "lambda" else float(pve_trainvar))
 
+                _set_rrblup_solver_state("pcg")
                 if rrblup_runtime_state is not None:
-                    rrblup_runtime_state["solver"] = "pcg"
                     rrblup_runtime_state["pcg_converged"] = bool(pcg_converged)
                     rrblup_runtime_state["pcg_iters"] = int(pcg_iters)
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
@@ -3205,8 +3226,8 @@ def GSapi(
                 fit["auto_grid_selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
                 fit["auto_grid_selected_lr"] = float(selected_cfg.get("lr", np.nan))
                 fit["auto_grid_selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
+            _set_rrblup_solver_state("adamw")
             if rrblup_runtime_state is not None:
-                rrblup_runtime_state["solver"] = "adamw"
                 rrblup_runtime_state["auto_grid_enabled"] = bool(use_auto_grid)
                 rrblup_runtime_state["selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
                 rrblup_runtime_state["selected_lr"] = float(selected_cfg.get("lr", np.nan))
@@ -3388,8 +3409,9 @@ def GSapi(
         else:
             pred_train = np.zeros((0, 1), dtype=float)
         pred_test = model.predict(Xtest, sample_indices=packed_test_indices)
+        if method == "rrBLUP":
+            _set_rrblup_solver_state(str(resolved_rr_solver))
         if method == "rrBLUP" and rrblup_runtime_state is not None:
-            rrblup_runtime_state["solver"] = str(resolved_rr_solver)
             rrblup_runtime_state["pve_used"] = float(model.pve)
             rrblup_runtime_state["pve_exact"] = float(model.pve)
             # Exact rrBLUP follows REML/variance-component PVE from pyBLUP.
@@ -4319,10 +4341,28 @@ def _run_method_task(
                                 rr_state_call.get("best_epoch", np.nan),
                             )
                         )
+                    solver_req_fold = str(
+                        rr_state_call.get(
+                            "solver_requested",
+                            str(rrblup_solver).strip().lower(),
+                        )
+                    ).strip().lower()
+                    solver_eff_fold = str(
+                        rr_state_call.get(
+                            "solver_effective",
+                            rr_state_call.get("solver", solver_req_fold),
+                        )
+                    ).strip().lower()
+                    solver_reason_fold = str(
+                        rr_state_call.get("solver_fallback_reason", "")
+                    ).strip()
                     rrblup_pve_rows.append(
                         {
                             "fold": int(fold_id),
-                            "solver": str(rr_state_call.get("solver", str(rrblup_solver).strip().lower())),
+                            "solver": str(solver_eff_fold),
+                            "solver_requested": str(solver_req_fold),
+                            "solver_effective": str(solver_eff_fold),
+                            "solver_fallback_reason": str(solver_reason_fold),
                             "pve_mode": str(rr_cfg_mode),
                             "pve_used": pve_used_f,
                             "pve_trainvar": pve_trainvar_f,
@@ -4524,9 +4564,25 @@ def _run_method_task(
                 [float(x.get("iter_like", np.nan)) for x in rrblup_pve_rows],
                 dtype=np.float64,
             )
+            solver_req_final = str(rrblup_solver).strip().lower()
+            solver_eff_final = str(solver_req_final)
+            solver_reason_final = ""
+            for _row in rrblup_pve_rows:
+                cand_req = str(_row.get("solver_requested", "")).strip().lower()
+                cand_eff = str(_row.get("solver_effective", _row.get("solver", ""))).strip().lower()
+                cand_reason = str(_row.get("solver_fallback_reason", "")).strip()
+                if cand_req != "":
+                    solver_req_final = str(cand_req)
+                if cand_eff != "":
+                    solver_eff_final = str(cand_eff)
+                if solver_reason_final == "" and cand_reason != "":
+                    solver_reason_final = str(cand_reason)
             rrblup_pve_final = {
                 "phase": "final(skipped)",
-                "solver": str(rrblup_solver).strip().lower(),
+                "solver": str(solver_eff_final),
+                "solver_requested": str(solver_req_final),
+                "solver_effective": str(solver_eff_final),
+                "solver_fallback_reason": str(solver_reason_final),
                 "pve_mode": str(rrblup_cfg_base.get("pve_mode", "lambda")).strip().lower(),
                 "pve_used": _float_or_nan(pve_final),
                 "pve_trainvar": (
@@ -4539,6 +4595,13 @@ def _run_method_task(
                     float(np.nanmean(itv)) if int(itv.size) > 0 and np.any(np.isfinite(itv)) else float("nan")
                 ),
             }
+            rrblup_final_state = {
+                "solver": str(solver_eff_final),
+                "solver_requested": str(solver_req_final),
+                "solver_effective": str(solver_eff_final),
+            }
+            if solver_reason_final != "":
+                rrblup_final_state["solver_fallback_reason"] = str(solver_reason_final)
     elif use_custom_gblup_final:
         fit = _fit_gblup_reml_from_grm(
             np.asarray(train_pheno, dtype=np.float64).reshape(-1),
@@ -4652,9 +4715,22 @@ def _run_method_task(
                 pve_trainvar_f = pve_used_f
             if (not np.isfinite(pve_lambda_f)) and mode_used == "lambda":
                 pve_lambda_f = pve_used_f
+            solver_req_final = str(
+                rr_state_final.get("solver_requested", str(rrblup_solver).strip().lower())
+            ).strip().lower()
+            solver_eff_final = str(
+                rr_state_final.get(
+                    "solver_effective",
+                    rr_state_final.get("solver", solver_req_final),
+                )
+            ).strip().lower()
+            solver_reason_final = str(rr_state_final.get("solver_fallback_reason", "")).strip()
             rrblup_pve_final = {
                 "phase": "final",
-                "solver": str(rr_state_final.get("solver", str(rrblup_solver).strip().lower())),
+                "solver": str(solver_eff_final),
+                "solver_requested": str(solver_req_final),
+                "solver_effective": str(solver_eff_final),
+                "solver_fallback_reason": str(solver_reason_final),
                 "pve_mode": str(mode_used),
                 "pve_used": pve_used_f,
                 "pve_trainvar": pve_trainvar_f,
@@ -4807,12 +4883,22 @@ def _run_methods_parallel(
                 )
                 or dict(rrblup_adamw_cfg or {})
             )
-            solver_req = str(rrblup_solver).strip().lower()
-            solver_used = str(rr_state.get("solver", solver_req)).strip().lower()
+            solver_req = str(
+                rr_state.get("solver_requested", str(rrblup_solver).strip().lower())
+            ).strip().lower()
+            solver_used = str(
+                rr_state.get(
+                    "solver_effective",
+                    rr_state.get("solver", solver_req),
+                )
+            ).strip().lower()
             if solver_req != solver_used:
                 rows.append(("solver", f"{solver_req} -> {solver_used.upper()}"))
             else:
                 rows.append(("solver", solver_used.upper()))
+            solver_fallback_reason = str(rr_state.get("solver_fallback_reason", "")).strip()
+            if solver_fallback_reason != "":
+                rows.append(("solver note", solver_fallback_reason))
 
             if solver_used == "pcg":
                 lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))

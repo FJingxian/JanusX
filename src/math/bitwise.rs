@@ -3,7 +3,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::hint::black_box;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 const PAR_REDUCE_MIN_WORDS: usize = 16 * 1024;
 const PAR_MUTATE_MIN_WORDS: usize = 16 * 1024;
@@ -23,6 +25,32 @@ fn parse_env_bool(name: &str) -> bool {
 }
 
 #[inline]
+fn parse_env_bool_default(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |v| {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on") {
+            true
+        } else if matches!(t.as_str(), "0" | "false" | "no" | "n" | "off") {
+            false
+        } else {
+            default
+        }
+    })
+}
+
+#[inline]
+fn parse_env_token(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    })
+}
+
+#[inline]
 fn force_scalar_runtime() -> bool {
     static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
     *FORCE_SCALAR.get_or_init(|| parse_env_bool("JANUSX_BITWISE_FORCE_SCALAR"))
@@ -34,11 +62,90 @@ fn force_simd_reduce_runtime() -> bool {
     *FORCE_SIMD_REDUCE.get_or_init(|| parse_env_bool("JANUSX_BITWISE_FORCE_SIMD_REDUCE"))
 }
 
-#[cfg(any(target_arch = "aarch64", test))]
 #[inline]
 fn force_simd_mutate_runtime() -> bool {
     static FORCE_SIMD_MUTATE: OnceLock<bool> = OnceLock::new();
     *FORCE_SIMD_MUTATE.get_or_init(|| parse_env_bool("JANUSX_BITWISE_FORCE_SIMD_MUTATE"))
+}
+
+#[inline]
+fn bitwise_autotune_enabled() -> bool {
+    static AUTO: OnceLock<bool> = OnceLock::new();
+    *AUTO.get_or_init(|| parse_env_bool_default("JANUSX_BITWISE_AUTOTUNE", true))
+}
+
+#[inline]
+fn bitwise_autotune_words() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("JANUSX_BITWISE_AUTOTUNE_WORDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1024)
+            .unwrap_or(1 << 16)
+    })
+}
+
+#[inline]
+fn bitwise_autotune_iters() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("JANUSX_BITWISE_AUTOTUNE_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(6)
+    })
+}
+
+#[inline]
+fn bitwise_backend_debug() -> bool {
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| parse_env_bool("JANUSX_BITWISE_BACKEND_DEBUG"))
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReduceBackend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+    Avx512,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MutateBackend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+}
+
+#[inline]
+fn reduce_backend_name(b: ReduceBackend) -> &'static str {
+    match b {
+        ReduceBackend::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        ReduceBackend::Avx2 => "avx2",
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => "avx512",
+        #[cfg(target_arch = "aarch64")]
+        ReduceBackend::Neon => "neon",
+    }
+}
+
+#[inline]
+fn mutate_backend_name(b: MutateBackend) -> &'static str {
+    match b {
+        MutateBackend::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        MutateBackend::Avx2 => "avx2",
+        #[cfg(target_arch = "aarch64")]
+        MutateBackend::Neon => "neon",
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -365,140 +472,399 @@ unsafe fn bitnot_in_place_simd_neon(words: &mut [u64]) {
 }
 
 #[inline]
-fn popcount_chunk(words: &[u64], use_simd: bool) -> u64 {
-    if use_simd {
+fn popcount_chunk_by_backend(words: &[u64], backend: ReduceBackend) -> u64 {
+    match backend {
+        ReduceBackend::Scalar => popcount_serial(words),
         #[cfg(target_arch = "x86_64")]
-        {
-            #[cfg(feature = "simd-avx512")]
+        ReduceBackend::Avx2 => {
+            if avx2_runtime_available() {
+                // SAFETY: gated by runtime AVX2 detection.
+                unsafe { popcount_simd_avx2(words) }
+            } else {
+                popcount_serial(words)
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => {
             if avx512_vpopcntdq_runtime_available() {
                 // SAFETY: gated by runtime AVX-512 VPOPCNTDQ detection.
-                return unsafe { popcount_simd_avx512(words) };
-            }
-            if force_simd_reduce_runtime() && avx2_runtime_available() {
+                unsafe { popcount_simd_avx512(words) }
+            } else if avx2_runtime_available() {
                 // SAFETY: gated by runtime AVX2 detection.
-                return unsafe { popcount_simd_avx2(words) };
+                unsafe { popcount_simd_avx2(words) }
+            } else {
+                popcount_serial(words)
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            if force_simd_reduce_runtime() && neon_runtime_available() {
+        ReduceBackend::Neon => {
+            if neon_runtime_available() {
                 // SAFETY: gated by runtime NEON detection.
-                return unsafe { popcount_simd_neon(words) };
+                unsafe { popcount_simd_neon(words) }
+            } else {
+                popcount_serial(words)
             }
         }
     }
-    popcount_serial(words)
 }
 
 #[inline]
-fn and_popcount_chunk(lhs: &[u64], rhs: &[u64], use_simd: bool) -> u64 {
-    if use_simd {
+fn and_popcount_chunk_by_backend(lhs: &[u64], rhs: &[u64], backend: ReduceBackend) -> u64 {
+    match backend {
+        ReduceBackend::Scalar => and_popcount_serial(lhs, rhs),
         #[cfg(target_arch = "x86_64")]
-        {
-            #[cfg(feature = "simd-avx512")]
+        ReduceBackend::Avx2 => {
+            if avx2_runtime_available() {
+                // SAFETY: gated by runtime AVX2 detection.
+                unsafe { and_popcount_simd_avx2(lhs, rhs) }
+            } else {
+                and_popcount_serial(lhs, rhs)
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => {
             if avx512_vpopcntdq_runtime_available() {
                 // SAFETY: gated by runtime AVX-512 VPOPCNTDQ detection.
-                return unsafe { and_popcount_simd_avx512(lhs, rhs) };
-            }
-            if force_simd_reduce_runtime() && avx2_runtime_available() {
+                unsafe { and_popcount_simd_avx512(lhs, rhs) }
+            } else if avx2_runtime_available() {
                 // SAFETY: gated by runtime AVX2 detection.
-                return unsafe { and_popcount_simd_avx2(lhs, rhs) };
+                unsafe { and_popcount_simd_avx2(lhs, rhs) }
+            } else {
+                and_popcount_serial(lhs, rhs)
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            if force_simd_reduce_runtime() && neon_runtime_available() {
+        ReduceBackend::Neon => {
+            if neon_runtime_available() {
                 // SAFETY: gated by runtime NEON detection.
-                return unsafe { and_popcount_simd_neon(lhs, rhs) };
+                unsafe { and_popcount_simd_neon(lhs, rhs) }
+            } else {
+                and_popcount_serial(lhs, rhs)
             }
         }
     }
-    and_popcount_serial(lhs, rhs)
 }
 
 #[inline]
-fn bitand_assign_chunk(dst: &mut [u64], rhs: &[u64], use_simd: bool) {
-    if use_simd {
+fn bitand_assign_chunk_by_backend(dst: &mut [u64], rhs: &[u64], backend: MutateBackend) {
+    match backend {
+        MutateBackend::Scalar => bitand_assign_serial(dst, rhs),
         #[cfg(target_arch = "x86_64")]
-        {
+        MutateBackend::Avx2 => {
             if avx2_runtime_available() {
                 // SAFETY: gated by runtime AVX2 detection.
                 unsafe { bitand_assign_simd_avx2(dst, rhs) };
-                return;
+            } else {
+                bitand_assign_serial(dst, rhs);
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            if force_simd_mutate_runtime() && neon_runtime_available() {
+        MutateBackend::Neon => {
+            if neon_runtime_available() {
                 // SAFETY: gated by runtime NEON detection.
                 unsafe { bitand_assign_simd_neon(dst, rhs) };
-                return;
+            } else {
+                bitand_assign_serial(dst, rhs);
             }
         }
     }
-    bitand_assign_serial(dst, rhs);
 }
 
 #[inline]
-fn bitor_into_chunk(dst: &mut [u64], src: &[u64], use_simd: bool) {
-    if use_simd {
+fn bitor_into_chunk_by_backend(dst: &mut [u64], src: &[u64], backend: MutateBackend) {
+    match backend {
+        MutateBackend::Scalar => bitor_into_serial(dst, src),
         #[cfg(target_arch = "x86_64")]
-        {
+        MutateBackend::Avx2 => {
             if avx2_runtime_available() {
                 // SAFETY: gated by runtime AVX2 detection.
                 unsafe { bitor_into_simd_avx2(dst, src) };
-                return;
+            } else {
+                bitor_into_serial(dst, src);
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            if force_simd_mutate_runtime() && neon_runtime_available() {
+        MutateBackend::Neon => {
+            if neon_runtime_available() {
                 // SAFETY: gated by runtime NEON detection.
                 unsafe { bitor_into_simd_neon(dst, src) };
-                return;
+            } else {
+                bitor_into_serial(dst, src);
             }
         }
     }
-    bitor_into_serial(dst, src);
 }
 
 #[inline]
-fn bitnot_in_place_chunk(words: &mut [u64], use_simd: bool) {
-    if use_simd {
+fn bitnot_in_place_chunk_by_backend(words: &mut [u64], backend: MutateBackend) {
+    match backend {
+        MutateBackend::Scalar => bitnot_in_place_serial(words),
         #[cfg(target_arch = "x86_64")]
-        {
+        MutateBackend::Avx2 => {
             if avx2_runtime_available() {
                 // SAFETY: gated by runtime AVX2 detection.
                 unsafe { bitnot_in_place_simd_avx2(words) };
-                return;
+            } else {
+                bitnot_in_place_serial(words);
             }
         }
         #[cfg(target_arch = "aarch64")]
-        {
-            if force_simd_mutate_runtime() && neon_runtime_available() {
+        MutateBackend::Neon => {
+            if neon_runtime_available() {
                 // SAFETY: gated by runtime NEON detection.
                 unsafe { bitnot_in_place_simd_neon(words) };
-                return;
+            } else {
+                bitnot_in_place_serial(words);
             }
         }
     }
-    bitnot_in_place_serial(words);
+}
+
+#[inline]
+fn popcount_with_backend(words: &[u64], backend: ReduceBackend) -> u64 {
+    if words.is_empty() {
+        return 0;
+    }
+    if should_parallelize(words.len(), PAR_REDUCE_MIN_WORDS) {
+        words
+            .par_chunks(PAR_CHUNK_WORDS)
+            .map(|chunk| popcount_chunk_by_backend(chunk, backend))
+            .sum::<u64>()
+    } else {
+        popcount_chunk_by_backend(words, backend)
+    }
+}
+
+#[inline]
+fn and_popcount_with_backend(lhs: &[u64], rhs: &[u64], backend: ReduceBackend) -> u64 {
+    if lhs.is_empty() {
+        return 0;
+    }
+    if should_parallelize(lhs.len(), PAR_REDUCE_MIN_WORDS) {
+        lhs.par_chunks(PAR_CHUNK_WORDS)
+            .zip(rhs.par_chunks(PAR_CHUNK_WORDS))
+            .map(|(l, r)| and_popcount_chunk_by_backend(l, r, backend))
+            .sum::<u64>()
+    } else {
+        and_popcount_chunk_by_backend(lhs, rhs, backend)
+    }
+}
+
+#[inline]
+fn available_reduce_simd_backends() -> Vec<ReduceBackend> {
+    let mut out = Vec::new();
+    #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+    {
+        if avx512_vpopcntdq_runtime_available() {
+            out.push(ReduceBackend::Avx512);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_runtime_available() {
+            out.push(ReduceBackend::Avx2);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon_runtime_available() {
+            out.push(ReduceBackend::Neon);
+        }
+    }
+    out
+}
+
+#[inline]
+fn available_mutate_simd_backends() -> Vec<MutateBackend> {
+    let mut out = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_runtime_available() {
+            out.push(MutateBackend::Avx2);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon_runtime_available() {
+            out.push(MutateBackend::Neon);
+        }
+    }
+    out
+}
+
+#[inline]
+fn make_autotune_words(n: usize, seed: u64) -> Vec<u64> {
+    let mut x = seed ^ 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = vec![0u64; n];
+    for v in out.iter_mut() {
+        x ^= x << 7;
+        x ^= x >> 9;
+        x = x.wrapping_mul(0xD134_2543_DE82_EF95);
+        *v = x;
+    }
+    out
+}
+
+#[inline]
+fn autotune_reduce_backend(cands: &[ReduceBackend], allow_scalar: bool) -> ReduceBackend {
+    if cands.is_empty() {
+        return ReduceBackend::Scalar;
+    }
+    if !bitwise_autotune_enabled() {
+        return cands[0];
+    }
+
+    let n_words = bitwise_autotune_words();
+    let iters = bitwise_autotune_iters();
+    let a = make_autotune_words(n_words, 0x1234_5678_9ABC_DEF0);
+    let b = make_autotune_words(n_words, 0x0FED_CBA9_8765_4321);
+
+    let mut options: Vec<ReduceBackend> = Vec::new();
+    if allow_scalar {
+        options.push(ReduceBackend::Scalar);
+    }
+    options.extend_from_slice(cands);
+
+    let mut best = options[0];
+    let mut best_t = f64::INFINITY;
+    for &backend in options.iter() {
+        let mut sink = 0u64;
+        let _ = and_popcount_with_backend(&a, &b, backend);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_with_backend(&a, &b, backend);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        black_box(sink);
+        if dt < best_t {
+            best_t = dt;
+            best = backend;
+        }
+    }
+    best
+}
+
+#[inline]
+fn choose_reduce_backend() -> ReduceBackend {
+    if force_scalar_runtime() {
+        return ReduceBackend::Scalar;
+    }
+    let simd = available_reduce_simd_backends();
+    if simd.is_empty() {
+        return ReduceBackend::Scalar;
+    }
+
+    if let Some(req) = parse_env_token("JANUSX_BITWISE_REDUCE_BACKEND") {
+        match req.as_str() {
+            "scalar" => return ReduceBackend::Scalar,
+            "simd" => return autotune_reduce_backend(&simd, false),
+            #[cfg(target_arch = "x86_64")]
+            "avx2" => {
+                if simd.contains(&ReduceBackend::Avx2) {
+                    return ReduceBackend::Avx2;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+            "avx512" => {
+                if simd.contains(&ReduceBackend::Avx512) {
+                    return ReduceBackend::Avx512;
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            "neon" => {
+                if simd.contains(&ReduceBackend::Neon) {
+                    return ReduceBackend::Neon;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if force_simd_reduce_runtime() {
+        return autotune_reduce_backend(&simd, false);
+    }
+    autotune_reduce_backend(&simd, true)
+}
+
+#[inline]
+fn resolve_reduce_backend() -> ReduceBackend {
+    static BACKEND: OnceLock<ReduceBackend> = OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        let b = choose_reduce_backend();
+        if bitwise_backend_debug() {
+            eprintln!("[bitwise] reduce_backend={}", reduce_backend_name(b));
+        }
+        b
+    })
+}
+
+#[inline]
+fn choose_mutate_backend() -> MutateBackend {
+    if force_scalar_runtime() {
+        return MutateBackend::Scalar;
+    }
+    let simd = available_mutate_simd_backends();
+    if simd.is_empty() {
+        return MutateBackend::Scalar;
+    }
+
+    if let Some(req) = parse_env_token("JANUSX_BITWISE_MUTATE_BACKEND") {
+        match req.as_str() {
+            "scalar" => return MutateBackend::Scalar,
+            "simd" => return simd[0],
+            #[cfg(target_arch = "x86_64")]
+            "avx2" => {
+                if simd.contains(&MutateBackend::Avx2) {
+                    return MutateBackend::Avx2;
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            "neon" => {
+                if simd.contains(&MutateBackend::Neon) {
+                    return MutateBackend::Neon;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if force_simd_mutate_runtime() {
+        return simd[0];
+    }
+
+    match resolve_reduce_backend() {
+        #[cfg(target_arch = "x86_64")]
+        ReduceBackend::Avx2 | ReduceBackend::Avx512 => {
+            if simd.contains(&MutateBackend::Avx2) {
+                return MutateBackend::Avx2;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ReduceBackend::Neon => {
+            if simd.contains(&MutateBackend::Neon) {
+                return MutateBackend::Neon;
+            }
+        }
+        ReduceBackend::Scalar => {}
+    }
+    MutateBackend::Scalar
+}
+
+#[inline]
+fn resolve_mutate_backend() -> MutateBackend {
+    static BACKEND: OnceLock<MutateBackend> = OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        let b = choose_mutate_backend();
+        if bitwise_backend_debug() {
+            eprintln!("[bitwise] mutate_backend={}", mutate_backend_name(b));
+        }
+        b
+    })
 }
 
 /// Count the number of 1-bits in a packed `u64` bit-vector.
 pub fn popcount(words: &[u64]) -> u64 {
-    if words.is_empty() {
-        return 0;
-    }
-    let use_simd = !force_scalar_runtime();
-    if should_parallelize(words.len(), PAR_REDUCE_MIN_WORDS) {
-        words
-            .par_chunks(PAR_CHUNK_WORDS)
-            .map(|chunk| popcount_chunk(chunk, use_simd))
-            .sum::<u64>()
-    } else {
-        popcount_chunk(words, use_simd)
-    }
+    popcount_with_backend(words, resolve_reduce_backend())
 }
 
 /// Count the number of 1-bits in `lhs & rhs` for packed `u64` bit-vectors.
@@ -513,15 +879,7 @@ pub fn and_popcount(lhs: &[u64], rhs: &[u64]) -> u64 {
     if lhs.is_empty() {
         return 0;
     }
-    let use_simd = !force_scalar_runtime();
-    if should_parallelize(lhs.len(), PAR_REDUCE_MIN_WORDS) {
-        lhs.par_chunks(PAR_CHUNK_WORDS)
-            .zip(rhs.par_chunks(PAR_CHUNK_WORDS))
-            .map(|(l, r)| and_popcount_chunk(l, r, use_simd))
-            .sum::<u64>()
-    } else {
-        and_popcount_chunk(lhs, rhs, use_simd)
-    }
+    and_popcount_with_backend(lhs, rhs, resolve_reduce_backend())
 }
 
 /// In-place `dst &= rhs` for packed `u64` bit-vectors.
@@ -536,13 +894,13 @@ pub fn bitand_assign(dst: &mut [u64], rhs: &[u64]) {
     if dst.is_empty() {
         return;
     }
-    let use_simd = !force_scalar_runtime();
+    let backend = resolve_mutate_backend();
     if should_parallelize(dst.len(), PAR_MUTATE_MIN_WORDS) {
         dst.par_chunks_mut(PAR_CHUNK_WORDS)
             .zip(rhs.par_chunks(PAR_CHUNK_WORDS))
-            .for_each(|(d, r)| bitand_assign_chunk(d, r, use_simd));
+            .for_each(|(d, r)| bitand_assign_chunk_by_backend(d, r, backend));
     } else {
-        bitand_assign_chunk(dst, rhs, use_simd);
+        bitand_assign_chunk_by_backend(dst, rhs, backend);
     }
 }
 
@@ -558,13 +916,13 @@ pub fn bitor_into(dst: &mut [u64], src: &[u64]) {
     if dst.is_empty() {
         return;
     }
-    let use_simd = !force_scalar_runtime();
+    let backend = resolve_mutate_backend();
     if should_parallelize(dst.len(), PAR_MUTATE_MIN_WORDS) {
         dst.par_chunks_mut(PAR_CHUNK_WORDS)
             .zip(src.par_chunks(PAR_CHUNK_WORDS))
-            .for_each(|(d, s)| bitor_into_chunk(d, s, use_simd));
+            .for_each(|(d, s)| bitor_into_chunk_by_backend(d, s, backend));
     } else {
-        bitor_into_chunk(dst, src, use_simd);
+        bitor_into_chunk_by_backend(dst, src, backend);
     }
 }
 
@@ -592,13 +950,13 @@ pub fn bitnot_masked(words: &mut [u64], n_valid_bits: usize) {
     );
 
     let (active, tail) = words.split_at_mut(active_words);
-    let use_simd = !force_scalar_runtime();
+    let backend = resolve_mutate_backend();
     if should_parallelize(active.len(), PAR_MUTATE_MIN_WORDS) {
         active
             .par_chunks_mut(PAR_CHUNK_WORDS)
-            .for_each(|chunk| bitnot_in_place_chunk(chunk, use_simd));
+            .for_each(|chunk| bitnot_in_place_chunk_by_backend(chunk, backend));
     } else {
-        bitnot_in_place_chunk(active, use_simd);
+        bitnot_in_place_chunk_by_backend(active, backend);
     }
 
     let rem = n_valid_bits & 63;

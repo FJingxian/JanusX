@@ -2679,7 +2679,9 @@ pub fn gfd_packbits_from_dosage_block<'py>(
         if end > raw.len() {
             return Err(PyValueError::new_err(format!(
                 "block copy layout error: start={}, total={}, raw_len={}",
-                start, total, raw.len()
+                start,
+                total,
+                raw.len()
             )));
         }
         input_owned = raw[start..end].to_vec();

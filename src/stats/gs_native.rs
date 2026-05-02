@@ -1478,7 +1478,16 @@ pub fn rrblup_pcg_bed<'py>(
     let y_mean = y_vec_f64.iter().sum::<f64>() / (n_train as f64);
     let y_center_f32: Vec<f32> = y_vec_f64.iter().map(|v| (*v - y_mean) as f32).collect();
 
-    let (pred_train_ret, pred_test_ret, pve_trainvar, converged, iters, rel_res, pve_lambda_vc, k_trace_mean) = py
+    let (
+        pred_train_ret,
+        pred_test_ret,
+        pve_trainvar,
+        converged,
+        iters,
+        rel_res,
+        pve_lambda_vc,
+        k_trace_mean,
+    ) = py
         .detach(
             move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64), String> {
                 let mut b = vec![0.0_f32; m];
@@ -1666,17 +1675,18 @@ pub fn rrblup_pcg_bed<'py>(
                 } else {
                     f64::NAN
                 };
-                let pve_lambda_vc = if mean_k_trace.is_finite() && mean_k_trace > 0.0 && m_effective > 0 {
-                    let lambda_k = (lambda_use as f64) / (m_effective as f64);
-                    let denom_vc = mean_k_trace + lambda_k;
-                    if denom_vc.is_finite() && denom_vc > 0.0 {
-                        mean_k_trace / denom_vc
+                let pve_lambda_vc =
+                    if mean_k_trace.is_finite() && mean_k_trace > 0.0 && m_effective > 0 {
+                        let lambda_k = (lambda_use as f64) / (m_effective as f64);
+                        let denom_vc = mean_k_trace + lambda_k;
+                        if denom_vc.is_finite() && denom_vc > 0.0 {
+                            mean_k_trace / denom_vc
+                        } else {
+                            f64::NAN
+                        }
                     } else {
                         f64::NAN
-                    }
-                } else {
-                    f64::NAN
-                };
+                    };
 
                 let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
                     local_idx.iter().map(|&i| pred_train_f64[i]).collect()

@@ -2921,6 +2921,12 @@ def GSapi(
                     raise ValueError(
                         f"rrBLUP PCG std_eps must be finite and > 0, got {pcg_std_eps!r}."
                     )
+                pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
+                if pve_mode not in {"lambda", "trainvar"}:
+                    pve_mode = "lambda"
+                # For PCG, default to skipping full train prediction unless
+                # train-variance PVE is explicitly requested.
+                pcg_compute_trainvar = bool(pve_mode == "trainvar")
 
                 if need_train_pred:
                     if train_pred_idx is None:
@@ -2970,6 +2976,7 @@ def GSapi(
                         int(max(1, int(n_jobs))),
                         progress_callback=pcg_progress_cb,
                         progress_every=int(pcg_progress_every),
+                        compute_trainvar=bool(pcg_compute_trainvar),
                     )
                 except TypeError:
                     rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
@@ -3038,9 +3045,6 @@ def GSapi(
                     if np.isfinite(float(pve_lambda_trace))
                     else float(pve_lambda_formula)
                 )
-                pve_mode = str(rr_cfg.get("pve_mode", "lambda")).strip().lower()
-                if pve_mode not in {"lambda", "trainvar"}:
-                    pve_mode = "lambda"
                 pve = float(pve_lambda if pve_mode == "lambda" else float(pve_trainvar))
 
                 _set_rrblup_solver_state("pcg")

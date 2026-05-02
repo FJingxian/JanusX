@@ -1270,7 +1270,8 @@ pub fn gblup_reml_packed_bed<'py>(
     std_eps=1e-12_f64,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    compute_trainvar=false
 ))]
 pub fn rrblup_pcg_bed<'py>(
     py: Python<'py>,
@@ -1288,6 +1289,7 @@ pub fn rrblup_pcg_bed<'py>(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    compute_trainvar: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
@@ -1657,40 +1659,87 @@ pub fn rrblup_pcg_bed<'py>(
                     }
                 }
 
-                let mut pred_train_full = pcg_x_mul_samples(
-                    packed_keep.as_ref(),
-                    bytes_per_snp,
-                    n_samples,
-                    row_flip_keep.as_ref(),
-                    &row_mean,
-                    &row_inv_sd,
-                    &train_idx,
-                    full_train_fast,
-                    row_step,
-                    &beta,
-                    &code4_lut,
-                    pool_ref,
-                )?;
-                for v in pred_train_full.iter_mut() {
-                    *v += y_mean as f32;
-                }
+                let need_train_pred_all = train_pred_pick.is_none();
+                let need_train_pred_subset = train_pred_pick
+                    .as_ref()
+                    .map(|idx| !idx.is_empty())
+                    .unwrap_or(false);
+                let need_train_pred_any = need_train_pred_all || need_train_pred_subset;
+                let need_train_full = compute_trainvar || need_train_pred_all;
 
-                let pred_train_f64: Vec<f64> = pred_train_full.iter().map(|v| *v as f64).collect();
-                let mut g_hat = pred_train_f64.clone();
-                for g in g_hat.iter_mut() {
-                    *g -= y_mean;
-                }
-                let resid: Vec<f64> = y_vec_f64
-                    .iter()
-                    .zip(pred_train_f64.iter())
-                    .map(|(y, p)| *y - *p)
-                    .collect();
-                let var_g = sample_var_f64(&g_hat);
-                let var_e = sample_var_f64(&resid);
-                let denom = var_g + var_e;
-                let pve_trainvar = if denom.is_finite() && denom > 0.0 {
-                    var_g / denom
+                let mut pred_train_ret: Vec<f64> = Vec::new();
+                let pve_trainvar = if need_train_full {
+                    let mut pred_train_full = pcg_x_mul_samples(
+                        packed_keep.as_ref(),
+                        bytes_per_snp,
+                        n_samples,
+                        row_flip_keep.as_ref(),
+                        &row_mean,
+                        &row_inv_sd,
+                        &train_idx,
+                        full_train_fast,
+                        row_step,
+                        &beta,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    for v in pred_train_full.iter_mut() {
+                        *v += y_mean as f32;
+                    }
+                    let pred_train_f64: Vec<f64> = pred_train_full.iter().map(|v| *v as f64).collect();
+                    pred_train_ret = if let Some(local_idx) = &train_pred_pick {
+                        local_idx.iter().map(|&i| pred_train_f64[i]).collect()
+                    } else {
+                        pred_train_f64.clone()
+                    };
+
+                    if compute_trainvar {
+                        let mut g_hat = pred_train_f64.clone();
+                        for g in g_hat.iter_mut() {
+                            *g -= y_mean;
+                        }
+                        let resid: Vec<f64> = y_vec_f64
+                            .iter()
+                            .zip(pred_train_f64.iter())
+                            .map(|(y, p)| *y - *p)
+                            .collect();
+                        let var_g = sample_var_f64(&g_hat);
+                        let var_e = sample_var_f64(&resid);
+                        let denom = var_g + var_e;
+                        if denom.is_finite() && denom > 0.0 {
+                            var_g / denom
+                        } else {
+                            f64::NAN
+                        }
+                    } else {
+                        f64::NAN
+                    }
                 } else {
+                    if need_train_pred_any {
+                        if let Some(local_idx) = &train_pred_pick {
+                            let train_pred_abs: Vec<usize> =
+                                local_idx.iter().map(|&i| train_idx[i]).collect();
+                            let train_pred_fast = is_identity_indices(&train_pred_abs, n_samples);
+                            let mut pred_train_sub = pcg_x_mul_samples(
+                                packed_keep.as_ref(),
+                                bytes_per_snp,
+                                n_samples,
+                                row_flip_keep.as_ref(),
+                                &row_mean,
+                                &row_inv_sd,
+                                &train_pred_abs,
+                                train_pred_fast,
+                                row_step,
+                                &beta,
+                                &code4_lut,
+                                pool_ref,
+                            )?;
+                            for v in pred_train_sub.iter_mut() {
+                                *v += y_mean as f32;
+                            }
+                            pred_train_ret = pred_train_sub.iter().map(|v| *v as f64).collect();
+                        }
+                    }
                     f64::NAN
                 };
                 let mean_k_trace = if n_train > 0 && m_effective > 0 {
@@ -1710,12 +1759,6 @@ pub fn rrblup_pcg_bed<'py>(
                     } else {
                         f64::NAN
                     };
-
-                let pred_train_ret = if let Some(local_idx) = &train_pred_pick {
-                    local_idx.iter().map(|&i| pred_train_f64[i]).collect()
-                } else {
-                    pred_train_f64
-                };
 
                 let mut pred_test_ret: Vec<f64> = Vec::new();
                 if !test_idx.is_empty() {

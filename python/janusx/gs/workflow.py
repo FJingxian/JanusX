@@ -2816,18 +2816,56 @@ def GSapi(
             else:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
                 source_prefix_raw = packed_train.get("source_prefix", None)
-                if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+                source_prefix = (
+                    ""
+                    if source_prefix_raw is None
+                    else str(source_prefix_raw).strip()
+                )
+                packed_arg = np.ascontiguousarray(
+                    np.asarray(packed_train["packed"], dtype=np.uint8),
+                    dtype=np.uint8,
+                )
+                maf_arg = np.ascontiguousarray(
+                    np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                row_flip_arg = np.ascontiguousarray(
+                    np.asarray(_ensure_packed_row_flip_cached(packed_train), dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+                packed_n_samples = int(packed_train["n_samples"])
+                if packed_n_samples <= 0:
+                    raise ValueError("Packed rrBLUP-PCG requires n_samples > 0 in packed context.")
+                if packed_arg.ndim != 2:
+                    raise ValueError("Packed rrBLUP-PCG requires packed array shape (m, bytes_per_snp).")
+                if int(packed_arg.shape[0]) != int(maf_arg.shape[0]):
                     raise ValueError(
-                        "Packed rrBLUP-PCG requires source PLINK prefix in packed context."
+                        "Packed rrBLUP-PCG payload mismatch: packed SNP rows != maf length."
                     )
-                source_prefix = str(source_prefix_raw)
+                if int(packed_arg.shape[0]) != int(row_flip_arg.shape[0]):
+                    raise ValueError(
+                        "Packed rrBLUP-PCG payload mismatch: packed SNP rows != row_flip length."
+                    )
+                expected_bps = int((packed_n_samples + 3) // 4)
+                if int(packed_arg.shape[1]) != expected_bps:
+                    raise ValueError(
+                        f"Packed rrBLUP-PCG payload mismatch: packed bytes_per_snp={packed_arg.shape[1]} "
+                        f"!= expected {expected_bps}."
+                    )
                 site_keep_raw = packed_train.get("site_keep", None)
-                site_keep_arg = None
+                site_keep_arg_legacy = None
                 if site_keep_raw is not None:
-                    site_keep_arg = np.ascontiguousarray(
+                    site_keep_arg_legacy = np.ascontiguousarray(
                         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
                         dtype=np.bool_,
                     )
+                # Avoid dimension mismatch when packed payload has already been SNP-filtered.
+                # Keep mask only when it still matches current packed rows.
+                site_keep_arg = None
+                if site_keep_arg_legacy is not None and int(site_keep_arg_legacy.shape[0]) == int(
+                    packed_arg.shape[0]
+                ):
+                    site_keep_arg = site_keep_arg_legacy
 
                 n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
                 if packed_train_indices is None:
@@ -2977,15 +3015,24 @@ def GSapi(
                         progress_callback=pcg_progress_cb,
                         progress_every=int(pcg_progress_every),
                         compute_trainvar=bool(pcg_compute_trainvar),
+                        packed=packed_arg,
+                        packed_n_samples=int(packed_n_samples),
+                        maf=maf_arg,
+                        row_flip=row_flip_arg,
                     )
                 except TypeError:
+                    if source_prefix == "":
+                        raise RuntimeError(
+                            "Current JanusX extension does not support direct packed rrBLUP-PCG "
+                            "arguments, and packed context has no source_prefix for legacy fallback."
+                        )
                     rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
                         source_prefix,
                         train_abs,
                         y_train_vec,
                         test_abs,
                         train_pred_local_arg,
-                        site_keep_arg,
+                        site_keep_arg_legacy,
                         float(lambda_equation),
                         float(pcg_tol),
                         int(pcg_max_iter),

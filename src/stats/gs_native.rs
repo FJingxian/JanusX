@@ -1271,7 +1271,11 @@ pub fn gblup_reml_packed_bed<'py>(
     threads=0,
     progress_callback=None,
     progress_every=0,
-    compute_trainvar=false
+    compute_trainvar=false,
+    packed=None,
+    packed_n_samples=0,
+    maf=None,
+    row_flip=None
 ))]
 pub fn rrblup_pcg_bed<'py>(
     py: Python<'py>,
@@ -1290,6 +1294,10 @@ pub fn rrblup_pcg_bed<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     compute_trainvar: bool,
+    packed: Option<PyReadonlyArray2<'py, u8>>,
+    packed_n_samples: usize,
+    maf: Option<PyReadonlyArray1<'py, f32>>,
+    row_flip: Option<PyReadonlyArray1<'py, bool>>,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
@@ -1316,13 +1324,52 @@ pub fn rrblup_pcg_bed<'py>(
         ));
     }
 
-    let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples) =
-        crate::gfreader::load_bed_2bit_packed(py, prefix)?;
-    if n_samples == 0 {
-        return Err(PyRuntimeError::new_err("No samples found in BED input."));
+    let use_external_packed =
+        packed.is_some() || maf.is_some() || row_flip.is_some() || packed_n_samples > 0;
+    let mut loaded_packed_arr: Option<Bound<'py, PyArray2<u8>>> = None;
+    let mut loaded_maf_arr: Option<Bound<'py, PyArray1<f32>>> = None;
+    let mut external_maf_ro: Option<PyReadonlyArray1<'py, f32>> = None;
+    let mut external_row_flip_ro: Option<PyReadonlyArray1<'py, bool>> = None;
+
+    let n_samples: usize;
+    let packed_ro: PyReadonlyArray2<'py, u8>;
+
+    if use_external_packed {
+        packed_ro = packed.ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "rrblup_pcg_bed: packed payload path requires `packed` argument.",
+            )
+        })?;
+        external_maf_ro = Some(maf.ok_or_else(|| {
+            PyRuntimeError::new_err("rrblup_pcg_bed: packed payload path requires `maf` argument.")
+        })?);
+        external_row_flip_ro = Some(row_flip.ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "rrblup_pcg_bed: packed payload path requires `row_flip` argument.",
+            )
+        })?);
+
+        if packed_n_samples == 0 {
+            return Err(PyRuntimeError::new_err(
+                "rrblup_pcg_bed: packed payload path requires packed_n_samples > 0.",
+            ));
+        }
+        n_samples = packed_n_samples;
+    } else {
+        let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples_loaded) =
+            crate::gfreader::load_bed_2bit_packed(py, prefix)?;
+        if n_samples_loaded == 0 {
+            return Err(PyRuntimeError::new_err("No samples found in BED input."));
+        }
+        n_samples = n_samples_loaded;
+        loaded_packed_arr = Some(packed_arr);
+        loaded_maf_arr = Some(maf_arr);
+        packed_ro = loaded_packed_arr
+            .as_ref()
+            .expect("packed array must exist")
+            .readonly();
     }
 
-    let packed_ro = packed_arr.readonly();
     let packed_view = packed_ro.as_array();
     if packed_view.ndim() != 2 {
         return Err(PyRuntimeError::new_err(
@@ -1345,10 +1392,20 @@ pub fn rrblup_pcg_bed<'py>(
         Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
     };
 
-    let maf_ro = maf_arr.readonly();
-    let maf_full: Vec<f32> = match maf_ro.as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
+    let maf_full: Vec<f32> = if use_external_packed {
+        let maf_ro = external_maf_ro
+            .as_ref()
+            .expect("external maf must exist for packed payload path");
+        match maf_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => maf_ro.as_array().iter().copied().collect(),
+        }
+    } else {
+        let maf_ro = loaded_maf_arr.as_ref().expect("maf array must exist").readonly();
+        match maf_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => maf_ro.as_array().iter().copied().collect(),
+        }
     };
     if maf_full.len() != m_total {
         return Err(PyRuntimeError::new_err(format!(
@@ -1357,15 +1414,32 @@ pub fn rrblup_pcg_bed<'py>(
         )));
     }
 
-    let row_flip_full_arr = bed_packed_row_flip_mask(py, packed_arr.readonly(), n_samples)?;
-    let row_flip_full: Vec<bool> = match row_flip_full_arr.readonly().as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => row_flip_full_arr
-            .readonly()
-            .as_array()
-            .iter()
-            .copied()
-            .collect(),
+    let row_flip_full: Vec<bool> = if use_external_packed {
+        let row_flip_ro = external_row_flip_ro
+            .as_ref()
+            .expect("external row_flip must exist for packed payload path");
+        match row_flip_ro.as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        }
+    } else {
+        let row_flip_full_arr = bed_packed_row_flip_mask(
+            py,
+            loaded_packed_arr
+                .as_ref()
+                .expect("packed array must exist")
+                .readonly(),
+            n_samples,
+        )?;
+        match row_flip_full_arr.readonly().as_slice() {
+            Ok(s) => s.to_vec(),
+            Err(_) => row_flip_full_arr
+                .readonly()
+                .as_array()
+                .iter()
+                .copied()
+                .collect(),
+        }
     };
     if row_flip_full.len() != m_total {
         return Err(PyRuntimeError::new_err(format!(

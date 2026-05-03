@@ -63,6 +63,8 @@ import sys
 import re
 import math
 import gc
+import glob
+import pickle
 import threading
 import subprocess
 import shutil
@@ -157,6 +159,7 @@ from janusx.script._common.threads import (
     runtime_thread_stage,
 )
 from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
+from janusx.gs import output as gs_output
 
 try:
     from janusx import janusx as _jxrs
@@ -293,6 +296,115 @@ def _methods_need_additive_dense(methods: list[str]) -> bool:
         _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
         for m in methods
     )
+
+
+_JXMODEL_FORMAT = "janusx.gs.jxmodel.v1"
+
+
+def _is_jxmodel_export_supported(method: str) -> bool:
+    m = str(method)
+    return bool(
+        (m == "rrBLUP")
+        or (m in {"BayesA", "BayesB", "BayesCpi"})
+        or (m in _ML_METHOD_MAP)
+    )
+
+
+def _parse_jxmodel_method_from_name(path_like: str) -> str | None:
+    base = os.path.basename(str(path_like))
+    m = re.search(r"\.gs\.([A-Za-z0-9_]+)\.jxmodel$", base)
+    if m is None:
+        return None
+    token = str(m.group(1))
+    if token in (_GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())):
+        return token
+    return None
+
+
+def _discover_jxmodel_methods(model_arg: str) -> list[str]:
+    p = str(model_arg)
+    if os.path.isfile(p):
+        one = _parse_jxmodel_method_from_name(p)
+        if one is not None:
+            return [one]
+        try:
+            payload = _load_jxmodel(p)
+            method = str(payload.get("method", "")).strip()
+            return [method] if method != "" else []
+        except Exception:
+            return []
+    if not os.path.isdir(p):
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for fp in sorted(glob.glob(os.path.join(p, "*.jxmodel"))):
+        m = _parse_jxmodel_method_from_name(fp)
+        if m is None or m in seen:
+            continue
+        seen.add(m)
+        found.append(m)
+    return found
+
+
+def _resolve_jxmodel_file(
+    *,
+    model_arg: str,
+    trait_name: str,
+    method: str,
+    prefix_hint: str | None,
+) -> str:
+    p = str(model_arg)
+    if os.path.isfile(p):
+        return p
+    if not os.path.isdir(p):
+        raise FileNotFoundError(
+            f"--model path does not exist: {model_arg}"
+        )
+
+    trait_token = str(trait_name)
+    method_token = str(method)
+    candidates: list[str] = []
+    if prefix_hint is not None and str(prefix_hint).strip() != "":
+        exact = os.path.join(
+            p,
+            f"{str(prefix_hint)}.{trait_token}.gs.{method_token}.jxmodel",
+        )
+        if os.path.isfile(exact):
+            candidates.append(exact)
+    candidates.extend(sorted(glob.glob(os.path.join(p, f"*.{trait_token}.gs.{method_token}.jxmodel"))))
+    if len(candidates) == 0:
+        candidates.extend(sorted(glob.glob(os.path.join(p, f"*.gs.{method_token}.jxmodel"))))
+    uniq = list(dict.fromkeys(candidates))
+    if len(uniq) == 1:
+        return uniq[0]
+    if len(uniq) == 0:
+        raise FileNotFoundError(
+            f"Cannot find model file for trait={trait_token}, method={method_token} under {p}."
+        )
+    raise RuntimeError(
+        f"Ambiguous model files for trait={trait_token}, method={method_token}: "
+        + ", ".join(uniq[:5])
+        + (" ..." if len(uniq) > 5 else "")
+    )
+
+
+def _save_jxmodel(path: str, payload: dict[str, typing.Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _load_jxmodel(path: str) -> dict[str, typing.Any]:
+    with open(path, "rb") as fh:
+        obj = pickle.load(fh)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Invalid jxmodel payload type: {type(obj)!r}")
+    fmt = str(obj.get("format", "")).strip()
+    if fmt != _JXMODEL_FORMAT:
+        raise ValueError(
+            f"Unsupported jxmodel format: {fmt!r}. Expected {_JXMODEL_FORMAT!r}."
+        )
+    return typing.cast(dict[str, typing.Any], obj)
 
 
 @dataclass
@@ -1750,6 +1862,57 @@ def _predict_rrblup_packed_from_beta(
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
 
+def _predict_rrblup_packed_raw_from_beta(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    alpha: float,
+    beta: np.ndarray,
+    row_block_size: int,
+    sample_chunk_size: int,
+) -> np.ndarray:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_out = int(sidx.shape[0])
+    if n_out == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    n_samples = int(packed_ctx["n_samples"])
+    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    m = int(packed.shape[0])
+    b = np.ascontiguousarray(np.asarray(beta, dtype=np.float32).reshape(-1), dtype=np.float32)
+    if int(b.shape[0]) != m:
+        raise ValueError(f"beta length mismatch: got {b.shape[0]}, expected {m}.")
+
+    out = np.zeros((n_out,), dtype=np.float32)
+    row_step = int(max(1, int(row_block_size)))
+    sample_step = int(max(1, int(sample_chunk_size)))
+    for cst in range(0, n_out, sample_step):
+        ced = min(cst + sample_step, n_out)
+        blk_idx = np.ascontiguousarray(sidx[cst:ced], dtype=np.int64)
+        pred = np.full((int(blk_idx.shape[0]),), np.float32(alpha), dtype=np.float32)
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
+            x_blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+                packed,
+                int(n_samples),
+                ridx,
+                row_flip,
+                maf,
+                blk_idx,
+            )
+            x = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float32), dtype=np.float32)
+            pred += np.asarray(x.T @ b[st:ed], dtype=np.float32).reshape(-1)
+        out[cst:ced] = pred
+    return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
 def _predict_bayes_packed_from_effects(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -2444,6 +2607,7 @@ def GSapi(
     bayes_auto_r2: float | None = None,
     bayes_runtime_state: dict[str, typing.Any] | None = None,
     bayes_auto_cfg: dict[str, typing.Any] | None = None,
+    model_state: dict[str, typing.Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Core genomic selection API.
@@ -2489,6 +2653,8 @@ def GSapi(
     bayes_auto_cfg : dict, optional
         Bayes auto-r2 configuration. Supports optional BLUP subsampling on
         large sample sizes to reduce memory usage.
+    model_state : dict, optional
+        Mutable sink for exporting a lightweight fitted-model artifact.
 
     Returns
     -------
@@ -3021,6 +3187,10 @@ def GSapi(
                         row_flip=row_flip_arg,
                     )
                 except TypeError:
+                    _emit_rrblup_progress(
+                        "pcg_callback_unavailable",
+                        reason="legacy_rrblup_pcg_bed_signature",
+                    )
                     if source_prefix == "":
                         raise RuntimeError(
                             "Current JanusX extension does not support direct packed rrBLUP-PCG "
@@ -3041,7 +3211,21 @@ def GSapi(
                         int(max(1, int(n_jobs))),
                     )
                 rr_out_t = tuple(rr_out)
-                if len(rr_out_t) >= 9:
+                beta_export = None
+                if len(rr_out_t) >= 10:
+                    (
+                        pred_train_raw,
+                        pred_test_raw,
+                        pve_trainvar,
+                        pcg_converged,
+                        pcg_iters,
+                        pcg_rel_res,
+                        m_effective,
+                        pve_lambda_trace,
+                        k_trace_mean,
+                        beta_export,
+                    ) = rr_out_t[:10]
+                elif len(rr_out_t) >= 9:
                     (
                         pred_train_raw,
                         pred_test_raw,
@@ -3121,6 +3305,31 @@ def GSapi(
                     rrblup_runtime_state["pve_lambda_trace"] = float(pve_lambda_trace)
                     rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
                     rrblup_runtime_state["k_trace_mean"] = float(k_trace_mean)
+                if model_state is not None and beta_export is not None:
+                    row_mean_pc, row_inv_pc = _ensure_packed_standard_stats_cached(packed_train)
+                    model_state["kind"] = "rrblup_linear"
+                    model_state["method"] = "rrBLUP"
+                    model_state["solver"] = "pcg"
+                    model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
+                    model_state["beta"] = np.ascontiguousarray(
+                        np.asarray(beta_export, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["packed"] = True
+                    model_state["standardized"] = True
+                    model_state["row_mean"] = np.ascontiguousarray(
+                        np.asarray(row_mean_pc, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["row_inv_sd"] = np.ascontiguousarray(
+                        np.asarray(row_inv_pc, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["snp_block_size"] = int(max(1, int(pcg_block_rows)))
+                    model_state["sample_chunk_size"] = int(
+                        max(1, int(rr_cfg.get("sample_chunk_size", 4096)))
+                    )
+                    model_state["pve"] = float(pve)
 
                 if _GS_DEBUG_STAGE:
                     print(
@@ -3400,6 +3609,29 @@ def GSapi(
                 rrblup_runtime_state["pve_trainvar"] = float(pve_trainvar)
                 rrblup_runtime_state["lambda_equation"] = float(lambda_eq)
                 rrblup_runtime_state["m_effective"] = int(m_eff)
+            if model_state is not None:
+                model_state["kind"] = "rrblup_linear"
+                model_state["method"] = "rrBLUP"
+                model_state["solver"] = "adamw"
+                model_state["alpha"] = float(alpha_hat)
+                model_state["beta"] = np.ascontiguousarray(
+                    np.asarray(beta_hat, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                model_state["packed"] = bool(is_packed_input)
+                model_state["standardized"] = True
+                if is_packed_input:
+                    model_state["row_mean"] = np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["row_inv_sd"] = np.ascontiguousarray(
+                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                model_state["snp_block_size"] = int(max(1, int(snp_block)))
+                model_state["sample_chunk_size"] = int(max(1, int(sample_chunk)))
+                model_state["pve"] = float(pve)
 
             if need_train_pred:
                 if train_pred_idx is None:
@@ -3470,6 +3702,26 @@ def GSapi(
             rrblup_runtime_state["pve_trainvar"] = float(model.pve)
             rrblup_runtime_state["pve_lambda"] = float("nan")
             rrblup_runtime_state["pve_mode_used"] = "exact_reml"
+        if method == "rrBLUP" and model_state is not None:
+            beta_fix = np.asarray(getattr(model, "beta", np.asarray([[0.0]], dtype=np.float64)), dtype=np.float64)
+            alpha0 = float(beta_fix.reshape(-1)[0]) if int(beta_fix.size) > 0 else 0.0
+            u_vec = np.ascontiguousarray(
+                np.asarray(getattr(model, "u", np.zeros((0, 1), dtype=np.float64)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            model_state["kind"] = "rrblup_linear"
+            model_state["method"] = "rrBLUP"
+            model_state["solver"] = "exact"
+            model_state["alpha"] = float(alpha0)
+            model_state["beta"] = u_vec
+            model_state["packed"] = bool(is_packed_input)
+            if bool(is_packed_input):
+                model_state["standardized"] = False
+            else:
+                model_state["standardized"] = True
+            model_state["snp_block_size"] = 2048
+            model_state["sample_chunk_size"] = 4096
+            model_state["pve"] = float(model.pve)
         if _GS_DEBUG_STAGE:
             print(
                 f"[GS-DEBUG] GSapi predict_done method={method} "
@@ -3642,6 +3894,27 @@ def GSapi(
                     )
                 else:
                     test_pred = np.zeros((0, 1), dtype=float)
+                if model_state is not None:
+                    model_state["kind"] = "bayes_linear"
+                    model_state["method"] = str(method)
+                    model_state["alpha"] = float(bayes_alpha0)
+                    model_state["beta"] = np.ascontiguousarray(
+                        np.asarray(bayes_beta, dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                    model_state["packed"] = True
+                    model_state["standardized"] = True
+                    model_state["row_mean"] = np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["row_inv_sd"] = np.ascontiguousarray(
+                        np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
+                    model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
+                    model_state["pve"] = float(pve)
                 return (
                     np.asarray(train_pred, dtype=float).reshape(-1, 1),
                     np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -3723,6 +3996,27 @@ def GSapi(
                 )
             else:
                 test_pred = np.zeros((0, 1), dtype=float)
+            if model_state is not None:
+                model_state["kind"] = "bayes_linear"
+                model_state["method"] = str(method)
+                model_state["alpha"] = float(bayes_alpha0)
+                model_state["beta"] = np.ascontiguousarray(
+                    np.asarray(bayes_beta, dtype=np.float64).reshape(-1),
+                    dtype=np.float64,
+                )
+                model_state["packed"] = True
+                model_state["standardized"] = True
+                model_state["row_mean"] = np.ascontiguousarray(
+                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                model_state["row_inv_sd"] = np.ascontiguousarray(
+                    np.asarray(row_inv_sd, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                model_state["snp_block_size"] = int(max(1, int(bayes_snp_block)))
+                model_state["sample_chunk_size"] = int(max(1, int(bayes_sample_chunk)))
+                model_state["pve"] = float(pve)
             return (
                 np.asarray(train_pred, dtype=float).reshape(-1, 1),
                 np.asarray(test_pred, dtype=float).reshape(-1, 1),
@@ -3769,6 +4063,23 @@ def GSapi(
                 train_pred = model.predict(np.asarray(Xtrain)[:, train_pred_idx])
         else:
             train_pred = np.zeros((0, 1), dtype=float)
+        if model_state is not None:
+            model_state["kind"] = "bayes_linear"
+            model_state["method"] = str(method)
+            model_state["alpha"] = float(
+                np.asarray(getattr(model, "alpha_hat", np.asarray([[0.0]], dtype=np.float64)), dtype=np.float64).reshape(-1)[0]
+                if int(np.asarray(getattr(model, "alpha_hat", np.asarray([[0.0]], dtype=np.float64))).size) > 0
+                else 0.0
+            )
+            model_state["beta"] = np.ascontiguousarray(
+                np.asarray(getattr(model, "beta_hat", np.zeros((0, 1))), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            model_state["packed"] = False
+            model_state["standardized"] = True
+            model_state["snp_block_size"] = 2048
+            model_state["sample_chunk_size"] = 4096
+            model_state["pve"] = float(pve)
         return (
             np.asarray(train_pred, dtype=float).reshape(-1, 1),
             np.asarray(model.predict(Xtest), dtype=float).reshape(-1, 1),
@@ -3806,6 +4117,31 @@ def GSapi(
         pve = float(
             (model.best_metrics_ or {}).get("r2", np.nan)
         )
+        if model_state is not None:
+            model_state["kind"] = "mlsk_model"
+            model_state["method"] = str(method)
+            model_state["alpha"] = float(0.0)
+            model_state["beta"] = None
+            model_state["packed"] = bool(is_packed_input)
+            model_state["standardized"] = False
+            model_state["estimator"] = model.model
+            model_state["feature_axis"] = str(getattr(model, "feature_axis_", "auto"))
+            model_state["marker_means"] = np.ascontiguousarray(
+                np.asarray(getattr(model, "marker_means_", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            model_state["cov_means"] = (
+                None
+                if getattr(model, "cov_means_", None) is None
+                else np.ascontiguousarray(
+                    np.asarray(getattr(model, "cov_means_", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+            )
+            model_state["cov_count"] = int(getattr(model, "cov_count_", 0))
+            model_state["snp_block_size"] = int(getattr(model, "best_n_estimators_", 0) or 0)
+            model_state["sample_chunk_size"] = int(getattr(model, "best_boost_rounds_", 0) or 0)
+            model_state["pve"] = float(pve)
         return (
             np.asarray(yhat_train, dtype=float).reshape(-1, 1),
             np.asarray(yhat_test, dtype=float).reshape(-1, 1),
@@ -3841,7 +4177,32 @@ def _run_method_task(
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cache: dict[str, float] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
+    export_model: bool = True,
+    stage_hook: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
 ) -> dict[str, typing.Any]:
+    _t_method_begin = time.time()
+    def _emit_stage(event: str, **payload: typing.Any) -> None:
+        if stage_hook is None:
+            return
+        try:
+            stage_hook(str(event), dict(payload))
+        except Exception:
+            return
+    def _stage_elapsed_metrics(elapsed_total: float) -> tuple[float, float, float]:
+        cv_elapsed = float(
+            np.nansum(
+                np.asarray(
+                    [float(r[6]) for r in fold_rows],
+                    dtype=np.float64,
+                )
+            )
+        ) if len(fold_rows) > 0 else 0.0
+        cv_elapsed = float(max(0.0, cv_elapsed))
+        fit_elapsed = float(max(0.0, float(elapsed_total) - cv_elapsed))
+        # Predict is included in final fit/inference stage for current kernels.
+        predict_elapsed = 0.0
+        return cv_elapsed, fit_elapsed, predict_elapsed
+
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
     rrblup_pve_rows: list[dict[str, typing.Any]] = []
     rrblup_pve_final: dict[str, typing.Any] | None = None
@@ -3853,6 +4214,7 @@ def _run_method_task(
     bayes_r2_source_final = ""
     bayes_r2_n_used_final = 0
     bayes_r2_n_total_final = 0
+    model_state_final: dict[str, typing.Any] | None = None
     best_test = None
     best_train = None
     best_r2 = -np.inf
@@ -3979,6 +4341,8 @@ def _run_method_task(
         and cv_splits is None
         and precomputed_hash_ztz_test_pred is not None
     ):
+        _elapsed_total = float(max(0.0, time.time() - _t_method_begin))
+        _cv_elapsed, _fit_elapsed, _predict_elapsed = _stage_elapsed_metrics(_elapsed_total)
         pred = np.ascontiguousarray(
             np.asarray(precomputed_hash_ztz_test_pred, dtype=np.float64).reshape(-1, 1),
             dtype=np.float64,
@@ -3988,6 +4352,10 @@ def _run_method_task(
             if precomputed_hash_ztz_pve is not None
             else float("nan")
         )
+        _emit_stage("fit_start", method=str(method))
+        _emit_stage("fit_end", method=str(method), elapsed=float(_fit_elapsed))
+        _emit_stage("predict_start", method=str(method))
+        _emit_stage("predict_end", method=str(method), elapsed=float(_predict_elapsed))
         return {
             "method": method,
             "method_display": _method_display_name(method),
@@ -4000,6 +4368,12 @@ def _run_method_task(
             "rrblup_final_state": None,
             "rrblup_final_cfg": None,
             "rrblup_cv_selected": None,
+            "model_state": None,
+            "cv_mode": "train_cv",
+            "elapsed_total_sec": _elapsed_total,
+            "elapsed_cv_sec": _cv_elapsed,
+            "elapsed_fit_sec": _fit_elapsed,
+            "elapsed_predict_sec": _predict_elapsed,
         }
 
     if method in _ML_METHOD_MAP and (not strict_cv):
@@ -4114,6 +4488,7 @@ def _run_method_task(
 
     if cv_splits is not None:
         cv_total = int(max(1, len(cv_splits)))
+        _emit_stage("cv_start", method=str(method), total=int(cv_total))
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
             t_fold = time.time()
             fold_train_idx_arg = None
@@ -4454,8 +4829,14 @@ def _run_method_task(
                 best_r2 = r2
                 best_test = ttest
                 best_train = ttrain
+        cv_elapsed_now = float(
+            np.nansum(np.asarray([float(r[6]) for r in fold_rows], dtype=np.float64))
+        ) if len(fold_rows) > 0 else 0.0
+        _emit_stage("cv_end", method=str(method), total=int(cv_total), elapsed=float(max(0.0, cv_elapsed_now)))
 
     if use_hash_cv_compact:
+        _elapsed_total = float(max(0.0, time.time() - _t_method_begin))
+        _cv_elapsed, _fit_elapsed, _predict_elapsed = _stage_elapsed_metrics(_elapsed_total)
         if train_sample_indices is None:
             raise ValueError(
                 "Compact hash+CV mode requires train_sample_indices for final fit."
@@ -4518,6 +4899,12 @@ def _run_method_task(
             "rrblup_final_state": None,
             "rrblup_final_cfg": None,
             "rrblup_cv_selected": None,
+            "model_state": None,
+            "cv_mode": "train_cv",
+            "elapsed_total_sec": _elapsed_total,
+            "elapsed_cv_sec": _cv_elapsed,
+            "elapsed_fit_sec": _fit_elapsed,
+            "elapsed_predict_sec": _predict_elapsed,
         }
 
     final_train_idx_arg = None
@@ -4587,9 +4974,15 @@ def _run_method_task(
                 and len(getattr(final_test, "shape")) >= 2
                 and int(final_test.shape[1]) == 0
             )
+    if bool(export_model) and _is_jxmodel_export_supported(method):
+        skip_final_fit = False
 
     if skip_final_fit:
+        _emit_stage("fit_start", method=str(method))
+        _emit_stage("fit_end", method=str(method), elapsed=0.0)
+        _emit_stage("predict_start", method=str(method))
         test_pred = np.zeros((0, 1), dtype=float)
+        _emit_stage("predict_end", method=str(method), elapsed=0.0)
         if len(fold_rows) > 0:
             pve_final = float(np.nanmean([float(r[5]) for r in fold_rows]))
         else:
@@ -4654,10 +5047,15 @@ def _run_method_task(
             if solver_reason_final != "":
                 rrblup_final_state["solver_fallback_reason"] = str(solver_reason_final)
     elif use_custom_gblup_final:
+        _emit_stage("fit_start", method=str(method))
+        _t_fit_stage = time.time()
         fit = _fit_gblup_reml_from_grm(
             np.asarray(train_pheno, dtype=np.float64).reshape(-1),
             np.asarray(gblup_cv_grm_full, dtype=np.float64),
         )
+        _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
+        _emit_stage("predict_start", method=str(method))
+        _t_pred_stage = time.time()
         alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
         beta = float(fit["beta"])
         pve_final = float(fit["pve"])
@@ -4669,11 +5067,13 @@ def _run_method_task(
                 alpha=alpha,
                 beta=beta,
             )
+        _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
         rr_state_final: dict[str, typing.Any] | None = None
         rr_progress_final = None
         gblup_state_final: dict[str, typing.Any] | None = None
+        model_state_call: dict[str, typing.Any] | None = None
         bayes_r2_final_call: float | None = None
         bayes_state_final: dict[str, typing.Any] | None = None
         bayes_r2_final_key: str | None = None
@@ -4707,6 +5107,10 @@ def _run_method_task(
             bayes_state_final = {}
         if method == "GBLUP":
             gblup_state_final = {}
+        if bool(export_model) and _is_jxmodel_export_supported(method):
+            model_state_call = {}
+        _emit_stage("fit_start", method=str(method))
+        _t_fit_stage = time.time()
         _, test_pred, pve_final = GSapi(
             train_pheno,
             final_train,
@@ -4727,7 +5131,13 @@ def _run_method_task(
             bayes_auto_r2=bayes_r2_final_call,
             bayes_runtime_state=bayes_state_final,
             bayes_auto_cfg=bayes_auto_r2_cfg,
+            model_state=model_state_call,
         )
+        _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
+        _emit_stage("predict_start", method=str(method))
+        _emit_stage("predict_end", method=str(method), elapsed=0.0)
+        if model_state_call is not None and len(model_state_call) > 0:
+            model_state_final = dict(model_state_call)
         if method == "GBLUP" and gblup_state_final is not None:
             gblup_final_state = dict(gblup_state_final)
         if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_final is not None:
@@ -4818,6 +5228,8 @@ def _run_method_task(
             bayes_r2_n_used_final = int(bayes_cv_shared_n_used)
         if bayes_r2_n_total_final <= 0 and bayes_cv_shared_n_total > 0:
             bayes_r2_n_total_final = int(bayes_cv_shared_n_total)
+    _elapsed_total = float(max(0.0, time.time() - _t_method_begin))
+    _cv_elapsed, _fit_elapsed, _predict_elapsed = _stage_elapsed_metrics(_elapsed_total)
     return {
         "method": method,
         "method_display": _method_display_name(method),
@@ -4837,6 +5249,313 @@ def _run_method_task(
         "rrblup_final_cfg": rrblup_final_cfg,
         "rrblup_cv_selected": rrblup_cv_selected,
         "gblup_final_state": gblup_final_state,
+        "model_state": model_state_final,
+        "cv_mode": "train_cv",
+        "elapsed_total_sec": _elapsed_total,
+        "elapsed_cv_sec": _cv_elapsed,
+        "elapsed_fit_sec": _fit_elapsed,
+        "elapsed_predict_sec": _predict_elapsed,
+    }
+
+
+def _predict_from_loaded_model_state(
+    *,
+    method: str,
+    model_state: dict[str, typing.Any],
+    dense_matrix: np.ndarray | None,
+    packed_ctx: dict[str, typing.Any] | None,
+    packed_sample_indices: np.ndarray | None,
+) -> np.ndarray:
+    kind = str(model_state.get("kind", "")).strip().lower()
+    m = str(method)
+    if kind == "rrblup_linear":
+        alpha = float(model_state.get("alpha", 0.0))
+        beta = np.asarray(model_state.get("beta", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+        block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
+        sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
+        is_std = bool(model_state.get("standardized", True))
+        if packed_ctx is not None and packed_sample_indices is not None:
+            if is_std:
+                row_mean = model_state.get("row_mean", None)
+                row_inv = model_state.get("row_inv_sd", None)
+                if row_mean is None or row_inv is None:
+                    row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(packed_ctx)
+                else:
+                    row_mean_arr = np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    row_inv_arr = np.ascontiguousarray(
+                        np.asarray(row_inv, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                return _predict_rrblup_packed_from_beta(
+                    packed_ctx=packed_ctx,
+                    sample_indices=np.ascontiguousarray(
+                        np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    ),
+                    alpha=alpha,
+                    beta=beta,
+                    row_mean=row_mean_arr,
+                    row_inv_sd=row_inv_arr,
+                    snp_block_size=block_rows,
+                    sample_chunk_size=sample_chunk,
+                )
+            return _predict_rrblup_packed_raw_from_beta(
+                packed_ctx=packed_ctx,
+                sample_indices=np.ascontiguousarray(
+                    np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                alpha=alpha,
+                beta=beta,
+                row_block_size=block_rows,
+                sample_chunk_size=sample_chunk,
+            )
+        if dense_matrix is None:
+            raise ValueError(f"Loaded model {m} requires dense genotype matrix for prediction.")
+        return _predict_rrblup_dense_from_beta(
+            X=np.asarray(dense_matrix, dtype=np.float32),
+            alpha=alpha,
+            beta=beta,
+            snp_block_size=block_rows,
+        )
+
+    if kind == "bayes_linear":
+        alpha0 = float(model_state.get("alpha", 0.0))
+        beta = np.asarray(model_state.get("beta", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1)
+        block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
+        sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
+        if packed_ctx is not None and packed_sample_indices is not None:
+            row_mean = model_state.get("row_mean", None)
+            row_inv = model_state.get("row_inv_sd", None)
+            if row_mean is None or row_inv is None:
+                row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(packed_ctx)
+            else:
+                row_mean_arr = np.ascontiguousarray(
+                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                row_inv_arr = np.ascontiguousarray(
+                    np.asarray(row_inv, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+            return _predict_bayes_packed_from_effects(
+                packed_ctx=packed_ctx,
+                sample_indices=np.ascontiguousarray(
+                    np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+                alpha0=alpha0,
+                beta=beta,
+                row_mean=row_mean_arr,
+                row_inv_sd=row_inv_arr,
+                snp_block_size=block_rows,
+                sample_chunk_size=sample_chunk,
+            )
+        if dense_matrix is None:
+            raise ValueError(f"Loaded model {m} requires dense genotype matrix for prediction.")
+        x = np.asarray(dense_matrix, dtype=np.float64)
+        if x.ndim != 2:
+            raise ValueError(f"Dense Bayes predict expects 2D matrix, got {x.shape}.")
+        if int(x.shape[0]) != int(beta.shape[0]):
+            raise ValueError(
+                f"Dense Bayes marker mismatch: matrix m={x.shape[0]} vs beta m={beta.shape[0]}."
+            )
+        pred = np.full((int(x.shape[1]),), float(alpha0), dtype=np.float64)
+        pred += np.asarray(x.T @ beta, dtype=np.float64).reshape(-1)
+        return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
+
+    if kind == "mlsk_model":
+        estimator = model_state.get("estimator", None)
+        if estimator is None:
+            raise ValueError(f"Loaded ML model for {m} is missing estimator payload.")
+        if dense_matrix is None:
+            raise ValueError(f"Loaded model {m} requires dense genotype matrix for prediction.")
+        mat = np.asarray(dense_matrix, dtype=np.float32)
+        if mat.ndim != 2:
+            raise ValueError(f"Loaded ML model expects 2D matrix, got {mat.shape}.")
+        marker_means = np.ascontiguousarray(
+            np.asarray(model_state.get("marker_means", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        m_expect = int(marker_means.shape[0])
+        if int(mat.shape[0]) == m_expect:
+            x = np.ascontiguousarray(mat.T, dtype=np.float32)
+        elif int(mat.shape[1]) == m_expect:
+            x = np.ascontiguousarray(mat, dtype=np.float32)
+        else:
+            raise ValueError(
+                f"Loaded ML model marker mismatch: expected {m_expect}, got matrix {mat.shape}."
+            )
+        if np.isnan(x).any():
+            idx = np.where(np.isnan(x))
+            x = x.copy()
+            x[idx] = marker_means[idx[1]]
+        pred = np.asarray(estimator.predict(x), dtype=np.float64).reshape(-1, 1)
+        return pred
+
+    raise ValueError(f"Unsupported loaded model kind for method={m}: {kind!r}")
+
+
+def _run_loaded_model_task(
+    *,
+    method: str,
+    model_state: dict[str, typing.Any],
+    train_pheno: np.ndarray,
+    train_snp: np.ndarray | None,
+    test_snp: np.ndarray | None,
+    train_snp_ml: np.ndarray | None,
+    test_snp_ml: np.ndarray | None,
+    packed_ctx: dict[str, typing.Any] | None,
+    train_sample_indices: np.ndarray | None,
+    test_sample_indices: np.ndarray | None,
+    cv_splits: list[tuple[np.ndarray, np.ndarray]] | None,
+    limit_predtrain: int | None,
+) -> dict[str, typing.Any]:
+    _t_loaded_begin = time.time()
+    fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
+    best_test = None
+    best_train = None
+    best_r2 = -np.inf
+    pve_final = float(model_state.get("pve", np.nan))
+
+    def _predict_local(
+        *,
+        idx_local: np.ndarray | None,
+        use_test: bool,
+    ) -> np.ndarray:
+        if method in _ML_METHOD_MAP:
+            base = test_snp_ml if use_test else train_snp_ml
+            if base is None:
+                return np.zeros((0, 1), dtype=np.float64)
+            if int(np.asarray(base).shape[1]) == 0:
+                return np.zeros((0, 1), dtype=np.float64)
+            if idx_local is None:
+                x = base
+            else:
+                x = np.asarray(base[:, idx_local], dtype=np.float32)
+            if int(np.asarray(x).shape[1]) == 0:
+                return np.zeros((0, 1), dtype=np.float64)
+            return _predict_from_loaded_model_state(
+                method=method,
+                model_state=model_state,
+                dense_matrix=np.asarray(x, dtype=np.float32),
+                packed_ctx=None,
+                packed_sample_indices=None,
+            )
+        if packed_ctx is not None and train_sample_indices is not None:
+            if use_test:
+                if test_sample_indices is None:
+                    base_abs = np.zeros((0,), dtype=np.int64)
+                else:
+                    base_abs = np.asarray(test_sample_indices, dtype=np.int64).reshape(-1)
+            else:
+                base_abs = np.asarray(train_sample_indices, dtype=np.int64).reshape(-1)
+            if int(base_abs.size) == 0:
+                return np.zeros((0, 1), dtype=np.float64)
+            if idx_local is None:
+                abs_idx = np.ascontiguousarray(base_abs, dtype=np.int64)
+            else:
+                abs_idx = np.ascontiguousarray(base_abs[np.asarray(idx_local, dtype=np.int64).reshape(-1)], dtype=np.int64)
+            return _predict_from_loaded_model_state(
+                method=method,
+                model_state=model_state,
+                dense_matrix=None,
+                packed_ctx=packed_ctx,
+                packed_sample_indices=abs_idx,
+            )
+        base_dense = test_snp if use_test else train_snp
+        if base_dense is None:
+            return np.zeros((0, 1), dtype=np.float64)
+        if int(np.asarray(base_dense).shape[1]) == 0:
+            return np.zeros((0, 1), dtype=np.float64)
+        if idx_local is None:
+            x_dense = base_dense
+        else:
+            x_dense = np.asarray(base_dense[:, idx_local], dtype=np.float32)
+        if int(np.asarray(x_dense).shape[1]) == 0:
+            return np.zeros((0, 1), dtype=np.float64)
+        return _predict_from_loaded_model_state(
+            method=method,
+            model_state=model_state,
+            dense_matrix=np.asarray(x_dense, dtype=np.float32),
+            packed_ctx=None,
+            packed_sample_indices=None,
+        )
+
+    if cv_splits is not None:
+        for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
+            t0 = time.time()
+            fold_test_idx = np.asarray(test_idx, dtype=np.int64).reshape(-1)
+            fold_train_idx = np.asarray(train_idx, dtype=np.int64).reshape(-1)
+            y_test = np.asarray(train_pheno[fold_test_idx], dtype=np.float64).reshape(-1, 1)
+            yhat_test = _predict_local(idx_local=fold_test_idx, use_test=False)
+
+            pick_local = _resolve_train_pred_local_indices(
+                n_train_fold=int(fold_train_idx.shape[0]),
+                limit_predtrain=limit_predtrain,
+                fold_id=int(fold_id),
+            )
+            if pick_local is None:
+                pred_train_idx = fold_train_idx
+            elif int(pick_local.size) == 0:
+                pred_train_idx = np.zeros((0,), dtype=np.int64)
+            else:
+                pred_train_idx = np.asarray(fold_train_idx[pick_local], dtype=np.int64).reshape(-1)
+
+            if int(pred_train_idx.size) > 0:
+                y_train_part = np.asarray(train_pheno[pred_train_idx], dtype=np.float64).reshape(-1, 1)
+                yhat_train = _predict_local(idx_local=pred_train_idx, use_test=False)
+                ttrain = np.concatenate([y_train_part, yhat_train], axis=1)
+            else:
+                ttrain = np.zeros((0, 2), dtype=np.float64)
+
+            ttest = np.concatenate([y_test, yhat_test], axis=1)
+            ss_res = np.sum((ttest[:, 0] - ttest[:, 1]) ** 2)
+            ss_tot = np.sum((ttest[:, 0] - ttest[:, 0].mean()) ** 2)
+            r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+            pear = float(pearsonr(ttest[:, 0], ttest[:, 1]).statistic)
+            spear = float(spearmanr(ttest[:, 0], ttest[:, 1]).statistic)
+            elapsed = float(time.time() - t0)
+            fold_rows.append((method, int(fold_id), pear, spear, r2, float(pve_final), elapsed))
+            if r2 > best_r2:
+                best_r2 = r2
+                best_test = ttest
+                best_train = ttrain
+
+    test_pred = _predict_local(idx_local=None, use_test=True)
+    _elapsed_total = float(max(0.0, time.time() - _t_loaded_begin))
+    _cv_elapsed = float(
+        np.nansum(
+            np.asarray(
+                [float(r[6]) for r in fold_rows],
+                dtype=np.float64,
+            )
+        )
+    ) if len(fold_rows) > 0 else 0.0
+    _cv_elapsed = float(max(0.0, _cv_elapsed))
+    _predict_elapsed = float(max(0.0, _elapsed_total - _cv_elapsed))
+    return {
+        "method": str(method),
+        "method_display": _method_display_name(str(method)),
+        "fold_rows": fold_rows,
+        "best_test": best_test,
+        "best_train": best_train,
+        "test_pred": np.asarray(test_pred, dtype=np.float64).reshape(-1, 1),
+        "pve_final": float(pve_final),
+        "ml_tuning": None,
+        "rrblup_final_state": None,
+        "rrblup_final_cfg": None,
+        "rrblup_cv_selected": None,
+        "gblup_final_state": None,
+        "model_state": dict(model_state),
+        "cv_mode": ("model_eval" if cv_splits is not None else "predict_only"),
+        "elapsed_total_sec": _elapsed_total,
+        "elapsed_cv_sec": _cv_elapsed,
+        "elapsed_fit_sec": 0.0,
+        "elapsed_predict_sec": _predict_elapsed,
     }
 
 
@@ -4862,6 +5581,10 @@ def _run_methods_parallel(
     rrblup_solver: str = "auto",
     rrblup_adamw_cfg: dict[str, typing.Any] | None = None,
     bayes_auto_r2_cfg: dict[str, typing.Any] | None = None,
+    emit_cv_progress_bar: bool = True,
+    emit_method_summary: bool = True,
+    on_method_start: typing.Callable[[str], None] | None = None,
+    on_method_complete: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -5097,7 +5820,7 @@ def _run_methods_parallel(
         for m in methods
     }
 
-    show_method_progress = cv_splits is not None
+    show_method_progress = (cv_splits is not None) and bool(emit_cv_progress_bar)
     # Force serial execution for all GS methods to avoid cross-method contention
     # and keep runtime behavior consistent.
     method_parallel_jobs = 1
@@ -5112,31 +5835,374 @@ def _run_methods_parallel(
             show_method_progress or any(rrblup_progress_enabled_by_method.values())
         )
         if animate_method_progress and rich_progress_available():
-            progress = build_rich_progress(
-                description_template="{task.fields[label]}",
-                show_percentage=False,
-                show_elapsed=True,
-                show_remaining=False,
-                field_templates_before_elapsed=["{task.fields[counter]}"],
-                finished_text=" ",
-                transient=True,
-            )
-            assert progress is not None
-            with progress:
-                for m in methods:
-                    m_disp = _method_display(str(m))
-                    cv_total = int(max(1, fold_total_map.get(m, 1)))
-                    has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
-                    has_rrblup_iter_progress = bool(
-                        rrblup_progress_enabled_by_method.get(str(m), False)
+            for m in methods:
+                progress = build_rich_progress(
+                    description_template="{task.fields[label]}",
+                    show_percentage=False,
+                    show_elapsed=True,
+                    show_remaining=False,
+                    field_templates_before_elapsed=["{task.fields[counter]}"],
+                    finished_text=" ",
+                    transient=False,
+                )
+                assert progress is not None
+                m_disp = _method_display(str(m))
+                if on_method_start is not None:
+                    try:
+                        on_method_start(str(m))
+                    except Exception:
+                        pass
+                cv_total = int(max(1, fold_total_map.get(m, 1)))
+                has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
+                has_rrblup_iter_progress = bool(
+                    rrblup_progress_enabled_by_method.get(str(m), False)
+                )
+                # Keep method UX stable: CV uses rich progress bar, fit/predict use spinner lines.
+                # Avoid nested rrBLUP sub-progress bars here to prevent terminal live-render contention.
+                use_rrblup_subprogress = bool(has_rrblup_iter_progress)
+                search_task_id: int | None = None
+                search_done = 0
+                search_total = 0
+                search_total_fixed = False
+                cv_task_id: int | None = None
+                cv_done = 0
+                prefit_task_id: int | None = None
+                adam_task_id: int | None = None
+                adam_done = 0
+                adam_total = 0
+                adam_stage = "fit"
+                adam_grid_trial_total = 0
+                adam_grid_trial_epochs = 0
+                adam_grid_completed_epochs = 0
+                adam_grid_active_trial = 0
+                lambda_task_id: int | None = None
+                lambda_done = 0
+                lambda_total = 0
+                cv_line_emitted = False
+                stage_lines_emitted = False
+                cv_stage_closed = False
+                cv_started_at: float | None = None
+                progress_live_stopped = False
+                fit_status: CliStatus | None = None
+                pred_status: CliStatus | None = None
+                rr_subprogress_seen = False
+                res: dict[str, typing.Any] | None = None
+                t0 = time.monotonic()
+
+                def _close_search_task() -> None:
+                    nonlocal search_task_id, search_done, search_total
+                    if search_task_id is None:
+                        return
+                    left = max(0, int(search_total) - int(search_done))
+                    if left > 0:
+                        progress.update(
+                            search_task_id,
+                            advance=left,
+                            label=f"{m_disp} search {int(search_total)}/{int(search_total)}",
+                        )
+                    try:
+                        progress.remove_task(search_task_id)
+                    except Exception:
+                        pass
+                    search_task_id = None
+
+                def _ensure_cv_task() -> None:
+                    nonlocal cv_task_id, cv_line_emitted, cv_started_at
+                    if not show_method_progress:
+                        return
+                    if cv_stage_closed:
+                        return
+                    if cv_task_id is None:
+                        cv_started_at = time.monotonic()
+                        cv_task_id = progress.add_task(
+                            description="",
+                            total=cv_total,
+                            label="Cross-validation",
+                            counter=f"{cv_done}/{cv_total}",
+                        )
+
+                def _finish_cv_stage() -> None:
+                    nonlocal cv_task_id, cv_done, cv_line_emitted, cv_stage_closed, prefit_task_id
+                    if cv_stage_closed:
+                        return
+                    if prefit_task_id is not None:
+                        try:
+                            progress.remove_task(prefit_task_id)
+                        except Exception:
+                            pass
+                        prefit_task_id = None
+                    if cv_task_id is None:
+                        if show_method_progress:
+                            cv_elapsed = float(max(0.0, time.monotonic() - (cv_started_at or t0)))
+                            progress.console.print(
+                                f"[green]{success_symbol()} Cross-validation ...Finished [{cv_elapsed:.1f}s][/green]"
+                            )
+                            cv_line_emitted = True
+                        cv_stage_closed = True
+                        return
+                    left_cv = max(0, cv_total - int(cv_done))
+                    if left_cv > 0:
+                        cv_done += left_cv
+                        progress.update(
+                            cv_task_id,
+                            advance=left_cv,
+                            label="Cross-validation",
+                            counter=f"{cv_done}/{cv_total}",
+                        )
+                    cv_elapsed = float(max(0.0, time.monotonic() - (cv_started_at or t0)))
+                    try:
+                        progress.remove_task(cv_task_id)
+                    except Exception:
+                        pass
+                    cv_task_id = None
+                    progress.console.print(
+                        f"[green]{success_symbol()} Cross-validation ...Finished [{cv_elapsed:.1f}s][/green]"
                     )
-                    search_task_id: int | None = None
-                    search_done = 0
-                    search_total = 0
-                    search_total_fixed = False
-                    cv_task_id: int | None = None
-                    cv_done = 0
-                    adam_task_id: int | None = None
+                    cv_line_emitted = True
+                    cv_stage_closed = True
+
+                def _start_fit_stage() -> None:
+                    nonlocal fit_status
+                    if fit_status is not None:
+                        return
+                    fit_status = CliStatus(
+                        "Computing Fitting...",
+                        enabled=True,
+                        use_process=False,
+                        show_elapsed=True,
+                    )
+                    fit_status.__enter__()
+
+                def _finish_fit_stage(elapsed_payload: float | None = None) -> None:
+                    nonlocal fit_status, stage_lines_emitted
+                    if use_rrblup_subprogress and fit_status is None:
+                        elapsed = (
+                            float(elapsed_payload)
+                            if (elapsed_payload is not None and np.isfinite(float(elapsed_payload)))
+                            else float(0.0)
+                        )
+                        progress.console.print(
+                            f"[green]{success_symbol()} Fitting ...Finished [{elapsed:.3f}s][/green]"
+                        )
+                        stage_lines_emitted = True
+                        return
+                    if fit_status is None:
+                        return
+                    fit_status.complete("Fitting ...Finished")
+                    fit_status.__exit__(None, None, None)
+                    fit_status = None
+                    stage_lines_emitted = True
+
+                def _start_predict_stage() -> None:
+                    nonlocal pred_status
+                    if pred_status is not None:
+                        return
+                    pred_status = CliStatus(
+                        "Computing Predicting...",
+                        enabled=True,
+                        use_process=False,
+                        show_elapsed=True,
+                    )
+                    pred_status.__enter__()
+
+                def _finish_predict_stage(elapsed_payload: float | None = None) -> None:
+                    nonlocal pred_status, stage_lines_emitted
+                    if use_rrblup_subprogress and pred_status is None:
+                        elapsed = (
+                            float(elapsed_payload)
+                            if (elapsed_payload is not None and np.isfinite(float(elapsed_payload)))
+                            else float(0.0)
+                        )
+                        progress.console.print(
+                            f"[green]{success_symbol()} Predicting ...Finished [{elapsed:.3f}s][/green]"
+                        )
+                        stage_lines_emitted = True
+                        return
+                    if pred_status is None:
+                        return
+                    pred_status.complete("Predicting ...Finished")
+                    pred_status.__exit__(None, None, None)
+                    pred_status = None
+                    stage_lines_emitted = True
+
+                def _fail_fit_stage() -> None:
+                    nonlocal fit_status
+                    if fit_status is None:
+                        return
+                    fit_status.fail("Fitting ...Failed")
+                    fit_status.__exit__(None, None, None)
+                    fit_status = None
+
+                def _fail_predict_stage() -> None:
+                    nonlocal pred_status
+                    if pred_status is None:
+                        return
+                    pred_status.fail("Predicting ...Failed")
+                    pred_status.__exit__(None, None, None)
+                    pred_status = None
+
+                def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                    nonlocal progress_live_stopped
+                    ev = str(event)
+                    if ev == "fit_start":
+                        _finish_cv_stage()
+                        if (not use_rrblup_subprogress) and (not progress_live_stopped):
+                            try:
+                                progress.stop()
+                            except Exception:
+                                pass
+                            progress_live_stopped = True
+                        _start_fit_stage()
+                        return
+                    if ev == "fit_end":
+                        _finish_fit_stage(payload.get("elapsed"))
+                        return
+                    if ev == "predict_start":
+                        _start_predict_stage()
+                        return
+                    if ev == "predict_end":
+                        _finish_predict_stage(payload.get("elapsed"))
+                        return
+
+                def _adam_stage_key(payload: dict[str, typing.Any]) -> str:
+                    stage = str(payload.get("stage", "fit")).strip().lower()
+                    if stage == "pcg":
+                        return "pcg"
+                    return "grid" if stage == "grid" else "fit"
+
+                def _adam_label(stage: str, done: int, total: int) -> str:
+                    if str(stage) == "grid":
+                        return f"{m_disp} adam search"
+                    if str(stage) == "pcg":
+                        return f"{m_disp} pcg"
+                    return f"{m_disp} adam"
+
+                def _adam_counter(done: int, total: int) -> str:
+                    return f"{int(done)}/{int(total)}"
+
+                def _adam_progress_values(
+                    event: str,
+                    payload: dict[str, typing.Any],
+                ) -> tuple[str, int, int]:
+                    nonlocal adam_done, adam_total
+                    nonlocal adam_grid_trial_total, adam_grid_trial_epochs
+                    nonlocal adam_grid_completed_epochs, adam_grid_active_trial
+                    stage = _adam_stage_key(payload)
+                    if stage == "pcg":
+                        adam_grid_trial_total = 0
+                        adam_grid_trial_epochs = 0
+                        adam_grid_completed_epochs = 0
+                        adam_grid_active_trial = 0
+                        total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
+                        if str(event) == "start":
+                            done = 0
+                        elif str(event) == "end":
+                            done = int(
+                                max(
+                                    0,
+                                    int(payload.get("iters", payload.get("iter", adam_done))),
+                                )
+                            )
+                        else:
+                            done = int(
+                                max(
+                                    0,
+                                    int(payload.get("iter", payload.get("iters", adam_done))),
+                                )
+                            )
+                        done = int(min(done, total))
+                        return stage, done, total
+                    if stage != "grid":
+                        if str(event) == "start":
+                            adam_grid_trial_total = 0
+                            adam_grid_trial_epochs = 0
+                            adam_grid_completed_epochs = 0
+                            adam_grid_active_trial = 0
+                        total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
+                        if str(event) == "start":
+                            done = 0
+                        elif str(event) == "end":
+                            done = int(max(0, int(payload.get("epochs_ran", adam_done))))
+                        else:
+                            done = int(max(0, int(payload.get("epoch", adam_done))))
+                        done = int(min(done, total))
+                        return stage, done, total
+
+                    trial_total = int(
+                        max(1, int(payload.get("trial_total", max(1, int(adam_grid_trial_total or 1)))))
+                    )
+                    trial_epochs = int(
+                        max(1, int(payload.get("total", max(1, int(adam_grid_trial_epochs or 1)))))
+                    )
+                    trial_id = int(
+                        max(1, int(payload.get("trial_id", max(1, int(adam_grid_active_trial or 1)))))
+                    )
+                    if str(event) == "start":
+                        if trial_id <= 1 or trial_id < int(adam_grid_active_trial):
+                            adam_grid_completed_epochs = 0
+                        adam_grid_active_trial = int(trial_id)
+                        trial_done = 0
+                    elif str(event) == "end":
+                        trial_done = int(max(0, int(payload.get("epochs_ran", payload.get("epoch", 0)))))
+                    else:
+                        trial_done = int(max(0, int(payload.get("epoch", 0))))
+                    trial_done = int(min(trial_done, trial_epochs))
+
+                    total = int(max(1, trial_total * trial_epochs))
+                    done = int(max(0, int(adam_grid_completed_epochs) + trial_done))
+                    done = int(min(done, total))
+                    if str(event) == "end":
+                        adam_grid_completed_epochs = int(max(int(adam_grid_completed_epochs), done))
+                    adam_grid_trial_total = int(trial_total)
+                    adam_grid_trial_epochs = int(trial_epochs)
+                    return stage, done, total
+
+                def _ensure_adam_task(
+                    payload: dict[str, typing.Any],
+                    *,
+                    event: str = "start",
+                ) -> None:
+                    nonlocal adam_task_id, adam_done, adam_total, adam_stage
+                    stage, target_done, target_total = _adam_progress_values(str(event), payload)
+                    adam_stage = str(stage)
+                    adam_done = int(target_done)
+                    adam_total = int(max(1, int(target_total)))
+                    label = _adam_label(adam_stage, adam_done, adam_total)
+                    if adam_task_id is None:
+                        adam_task_id = progress.add_task(
+                            description="",
+                            total=adam_total,
+                            label=label,
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
+                        if adam_done > 0:
+                            progress.update(
+                                adam_task_id,
+                                total=adam_total,
+                                completed=adam_done,
+                                label=label,
+                                counter=_adam_counter(adam_done, adam_total),
+                            )
+                    else:
+                        progress.update(
+                            adam_task_id,
+                            total=adam_total,
+                            completed=adam_done,
+                            label=label,
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
+
+                def _close_adam_task() -> None:
+                    nonlocal adam_task_id, adam_done, adam_total, adam_stage
+                    nonlocal adam_grid_trial_total, adam_grid_trial_epochs
+                    nonlocal adam_grid_completed_epochs, adam_grid_active_trial
+                    if adam_task_id is None:
+                        return
+                    try:
+                        progress.remove_task(adam_task_id)
+                    except Exception:
+                        pass
+                    adam_task_id = None
                     adam_done = 0
                     adam_total = 0
                     adam_stage = "fit"
@@ -5144,424 +6210,263 @@ def _run_methods_parallel(
                     adam_grid_trial_epochs = 0
                     adam_grid_completed_epochs = 0
                     adam_grid_active_trial = 0
-                    lambda_task_id: int | None = None
-                    lambda_done = 0
-                    lambda_total = 0
 
-                    def _close_search_task() -> None:
-                        nonlocal search_task_id, search_done, search_total
-                        if search_task_id is None:
-                            return
-                        left = max(0, int(search_total) - int(search_done))
-                        if left > 0:
-                            progress.update(
-                                search_task_id,
-                                advance=left,
-                                label=f"{m_disp} search {int(search_total)}/{int(search_total)}",
-                            )
-                        try:
-                            progress.remove_task(search_task_id)
-                        except Exception:
-                            pass
-                        search_task_id = None
-
-                    def _ensure_cv_task() -> None:
-                        nonlocal cv_task_id
-                        if not show_method_progress:
-                            return
-                        if cv_task_id is None:
-                            cv_task_id = progress.add_task(
-                                description="",
-                                total=cv_total,
-                                label=f"{m_disp} cv",
-                                counter=f"{cv_done}/{cv_total}",
-                            )
-
-                    def _adam_stage_key(payload: dict[str, typing.Any]) -> str:
-                        stage = str(payload.get("stage", "fit")).strip().lower()
-                        if stage == "pcg":
-                            return "pcg"
-                        return "grid" if stage == "grid" else "fit"
-
-                    def _adam_label(stage: str, done: int, total: int) -> str:
-                        if str(stage) == "grid":
-                            return f"{m_disp} adam search"
-                        if str(stage) == "pcg":
-                            return f"{m_disp} pcg"
-                        return f"{m_disp} adam"
-
-                    def _adam_counter(done: int, total: int) -> str:
-                        return f"{int(done)}/{int(total)}"
-
-                    def _adam_progress_values(
-                        event: str,
-                        payload: dict[str, typing.Any],
-                    ) -> tuple[str, int, int]:
-                        nonlocal adam_done, adam_total
-                        nonlocal adam_grid_trial_total, adam_grid_trial_epochs
-                        nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                        stage = _adam_stage_key(payload)
-                        if stage == "pcg":
-                            adam_grid_trial_total = 0
-                            adam_grid_trial_epochs = 0
-                            adam_grid_completed_epochs = 0
-                            adam_grid_active_trial = 0
-                            total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                            if str(event) == "start":
-                                done = 0
-                            elif str(event) == "end":
-                                done = int(
-                                    max(
-                                        0,
-                                        int(payload.get("iters", payload.get("iter", adam_done))),
-                                    )
-                                )
-                            else:
-                                done = int(
-                                    max(
-                                        0,
-                                        int(payload.get("iter", payload.get("iters", adam_done))),
-                                    )
-                                )
-                            done = int(min(done, total))
-                            return stage, done, total
-                        if stage != "grid":
-                            if str(event) == "start":
-                                adam_grid_trial_total = 0
-                                adam_grid_trial_epochs = 0
-                                adam_grid_completed_epochs = 0
-                                adam_grid_active_trial = 0
-                            total = int(max(1, int(payload.get("total", max(1, int(adam_total))))))
-                            if str(event) == "start":
-                                done = 0
-                            elif str(event) == "end":
-                                done = int(max(0, int(payload.get("epochs_ran", adam_done))))
-                            else:
-                                done = int(max(0, int(payload.get("epoch", adam_done))))
-                            done = int(min(done, total))
-                            return stage, done, total
-
-                        trial_total = int(
-                            max(1, int(payload.get("trial_total", max(1, int(adam_grid_trial_total or 1)))))
-                        )
-                        trial_epochs = int(
-                            max(1, int(payload.get("total", max(1, int(adam_grid_trial_epochs or 1)))))
-                        )
-                        trial_id = int(
-                            max(1, int(payload.get("trial_id", max(1, int(adam_grid_active_trial or 1)))))
-                        )
-                        if str(event) == "start":
-                            if trial_id <= 1 or trial_id < int(adam_grid_active_trial):
-                                adam_grid_completed_epochs = 0
-                            adam_grid_active_trial = int(trial_id)
-                            trial_done = 0
-                        elif str(event) == "end":
-                            trial_done = int(max(0, int(payload.get("epochs_ran", payload.get("epoch", 0)))))
-                        else:
-                            trial_done = int(max(0, int(payload.get("epoch", 0))))
-                        trial_done = int(min(trial_done, trial_epochs))
-
-                        total = int(max(1, trial_total * trial_epochs))
-                        done = int(max(0, int(adam_grid_completed_epochs) + trial_done))
-                        done = int(min(done, total))
-                        if str(event) == "end":
-                            adam_grid_completed_epochs = int(max(int(adam_grid_completed_epochs), done))
-                        adam_grid_trial_total = int(trial_total)
-                        adam_grid_trial_epochs = int(trial_epochs)
-                        return stage, done, total
-
-                    def _ensure_adam_task(
-                        payload: dict[str, typing.Any],
-                        *,
-                        event: str = "start",
-                    ) -> None:
-                        nonlocal adam_task_id, adam_done, adam_total, adam_stage
-                        stage, target_done, target_total = _adam_progress_values(str(event), payload)
-                        adam_stage = str(stage)
-                        adam_done = int(target_done)
-                        adam_total = int(max(1, int(target_total)))
-                        label = _adam_label(adam_stage, adam_done, adam_total)
-                        if adam_task_id is None:
-                            adam_task_id = progress.add_task(
-                                description="",
-                                total=adam_total,
-                                label=label,
-                                counter=_adam_counter(adam_done, adam_total),
-                            )
-                            if adam_done > 0:
-                                progress.update(
-                                    adam_task_id,
-                                    total=adam_total,
-                                    completed=adam_done,
-                                    label=label,
-                                    counter=_adam_counter(adam_done, adam_total),
-                                )
-                        else:
-                            progress.update(
-                                adam_task_id,
-                                total=adam_total,
-                                completed=adam_done,
-                                label=label,
-                                counter=_adam_counter(adam_done, adam_total),
-                            )
-
-                    def _close_adam_task() -> None:
-                        nonlocal adam_task_id, adam_done, adam_total, adam_stage
-                        nonlocal adam_grid_trial_total, adam_grid_trial_epochs
-                        nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                        if adam_task_id is None:
-                            return
-                        try:
-                            progress.remove_task(adam_task_id)
-                        except Exception:
-                            pass
-                        adam_task_id = None
-                        adam_done = 0
-                        adam_total = 0
-                        adam_stage = "fit"
-                        adam_grid_trial_total = 0
-                        adam_grid_trial_epochs = 0
-                        adam_grid_completed_epochs = 0
-                        adam_grid_active_trial = 0
-
-                    def _ensure_lambda_task(
-                        *,
-                        done: int,
-                        total: int,
-                    ) -> None:
-                        nonlocal lambda_task_id, lambda_done, lambda_total
-                        lambda_done = int(max(0, int(done)))
-                        lambda_total = int(max(1, int(total)))
-                        if lambda_task_id is None:
-                            lambda_task_id = progress.add_task(
-                                description="",
-                                total=lambda_total,
-                                label=f"{m_disp} lambda search",
-                                counter=f"{lambda_done}/{lambda_total}",
-                            )
-                        progress.update(
-                            lambda_task_id,
+                def _ensure_lambda_task(
+                    *,
+                    done: int,
+                    total: int,
+                ) -> None:
+                    nonlocal lambda_task_id, lambda_done, lambda_total
+                    lambda_done = int(max(0, int(done)))
+                    lambda_total = int(max(1, int(total)))
+                    if lambda_task_id is None:
+                        lambda_task_id = progress.add_task(
+                            description="",
                             total=lambda_total,
-                            completed=min(lambda_done, lambda_total),
                             label=f"{m_disp} lambda search",
                             counter=f"{lambda_done}/{lambda_total}",
                         )
+                    progress.update(
+                        lambda_task_id,
+                        total=lambda_total,
+                        completed=min(lambda_done, lambda_total),
+                        label=f"{m_disp} lambda search",
+                        counter=f"{lambda_done}/{lambda_total}",
+                    )
 
-                    def _close_lambda_task(*, complete: bool = False) -> None:
-                        nonlocal lambda_task_id, lambda_done, lambda_total
-                        if lambda_task_id is not None:
-                            if complete:
-                                progress.update(
-                                    lambda_task_id,
-                                    total=max(1, int(lambda_total)),
-                                    completed=max(0, int(lambda_total)),
-                                    label=f"{m_disp} lambda search",
-                                    counter=f"{int(max(0, lambda_total))}/{int(max(1, lambda_total))}",
-                                )
-                            try:
-                                progress.remove_task(lambda_task_id)
-                            except Exception:
-                                pass
-                        lambda_task_id = None
-                        lambda_done = 0
-                        lambda_total = 0
+                def _close_lambda_task(*, complete: bool = False) -> None:
+                    nonlocal lambda_task_id, lambda_done, lambda_total
+                    if lambda_task_id is not None:
+                        if complete:
+                            progress.update(
+                                lambda_task_id,
+                                total=max(1, int(lambda_total)),
+                                completed=max(0, int(lambda_total)),
+                                label=f"{m_disp} lambda search",
+                                counter=f"{int(max(0, lambda_total))}/{int(max(1, lambda_total))}",
+                            )
+                        try:
+                            progress.remove_task(lambda_task_id)
+                        except Exception:
+                            pass
+                    lambda_task_id = None
+                    lambda_done = 0
+                    lambda_total = 0
 
-                    def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                        nonlocal search_task_id, search_done, search_total, search_total_fixed
-                        ev = str(event)
-                        if ev == "search_total":
-                            count = int(max(0, int(payload.get("count", 0))))
-                            if count <= 0:
-                                return
-                            search_total = int(count)
-                            search_total_fixed = True
-                            if search_task_id is None:
-                                search_task_id = progress.add_task(
-                                    description="",
-                                    total=int(max(1, search_total)),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                    counter="",
-                                )
-                            else:
-                                progress.update(
-                                    search_task_id,
-                                    total=int(max(1, search_total)),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                )
+                def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                    nonlocal search_task_id, search_done, search_total, search_total_fixed
+                    ev = str(event)
+                    if ev == "search_total":
+                        count = int(max(0, int(payload.get("count", 0))))
+                        if count <= 0:
                             return
-                        if ev == "search_plan":
-                            count = int(max(0, int(payload.get("count", 0))))
-                            if count <= 0:
-                                return
-                            if not search_total_fixed:
-                                search_total += count
-                            if search_total <= 0:
-                                search_total = count
-                            if search_task_id is None:
-                                search_task_id = progress.add_task(
-                                    description="",
-                                    total=int(max(1, search_total)),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                    counter="",
-                                )
-                            else:
-                                progress.update(
-                                    search_task_id,
-                                    total=int(max(1, search_total)),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                )
-                            return
-                        if ev == "search_advance":
-                            inc = int(max(0, int(payload.get("inc", 0))))
-                            if inc <= 0:
-                                return
-                            if (not search_total_fixed) and (search_done + inc > search_total):
-                                search_total = search_done + inc
-                            if search_task_id is None:
-                                search_task_id = progress.add_task(
-                                    description="",
-                                    total=int(max(1, search_total)),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                    counter="",
-                                )
-                            left = max(0, int(search_total) - int(search_done))
-                            adv = min(left, inc)
-                            if adv > 0:
-                                search_done += adv
-                                progress.update(
-                                    search_task_id,
-                                    total=int(max(1, search_total)),
-                                    advance=int(adv),
-                                    label=f"{m_disp} search {search_done}/{search_total}",
-                                )
-
-                    def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                        nonlocal adam_done, adam_total, adam_task_id, adam_stage
-                        nonlocal lambda_done, lambda_total
-                        if not has_rrblup_iter_progress:
-                            return
-                        ev = str(event)
-                        if ev == "pcg_lambda_subsample_start":
-                            total = int(max(1, int(payload.get("total", payload.get("repeats", 1)))))
-                            _ensure_lambda_task(done=0, total=total)
-                            return
-                        if ev == "pcg_lambda_subsample_iter":
-                            total = int(max(1, int(payload.get("total", max(1, int(lambda_total or 1))))))
-                            done = int(max(0, int(payload.get("iter", lambda_done))))
-                            _ensure_lambda_task(done=min(done, total), total=total)
-                            return
-                        if ev == "pcg_lambda_subsample_end":
-                            total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
-                            done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
-                            _ensure_lambda_task(done=min(done, total), total=total)
-                            _close_lambda_task(complete=True)
-                            return
-                        if ev == "pcg_start":
-                            _close_lambda_task()
-                            pp = dict(payload)
-                            pp["stage"] = "pcg"
-                            _ensure_adam_task(pp, event="start")
-                            return
-                        if ev == "pcg_iter":
-                            pp = dict(payload)
-                            pp["stage"] = "pcg"
-                            if adam_task_id is None:
-                                _ensure_adam_task(pp, event="epoch")
-                            if adam_task_id is None:
-                                return
-                            stage, target, total = _adam_progress_values("epoch", pp)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
-                            progress.update(
-                                adam_task_id,
-                                total=adam_total,
-                                completed=adam_done,
-                                label=_adam_label(adam_stage, adam_done, adam_total),
-                                counter=_adam_counter(adam_done, adam_total),
+                        search_total = int(count)
+                        search_total_fixed = True
+                        if search_task_id is None:
+                            search_task_id = progress.add_task(
+                                description="",
+                                total=int(max(1, search_total)),
+                                label=f"{m_disp} search {search_done}/{search_total}",
+                                counter="",
                             )
-                            return
-                        if ev == "pcg_end":
-                            pp = dict(payload)
-                            pp["stage"] = "pcg"
-                            if "iter" not in pp and ("iters" in pp):
-                                pp["iter"] = pp.get("iters")
-                            if adam_task_id is None:
-                                _ensure_adam_task(pp, event="end")
-                            if adam_task_id is None:
-                                return
-                            stage, target, total = _adam_progress_values("end", pp)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
+                        else:
                             progress.update(
-                                adam_task_id,
-                                total=adam_total,
-                                completed=adam_done,
-                                label=_adam_label(adam_stage, adam_done, adam_total),
-                                counter=_adam_counter(adam_done, adam_total),
+                                search_task_id,
+                                total=int(max(1, search_total)),
+                                label=f"{m_disp} search {search_done}/{search_total}",
                             )
-                            # Reset per-round PCG sub-progress elapsed timer:
-                            # close current task at round end so next round creates
-                            # a fresh task with elapsed starting from 0.
-                            _close_adam_task()
+                        return
+                    if ev == "search_plan":
+                        count = int(max(0, int(payload.get("count", 0))))
+                        if count <= 0:
                             return
-                        if ev == "adam_start":
-                            _ensure_adam_task(payload, event="start")
-                            return
-                        if ev == "adam_epoch":
-                            if adam_task_id is None:
-                                _ensure_adam_task(payload, event="epoch")
-                            if adam_task_id is None:
-                                return
-                            stage, target, total = _adam_progress_values("epoch", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
-                            progress.update(
-                                adam_task_id,
-                                total=adam_total,
-                                completed=adam_done,
-                                label=_adam_label(adam_stage, adam_done, adam_total),
-                                counter=_adam_counter(adam_done, adam_total),
+                        if not search_total_fixed:
+                            search_total += count
+                        if search_total <= 0:
+                            search_total = count
+                        if search_task_id is None:
+                            search_task_id = progress.add_task(
+                                description="",
+                                total=int(max(1, search_total)),
+                                label=f"{m_disp} search {search_done}/{search_total}",
+                                counter="",
                             )
-                            return
-                        if ev == "adam_end":
-                            if adam_task_id is None:
-                                return
-                            stage, target, total = _adam_progress_values("end", payload)
-                            adam_stage = str(stage)
-                            adam_done = int(target)
-                            adam_total = int(max(1, int(total)))
+                        else:
                             progress.update(
-                                adam_task_id,
-                                total=adam_total,
-                                completed=adam_done,
-                                label=_adam_label(adam_stage, adam_done, adam_total),
-                                counter=_adam_counter(adam_done, adam_total),
+                                search_task_id,
+                                total=int(max(1, search_total)),
+                                label=f"{m_disp} search {search_done}/{search_total}",
+                            )
+                        return
+                    if ev == "search_advance":
+                        inc = int(max(0, int(payload.get("inc", 0))))
+                        if inc <= 0:
+                            return
+                        if (not search_total_fixed) and (search_done + inc > search_total):
+                            search_total = search_done + inc
+                        if search_task_id is None:
+                            search_task_id = progress.add_task(
+                                description="",
+                                total=int(max(1, search_total)),
+                                label=f"{m_disp} search {search_done}/{search_total}",
+                                counter="",
+                            )
+                        left = max(0, int(search_total) - int(search_done))
+                        adv = min(left, inc)
+                        if adv > 0:
+                            search_done += adv
+                            progress.update(
+                                search_task_id,
+                                total=int(max(1, search_total)),
+                                advance=int(adv),
+                                label=f"{m_disp} search {search_done}/{search_total}",
                             )
 
-                    def _cv_hook(method_name: str, inc: int) -> None:
-                        nonlocal cv_done
-                        if str(method_name) != str(m):
-                            return
+                def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                    nonlocal adam_done, adam_total, adam_task_id, adam_stage
+                    nonlocal lambda_done, lambda_total
+                    nonlocal rr_subprogress_seen, fit_status
+                    if not has_rrblup_iter_progress:
+                        return
+                    rr_subprogress_seen = True
+                    # If rrBLUP sub-progress is active, hide generic fitting spinner
+                    # to avoid two live indicators competing on the same terminal rows.
+                    if fit_status is not None:
+                        fit_status.__exit__(None, None, None)
+                        fit_status = None
+                    ev = str(event)
+                    if ev == "pcg_lambda_subsample_start":
+                        total = int(max(1, int(payload.get("total", payload.get("repeats", 1)))))
+                        _ensure_lambda_task(done=0, total=total)
+                        return
+                    if ev == "pcg_callback_unavailable":
+                        progress.console.print(
+                            "[yellow]Warning: rrBLUP-PCG backend has no iter callback; "
+                            "showing spinner instead of sub-progress bar.[/yellow]"
+                        )
+                        return
+                    if ev == "pcg_lambda_subsample_iter":
+                        total = int(max(1, int(payload.get("total", max(1, int(lambda_total or 1))))))
+                        done = int(max(0, int(payload.get("iter", lambda_done))))
+                        _ensure_lambda_task(done=min(done, total), total=total)
+                        return
+                    if ev == "pcg_lambda_subsample_end":
+                        total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
+                        done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
+                        _ensure_lambda_task(done=min(done, total), total=total)
+                        _close_lambda_task(complete=True)
+                        return
+                    if ev == "pcg_start":
                         _close_lambda_task()
-                        _close_search_task()
-                        _ensure_cv_task()
-                        left = max(0, cv_total - int(cv_done))
-                        adv = min(left, int(max(0, int(inc))))
-                        if adv > 0 and cv_task_id is not None:
-                            cv_done += adv
-                            progress.update(
-                                cv_task_id,
-                                advance=adv,
-                                label=f"{m_disp} cv",
-                                counter=f"{cv_done}/{cv_total}",
-                            )
+                        pp = dict(payload)
+                        pp["stage"] = "pcg"
+                        _ensure_adam_task(pp, event="start")
+                        return
+                    if ev == "pcg_iter":
+                        pp = dict(payload)
+                        pp["stage"] = "pcg"
+                        if adam_task_id is None:
+                            _ensure_adam_task(pp, event="epoch")
+                        if adam_task_id is None:
+                            return
+                        stage, target, total = _adam_progress_values("epoch", pp)
+                        adam_stage = str(stage)
+                        adam_done = int(target)
+                        adam_total = int(max(1, int(total)))
+                        progress.update(
+                            adam_task_id,
+                            total=adam_total,
+                            completed=adam_done,
+                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
+                        return
+                    if ev == "pcg_end":
+                        pp = dict(payload)
+                        pp["stage"] = "pcg"
+                        if "iter" not in pp and ("iters" in pp):
+                            pp["iter"] = pp.get("iters")
+                        if adam_task_id is None:
+                            _ensure_adam_task(pp, event="end")
+                        if adam_task_id is None:
+                            return
+                        stage, target, total = _adam_progress_values("end", pp)
+                        adam_stage = str(stage)
+                        adam_done = int(target)
+                        adam_total = int(max(1, int(total)))
+                        progress.update(
+                            adam_task_id,
+                            total=adam_total,
+                            completed=adam_done,
+                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
+                        _close_adam_task()
+                        return
+                    if ev == "adam_start":
+                        _ensure_adam_task(payload, event="start")
+                        return
+                    if ev == "adam_epoch":
+                        if adam_task_id is None:
+                            _ensure_adam_task(payload, event="epoch")
+                        if adam_task_id is None:
+                            return
+                        stage, target, total = _adam_progress_values("epoch", payload)
+                        adam_stage = str(stage)
+                        adam_done = int(target)
+                        adam_total = int(max(1, int(total)))
+                        progress.update(
+                            adam_task_id,
+                            total=adam_total,
+                            completed=adam_done,
+                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
+                        return
+                    if ev == "adam_end":
+                        if adam_task_id is None:
+                            return
+                        stage, target, total = _adam_progress_values("end", payload)
+                        adam_stage = str(stage)
+                        adam_done = int(target)
+                        adam_total = int(max(1, int(total)))
+                        progress.update(
+                            adam_task_id,
+                            total=adam_total,
+                            completed=adam_done,
+                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            counter=_adam_counter(adam_done, adam_total),
+                        )
 
+                def _cv_hook(method_name: str, inc: int) -> None:
+                    nonlocal cv_done, prefit_task_id
+                    if str(method_name) != str(m):
+                        return
+                    _close_lambda_task()
+                    _close_search_task()
+                    _ensure_cv_task()
+                    left = max(0, cv_total - int(cv_done))
+                    adv = min(left, int(max(0, int(inc))))
+                    if adv > 0 and cv_task_id is not None:
+                        cv_done += adv
+                        progress.update(
+                            cv_task_id,
+                            advance=adv,
+                            label="Cross-validation",
+                            counter=f"{cv_done}/{cv_total}",
+                        )
+                        if int(cv_done) >= int(cv_total):
+                            if prefit_task_id is None:
+                                prefit_task_id = progress.add_task(
+                                    description="",
+                                    total=None,
+                                    label="Preparing final fit",
+                                    counter="",
+                                )
+
+                with progress:
                     if show_method_progress and (not has_search_stage):
                         _ensure_cv_task()
-                    t0 = time.monotonic()
                     try:
                         res = _run_method_task(
                             m,
@@ -5583,17 +6488,24 @@ def _run_methods_parallel(
                             progress_queue=None,
                             progress_hook=_cv_hook,
                             search_progress_hook=_search_hook,
-                            rrblup_progress_hook=(_adam_hook if has_rrblup_iter_progress else None),
+                            rrblup_progress_hook=(
+                                _adam_hook
+                                if (has_rrblup_iter_progress and use_rrblup_subprogress)
+                                else None
+                            ),
                             limit_predtrain=limit_predtrain,
                             rrblup_solver=rrblup_solver,
                             rrblup_adamw_cfg=rrblup_adamw_cfg,
                             bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                             bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                            stage_hook=_stage_hook,
                         )
                     except Exception:
                         _close_search_task()
                         _close_adam_task()
                         _close_lambda_task()
+                        _fail_fit_stage()
+                        _fail_predict_stage()
                         if cv_task_id is not None:
                             try:
                                 progress.remove_task(cv_task_id)
@@ -5608,37 +6520,46 @@ def _run_methods_parallel(
                     _close_lambda_task()
                     if show_method_progress:
                         _ensure_cv_task()
-                        left_cv = max(0, cv_total - int(cv_done))
-                        if left_cv > 0 and cv_task_id is not None:
-                            cv_done += left_cv
-                            progress.update(
-                                cv_task_id,
-                                advance=left_cv,
-                                label=f"{m_disp} cv",
-                                counter=f"{cv_done}/{cv_total}",
-                            )
-                        if cv_task_id is not None:
-                            try:
-                                progress.remove_task(cv_task_id)
-                            except Exception:
-                                pass
+                        _finish_cv_stage()
                     _close_adam_task()
                     _close_lambda_task()
-                    out.append(res)
-                    elapsed = format_elapsed(time.monotonic() - t0)
-                    progress.console.print(
-                        f"[green]{success_symbol()} {m_disp} ...Finished [{elapsed}][/green]"
-                    )
-                    _emit_method_details_plain(
-                        m,
-                        res,
-                        line_printer=lambda s: progress.console.print(s, highlight=False),
-                    )
+                    if fit_status is not None:
+                        _finish_fit_stage(None)
+                    if pred_status is not None:
+                        _finish_predict_stage(None)
+                    if res is not None and stage_lines_emitted:
+                        res["__stage_lines_emitted"] = True
+                    if res is not None and cv_line_emitted:
+                        res["__cv_line_emitted"] = True
+                    if emit_method_summary and res is not None:
+                        elapsed = format_elapsed(time.monotonic() - t0)
+                        progress.console.print(
+                            f"[green]{success_symbol()} {m_disp} ...Finished [{elapsed}][/green]"
+                        )
+                        _emit_method_details_plain(
+                            m,
+                            res,
+                            line_printer=lambda s: progress.console.print(s, highlight=False),
+                        )
+
+                if res is None:
+                    continue
+                out.append(res)
+                if on_method_complete is not None:
+                    try:
+                        on_method_complete(str(m), res)
+                    except Exception:
+                        pass
             return out
         for m in methods:
             t0 = time.monotonic()
             method_offset = _method_offset(str(m))
             m_disp = _method_display(str(m))
+            if on_method_start is not None:
+                try:
+                    on_method_start(str(m))
+                except Exception:
+                    pass
             cv_total = int(max(1, fold_total_map.get(m, 1)))
             has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
             has_rrblup_iter_progress = bool(
@@ -5650,6 +6571,8 @@ def _run_methods_parallel(
                 and (show_method_progress or has_rrblup_iter_progress)
             )
             enable_method_spinner = bool(
+                emit_method_summary
+                and
                 (not enable_tqdm_progress)
                 and stdout_is_tty()
                 and (method_offset <= 0.0)
@@ -5671,6 +6594,10 @@ def _run_methods_parallel(
             adam_grid_active_trial = 0
             lambda_done = 0
             lambda_total = 0
+            fit_status: CliStatus | None = None
+            pred_status: CliStatus | None = None
+            stage_lines_emitted = False
+            cv_line_emitted = bool(enable_tqdm_progress and show_method_progress)
 
             def _close_search_bar() -> None:
                 nonlocal search_bar
@@ -5693,7 +6620,7 @@ def _run_methods_parallel(
                 assert tqdm is not None
                 cv_bar = tqdm(
                     total=cv_total,
-                    desc=f"{m_disp} cv",
+                    desc="Cross-validation",
                     unit="fold",
                     leave=False,
                     dynamic_ncols=True,
@@ -5888,6 +6815,89 @@ def _run_methods_parallel(
                     lambda_bar = None
                 lambda_done = 0
                 lambda_total = 0
+
+            def _start_fit_status() -> None:
+                nonlocal fit_status
+                if fit_status is not None:
+                    return
+                if not stdout_is_tty():
+                    return
+                fit_status = CliStatus(
+                    "Computing Fitting...",
+                    enabled=True,
+                    use_process=True,
+                    show_elapsed=False,
+                )
+                fit_status.__enter__()
+
+            def _complete_fit_status(elapsed: float | None = None) -> None:
+                nonlocal fit_status, stage_lines_emitted
+                if fit_status is None:
+                    return
+                msg = "Fitting ...Finished"
+                if elapsed is not None and np.isfinite(float(elapsed)):
+                    msg = f"Fitting ...Finished [{float(elapsed):.1f}s]"
+                fit_status.complete(msg)
+                fit_status.__exit__(None, None, None)
+                fit_status = None
+                stage_lines_emitted = True
+
+            def _fail_fit_status() -> None:
+                nonlocal fit_status
+                if fit_status is None:
+                    return
+                fit_status.fail("Fitting ...Failed")
+                fit_status.__exit__(None, None, None)
+                fit_status = None
+
+            def _start_predict_status() -> None:
+                nonlocal pred_status
+                if pred_status is not None:
+                    return
+                if not stdout_is_tty():
+                    return
+                pred_status = CliStatus(
+                    "Computing Predicting...",
+                    enabled=True,
+                    use_process=True,
+                    show_elapsed=False,
+                )
+                pred_status.__enter__()
+
+            def _complete_predict_status(elapsed: float | None = None) -> None:
+                nonlocal pred_status, stage_lines_emitted
+                if pred_status is None:
+                    return
+                msg = "Predicting ...Finished"
+                if elapsed is not None and np.isfinite(float(elapsed)):
+                    msg = f"Predicting ...Finished [{float(elapsed):.1f}s]"
+                pred_status.complete(msg)
+                pred_status.__exit__(None, None, None)
+                pred_status = None
+                stage_lines_emitted = True
+
+            def _fail_predict_status() -> None:
+                nonlocal pred_status
+                if pred_status is None:
+                    return
+                pred_status.fail("Predicting ...Failed")
+                pred_status.__exit__(None, None, None)
+                pred_status = None
+
+            def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
+                ev = str(event)
+                if ev == "fit_start":
+                    _start_fit_status()
+                    return
+                if ev == "fit_end":
+                    _complete_fit_status(float(payload.get("elapsed", np.nan)))
+                    return
+                if ev == "predict_start":
+                    _start_predict_status()
+                    return
+                if ev == "predict_end":
+                    _complete_predict_status(float(payload.get("elapsed", np.nan)))
+                    return
 
             def _ensure_search_bar() -> None:
                 nonlocal search_bar, search_total
@@ -6084,7 +7094,7 @@ def _run_methods_parallel(
                     cv_done += adv
                     cv_bar.update(adv)
                     cv_bar.set_description_str(
-                        f"{m_disp} cv",
+                        "Cross-validation",
                         refresh=True,
                     )
 
@@ -6130,12 +7140,15 @@ def _run_methods_parallel(
                         rrblup_adamw_cfg=rrblup_adamw_cfg,
                         bayes_auto_r2_cache=bayes_auto_r2_cache_shared,
                         bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                        stage_hook=_stage_hook,
                     )
                 except Exception:
                     _close_search_bar()
                     _close_adam_bar()
                     _close_lambda_bar()
                     _close_cv_bar()
+                    _fail_fit_status()
+                    _fail_predict_status()
                     elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
                     if method_status is not None:
                         method_status.fail(f"{m_disp} ...Failed")
@@ -6153,24 +7166,36 @@ def _run_methods_parallel(
                             cv_done += left_cv
                             cv_bar.update(left_cv)
                         cv_bar.set_description_str(
-                            f"{m_disp} cv",
+                            "Cross-validation",
                             refresh=True,
                         )
                 _close_adam_bar()
                 _close_lambda_bar()
                 _close_cv_bar()
+                _complete_fit_status(None)
+                _complete_predict_status(None)
 
+                if stage_lines_emitted:
+                    res["__stage_lines_emitted"] = True
+                if cv_line_emitted:
+                    res["__cv_line_emitted"] = True
                 out.append(res)
+                if on_method_complete is not None:
+                    try:
+                        on_method_complete(str(m), res)
+                    except Exception:
+                        pass
                 elapsed = format_elapsed((time.monotonic() - t0) + method_offset)
-                if method_status is not None:
-                    method_status.complete(f"{m_disp} ...Finished")
-                else:
-                    print_success(f"{m_disp} ...Finished [{elapsed}]", force_color=True)
-                _emit_method_details_plain(
-                    m,
-                    res,
-                    line_printer=lambda s: print(s, flush=True),
-                )
+                if emit_method_summary:
+                    if method_status is not None:
+                        method_status.complete(f"{m_disp} ...Finished")
+                    else:
+                        print_success(f"{m_disp} ...Finished [{elapsed}]", force_color=True)
+                    _emit_method_details_plain(
+                        m,
+                        res,
+                        line_printer=lambda s: print(s, flush=True),
+                    )
             finally:
                 if method_status is not None:
                     method_status.__exit__(None, None, None)
@@ -6232,20 +7257,26 @@ def _run_methods_parallel(
                         force_color=True,
                     )
                     raise
+                if on_method_complete is not None:
+                    try:
+                        on_method_complete(str(method), results_by_method[method])
+                    except Exception:
+                        pass
                 elapsed = format_elapsed(
                     (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                     + _method_offset(str(method))
                 )
                 method_disp = _method_display(str(method))
-                print_success(
-                    f"{method_disp} ...Finished [{elapsed}]",
-                    force_color=True,
-                )
-                _emit_method_details_plain(
-                    method,
-                    results_by_method[method],
-                    line_printer=lambda s: print(s, flush=True),
-                )
+                if emit_method_summary:
+                    print_success(
+                        f"{method_disp} ...Finished [{elapsed}]",
+                        force_color=True,
+                    )
+                    _emit_method_details_plain(
+                        method,
+                        results_by_method[method],
+                        line_printer=lambda s: print(s, flush=True),
+                    )
     elif bool(show_method_progress and rich_progress_available()):
         progress = build_rich_progress(
             description_template="{task.fields[method]}",
@@ -6345,6 +7376,11 @@ def _run_methods_parallel(
                             method = future_map.pop(fut)
                             res = fut.result()
                             results_by_method[method] = res
+                            if on_method_complete is not None:
+                                try:
+                                    on_method_complete(str(method), res)
+                                except Exception:
+                                    pass
                             tid = task_map.get(method)
                             if tid is not None:
                                 try:
@@ -6356,12 +7392,13 @@ def _run_methods_parallel(
                                 (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                                 + _method_offset(str(method))
                             )
-                            _rich_print_success(_method_display(str(method)), elapsed)
-                            _emit_method_details_plain(
-                                method,
-                                res,
-                                line_printer=lambda s: progress.console.print(s, highlight=False),
-                            )
+                            if emit_method_summary:
+                                _rich_print_success(_method_display(str(method)), elapsed)
+                                _emit_method_details_plain(
+                                    method,
+                                    res,
+                                    line_printer=lambda s: progress.console.print(s, highlight=False),
+                                )
             except Exception:
                 for method, tid in task_map.items():
                     try:
@@ -6434,6 +7471,11 @@ def _run_methods_parallel(
                         method = future_map.pop(fut)
                         res = fut.result()
                         results_by_method[method] = res
+                        if on_method_complete is not None:
+                            try:
+                                on_method_complete(str(method), res)
+                            except Exception:
+                                pass
                         methods_done = min(method_total, methods_done + 1)
                         pbar.update(1)
                         pbar.set_description_str(
@@ -6445,15 +7487,16 @@ def _run_methods_parallel(
                             (time.monotonic() - method_start_ts.get(method, time.monotonic()))
                             + _method_offset(str(method))
                         )
-                        print_success(
-                            f"{_method_display(str(method))} ...Finished [{elapsed}]",
-                            force_color=True,
-                        )
-                        _emit_method_details_plain(
-                            method,
-                            res,
-                            line_printer=lambda s: print(s, flush=True),
-                        )
+                        if emit_method_summary:
+                            print_success(
+                                f"{_method_display(str(method))} ...Finished [{elapsed}]",
+                                force_color=True,
+                            )
+                            _emit_method_details_plain(
+                                method,
+                                res,
+                                line_printer=lambda s: print(s, flush=True),
+                            )
         finally:
             pbar.close()
             try:
@@ -8011,6 +9054,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help="Use ElasticNet genomic selection with compact inner tuning "
              "(default: %(default)s).",
     )
+    model_group.add_argument(
+        "-model", "--model",
+        type=str,
+        default=None,
+        help=(
+            "Load saved .jxmodel file/folder for direct prediction/evaluation. "
+            "When set, selected methods are loaded from model artifacts instead of refitting."
+        ),
+    )
     # ------------------------------------------------------------------
     # Optional arguments
     # ------------------------------------------------------------------
@@ -8556,6 +9608,13 @@ def parse_args(argv: typing.Optional[list[str]] = None):
 
     if (args.hash_dim is not None) and (int(args.hash_dim) <= 0):
         parser.error("--hash dim must be > 0.")
+    if args.model is not None:
+        model_path = str(args.model).strip()
+        if model_path == "":
+            parser.error("--model path must not be empty.")
+        if not os.path.exists(model_path):
+            parser.error(f"--model path does not exist: {model_path}")
+        args.model = model_path
     return args
 
 
@@ -8789,77 +9848,6 @@ def _run_gs_pipeline(
     packed_preprocess_requested = bool(
         hard_packed_preprocess_requested or auto_packed_lmm_requested
     )
-    if packed_preprocess_requested and (not gfile_is_plink):
-        if bool(args.vcf) or bool(args.hmp) or bool(args.file):
-            src_label = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
-            with CliStatus(
-                f"Preparing PLINK cache for packed GS from {src_label}...",
-                enabled=use_spinner,
-            ) as task:
-                try:
-                    cached_prefix = prepare_cli_input_cache(
-                        str(gfile),
-                        snps_only=False,
-                        delimiter=None,
-                        # For -file inputs, allow TXT/TSV/CSV sources to be packed
-                        # into PLINK BED for packed preprocessing / auto packed LMM flow.
-                        prefer_plink_for_txt=True,
-                    )
-                except Exception as ex:
-                    if hard_packed_preprocess_requested:
-                        task.fail("Preparing PLINK cache for packed GS ...Failed")
-                        raise
-                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
-                    logger.warning(
-                        "Auto packed LMM cache was requested but failed; fallback to dense path. "
-                        f"reason: {ex}"
-                    )
-                    cached_prefix = None
-                if cached_prefix is not None and _is_plink_prefix(str(cached_prefix)):
-                    gfile = str(cached_prefix).replace("\\", "/")
-                    gfile_is_plink = True
-                    task.complete(
-                        "Preparing PLINK cache for packed GS ...Finished "
-                        f"({format_path_for_display(gfile)})"
-                    )
-                elif cached_prefix is not None:
-                    if hard_packed_preprocess_requested:
-                        task.fail("Preparing PLINK cache for packed GS ...Failed")
-                        if pcg_packed_preprocess_requested:
-                            logger.error(
-                                "rrBLUP solver=pcg requires packed PLINK cache, but input could not be "
-                                f"converted to PLINK BED: {cached_prefix}."
-                            )
-                            raise SystemExit(1)
-                        logger.error(
-                            "--hash/--ldprune require PLINK BED input. "
-                            "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
-                            "when source resolves to VCF/HMP/TXT. "
-                            f"Current input could not be converted to BED: {cached_prefix}. "
-                            "For -file inputs backed by .npy/.bin, please convert to -bfile first."
-                        )
-                        raise SystemExit(1)
-                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
-                    logger.warning(
-                        "Auto packed LMM cache produced non-PLINK output; fallback to dense path. "
-                        f"resolved={cached_prefix}"
-                    )
-        else:
-            if hard_packed_preprocess_requested:
-                if pcg_packed_preprocess_requested:
-                    logger.error(
-                        "rrBLUP solver=pcg requires packed PLINK cache. "
-                        "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
-                    )
-                    raise SystemExit(1)
-                logger.error(
-                    "--hash/--ldprune require PLINK BED input. "
-                    "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
-                )
-                raise SystemExit(1)
-            logger.warning(
-                "Auto packed LMM cache requested but input is not convertible; fallback to dense path."
-            )
 
     checks: list[bool] = []
     if gfile_is_plink:
@@ -8907,12 +9895,33 @@ def _run_gs_pipeline(
             _seen_methods.add(_m)
             _uniq_methods.append(_m)
         methods = _uniq_methods
+    model_mode = bool(args.model is not None)
+    if model_mode and len(methods) == 0:
+        inferred = _discover_jxmodel_methods(str(args.model))
+        if len(inferred) > 0:
+            methods = inferred
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
-            "--GBLUP [a|d|ad]/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET."
+            "--GBLUP [a|d|ad]/--rrBLUP/--BayesA/--BayesB/--BayesCpi/--RF/--ET/--GBDT/--XGB/--SVM/--ENET "
+            "or provide --model with discoverable *.jxmodel files."
         )
         raise SystemExit(1)
+    if model_mode:
+        unsupported = [m for m in methods if not _is_jxmodel_export_supported(m)]
+        if len(unsupported) > 0:
+            logger.error(
+                "Loaded-model mode currently supports rrBLUP/Bayes/RF/ET/GBDT/XGB/SVM/ENET. "
+                "Unsupported: " + ", ".join(unsupported)
+            )
+            raise SystemExit(1)
+    cv_enabled = bool(args.cv is not None)
+    if model_mode and cv_enabled:
+        logger.warning(
+            "--cv is ignored when --model is set. "
+            "Loaded-model mode runs prediction only."
+        )
+        cv_enabled = False
     ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
     gblup_d_like_methods = [
         m for m in methods
@@ -8962,9 +9971,13 @@ def _run_gs_pipeline(
             else ",".join(str(int(i)) for i in args.ncol)
         )
         cv_cfg = (
-            "off"
-            if args.cv is None
-            else f"{int(args.cv)}-fold, strict={bool(args.strict_cv)}"
+            f"{int(args.cv)}-fold, strict={bool(args.strict_cv)}"
+            if cv_enabled
+            else (
+                "off (--model: predict-only)"
+                if (model_mode and (args.cv is not None))
+                else "off"
+            )
         )
         ld_cfg = (
             args.ldprune_spec.label()
@@ -9031,6 +10044,7 @@ def _run_gs_pipeline(
                     [
                         ("Threads", int(args.thread)),
                         ("CV", cv_cfg),
+                        ("Model mode", ("on" if model_mode else "off")),
                         ("Train prediction", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
                     ],
                 ),
@@ -9039,6 +10053,79 @@ def _run_gs_pipeline(
             footer_rows=[("Output prefix", outprefix)],
             line_max_chars=62,
         )
+
+    if packed_preprocess_requested and (not gfile_is_plink):
+        if bool(args.vcf) or bool(args.hmp) or bool(args.file):
+            src_label = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
+            with CliStatus(
+                f"Preparing PLINK cache for packed GS from {src_label}...",
+                enabled=use_spinner,
+            ) as task:
+                try:
+                    cached_prefix = prepare_cli_input_cache(
+                        str(gfile),
+                        snps_only=False,
+                        delimiter=None,
+                        # For -file inputs, allow TXT/TSV/CSV sources to be packed
+                        # into PLINK BED for packed preprocessing / auto packed LMM flow.
+                        prefer_plink_for_txt=True,
+                    )
+                except Exception as ex:
+                    if hard_packed_preprocess_requested:
+                        task.fail("Preparing PLINK cache for packed GS ...Failed")
+                        raise
+                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
+                    logger.warning(
+                        "Auto packed LMM cache was requested but failed; fallback to dense path. "
+                        f"reason: {ex}"
+                    )
+                    cached_prefix = None
+                if cached_prefix is not None and _is_plink_prefix(str(cached_prefix)):
+                    gfile = str(cached_prefix).replace("\\", "/")
+                    gfile_is_plink = True
+                    task.complete(
+                        "Preparing PLINK cache for packed GS ...Finished "
+                        f"({format_path_for_display(gfile)})"
+                    )
+                    logger.info(f"Cached bfile: {format_path_for_display(gfile)}")
+                elif cached_prefix is not None:
+                    if hard_packed_preprocess_requested:
+                        task.fail("Preparing PLINK cache for packed GS ...Failed")
+                        if pcg_packed_preprocess_requested:
+                            logger.error(
+                                "rrBLUP solver=pcg requires packed PLINK cache, but input could not be "
+                                f"converted to PLINK BED: {cached_prefix}."
+                            )
+                            raise SystemExit(1)
+                        logger.error(
+                            "--hash/--ldprune require PLINK BED input. "
+                            "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
+                            "when source resolves to VCF/HMP/TXT. "
+                            f"Current input could not be converted to BED: {cached_prefix}. "
+                            "For -file inputs backed by .npy/.bin, please convert to -bfile first."
+                        )
+                        raise SystemExit(1)
+                    task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
+                    logger.warning(
+                        "Auto packed LMM cache produced non-PLINK output; fallback to dense path. "
+                        f"resolved={cached_prefix}"
+                    )
+        else:
+            if hard_packed_preprocess_requested:
+                if pcg_packed_preprocess_requested:
+                    logger.error(
+                        "rrBLUP solver=pcg requires packed PLINK cache. "
+                        "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
+                    )
+                    raise SystemExit(1)
+                logger.error(
+                    "--hash/--ldprune require PLINK BED input. "
+                    "Auto-cache to PLINK is supported for -vcf/-hmp/-file when convertible."
+                )
+                raise SystemExit(1)
+            logger.warning(
+                "Auto packed LMM cache requested but input is not convertible; fallback to dense path."
+            )
 
     # ------------------------------------------------------------------
     # Load phenotype
@@ -10034,7 +11121,7 @@ def _run_gs_pipeline(
             else:
                 used_stream_ztz = False
                 if (
-                    args.cv is not None
+                    cv_enabled
                     and _jxrs is not None
                     and hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")
                 ):
@@ -10051,7 +11138,7 @@ def _run_gs_pipeline(
                     trait_packed_ctx["__gblup_hash_standardize__"] = bool(hash_std)
                     used_stream_ztz = True
                 if (
-                    args.cv is None
+                    (not cv_enabled)
                     and _jxrs is not None
                     and hasattr(_jxrs, "bed_packed_signed_hash_ztz_stats_f64")
                 ):
@@ -10265,7 +11352,7 @@ def _run_gs_pipeline(
 
         # 5-fold cross-validation on training population
         cv_splits = None
-        if args.cv is not None:
+        if cv_enabled:
             cv_splits = build_cv_splits(
                 n_samples=int(train_sample_idx.shape[0]),
                 n_splits=int(args.cv),
@@ -10318,77 +11405,194 @@ def _run_gs_pipeline(
             gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
 
         sep_w = max(40, min(80, _terminal_columns()))
-        logger.info("*" * sep_w)
-        logger.info(
-            f"* Genomic Selection for trait: {trait_name}\n"
-            f"Train size: {np.sum(trainmask)}, Test size: {np.sum(testmask)}, EffSNPs: {eff_snp}"
+        gs_output.emit_trait_header(
+            logger,
+            trait_name=str(trait_name),
+            train_size=int(np.sum(trainmask)),
+            test_size=int(np.sum(testmask)),
+            eff_snp=int(eff_snp),
+            sep_width=int(sep_w),
+            debug_mode=bool(debug_mode),
+            gblup_backend_label=gblup_backend_label,
+            gblup_backend_n=gblup_backend_n,
+            gblup_backend_m=gblup_backend_m,
         )
-        if (
-            bool(debug_mode)
-            and gblup_backend_label is not None
-            and gblup_backend_n is not None
-            and gblup_backend_m is not None
-        ):
-            logger.info(
-                f"GBLUP backend(auto): {gblup_backend_label} "
-                f"(n={gblup_backend_n}, m={gblup_backend_m})"
+        method_display_map = {str(m): _method_display_name(str(m)) for m in methods}
+        out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
+        expected_test_n = int(np.sum(testmask))
+        pred_by_method: dict[str, np.ndarray] = {}
+
+        def _emit_method_header(method_key: str) -> None:
+            m_key = str(method_key)
+            m_disp = method_display_map.get(m_key, _method_display_name(m_key))
+            gs_output.emit_method_header(logger, m_disp)
+
+        def _emit_method_block_and_artifacts(
+            method_key: str,
+            res_obj: dict[str, typing.Any],
+        ) -> None:
+            m_key = str(method_key)
+            m_disp = method_display_map.get(m_key, _method_display_name(m_key))
+
+            cv_sec = float(res_obj.get("elapsed_cv_sec", np.nan))
+            fit_sec = float(res_obj.get("elapsed_fit_sec", np.nan))
+            pred_sec = float(res_obj.get("elapsed_predict_sec", np.nan))
+            stage_lines_emitted = bool(res_obj.get("__stage_lines_emitted", False))
+            cv_line_emitted = bool(res_obj.get("__cv_line_emitted", False))
+            gs_output.emit_method_stage_lines(
+                logger,
+                cv_folds=(
+                    (int(len(cv_splits)) if cv_splits is not None else None)
+                    if (not cv_line_emitted)
+                    else None
+                ),
+                cv_elapsed_sec=float(cv_sec),
+                fit_elapsed_sec=float(fit_sec),
+                predict_elapsed_sec=float(pred_sec),
+                include_fit=bool((args.model is None) and (not stage_lines_emitted)),
+                include_predict=bool(not stage_lines_emitted),
+                terminal_columns=int(_terminal_columns()),
+                format_elapsed=format_elapsed,
+                log_success=log_success,
             )
+
+            cv_mode_row = str(res_obj.get("cv_mode", "train_cv")).strip().lower()
+            gs_output.emit_method_detail_lines(
+                logger,
+                cv_mode=cv_mode_row,
+                is_gblup=bool(_is_gblup_method(m_key)),
+                gblup_kernel_label=(
+                    _gblup_mode_label(_gblup_method_kernel_mode(m_key))
+                    if _is_gblup_method(m_key)
+                    else None
+                ),
+                gblup_backend_label=(
+                    "packed active" if _looks_like_packed_payload(trait_packed_ctx) else "dense"
+                ),
+            )
+
+            if args.model is None and _is_jxmodel_export_supported(m_key):
+                state_raw = res_obj.get("model_state", None)
+                if isinstance(state_raw, dict) and len(state_raw) > 0:
+                    payload = {
+                        "format": _JXMODEL_FORMAT,
+                        "method": str(m_key),
+                        "method_display": str(m_disp),
+                        "trait": str(trait_name),
+                        "created_at_unix": float(time.time()),
+                        "pve_final": float(res_obj.get("pve_final", np.nan)),
+                        "model_state": dict(state_raw),
+                    }
+                    model_out = f"{outprefix}.{trait_name}.gs.{m_key}.jxmodel"
+                    _save_jxmodel(model_out, payload)
+                    saved_result_paths.append(str(model_out))
+                    log_success(
+                        logger,
+                        f"Saved model to {format_path_for_display(model_out)}",
+                    )
+                else:
+                    logger.warning(
+                        f"Skip model export for method={m_key}: fitted model state is unavailable."
+                    )
+
+            pred_arr = np.asarray(res_obj["test_pred"], dtype=float).reshape(-1, 1)
+            n_pred = int(pred_arr.shape[0])
+            if n_pred != expected_test_n:
+                if (n_pred == 0) and (expected_test_n > 0):
+                    logger.warning(
+                        f"{m_key} returned empty test predictions while expected n_test={expected_test_n}; "
+                        "filling with NaN."
+                    )
+                    pred_arr = np.full((expected_test_n, 1), np.nan, dtype=float)
+                else:
+                    raise RuntimeError(
+                        f"Prediction length mismatch for method={m_key}: "
+                        f"got n_pred={n_pred}, expected n_test={expected_test_n}."
+                    )
+            pred_by_method[m_key] = pred_arr
+            ordered_keys = [str(mm) for mm in methods if str(mm) in pred_by_method]
+            outpred_partial = pd.DataFrame(
+                np.concatenate([pred_by_method[k] for k in ordered_keys], axis=1),
+                columns=[method_display_map.get(k, k) for k in ordered_keys],
+                index=samples[testmask],
+            )
+            outpred_partial.to_csv(out_tsv, sep="\t", float_format="%.4f")
+
         t_stage = time.time()
-        method_results = _run_methods_parallel(
-            methods=methods,
-            train_pheno=train_pheno,
-            train_snp=train_snp,
-            test_snp=test_snp,
-            train_snp_add=train_snp_add,
-            test_snp_add=test_snp_add,
-            train_snp_ml=train_snp_ml,
-            test_snp_ml=test_snp_ml,
-            pca_dec=args.pcd,
-            cv_splits=cv_splits,
-            n_jobs=int(max(1, args.thread)),
-            strict_cv=bool(args.strict_cv),
-            force_fast=bool(args.force_fast),
-            packed_ctx=trait_packed_ctx,
-            train_sample_indices=train_sample_idx,
-            test_sample_indices=test_sample_idx,
-            limit_predtrain=args.limit_predtrain,
-            elapsed_offset_by_method=method_elapsed_offsets,
-            rrblup_solver=rrblup_solver,
-            rrblup_adamw_cfg=rrblup_adamw_cfg,
-            bayes_auto_r2_cfg=bayes_auto_r2_cfg,
-        )
+        if model_mode:
+            method_results = []
+            for m in methods:
+                model_file = _resolve_jxmodel_file(
+                    model_arg=str(args.model),
+                    trait_name=str(trait_name),
+                    method=str(m),
+                    prefix_hint=str(args.prefix),
+                )
+                artifact = _load_jxmodel(model_file)
+                artifact_method = str(artifact.get("method", "")).strip()
+                if artifact_method != "" and artifact_method != str(m):
+                    raise ValueError(
+                        f"Loaded model mismatch: expected method={m}, got {artifact_method} in {model_file}."
+                    )
+                model_state = artifact.get("model_state", None)
+                if not isinstance(model_state, dict) or len(model_state) == 0:
+                    raise ValueError(f"Loaded model artifact missing model_state: {model_file}")
+                res = _run_loaded_model_task(
+                    method=str(m),
+                    model_state=dict(model_state),
+                    train_pheno=train_pheno,
+                    train_snp=train_snp,
+                    test_snp=test_snp,
+                    train_snp_ml=train_snp_ml,
+                    test_snp_ml=test_snp_ml,
+                    packed_ctx=trait_packed_ctx if _looks_like_packed_payload(trait_packed_ctx) else None,
+                    train_sample_indices=train_sample_idx,
+                    test_sample_indices=test_sample_idx,
+                    cv_splits=None,
+                    limit_predtrain=args.limit_predtrain,
+                )
+                res["model_file"] = str(model_file)
+                method_results.append(res)
+                _emit_method_header(str(m))
+                _emit_method_block_and_artifacts(str(m), res)
+        else:
+            method_results = _run_methods_parallel(
+                methods=methods,
+                train_pheno=train_pheno,
+                train_snp=train_snp,
+                test_snp=test_snp,
+                train_snp_add=train_snp_add,
+                test_snp_add=test_snp_add,
+                train_snp_ml=train_snp_ml,
+                test_snp_ml=test_snp_ml,
+                pca_dec=args.pcd,
+                cv_splits=cv_splits,
+                n_jobs=int(max(1, args.thread)),
+                strict_cv=bool(args.strict_cv),
+                force_fast=bool(args.force_fast),
+                packed_ctx=trait_packed_ctx,
+                train_sample_indices=train_sample_idx,
+                test_sample_indices=test_sample_idx,
+                limit_predtrain=args.limit_predtrain,
+                elapsed_offset_by_method=method_elapsed_offsets,
+                rrblup_solver=rrblup_solver,
+                rrblup_adamw_cfg=rrblup_adamw_cfg,
+                bayes_auto_r2_cfg=bayes_auto_r2_cfg,
+                emit_cv_progress_bar=True,
+                emit_method_summary=False,
+                on_method_start=_emit_method_header,
+                on_method_complete=_emit_method_block_and_artifacts,
+            )
         if _GS_DEBUG_STAGE:
             logger.info(
                 f"[GS-DEBUG][{trait_name}] stage=run_methods_parallel "
                 f"elapsed={time.time() - t_stage:.3f}s"
             )
         method_result_map = {str(x["method"]): x for x in method_results}
-        method_display_map = {str(m): _method_display_name(str(m)) for m in methods}
 
-        if args.cv is not None:
-            logger.info("-" * 60)
-            row_fmt = (
-                "{fold:>4} "
-                "{method:<10} "
-                "{pear:>8} "
-                "{spear:>9} "
-                "{r2:>6} "
-                "{h2:>6} "
-                "{time:>10}"
-            )
-            logger.info(
-                row_fmt.format(
-                    fold="Fold",
-                    method="Method",
-                    pear="Pearsonr",
-                    spear="Spearmanr",
-                    r2="R2",
-                    h2="h2/PVE",
-                    time="time(secs)",
-                )
-            )
+        all_rows: list[tuple[str, int, float, float, float, float, float]] = []
+        if cv_splits is not None:
             method_order = {str(m): i for i, m in enumerate(methods)}
-            all_rows: list[tuple[str, int, float, float, float, float, float]] = []
             for method in methods:
                 res = method_result_map.get(method)
                 if res is None:
@@ -10402,20 +11606,7 @@ def _run_gs_pipeline(
                     str(r[0]),
                 )
             )
-            for row in all_rows:
-                m_name, fold_id, pear, spear, r2, pve, t_fold = row
-                logger.info(
-                    row_fmt.format(
-                        fold=int(fold_id),
-                        method=method_display_map.get(str(m_name), str(m_name)),
-                        pear=f"{float(pear):.3f}",
-                        spear=f"{float(spear):.3f}",
-                        r2=f"{float(r2):.3f}",
-                        h2=f"{float(pve):.3f}",
-                        time=f"{float(t_fold):.3f}",
-                    )
-                )
-        if args.cv is not None:
+        if cv_splits is not None:
             for method in methods:
                 res = method_result_map.get(method)
                 if res is None:
@@ -10448,25 +11639,53 @@ def _run_gs_pipeline(
             raise RuntimeError(
                 "Missing GS results for methods: " + ", ".join(missing_methods)
             )
-        expected_test_n = int(np.sum(testmask))
-        outpred_list: list[np.ndarray] = []
+
+        pred_cols: list[np.ndarray] = []
+        pred_colnames: list[str] = []
         for m in methods:
-            pred_arr = np.asarray(method_result_map[m]["test_pred"], dtype=float).reshape(-1, 1)
-            n_pred = int(pred_arr.shape[0])
-            if n_pred == expected_test_n:
-                outpred_list.append(pred_arr)
-                continue
-            if (n_pred == 0) and (expected_test_n > 0):
-                logger.warning(
-                    f"{m} returned empty test predictions while expected n_test={expected_test_n}; "
-                    "filling with NaN."
-                )
-                outpred_list.append(np.full((expected_test_n, 1), np.nan, dtype=float))
-                continue
-            raise RuntimeError(
-                f"Prediction length mismatch for method={m}: "
-                f"got n_pred={n_pred}, expected n_test={expected_test_n}."
+            m_key = str(m)
+            m_disp = method_display_map.get(m_key, m_key)
+            pred_arr = pred_by_method.get(m_key)
+            if pred_arr is None:
+                res = method_result_map.get(m_key)
+                if res is None:
+                    continue
+                pred_arr = np.asarray(res["test_pred"], dtype=float).reshape(-1, 1)
+                n_pred = int(pred_arr.shape[0])
+                if n_pred != expected_test_n:
+                    if (n_pred == 0) and (expected_test_n > 0):
+                        logger.warning(
+                            f"{m_key} returned empty test predictions while expected n_test={expected_test_n}; "
+                            "filling with NaN."
+                        )
+                        pred_arr = np.full((expected_test_n, 1), np.nan, dtype=float)
+                    else:
+                        raise RuntimeError(
+                            f"Prediction length mismatch for method={m_key}: "
+                            f"got n_pred={n_pred}, expected n_test={expected_test_n}."
+                        )
+            pred_cols.append(np.asarray(pred_arr, dtype=float).reshape(-1, 1))
+            pred_colnames.append(str(m_disp))
+
+        if len(pred_cols) == 0:
+            raise RuntimeError("No GS test predictions were collected from methods.")
+
+        outpred = pd.DataFrame(
+            np.concatenate(pred_cols, axis=1),
+            columns=pred_colnames,
+            index=samples[testmask],
+        )
+        outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
+        saved_result_paths.append(str(out_tsv))
+
+        if cv_splits is not None:
+            gs_output.emit_cv_fold_table(
+                logger,
+                all_rows=all_rows,
+                method_result_map=typing.cast(dict[str, dict[str, typing.Any]], method_result_map),
+                method_display_map=method_display_map,
             )
+
         for m in methods:
             res = method_result_map.get(m)
             if res is None:
@@ -10493,6 +11712,7 @@ def _run_gs_pipeline(
                 {
                     "trait": str(trait_name),
                     "model": str(method_display_map.get(str(m), str(m))),
+                    "cv_mode": str(res.get("cv_mode", "train_cv")),
                     "n_train": int(np.sum(trainmask)),
                     "n_test": int(expected_test_n),
                     "pearsonr_cv_mean": pear_mean,
@@ -10502,16 +11722,7 @@ def _run_gs_pipeline(
                     "time_cv_mean_sec": elapsed_mean,
                 }
             )
-        logger.info(f"-"*60) if args.cv is not None else None
-        # Stack predictions from all models: shape (n_test, n_methods)
-        outpred = pd.DataFrame(
-            np.concatenate(outpred_list, axis=1),
-            columns=[method_display_map.get(str(m), str(m)) for m in methods],
-            index=samples[testmask],
-        )
-        out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
-        outpred.to_csv(out_tsv, sep="\t", float_format="%.4f")
-        saved_result_paths.append(str(out_tsv))
+        logger.info(f"-"*60) if cv_splits is not None else None
         log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
         log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
 

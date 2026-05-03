@@ -2204,9 +2204,7 @@ pub fn load_bed_2bit_packed<'py>(
             let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
             let mut maf: Vec<f32> = vec![0.0; n_snps];
             let mut std_denom: Vec<f32> = vec![0.0; n_snps];
-            let n_samples_f = n_samples as f32;
-            let full_bytes = n_samples / 4;
-            let rem = n_samples % 4;
+            let byte_counts = build_bed_count_byte_table();
             missing_rate
                 .par_iter_mut()
                 .zip(maf.par_iter_mut())
@@ -2214,50 +2212,12 @@ pub fn load_bed_2bit_packed<'py>(
                 .enumerate()
                 .for_each(|(snp_idx, ((miss_dst, maf_dst), std_dst))| {
                     let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-                    let mut non_missing: usize = 0;
-                    let mut alt_sum: usize = 0;
+                    let (missing, het, hom_alt) =
+                        count_packed_row_counts(row, n_samples, &byte_counts);
+                    let non_missing = n_samples.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
 
-                    for &byte in row.iter().take(full_bytes) {
-                        for within in 0..4 {
-                            let code = (byte >> (within * 2)) & 0b11;
-                            match code {
-                                0b00 => {
-                                    non_missing += 1;
-                                }
-                                0b10 => {
-                                    non_missing += 1;
-                                    alt_sum += 1;
-                                }
-                                0b11 => {
-                                    non_missing += 1;
-                                    alt_sum += 2;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if rem > 0 {
-                        let byte = row[full_bytes];
-                        for within in 0..rem {
-                            let code = (byte >> (within * 2)) & 0b11;
-                            match code {
-                                0b00 => {
-                                    non_missing += 1;
-                                }
-                                0b10 => {
-                                    non_missing += 1;
-                                    alt_sum += 1;
-                                }
-                                0b11 => {
-                                    non_missing += 1;
-                                    alt_sum += 2;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    *miss_dst = 1.0_f32 - (non_missing as f32 / n_samples_f);
+                    *miss_dst = (missing as f32) / (n_samples as f32);
                     if non_missing > 0 {
                         let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
                         let maf_v = p.min(1.0_f32 - p);
@@ -2414,78 +2374,46 @@ pub fn prepare_bed_2bit_packed<'py>(
                 .read_exact(&mut packed_full)
                 .map_err(|e| format!("failed to read BED payload: {e}"))?;
 
+            let byte_counts = build_bed_count_byte_table();
+            let row_stats: Vec<(f32, f32, f32, f32, bool)> = packed_full
+                .par_chunks(bytes_per_snp)
+                .map(|row| {
+                    let (missing, het, hom_alt) =
+                        count_packed_row_counts(row, n_samples, &byte_counts);
+                    let non_missing = n_samples.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let miss = (missing as f32) / (n_samples as f32);
+                    if non_missing > 0 {
+                        let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
+                        let flip = p > 0.5_f64;
+                        let maf_v = p.min(1.0_f64 - p) as f32;
+                        let het_rate = het as f32 / non_missing as f32;
+                        let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
+                        let std = if d.is_finite() { d } else { 0.0_f32 };
+                        (miss, maf_v, std, het_rate, flip)
+                    } else {
+                        (miss, 0.0_f32, 0.0_f32, 0.0_f32, false)
+                    }
+                })
+                .collect();
+            if row_stats.len() != n_snps {
+                return Err(format!(
+                    "internal error: stats rows {} != n_snps {n_snps}",
+                    row_stats.len()
+                ));
+            }
+
             let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
             let mut maf: Vec<f32> = vec![0.0; n_snps];
             let mut std_denom: Vec<f32> = vec![0.0; n_snps];
             let mut het_rate: Vec<f32> = vec![0.0; n_snps];
             let mut row_flip: Vec<bool> = vec![false; n_snps];
-            let n_samples_f = n_samples as f32;
-            let full_bytes = n_samples / 4;
-            let rem = n_samples % 4;
-
-            for snp_idx in 0..n_snps {
-                let row = &packed_full[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-                let mut non_missing: usize = 0;
-                let mut alt_sum: usize = 0;
-                let mut het_count: usize = 0;
-
-                for &byte in row.iter().take(full_bytes) {
-                    for within in 0..4 {
-                        let code = (byte >> (within * 2)) & 0b11;
-                        match code {
-                            0b00 => {
-                                non_missing += 1;
-                            }
-                            0b10 => {
-                                non_missing += 1;
-                                alt_sum += 1;
-                                het_count += 1;
-                            }
-                            0b11 => {
-                                non_missing += 1;
-                                alt_sum += 2;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if rem > 0 {
-                    let byte = row[full_bytes];
-                    for within in 0..rem {
-                        let code = (byte >> (within * 2)) & 0b11;
-                        match code {
-                            0b00 => {
-                                non_missing += 1;
-                            }
-                            0b10 => {
-                                non_missing += 1;
-                                alt_sum += 1;
-                                het_count += 1;
-                            }
-                            0b11 => {
-                                non_missing += 1;
-                                alt_sum += 2;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                missing_rate[snp_idx] = 1.0_f32 - (non_missing as f32 / n_samples_f);
-                if non_missing > 0 {
-                    let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
-                    row_flip[snp_idx] = p > 0.5_f64;
-                    let maf_v = p.min(1.0_f64 - p) as f32;
-                    maf[snp_idx] = maf_v;
-                    het_rate[snp_idx] = het_count as f32 / non_missing as f32;
-                    let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
-                    std_denom[snp_idx] = if d.is_finite() { d } else { 0.0_f32 };
-                } else {
-                    row_flip[snp_idx] = false;
-                    maf[snp_idx] = 0.0_f32;
-                    het_rate[snp_idx] = 0.0_f32;
-                    std_denom[snp_idx] = 0.0_f32;
-                }
+            for (i, (miss, maf_v, std, het, flip)) in row_stats.iter().copied().enumerate() {
+                missing_rate[i] = miss;
+                maf[i] = maf_v;
+                std_denom[i] = std;
+                het_rate[i] = het;
+                row_flip[i] = flip;
             }
 
             let mut keep: Vec<bool> = vec![true; n_snps];
@@ -2518,27 +2446,32 @@ pub fn prepare_bed_2bit_packed<'py>(
                 );
             }
 
-            let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
-            let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
-            let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
-            let mut std_keep = Vec::<f32>::with_capacity(kept_n);
-            let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
-            let mut dst = 0usize;
-            for i in 0..n_snps {
-                if !keep[i] {
-                    continue;
+            let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep) = if kept_n == n_snps {
+                (packed_full, missing_rate, maf, std_denom, row_flip)
+            } else {
+                let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
+                let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut std_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+                let mut dst = 0usize;
+                for i in 0..n_snps {
+                    if !keep[i] {
+                        continue;
+                    }
+                    let src_off = i * bytes_per_snp;
+                    let dst_off = dst * bytes_per_snp;
+                    packed_keep[dst_off..dst_off + bytes_per_snp]
+                        .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
+                    miss_keep.push(missing_rate[i]);
+                    maf_keep.push(maf[i]);
+                    std_keep.push(std_denom[i]);
+                    row_flip_keep.push(row_flip[i]);
+                    dst = dst.saturating_add(1);
                 }
-                let src_off = i * bytes_per_snp;
-                let dst_off = dst * bytes_per_snp;
-                packed_keep[dst_off..dst_off + bytes_per_snp]
-                    .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
-                miss_keep.push(missing_rate[i]);
-                maf_keep.push(maf[i]);
-                std_keep.push(std_denom[i]);
-                row_flip_keep.push(row_flip[i]);
-                dst = dst.saturating_add(1);
-            }
-            debug_assert_eq!(dst, kept_n);
+                debug_assert_eq!(dst, kept_n);
+                (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep)
+            };
 
             Ok((
                 packed_keep,

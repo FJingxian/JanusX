@@ -378,10 +378,7 @@ def _animate_plain_process(
             body = f"{desc_text} [{format_elapsed(elapsed)}]"
         else:
             body = f"{desc_text}"
-        if bool(use_color) and (stdout_is_tty() or bool(use_color)):
-            line = f"\r{_CYAN}{frame}{_RESET} {body}"
-        else:
-            line = f"\r{frame} {body}"
+        line = f"\r{frame} {body}"
         try:
             _safe_print(line, flush=True, end="")
         except Exception:
@@ -406,7 +403,11 @@ class CliStatus:
         self.timeout = float(timeout)
         self.show_elapsed = bool(show_elapsed)
         self.use_process = bool(use_process)
-        self._animate = bool(self.enabled and should_animate_status(self.desc))
+        # Restrict spinner animation to interactive TTY only; in non-TTY
+        # contexts keep output clean and emit only completion lines.
+        self._animate = bool(
+            self.enabled and should_animate_status(self.desc) and stdout_is_tty()
+        )
         self._backend = "none"
         self._done = False
         self._thread: Optional[Thread] = None
@@ -422,10 +423,7 @@ class CliStatus:
             if self._plain_done:
                 break
             body = self._running_line()
-            if self.enabled and (stdout_is_tty() or self.enabled):
-                line = f"\r{_CYAN}{frame}{_RESET} {body}"
-            else:
-                line = f"\r{frame} {body}"
+            line = f"\r{frame} {body}"
             _safe_print(line, flush=True, end="")
             sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 
@@ -465,7 +463,7 @@ class CliStatus:
                             float(self._start_ts),
                             self._proc_stop_evt,
                             int(os.getpid()),
-                            bool(self.enabled),
+                            bool(self.enabled and stdout_is_tty()),
                         ),
                         daemon=True,
                     )
@@ -533,9 +531,9 @@ class CliStatus:
             return
 
         if self._backend in ("plain", "process"):
-            cols = get_terminal_size((80, 20)).columns
-            _safe_print("\r" + " " * cols, end="", flush=True)
-            _safe_print("\r", end="", flush=True)
+            # No-op teardown for plain/process fallback to avoid introducing
+            # extra blank lines in captured/pseudo-terminal outputs.
+            return
 
     def _elapsed_seconds(self) -> Optional[float]:
         if self._start_ts is None:

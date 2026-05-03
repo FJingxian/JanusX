@@ -1308,6 +1308,7 @@ pub fn rrblup_pcg_bed<'py>(
     usize,
     f64,
     f64,
+    Bound<'py, PyArray1<f32>>,
 )> {
     if max_iter == 0 {
         return Err(PyRuntimeError::new_err("max_iter must be > 0"));
@@ -1586,9 +1587,10 @@ pub fn rrblup_pcg_bed<'py>(
         rel_res,
         pve_lambda_vc,
         k_trace_mean,
+        beta_ret,
     ) = py
         .detach(
-            move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64), String> {
+            move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64, Vec<f32>), String> {
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];
                 let mut block = vec![0.0_f32; row_step * n_train];
@@ -1862,6 +1864,7 @@ pub fn rrblup_pcg_bed<'py>(
                     rel_res,
                     pve_lambda_vc,
                     mean_k_trace,
+                    beta,
                 ))
             },
         )
@@ -1879,6 +1882,7 @@ pub fn rrblup_pcg_bed<'py>(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .into_bound();
+    let beta_arr = PyArray1::from_owned_array(py, Array1::from_vec(beta_ret)).into_bound();
 
     Ok((
         train_arr,
@@ -1890,6 +1894,7 @@ pub fn rrblup_pcg_bed<'py>(
         m_effective,
         pve_lambda_vc,
         k_trace_mean,
+        beta_arr,
     ))
 }
 

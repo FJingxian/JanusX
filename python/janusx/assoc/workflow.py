@@ -18,10 +18,9 @@ Execution mode (automatic)
 
 Caching
 -------
-  - Genotype/GRM/PCA caches use parameterized filenames (no JSON cache metadata).
-  - GRM and PCA caches for streaming LMM/LM runs:
-      * genotype cache (VCF): ~{geno_prefix}.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam
-      * genotype cache (HMP): ~{geno_prefix}.bed/.bim/.fam
+  - Genotype cache uses a single base cache prefix (no JSON cache metadata):
+      * genotype cache (VCF/HMP): ~{geno_prefix}.bed/.bim/.fam
+  - GRM and PCA caches for streaming LMM/LM runs remain parameterized:
       * GRM cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.npy (+ .id)
       * PCA cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.pc{q}.txt
   - If genotype directory is not writable, cache falls back to

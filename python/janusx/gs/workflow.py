@@ -10087,7 +10087,6 @@ def _run_gs_pipeline(
                         "Preparing PLINK cache for packed GS ...Finished "
                         f"({format_path_for_display(gfile)})"
                     )
-                    logger.info(f"Cached bfile: {format_path_for_display(gfile)}")
                 elif cached_prefix is not None:
                     if hard_packed_preprocess_requested:
                         task.fail("Preparing PLINK cache for packed GS ...Failed")

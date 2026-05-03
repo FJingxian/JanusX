@@ -220,16 +220,6 @@ def _cache_prefix(prefix: str, cache_dir: Union[str, None] = None) -> str:
     return os.path.join(os.path.dirname(prefix), f"~{base}")
 
 
-def _fmt_cache_num(v: Union[float, int]) -> str:
-    x = float(v)
-    s = f"{x:.6g}"
-    if "e" in s or "E" in s:
-        s = f"{x:.12f}".rstrip("0").rstrip(".")
-    if s in {"", "-0"}:
-        s = "0"
-    return s
-
-
 def _vcf_cache_prefix(
     prefix: str,
     snps_only: bool = True,
@@ -239,14 +229,14 @@ def _vcf_cache_prefix(
     cache_dir: Union[str, None] = None,
 ) -> str:
     """
-    VCF->PLINK cache prefix using parameterized naming:
-      ~prefix.maf{maf}.geno{geno}.snp{0|1}
+    VCF->PLINK cache prefix.
+    Use a single base cache (~prefix) to avoid creating per-parameter cache files.
+    Runtime maf/missing/model/selection filters are applied during chunk decoding.
     """
-    base = _cache_prefix(prefix, cache_dir=cache_dir)
-    maf_s = _fmt_cache_num(0.0 if maf is None else maf)
-    geno_s = _fmt_cache_num(1.0 if missing_rate is None else missing_rate)
-    snp_s = "1" if bool(snps_only) else "0"
-    return f"{base}.maf{maf_s}.geno{geno_s}.snp{snp_s}"
+    _ = snps_only
+    _ = maf
+    _ = missing_rate
+    return _cache_prefix(prefix, cache_dir=cache_dir)
 
 
 @contextmanager
@@ -1310,9 +1300,9 @@ def load_genotype_chunks(
     - SNP order (rows) follows the original file order after filtering.
     - VCF/HMP/TXT caching itself does not perform maf/missing filtering or imputation.
       Filters are applied during chunk streaming in Rust readers.
-    - VCF cache uses parameterized filenames:
-      `~prefix.maf{maf}.geno{geno}.snp{0|1}.bed/.bim/.fam`
-      with mtime-based stale detection and lock-based concurrent build safety.
+    - VCF cache uses a single base filename:
+      `~prefix.bed/.bim/.fam`, with mtime-based stale detection and
+      lock-based concurrent build safety.
 
     Selection
     ---------

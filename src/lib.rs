@@ -95,7 +95,7 @@ use beam::{
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use blas::{rust_blas_get_num_threads, rust_blas_set_num_threads, rust_sgemm_backend};
 use bsa::preprocess_bsa;
-use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64};
+use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace};
 use gfreader::{
     bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
     load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
@@ -213,6 +213,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;

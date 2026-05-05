@@ -23,9 +23,7 @@ enum SgemmBackend {
 static SGEMM_BACKEND: OnceLock<SgemmBackend> = OnceLock::new();
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-const HAS_OPENBLAS_BACKEND: bool = cfg!(any(
-    all(feature = "blas-openblas", jx_openblas_available)
-));
+const HAS_OPENBLAS_BACKEND: bool = cfg!(any(all(feature = "blas-openblas", jx_openblas_available)));
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const HAS_ACCELERATE_BACKEND: bool = cfg!(all(
     target_os = "macos",
@@ -1115,7 +1113,10 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
         lapack_dsyevd_openblas(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Ok(());
     }
-    #[cfg(all(target_os = "windows", not(all(feature = "blas-openblas", jx_openblas_available))))]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
         let _ = (jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Err("lapack_dsyevd unavailable on this Windows build");
@@ -1203,7 +1204,10 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
         );
         return Ok(());
     }
-    #[cfg(all(target_os = "windows", not(all(feature = "blas-openblas", jx_openblas_available))))]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
         let _ = (
             jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,

@@ -105,6 +105,10 @@ try:
     from janusx.janusx import rust_eigh_from_array_f64 as _rust_eigh_from_array_f64
 except Exception:
     _rust_eigh_from_array_f64 = None
+try:
+    from janusx.janusx import rust_eigh_from_array_f64_inplace as _rust_eigh_from_array_f64_inplace
+except Exception:
+    _rust_eigh_from_array_f64_inplace = None
 
 try:
     from janusx.janusx import (
@@ -1115,12 +1119,47 @@ class LMM:
         kinship.flat[::kinship.shape[0]+1] += 1e-6
         t_start = time.time()
         eig_done = False
-        if _rust_eigh_from_array_f64 is not None:
+        kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
+        if _rust_eigh_from_array_f64_inplace is not None:
+            try:
+                eig_thr = int(_infer_blas_threads_from_env() or 0)
+                eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
+                    _rust_eigh_from_array_f64_inplace(
+                        kinship_eigh,
+                        threads=eig_thr,
+                        driver="auto",
+                        jobz="V",
+                        require_lapack=False,
+                    )
+                )
+                if evec_raw is None:
+                    raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
+                self.S = np.asarray(eval_raw, dtype=np.float64)
+                self.Dh = np.asarray(evec_raw, dtype=np.float64)
+                if not str(_evd_backend).lower().startswith("lapack_"):
+                    _emit_runtime_warning_once(
+                        "eigh_non_lapack",
+                        (
+                            "Rust eigh did not use LAPACK backend "
+                            f"(backend={_evd_backend}); performance may degrade."
+                        ),
+                )
+                eig_done = True
+            except Exception as ex:
+                _emit_runtime_warning_once(
+                    "eigh_scipy_fallback",
+                    (
+                        "Rust eigh failed; fallback to scipy.linalg.eigh "
+                        f"(reason: {ex})."
+                    ),
+                )
+                eig_done = False
+        elif _rust_eigh_from_array_f64 is not None:
             try:
                 eig_thr = int(_infer_blas_threads_from_env() or 0)
                 eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
                     _rust_eigh_from_array_f64(
-                        np.ascontiguousarray(kinship, dtype=np.float64),
+                        kinship_eigh,
                         threads=eig_thr,
                         driver="auto",
                         jobz="V",

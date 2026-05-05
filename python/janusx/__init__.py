@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 
@@ -49,3 +48,26 @@ def _init_windows_dll_search_path() -> None:
 
 _init_windows_dll_search_path()
 
+from . import linalg as linalg
+
+
+def _attach_native_linalg_alias() -> None:
+    """
+    Expose linear algebra convenience API on native extension namespace:
+        import janusx.janusx as jx
+        jx.linalg.eigh(...)
+    """
+    try:
+        from . import janusx as _jx
+    except Exception:
+        return
+    try:
+        if not hasattr(_jx, "linalg"):
+            setattr(_jx, "linalg", linalg)
+    except Exception:
+        pass
+
+
+_attach_native_linalg_alias()
+
+__all__ = ["linalg"]

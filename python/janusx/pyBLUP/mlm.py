@@ -880,6 +880,8 @@ class BLUP:
         sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2
         if self.kinship is None:
+            # rrBLUP exact: report train genetic variance scale
+            # (g = M^T u), which is the preferred operational PVE for GS.
             g = self.M.T @ self.u
             var_g = float(np.var(g, ddof=1))
         else:
@@ -1143,14 +1145,23 @@ class BLUP:
         else:
             self.u = self._fast_v @ (self._fast_svals[:, None] * rhs)
             self.alpha = None
-            g = np.empty((self.n, 1), dtype=np.float64)
+            # rrBLUP exact PVE uses train genetic variance Var(g), g = M^T u.
+            # Compute it in blocks to avoid allocating a full extra vector.
+            cnt = 0
+            mean_g = 0.0
+            m2_g = 0.0
             for st in range(0, n_train, step):
                 ed = min(st + step, n_train)
                 sidx_blk = np.ascontiguousarray(self._packed_sample_indices[st:ed], dtype=np.int64)
                 blk = _decode_packed_rows_f32(self._packed_ctx, self._packed_all_rows, sidx_blk)
-                blk64 = np.asarray(blk, dtype=np.float64)
-                g[st:ed] = blk64.T @ self.u
-            var_g = float(np.var(g, ddof=1))
+                g_blk = np.asarray(blk, dtype=np.float64).T @ self.u
+                vals = np.asarray(g_blk, dtype=np.float64).reshape(-1)
+                for x in vals:
+                    cnt += 1
+                    delta = float(x) - mean_g
+                    mean_g += delta / float(cnt)
+                    m2_g += delta * (float(x) - mean_g)
+            var_g = float(m2_g / float(max(1, cnt - 1)))
 
         sigma_g2 = self.rTV_invr / (self.n - self.p)
         sigma_e2 = lbd * sigma_g2

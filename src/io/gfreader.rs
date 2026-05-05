@@ -1939,6 +1939,29 @@ pub struct TxtChunkReader {
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
+    passthrough_raw: bool,
+}
+
+#[inline]
+fn impute_missing_with_row_mean(row: &mut [f32]) {
+    let mut sum: f64 = 0.0;
+    let mut n_obs: usize = 0;
+    for &v in row.iter() {
+        if v >= 0.0 {
+            sum += v as f64;
+            n_obs += 1;
+        }
+    }
+    let fill = if n_obs > 0 {
+        (sum / n_obs as f64) as f32
+    } else {
+        0.0
+    };
+    for v in row.iter_mut() {
+        if *v < 0.0 {
+            *v = fill;
+        }
+    }
 }
 
 #[pymethods]
@@ -1998,6 +2021,10 @@ impl TxtChunkReader {
             ));
         }
         let apply_het_filter = model_key != "add";
+        // When no genotype-QC is requested in additive mode, treat numeric
+        // TXT/NPY/BIN matrices as raw values instead of genotype dosage.
+        // This avoids accidental row dropping for non-0/1/2 matrices.
+        let passthrough_raw = maf <= 0.0 && miss >= 1.0 && !apply_het_filter;
 
         let it = TxtSnpIter::new(&path, delimiter.as_deref())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
@@ -2024,6 +2051,7 @@ impl TxtChunkReader {
             fill_missing: fill,
             apply_het_filter,
             het_threshold: het,
+            passthrough_raw,
         })
     }
 
@@ -2078,20 +2106,29 @@ impl TxtChunkReader {
                     } else {
                         self.sample_indices.iter().map(|&i| row[i]).collect()
                     };
-                    let keep = core::process_snp_row(
-                        &mut row_sub,
-                        &mut site.ref_allele,
-                        &mut site.alt_allele,
-                        self.maf,
-                        self.miss,
-                        self.fill_missing,
-                        self.apply_het_filter,
-                        self.het_threshold,
-                    );
-                    if keep {
+                    if self.passthrough_raw {
+                        if self.fill_missing {
+                            impute_missing_with_row_mean(&mut row_sub);
+                        }
                         data.extend_from_slice(&row_sub);
                         sites.push(site.into());
                         m += 1;
+                    } else {
+                        let keep = core::process_snp_row(
+                            &mut row_sub,
+                            &mut site.ref_allele,
+                            &mut site.alt_allele,
+                            self.maf,
+                            self.miss,
+                            self.fill_missing,
+                            self.apply_het_filter,
+                            self.het_threshold,
+                        );
+                        if keep {
+                            data.extend_from_slice(&row_sub);
+                            sites.push(site.into());
+                            m += 1;
+                        }
                     }
                 }
             }
@@ -2107,20 +2144,29 @@ impl TxtChunkReader {
                         } else {
                             self.sample_indices.iter().map(|&i| row[i]).collect()
                         };
-                        let keep = core::process_snp_row(
-                            &mut row_sub,
-                            &mut site.ref_allele,
-                            &mut site.alt_allele,
-                            self.maf,
-                            self.miss,
-                            self.fill_missing,
-                            self.apply_het_filter,
-                            self.het_threshold,
-                        );
-                        if keep {
+                        if self.passthrough_raw {
+                            if self.fill_missing {
+                                impute_missing_with_row_mean(&mut row_sub);
+                            }
                             data.extend_from_slice(&row_sub);
                             sites.push(site.into());
                             m += 1;
+                        } else {
+                            let keep = core::process_snp_row(
+                                &mut row_sub,
+                                &mut site.ref_allele,
+                                &mut site.alt_allele,
+                                self.maf,
+                                self.miss,
+                                self.fill_missing,
+                                self.apply_het_filter,
+                                self.het_threshold,
+                            );
+                            if keep {
+                                data.extend_from_slice(&row_sub);
+                                sites.push(site.into());
+                                m += 1;
+                            }
                         }
                     }
                     None => break,

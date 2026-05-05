@@ -1,5 +1,5 @@
 use numpy::ndarray::Array2;
-use numpy::{PyArray2, PyReadwriteArray1, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1};
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;

@@ -1895,8 +1895,11 @@ def main() -> None:
             elif use_direct_no_cache and source_kind == "txt":
                 txt_arg = str(args.file or gfile)
                 txt_matrix_path, txt_id_path, txt_site_path = _resolve_txt_direct_paths(txt_arg)
-                sample_ids = _read_id_sidecar(txt_id_path)
-                n_sites = _count_text_matrix_rows(txt_matrix_path)
+                # Keep explicit direct TXT paths for streaming later, but reuse
+                # the same reader stack used by conversion to avoid inspect/write
+                # count divergence on non-dosage numeric matrices.
+                _ = (txt_matrix_path, txt_id_path, txt_site_path)
+                sample_ids, n_sites = inspect_genotype_file(gfile)
             else:
                 sample_ids, n_sites = inspect_genotype_file(gfile)
         except Exception:

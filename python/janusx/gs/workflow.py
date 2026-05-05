@@ -250,6 +250,69 @@ def _gblup_mode_label(mode: str) -> str:
     return "additive"
 
 
+def _select_top_method_for_trait(
+    methods: list[str],
+    method_result_map: dict[str, dict[str, typing.Any]],
+    train_truth: np.ndarray,
+    metric: str,
+) -> tuple[str, dict[str, dict[str, float]]]:
+    metric_key = str(metric).strip().lower()
+    scores: dict[str, dict[str, float]] = {}
+    best_method = ""
+    best_score = np.inf if metric_key in {"rmse", "nrmse"} else -np.inf
+    for m in methods:
+        key = str(m)
+        res = method_result_map.get(key)
+        if res is None:
+            continue
+        oof_pred = res.get("oof_pred", None)
+        oof_truth = res.get("oof_truth", train_truth)
+        if oof_pred is None:
+            continue
+        y_true = np.asarray(oof_truth, dtype=np.float64).reshape(-1)
+        y_pred = np.asarray(oof_pred, dtype=np.float64).reshape(-1)
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if int(mask.sum()) < 2:
+            continue
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        pear = float(pearsonr(yt, yp).statistic)
+        spear = float(spearmanr(yt, yp).statistic)
+        ss_res = float(np.sum((yt - yp) ** 2))
+        ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+        rmse = float(np.sqrt(ss_res / max(1, int(mask.sum()))))
+        y_std = float(np.std(yt, ddof=0))
+        nrmse = float(rmse / y_std) if np.isfinite(y_std) and y_std > 0.0 else float("nan")
+        scores[key] = {
+            "pearson": pear,
+            "spearman": spear,
+            "r2": r2,
+            "rmse": rmse,
+            "nrmse": nrmse,
+        }
+        score = scores[key].get(metric_key, float("nan"))
+        if not np.isfinite(score):
+            continue
+        if metric_key in {"rmse", "nrmse"}:
+            better = (best_method == "") or (score < best_score)
+        else:
+            better = (best_method == "") or (score > best_score)
+        if better:
+            best_method = key
+            best_score = float(score)
+    if best_method == "":
+        # Fallback: first available method if all metrics are NaN.
+        for m in methods:
+            key = str(m)
+            if key in method_result_map:
+                best_method = key
+                break
+    if best_method == "":
+        raise RuntimeError("No valid method result found for TOP selection.")
+    return best_method, scores
+
+
 def _normalize_gblup_kernel_token(token: str) -> str:
     t = str(token).strip().lower()
     if t in {"a", "add", "additive"}:
@@ -299,6 +362,16 @@ def _methods_need_additive_dense(methods: list[str]) -> bool:
 
 
 _JXMODEL_FORMAT = "janusx.gs.jxmodel.v1"
+_JXMODEL_TOP_BUNDLE_METHOD = "GS_TOP_BUNDLE"
+_SELECT_INTERACTIVE_SENTINEL = "__JX_INTERACTIVE_TOP_SELECT__"
+
+
+def _is_top_bundle_method(method: str) -> bool:
+    return str(method).strip().upper() == _JXMODEL_TOP_BUNDLE_METHOD
+
+
+def _is_top_bundle_payload(payload: typing.Mapping[str, typing.Any]) -> bool:
+    return _is_top_bundle_method(str(payload.get("method", "")))
 
 
 def _is_jxmodel_export_supported(method: str) -> bool:
@@ -322,6 +395,21 @@ def _parse_jxmodel_method_from_name(path_like: str) -> str | None:
 
 
 def _discover_jxmodel_methods(model_arg: str) -> list[str]:
+    def _from_bundle(payload: dict[str, typing.Any]) -> list[str]:
+        trait_models = payload.get("trait_models", None)
+        out: list[str] = []
+        seen: set[str] = set()
+        if isinstance(trait_models, dict):
+            for item in trait_models.values():
+                if not isinstance(item, dict):
+                    continue
+                meth = str(item.get("selected_method", "")).strip()
+                if meth == "" or meth in seen:
+                    continue
+                seen.add(meth)
+                out.append(meth)
+        return out
+
     p = str(model_arg)
     if os.path.isfile(p):
         one = _parse_jxmodel_method_from_name(p)
@@ -330,6 +418,8 @@ def _discover_jxmodel_methods(model_arg: str) -> list[str]:
         try:
             payload = _load_jxmodel(p)
             method = str(payload.get("method", "")).strip()
+            if _is_top_bundle_method(method):
+                return _from_bundle(payload)
             return [method] if method != "" else []
         except Exception:
             return []
@@ -339,7 +429,19 @@ def _discover_jxmodel_methods(model_arg: str) -> list[str]:
     seen: set[str] = set()
     for fp in sorted(glob.glob(os.path.join(p, "*.jxmodel"))):
         m = _parse_jxmodel_method_from_name(fp)
-        if m is None or m in seen:
+        if m is None:
+            try:
+                payload = _load_jxmodel(fp)
+                meth = str(payload.get("method", "")).strip()
+                if _is_top_bundle_method(meth):
+                    for x in _from_bundle(payload):
+                        if x not in seen:
+                            seen.add(x)
+                            found.append(x)
+            except Exception:
+                pass
+            continue
+        if m in seen:
             continue
         seen.add(m)
         found.append(m)
@@ -405,6 +507,51 @@ def _load_jxmodel(path: str) -> dict[str, typing.Any]:
             f"Unsupported jxmodel format: {fmt!r}. Expected {_JXMODEL_FORMAT!r}."
         )
     return typing.cast(dict[str, typing.Any], obj)
+
+
+def _resolve_top_bundle_model_file(
+    *,
+    model_arg: str,
+    prefix_hint: str | None,
+) -> str:
+    p = str(model_arg)
+    if os.path.isfile(p):
+        payload = _load_jxmodel(p)
+        if not _is_top_bundle_payload(payload):
+            raise ValueError(
+                f"--model file is not a GS TOP bundle: {p} "
+                f"(method={payload.get('method', '')!r})."
+            )
+        return p
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"--model path does not exist: {p}")
+
+    cand: list[str] = []
+    if prefix_hint is not None and str(prefix_hint).strip() != "":
+        hint = os.path.join(p, f"{str(prefix_hint)}.gs.TOP.jxmodel")
+        if os.path.isfile(hint):
+            cand.append(hint)
+    cand.extend(sorted(glob.glob(os.path.join(p, "*.gs.TOP.jxmodel"))))
+    cand.extend(sorted(glob.glob(os.path.join(p, "*.jxmodel"))))
+    uniq = list(dict.fromkeys(cand))
+
+    valid: list[str] = []
+    for fp in uniq:
+        try:
+            payload = _load_jxmodel(fp)
+        except Exception:
+            continue
+        if _is_top_bundle_payload(payload):
+            valid.append(fp)
+    if len(valid) == 1:
+        return valid[0]
+    if len(valid) == 0:
+        raise FileNotFoundError(
+            f"Cannot find GS TOP bundle (*.gs.TOP.jxmodel) under: {p}"
+        )
+    raise RuntimeError(
+        "Ambiguous GS TOP bundle files: " + ", ".join(valid[:5]) + (" ..." if len(valid) > 5 else "")
+    )
 
 
 @dataclass
@@ -779,6 +926,167 @@ def _load_phenotype_flexible(path: str) -> pd.DataFrame:
     out = df.groupby(id_col, sort=False).mean(numeric_only=True)
     out.index = out.index.astype(str)
     return out
+
+
+def _extract_target_values_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    trait_names: list[str],
+    source_label: str,
+) -> np.ndarray:
+    k = int(len(trait_names))
+    if k <= 0:
+        raise ValueError("No trait names provided for TOP target parsing.")
+
+    if all(str(t) in df.columns for t in trait_names):
+        sub = df.loc[:, [str(t) for t in trait_names]]
+    else:
+        if int(df.shape[1]) < k:
+            raise ValueError(
+                f"TOP target file {source_label} has {int(df.shape[1])} columns, "
+                f"but {k} trait values are required."
+            )
+        sub = df.iloc[:, :k]
+    arr = sub.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    if arr.ndim != 2 or int(arr.shape[1]) != k:
+        raise ValueError(
+            f"TOP target values from {source_label} have invalid shape: {arr.shape} (expected * x {k})."
+        )
+    finite_cnt = np.sum(np.isfinite(arr), axis=1)
+    if int(np.max(finite_cnt)) <= 0:
+        raise ValueError(
+            f"TOP target file {source_label} has no row with finite trait values "
+            f"for requested traits: {', '.join(trait_names)}."
+        )
+    first = int(np.argmax(finite_cnt))
+    return np.asarray(arr[first, :], dtype=np.float64).reshape(-1)
+
+
+def _load_top_target_values_from_file(
+    path: str,
+    *,
+    trait_names: list[str],
+) -> np.ndarray:
+    p = str(path)
+    # 1) try phenotype-style loader (header + sample-id first column).
+    try:
+        ph = _load_phenotype_flexible(p)
+        return _extract_target_values_from_dataframe(
+            ph,
+            trait_names=trait_names,
+            source_label=p,
+        )
+    except Exception:
+        pass
+
+    # 2) fallback: headerless table; prefer skipping first column as possible sample ID.
+    sniffed = _sniff_sep(p)
+    sep: str
+    if sniffed == "tab":
+        sep = "\t"
+    elif sniffed == "comma":
+        sep = ","
+    else:
+        sep = r"\s+"
+    raw = pd.read_csv(p, sep=sep, header=None, engine="python")
+    if raw.empty:
+        raise ValueError(f"TOP target file is empty: {p}")
+    arr_full = raw.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    k = int(len(trait_names))
+    candidates: list[np.ndarray] = []
+    if int(arr_full.shape[1]) >= (k + 1):
+        candidates.append(np.asarray(arr_full[:, 1 : 1 + k], dtype=np.float64))
+    if int(arr_full.shape[1]) >= k:
+        candidates.append(np.asarray(arr_full[:, :k], dtype=np.float64))
+    for cand in candidates:
+        finite_cnt = np.sum(np.isfinite(cand), axis=1)
+        if int(np.max(finite_cnt)) > 0:
+            first = int(np.argmax(finite_cnt))
+            return np.asarray(cand[first, :], dtype=np.float64).reshape(-1)
+    raise ValueError(
+        f"Failed to parse TOP target values from file: {p}. "
+        "Provide a phenotype-like table with at least one row of finite values."
+    )
+
+
+def _resolve_top_target_values(
+    *,
+    select_arg: str | None,
+    trait_names: list[str],
+    trait_mean: np.ndarray | None,
+    trait_std: np.ndarray | None,
+    logger: logging.Logger,
+) -> tuple[np.ndarray | None, str]:
+    k = int(len(trait_names))
+    if k <= 0:
+        return None, "none"
+
+    if select_arg is not None and str(select_arg).strip() == _SELECT_INTERACTIVE_SENTINEL:
+        select_arg = None
+
+    if select_arg is not None:
+        token = str(select_arg).strip()
+        if token == "":
+            raise ValueError("--select must not be empty.")
+        if os.path.isfile(token):
+            values = _load_top_target_values_from_file(token, trait_names=trait_names)
+            if int(values.size) != k:
+                raise ValueError(
+                    f"--select file resolved to {int(values.size)} values, but expected {k}."
+                )
+            return np.asarray(values, dtype=np.float64).reshape(-1), "file"
+
+        parts = [x for x in re.split(r"[,\s]+", token) if str(x).strip() != ""]
+        if len(parts) != k:
+            raise ValueError(
+                f"--select requires exactly {k} numeric values for traits "
+                f"({', '.join(trait_names)}); got {len(parts)}."
+            )
+        vals: list[float] = []
+        for i, p in enumerate(parts):
+            pt = str(p).strip().lower()
+            if pt in {"na", "nan", ".", "null", "none"}:
+                vals.append(float("nan"))
+                continue
+            try:
+                v = float(p)
+            except Exception as ex:
+                raise ValueError(
+                    f"--select value at position {i + 1} is not numeric: {p!r}"
+                ) from ex
+            vals.append(float(v))
+        if not np.isfinite(np.asarray(vals, dtype=np.float64)).any():
+            raise ValueError("--select must provide at least one finite target value.")
+        return np.asarray(vals, dtype=np.float64).reshape(-1), "inline"
+
+    if not sys.stdin.isatty():
+        logger.warning(
+            "TOP --select is not provided and stdin is not interactive; skip TOP ranking output."
+        )
+        return None, "none"
+
+    vals: list[float] = []
+    for i, trait in enumerate(trait_names):
+        mu = float(trait_mean[i]) if (trait_mean is not None and i < int(trait_mean.size) and np.isfinite(trait_mean[i])) else float("nan")
+        sd = float(trait_std[i]) if (trait_std is not None and i < int(trait_std.size) and np.isfinite(trait_std[i])) else float("nan")
+        while True:
+            raw = input(
+                f"Input target value for {trait} (mean={mu:.4g}, std={sd:.4g}): "
+            ).strip()
+            if raw == "":
+                print("Please input a numeric value.")
+                continue
+            try:
+                v = float(raw)
+            except Exception:
+                print("Invalid number, please retry.")
+                continue
+            if not np.isfinite(v):
+                print("Value must be finite, please retry.")
+                continue
+            vals.append(float(v))
+            break
+    return np.asarray(vals, dtype=np.float64).reshape(-1), "interactive"
 
 
 def build_cv_splits(
@@ -2941,6 +3249,12 @@ def GSapi(
                         )
                     )
                 if gblup_runtime_state is not None:
+                    _evd_backend_l = str(_eigh_backend).strip().lower()
+                    _vc_path = (
+                        "fast"
+                        if _evd_backend_l.startswith("marker_fast")
+                        else "grm"
+                    )
                     gblup_runtime_state["rust_backend"] = str(rust_backend)
                     gblup_runtime_state["eigh_backend"] = str(_eigh_backend)
                     gblup_runtime_state["eigh_sec"] = float(_eigh_elapsed)
@@ -2948,6 +3262,10 @@ def GSapi(
                     gblup_runtime_state["ml"] = float(_ml)
                     gblup_runtime_state["reml"] = float(_reml)
                     gblup_runtime_state["m_effective"] = int(_m_eff)
+                    gblup_runtime_state["variance_component_path"] = str(_vc_path)
+                    gblup_runtime_state["variance_component"] = (
+                        "REML/FaST" if _vc_path == "fast" else "REML/GRM"
+                    )
                 pred_train = (
                     np.zeros((0, 1), dtype=float)
                     if (not need_train_pred)
@@ -3692,6 +4010,16 @@ def GSapi(
         else:
             pred_train = np.zeros((0, 1), dtype=float)
         pred_test = model.predict(Xtest, sample_indices=packed_test_indices)
+        if method == "GBLUP" and gblup_runtime_state is not None:
+            vc_path = (
+                "fast"
+                if bool(getattr(model, "_implicit_kinship_fast", False))
+                else "grm"
+            )
+            gblup_runtime_state["variance_component_path"] = str(vc_path)
+            gblup_runtime_state["variance_component"] = (
+                "REML/FaST" if vc_path == "fast" else "REML/GRM"
+            )
         if method == "rrBLUP":
             _set_rrblup_solver_state(str(resolved_rr_solver))
         if method == "rrBLUP" and rrblup_runtime_state is not None:
@@ -4168,6 +4496,7 @@ def _run_method_task(
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
+    train_sample_ids: np.ndarray | None = None,
     progress_queue: typing.Any = None,
     progress_hook: typing.Any = None,
     search_progress_hook: typing.Any = None,
@@ -4204,6 +4533,8 @@ def _run_method_task(
         return cv_elapsed, fit_elapsed, predict_elapsed
 
     fold_rows: list[tuple[str, int, float, float, float, float, float]] = []
+    oof_pred: np.ndarray | None = None
+    oof_truth: np.ndarray | None = None
     rrblup_pve_rows: list[dict[str, typing.Any]] = []
     rrblup_pve_final: dict[str, typing.Any] | None = None
     rrblup_final_state: dict[str, typing.Any] | None = None
@@ -4362,6 +4693,9 @@ def _run_method_task(
             "fold_rows": [],
             "best_test": None,
             "best_train": None,
+            "oof_pred": None,
+            "oof_truth": None,
+            "oof_sample_ids": None,
             "test_pred": pred,
             "pve_final": float(pve_final),
             "ml_tuning": None,
@@ -4488,6 +4822,8 @@ def _run_method_task(
 
     if cv_splits is not None:
         cv_total = int(max(1, len(cv_splits)))
+        oof_pred = np.full((int(train_pheno.shape[0]),), np.nan, dtype=np.float64)
+        oof_truth = np.asarray(train_pheno, dtype=np.float64).reshape(-1)
         _emit_stage("cv_start", method=str(method), total=int(cv_total))
         for fold_id, (test_idx, train_idx) in enumerate(cv_splits, start=1):
             t_fold = time.time()
@@ -4797,6 +5133,13 @@ def _run_method_task(
                             "iter_like": iter_like,
                         }
                     )
+            if oof_pred is not None:
+                try:
+                    yhat_oof = np.asarray(yhat_test, dtype=np.float64).reshape(-1)
+                    if int(yhat_oof.shape[0]) == int(fold_test_idx.shape[0]):
+                        oof_pred[fold_test_idx] = yhat_oof
+                except Exception:
+                    pass
             if ml_tuning_cache is not None:
                 pve = float(ml_tuning_cache.get("pve", np.nan))
             ttest = np.concatenate([train_pheno[fold_test_idx], yhat_test], axis=1)
@@ -4893,6 +5236,21 @@ def _run_method_task(
             "fold_rows": fold_rows,
             "best_test": best_test,
             "best_train": best_train,
+            "oof_pred": (
+                None
+                if oof_pred is None
+                else np.asarray(oof_pred, dtype=np.float64).reshape(-1)
+            ),
+            "oof_truth": (
+                None
+                if oof_truth is None
+                else np.asarray(oof_truth, dtype=np.float64).reshape(-1)
+            ),
+            "oof_sample_ids": (
+                None
+                if train_sample_ids is None
+                else np.asarray(train_sample_ids, dtype=str).reshape(-1)
+            ),
             "test_pred": np.asarray(test_pred, dtype=float).reshape(-1, 1),
             "pve_final": float(fit_final["pve"]),
             "ml_tuning": ml_tuning_cache,
@@ -5067,6 +5425,11 @@ def _run_method_task(
                 alpha=alpha,
                 beta=beta,
             )
+        gblup_final_state = {
+            "variance_component_path": "grm",
+            "variance_component": "REML/GRM",
+            "backend": ("packed active" if packed_payload is not None else "dense"),
+        }
         _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
@@ -5238,6 +5601,21 @@ def _run_method_task(
         "rrblup_pve_final": rrblup_pve_final,
         "best_test": best_test,
         "best_train": best_train,
+        "oof_pred": (
+            None
+            if oof_pred is None
+            else np.asarray(oof_pred, dtype=np.float64).reshape(-1)
+        ),
+        "oof_truth": (
+            None
+            if oof_truth is None
+            else np.asarray(oof_truth, dtype=np.float64).reshape(-1)
+        ),
+        "oof_sample_ids": (
+            None
+            if train_sample_ids is None
+            else np.asarray(train_sample_ids, dtype=str).reshape(-1)
+        ),
         "test_pred": test_pred,
         "pve_final": float(pve_final),
         "bayes_r2_final": float(bayes_r2_final),
@@ -5543,6 +5921,9 @@ def _run_loaded_model_task(
         "fold_rows": fold_rows,
         "best_test": best_test,
         "best_train": best_train,
+        "oof_pred": None,
+        "oof_truth": None,
+        "oof_sample_ids": None,
         "test_pred": np.asarray(test_pred, dtype=np.float64).reshape(-1, 1),
         "pve_final": float(pve_final),
         "ml_tuning": None,
@@ -5576,6 +5957,7 @@ def _run_methods_parallel(
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
     test_sample_indices: np.ndarray | None = None,
+    train_sample_ids: np.ndarray | None = None,
     limit_predtrain: int | None = None,
     elapsed_offset_by_method: dict[str, float] | None = None,
     rrblup_solver: str = "auto",
@@ -5614,7 +5996,26 @@ def _run_methods_parallel(
         if _is_gblup_method(m):
             mode = _gblup_method_kernel_mode(m)
             rows.append(("kernel", _gblup_mode_label(mode)))
-            rows.append(("variance component", "REML/FaST"))
+            gblup_state = dict(
+                typing.cast(
+                    dict[str, typing.Any] | None,
+                    result.get("gblup_final_state"),
+                )
+                or {}
+            )
+            vc_label = str(gblup_state.get("variance_component", "")).strip()
+            vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
+            eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
+            if vc_label == "":
+                if mode in {"d", "ad"}:
+                    vc_label = "REML/GRM"
+                elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
+                    vc_label = "REML/FaST"
+                elif vc_path == "grm" or eigh_backend != "":
+                    vc_label = "REML/GRM"
+                else:
+                    vc_label = "REML/FaST"
+            rows.append(("variance component", vc_label))
             if mode in {"d", "ad"}:
                 rows.append(("backend", "pyBLUP/JAX"))
             else:
@@ -5640,6 +6041,11 @@ def _run_methods_parallel(
                     eigh_sec = float("nan")
                 if np.isfinite(eigh_sec):
                     rows.append(("eigh time", f"{eigh_sec:.3f}s"))
+            try:
+                pve_final = float(result.get("pve_final", np.nan))
+            except Exception:
+                pve_final = float("nan")
+            rows.append(("PVE", f"{pve_final:.3f}" if np.isfinite(pve_final) else "NA"))
             return rows
 
         if m == "rrBLUP":
@@ -6485,6 +6891,7 @@ def _run_methods_parallel(
                             packed_ctx=packed_ctx,
                             train_sample_indices=train_sample_indices,
                             test_sample_indices=test_sample_indices,
+                            train_sample_ids=train_sample_ids,
                             progress_queue=None,
                             progress_hook=_cv_hook,
                             search_progress_hook=_search_hook,
@@ -7127,6 +7534,7 @@ def _run_methods_parallel(
                         packed_ctx=packed_ctx,
                         train_sample_indices=train_sample_indices,
                         test_sample_indices=test_sample_indices,
+                        train_sample_ids=train_sample_ids,
                         progress_queue=None,
                         progress_hook=(_cv_hook if enable_tqdm_progress else None),
                         search_progress_hook=(_search_hook if enable_tqdm_progress else None),
@@ -9059,8 +9467,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         type=str,
         default=None,
         help=(
-            "Load saved .jxmodel file/folder for direct prediction/evaluation. "
-            "When set, selected methods are loaded from model artifacts instead of refitting."
+            "Load saved .jxmodel file for direct prediction/evaluation. "
+            "When set, selected methods are loaded from model artifact instead of refitting."
         ),
     )
     # ------------------------------------------------------------------
@@ -9111,6 +9519,94 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         default=None,
         help="K fold of cross-validation for models. "
              "(default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-select","--select",
+        type=str,
+        nargs="?",
+        const=_SELECT_INTERACTIVE_SENTINEL,
+        default=None,
+        help=(
+            "TOP target trait values for ranking. "
+            "Accepts a comma list (e.g. 180,200,121), or a target-value file "
+            "(phenotype-like table). If provided without a value, interactive input is used."
+        ),
+    )
+    optional_group.add_argument(
+        "--model-select",
+        type=str,
+        choices=("per-trait", "global"),
+        default="per-trait",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--model-select-metric",
+        type=str,
+        choices=("pearson", "spearman", "r2", "rmse", "nrmse"),
+        default="pearson",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-mode",
+        type=str,
+        choices=("auto", "exact-newton", "exact-bfgs", "minibatch-adam"),
+        default="auto",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-exact-threshold",
+        type=int,
+        default=20000,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-max-iter",
+        type=int,
+        default=50,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-tol",
+        type=float,
+        default=1e-6,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-l2",
+        type=float,
+        default=1e-4,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-batch-size",
+        type=int,
+        default=1024,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-epochs",
+        type=int,
+        default=20,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-lr",
+        type=float,
+        default=1e-2,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-seed",
+        type=int,
+        default=2026,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--top-calibration",
+        type=str,
+        choices=("linear", "none", "addmean"),
+        default="linear",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-t", "--thread",
@@ -9611,10 +10107,36 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     if args.model is not None:
         model_path = str(args.model).strip()
         if model_path == "":
-            parser.error("--model path must not be empty.")
-        if not os.path.exists(model_path):
-            parser.error(f"--model path does not exist: {model_path}")
+            parser.error("--model file must not be empty.")
+        if not os.path.isfile(model_path):
+            parser.error(f"--model must be a .jxmodel file (got: {model_path})")
+        if not str(model_path).lower().endswith(".jxmodel"):
+            parser.error(f"--model must point to a .jxmodel file (got: {model_path})")
         args.model = model_path
+    if args.select is not None:
+        if str(args.select).strip() == _SELECT_INTERACTIVE_SENTINEL:
+            args.select = _SELECT_INTERACTIVE_SENTINEL
+        else:
+            target = str(args.select).strip()
+            if target == "":
+                parser.error("--select must not be empty.")
+            args.select = target
+    if int(args.top_exact_threshold) <= 0:
+        parser.error("--top-exact-threshold must be > 0.")
+    if int(args.top_max_iter) <= 0:
+        parser.error("--top-max-iter must be > 0.")
+    if not np.isfinite(float(args.top_tol)) or float(args.top_tol) <= 0.0:
+        parser.error("--top-tol must be a finite value > 0.")
+    if not np.isfinite(float(args.top_l2)) or float(args.top_l2) < 0.0:
+        parser.error("--top-l2 must be a finite value >= 0.")
+    if int(args.top_batch_size) <= 0:
+        parser.error("--top-batch-size must be > 0.")
+    if int(args.top_epochs) <= 0:
+        parser.error("--top-epochs must be > 0.")
+    if not np.isfinite(float(args.top_lr)) or float(args.top_lr) <= 0.0:
+        parser.error("--top-lr must be a finite value > 0.")
+    if int(args.top_seed) < 0:
+        parser.error("--top-seed must be >= 0.")
     return args
 
 
@@ -9896,10 +10418,27 @@ def _run_gs_pipeline(
             _uniq_methods.append(_m)
         methods = _uniq_methods
     model_mode = bool(args.model is not None)
+    top_requested = bool(getattr(args, "select", None) is not None)
     if model_mode and len(methods) == 0:
         inferred = _discover_jxmodel_methods(str(args.model))
         if len(inferred) > 0:
             methods = inferred
+    loaded_bundle_file: str | None = None
+    loaded_bundle_payload: dict[str, typing.Any] | None = None
+    if model_mode:
+        try:
+            loaded_bundle_file = _resolve_top_bundle_model_file(
+                model_arg=str(args.model),
+                prefix_hint=str(args.prefix),
+            )
+            loaded_bundle_payload = _load_jxmodel(str(loaded_bundle_file))
+            if top_requested:
+                inferred_bundle = _discover_jxmodel_methods(str(loaded_bundle_file))
+                if len(inferred_bundle) > 0:
+                    methods = list(dict.fromkeys([str(x) for x in inferred_bundle]))
+        except Exception:
+            loaded_bundle_file = None
+            loaded_bundle_payload = None
     if len(methods) == 0:
         logger.error(
             "No model selected. Use "
@@ -9922,6 +10461,29 @@ def _run_gs_pipeline(
             "Loaded-model mode runs prediction only."
         )
         cv_enabled = False
+    top_enabled = bool(top_requested)
+    if top_enabled and (str(getattr(args, "model_select", "per-trait")).strip().lower() != "per-trait"):
+        logger.error("TOP currently supports only --model-select per-trait.")
+        raise SystemExit(1)
+    if top_enabled and (_jxrs is None):
+        logger.error("Rust backend is unavailable: cannot run TOP fitting/ranking.")
+        raise SystemExit(1)
+    if top_enabled and (not hasattr(_jxrs, "top_rank_to_target_values")):
+        logger.error("Rust backend missing top_rank_to_target_values export. Please rebuild JanusX.")
+        raise SystemExit(1)
+    if top_enabled and model_mode:
+        if loaded_bundle_payload is None or not _is_top_bundle_payload(loaded_bundle_payload):
+            logger.error(
+                "TOP with --model requires a single GS TOP bundle model file "
+                "(*.gs.TOP.jxmodel)."
+            )
+            raise SystemExit(1)
+    elif top_enabled and (not cv_enabled):
+        logger.error("TOP fitting requires --cv (OOF predictions are required).")
+        raise SystemExit(1)
+    if top_enabled and (not model_mode) and (not hasattr(_jxrs, "top_fit_model")):
+        logger.error("Rust backend missing top_fit_model export. Please rebuild JanusX.")
+        raise SystemExit(1)
     ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
     gblup_d_like_methods = [
         m for m in methods
@@ -10045,6 +10607,14 @@ def _run_gs_pipeline(
                         ("Threads", int(args.thread)),
                         ("CV", cv_cfg),
                         ("Model mode", ("on" if model_mode else "off")),
+                        (
+                            "TOP",
+                            (
+                                f"on ({str(args.model_select_metric).strip().lower()})"
+                                if top_enabled
+                                else "off"
+                            ),
+                        ),
                         ("Train prediction", ("All" if args.limit_predtrain is None else int(args.limit_predtrain))),
                     ],
                 ),
@@ -10826,6 +11396,25 @@ def _run_gs_pipeline(
     trait_order = [str(x) for x in list(pheno.columns)]
     gs_summary_rows: list[dict[str, typing.Any]] = []
     saved_result_paths: list[str] = []
+    top_trait_selected_method: dict[str, str] = {}
+    top_trait_metric_scores: dict[str, dict[str, dict[str, float]]] = {}
+    top_train_ids_by_trait: dict[str, np.ndarray] = {}
+    top_train_true_by_trait: dict[str, np.ndarray] = {}
+    top_train_oof_by_trait: dict[str, np.ndarray] = {}
+    top_test_ids_by_trait: dict[str, np.ndarray] = {}
+    top_test_pred_by_trait: dict[str, np.ndarray] = {}
+    top_trait_model_state: dict[str, dict[str, typing.Any]] = {}
+    top_model_payload_loaded: dict[str, typing.Any] | None = None
+    top_bundle_trait_models: dict[str, dict[str, typing.Any]] = {}
+    if loaded_bundle_payload is not None and _is_top_bundle_payload(loaded_bundle_payload):
+        raw_top_state = loaded_bundle_payload.get("top_model_state", None)
+        if isinstance(raw_top_state, dict) and len(raw_top_state) > 0:
+            top_model_payload_loaded = dict(raw_top_state)
+        raw_trait_models = loaded_bundle_payload.get("trait_models", None)
+        if isinstance(raw_trait_models, dict):
+            for tk, tv in raw_trait_models.items():
+                if isinstance(tv, dict):
+                    top_bundle_trait_models[str(tk)] = dict(tv)
     for trait_name in pheno.columns:
         t_trait = time.time()
         if _GS_DEBUG_STAGE:
@@ -11416,7 +12005,29 @@ def _run_gs_pipeline(
             gblup_backend_n=gblup_backend_n,
             gblup_backend_m=gblup_backend_m,
         )
-        method_display_map = {str(m): _method_display_name(str(m)) for m in methods}
+        bundle_mode = bool(
+            model_mode
+            and (loaded_bundle_payload is not None)
+            and _is_top_bundle_payload(loaded_bundle_payload)
+        )
+        trait_methods = list(methods)
+        trait_bundle_entry: dict[str, typing.Any] | None = None
+        if bundle_mode:
+            trait_bundle_entry = top_bundle_trait_models.get(str(trait_name), None)
+            if trait_bundle_entry is None:
+                logger.warning(
+                    f"TOP bundle does not contain trait={trait_name}; skipped."
+                )
+                continue
+            sel_from_bundle = str(trait_bundle_entry.get("selected_method", "")).strip()
+            if sel_from_bundle == "":
+                logger.warning(
+                    f"TOP bundle trait entry missing selected_method for trait={trait_name}; skipped."
+                )
+                continue
+            trait_methods = [sel_from_bundle]
+
+        method_display_map = {str(m): _method_display_name(str(m)) for m in trait_methods}
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         expected_test_n = int(np.sum(testmask))
         pred_by_method: dict[str, np.ndarray] = {}
@@ -11456,6 +12067,48 @@ def _run_gs_pipeline(
             )
 
             cv_mode_row = str(res_obj.get("cv_mode", "train_cv")).strip().lower()
+            gblup_variance_component_label: str | None = None
+            if _is_gblup_method(m_key):
+                gblup_mode = _gblup_method_kernel_mode(m_key)
+                if gblup_mode in {"d", "ad"}:
+                    # Dominance/add+dom path uses explicit kernel matrices.
+                    gblup_variance_component_label = "REML/GRM"
+                else:
+                    gblup_state = dict(
+                        typing.cast(
+                            dict[str, typing.Any] | None,
+                            res_obj.get("gblup_final_state"),
+                        )
+                        or {}
+                    )
+                    vc_label = str(gblup_state.get("variance_component", "")).strip()
+                    vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
+                    eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
+                    if vc_label != "":
+                        gblup_variance_component_label = vc_label
+                    elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
+                        gblup_variance_component_label = "REML/FaST"
+                    elif vc_path == "grm" or eigh_backend != "":
+                        gblup_variance_component_label = "REML/GRM"
+                    else:
+                        m_eff = 0
+                        try:
+                            if _looks_like_packed_payload(trait_packed_ctx):
+                                m_eff = int(
+                                    np.asarray(
+                                        typing.cast(dict[str, typing.Any], trait_packed_ctx)["packed"]
+                                    ).shape[0]
+                                )
+                            elif train_snp is not None:
+                                m_eff = int(np.asarray(train_snp).shape[0])
+                        except Exception:
+                            m_eff = 0
+                        n_eff = int(np.asarray(train_pheno).reshape(-1).shape[0])
+                        gblup_variance_component_label = (
+                            "REML/FaST"
+                            if (m_eff > 0 and n_eff > m_eff)
+                            else "REML/GRM"
+                        )
             gs_output.emit_method_detail_lines(
                 logger,
                 cv_mode=cv_mode_row,
@@ -11465,12 +12118,14 @@ def _run_gs_pipeline(
                     if _is_gblup_method(m_key)
                     else None
                 ),
+                gblup_variance_component=gblup_variance_component_label,
                 gblup_backend_label=(
                     "packed active" if _looks_like_packed_payload(trait_packed_ctx) else "dense"
                 ),
+                gblup_pve=float(res_obj.get("pve_final", np.nan)),
             )
 
-            if args.model is None and _is_jxmodel_export_supported(m_key):
+            if (args.model is None) and (not top_enabled) and _is_jxmodel_export_supported(m_key):
                 state_raw = res_obj.get("model_state", None)
                 if isinstance(state_raw, dict) and len(state_raw) > 0:
                     payload = {
@@ -11509,7 +12164,7 @@ def _run_gs_pipeline(
                         f"got n_pred={n_pred}, expected n_test={expected_test_n}."
                     )
             pred_by_method[m_key] = pred_arr
-            ordered_keys = [str(mm) for mm in methods if str(mm) in pred_by_method]
+            ordered_keys = [str(mm) for mm in trait_methods if str(mm) in pred_by_method]
             outpred_partial = pd.DataFrame(
                 np.concatenate([pred_by_method[k] for k in ordered_keys], axis=1),
                 columns=[method_display_map.get(k, k) for k in ordered_keys],
@@ -11520,22 +12175,42 @@ def _run_gs_pipeline(
         t_stage = time.time()
         if model_mode:
             method_results = []
-            for m in methods:
-                model_file = _resolve_jxmodel_file(
-                    model_arg=str(args.model),
-                    trait_name=str(trait_name),
-                    method=str(m),
-                    prefix_hint=str(args.prefix),
-                )
-                artifact = _load_jxmodel(model_file)
-                artifact_method = str(artifact.get("method", "")).strip()
-                if artifact_method != "" and artifact_method != str(m):
-                    raise ValueError(
-                        f"Loaded model mismatch: expected method={m}, got {artifact_method} in {model_file}."
+            for m in trait_methods:
+                model_file = ""
+                model_state: dict[str, typing.Any] | None = None
+                if bundle_mode:
+                    if trait_bundle_entry is None:
+                        raise RuntimeError("Internal error: missing TOP bundle trait entry.")
+                    m_bundle = str(trait_bundle_entry.get("selected_method", "")).strip()
+                    if m_bundle != str(m):
+                        raise ValueError(
+                            f"TOP bundle trait method mismatch for {trait_name}: "
+                            f"expected {m}, got {m_bundle}."
+                        )
+                    raw_state = trait_bundle_entry.get("model_state", None)
+                    if not isinstance(raw_state, dict) or len(raw_state) == 0:
+                        raise ValueError(
+                            f"TOP bundle trait model_state is missing for trait={trait_name}, method={m}."
+                        )
+                    model_state = dict(raw_state)
+                    model_file = str(loaded_bundle_file or args.model)
+                else:
+                    model_file = _resolve_jxmodel_file(
+                        model_arg=str(args.model),
+                        trait_name=str(trait_name),
+                        method=str(m),
+                        prefix_hint=str(args.prefix),
                     )
-                model_state = artifact.get("model_state", None)
-                if not isinstance(model_state, dict) or len(model_state) == 0:
-                    raise ValueError(f"Loaded model artifact missing model_state: {model_file}")
+                    artifact = _load_jxmodel(model_file)
+                    artifact_method = str(artifact.get("method", "")).strip()
+                    if artifact_method != "" and artifact_method != str(m):
+                        raise ValueError(
+                            f"Loaded model mismatch: expected method={m}, got {artifact_method} in {model_file}."
+                        )
+                    raw_state = artifact.get("model_state", None)
+                    if not isinstance(raw_state, dict) or len(raw_state) == 0:
+                        raise ValueError(f"Loaded model artifact missing model_state: {model_file}")
+                    model_state = dict(raw_state)
                 res = _run_loaded_model_task(
                     method=str(m),
                     model_state=dict(model_state),
@@ -11556,7 +12231,7 @@ def _run_gs_pipeline(
                 _emit_method_block_and_artifacts(str(m), res)
         else:
             method_results = _run_methods_parallel(
-                methods=methods,
+                methods=trait_methods,
                 train_pheno=train_pheno,
                 train_snp=train_snp,
                 test_snp=test_snp,
@@ -11572,6 +12247,7 @@ def _run_gs_pipeline(
                 packed_ctx=trait_packed_ctx,
                 train_sample_indices=train_sample_idx,
                 test_sample_indices=test_sample_idx,
+                train_sample_ids=np.asarray(samples[trainmask], dtype=str).reshape(-1),
                 limit_predtrain=args.limit_predtrain,
                 elapsed_offset_by_method=method_elapsed_offsets,
                 rrblup_solver=rrblup_solver,
@@ -11588,11 +12264,124 @@ def _run_gs_pipeline(
                 f"elapsed={time.time() - t_stage:.3f}s"
             )
         method_result_map = {str(x["method"]): x for x in method_results}
+        top_selected_method = ""
+        top_metric_scores: dict[str, dict[str, float]] = {}
+        if top_enabled:
+            if model_mode and bundle_mode and (trait_bundle_entry is not None):
+                top_selected_method = str(trait_bundle_entry.get("selected_method", "")).strip()
+                if top_selected_method == "":
+                    raise RuntimeError(
+                        f"TOP bundle trait entry missing selected_method for trait={trait_name}."
+                    )
+                if top_selected_method not in method_result_map:
+                    raise RuntimeError(
+                        f"TOP bundle selected method={top_selected_method} not present in loaded results "
+                        f"for trait={trait_name}."
+                    )
+                score_pack = trait_bundle_entry.get("metrics", None)
+                if isinstance(score_pack, dict):
+                    top_metric_scores[top_selected_method] = {
+                        "pearson": float(score_pack.get("pearson", np.nan)),
+                        "spearman": float(score_pack.get("spearman", np.nan)),
+                        "r2": float(score_pack.get("r2", np.nan)),
+                        "rmse": float(score_pack.get("rmse", np.nan)),
+                        "nrmse": float(score_pack.get("nrmse", np.nan)),
+                    }
+                else:
+                    top_metric_scores[top_selected_method] = {}
+                logger.info(
+                    "TOP selected model for trait %s (from bundle): %s",
+                    str(trait_name),
+                    method_display_map.get(str(top_selected_method), str(top_selected_method)),
+                )
+            else:
+                top_selected_method, top_metric_scores = _select_top_method_for_trait(
+                    methods=trait_methods,
+                    method_result_map=method_result_map,
+                    train_truth=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+                    metric=str(args.model_select_metric),
+                )
+                top_metric_key = str(args.model_select_metric).strip().lower()
+                top_metric_val = float(
+                    dict(top_metric_scores.get(str(top_selected_method), {})).get(top_metric_key, np.nan)
+                )
+                logger.info(
+                    "TOP selected model for trait %s: %s (%s=%.4f)",
+                    str(trait_name),
+                    method_display_map.get(str(top_selected_method), str(top_selected_method)),
+                    top_metric_key,
+                    top_metric_val,
+                )
+            if not model_mode:
+                sel_state_try = method_result_map[top_selected_method].get("model_state", None)
+                if not (isinstance(sel_state_try, dict) and len(sel_state_try) > 0):
+                    exportable_methods = [
+                        str(mm)
+                        for mm in trait_methods
+                        if isinstance(method_result_map.get(str(mm), {}).get("model_state", None), dict)
+                        and len(typing.cast(dict[str, typing.Any], method_result_map.get(str(mm), {}).get("model_state", {}))) > 0
+                    ]
+                    if len(exportable_methods) > 0:
+                        metric_key = str(args.model_select_metric).strip().lower()
+                        prefer_small = metric_key in {"rmse", "nrmse"}
+                        picked = exportable_methods[0]
+                        picked_score = float(
+                            dict(top_metric_scores.get(picked, {})).get(metric_key, np.nan)
+                        )
+                        for cand in exportable_methods[1:]:
+                            s = float(dict(top_metric_scores.get(cand, {})).get(metric_key, np.nan))
+                            if not np.isfinite(s):
+                                continue
+                            if (not np.isfinite(picked_score)) or (
+                                (s < picked_score) if prefer_small else (s > picked_score)
+                            ):
+                                picked = str(cand)
+                                picked_score = float(s)
+                        if picked != top_selected_method:
+                            logger.warning(
+                                "TOP selected method=%s for trait=%s has no exportable model state; "
+                                "fallback to exportable method=%s.",
+                                str(top_selected_method),
+                                str(trait_name),
+                                str(picked),
+                            )
+                            top_selected_method = str(picked)
+            sel_res = method_result_map[top_selected_method]
+            sel_oof = np.asarray(sel_res.get("oof_pred"), dtype=np.float64).reshape(-1)
+            sel_truth = np.asarray(sel_res.get("oof_truth", train_pheno), dtype=np.float64).reshape(-1)
+            if (not model_mode) and (int(sel_oof.size) != int(sel_truth.size)):
+                raise RuntimeError(
+                    f"TOP selected method {top_selected_method} returned mismatched OOF vectors "
+                    f"for trait={trait_name}: pred={sel_oof.size}, truth={sel_truth.size}"
+                )
+            sel_test = np.asarray(sel_res.get("test_pred"), dtype=np.float64).reshape(-1)
+            full_pred = np.full((int(samples.shape[0]),), np.nan, dtype=np.float64)
+            if int(sel_oof.size) == int(np.sum(trainmask)):
+                full_pred[trainmask] = sel_oof
+            if int(sel_test.size) == int(np.sum(testmask)):
+                full_pred[testmask] = sel_test
+            elif int(sel_test.size) == 0 and int(np.sum(testmask)) == 0:
+                pass
+            else:
+                raise RuntimeError(
+                    f"TOP selected method {top_selected_method} returned mismatched test predictions "
+                    f"for trait={trait_name}: pred={sel_test.size}, expected={int(np.sum(testmask))}"
+                )
+            top_trait_selected_method[str(trait_name)] = str(top_selected_method)
+            top_trait_metric_scores[str(trait_name)] = dict(top_metric_scores)
+            top_train_ids_by_trait[str(trait_name)] = np.asarray(samples[trainmask], dtype=str).reshape(-1)
+            top_train_true_by_trait[str(trait_name)] = np.asarray(sel_truth, dtype=np.float64).reshape(-1)
+            top_train_oof_by_trait[str(trait_name)] = np.asarray(sel_oof, dtype=np.float64).reshape(-1)
+            top_test_ids_by_trait[str(trait_name)] = np.asarray(samples[testmask], dtype=str).reshape(-1)
+            top_test_pred_by_trait[str(trait_name)] = np.asarray(full_pred, dtype=np.float64).reshape(-1)
+            state_sel = sel_res.get("model_state", None)
+            if isinstance(state_sel, dict) and len(state_sel) > 0:
+                top_trait_model_state[str(trait_name)] = dict(state_sel)
 
         all_rows: list[tuple[str, int, float, float, float, float, float]] = []
         if cv_splits is not None:
-            method_order = {str(m): i for i, m in enumerate(methods)}
-            for method in methods:
+            method_order = {str(m): i for i, m in enumerate(trait_methods)}
+            for method in trait_methods:
                 res = method_result_map.get(method)
                 if res is None:
                     continue
@@ -11606,7 +12395,7 @@ def _run_gs_pipeline(
                 )
             )
         if cv_splits is not None:
-            for method in methods:
+            for method in trait_methods:
                 res = method_result_map.get(method)
                 if res is None:
                     continue
@@ -11633,7 +12422,7 @@ def _run_gs_pipeline(
                 )
                 plt.close(fig)
 
-        missing_methods = [m for m in methods if m not in method_result_map]
+        missing_methods = [m for m in trait_methods if m not in method_result_map]
         if len(missing_methods) > 0:
             raise RuntimeError(
                 "Missing GS results for methods: " + ", ".join(missing_methods)
@@ -11641,7 +12430,7 @@ def _run_gs_pipeline(
 
         pred_cols: list[np.ndarray] = []
         pred_colnames: list[str] = []
-        for m in methods:
+        for m in trait_methods:
             m_key = str(m)
             m_disp = method_display_map.get(m_key, m_key)
             pred_arr = pred_by_method.get(m_key)
@@ -11685,7 +12474,7 @@ def _run_gs_pipeline(
                 method_display_map=method_display_map,
             )
 
-        for m in methods:
+        for m in trait_methods:
             res = method_result_map.get(m)
             if res is None:
                 continue
@@ -11721,9 +12510,303 @@ def _run_gs_pipeline(
                     "time_cv_mean_sec": elapsed_mean,
                 }
             )
-        logger.info(f"-"*60) if cv_splits is not None else None
+        if cv_splits is not None:
+            logger.info(f"-"*60)
+            selected_cv_model_key = gs_output.select_cv_best_model(
+                all_rows=all_rows,
+                method_order={str(m): i for i, m in enumerate(trait_methods)},
+            )
+            if selected_cv_model_key is not None and str(selected_cv_model_key).strip() != "":
+                logger.info(
+                    "Selected model: %s",
+                    method_display_map.get(str(selected_cv_model_key), str(selected_cv_model_key)),
+                )
         log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
         log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
+
+    if top_enabled:
+        available_traits = [
+            str(t)
+            for t in trait_order
+            if (
+                str(t) in top_trait_selected_method
+                and str(t) in top_test_pred_by_trait
+            )
+        ]
+        if len(available_traits) == 0:
+            raise RuntimeError("TOP requested but no trait has valid model/prediction payload.")
+
+        top_traits = [str(t) for t in available_traits]
+        top_model_payload: dict[str, typing.Any] | None = None
+        top_train_ids: list[str] = []
+        y_true_df: pd.DataFrame | None = None
+        y_pred_df: pd.DataFrame | None = None
+
+        if model_mode:
+            if top_model_payload_loaded is None:
+                raise RuntimeError(
+                    "TOP --model mode requires top_model_state in bundle, but none was found."
+                )
+            top_model_payload = dict(top_model_payload_loaded)
+            model_traits_raw = top_model_payload.get("trait_names", [])
+            model_traits = [str(x) for x in list(model_traits_raw or [])]
+            if len(model_traits) > 0:
+                top_traits = [t for t in model_traits if t in set(available_traits)]
+                if len(top_traits) == 0:
+                    raise RuntimeError(
+                        "TOP bundle trait_names do not overlap with current phenotype traits."
+                    )
+        else:
+            trait_train_counts: dict[str, int] = {}
+            sample_all = np.asarray(samples, dtype=str).reshape(-1)
+            n_all = int(sample_all.shape[0])
+            sid_to_pos = {str(s): i for i, s in enumerate(sample_all.tolist())}
+            k_top = int(len(top_traits))
+            y_true_full = np.full((n_all, k_top), np.nan, dtype=np.float64)
+            y_pred_full = np.full((n_all, k_top), np.nan, dtype=np.float64)
+
+            for t_idx, trait in enumerate(top_traits):
+                sid = np.asarray(
+                    top_train_ids_by_trait.get(trait, np.array([], dtype=str)),
+                    dtype=str,
+                ).reshape(-1)
+                y_true = np.asarray(
+                    top_train_true_by_trait.get(trait, np.array([], dtype=np.float64)),
+                    dtype=np.float64,
+                ).reshape(-1)
+                y_oof = np.asarray(
+                    top_train_oof_by_trait.get(trait, np.array([], dtype=np.float64)),
+                    dtype=np.float64,
+                ).reshape(-1)
+                if int(sid.size) != int(y_true.size) or int(y_true.size) != int(y_oof.size):
+                    raise RuntimeError(
+                        f"TOP trait payload mismatch for {trait}: ids={sid.size}, true={y_true.size}, oof={y_oof.size}"
+                    )
+                trait_train_counts[str(trait)] = int(sid.size)
+                pred_full_col = np.asarray(
+                    top_test_pred_by_trait.get(trait, np.full((n_all,), np.nan, dtype=np.float64)),
+                    dtype=np.float64,
+                ).reshape(-1)
+                if int(pred_full_col.size) != n_all:
+                    raise RuntimeError(
+                        f"TOP trait prediction length mismatch for {trait}: "
+                        f"pred={pred_full_col.size}, expected={n_all}"
+                    )
+                y_pred_full[:, t_idx] = pred_full_col
+                for ii in range(int(sid.size)):
+                    pos = sid_to_pos.get(str(sid[ii]), None)
+                    if pos is None:
+                        continue
+                    y_true_full[int(pos), t_idx] = float(y_true[ii])
+
+            y_true_df = pd.DataFrame(y_true_full, index=sample_all, columns=top_traits)
+            y_pred_df = pd.DataFrame(y_pred_full, index=sample_all, columns=top_traits)
+
+            valid_pred_rows = np.isfinite(y_pred_full).all(axis=1)
+            if int(np.sum(valid_pred_rows)) < n_all:
+                dropped = int(n_all - int(np.sum(valid_pred_rows)))
+                logger.warning(
+                    f"TOP fitting dropped {dropped} rows due to non-finite predicted trait matrix."
+                )
+                y_true_df = y_true_df.loc[valid_pred_rows]
+                y_pred_df = y_pred_df.loc[valid_pred_rows]
+                y_true_full = np.asarray(y_true_df, dtype=np.float64)
+                y_pred_full = np.asarray(y_pred_df, dtype=np.float64)
+            else:
+                y_true_full = np.asarray(y_true_df, dtype=np.float64)
+                y_pred_full = np.asarray(y_pred_df, dtype=np.float64)
+
+            observed_any = np.isfinite(y_true_full).any(axis=1)
+            top_train_ids = [str(x) for x in y_true_df.index.to_list()]
+            low_obs_threshold = 20
+            low_obs_traits = [
+                f"{tr}={cnt}"
+                for tr, cnt in trait_train_counts.items()
+                if int(cnt) < int(low_obs_threshold)
+            ]
+            if len(low_obs_traits) > 0:
+                logger.warning(
+                    "TOP low-observation traits detected (<%d): %s",
+                    int(low_obs_threshold),
+                    ", ".join(low_obs_traits),
+                )
+            if int(np.sum(observed_any)) < 2:
+                logger.warning(
+                    "TOP fitting is skipped: less than 2 samples have any observed phenotype "
+                    "across selected traits."
+                )
+                logger.warning(
+                    "Per-trait observed counts: "
+                    + ", ".join(f"{k}={v}" for k, v in trait_train_counts.items())
+                )
+            else:
+                top_selected_models = [str(top_trait_selected_method[t]) for t in top_traits]
+                with CliStatus("Fitting TOP model from OOF predictions...", enabled=use_spinner) as task:
+                    try:
+                        top_model_payload = _jxrs.top_fit_model(
+                            top_train_ids,
+                            top_traits,
+                            y_true_full,
+                            y_pred_full,
+                            selected_models=top_selected_models,
+                            mode=str(args.top_mode),
+                            exact_threshold=int(args.top_exact_threshold),
+                            max_iter=int(args.top_max_iter),
+                            tol=float(args.top_tol),
+                            l2=float(args.top_l2),
+                            batch_size=int(args.top_batch_size),
+                            epochs=int(args.top_epochs),
+                            learning_rate=float(args.top_lr),
+                            seed=int(args.top_seed),
+                            calibration_mode=str(args.top_calibration),
+                        )
+                    except Exception:
+                        task.fail("Fitting TOP model ...Failed")
+                        raise
+                    task.complete(
+                        f"Fitting TOP model (n={int(y_true_full.shape[0])}, k={int(y_true_full.shape[1])})"
+                    )
+
+        if top_model_payload is not None:
+            weights = np.asarray(top_model_payload.get("weights", []), dtype=np.float64).reshape(-1)
+            top_metrics_rows: list[dict[str, typing.Any]] = []
+            trait_models_payload: dict[str, dict[str, typing.Any]] = {}
+            for i, trait in enumerate(top_traits):
+                method_sel = str(top_trait_selected_method.get(trait, "")).strip()
+                score_pack = dict(top_trait_metric_scores.get(trait, {}).get(method_sel, {}))
+                obs_n = int(
+                    np.asarray(
+                        top_train_true_by_trait.get(str(trait), np.array([], dtype=np.float64)),
+                        dtype=np.float64,
+                    ).reshape(-1).shape[0]
+                )
+                total_n = int(np.asarray(samples, dtype=str).reshape(-1).shape[0])
+                miss_n = int(max(0, total_n - obs_n))
+                warn_flag = (
+                    "LOW_OBSERVED_N"
+                    if (obs_n > 0 and obs_n < 20)
+                    else ""
+                )
+                top_metrics_rows.append(
+                    {
+                        "trait": str(trait),
+                        "observed_n": int(obs_n),
+                        "missing_n": int(miss_n),
+                        "selected_gs_model": method_sel,
+                        "weight": (float(weights[i]) if i < int(weights.size) else float("nan")),
+                        "pearson": float(score_pack.get("pearson", np.nan)),
+                        "spearman": float(score_pack.get("spearman", np.nan)),
+                        "r2": float(score_pack.get("r2", np.nan)),
+                        "rmse": float(score_pack.get("rmse", np.nan)),
+                        "nrmse": float(score_pack.get("nrmse", np.nan)),
+                        "warning": str(warn_flag),
+                    }
+                )
+                trait_models_payload[str(trait)] = {
+                    "selected_method": str(method_sel),
+                    "observed_n": int(obs_n),
+                    "missing_n": int(miss_n),
+                    "warning": str(warn_flag),
+                    "metrics": dict(score_pack),
+                    "model_state": dict(top_trait_model_state.get(str(trait), {})),
+                }
+
+            top_weights_out = f"{outprefix}.gs.TOP.weights.tsv"
+            pd.DataFrame(top_metrics_rows).to_csv(
+                top_weights_out,
+                sep="\t",
+                index=False,
+                float_format="%.6g",
+            )
+            saved_result_paths.append(str(top_weights_out))
+            log_success(logger, f"Saved TOP weights to {format_path_for_display(top_weights_out)}")
+
+            if not model_mode:
+                top_model_out = f"{outprefix}.gs.TOP.jxmodel"
+                _save_jxmodel(
+                    top_model_out,
+                    {
+                        "format": _JXMODEL_FORMAT,
+                        "method": _JXMODEL_TOP_BUNDLE_METHOD,
+                        "method_display": "GS_TOP_BUNDLE",
+                        "trait": "MULTI",
+                        "created_at_unix": float(time.time()),
+                        "model_select_metric": str(args.model_select_metric).strip().lower(),
+                        "top_model_state": dict(top_model_payload),
+                        "trait_models": trait_models_payload,
+                        "top_mask_meta": {
+                            "missing_aware": True,
+                            "distance_normalization": "observed_weight",
+                            "min_trait_observed_warning": 20,
+                            "n_samples": int(np.asarray(samples, dtype=str).reshape(-1).shape[0]),
+                            "n_traits": int(len(top_traits)),
+                            "traits": [str(x) for x in top_traits],
+                        },
+                    },
+                )
+                saved_result_paths.append(str(top_model_out))
+                log_success(logger, f"Saved TOP bundle model to {format_path_for_display(top_model_out)}")
+
+            pred_full_df = pd.DataFrame(
+                {
+                    str(t): np.asarray(top_test_pred_by_trait[str(t)], dtype=np.float64).reshape(-1)
+                    for t in top_traits
+                },
+                index=np.asarray(samples, dtype=str).reshape(-1),
+            )
+            cand_valid_mask = np.isfinite(np.asarray(pred_full_df, dtype=np.float64)).all(axis=1)
+            candidate_df = pred_full_df.loc[cand_valid_mask]
+            if int(candidate_df.shape[0]) == 0:
+                logger.warning("TOP ranking is skipped: no candidate rows with finite multi-trait predictions.")
+            else:
+                std_pack = dict(top_model_payload.get("standardizer", {}))
+                mean_vec = np.asarray(std_pack.get("mean", []), dtype=np.float64).reshape(-1)
+                std_vec = np.asarray(std_pack.get("std", []), dtype=np.float64).reshape(-1)
+                target_values, target_source = _resolve_top_target_values(
+                    select_arg=(None if args.select is None else str(args.select)),
+                    trait_names=top_traits,
+                    trait_mean=mean_vec,
+                    trait_std=std_vec,
+                    logger=logger,
+                )
+                if target_values is not None:
+                    with CliStatus("Ranking candidates by TOP target values...", enabled=use_spinner) as task:
+                        try:
+                            rank_payload = _jxrs.top_rank_to_target_values(
+                                top_model_payload,
+                                top_traits,
+                                [str(x) for x in candidate_df.index.to_list()],
+                                np.asarray(candidate_df, dtype=np.float64),
+                                np.asarray(target_values, dtype=np.float64).reshape(-1),
+                            )
+                        except Exception:
+                            task.fail("Ranking candidates by TOP ...Failed")
+                            raise
+                        task.complete(f"Ranking candidates by TOP (n={int(candidate_df.shape[0])})")
+
+                    rank_rows: list[dict[str, typing.Any]] = []
+                    for rec in list(rank_payload.get("records", [])):
+                        raw = np.asarray(rec.get("pred_traits_raw", []), dtype=np.float64).reshape(-1)
+                        cal = np.asarray(rec.get("pred_traits_calibrated", []), dtype=np.float64).reshape(-1)
+                        row: dict[str, typing.Any] = {
+                            "rank": int(rec.get("rank", 0)),
+                            "sample_id": str(rec.get("sample_id", "")),
+                            "top_distance": float(rec.get("distance", np.nan)),
+                            "top_similarity": float(rec.get("similarity", np.nan)),
+                            "target_source": str(target_source),
+                        }
+                        for i, trait in enumerate(top_traits):
+                            row[f"target_{trait}"] = float(target_values[i]) if i < int(target_values.size) else float("nan")
+                            row[f"{trait}_raw"] = float(raw[i]) if i < int(raw.size) else float("nan")
+                            row[f"{trait}_cal"] = float(cal[i]) if i < int(cal.size) else float("nan")
+                        rank_rows.append(row)
+                    rank_df = pd.DataFrame(rank_rows)
+                    if "rank" in rank_df.columns:
+                        rank_df = rank_df.sort_values("rank", ascending=True)
+                    top_rank_out = f"{outprefix}.top.rank.tsv"
+                    rank_df.to_csv(top_rank_out, sep="\t", index=False, float_format="%.6g")
+                    saved_result_paths.append(str(top_rank_out))
+                    log_success(logger, f"Saved TOP rank to {format_path_for_display(top_rank_out)}")
 
     # ----------------------------------------------------------------------
     # Final summary

@@ -1402,7 +1402,10 @@ pub fn rrblup_pcg_bed<'py>(
             Err(_) => maf_ro.as_array().iter().copied().collect(),
         }
     } else {
-        let maf_ro = loaded_maf_arr.as_ref().expect("maf array must exist").readonly();
+        let maf_ro = loaded_maf_arr
+            .as_ref()
+            .expect("maf array must exist")
+            .readonly();
         match maf_ro.as_slice() {
             Ok(s) => s.to_vec(),
             Err(_) => maf_ro.as_array().iter().copied().collect(),

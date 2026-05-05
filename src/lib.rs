@@ -32,6 +32,9 @@ mod rsvd;
 pub mod score;
 #[path = "stats/common.rs"]
 mod stats_common;
+#[allow(dead_code)]
+#[path = "stats/top.rs"]
+mod top;
 #[path = "stats/tree.rs"]
 mod tree;
 
@@ -40,12 +43,12 @@ mod tree;
 mod gfcore;
 #[path = "io/gfreader.rs"]
 mod gfreader;
-#[path = "io/sim.rs"]
-mod sim;
 #[path = "io/gmerge.rs"]
 mod gmerge;
 #[path = "io/gwasio.rs"]
 mod gwasio;
+#[path = "io/sim.rs"]
+mod sim;
 #[path = "io/vcfout.rs"]
 mod vcfout;
 
@@ -70,6 +73,8 @@ mod linalg;
 mod math_farmcpu;
 #[path = "math/ld.rs"]
 mod math_ld;
+#[path = "ml/mod.rs"]
+mod ml;
 
 use admixture::{
     admx_adam_optimize_f32, admx_adam_update_p, admx_adam_update_p_inplace,
@@ -94,8 +99,8 @@ use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64};
 use gfreader::{
     bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
     load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
-    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo,
-    TxtChunkReader, VcfChunkReader, VcfStreamWriter,
+    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
+    VcfChunkReader, VcfStreamWriter,
 };
 use glm::{glmf32, glmf32_full, glmf32_packed};
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
@@ -112,6 +117,7 @@ use lmm_scan::{
     lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
 };
 use logreg::fit_best_and_not_py;
+use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
     bed_packed_decode_rows_f32, bed_packed_decode_stats_f64, bed_packed_row_flip_mask,
     bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
@@ -123,6 +129,7 @@ use score::{
     score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
 };
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
+use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
 use tree::{
     geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
     geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
@@ -206,6 +213,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;
+    m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
+    m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
@@ -261,6 +271,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_adam_optimize_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_ml_feature_scores_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_ml_select_topk_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;

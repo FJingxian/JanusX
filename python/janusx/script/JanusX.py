@@ -104,8 +104,8 @@ __logo__ = r'''
   ---------------------------------------------------------
 '''
 __version__ = (
-    f"JanusX v{v} by Jingxian FU, Yazhouwan National Laboratory\n"
-    "Please report issues to <fujingxian@yzwlab.cn>\n"
+    f"JanusX v{v} by Jingxian FU, Huazhong Agricultural University\n"
+    "Please report issues to <fujingxian@webmail.hzau.edu.cn>\n"
     f"Build date: {_build_date()}\n"
 )
 

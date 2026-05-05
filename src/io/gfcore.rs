@@ -1074,7 +1074,11 @@ fn purge_stale_txt_cache(paths: &TxtPaths) -> Result<(), String> {
         source_files.push(src_site_path.as_path());
     }
     if let Some(src_bim_path) = paths.src_bim_path.as_ref() {
-        source_files.push(src_bim_path.as_path());
+        // Avoid self-reference: when source BIM is resolved to cached
+        // "~prefix.bim", it must not participate in stale-source checks.
+        if src_bim_path != &paths.cache_bim_path {
+            source_files.push(src_bim_path.as_path());
+        }
     }
     if source_files.is_empty() {
         return Ok(());

@@ -14,6 +14,7 @@ from janusx.garfield.garfield2 import (
     window as garfield_window,
     _HAS_SKLEARN as _GARFIELD_HAS_SKLEARN,
     _SKLEARN_IMPORT_ERROR as _GARFIELD_SKLEARN_IMPORT_ERROR,
+    _HAS_RUST_GARFIELD_ML as _GARFIELD_HAS_RUST_ML,
 )
 from janusx._optional_deps import format_missing_dependency_message
 from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
@@ -352,6 +353,17 @@ def main() -> None:
         help="Number of trees/estimators (default: %(default)s).",
     )
     optional_group.add_argument(
+        "--ml-engine",
+        type=str,
+        default="auto",
+        choices=["auto", "sklearn", "rf", "gbdt", "et", "corr", "mcc", "mean_diff", "fisher"],
+        help=(
+            "Candidate-compression ML engine. "
+            "auto=prefer Rust ET then sklearn fallback; "
+            "et/corr/mcc/mean_diff/fisher require Rust extension support."
+        ),
+    )
+    optional_group.add_argument(
         "-t", "--thread", dest="thread", type=int, default=detect_effective_threads(),
         help="Number of CPU threads (default: %(default)s).",
     )
@@ -387,10 +399,27 @@ def main() -> None:
             "the following arguments are required: "
             "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
-    if not _GARFIELD_HAS_SKLEARN:
+    ml_engine = str(args.ml_engine).strip().lower()
+    rust_only_engines = {"et", "corr", "mcc", "mean_diff", "fisher"}
+    needs_sklearn_fallback = ml_engine in {"auto", "sklearn", "rf", "gbdt"}
+    if ml_engine in rust_only_engines and (not _GARFIELD_HAS_RUST_ML):
+        parser.error(
+            f"--ml-engine {ml_engine} requires Rust GARFIELD ML support. "
+            "Rebuild janusx extension with current Rust modules."
+        )
+    if needs_sklearn_fallback and (not _GARFIELD_HAS_RUST_ML) and (not _GARFIELD_HAS_SKLEARN):
         parser.error(
             format_missing_dependency_message(
-                "scikit-learn is required for GARFIELD.",
+                "GARFIELD requires either Rust ML engine support or scikit-learn fallback.",
+                packages=("scikit-learn",),
+                extra="ml",
+                original_error=_GARFIELD_SKLEARN_IMPORT_ERROR,
+            )
+        )
+    if ml_engine == "sklearn" and (not _GARFIELD_HAS_SKLEARN):
+        parser.error(
+            format_missing_dependency_message(
+                "--ml-engine sklearn requires scikit-learn.",
                 packages=("scikit-learn",),
                 extra="ml",
                 original_error=_GARFIELD_SKLEARN_IMPORT_ERROR,
@@ -453,6 +482,7 @@ def main() -> None:
             ("Top SNPs", args.nsnp),
             ("Min literals", args.min_literals),
             ("Estimators", args.nestimators),
+            ("ML engine", args.ml_engine),
             ("Mmap limit", args.mmap_limit),
         ]
     )
@@ -613,6 +643,11 @@ def main() -> None:
         logger.info("Window mode: streaming genotype loading.")
 
     logger.info("=" * 60)
+    if ml_engine == "auto":
+        if _GARFIELD_HAS_RUST_ML:
+            logger.info("ML engine(auto): using Rust backend (et).")
+        else:
+            logger.info("ML engine(auto): Rust backend unavailable, using sklearn fallback.")
 
     used_trait_labels: dict[str, int] = {}
     saved = 0
@@ -653,6 +688,7 @@ def main() -> None:
                         bimranges,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        core=args.ml_engine,
                         min_literals=args.min_literals,
                         threads=threads,
                         response=response_mode,
@@ -668,6 +704,7 @@ def main() -> None:
                         bimranges,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        core=args.ml_engine,
                         min_literals=args.min_literals,
                         threads=threads,
                         response=response_mode,
@@ -682,6 +719,7 @@ def main() -> None:
                         args.extension,
                         nsnp=args.nsnp,
                         n_estimators=args.nestimators,
+                        core=args.ml_engine,
                         min_literals=args.min_literals,
                         response=response_mode,
                         gsetmode=False,

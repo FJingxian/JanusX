@@ -121,10 +121,15 @@ try:
     from janusx.janusx import (
         bed_packed_row_flip_mask as _bed_packed_row_flip_mask,
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
+        garfield_ml_feature_scores as _garfield_ml_feature_scores,
     )
 except Exception:
     _bed_packed_row_flip_mask = None
     _bed_packed_decode_rows_f32 = None
+    _garfield_ml_feature_scores = None
+
+_HAS_RUST_GARFIELD_ML = _garfield_ml_feature_scores is not None
+GarfieldCore = Literal["auto", "sklearn", "rf", "gbdt", "et", "corr", "mcc", "mean_diff", "fisher"]
 
 def load_all_genotype_int8(
     genofile: str,
@@ -447,7 +452,7 @@ def getLogicgate(
     nsnp: int = 5,
     n_estimators: int = 200,
     sites: Any = None,
-    core:Literal['rf','gbdt']='gbdt',
+    core: GarfieldCore = "auto",
     response:Literal['binary', 'continuous']="continuous",
     gsetmode:bool = True,
     gset_groups: Union[None, List[np.ndarray], List[list[int]]] = None,
@@ -455,9 +460,12 @@ def getLogicgate(
 ):
     """
     Find logic combinations (xcombine) in a genotype block using
-    random forest + permutation importance + logistic regression.
+    Rust ML engine (preferred) + logic regression.
+    Falls back to sklearn rf/gbdt when Rust engine is unavailable.
     """
-    _require_sklearn("GARFIELD core models (rf/gbdt)")
+    core_name = str(core).strip().lower()
+    if core_name == "":
+        core_name = "auto"
     if sites is not None:
         if len(sites) == 0:
             sites = np.arange(M.shape[0])
@@ -511,29 +519,71 @@ def getLogicgate(
             return None
     else:
         M,sites = ldprune(M,sites)
-    if core == 'rf':
-        model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=nsnp,
-            min_samples_leaf=nsnp,
-            bootstrap=True,
-            n_jobs=1,
-            random_state=0,
-        )
-    elif core == 'gbdt':
-        model = GradientBoostingRegressor(
-            n_estimators=n_estimators,
-            max_depth=nsnp,
-            learning_rate=0.05,
-            subsample=0.7,
-            random_state=0,
-        )
-    model.fit(M.T, y)
-    Imp = model.feature_importances_
+
+    Imp = None
+    # 1) Rust ML engine path (preferred).
+    rust_method = core_name
+    if rust_method == "auto":
+        rust_method = "et"
+    if rust_method in {"rf", "gbdt"}:
+        # Keep old user terms, route to Rust tree engine.
+        rust_method = "et"
+    if _garfield_ml_feature_scores is not None and core_name != "sklearn":
+        try:
+            Imp = np.asarray(
+                _garfield_ml_feature_scores(
+                    np.ascontiguousarray(np.asarray(M, dtype=np.int8)),
+                    np.ascontiguousarray(np.asarray(y, dtype=np.float64).reshape(-1)),
+                    response=str(response),
+                    method=str(rust_method),
+                    n_estimators=int(max(1, int(n_estimators))),
+                    max_depth=int(max(1, int(nsnp))),
+                    min_samples_leaf=1,
+                    bootstrap=True,
+                    seed=0,
+                    feature_subsample=0.0,
+                ),
+                dtype=np.float64,
+            ).reshape(-1)
+        except Exception:
+            # Explicit Rust engine request should surface the error.
+            if core_name not in {"auto", "rf", "gbdt"}:
+                raise
+            Imp = None
+
+    # 2) sklearn fallback path.
+    if Imp is None:
+        _require_sklearn("GARFIELD core models (rf/gbdt)")
+        if core_name not in {"rf", "gbdt", "auto", "sklearn"}:
+            # User asked an unsupported Rust-only engine but Rust path is unavailable.
+            raise RuntimeError(
+                f"Rust ML engine '{core_name}' is unavailable in this build; "
+                "use {auto, sklearn, rf, gbdt} fallback or rebuild janusx extension "
+                "to enable {et, corr, mcc, mean_diff, fisher}."
+            )
+        sk_core = "gbdt" if core_name in {"auto", "sklearn"} else core_name
+        if sk_core == 'rf':
+            model = RandomForestRegressor(
+                n_estimators=n_estimators,
+                max_depth=nsnp,
+                min_samples_leaf=nsnp,
+                bootstrap=True,
+                n_jobs=1,
+                random_state=0,
+            )
+        else:
+            model = GradientBoostingRegressor(
+                n_estimators=n_estimators,
+                max_depth=nsnp,
+                learning_rate=0.05,
+                subsample=0.7,
+                random_state=0,
+            )
+        model.fit(M.T, y)
+        Imp = np.asarray(model.feature_importances_, dtype=np.float64).reshape(-1)
 
     topk = nsnp
     if gsetmode and gset_groups is not None:
-        order = np.argsort(Imp)[::-1]
         idx = []
         for g in gset_groups:
             if g.size == 0:
@@ -570,6 +620,7 @@ def _window_task(
     y: np.ndarray,
     nsnp: int,
     n_estimators: int,
+    core: GarfieldCore,
     response: Literal['binary', 'continuous'],
     gsetmode: bool,
     min_literals: int,
@@ -582,6 +633,7 @@ def _window_task(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=tags,
+            core=str(core),
             response=response,
             gsetmode=gsetmode,
             min_literals=min_literals,
@@ -633,6 +685,7 @@ def window(
     missing_rate: float = 0.05,
     nsnp: int = 5,
     n_estimators: int = 200,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = False,
     threads: int = 4,
@@ -783,12 +836,12 @@ def window(
                                 if len(tasks) >= batch_size:
                                     if threads <= 1:
                                         batch_outputs = [
-                                            _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
+                                            _window_task(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals)
                                             for t in tasks
                                         ]
                                     else:
                                         batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                            delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
+                                            delayed(_window_task)(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals) for t in tasks
                                         )
                                     _consume_task_outputs(batch_outputs)
                                     tasks.clear()
@@ -813,12 +866,12 @@ def window(
                         if len(tasks) >= batch_size:
                             if threads <= 1:
                                 batch_outputs = [
-                                    _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
+                                    _window_task(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals)
                                     for t in tasks
                                 ]
                             else:
                                 batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
+                                    delayed(_window_task)(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals) for t in tasks
                                 )
                             _consume_task_outputs(batch_outputs)
                             tasks.clear()
@@ -841,12 +894,12 @@ def window(
                     if len(tasks) >= batch_size:
                         if threads <= 1:
                             batch_outputs = [
-                                _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
+                                _window_task(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals)
                                 for t in tasks
                             ]
                         else:
                             batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                                delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
+                                delayed(_window_task)(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals) for t in tasks
                             )
                         _consume_task_outputs(batch_outputs)
                         tasks.clear()
@@ -855,12 +908,12 @@ def window(
         if tasks:
             if threads <= 1:
                 batch_outputs = [
-                    _window_task(t, y, nsnp, n_estimators, response, gsetmode, min_literals)
+                    _window_task(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals)
                     for t in tasks
                 ]
             else:
                 batch_outputs = Parallel(n_jobs=threads, backend="loky")(
-                    delayed(_window_task)(t, y, nsnp, n_estimators, response, gsetmode, min_literals) for t in tasks
+                    delayed(_window_task)(t, y, nsnp, n_estimators, core, response, gsetmode, min_literals) for t in tasks
                 )
             _consume_task_outputs(batch_outputs)
     finally:
@@ -888,6 +941,7 @@ def _process(
     missing_rate: float = 0.05,
     nsnp: int = 5,
     n_estimators: int = 200,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     mmap_window_mb: Union[int, None] = None,
@@ -988,6 +1042,7 @@ def _process(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=sites_list,
+            core=core,
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
@@ -1064,6 +1119,7 @@ def _process_inmemory(
     y: np.ndarray,
     nsnp: int = 5,
     n_estimators: int = 200,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     min_literals: int = 2,
@@ -1117,6 +1173,7 @@ def _process_inmemory(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=sites_list,
+            core=core,
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
@@ -1139,6 +1196,7 @@ def _process_inmemory_packed(
     y: np.ndarray,
     nsnp: int = 5,
     n_estimators: int = 200,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     min_literals: int = 2,
@@ -1192,6 +1250,7 @@ def _process_inmemory_packed(
             nsnp=nsnp,
             n_estimators=n_estimators,
             sites=sites_list,
+            core=core,
             response=response,
             gsetmode=gsetmode,
             gset_groups=gset_groups if gsetmode and isinstance(ChromPos, list) else None,
@@ -1216,6 +1275,7 @@ def main(
     nsnp=5,
     n_estimators=200,
     threads=4,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
@@ -1237,6 +1297,7 @@ def main(
             missing_rate,
             nsnp,
             n_estimators,
+            core,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             mmap_window_mb,
@@ -1254,6 +1315,7 @@ def main_inmemory(
     nsnp: int = 5,
     n_estimators: int = 200,
     threads: int = 4,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
@@ -1281,6 +1343,7 @@ def main_inmemory(
             y,
             nsnp,
             n_estimators,
+            core,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             min_literals,
@@ -1299,6 +1362,7 @@ def main_inmemory_packed(
     nsnp: int = 5,
     n_estimators: int = 200,
     threads: int = 4,
+    core: GarfieldCore = "auto",
     response: Literal['binary', 'continuous'] = "continuous",
     gsetmode: bool = True,
     gsetmodes: Optional[List[bool]] = None,
@@ -1332,6 +1396,7 @@ def main_inmemory_packed(
             y,
             nsnp,
             n_estimators,
+            core,
             response,
             gsetmodes[i] if gsetmodes is not None else gsetmode,
             min_literals,

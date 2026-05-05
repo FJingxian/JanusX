@@ -4718,60 +4718,14 @@ def run_chunked_gwas_lmm_lm(
     # Keep output file suffixes consistent and lowercase.
     base_model_tag = base_model_label.lower()
 
-    # FastLMM packed full-rust route:
-    # packed BED -> Rust GRM -> Rust EVD -> Rust full SNP scan.
+    # FastLMM route: reuse prepared streaming GRM and slice to trait samples.
+    # Do NOT rebuild packed GRM here.
     if model_key == "fastlmm":
-        can_packed = _as_plink_prefix(genofile) is not None
-        has_symbols = all(
-            hasattr(jxrs, s)
-            for s in (
-                "grm_packed_f64_with_stats",
-                "rust_eigh_from_array_f64",
-                "fastlmm_assoc_packed_f32",
-            )
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "FastLMM route: using prepared streaming GRM + trait slicing (packed GRM rebuild disabled).",
         )
-        if can_packed and has_symbols:
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "FastLMM route: using full-rust packed pipeline (GRM+EVD+scan).",
-            )
-            run_fastlmm_packed_fullrank(
-                genofile=genofile,
-                pheno=pheno,
-                ids=ids,
-                outprefix=outprefix,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                genetic_model=genetic_model,
-                het_threshold=het_threshold,
-                chunk_size=chunk_size,
-                qmatrix=qmatrix,
-                cov_all=cov_all,
-                plot=plot,
-                threads=threads,
-                logger=logger,
-                use_spinner=use_spinner,
-                snps_only=bool(snps_only),
-                eff_snp_by_trait=eff_snp_by_trait,
-                summary_rows=summary_rows,
-                saved_paths=saved_paths,
-                trait_names=trait_names,
-                emit_trait_header=emit_trait_header,
-            )
-            return
-        if model_key == "fastlmm":
-            reasons: list[str] = []
-            if not can_packed:
-                reasons.append("input is not PLINK BED prefix")
-            if not has_symbols:
-                reasons.append("required rust symbols unavailable")
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "FastLMM route: fallback to streaming Python orchestrator "
-                f"({'; '.join(reasons) if len(reasons) > 0 else 'unknown reason'}).",
-            )
     if model_key == "lm":
         can_packed = _as_plink_prefix(genofile) is not None
         has_symbols = hasattr(jxrs, "glmf32_packed")
@@ -7076,14 +7030,6 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
-        "-lrlmm", "--lrlmm", nargs="?", const=-1, default=None, type=int, metavar="RANK",
-        help=(
-            "Run low-rank LMM (packed BED + RSVD + Rust FaST GWAS). "
-            "Optional RANK; if omitted after the flag, use sqrt(n). "
-            "Disabled unless explicitly requested."
-        ),
-    )
-    models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
         help="Run FarmCPU (full genotype in memory; default: %(default)s).",
     )
@@ -7093,7 +7039,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for streaming LM/LMM/FastLMM/LRLMM (default: %(default)s).",
+        help="Genetic effect coding model for streaming LM/LMM/FastLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -7312,11 +7258,6 @@ def _run_gwas_pipeline(
             model_tokens.append("LMM")
         if args.fastlmm:
             model_tokens.append("fastLMM")
-        if args.lrlmm is not None:
-            if int(args.lrlmm) > 0:
-                model_tokens.append(f"LRLMM(rank={int(args.lrlmm)})")
-            else:
-                model_tokens.append("LRLMM(rank=sqrt(n))")
         if args.lm:
             model_tokens.append("LM")
         if args.farmcpu:
@@ -7335,10 +7276,6 @@ def _run_gwas_pipeline(
             ("Miss threshold", args.geno),
             ("Chunk size", args.chunksize),
         ]
-        if args.lrlmm is not None:
-            cfg_rows.append(
-                ("LRLMM rank", int(args.lrlmm) if int(args.lrlmm) > 0 else "sqrt(n)")
-            )
         if args.model != "add":
             cfg_rows.append(("Het filter", f"{args.het} (keep [{args.het}, {1.0 - args.het}])"))
         if args.farmcpu:
@@ -7388,17 +7325,14 @@ def _run_gwas_pipeline(
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if not (args.lm or args.lmm or args.fastlmm or (args.lrlmm is not None) or args.farmcpu):
+    if not (args.lm or args.lmm or args.fastlmm or args.farmcpu):
         logger.error(
-            "No model selected. Use -lm, -lmm, -fastlmm, -lrlmm, and/or -farmcpu."
+            "No model selected. Use -lm, -lmm, -fastlmm, and/or -farmcpu."
         )
-        raise SystemExit(1)
-    if (args.lrlmm is not None) and args.model != "add":
-        logger.error("LRLMM currently supports additive coding only (--model add).")
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM/LRLMM; "
+            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM; "
             "FarmCPU keeps additive coding."
         )
 
@@ -7444,7 +7378,7 @@ def _run_gwas_pipeline(
             )
             _phase_split(logger)
         else:
-            if args.farmcpu and (args.lrlmm is None):
+            if args.farmcpu:
                 pheno = _load_phenotype_with_status(
                     args.pheno,
                     args.ncol,
@@ -7460,7 +7394,6 @@ def _run_gwas_pipeline(
             stream_models.append("fastlmm")
         if args.lm:
             stream_models.append("lm")
-        has_lrlmm = bool(args.lrlmm is not None)
         has_farmcpu = bool(args.farmcpu)
 
         trait_order = list(pheno.columns) if pheno is not None else []
@@ -7488,15 +7421,6 @@ def _run_gwas_pipeline(
                     mk = str(mkey).lower().strip()
                     if not packed_prefix_ok:
                         return False
-                    if mk == "fastlmm":
-                        return all(
-                            hasattr(jxrs, s)
-                            for s in (
-                                "grm_packed_f64_with_stats",
-                                "rust_eigh_from_array_f64",
-                                "fastlmm_assoc_packed_f32",
-                            )
-                        )
                     if mk == "lmm":
                         return (
                             str(args.model).lower() == "add"
@@ -7510,7 +7434,7 @@ def _run_gwas_pipeline(
                         )
                     return False
 
-                for model_sep in ("fastlmm", "lmm", "lm"):
+                for model_sep in ("lmm", "lm"):
                     if (model_sep not in stream_models) or (not _can_fullrust_model(model_sep)):
                         continue
                     run_chunked_gwas_lmm_lm(
@@ -7610,194 +7534,32 @@ def _run_gwas_pipeline(
                         logger.info("")
 
         # -------------------------------
-        # 2) Full genotype task (LowRankLMM / FarmCPU)
+        # 2) Full genotype task (FarmCPU)
         # -------------------------------
-        if has_lrlmm or has_farmcpu:
-            full_task_summary_start = int(len(gwas_summary_rows))
+        if has_farmcpu:
             if len(stream_models) > 0:
                 logger.info("")
             _section(logger, "Full genotype task")
             context_prepared = bool(pheno is not None and ids is not None and n_snps is not None)
-
-            shared_full_cache: Union[dict[str, object], None] = None
-            if has_lrlmm:
-                shared_full_cache = run_farmcpu_fullmem(
-                    args=args,
-                    gfile=gfile,
-                    prefix=prefix,
-                    logger=logger,
-                    pheno_preloaded=pheno,
-                    ids_preloaded=ids,
-                    n_snps_preloaded=n_snps,
-                    qmatrix_preloaded=qmatrix,
-                    cov_preloaded=cov_all,
-                    use_spinner=use_spinner,
-                    context_prepared=context_prepared,
-                    summary_rows=gwas_summary_rows,
-                    saved_paths=saved_result_paths,
-                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                    farmcpu_cache=None,
-                    prepare_only=True,
-                    emit_trait_header=True,
-                )
-                if len(trait_order) == 0 and isinstance(shared_full_cache, dict):
-                    pheno_cache = shared_full_cache.get("pheno")
-                    if isinstance(pheno_cache, pd.DataFrame):
-                        trait_order = [str(t) for t in list(pheno_cache.columns)]
-                        trait_col_map = {str(t): int(i) for i, t in enumerate(trait_order)}
-
-                _phase_split(logger)
             trait_names_full = [str(t) for t in trait_order] if len(trait_order) > 0 else None
-
-            def _emit_lrlmm_pve_for_trait(trait_name: str) -> None:
-                for row in reversed(gwas_summary_rows):
-                    if str(row.get("model", "")).strip().lower() != "lrlmm":
-                        continue
-                    if str(row.get("phenotype", "")).strip() != str(trait_name):
-                        continue
-                    pve_raw = row.get("pve")
-                    try:
-                        pve_val = float(pve_raw) if pve_raw is not None else float("nan")
-                    except Exception:
-                        pve_val = float("nan")
-                    if np.isfinite(pve_val):
-                        _emit_plain_info_line(
-                            logger,
-                            f"pve={pve_val:.3f} (from LrLMM)",
-                            use_spinner=bool(use_spinner),
-                        )
-                    return
-
-            # For multi-trait full task, keep per-trait output grouped:
-            # trait header -> LrLMM -> FarmCPU -> pve
-            if has_lrlmm and has_farmcpu and trait_names_full is not None:
-                for trait_idx, tname in enumerate(trait_names_full):
-                    run_lrlmm_packed(
-                        rank_opt=args.lrlmm,
-                        genofile=gfile,
-                        pheno=pheno if pheno is not None else pd.DataFrame(),
-                        ids=ids if ids is not None else np.asarray([], dtype=str),
-                        outprefix=outprefix,
-                        maf_threshold=args.maf,
-                        max_missing_rate=args.geno,
-                        genetic_model=args.model,
-                        chunk_size=args.chunksize,
-                        mmap_limit=args.mmap_limit,
-                        qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
-                        cov_all=cov_all,
-                        plot=args.plot,
-                        threads=args.thread,
-                        logger=logger,
-                        use_spinner=use_spinner,
-                        snps_only=bool(args.snps_only),
-                        eff_snp_by_trait=eff_snp_by_trait,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=[str(tname)],
-                        emit_trait_header=True,
-                        prepared_cache=shared_full_cache,
-                    )
-                    _ = run_farmcpu_fullmem(
-                        args=args,
-                        gfile=gfile,
-                        prefix=prefix,
-                        logger=logger,
-                        pheno_preloaded=pheno,
-                        ids_preloaded=ids,
-                        n_snps_preloaded=n_snps,
-                        qmatrix_preloaded=qmatrix,
-                        cov_preloaded=cov_all,
-                        use_spinner=use_spinner,
-                        context_prepared=context_prepared,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=[str(tname)],
-                        farmcpu_cache=shared_full_cache,
-                        emit_trait_header=False,
-                    )
-                    _emit_lrlmm_pve_for_trait(str(tname))
-                    if trait_idx < len(trait_names_full) - 1:
-                        logger.info("")
-            else:
-                if has_lrlmm:
-                    run_lrlmm_packed(
-                        rank_opt=args.lrlmm,
-                        genofile=gfile,
-                        pheno=pheno if pheno is not None else pd.DataFrame(),
-                        ids=ids if ids is not None else np.asarray([], dtype=str),
-                        outprefix=outprefix,
-                        maf_threshold=args.maf,
-                        max_missing_rate=args.geno,
-                        genetic_model=args.model,
-                        chunk_size=args.chunksize,
-                        mmap_limit=args.mmap_limit,
-                        qmatrix=qmatrix if qmatrix is not None else np.zeros((0, 0), dtype=np.float32),
-                        cov_all=cov_all,
-                        plot=args.plot,
-                        threads=args.thread,
-                        logger=logger,
-                        use_spinner=use_spinner,
-                        snps_only=bool(args.snps_only),
-                        eff_snp_by_trait=eff_snp_by_trait,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=trait_names_full,
-                        emit_trait_header=True,
-                        prepared_cache=shared_full_cache,
-                    )
-
-                if has_farmcpu:
-                    _ = run_farmcpu_fullmem(
-                        args=args,
-                        gfile=gfile,
-                        prefix=prefix,
-                        logger=logger,
-                        pheno_preloaded=pheno,
-                        ids_preloaded=ids,
-                        n_snps_preloaded=n_snps,
-                        qmatrix_preloaded=qmatrix,
-                        cov_preloaded=cov_all,
-                        use_spinner=use_spinner,
-                        context_prepared=context_prepared,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=trait_names_full,
-                        farmcpu_cache=shared_full_cache,
-                        emit_trait_header=(not has_lrlmm),
-                    )
-
-                # Print LrLMM PVE after all full-task methods finish.
-                if has_lrlmm:
-                    pve_lines: list[tuple[str, float]] = []
-                    seen_trait: set[str] = set()
-                    for row in gwas_summary_rows[full_task_summary_start:]:
-                        if str(row.get("model", "")).strip().lower() != "lrlmm":
-                            continue
-                        trait_name = str(row.get("phenotype", "")).strip()
-                        if trait_name in seen_trait:
-                            continue
-                        pve_raw = row.get("pve")
-                        try:
-                            pve_val = float(pve_raw) if pve_raw is not None else float("nan")
-                        except Exception:
-                            pve_val = float("nan")
-                        if not np.isfinite(pve_val):
-                            continue
-                        seen_trait.add(trait_name)
-                        pve_lines.append((trait_name, pve_val))
-                    if len(pve_lines) == 1:
-                        _emit_plain_info_line(
-                            logger,
-                            f"pve={pve_lines[0][1]:.3f} (from LrLMM)",
-                            use_spinner=bool(use_spinner),
-                        )
-                    elif len(pve_lines) > 1:
-                        for tname, pve_val in pve_lines:
-                            _emit_plain_info_line(
-                                logger,
-                                f"{tname}: pve={pve_val:.3f} (from LrLMM)",
-                                use_spinner=bool(use_spinner),
-                            )
+            _ = run_farmcpu_fullmem(
+                args=args,
+                gfile=gfile,
+                prefix=prefix,
+                logger=logger,
+                pheno_preloaded=pheno,
+                ids_preloaded=ids,
+                n_snps_preloaded=n_snps,
+                qmatrix_preloaded=qmatrix,
+                cov_preloaded=cov_all,
+                use_spinner=use_spinner,
+                context_prepared=context_prepared,
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
+                trait_names=trait_names_full,
+                farmcpu_cache=None,
+                emit_trait_header=True,
+            )
 
         if len(gwas_summary_rows) > 0:
             for row in gwas_summary_rows:
@@ -7845,12 +7607,10 @@ def _run_gwas_pipeline(
                 "models": {
                     "lmm": bool(args.lmm),
                     "fastlmm": bool(args.fastlmm),
-                    "lrlmm": bool(args.lrlmm is not None),
                     "lm": bool(args.lm),
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),
-                "lrlmm_rank": (None if args.lrlmm is None else int(args.lrlmm)),
                 "snps_only": bool(args.snps_only),
                 "maf": float(args.maf),
                 "geno": float(args.geno),

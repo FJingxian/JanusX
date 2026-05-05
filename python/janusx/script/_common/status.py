@@ -107,6 +107,16 @@ def _safe_write(text: str, *, flush: bool = True) -> None:
         sys.stdout.flush()
 
 
+def _clear_current_console_line() -> None:
+    # Portable line clear without relying on ANSI escape support.
+    try:
+        cols = int(get_terminal_size((80, 20)).columns)
+    except Exception:
+        cols = 80
+    cols = max(1, int(cols))
+    _safe_write("\r" + (" " * cols) + "\r")
+
+
 def _split_leading_newlines(text: str) -> tuple[str, str]:
     s = str(text)
     i = 0
@@ -560,6 +570,11 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
+        if self._backend in ("plain", "process") and stdout_is_tty():
+            # Clear the in-place spinner line before printing completion text,
+            # otherwise outputs like "- Computing ...✔︎ ...Finished" may glue
+            # together on terminals that keep cursor at line tail.
+            _clear_current_console_line()
         symbol = _SUCCESS_SYMBOL
         line = self._compose_line(symbol, str(message))
         if should_animate_status(message) or is_completed_status_text(message):
@@ -585,6 +600,9 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
+        if self._backend in ("plain", "process") and stdout_is_tty():
+            # Keep failure output aligned with complete(): remove stale spinner line.
+            _clear_current_console_line()
         if is_skip_status_text(message):
             plain = str(message)
             if self.show_elapsed:

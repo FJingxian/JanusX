@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
+import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -112,8 +113,86 @@ def _rewrite_record(extract_root: Path) -> None:
         w.writerows(rows)
 
 
-def _inject_extension_into_wheel(wheel_path: Path, ext_path: Path) -> None:
-    if not ext_path.is_file():
+def _iter_unique_existing_dirs(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        key = str(rp).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if rp.exists() and rp.is_dir():
+            out.append(rp)
+    return out
+
+
+def _windows_runtime_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for var in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
+        raw = str(os.environ.get(var, "")).strip()
+        if raw:
+            dirs.append(Path(raw))
+
+    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix:
+        cp = Path(conda_prefix)
+        dirs.extend(
+            [
+                cp / "Library" / "bin",
+                cp / "Library" / "lib",
+                cp / "DLLs",
+                cp / "bin",
+            ]
+        )
+    return _iter_unique_existing_dirs(dirs)
+
+
+def _collect_windows_runtime_dlls() -> list[Path]:
+    if not sys.platform.startswith("win"):
+        return []
+
+    # Keep this list tight to avoid wheel bloat while still covering common
+    # OpenBLAS + MinGW runtime dependencies in conda environments.
+    patterns = [
+        "libopenblas*.dll",
+        "openblas*.dll",
+        "libgfortran*.dll",
+        "libquadmath*.dll",
+        "libgcc_s*.dll",
+        "libwinpthread*.dll",
+        "libstdc++*.dll",
+        "libgomp*.dll",
+    ]
+    picked: dict[str, Path] = {}
+    for d in _windows_runtime_dirs():
+        try:
+            names = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for name in names:
+            lname = name.lower()
+            if not lname.endswith(".dll"):
+                continue
+            if not any(fnmatch.fnmatch(lname, pat) for pat in patterns):
+                continue
+            full = d / name
+            if not full.is_file():
+                continue
+            key = name.lower()
+            # Prefer the first match by search priority.
+            picked.setdefault(key, full)
+    return sorted(picked.values(), key=lambda p: p.name.lower())
+
+
+def _inject_artifacts_into_wheel(
+    wheel_path: Path,
+    artifacts: list[tuple[Path, Path]],
+) -> None:
+    if len(artifacts) == 0:
         return
 
     with tempfile.TemporaryDirectory(prefix="janusx_wheel_edit_") as td:
@@ -122,9 +201,10 @@ def _inject_extension_into_wheel(wheel_path: Path, ext_path: Path) -> None:
         with zipfile.ZipFile(wheel_path, "r") as zf:
             zf.extractall(root)
 
-        target = root / "janusx" / ext_path.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ext_path, target)
+        for src, rel in artifacts:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
 
         _rewrite_record(root)
 
@@ -193,6 +273,14 @@ def build_wheel(
     metadata_directory: str | None = None,
 ) -> str:
     ext_path = _build_kmc_extension_for_wheel()
+    win_dlls = _collect_windows_runtime_dlls()
+    if sys.platform.startswith("win") and _env_flag("JANUSX_REQUIRE_OPENBLAS"):
+        has_openblas_dll = any("openblas" in p.name.lower() for p in win_dlls)
+        if not has_openblas_dll:
+            raise RuntimeError(
+                "JANUSX_REQUIRE_OPENBLAS=1 but no OpenBLAS runtime DLL was found for wheel bundling. "
+                "Set OPENBLAS_BIN_DIR/OPENBLAS_LIB_DIR or use a conda env with OpenBLAS in Library/bin."
+            )
 
     prev = os.environ.get("JANUSX_PREBUILD_KMC_BIND")
     os.environ["JANUSX_PREBUILD_KMC_BIND"] = "0"
@@ -204,8 +292,18 @@ def build_wheel(
         else:
             os.environ["JANUSX_PREBUILD_KMC_BIND"] = prev
 
+    artifacts: list[tuple[Path, Path]] = []
     if ext_path is not None:
+        artifacts.append((ext_path, Path("janusx") / ext_path.name))
+    for dll in win_dlls:
+        artifacts.append((dll, Path("janusx") / dll.name))
+
+    if len(artifacts) > 0:
         wheel_path = Path(wheel_directory).resolve() / wheel_name
-        _inject_extension_into_wheel(wheel_path, ext_path)
-        print(f"[build-backend] injected extension: janusx/{ext_path.name}", flush=True)
+        _inject_artifacts_into_wheel(wheel_path, artifacts)
+        if ext_path is not None:
+            print(f"[build-backend] injected extension: janusx/{ext_path.name}", flush=True)
+        if win_dlls:
+            joined = ", ".join(sorted(d.name for d in win_dlls))
+            print(f"[build-backend] injected runtime DLLs: {joined}", flush=True)
     return wheel_name

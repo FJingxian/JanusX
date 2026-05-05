@@ -42,6 +42,9 @@ warnings.filterwarnings(
     message="invalid value encountered in",
 )
 
+_WARNED_EIGH_NON_LAPACK = False
+_WARNED_EIGH_SCIPY_FALLBACK = False
+
 from joblib import Parallel, delayed, cpu_count
 try:
     from threadpoolctl import threadpool_limits as _threadpool_limits
@@ -1070,6 +1073,7 @@ class LMM:
     """
 
     def __init__(self, y: np.ndarray, X: Optional[np.ndarray], kinship: np.ndarray):
+        global _WARNED_EIGH_NON_LAPACK, _WARNED_EIGH_SCIPY_FALLBACK
         y = np.asarray(y).reshape(-1, 1)  # ensure (n,1)
 
         # Add intercept automatically
@@ -1099,8 +1103,27 @@ class LMM:
                     raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
                 self.S = np.asarray(eval_raw, dtype=np.float64)
                 self.Dh = np.asarray(evec_raw, dtype=np.float64)
+                if not str(_evd_backend).lower().startswith("lapack_"):
+                    if not _WARNED_EIGH_NON_LAPACK:
+                        warnings.warn(
+                            (
+                                "Rust eigh did not use LAPACK backend "
+                                f"(backend={_evd_backend}); performance may degrade."
+                            ),
+                            RuntimeWarning,
+                        )
+                        _WARNED_EIGH_NON_LAPACK = True
                 eig_done = True
-            except Exception:
+            except Exception as ex:
+                if not _WARNED_EIGH_SCIPY_FALLBACK:
+                    warnings.warn(
+                        (
+                            "Rust eigh failed; fallback to scipy.linalg.eigh "
+                            f"(reason: {ex})."
+                        ),
+                        RuntimeWarning,
+                    )
+                    _WARNED_EIGH_SCIPY_FALLBACK = True
                 eig_done = False
         if not eig_done:
             self.S, self.Dh = eigh(kinship, overwrite_a=True, check_finite=False)

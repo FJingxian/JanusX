@@ -325,9 +325,15 @@ fn symmetric_eigh_f64_row_major_with_driver(
         }
 
         let allow_nalgebra_fallback = if cfg!(target_os = "windows") {
-            // Windows builds may not always provide LAPACK EVD symbols from the
-            // linked BLAS runtime. Keep fallback enabled there by default.
-            true
+            // Windows default keeps fallback enabled, but allow explicit env
+            // override for diagnostics/perf debugging.
+            match std::env::var("JX_EIGH_ALLOW_NALGEBRA_FALLBACK") {
+                Ok(v) => {
+                    let t = v.trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on")
+                }
+                Err(_) => true,
+            }
         } else {
             env_truthy("JX_EIGH_ALLOW_NALGEBRA_FALLBACK")
         };

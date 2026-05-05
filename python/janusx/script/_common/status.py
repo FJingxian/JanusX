@@ -624,3 +624,9 @@ class CliStatus:
     def __exit__(self, exc_type, exc, tb) -> None:
         if not self._done:
             self._stop_spinner()
+            if self._backend in ("plain", "process") and stdout_is_tty():
+                # When status context exits without complete()/fail(), ensure
+                # the in-place spinner line is cleared before next log line.
+                # This avoids glued outputs like:
+                #   "- Waiting ... [1.4s]position... [10.5s]"
+                _clear_current_console_line()

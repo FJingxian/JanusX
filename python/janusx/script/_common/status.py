@@ -388,7 +388,12 @@ def _animate_plain_process(
             body = f"{desc_text} [{format_elapsed(elapsed)}]"
         else:
             body = f"{desc_text}"
-        line = f"\r{frame} {body}"
+        frame_text = (
+            f"{_CYAN}{frame}{_RESET}"
+            if bool(use_color)
+            else str(frame)
+        )
+        line = f"\r{frame_text} {body}"
         try:
             _safe_print(line, flush=True, end="")
         except Exception:
@@ -433,7 +438,12 @@ class CliStatus:
             if self._plain_done:
                 break
             body = self._running_line()
-            line = f"\r{frame} {body}"
+            frame_text = (
+                f"{_CYAN}{frame}{_RESET}"
+                if stdout_is_tty()
+                else str(frame)
+            )
+            line = f"\r{frame_text} {body}"
             _safe_print(line, flush=True, end="")
             sleep(max(self.timeout, spinner_refresh_interval(self._elapsed_seconds())))
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import time
 import os
+import sys
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
@@ -44,6 +45,33 @@ warnings.filterwarnings(
 
 _WARNED_EIGH_NON_LAPACK = False
 _WARNED_EIGH_SCIPY_FALLBACK = False
+
+
+def _emit_runtime_warning_once(flag_name: str, message: str) -> None:
+    """
+    Emit a concise runtime warning once without Python warnings module
+    traceback/path prefix (keeps spinner/log output cleaner in CLI mode).
+    """
+    global _WARNED_EIGH_NON_LAPACK, _WARNED_EIGH_SCIPY_FALLBACK
+    key = str(flag_name).strip().lower()
+    enabled = False
+    if key == "eigh_non_lapack":
+        enabled = bool(_WARNED_EIGH_NON_LAPACK)
+        if not enabled:
+            _WARNED_EIGH_NON_LAPACK = True
+    elif key == "eigh_scipy_fallback":
+        enabled = bool(_WARNED_EIGH_SCIPY_FALLBACK)
+        if not enabled:
+            _WARNED_EIGH_SCIPY_FALLBACK = True
+    else:
+        return
+    if enabled:
+        return
+    try:
+        sys.stderr.write(f"\n! Warning: {str(message).strip()}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 from joblib import Parallel, delayed, cpu_count
 try:
@@ -1104,26 +1132,22 @@ class LMM:
                 self.S = np.asarray(eval_raw, dtype=np.float64)
                 self.Dh = np.asarray(evec_raw, dtype=np.float64)
                 if not str(_evd_backend).lower().startswith("lapack_"):
-                    if not _WARNED_EIGH_NON_LAPACK:
-                        warnings.warn(
-                            (
-                                "Rust eigh did not use LAPACK backend "
-                                f"(backend={_evd_backend}); performance may degrade."
-                            ),
-                            RuntimeWarning,
-                        )
-                        _WARNED_EIGH_NON_LAPACK = True
+                    _emit_runtime_warning_once(
+                        "eigh_non_lapack",
+                        (
+                            "Rust eigh did not use LAPACK backend "
+                            f"(backend={_evd_backend}); performance may degrade."
+                        ),
+                    )
                 eig_done = True
             except Exception as ex:
-                if not _WARNED_EIGH_SCIPY_FALLBACK:
-                    warnings.warn(
-                        (
-                            "Rust eigh failed; fallback to scipy.linalg.eigh "
-                            f"(reason: {ex})."
-                        ),
-                        RuntimeWarning,
-                    )
-                    _WARNED_EIGH_SCIPY_FALLBACK = True
+                _emit_runtime_warning_once(
+                    "eigh_scipy_fallback",
+                    (
+                        "Rust eigh failed; fallback to scipy.linalg.eigh "
+                        f"(reason: {ex})."
+                    ),
+                )
                 eig_done = False
         if not eig_done:
             self.S, self.Dh = eigh(kinship, overwrite_a=True, check_finite=False)

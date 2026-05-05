@@ -24,7 +24,6 @@ static SGEMM_BACKEND: OnceLock<SgemmBackend> = OnceLock::new();
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const HAS_OPENBLAS_BACKEND: bool = cfg!(any(
-    target_os = "windows",
     all(feature = "blas-openblas", jx_openblas_available)
 ));
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -51,7 +50,10 @@ fn default_sgemm_backend() -> SgemmBackend {
     }
     #[cfg(target_os = "windows")]
     {
-        return SgemmBackend::OpenBlas;
+        if HAS_OPENBLAS_BACKEND {
+            return SgemmBackend::OpenBlas;
+        }
+        return SgemmBackend::Rust;
     }
     #[cfg(target_os = "linux")]
     {
@@ -566,8 +568,13 @@ unsafe extern "C" {
     fn openblas_get_num_threads() -> CblasInt;
 }
 
-#[cfg(all(target_os = "windows", not(jx_openblas_link_openblas_plain)))]
-#[link(name = "libopenblas", kind = "static")]
+#[cfg(all(
+    target_os = "windows",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    not(jx_openblas_link_openblas_plain)
+))]
+#[link(name = "libopenblas")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(
@@ -607,8 +614,13 @@ unsafe extern "C" {
     fn openblas_get_num_threads() -> CblasInt;
 }
 
-#[cfg(all(target_os = "windows", jx_openblas_link_openblas_plain))]
-#[link(name = "openblas", kind = "static")]
+#[cfg(all(
+    target_os = "windows",
+    feature = "blas-openblas",
+    jx_openblas_available,
+    jx_openblas_link_openblas_plain
+))]
+#[link(name = "openblas")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(

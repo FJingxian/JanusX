@@ -188,8 +188,12 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
 
     let has_win_libopenblas = Path::new(lib_dir_s).join("libopenblas.lib").exists()
         || Path::new(lib_dir_s).join("libopenblas.dll.a").exists()
+        || Path::new(lib_dir_s).join("libopenblas.a").exists()
         || Path::new(lib_dir_s).join("libopenblas.dll").exists();
-    let has_win_openblas = Path::new(lib_dir_s).join("openblas.lib").exists();
+    let has_win_openblas = Path::new(lib_dir_s).join("openblas.lib").exists()
+        || Path::new(lib_dir_s).join("openblas.dll.a").exists()
+        || Path::new(lib_dir_s).join("openblas.a").exists()
+        || Path::new(lib_dir_s).join("openblas.dll").exists();
 
     // Conda/macOS can expose versioned soname only (e.g. libopenblas.0.dylib)
     // without a generic libopenblas.dylib symlink.
@@ -242,6 +246,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BLAS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+    println!("cargo:rerun-if-env-changed=LIBRARY_LIB");
+    println!("cargo:rerun-if-env-changed=LIBRARY_PREFIX");
     println!("cargo:rerun-if-env-changed=JANUSX_LINK_BLAS_FAMILY");
     let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
 
@@ -297,13 +303,42 @@ Enable default features or pass --features blas-openblas."
     }
 
     // Conda environments may provide OpenBLAS without pkg-config metadata.
+    // On Windows, libraries are usually in %CONDA_PREFIX%/Library/lib.
     if let Some(conda_prefix) = env::var_os("CONDA_PREFIX") {
-        let conda_lib = Path::new(&conda_prefix).join("lib");
-        let conda_lib_s = conda_lib.to_string_lossy().to_string();
-        if configure_openblas_from_dir(&conda_lib_s, "CONDA_PREFIX/lib") {
-            let conda_inc = Path::new(&conda_prefix).join("include");
-            if conda_inc.exists() {
-                println!("cargo:include={}", conda_inc.to_string_lossy());
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let p = Path::new(&conda_prefix);
+        candidates.push((
+            p.join("lib").to_string_lossy().to_string(),
+            "CONDA_PREFIX/lib".to_string(),
+        ));
+        candidates.push((
+            p.join("Library").join("lib").to_string_lossy().to_string(),
+            "CONDA_PREFIX/Library/lib".to_string(),
+        ));
+        for (lib_dir_s, label) in candidates {
+            if configure_openblas_from_dir(&lib_dir_s, &label) {
+                let conda_inc = if label.contains("Library") {
+                    Path::new(&conda_prefix).join("Library").join("include")
+                } else {
+                    Path::new(&conda_prefix).join("include")
+                };
+                if conda_inc.exists() {
+                    println!("cargo:include={}", conda_inc.to_string_lossy());
+                }
+                return;
+            }
+        }
+    }
+
+    // Windows conda-build style helper envs.
+    if let Some(library_lib) = env::var_os("LIBRARY_LIB") {
+        let library_lib_s = library_lib.to_string_lossy().to_string();
+        if configure_openblas_from_dir(&library_lib_s, "LIBRARY_LIB") {
+            if let Some(library_prefix) = env::var_os("LIBRARY_PREFIX") {
+                let inc = Path::new(&library_prefix).join("include");
+                if inc.exists() {
+                    println!("cargo:include={}", inc.to_string_lossy());
+                }
             }
             return;
         }

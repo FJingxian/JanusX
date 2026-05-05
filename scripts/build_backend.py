@@ -12,6 +12,11 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+# We intentionally use a custom PEP517 backend (this file) to wrap maturin
+# and inject optional native artifacts into wheels. Silence maturin's
+# informational warning about non-`maturin` build-backend to reduce noise.
+os.environ.setdefault("MATURIN_NO_MISSING_BUILD_BACKEND_WARNING", "1")
+
 _MATURIN = importlib.import_module("maturin")
 
 

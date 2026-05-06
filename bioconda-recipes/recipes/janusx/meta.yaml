@@ -44,6 +44,7 @@ requirements:
     - python
     - pip
     - maturin >=1.7,<2
+    - numpy >=1.23
     - openblas
   run:
     - python
@@ -63,6 +64,7 @@ test:
   commands:
     - jxpy -h
     - python -c "import janusx.janusx"
+    - python -c "import janusx.janusx as _jx; assert _jx.rust_sgemm_backend() == 'openblas'"
     - python -c "import janusx.script.JanusX as jx; assert callable(jx.main)"
 
 about:

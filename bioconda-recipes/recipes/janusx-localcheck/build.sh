@@ -18,7 +18,7 @@ if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
   unset http_proxy https_proxy all_proxy no_proxy || true
   unset CARGO_HTTP_PROXY || true
   if [[ -z "${JANUSX_CARGO_REGISTRY:-}" && -z "${JANUSX_CARGO_REGISTRIES:-}" ]]; then
-    JANUSX_CARGO_REGISTRIES="sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index"
+    JANUSX_CARGO_REGISTRIES="sparse+https://index.crates.io/"
   fi
   echo "[build.sh] network mode: direct"
 else
@@ -96,12 +96,8 @@ retry = 6
 offline = true
 EOF
 else
-  if [[ "${JANUSX_NET_MODE}" == "direct" ]]; then
-    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://rsproxy.cn/index/ sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index}"
-  else
-    : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/ https://mirrors.ustc.edu.cn/crates.io-index sparse+https://rsproxy.cn/index/}"
-  fi
-  : "${JANUSX_CARGO_PROBE:=1}"
+  : "${JANUSX_CARGO_REGISTRIES:=sparse+https://index.crates.io/}"
+  : "${JANUSX_CARGO_PROBE:=0}"
   : "${JANUSX_CARGO_PROBE_TIMEOUT:=20}"
   : "${JANUSX_CARGO_PROBE_STRICT:=0}"
 
@@ -293,8 +289,16 @@ echo "[build.sh] cargo: $(cargo --version || true)"
 echo "[build.sh] HOME=${HOME}"
 echo "[build.sh] CARGO_HOME=${CARGO_HOME}"
 echo "[build.sh] JANUSX_NET_MODE=${JANUSX_NET_MODE}"
-echo "[build.sh] JANUSX_CARGO_REGISTRY=${JANUSX_CARGO_REGISTRY:-}"
-echo "[build.sh] JANUSX_CARGO_REGISTRIES=${JANUSX_CARGO_REGISTRIES:-}"
+if [[ -n "${JANUSX_CARGO_REGISTRY:-}" ]]; then
+  echo "[build.sh] JANUSX_CARGO_REGISTRY: set"
+else
+  echo "[build.sh] JANUSX_CARGO_REGISTRY: unset"
+fi
+if [[ -n "${JANUSX_CARGO_REGISTRIES:-}" ]]; then
+  echo "[build.sh] JANUSX_CARGO_REGISTRIES: set"
+else
+  echo "[build.sh] JANUSX_CARGO_REGISTRIES: unset"
+fi
 echo "[build.sh] selected registry dl=${selected_dl:-unknown}"
 echo "[build.sh] CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT}"
 echo "[build.sh] CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT}"
@@ -314,8 +318,7 @@ if [[ -n "${ALL_PROXY:-${all_proxy:-}}" ]]; then
 else
   echo "[build.sh] ALL proxy: unset"
 fi
-echo "[build.sh] project cargo config:"
-cat "${project_cargo_config}"
+echo "[build.sh] project cargo config prepared"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
 export JANUSX_REQUIRE_OPENBLAS=1

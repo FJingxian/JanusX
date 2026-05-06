@@ -6173,13 +6173,27 @@ def _run_methods_parallel(
             continue
     detail_key_width = max(8, int(detail_key_width))
 
+    def _attach_method_detail_rows(
+        method: str,
+        result: dict[str, typing.Any] | None,
+    ) -> list[tuple[str, str]]:
+        if not isinstance(result, dict):
+            return []
+        try:
+            rows = _method_detail_rows(str(method), result)
+        except Exception:
+            rows = []
+        safe_rows = [(str(k), str(v)) for k, v in rows]
+        result["method_detail_rows"] = safe_rows
+        return safe_rows
+
     def _emit_method_details_plain(
         method: str,
         result: dict[str, typing.Any],
         *,
         line_printer: typing.Callable[[str], None],
     ) -> None:
-        rows = _method_detail_rows(str(method), result)
+        rows = _attach_method_detail_rows(str(method), result)
         if len(rows) == 0:
             return
         key_w = max(int(detail_key_width), max(len(str(k)) for k, _ in rows))
@@ -6951,6 +6965,7 @@ def _run_methods_parallel(
 
                 if res is None:
                     continue
+                _attach_method_detail_rows(str(m), res)
                 out.append(res)
                 if on_method_complete is not None:
                     try:
@@ -7587,6 +7602,7 @@ def _run_methods_parallel(
                     res["__stage_lines_emitted"] = True
                 if cv_line_emitted:
                     res["__cv_line_emitted"] = True
+                _attach_method_detail_rows(str(m), res)
                 out.append(res)
                 if on_method_complete is not None:
                     try:
@@ -7653,7 +7669,7 @@ def _run_methods_parallel(
             for fut in cf.as_completed(list(future_map.keys())):
                 method = future_map[fut]
                 try:
-                    results_by_method[method] = fut.result()
+                    res_obj = fut.result()
                 except Exception:
                     elapsed = format_elapsed(
                         (time.monotonic() - method_start_ts.get(method, time.monotonic()))
@@ -7665,6 +7681,8 @@ def _run_methods_parallel(
                         force_color=True,
                     )
                     raise
+                _attach_method_detail_rows(str(method), typing.cast(dict[str, typing.Any], res_obj))
+                results_by_method[method] = typing.cast(dict[str, typing.Any], res_obj)
                 if on_method_complete is not None:
                     try:
                         on_method_complete(str(method), results_by_method[method])
@@ -7783,6 +7801,7 @@ def _run_methods_parallel(
                         for fut in done:
                             method = future_map.pop(fut)
                             res = fut.result()
+                            _attach_method_detail_rows(str(method), res)
                             results_by_method[method] = res
                             if on_method_complete is not None:
                                 try:
@@ -7878,6 +7897,7 @@ def _run_methods_parallel(
                     for fut in done:
                         method = future_map.pop(fut)
                         res = fut.result()
+                        _attach_method_detail_rows(str(method), res)
                         results_by_method[method] = res
                         if on_method_complete is not None:
                             try:
@@ -7943,7 +7963,9 @@ def _run_methods_parallel(
             }
             for fut in cf.as_completed(list(future_map.keys())):
                 method = future_map[fut]
-                results_by_method[method] = fut.result()
+                res = fut.result()
+                _attach_method_detail_rows(str(method), res)
+                results_by_method[method] = res
 
     return [results_by_method[m] for m in methods if m in results_by_method]
 
@@ -9520,18 +9542,18 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help="K fold of cross-validation for models. "
              "(default: %(default)s).",
     )
-    optional_group.add_argument(
-        "-select","--select",
-        type=str,
-        nargs="?",
-        const=_SELECT_INTERACTIVE_SENTINEL,
-        default=None,
-        help=(
-            "TOP target trait values for ranking. "
-            "Accepts a comma list (e.g. 180,200,121), or a target-value file "
-            "(phenotype-like table). If provided without a value, interactive input is used."
-        ),
-    )
+    # optional_group.add_argument(
+    #     "-select","--select",
+    #     type=str,
+    #     nargs="?",
+    #     const=_SELECT_INTERACTIVE_SENTINEL,
+    #     default=None,
+    #     help=(
+    #         "TOP target trait values for ranking. "
+    #         "Accepts a comma list (e.g. 180,200,121), or a target-value file "
+    #         "(phenotype-like table). If provided without a value, interactive input is used."
+    #     ),
+    # )
     optional_group.add_argument(
         "--model-select",
         type=str,
@@ -9549,7 +9571,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "--top-mode",
         type=str,
-        choices=("auto", "exact-newton", "exact-bfgs", "minibatch-adam"),
+        choices=("auto", "exact-newton", "exact-bfgs", "quasi-newton", "minibatch-adam"),
         default="auto",
         help=argparse.SUPPRESS,
     )
@@ -10167,6 +10189,24 @@ def _run_gs_pipeline(
         except Exception:
             pass
     gblup_methods = [_gblup_mode_to_method(m) for m in gblup_modes]
+    # Policy: if user selected only GBLUP (without rrBLUP or other models),
+    # run rrBLUP path directly.
+    gblup_only_requested = bool(
+        (len(gblup_methods) > 0)
+        and (not bool(args.rrBLUP))
+        and (not bool(args.BayesA))
+        and (not bool(args.BayesB))
+        and (not bool(args.BayesCpi))
+        and (not bool(args.RF))
+        and (not bool(args.ET))
+        and (not bool(args.GBDT))
+        and (not bool(args.XGB))
+        and (not bool(args.SVM))
+        and (not bool(args.ENET))
+    )
+    if gblup_only_requested:
+        gblup_methods = []
+        args.rrBLUP = True
 
     rrblup_solver = str(args.rrblup_solver).strip().lower()
     rrblup_adamw_cfg: dict[str, typing.Any] = {
@@ -12113,6 +12153,10 @@ def _run_gs_pipeline(
                 logger,
                 cv_mode=cv_mode_row,
                 is_gblup=bool(_is_gblup_method(m_key)),
+                detail_rows=typing.cast(
+                    list[tuple[str, str]] | None,
+                    res_obj.get("method_detail_rows"),
+                ),
                 gblup_kernel_label=(
                     _gblup_mode_label(_gblup_method_kernel_mode(m_key))
                     if _is_gblup_method(m_key)
@@ -12301,17 +12345,6 @@ def _run_gs_pipeline(
                     train_truth=np.asarray(train_pheno, dtype=np.float64).reshape(-1),
                     metric=str(args.model_select_metric),
                 )
-                top_metric_key = str(args.model_select_metric).strip().lower()
-                top_metric_val = float(
-                    dict(top_metric_scores.get(str(top_selected_method), {})).get(top_metric_key, np.nan)
-                )
-                logger.info(
-                    "TOP selected model for trait %s: %s (%s=%.4f)",
-                    str(trait_name),
-                    method_display_map.get(str(top_selected_method), str(top_selected_method)),
-                    top_metric_key,
-                    top_metric_val,
-                )
             if not model_mode:
                 sel_state_try = method_result_map[top_selected_method].get("model_state", None)
                 if not (isinstance(sel_state_try, dict) and len(sel_state_try) > 0):
@@ -12322,30 +12355,35 @@ def _run_gs_pipeline(
                         and len(typing.cast(dict[str, typing.Any], method_result_map.get(str(mm), {}).get("model_state", {}))) > 0
                     ]
                     if len(exportable_methods) > 0:
-                        metric_key = str(args.model_select_metric).strip().lower()
-                        prefer_small = metric_key in {"rmse", "nrmse"}
-                        picked = exportable_methods[0]
-                        picked_score = float(
-                            dict(top_metric_scores.get(picked, {})).get(metric_key, np.nan)
-                        )
-                        for cand in exportable_methods[1:]:
-                            s = float(dict(top_metric_scores.get(cand, {})).get(metric_key, np.nan))
-                            if not np.isfinite(s):
-                                continue
-                            if (not np.isfinite(picked_score)) or (
-                                (s < picked_score) if prefer_small else (s > picked_score)
-                            ):
-                                picked = str(cand)
-                                picked_score = float(s)
-                        if picked != top_selected_method:
-                            logger.warning(
-                                "TOP selected method=%s for trait=%s has no exportable model state; "
-                                "fallback to exportable method=%s.",
-                                str(top_selected_method),
-                                str(trait_name),
-                                str(picked),
+                        picked = "rrBLUP" if "rrBLUP" in exportable_methods else exportable_methods[0]
+                        if picked != "rrBLUP":
+                            metric_key = str(args.model_select_metric).strip().lower()
+                            prefer_small = metric_key in {"rmse", "nrmse"}
+                            picked_score = float(
+                                dict(top_metric_scores.get(picked, {})).get(metric_key, np.nan)
                             )
+                            for cand in exportable_methods[1:]:
+                                s = float(dict(top_metric_scores.get(cand, {})).get(metric_key, np.nan))
+                                if not np.isfinite(s):
+                                    continue
+                                if (not np.isfinite(picked_score)) or (
+                                    (s < picked_score) if prefer_small else (s > picked_score)
+                                ):
+                                    picked = str(cand)
+                                    picked_score = float(s)
+                        if picked != top_selected_method:
                             top_selected_method = str(picked)
+            top_metric_key = str(args.model_select_metric).strip().lower()
+            top_metric_val = float(
+                dict(top_metric_scores.get(str(top_selected_method), {})).get(top_metric_key, np.nan)
+            )
+            logger.info(
+                "TOP selected model for trait %s: %s (%s=%.4f)",
+                str(trait_name),
+                method_display_map.get(str(top_selected_method), str(top_selected_method)),
+                top_metric_key,
+                top_metric_val,
+            )
             sel_res = method_result_map[top_selected_method]
             sel_oof = np.asarray(sel_res.get("oof_pred"), dtype=np.float64).reshape(-1)
             sel_truth = np.asarray(sel_res.get("oof_truth", train_pheno), dtype=np.float64).reshape(-1)

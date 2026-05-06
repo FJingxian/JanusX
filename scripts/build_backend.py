@@ -10,6 +10,8 @@ import sys
 import tempfile
 import zipfile
 import fnmatch
+import subprocess
+import sysconfig
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,95 @@ from typing import Any
 os.environ.setdefault("MATURIN_NO_MISSING_BUILD_BACKEND_WARNING", "1")
 
 _MATURIN = importlib.import_module("maturin")
+
+
+def _prepend_path_entry(path_entry: str) -> None:
+    entry = str(path_entry).strip()
+    if not entry:
+        return
+    current = str(os.environ.get("PATH", ""))
+    parts = current.split(os.pathsep) if current else []
+    norm_entry = os.path.normcase(os.path.normpath(entry))
+    for p in parts:
+        if os.path.normcase(os.path.normpath(p)) == norm_entry:
+            return
+    os.environ["PATH"] = entry + (os.pathsep + current if current else "")
+
+
+def _ensure_maturin_on_path() -> None:
+    # Build frontends may invoke this backend with a sanitized PATH that does
+    # not include the active interpreter's scripts directory. Maturin's own
+    # PEP517 shim shells out to `maturin ...`, so ensure both candidate
+    # locations are visible.
+    try:
+        _prepend_path_entry(str(Path(sys.executable).resolve().parent))
+    except Exception:
+        pass
+    try:
+        scripts_dir = sysconfig.get_path("scripts")
+    except Exception:
+        scripts_dir = None
+    if scripts_dir:
+        _prepend_path_entry(str(scripts_dir))
+
+
+def _build_wheel_via_python_module(
+    wheel_directory: str,
+    config_settings: dict[str, Any] | None = None,
+) -> str:
+    options: list[str] = []
+    add_args_fn = getattr(_MATURIN, "_additional_pep517_args", None)
+    if callable(add_args_fn):
+        try:
+            options.extend(list(add_args_fn()))
+        except Exception:
+            pass
+    get_args_fn = getattr(_MATURIN, "get_maturin_pep517_args", None)
+    if callable(get_args_fn):
+        try:
+            options.extend(list(get_args_fn(config_settings)))
+        except Exception:
+            pass
+
+    if "--compatibility" not in options and "--manylinux" not in options:
+        options = ["--compatibility", "off", *options]
+
+    command = [
+        sys.executable,
+        "-m",
+        "maturin",
+        "pep517",
+        "build-wheel",
+        "-i",
+        sys.executable,
+        *options,
+    ]
+    print(
+        "[build-backend] fallback: running `" + " ".join(command) + "`",
+        flush=True,
+    )
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+    )
+    output_bytes = result.stdout or b""
+    if output_bytes:
+        sys.stdout.buffer.write(output_bytes)
+        sys.stdout.flush()
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"`python -m maturin` fallback failed with exit status {result.returncode}"
+        )
+    output = output_bytes.decode(errors="replace")
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if len(lines) == 0:
+        raise RuntimeError("maturin fallback produced empty output; cannot locate wheel path.")
+    wheel_path = lines[-1]
+    filename = os.path.basename(wheel_path)
+    shutil.copy2(wheel_path, os.path.join(wheel_directory, filename))
+    return filename
 
 
 def _env_flag(name: str) -> bool:
@@ -285,7 +376,26 @@ def build_wheel(
     prev = os.environ.get("JANUSX_PREBUILD_KMC_BIND")
     os.environ["JANUSX_PREBUILD_KMC_BIND"] = "0"
     try:
-        wheel_name = _MATURIN.build_wheel(wheel_directory, config_settings, metadata_directory)
+        _ensure_maturin_on_path()
+        try:
+            wheel_name = _MATURIN.build_wheel(
+                wheel_directory,
+                config_settings,
+                metadata_directory,
+            )
+        except FileNotFoundError as exc:
+            missing = str(getattr(exc, "filename", "")).strip().lower()
+            if missing != "maturin":
+                raise
+            print(
+                "[build-backend] warning: `maturin` executable not found on PATH; "
+                "falling back to `python -m maturin`.",
+                flush=True,
+            )
+            wheel_name = _build_wheel_via_python_module(
+                wheel_directory,
+                config_settings,
+            )
     finally:
         if prev is None:
             os.environ.pop("JANUSX_PREBUILD_KMC_BIND", None)

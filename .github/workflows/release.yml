@@ -405,6 +405,7 @@ jobs:
               echo \"[linux build container] threaded OpenBLAS candidate: \${THREAD_LIB}\"
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
               source /root/.cargo/env
+              export PATH=\"$(dirname ${INTERP}):\${PATH}\"
               ${INTERP} -m pip install -U pip
               ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
               export JANUSX_REQUIRE_OPENBLAS=1

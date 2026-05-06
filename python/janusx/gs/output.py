@@ -171,12 +171,20 @@ def emit_method_detail_lines(
     *,
     cv_mode: str,
     is_gblup: bool,
+    detail_rows: typing.Sequence[tuple[str, str]] | None = None,
     gblup_kernel_label: str | None = None,
     gblup_variance_component: str | None = None,
     gblup_backend_label: str | None = None,
     gblup_pve: float | None = None,
 ) -> None:
     _ = cv_mode
+
+    rows = list(detail_rows or [])
+    if len(rows) > 0:
+        key_w = max(8, max(len(str(k)) for k, _ in rows))
+        for k, v in rows:
+            logger.info(f"{str(k):<{key_w}}  {str(v)}")
+        return
 
     if is_gblup:
         logger.info(f"kernel              {str(gblup_kernel_label or 'additive')}")

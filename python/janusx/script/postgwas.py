@@ -78,7 +78,7 @@ import socket
 import sys
 import colorsys
 import concurrent.futures as cf
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from typing import Any, Optional, Tuple
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
@@ -3779,7 +3779,14 @@ def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
     if mute_stream:
         detached_handlers = _detach_stream_handlers(logger)
     try:
-        GWASplot(file, args, logger)
+        if mute_stream:
+            # In parallel worker mode, fully silence worker stdout/stderr to
+            # avoid corrupting parent-side progress/spinner rendering.
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                with redirect_stdout(devnull), redirect_stderr(devnull):
+                    GWASplot(file, args, logger)
+        else:
+            GWASplot(file, args, logger)
     finally:
         if mute_stream:
             _restore_handlers(logger, detached_handlers)

@@ -10135,14 +10135,14 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         if not str(model_path).lower().endswith(".jxmodel"):
             parser.error(f"--model must point to a .jxmodel file (got: {model_path})")
         args.model = model_path
-    if args.select is not None:
-        if str(args.select).strip() == _SELECT_INTERACTIVE_SENTINEL:
-            args.select = _SELECT_INTERACTIVE_SENTINEL
-        else:
-            target = str(args.select).strip()
-            if target == "":
-                parser.error("--select must not be empty.")
-            args.select = target
+    # if args.select is not None:
+    #     if str(args.select).strip() == _SELECT_INTERACTIVE_SENTINEL:
+    #         args.select = _SELECT_INTERACTIVE_SENTINEL
+    #     else:
+    #         target = str(args.select).strip()
+    #         if target == "":
+    #             parser.error("--select must not be empty.")
+    #         args.select = target
     if int(args.top_exact_threshold) <= 0:
         parser.error("--top-exact-threshold must be > 0.")
     if int(args.top_max_iter) <= 0:
@@ -12186,7 +12186,7 @@ def _run_gs_pipeline(
                     saved_result_paths.append(str(model_out))
                     log_success(
                         logger,
-                        f"Saved model to {format_path_for_display(model_out)}",
+                        f"Saved model to {format_path_for_display(model_out)}\n",
                     )
                 else:
                     logger.warning(
@@ -12801,7 +12801,8 @@ def _run_gs_pipeline(
                 mean_vec = np.asarray(std_pack.get("mean", []), dtype=np.float64).reshape(-1)
                 std_vec = np.asarray(std_pack.get("std", []), dtype=np.float64).reshape(-1)
                 target_values, target_source = _resolve_top_target_values(
-                    select_arg=(None if args.select is None else str(args.select)),
+                    select_arg=None,
+                    # select_arg=(None if args.select is None else str(args.select)),
                     trait_names=top_traits,
                     trait_mean=mean_vec,
                     trait_std=std_vec,

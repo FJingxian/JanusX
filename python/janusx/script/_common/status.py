@@ -39,12 +39,14 @@ _LOADING_PREFIXES = (
     "computing ",
     "building ",
     "calculating ",
+    "visualizing ",
     "writing ",
     "converting ",
 )
 _COMPLETION_TOKENS = (
     "...finished",
     "...found",
+    "...pve",
 )
 _SKIP_TOKENS = (
     "skip",

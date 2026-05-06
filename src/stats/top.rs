@@ -1887,12 +1887,17 @@ fn parse_top_mode(s: &str) -> Result<TopMode, String> {
     match x.as_str() {
         "" | "auto" => Ok(TopMode::Auto),
         "exact-newton" | "exact_newton" | "newton" => Ok(TopMode::ExactNewton),
-        "exact-bfgs" | "exact_bfgs" | "bfgs" => Ok(TopMode::ExactBfgs),
+        "exact-bfgs"
+        | "exact_bfgs"
+        | "bfgs"
+        | "quasi-newton"
+        | "quasi_newton"
+        | "quasinewton" => Ok(TopMode::ExactBfgs),
         "minibatch-adam" | "minibatch_adam" | "mini-batch-adam" | "adam" => {
             Ok(TopMode::MiniBatchAdam)
         }
         _ => Err(format!(
-            "invalid top mode '{s}', expected one of: auto, exact-newton, exact-bfgs, minibatch-adam"
+            "invalid top mode '{s}', expected one of: auto, exact-newton, exact-bfgs(quasi-newton), minibatch-adam"
         )),
     }
 }

@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::BoundObject;
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -1622,6 +1622,112 @@ impl BedChunkReader {
         #[allow(deprecated)]
         let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
         Ok(Some((py_mat, sites)))
+    }
+
+    /// Return chunk with model-coding + row-centering prepared in Rust.
+    ///
+    /// Output tuple:
+    ///   (geno_centered, sites, maf)
+    /// where `maf` is:
+    ///   - additive: mean(additive dosage)/2
+    ///   - dom/rec/het: mean(coded value)
+    #[pyo3(signature = (chunk_size, coding=None))]
+    fn next_chunk_prepared<'py>(
+        &mut self,
+        py: Python<'py>,
+        chunk_size: usize,
+        coding: Option<String>,
+    ) -> PyResult<
+        Option<(
+            Bound<'py, PyArray2<f32>>,
+            Vec<SiteInfo>,
+            Bound<'py, PyArray1<f32>>,
+        )>,
+    > {
+        let coding_key = coding
+            .unwrap_or_else(|| "add".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(coding_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "coding must be one of: add, dom, rec, het",
+            ));
+        }
+
+        let base = self.next_chunk(py, chunk_size)?;
+        let Some((geno_chunk, sites)) = base else {
+            return Ok(None);
+        };
+        let ro = geno_chunk.readonly();
+        let g = ro.as_slice().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("chunk matrix is not contiguous")
+        })?;
+        let sh = ro.shape();
+        if sh.len() != 2 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "chunk matrix must be 2D",
+            ));
+        }
+        let m = sh[0];
+        let n = sh[1];
+        if m == 0 || n == 0 {
+            return Ok(None);
+        }
+
+        let mut out = vec![0.0_f32; m * n];
+        let mut maf = vec![0.0_f32; m];
+
+        for i in 0..m {
+            let row = &g[i * n..(i + 1) * n];
+            let out_row = &mut out[i * n..(i + 1) * n];
+            let mut sum = 0.0_f64;
+            for (j, &v) in row.iter().enumerate() {
+                let mv = match coding_key.as_str() {
+                    "add" => v,
+                    "dom" => {
+                        if (v - 1.0_f32).abs() <= 1e-6_f32 || (v - 2.0_f32).abs() <= 1e-6_f32 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "rec" => {
+                        if (v - 2.0_f32).abs() <= 1e-6_f32 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "het" => {
+                        if (v - 1.0_f32).abs() <= 1e-6_f32 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => v,
+                };
+                out_row[j] = mv;
+                sum += mv as f64;
+            }
+            let mean = (sum / n as f64) as f32;
+            for v in out_row.iter_mut() {
+                *v -= mean;
+            }
+            maf[i] = if coding_key == "add" {
+                (sum / n as f64 / 2.0) as f32
+            } else {
+                (sum / n as f64) as f32
+            };
+        }
+
+        let mat = Array2::from_shape_vec((m, n), out)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
+        #[allow(deprecated)]
+        let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound();
+        Ok(Some((py_mat, sites, maf_arr)))
     }
 }
 

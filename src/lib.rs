@@ -85,7 +85,10 @@ use admixture::{
     admx_multiply_at_omega, admx_multiply_at_omega_inplace, admx_rmse_f32, admx_rmse_f64,
     admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
-use assoc::{farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed};
+use assoc::{
+    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
+    farmcpu_packed_to_tsv, farmcpu_write_assoc_tsv,
+};
 use bayes::{bayesa, bayesa_packed, bayesb, bayesb_packed, bayescpi, bayescpi_packed};
 use beam::{
     beam_scan_windows_binary_mcc_bin_py, beam_scan_windows_continuous_corr_bin_py,
@@ -102,7 +105,10 @@ use gfreader::{
     BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
     VcfChunkReader, VcfStreamWriter,
 };
-use glm::{glmf32, glmf32_full, glmf32_packed};
+use glm::{
+    glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc, glmf32_packed_assoc_to_tsv,
+    lm_stream_bed_to_tsv,
+};
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gs_native::{
     gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats,
@@ -113,6 +119,7 @@ use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
+    fastlmm_assoc_packed_f32_to_tsv,
     lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_packed_f32,
     lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
 };
@@ -194,6 +201,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(glmf32_packed_assoc, m)?)?;
+    m.add_function(wrap_pyfunction!(glmf32_packed_assoc_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
@@ -225,6 +235,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ml_loglike_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_null_f64, m)?)?;
@@ -236,6 +248,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;

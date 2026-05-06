@@ -30,11 +30,16 @@ from __future__ import annotations
 import time
 import os
 import sys
+import math
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from scipy.linalg import eigh, cho_factor, cho_solve
+try:
+    from scipy.special import erfc as _sp_erfc
+except Exception:
+    _sp_erfc = None
 import warnings
 
 warnings.filterwarnings(
@@ -45,6 +50,53 @@ warnings.filterwarnings(
 
 _WARNED_EIGH_NON_LAPACK = False
 _WARNED_EIGH_SCIPY_FALLBACK = False
+
+
+def _chi2_sf_df1(stat: np.ndarray) -> np.ndarray:
+    """
+    Survival function of Chi-square(df=1) for vector inputs.
+    Uses erfc(sqrt(x/2)) with SciPy special when available.
+    """
+    x = np.asarray(stat, dtype=np.float64)
+    out = np.full(x.shape, np.nan, dtype=np.float64)
+    ok = np.isfinite(x) & (x >= 0.0)
+    if not np.any(ok):
+        return out
+    z = np.sqrt(0.5 * x[ok])
+    if _sp_erfc is not None:
+        p = np.asarray(_sp_erfc(z), dtype=np.float64)
+    else:
+        p = np.fromiter((math.erfc(float(v)) for v in np.asarray(z, dtype=np.float64)), dtype=np.float64)
+    out[ok] = np.clip(p, np.finfo(np.float64).tiny, 1.0)
+    return out
+
+
+def _lm_plrt_from_beta_se(
+    beta: np.ndarray,
+    se: np.ndarray,
+    *,
+    n_obs: int,
+    df: int,
+) -> np.ndarray:
+    """
+    Approximate LM likelihood-ratio-test p-values from beta/se without a second scan.
+    LRT stat for 1-df nested linear model:
+        stat = n * log(1 + t^2 / df), where t = beta / se
+    """
+    b = np.asarray(beta, dtype=np.float64).reshape(-1)
+    s = np.asarray(se, dtype=np.float64).reshape(-1)
+    out = np.full(b.shape, np.nan, dtype=np.float64)
+    n = int(n_obs)
+    d = int(df)
+    if n <= 0 or d <= 0:
+        return out
+    ok = np.isfinite(b) & np.isfinite(s) & (s > 0.0)
+    if not np.any(ok):
+        return out
+    t2 = np.square(b[ok] / s[ok])
+    stat = float(n) * np.log1p(t2 / float(d))
+    out[ok] = _chi2_sf_df1(stat)
+    return out
 
 
 def _emit_runtime_warning_once(flag_name: str, message: str) -> None:
@@ -1373,8 +1425,8 @@ class LM:
 
         Returns
         -------
-        beta_se_p : np.ndarray, shape (m, 3)
-            Columns: beta, se, p (as you slice in the original code).
+        beta_se_p_plrt : np.ndarray, shape (m, 4)
+            Columns: beta, se, pwald, plrt.
         """
         beta_se_p = FEM(
             self.y,
@@ -1384,7 +1436,14 @@ class LM:
             threads,
             ixx=self.ixx,
         )[:, [0, 1, -1]]
-        return beta_se_p
+        n = int(self.y.shape[0])
+        q0 = int(self.X.shape[1])
+        df = int(n - q0 - 1)
+        plrt = _lm_plrt_from_beta_se(beta_se_p[:, 0], beta_se_p[:, 1], n_obs=n, df=df)
+        return np.concatenate(
+            [np.asarray(beta_se_p, dtype=np.float64), plrt.reshape(-1, 1)],
+            axis=1,
+        )
 
 
 # ----------------------------

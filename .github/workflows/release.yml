@@ -81,7 +81,9 @@ jobs:
 
       - name: Set up Zig (Linux compatibility build)
         if: ${{ matrix.use_zigbuild }}
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
 
       - name: Install cargo-zigbuild
         if: ${{ matrix.use_zigbuild }}
@@ -327,7 +329,7 @@ jobs:
         if: ${{ matrix.platform != 'linux' }}
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin==1.9.4 build "pybind11>=2.13"
+          python -m pip install maturin==1.9.4 build "numpy>=1.23" "pybind11>=2.13"
 
       - name: Install OpenBLAS (macOS)
         if: ${{ matrix.platform == 'macos' }}
@@ -404,7 +406,7 @@ jobs:
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
               source /root/.cargo/env
               ${INTERP} -m pip install -U pip
-              ${INTERP} -m pip install maturin==1.9.4 build "pybind11>=2.13" auditwheel
+              ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
               export JANUSX_REQUIRE_OPENBLAS=1
               export JANUSX_STRICT_KMC_BIND=1
               export OPENBLAS_LIB_DIR=/tmp/openblas_threaded

@@ -350,7 +350,8 @@ jobs:
           & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
 
           if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
-            # Cross ARM64 build keeps static-md for simpler cross-linking on x64 host.
+            # Keep static-md for ARM64 cross-build; Rust side will detect static
+            # layout and switch OpenBLAS extern linkage to kind=static.
             $triplet = "arm64-windows-static-md"
           } else {
             # x64 wheel build (python -m build) requires runtime OpenBLAS DLL bundling.
@@ -451,6 +452,9 @@ jobs:
             # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
             export PYO3_CROSS=1
             export PYO3_CROSS_PYTHON_VERSION=3.10
+            # Skip KMC prebuild on cross target; vendored pybind11 in KMC is not
+            # Python 3.14 friendly and this path is not required for arm64 wheel sanity.
+            export JANUSX_PREBUILD_KMC_BIND=0
             maturin build --release --out dist --target ${{ matrix.target }} --features blas-openblas
           else
             maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas

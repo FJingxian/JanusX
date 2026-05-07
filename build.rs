@@ -56,6 +56,38 @@ fn has_library_with_prefix(lib_dir_s: &str, prefix: &str) -> bool {
     false
 }
 
+fn has_windows_openblas_runtime_dll(lib_dir_s: &str) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    let lib_dir = Path::new(lib_dir_s);
+    let mut probe_dirs: Vec<std::path::PathBuf> = vec![lib_dir.to_path_buf()];
+    if let Some(parent) = lib_dir.parent() {
+        probe_dirs.push(parent.join("bin"));
+        probe_dirs.push(parent.join("Library").join("bin"));
+    }
+    for d in probe_dirs {
+        if !(d.exists() && d.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name_raw) = entry.file_name().to_str().map(|s| s.to_ascii_lowercase()) else {
+                continue;
+            };
+            if !name_raw.ends_with(".dll") {
+                continue;
+            }
+            if name_raw.starts_with("openblas") || name_raw.starts_with("libopenblas") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn maybe_link_blas_family_from_dir(lib_dir_s: &str, source_label: &str) {
     // Explicitly link liblapack/libblas when available in the same prefix
     // (typically conda's lib directory). OpenBLAS itself is still linked by
@@ -239,6 +271,11 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
             "OpenBLAS detected via {source_label}, but LAPACK symbols are treated as unavailable."
         ));
     }
+    if cfg!(target_os = "windows") && !has_windows_openblas_runtime_dll(lib_dir_s) {
+        // Static-only layout (e.g. vcpkg *-windows-static-md): use static link kind
+        // in Rust extern blocks to avoid unresolved __imp_* imports.
+        println!("cargo:rustc-cfg=jx_openblas_static_link");
+    }
     if cfg!(target_os = "windows") && has_win_openblas && !has_win_libopenblas {
         println!("cargo:rustc-cfg=jx_openblas_link_openblas_plain");
     }
@@ -262,6 +299,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_available)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas0)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas_plain)");
+    println!("cargo:rustc-check-cfg=cfg(jx_openblas_static_link)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_lapack_available)");
     println!("cargo:rustc-check-cfg=cfg(jx_blas_available)");
     println!("cargo:rerun-if-env-changed=JANUSX_REQUIRE_OPENBLAS");

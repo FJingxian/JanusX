@@ -584,7 +584,8 @@ unsafe extern "C" {
     jx_openblas_available,
     not(jx_openblas_link_openblas_plain)
 ))]
-#[link(name = "libopenblas")]
+#[cfg_attr(jx_openblas_static_link, link(name = "libopenblas", kind = "static"))]
+#[cfg_attr(not(jx_openblas_static_link), link(name = "libopenblas"))]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(
@@ -670,7 +671,8 @@ unsafe extern "C" {
     jx_openblas_available,
     jx_openblas_link_openblas_plain
 ))]
-#[link(name = "openblas")]
+#[cfg_attr(jx_openblas_static_link, link(name = "openblas", kind = "static"))]
+#[cfg_attr(not(jx_openblas_static_link), link(name = "openblas"))]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(

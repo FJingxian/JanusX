@@ -86,8 +86,8 @@ use admixture::{
     admx_rsvd_power_step_inplace, admx_rsvd_stream, admx_rsvd_stream_sample, admx_set_threads,
 };
 use assoc::{
-    farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense, farmcpu_super_packed,
-    farmcpu_packed_to_tsv, farmcpu_write_assoc_tsv,
+    farmcpu_packed_to_tsv, farmcpu_rem_dense, farmcpu_rem_packed, farmcpu_super_dense,
+    farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
 use bayes::{bayesa, bayesa_packed, bayesb, bayesb_packed, bayescpi, bayescpi_packed};
 use beam::{
@@ -111,17 +111,17 @@ use glm::{
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gs_native::{
-    gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats,
-    grm_packed_f64_with_stats, rrblup_pcg_bed,
+    farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32,
+    grm_packed_f32_with_stats, grm_packed_f64_with_stats, rrblup_pcg_bed,
 };
 use gwasio::load_gwas_triplet_fast;
 use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune_kernel_stats};
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
-    fastlmm_assoc_packed_f32_to_tsv,
-    lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32, lmm_reml_assoc_packed_f32,
-    lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, ml_loglike_null_f32,
+    fastlmm_assoc_packed_f32_to_tsv, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
+    lmm_reml_assoc_packed_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32,
+    ml_loglike_null_f32,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -231,6 +231,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;

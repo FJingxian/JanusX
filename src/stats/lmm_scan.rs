@@ -12,8 +12,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::fmt::Write as _;
 use std::f64::consts::PI;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -1376,14 +1376,7 @@ fn rotate_snp_block_with_ut(
 }
 
 #[inline]
-fn matmul_rowmajor_f32(
-    a: &[f32],
-    m: usize,
-    k: usize,
-    b: &[f32],
-    n: usize,
-    out: &mut [f32],
-) {
+fn matmul_rowmajor_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
     if m == 0 || k == 0 || n == 0 {
         return;
     }
@@ -3359,10 +3352,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         }
         (0..n).collect()
     };
-    let sample_identity = sample_idx
-        .iter()
-        .enumerate()
-        .all(|(i, &sid)| sid == i);
+    let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
     let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
         None
     } else {
@@ -3521,42 +3511,14 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         }
         let log10_lbd = lbd_fixed.log10();
         fastlmm_null_eval_packed(
-            log10_lbd,
-            tau,
-            &s_vec,
-            &u1tx,
-            &u2tx,
-            &u1ty,
-            &u2ty,
-            &u2_xtx,
-            &u2_xty,
-            k,
-            n,
-            p,
-            c_reml,
+            log10_lbd, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
             c_ml,
         )
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "failed to evaluate null model at fixed_lbd",
-            )
-        })?
+        .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at fixed_lbd"))?
     } else {
         let (best_log10, _best_cost) = brent_minimize(
             |x0| match fastlmm_null_eval_packed(
-                x0,
-                tau,
-                &s_vec,
-                &u1tx,
-                &u2tx,
-                &u1ty,
-                &u2ty,
-                &u2_xtx,
-                &u2_xty,
-                k,
-                n,
-                p,
-                c_reml,
+                x0, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
                 c_ml,
             ) {
                 Some(v) if v.reml.is_finite() => -v.reml,
@@ -3569,19 +3531,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         );
 
         fastlmm_null_eval_packed(
-            best_log10,
-            tau,
-            &s_vec,
-            &u1tx,
-            &u2tx,
-            &u1ty,
-            &u2ty,
-            &u2_xtx,
-            &u2_xty,
-            k,
-            n,
-            p,
-            c_reml,
+            best_log10, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
             c_ml,
         )
         .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at optimum"))?
@@ -3649,9 +3599,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         None
     };
     let u1_lin_basis_f32: Option<Vec<f32>> = if p_is_one {
-        let w_ty = u1_w_ty
-            .as_ref()
-            .expect("u1_w_ty must exist when p_is_one");
+        let w_ty = u1_w_ty.as_ref().expect("u1_w_ty must exist when p_is_one");
         let w_xt = u1_w_xt0
             .as_ref()
             .expect("u1_w_xt0 must exist when p_is_one");
@@ -3740,64 +3688,18 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                 let u2_sub = &mut u2_block[..rows * n];
 
                 if sample_identity {
-                    g_sub
-                        .par_chunks_mut(n)
-                        .enumerate()
-                        .for_each(|(off, dst)| {
-                            let idx = start + off;
-                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let flip = row_flip[idx];
-                            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                            let mut sum_g = 0.0_f64;
+                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
+                        let idx = start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip[idx];
+                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+                        let mut sum_g = 0.0_f64;
 
-                            let mut j = 0usize;
-                            for &b in row.iter() {
-                                let mut lane = 0usize;
-                                while lane < 4 && j < n {
-                                    let code = (b >> (lane * 2)) & 0b11;
-                                    let mut gv = match code {
-                                        0b00 => 0.0_f64,
-                                        0b10 => 1.0_f64,
-                                        0b11 => 2.0_f64,
-                                        _ => mean_g,
-                                    };
-                                    if flip && code != 0b01 {
-                                        gv = 2.0_f64 - gv;
-                                    }
-                                    gv = gm.apply(gv);
-                                    dst[j] = gv as f32;
-                                    sum_g += gv;
-                                    lane += 1;
-                                    j += 1;
-                                }
-                                if j >= n {
-                                    break;
-                                }
-                            }
-                            let g_mean = (sum_g / (n as f64)) as f32;
-                            for v in dst.iter_mut() {
-                                *v -= g_mean;
-                            }
-                        });
-                } else {
-                    let byte_idx = sample_byte_idx
-                        .as_ref()
-                        .expect("sample_byte_idx must exist for non-identity mapping");
-                    let bit_shift = sample_bit_shift
-                        .as_ref()
-                        .expect("sample_bit_shift must exist for non-identity mapping");
-                    g_sub
-                        .par_chunks_mut(n)
-                        .enumerate()
-                        .for_each(|(off, dst)| {
-                            let idx = start + off;
-                            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                            let flip = row_flip[idx];
-                            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                            let mut sum_g = 0.0_f64;
-                            for j in 0..n {
-                                let b = row[byte_idx[j]];
-                                let code = (b >> bit_shift[j]) & 0b11;
+                        let mut j = 0usize;
+                        for &b in row.iter() {
+                            let mut lane = 0usize;
+                            while lane < 4 && j < n {
+                                let code = (b >> (lane * 2)) & 0b11;
                                 let mut gv = match code {
                                     0b00 => 0.0_f64,
                                     0b10 => 1.0_f64,
@@ -3810,12 +3712,52 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                                 gv = gm.apply(gv);
                                 dst[j] = gv as f32;
                                 sum_g += gv;
+                                lane += 1;
+                                j += 1;
                             }
-                            let g_mean = (sum_g / (n as f64)) as f32;
-                            for v in dst.iter_mut() {
-                                *v -= g_mean;
+                            if j >= n {
+                                break;
                             }
-                        });
+                        }
+                        let g_mean = (sum_g / (n as f64)) as f32;
+                        for v in dst.iter_mut() {
+                            *v -= g_mean;
+                        }
+                    });
+                } else {
+                    let byte_idx = sample_byte_idx
+                        .as_ref()
+                        .expect("sample_byte_idx must exist for non-identity mapping");
+                    let bit_shift = sample_bit_shift
+                        .as_ref()
+                        .expect("sample_bit_shift must exist for non-identity mapping");
+                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
+                        let idx = start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip[idx];
+                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+                        let mut sum_g = 0.0_f64;
+                        for j in 0..n {
+                            let b = row[byte_idx[j]];
+                            let code = (b >> bit_shift[j]) & 0b11;
+                            let mut gv = match code {
+                                0b00 => 0.0_f64,
+                                0b10 => 1.0_f64,
+                                0b11 => 2.0_f64,
+                                _ => mean_g,
+                            };
+                            if flip && code != 0b01 {
+                                gv = 2.0_f64 - gv;
+                            }
+                            gv = gm.apply(gv);
+                            dst[j] = gv as f32;
+                            sum_g += gv;
+                        }
+                        let g_mean = (sum_g / (n as f64)) as f32;
+                        for v in dst.iter_mut() {
+                            *v -= g_mean;
+                        }
+                    });
                 }
 
                 let tile_rows = choose_rotate_tile_rows(
@@ -3830,16 +3772,13 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                 matmul_rowmajor_rhs_transposed_from_rowmajor_f32_parallel(
                     u1_sub, rows, k, &u_sub, n, proj_sub, tile_rows,
                 );
-                u2_sub
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(off, dst)| {
-                        let src_g = &g_sub[off * n..(off + 1) * n];
-                        let src_p = &proj_sub[off * n..(off + 1) * n];
-                        for i in 0..n {
-                            dst[i] = src_g[i] - src_p[i];
-                        }
-                    });
+                u2_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
+                    let src_g = &g_sub[off * n..(off + 1) * n];
+                    let src_p = &proj_sub[off * n..(off + 1) * n];
+                    for i in 0..n {
+                        dst[i] = src_g[i] - src_p[i];
+                    }
+                });
                 if p_is_one {
                     let u1_basis = u1_lin_basis_f32
                         .as_ref()
@@ -3885,86 +3824,89 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                     let u1_sq_sub = &u1_snp_snp_block[..rows];
                     let u2_sq_sub = &u2_snp_snp_block[..rows];
                     let mut run_block = || {
-                        out_sub.par_chunks_mut(out_cols).enumerate().for_each(|(off, out_row)| {
-                            let u1_snp_ty = u1_lin_sub[off * 2] as f64;
-                            let u1_xt0 = u1_lin_sub[off * 2 + 1] as f64;
-                            let u2_snp_ty = u2_lin_sub[off * 2] as f64;
-                            let u2_xt0 = u2_lin_sub[off * 2 + 1] as f64;
-                            let u1_snp_snp = u1_sq_sub[off];
-                            let u2_snp_snp = u2_sq_sub[off];
+                        out_sub
+                            .par_chunks_mut(out_cols)
+                            .enumerate()
+                            .for_each(|(off, out_row)| {
+                                let u1_snp_ty = u1_lin_sub[off * 2] as f64;
+                                let u1_xt0 = u1_lin_sub[off * 2 + 1] as f64;
+                                let u2_snp_ty = u2_lin_sub[off * 2] as f64;
+                                let u2_xt0 = u2_lin_sub[off * 2 + 1] as f64;
+                                let u1_snp_snp = u1_sq_sub[off];
+                                let u2_snp_snp = u2_sq_sub[off];
 
-                            let a00 = base_a[0] + ridge;
-                            let c01 = u1_xt0 + v2_inv * u2_xt0;
-                            let d11 = u1_snp_snp + v2_inv * u2_snp_snp + ridge;
-                            let y0 = base_b[0];
-                            let y1 = u1_snp_ty + v2_inv * u2_snp_ty;
-                            let det = a00 * d11 - c01 * c01;
-                            if !(det.is_finite()) || det <= 1e-12 {
-                                out_row[0] = f64::NAN;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
+                                let a00 = base_a[0] + ridge;
+                                let c01 = u1_xt0 + v2_inv * u2_xt0;
+                                let d11 = u1_snp_snp + v2_inv * u2_snp_snp + ridge;
+                                let y0 = base_b[0];
+                                let y1 = u1_snp_ty + v2_inv * u2_snp_ty;
+                                let det = a00 * d11 - c01 * c01;
+                                if !(det.is_finite()) || det <= 1e-12 {
+                                    out_row[0] = f64::NAN;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
 
-                            let beta0 = (d11 * y0 - c01 * y1) / det;
-                            let beta1 = (a00 * y1 - c01 * y0) / det;
-                            let r1_sum = u1_yy_const
-                                - 2.0 * beta0 * u1_xy_const
-                                - 2.0 * beta1 * u1_snp_ty
-                                + beta0 * beta0 * u1_xx_const
-                                + 2.0 * beta0 * beta1 * u1_xt0
-                                + beta1 * beta1 * u1_snp_snp;
-                            let r2_sum = u2_yy_const
-                                - 2.0 * beta0 * u2_xy_const
-                                - 2.0 * beta1 * u2_snp_ty
-                                + beta0 * beta0 * u2_xx_const
-                                + 2.0 * beta0 * beta1 * u2_xt0
-                                + beta1 * beta1 * u2_snp_snp;
-                            let rtv_invr = r1_sum + v2_inv * r2_sum;
-                            if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                                let beta0 = (d11 * y0 - c01 * y1) / det;
+                                let beta1 = (a00 * y1 - c01 * y0) / det;
+                                let r1_sum = u1_yy_const
+                                    - 2.0 * beta0 * u1_xy_const
+                                    - 2.0 * beta1 * u1_snp_ty
+                                    + beta0 * beta0 * u1_xx_const
+                                    + 2.0 * beta0 * beta1 * u1_xt0
+                                    + beta1 * beta1 * u1_snp_snp;
+                                let r2_sum = u2_yy_const
+                                    - 2.0 * beta0 * u2_xy_const
+                                    - 2.0 * beta1 * u2_snp_ty
+                                    + beta0 * beta0 * u2_xx_const
+                                    + 2.0 * beta0 * beta1 * u2_xt0
+                                    + beta1 * beta1 * u2_snp_snp;
+                                let rtv_invr = r1_sum + v2_inv * r2_sum;
+                                if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                                    out_row[0] = beta1;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
+                                let sigma2 = rtv_invr / df_f;
+                                if !sigma2.is_finite() || sigma2 <= 0.0 {
+                                    out_row[0] = beta1;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
+                                let var_beta = sigma2 * (a00 / det);
+                                let se = if var_beta.is_finite() && var_beta > 0.0 {
+                                    var_beta.sqrt()
+                                } else {
+                                    f64::NAN
+                                };
+                                let pval = if beta1.is_finite() && se.is_finite() && se > 0.0 {
+                                    let z = (beta1 / se).abs();
+                                    (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                                } else {
+                                    1.0
+                                };
+                                let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
+                                let mut stat = if ml.is_finite() {
+                                    2.0 * (ml - ml0)
+                                } else {
+                                    0.0
+                                };
+                                if !stat.is_finite() || stat < 0.0 {
+                                    stat = 0.0;
+                                }
+                                let plrt = chi2_sf_df1(stat);
+
                                 out_row[0] = beta1;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
-                            let sigma2 = rtv_invr / df_f;
-                            if !sigma2.is_finite() || sigma2 <= 0.0 {
-                                out_row[0] = beta1;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
-                            let var_beta = sigma2 * (a00 / det);
-                            let se = if var_beta.is_finite() && var_beta > 0.0 {
-                                var_beta.sqrt()
-                            } else {
-                                f64::NAN
-                            };
-                            let pval = if beta1.is_finite() && se.is_finite() && se > 0.0 {
-                                let z = (beta1 / se).abs();
-                                (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
-                            } else {
-                                1.0
-                            };
-                            let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
-                            let mut stat = if ml.is_finite() {
-                                2.0 * (ml - ml0)
-                            } else {
-                                0.0
-                            };
-                            if !stat.is_finite() || stat < 0.0 {
-                                stat = 0.0;
-                            }
-                            let plrt = chi2_sf_df1(stat);
-
-                            out_row[0] = beta1;
-                            out_row[1] = se;
-                            out_row[2] = pval;
-                            out_row[3] = plrt;
-                        });
+                                out_row[1] = se;
+                                out_row[2] = pval;
+                                out_row[3] = plrt;
+                            });
                     };
                     if let Some(tp) = &pool {
                         tp.install(run_block);
@@ -4268,10 +4210,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         }
         (0..n).collect()
     };
-    let sample_identity = sample_idx
-        .iter()
-        .enumerate()
-        .all(|(i, &sid)| sid == i);
+    let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
     let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
         None
     } else {
@@ -4430,38 +4369,14 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         }
         let log10_lbd = lbd_fixed.log10();
         fastlmm_null_eval_packed(
-            log10_lbd,
-            tau,
-            &s_vec,
-            &u1tx,
-            &u2tx,
-            &u1ty,
-            &u2ty,
-            &u2_xtx,
-            &u2_xty,
-            k,
-            n,
-            p,
-            c_reml,
+            log10_lbd, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
             c_ml,
         )
         .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at fixed_lbd"))?
     } else {
         let (best_log10, _best_cost) = brent_minimize(
             |x0| match fastlmm_null_eval_packed(
-                x0,
-                tau,
-                &s_vec,
-                &u1tx,
-                &u2tx,
-                &u1ty,
-                &u2ty,
-                &u2_xtx,
-                &u2_xty,
-                k,
-                n,
-                p,
-                c_reml,
+                x0, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
                 c_ml,
             ) {
                 Some(v) if v.reml.is_finite() => -v.reml,
@@ -4474,19 +4389,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         );
 
         fastlmm_null_eval_packed(
-            best_log10,
-            tau,
-            &s_vec,
-            &u1tx,
-            &u2tx,
-            &u1ty,
-            &u2ty,
-            &u2_xtx,
-            &u2_xty,
-            k,
-            n,
-            p,
-            c_reml,
+            best_log10, tau, &s_vec, &u1tx, &u2tx, &u1ty, &u2ty, &u2_xtx, &u2_xty, k, n, p, c_reml,
             c_ml,
         )
         .ok_or_else(|| PyRuntimeError::new_err("failed to evaluate null model at optimum"))?
@@ -4554,9 +4457,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         None
     };
     let u1_lin_basis_f32: Option<Vec<f32>> = if p_is_one {
-        let w_ty = u1_w_ty
-            .as_ref()
-            .expect("u1_w_ty must exist when p_is_one");
+        let w_ty = u1_w_ty.as_ref().expect("u1_w_ty must exist when p_is_one");
         let w_xt = u1_w_xt0
             .as_ref()
             .expect("u1_w_xt0 must exist when p_is_one");
@@ -4768,8 +4669,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let u1_sq_sub = &mut u1_snp_snp_block[..rows];
                     let u2_sq_sub = &mut u2_snp_snp_block[..rows];
 
-                    matmul_rowmajor_f32_parallel(u1_sub, rows, k, u1_basis, 2, u1_lin_sub, tile_rows);
-                    matmul_rowmajor_f32_parallel(u2_sub, rows, n, u2_basis, 2, u2_lin_sub, tile_rows);
+                    matmul_rowmajor_f32_parallel(
+                        u1_sub, rows, k, u1_basis, 2, u1_lin_sub, tile_rows,
+                    );
+                    matmul_rowmajor_f32_parallel(
+                        u2_sub, rows, n, u2_basis, 2, u2_lin_sub, tile_rows,
+                    );
                     u1_sq_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
                         let row = &u1_sub[off * k..(off + 1) * k];
                         let mut s = 0.0_f64;
@@ -4797,86 +4702,89 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     let u1_sq_sub = &u1_snp_snp_block[..rows];
                     let u2_sq_sub = &u2_snp_snp_block[..rows];
                     let mut run_block = || {
-                        out_sub.par_chunks_mut(out_cols).enumerate().for_each(|(off, out_row)| {
-                            let u1_snp_ty = u1_lin_sub[off * 2] as f64;
-                            let u1_xt0 = u1_lin_sub[off * 2 + 1] as f64;
-                            let u2_snp_ty = u2_lin_sub[off * 2] as f64;
-                            let u2_xt0 = u2_lin_sub[off * 2 + 1] as f64;
-                            let u1_snp_snp = u1_sq_sub[off];
-                            let u2_snp_snp = u2_sq_sub[off];
+                        out_sub
+                            .par_chunks_mut(out_cols)
+                            .enumerate()
+                            .for_each(|(off, out_row)| {
+                                let u1_snp_ty = u1_lin_sub[off * 2] as f64;
+                                let u1_xt0 = u1_lin_sub[off * 2 + 1] as f64;
+                                let u2_snp_ty = u2_lin_sub[off * 2] as f64;
+                                let u2_xt0 = u2_lin_sub[off * 2 + 1] as f64;
+                                let u1_snp_snp = u1_sq_sub[off];
+                                let u2_snp_snp = u2_sq_sub[off];
 
-                            let a00 = base_a[0] + ridge;
-                            let c01 = u1_xt0 + v2_inv * u2_xt0;
-                            let d11 = u1_snp_snp + v2_inv * u2_snp_snp + ridge;
-                            let y0 = base_b[0];
-                            let y1 = u1_snp_ty + v2_inv * u2_snp_ty;
-                            let det = a00 * d11 - c01 * c01;
-                            if !(det.is_finite()) || det <= 1e-12 {
-                                out_row[0] = f64::NAN;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
+                                let a00 = base_a[0] + ridge;
+                                let c01 = u1_xt0 + v2_inv * u2_xt0;
+                                let d11 = u1_snp_snp + v2_inv * u2_snp_snp + ridge;
+                                let y0 = base_b[0];
+                                let y1 = u1_snp_ty + v2_inv * u2_snp_ty;
+                                let det = a00 * d11 - c01 * c01;
+                                if !(det.is_finite()) || det <= 1e-12 {
+                                    out_row[0] = f64::NAN;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
 
-                            let beta0 = (d11 * y0 - c01 * y1) / det;
-                            let beta1 = (a00 * y1 - c01 * y0) / det;
-                            let r1_sum = u1_yy_const
-                                - 2.0 * beta0 * u1_xy_const
-                                - 2.0 * beta1 * u1_snp_ty
-                                + beta0 * beta0 * u1_xx_const
-                                + 2.0 * beta0 * beta1 * u1_xt0
-                                + beta1 * beta1 * u1_snp_snp;
-                            let r2_sum = u2_yy_const
-                                - 2.0 * beta0 * u2_xy_const
-                                - 2.0 * beta1 * u2_snp_ty
-                                + beta0 * beta0 * u2_xx_const
-                                + 2.0 * beta0 * beta1 * u2_xt0
-                                + beta1 * beta1 * u2_snp_snp;
-                            let rtv_invr = r1_sum + v2_inv * r2_sum;
-                            if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                                let beta0 = (d11 * y0 - c01 * y1) / det;
+                                let beta1 = (a00 * y1 - c01 * y0) / det;
+                                let r1_sum = u1_yy_const
+                                    - 2.0 * beta0 * u1_xy_const
+                                    - 2.0 * beta1 * u1_snp_ty
+                                    + beta0 * beta0 * u1_xx_const
+                                    + 2.0 * beta0 * beta1 * u1_xt0
+                                    + beta1 * beta1 * u1_snp_snp;
+                                let r2_sum = u2_yy_const
+                                    - 2.0 * beta0 * u2_xy_const
+                                    - 2.0 * beta1 * u2_snp_ty
+                                    + beta0 * beta0 * u2_xx_const
+                                    + 2.0 * beta0 * beta1 * u2_xt0
+                                    + beta1 * beta1 * u2_snp_snp;
+                                let rtv_invr = r1_sum + v2_inv * r2_sum;
+                                if !rtv_invr.is_finite() || rtv_invr <= 0.0 {
+                                    out_row[0] = beta1;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
+                                let sigma2 = rtv_invr / df_f;
+                                if !sigma2.is_finite() || sigma2 <= 0.0 {
+                                    out_row[0] = beta1;
+                                    out_row[1] = f64::NAN;
+                                    out_row[2] = f64::NAN;
+                                    out_row[3] = 1.0;
+                                    return;
+                                }
+                                let var_beta = sigma2 * (a00 / det);
+                                let se = if var_beta.is_finite() && var_beta > 0.0 {
+                                    var_beta.sqrt()
+                                } else {
+                                    f64::NAN
+                                };
+                                let pval = if beta1.is_finite() && se.is_finite() && se > 0.0 {
+                                    let z = (beta1 / se).abs();
+                                    (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
+                                } else {
+                                    1.0
+                                };
+                                let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
+                                let mut stat = if ml.is_finite() {
+                                    2.0 * (ml - ml0)
+                                } else {
+                                    0.0
+                                };
+                                if !stat.is_finite() || stat < 0.0 {
+                                    stat = 0.0;
+                                }
+                                let plrt = chi2_sf_df1(stat);
+
                                 out_row[0] = beta1;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
-                            let sigma2 = rtv_invr / df_f;
-                            if !sigma2.is_finite() || sigma2 <= 0.0 {
-                                out_row[0] = beta1;
-                                out_row[1] = f64::NAN;
-                                out_row[2] = f64::NAN;
-                                out_row[3] = 1.0;
-                                return;
-                            }
-                            let var_beta = sigma2 * (a00 / det);
-                            let se = if var_beta.is_finite() && var_beta > 0.0 {
-                                var_beta.sqrt()
-                            } else {
-                                f64::NAN
-                            };
-                            let pval = if beta1.is_finite() && se.is_finite() && se > 0.0 {
-                                let z = (beta1 / se).abs();
-                                (2.0 * normal_sf(z)).clamp(f64::MIN_POSITIVE, 1.0)
-                            } else {
-                                1.0
-                            };
-                            let ml = c_ml - 0.5 * (n_f * rtv_invr.ln() + log_det_v);
-                            let mut stat = if ml.is_finite() {
-                                2.0 * (ml - ml0)
-                            } else {
-                                0.0
-                            };
-                            if !stat.is_finite() || stat < 0.0 {
-                                stat = 0.0;
-                            }
-                            let plrt = chi2_sf_df1(stat);
-
-                            out_row[0] = beta1;
-                            out_row[1] = se;
-                            out_row[2] = pval;
-                            out_row[3] = plrt;
-                        });
+                                out_row[1] = se;
+                                out_row[2] = pval;
+                                out_row[3] = plrt;
+                            });
                     };
                     if let Some(tp) = &pool {
                         tp.install(run_block);
@@ -5072,9 +4980,9 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             }
         }
         drop(tx);
-        let writer_result = writer_handle
-            .join()
-            .map_err(|_| PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}")))?;
+        let writer_result = writer_handle.join().map_err(|_| {
+            PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}"))
+        })?;
         if let Err(msg) = writer_result {
             return Err(PyRuntimeError::new_err(msg));
         }

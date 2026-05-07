@@ -683,6 +683,11 @@ jobs:
       BIOCONDA_BRANCH: update-janusx
       BIOCONDA_PAT: ${{ secrets.BIOCONDA_PAT }}
     steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
       - name: Check Bioconda token
         id: bioconda_gate
         shell: bash
@@ -788,9 +793,56 @@ jobs:
                   shutil.copy2(template, path)
                   print(f"Recipe missing in fork; created from template: {path}")
               else:
-                  raise SystemExit(
-                      f"Bioconda recipe not found: {path}; template also missing: {template}"
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  default_recipe = (
+                      '{% set version = "' + version + '" %}\n'
+                      "\n"
+                      "package:\n"
+                      "  name: janusx\n"
+                      "  version: {{ version }}\n"
+                      "\n"
+                      "source:\n"
+                      "  url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz\n"
+                      f"  sha256: {sha}\n"
+                      "\n"
+                      "build:\n"
+                      "  number: 0\n"
+                      "  script: {{ PYTHON }} -m pip install . --no-deps -vv\n"
+                      "\n"
+                      "requirements:\n"
+                      "  host:\n"
+                      "    - python\n"
+                      "    - pip\n"
+                      "    - maturin >=1.7,<2\n"
+                      "    - numpy >=1.23\n"
+                      "    - pybind11 >=2.13\n"
+                      "  run:\n"
+                      "    - python\n"
+                      "    - numpy\n"
+                      "    - scipy\n"
+                      "    - pandas >=1.5\n"
+                      "    - matplotlib\n"
+                      "    - psutil\n"
+                      "    - rich\n"
+                      "    - tqdm\n"
+                      "    - joblib >=1.5\n"
+                      "    - threadpoolctl\n"
+                      "\n"
+                      "test:\n"
+                      "  commands:\n"
+                      "    - jx --version\n"
+                      "\n"
+                      "about:\n"
+                      "  home: https://github.com/FJingxian/JanusX\n"
+                      "  license: GPL-3.0-or-later\n"
+                      "  summary: A Suite of Genotyping Tools for GWAS and GS\n"
+                      "\n"
+                      "extra:\n"
+                      "  recipe-maintainers:\n"
+                      "    - FJingxian\n"
                   )
+                  path.write_text(default_recipe, encoding="utf-8")
+                  print(f"Recipe missing in fork and source template; created default: {path}")
 
           text = path.read_text(encoding="utf-8")
 

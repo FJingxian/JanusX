@@ -1,9 +1,9 @@
+use crate::bedmath::decode_plink_bed_hardcall;
+use crate::linalg::chi2_sf_df1;
 use crate::math_farmcpu::{
     decode_dense_rows_to_sample_major, decode_packed_rows_to_sample_major,
     farmcpu_ll_score_from_sample_major, farmcpu_super_keep_from_sample_major, select_lead_indices,
 };
-use crate::bedmath::decode_plink_bed_hardcall;
-use crate::linalg::chi2_sf_df1;
 use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
 use nalgebra::DMatrix;
 use numpy::PyArray1;
@@ -202,11 +202,7 @@ fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
         .v_t
         .ok_or_else(|| "SVD failed to produce V^T for X'X pseudo-inverse".to_string())?;
     let mut s_inv = DMatrix::<f64>::zeros(q, q);
-    let smax = svd
-        .singular_values
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
     let rcond = 1e-12_f64;
     let cutoff = rcond * smax.max(1.0);
     for i in 0..q {
@@ -262,7 +258,7 @@ fn build_x_with_qtn_packed(
 
 fn scan_packed_full_matrix(
     y: &[f64],
-    x_flat: &[f64], // row-major (n, q0)
+    x_flat: &[f64],   // row-major (n, q0)
     ixx_flat: &[f64], // row-major (q0, q0)
     packed_flat: &[u8],
     n_samples: usize,
@@ -317,67 +313,65 @@ fn scan_packed_full_matrix(
     let mut out = vec![f64::NAN; m * row_stride];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let mut runner = || {
-        out.par_chunks_mut(row_stride)
-            .enumerate()
-            .for_each_init(
-                || GlmScratch::new(q0),
-                |scr, (idx, row_out)| {
-                    scr.reset_xs();
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let flip = row_flip[idx];
-                    let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                    let mut sy = 0.0_f64;
-                    let mut ss = 0.0_f64;
-                    for (k, &sidx) in sample_idx.iter().enumerate() {
-                        let b = row[sidx >> 2];
-                        let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                        let mut gv = match decode_plink_bed_hardcall(code) {
-                            Some(v) => v,
-                            None => mean_g,
-                        };
-                        if flip && code != 0b01 {
-                            gv = 2.0 - gv;
-                        }
-                        sy += gv * y[k];
-                        ss += gv * gv;
-                        let xrow = &x_flat[k * q0..(k + 1) * q0];
-                        for j in 0..q0 {
-                            scr.xs[j] += xrow[j] * gv;
-                        }
-                    }
-                    xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
-                    let t2 = dot(&scr.b21, &scr.xs);
-                    let b22 = ss - t2;
-                    let (invb22, df) = if b22 < 1e-8 {
-                        (0.0, (n as i32) - (q0 as i32))
-                    } else {
-                        (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+        out.par_chunks_mut(row_stride).enumerate().for_each_init(
+            || GlmScratch::new(q0),
+            |scr, (idx, row_out)| {
+                scr.reset_xs();
+                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                let flip = row_flip[idx];
+                let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
+                let mut sy = 0.0_f64;
+                let mut ss = 0.0_f64;
+                for (k, &sidx) in sample_idx.iter().enumerate() {
+                    let b = row[sidx >> 2];
+                    let code = (b >> ((sidx & 3) * 2)) & 0b11;
+                    let mut gv = match decode_plink_bed_hardcall(code) {
+                        Some(v) => v,
+                        None => mean_g,
                     };
-                    if df <= 0 {
-                        row_out.fill(f64::NAN);
-                        return;
+                    if flip && code != 0b01 {
+                        gv = 2.0 - gv;
                     }
-                    build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
-                    scr.rhs[..q0].copy_from_slice(&xy);
-                    scr.rhs[q0] = sy;
-                    matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
-                    let beta_rhs = dot(&scr.beta, &scr.rhs);
-                    let ve = (yy - beta_rhs) / (df as f64);
-                    for ff in 0..dim {
-                        let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
-                        let t = scr.beta[ff] / se;
-                        row_out[2 + ff] = student_t_p_two_sided(t, df);
+                    sy += gv * y[k];
+                    ss += gv * gv;
+                    let xrow = &x_flat[k * q0..(k + 1) * q0];
+                    for j in 0..q0 {
+                        scr.xs[j] += xrow[j] * gv;
                     }
-                    if invb22 == 0.0 {
-                        row_out[0] = f64::NAN;
-                        row_out[1] = f64::NAN;
-                        row_out[2 + q0] = f64::NAN;
-                    } else {
-                        row_out[0] = scr.beta[q0];
-                        row_out[1] = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
-                    }
-                },
-            );
+                }
+                xs_t_ixx_into(&scr.xs, ixx_flat, q0, &mut scr.b21);
+                let t2 = dot(&scr.b21, &scr.xs);
+                let b22 = ss - t2;
+                let (invb22, df) = if b22 < 1e-8 {
+                    (0.0, (n as i32) - (q0 as i32))
+                } else {
+                    (1.0 / b22, (n as i32) - (q0 as i32) - 1)
+                };
+                if df <= 0 {
+                    row_out.fill(f64::NAN);
+                    return;
+                }
+                build_ixxs_into(ixx_flat, &scr.b21, invb22, q0, &mut scr.ixxs);
+                scr.rhs[..q0].copy_from_slice(&xy);
+                scr.rhs[q0] = sy;
+                matvec_into(&scr.ixxs, dim, &scr.rhs, &mut scr.beta);
+                let beta_rhs = dot(&scr.beta, &scr.rhs);
+                let ve = (yy - beta_rhs) / (df as f64);
+                for ff in 0..dim {
+                    let se = (scr.ixxs[ff * dim + ff] * ve).sqrt();
+                    let t = scr.beta[ff] / se;
+                    row_out[2 + ff] = student_t_p_two_sided(t, df);
+                }
+                if invb22 == 0.0 {
+                    row_out[0] = f64::NAN;
+                    row_out[1] = f64::NAN;
+                    row_out[2 + q0] = f64::NAN;
+                } else {
+                    row_out[0] = scr.beta[q0];
+                    row_out[1] = (scr.ixxs[q0 * dim + q0] * ve).sqrt();
+                }
+            },
+        );
     };
     if let Some(p) = &pool {
         p.install(&mut runner);
@@ -1011,7 +1005,9 @@ pub fn farmcpu_packed_to_tsv(
                 }
             }
 
-            let has_signal = femp.iter().any(|&p| p.is_finite() && p <= qtn_threshold_eff);
+            let has_signal = femp
+                .iter()
+                .any(|&p| p.is_finite() && p <= qtn_threshold_eff);
             if !has_signal {
                 if let Some(cb) = progress_callback.as_ref() {
                     Python::attach(|py2| -> PyResult<()> {
@@ -1295,15 +1291,7 @@ pub fn farmcpu_packed_to_tsv(
                 let _ = write!(
                     text_buf,
                     "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
-                    chrom[i],
-                    pos[i],
-                    allele0[i],
-                    allele1[i],
-                    row_maf[i],
-                    beta,
-                    se,
-                    pwald,
-                    plrt
+                    chrom[i], pos[i], allele0[i], allele1[i], row_maf[i], beta, se, pwald, plrt
                 );
                 if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                     if qtn_lookup.contains_key(&i) {
@@ -1325,9 +1313,7 @@ pub fn farmcpu_packed_to_tsv(
             }
             let payload = std::mem::take(&mut text_buf).into_bytes();
             tx.send(payload).map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "writer queue send failed for {out_path}: {e}"
-                ))
+                PyRuntimeError::new_err(format!("writer queue send failed for {out_path}: {e}"))
             })?;
             if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
                 if !qtn_text_buf.is_empty() {
@@ -1343,9 +1329,9 @@ pub fn farmcpu_packed_to_tsv(
             }
         }
         drop(tx);
-        let writer_result = writer_handle
-            .join()
-            .map_err(|_| PyRuntimeError::new_err(format!("writer thread panicked for {out_path}")))?;
+        let writer_result = writer_handle.join().map_err(|_| {
+            PyRuntimeError::new_err(format!("writer thread panicked for {out_path}"))
+        })?;
         if let Err(msg) = writer_result {
             return Err(PyRuntimeError::new_err(msg));
         }
@@ -1501,9 +1487,7 @@ pub fn farmcpu_write_assoc_tsv(
                     plrt
                 )
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "write qtn row {idx} to {pseudo_path}: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("write qtn row {idx} to {pseudo_path}: {e}"))
                 })?;
             }
             q_writer

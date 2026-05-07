@@ -1131,12 +1131,8 @@ def _cache_prefix_tilde(
     """
     Cache prefix used by gfreader for VCF/HMP/TXT temporary converted files.
     """
-    return _gwas_cache_prefix_with_params(
-        genofile,
-        maf=float(maf),
-        geno=float(max_missing_rate),
-        snps_only=bool(snps_only),
-    )
+    base = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
+    return f"{base}.snp{1 if bool(snps_only) else 0}"
 
 
 def _detect_cache_need(
@@ -1171,7 +1167,7 @@ def _detect_cache_need(
     if low.endswith(".hmp.gz") or low.endswith(".hmp"):
         # HMP caching currently uses the non-parameterized PLINK cache prefix (~base)
         # from gfreader's source-cache path.
-        cprefix = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
+        cprefix = f"{genotype_cache_prefix(genofile, snps_only=bool(snps_only))}.snp{1 if bool(snps_only) else 0}"
         targets = [f"{cprefix}.bed", f"{cprefix}.bim", f"{cprefix}.fam"]
         all_exist = all(os.path.isfile(p) for p in targets)
         stale = False
@@ -1185,7 +1181,7 @@ def _detect_cache_need(
     if file_prefix and matrix_path:
         if matrix_path.lower().endswith(".npy"):
             return False, "", []
-        cprefix = genotype_cache_prefix(genofile, snps_only=True)
+        cprefix = genotype_cache_prefix(genofile, snps_only=bool(snps_only))
         targets = [f"{cprefix}.npy"]
         stale = False
         if os.path.isfile(targets[0]) and os.path.isfile(matrix_path):
@@ -3399,7 +3395,7 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     optional_group.add_argument(
-        "-snps-only", "--snps-only", action="store_true", default=False,
+        "-snps-only", "--snps-only", "-only-snps", "--only-snps", action="store_true", default=False,
         help="Exclude non-SNP variants.",
     )
     optional_group.add_argument(

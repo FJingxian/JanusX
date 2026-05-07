@@ -2524,3 +2524,118 @@ pub fn grm_packed_f64_with_stats<'py>(
         progress_every,
     )
 }
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    qdim,
+    sample_indices=None,
+    method=1,
+    block_cols=2048,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn farmcpu_q_packed_grm_pca_f32<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    qdim: usize,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+    String,
+    f64,
+)> {
+    let grm_arr = grm_packed_f32(
+        py,
+        packed,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_indices,
+        method,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
+    )?;
+
+    let (n, grm_f64) = {
+        let grm_ro = grm_arr.readonly();
+        let grm_view = grm_ro.as_array();
+        if grm_view.ndim() != 2 {
+            return Err(PyRuntimeError::new_err(
+                "farmcpu_q_packed_grm_pca_f32 internal GRM is not 2D.",
+            ));
+        }
+        let n0 = grm_view.shape()[0];
+        let n1 = grm_view.shape()[1];
+        if n0 != n1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "farmcpu_q_packed_grm_pca_f32 internal GRM is not square: ({n0}, {n1})"
+            )));
+        }
+        if qdim >= n0 && qdim != 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "qdim out of range: got {qdim}, valid=[0..{}]",
+                n0.saturating_sub(1)
+            )));
+        }
+        let grm_slice = grm_ro
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(format!("GRM buffer is not contiguous: {e}")))?;
+        let mut tmp = Vec::with_capacity(grm_slice.len());
+        tmp.extend(grm_slice.iter().map(|v| *v as f64));
+        (n0, tmp)
+    };
+
+    if qdim == 0 {
+        let q_empty = PyArray2::from_owned_array(
+            py,
+            Array2::from_shape_vec((n, 0), Vec::<f32>::new())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        )
+        .into_bound();
+        return Ok((grm_arr, q_empty, "none".to_string(), 0.0_f64));
+    }
+
+    let (q_vec, evd_backend, evd_elapsed) = py
+        .detach(move || -> Result<(Vec<f32>, String, f64), String> {
+            let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
+            let t0 = Instant::now();
+            let (_eval, evec, backend) = symmetric_eigh_f64_row_major(&grm_f64, n)?;
+            let evd_secs = t0.elapsed().as_secs_f64();
+
+            let mut q = vec![0.0_f32; n.saturating_mul(qdim)];
+            let src0 = n.saturating_sub(qdim);
+            for r in 0..n {
+                let src = &evec[r * n + src0..r * n + n];
+                let dst = &mut q[r * qdim..(r + 1) * qdim];
+                for (j, v) in src.iter().enumerate() {
+                    dst[j] = *v as f32;
+                }
+            }
+            Ok((q, backend.to_string(), evd_secs))
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let q_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, qdim), q_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok((grm_arr, q_arr, evd_backend, evd_elapsed))
+}

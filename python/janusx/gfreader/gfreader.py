@@ -230,13 +230,13 @@ def _vcf_cache_prefix(
 ) -> str:
     """
     VCF->PLINK cache prefix.
-    Use a single base cache (~prefix) to avoid creating per-parameter cache files.
-    Runtime maf/missing/model/selection filters are applied during chunk decoding.
+    Keep source-cache independent from runtime maf/missing filters, but include
+    SNP-only mode to avoid cache-mode stickiness across runs.
     """
-    _ = snps_only
+    mode_tag = ".snp1" if bool(snps_only) else ".snp0"
     _ = maf
     _ = missing_rate
-    return _cache_prefix(prefix, cache_dir=cache_dir)
+    return f"{_cache_prefix(prefix, cache_dir=cache_dir)}{mode_tag}"
 
 
 @contextmanager
@@ -676,13 +676,18 @@ def _ensure_plink_cache_for_cli_source(
     source_label: str,
     snps_only: bool = False,
 ) -> str:
-    primary = _cache_prefix(prefix)
+    mode_tag = ".snp1" if bool(snps_only) else ".snp0"
+    primary = f"{_cache_prefix(prefix)}{mode_tag}"
     cache_dir = _cache_dir_from_env()
-    fallback = _cache_prefix(prefix, cache_dir=cache_dir) if cache_dir else None
+    fallback = (
+        f"{_cache_prefix(prefix, cache_dir=cache_dir)}{mode_tag}"
+        if cache_dir
+        else None
+    )
     if fallback is None:
         auto_cache_dir = os.path.join(tempfile.gettempdir(), "janusx_cache")
         os.makedirs(auto_cache_dir, mode=0o755, exist_ok=True)
-        fallback = _cache_prefix(prefix, cache_dir=auto_cache_dir)
+        fallback = f"{_cache_prefix(prefix, cache_dir=auto_cache_dir)}{mode_tag}"
 
     if fallback is not None and not _dir_is_writable(os.path.dirname(primary) or "."):
         _warn_cache_once(

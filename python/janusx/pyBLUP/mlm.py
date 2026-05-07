@@ -1582,6 +1582,55 @@ class BLUP:
                 f"usefast=0 rust_threads={int(self._rust_threads)}",
                 flush=True,
             )
+        packed_exact_decode_mode = _env_choice(
+            "JX_MLM_PACKED_EXACT_DECODE_MODE",
+            "auto",
+            {"auto", "python", "rust", "rust_decode"},
+        )
+        if packed_exact_decode_mode == "rust":
+            packed_exact_decode_mode = "rust_decode"
+        use_rust_exact_decode = bool(
+            (_bed_packed_decode_stats_f64 is not None)
+            and (packed_exact_decode_mode in {"auto", "rust_decode"})
+        )
+        if packed_exact_decode_mode == "rust_decode" and _bed_packed_decode_stats_f64 is None:
+            raise RuntimeError(
+                "JX_MLM_PACKED_EXACT_DECODE_MODE=rust_decode requires Rust extension function "
+                "bed_packed_decode_stats_f64."
+            )
+        sample_idx_all = np.ascontiguousarray(self._packed_sample_indices, dtype=np.int64)
+        if self._debug_stage:
+            print(
+                f"[MLM-DEBUG] packed_exact_decode mode={('rust_decode' if use_rust_exact_decode else 'python')}",
+                flush=True,
+            )
+
+        def _decode_row_block_f64(st: int, ed: int) -> np.ndarray:
+            if use_rust_exact_decode:
+                packed_blk = np.ascontiguousarray(
+                    np.asarray(self._packed_ctx["packed"][st:ed, :], dtype=np.uint8),
+                    dtype=np.uint8,
+                )
+                row_flip_blk = np.ascontiguousarray(
+                    np.asarray(self._packed_ctx["row_flip"][st:ed], dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+                maf_blk = np.ascontiguousarray(
+                    np.asarray(self._packed_ctx["maf"][st:ed], dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+                blk64_raw, _sum_rows_raw, _sq_sum_rows_raw = _bed_packed_decode_stats_f64(
+                    packed_blk,
+                    int(self._packed_ctx["n_samples"]),
+                    row_flip_blk,
+                    maf_blk,
+                    sample_idx_all,
+                    threads=int(self._rust_threads),
+                )
+                return np.asarray(blk64_raw, dtype=np.float64)
+            ridx = np.arange(st, ed, dtype=np.int64)
+            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            return np.asarray(blk, dtype=np.float64)
 
         t_k = time.time()
         gram_mode, mem_limit, est_fast_peak, auto_dim = _choose_gram_strategy(
@@ -1608,12 +1657,11 @@ class BLUP:
         # Build ZZT = M^T M directly in row chunks without materializing dense M.
         for st in range(0, m, row_step):
             ed = min(st + row_step, m)
-            ridx = np.arange(st, ed, dtype=np.int64)
-            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
+            blk = _decode_row_block_f64(st, ed)
             blk_t = (
-                np.asfortranarray(np.asarray(blk, dtype=np.float64).T)
+                np.asfortranarray(blk.T)
                 if gram_mode == "lowmem"
-                else np.asarray(blk, dtype=np.float64).T
+                else np.asarray(blk.T, dtype=np.float64)
             )
             gram = _gram_rankk_update(
                 gram,
@@ -1676,12 +1724,39 @@ class BLUP:
 
         rhs = (self.V_inv.ravel() * self.r.ravel()).reshape(-1, 1)
         q = eigvec @ rhs
-        self.u = np.zeros((m, 1), dtype=np.float64)
-        for st in range(0, m, row_step):
-            ed = min(st + row_step, m)
-            ridx = np.arange(st, ed, dtype=np.int64)
-            blk = _decode_packed_rows_f32(self._packed_ctx, ridx, self._packed_sample_indices)
-            self.u[st:ed, :] = np.asarray(blk, dtype=np.float64) @ q
+        used_rust_malpha = False
+        if _packed_malpha_f64 is not None:
+            try:
+                u_raw = _packed_malpha_f64(
+                    self._packed_ctx["packed"],
+                    int(self._packed_ctx["n_samples"]),
+                    self._packed_ctx["row_flip"],
+                    self._packed_ctx["maf"],
+                    sample_idx_all,
+                    np.ascontiguousarray(np.asarray(q, dtype=np.float64).reshape(-1)),
+                    block_rows=max(1, row_step),
+                    threads=int(self._rust_threads),
+                )
+                self.u = np.ascontiguousarray(
+                    np.asarray(u_raw, dtype=np.float64).reshape(-1, 1),
+                    dtype=np.float64,
+                )
+                if int(self.u.shape[0]) != int(m):
+                    raise RuntimeError(
+                        f"Rust packed_malpha length mismatch: got {self.u.shape[0]}, expected {m}"
+                    )
+                used_rust_malpha = True
+            except Exception:
+                used_rust_malpha = False
+
+        if not used_rust_malpha:
+            self.u = np.zeros((m, 1), dtype=np.float64)
+            for st in range(0, m, row_step):
+                ed = min(st + row_step, m)
+                blk = _decode_row_block_f64(st, ed)
+                self.u[st:ed, :] = blk @ q
+        elif self._debug_stage:
+            print("[MLM-DEBUG] packed_exact_u source=rust_packed_malpha", flush=True)
         self.alpha = None
 
         sigma_g2 = self.rTV_invr / (self.n - self.p)

@@ -55,7 +55,7 @@ class AssociationConfig:
     maf: float = 0.02
     geno: float = 0.05
     het: float = 0.02
-    snps_only: bool = True
+    snps_only: bool = False
     threads: int = 0
     chunksize: int = 10000
     mmap_limit: bool = False

@@ -100,6 +100,8 @@ def build_qmatrix_farmcpu(
     n_snps_hint: Union[int, None] = None,
     threads: int = 1,
     mmap_limit: bool = False,
+    preloaded_packed: Union[dict[str, object], None] = None,
+    packed_ctx_preloaded: Union[dict[str, object], None] = None,
 ) -> np.ndarray:
     """
     Build or load Q matrix for FarmCPU (PCs + optional covariates).
@@ -121,6 +123,118 @@ def build_qmatrix_farmcpu(
         raise ValueError(
             "FarmCPU Q-matrix build requires either sample_ids or dense geno matrix."
         )
+
+    q_direct_state: dict[str, object] = {
+        "q": None,
+        "evd_backend": "",
+        "evd_secs": 0.0,
+    }
+
+    def _build_grm_from_packed_ctx_rust(
+        packed_ctx_obj: dict[str, object],
+        qdim: int = 0,
+    ) -> np.ndarray:
+        if not hasattr(jxrs, "grm_packed_f32"):
+            raise RuntimeError("rust symbol grm_packed_f32 is unavailable.")
+
+        packed = np.ascontiguousarray(
+            np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
+            dtype=np.uint8,
+        )
+        maf = np.ascontiguousarray(
+            np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        packed_n = int(packed_ctx_obj["n_samples"])
+        if packed_n != int(n):
+            raise ValueError(
+                f"Packed context sample size mismatch for FarmCPU-Q: packed={packed_n}, expected={n}."
+            )
+
+        row_flip_obj = packed_ctx_obj.get("row_flip", None)
+        if row_flip_obj is None:
+            if hasattr(jxrs, "bed_packed_row_flip_mask"):
+                row_flip_obj = jxrs.bed_packed_row_flip_mask(packed, int(packed_n))
+            else:
+                row_flip_obj = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
+        row_flip = np.ascontiguousarray(
+            np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+
+        if int(packed.shape[0]) != int(maf.shape[0]) or int(packed.shape[0]) != int(row_flip.shape[0]):
+            raise ValueError(
+                "Packed context dimension mismatch for FarmCPU-Q "
+                f"(packed_rows={packed.shape[0]}, maf={maf.shape[0]}, row_flip={row_flip.shape[0]})."
+            )
+
+        pbar = _ProgressAdapter(
+            total=int(max(1, int(packed.shape[0]))),
+            desc="GRM (packed-bed)",
+            force_animate=True,
+        )
+        process = psutil.Process()
+        mem_tick_span = max(1, 10 * int(max(1, int(chunk_size))))
+        progress_state = {"done": 0}
+
+        def _on_grm_progress(done: int, _total: int) -> None:
+            d = int(done)
+            delta = d - int(progress_state["done"])
+            if delta > 0:
+                pbar.update(delta)
+                progress_state["done"] = d
+            if d % mem_tick_span == 0:
+                mem = process.memory_info().rss / 1024**3
+                pbar.set_postfix(memory=f"{mem:.2f}GB")
+
+        qdim_use = int(max(0, int(qdim)))
+        try:
+            if qdim_use > 0 and hasattr(jxrs, "farmcpu_q_packed_grm_pca_f32"):
+                grm_raw, q_raw, evd_backend, evd_secs = jxrs.farmcpu_q_packed_grm_pca_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    int(qdim_use),
+                    sample_indices=None,
+                    method=1,
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_grm_progress,
+                    progress_every=max(1, int(chunk_size)),
+                )
+                q_direct = np.asarray(q_raw, dtype="float32")
+                if q_direct.ndim != 2 or q_direct.shape != (int(n), int(qdim_use)):
+                    raise ValueError(
+                        "Rust packed FarmCPU-Q shape mismatch: "
+                        f"got {q_direct.shape}, expected ({n},{qdim_use})."
+                    )
+                q_direct_state["q"] = q_direct
+                q_direct_state["evd_backend"] = str(evd_backend)
+                q_direct_state["evd_secs"] = float(evd_secs)
+            else:
+                grm_raw = jxrs.grm_packed_f32(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    sample_indices=None,
+                    method=1,
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_grm_progress,
+                    progress_every=max(1, int(chunk_size)),
+                )
+            pbar.finish()
+        finally:
+            pbar.close(show_done=False)
+
+        grm = np.asarray(grm_raw, dtype="float32")
+        if grm.ndim != 2 or grm.shape[0] != grm.shape[1] or int(grm.shape[0]) != int(n):
+            raise ValueError(
+                f"Rust packed GRM shape mismatch for FarmCPU-Q: got {grm.shape}, expected ({n},{n})."
+            )
+        return grm
 
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
         grm_path, id_path = _grm_cache_paths(gfile_prefix, mgrm="1")
@@ -175,39 +289,74 @@ def build_qmatrix_farmcpu(
                             pass
 
                 _farm_log("* Building GRM cache for FarmCPU PCA...")
-                if geno is not None:
-                    grm = GRM(geno).astype("float32")
-                else:
-                    if n_snps_hint is not None:
-                        n_snps_eff = int(n_snps_hint)
-                    else:
-                        _ids0, n_snps0 = inspect_genotype_file(
-                            genofile,
-                            snps_only=bool(snps_only),
-                            maf=float(maf_threshold),
-                            missing_rate=float(max_missing_rate),
-                            het=float(het_threshold),
+                grm = None
+                built_with_rust_packed = False
+
+                # Preferred path for FarmCPU Q build: packed Rust single-entry
+                # (GRM + optional PCA) from already prepared packed context.
+                if isinstance(packed_ctx_preloaded, dict):
+                    try:
+                        _farm_log("* Building GRM cache for FarmCPU PCA (packed Rust)...")
+                        grm = _build_grm_from_packed_ctx_rust(
+                            packed_ctx_preloaded,
+                            qdim=int(q_int),
                         )
-                        n_snps_eff = int(n_snps0)
-                    grm, _eff_m = build_grm_streaming(
-                        genofile=genofile,
-                        n_samples=n,
-                        n_snps=n_snps_eff,
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        chunk_size=int(chunk_size),
-                        method=1,
-                        mmap_window_mb=auto_mmap_window_mb(
-                            genofile, n, n_snps_eff, int(chunk_size)
-                        ) if bool(mmap_limit) else None,
-                        threads=max(1, int(threads)),
-                        logger=logger,
-                        use_spinner=bool(use_spinner),
-                        snps_only=bool(snps_only),
-                        # Full task (FarmCPU): allow packed full-load acceleration.
-                        allow_packed_full_load=True,
-                    )
-                    grm = np.asarray(grm, dtype="float32")
+                        built_with_rust_packed = True
+                    except Exception as ex:
+                        _emit_warning_line(
+                            logger,
+                            f"FarmCPU packed-Rust GRM failed; fallback to legacy path. reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+
+                if not built_with_rust_packed:
+                    if geno is not None:
+                        grm = GRM(geno).astype("float32")
+                    else:
+                        if n_snps_hint is not None:
+                            n_snps_eff = int(n_snps_hint)
+                        else:
+                            _ids0, n_snps0 = inspect_genotype_file(
+                                genofile,
+                                snps_only=bool(snps_only),
+                                maf=float(maf_threshold),
+                                missing_rate=float(max_missing_rate),
+                                het=float(het_threshold),
+                            )
+                            n_snps_eff = int(n_snps0)
+
+                        packed_fallback = preloaded_packed
+                        if (packed_fallback is None) and isinstance(packed_ctx_preloaded, dict):
+                            px = str(packed_ctx_preloaded.get("source_prefix", "")).strip()
+                            if px != "":
+                                packed_fallback = {
+                                    "prefix": px,
+                                    "packed_ctx": packed_ctx_preloaded,
+                                }
+
+                        grm, _eff_m = build_grm_streaming(
+                            genofile=genofile,
+                            n_samples=n,
+                            n_snps=n_snps_eff,
+                            maf_threshold=float(maf_threshold),
+                            max_missing_rate=float(max_missing_rate),
+                            chunk_size=int(chunk_size),
+                            method=1,
+                            mmap_window_mb=auto_mmap_window_mb(
+                                genofile, n, n_snps_eff, int(chunk_size)
+                            ) if bool(mmap_limit) else None,
+                            threads=max(1, int(threads)),
+                            logger=logger,
+                            use_spinner=bool(use_spinner),
+                            snps_only=bool(snps_only),
+                            # Full task (FarmCPU): allow packed full-load acceleration.
+                            allow_packed_full_load=True,
+                            preloaded_packed=packed_fallback,
+                        )
+                        grm = np.asarray(grm, dtype="float32")
+
+                if grm is None:
+                    raise RuntimeError("FarmCPU Q build failed to construct GRM.")
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 np.save(tmp_grm, grm)
                 os.replace(tmp_grm, grm_path)
@@ -262,13 +411,30 @@ def build_qmatrix_farmcpu(
             else:
                 _farm_log(f"* PCA dimension for FarmCPU Q matrix: {q_int}")
                 grm = _load_or_build_grm_cache_for_pca()
-                eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
-                    grm,
-                    threads=max(1, int(threads)),
-                    logger=logger,
-                    stage_label="FarmCPU-Q-build",
-                )
-                qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
+                q_direct_obj = q_direct_state.get("q")
+                if isinstance(q_direct_obj, np.ndarray):
+                    qmatrix = np.asarray(q_direct_obj, dtype="float32")
+                    if qmatrix.shape != (n, int(q_int)):
+                        raise ValueError(
+                            "FarmCPU-Q packed Rust direct output shape mismatch: "
+                            f"got {qmatrix.shape}, expected ({n},{q_int})."
+                        )
+                    evd_backend = str(q_direct_state.get("evd_backend", "unknown"))
+                    evd_secs = float(q_direct_state.get("evd_secs", 0.0))
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"FarmCPU-Q-build packed Rust single-entry eig backend={evd_backend} "
+                        f"elapsed={evd_secs:.3f}s",
+                    )
+                else:
+                    _eigval, eigvec, _evd_backend, _evd_secs = _gwas_eigh_from_grm(
+                        grm,
+                        threads=max(1, int(threads)),
+                        logger=logger,
+                        stage_label="FarmCPU-Q-build",
+                    )
+                    qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
                 os.replace(tmp_q, q_path)
@@ -682,6 +848,8 @@ def run_farmcpu_fullmem(
             n_snps_hint=int(ref_alt.shape[0]),
             threads=int(args.thread),
             mmap_limit=bool(args.mmap_limit),
+            preloaded_packed=preloaded_packed,
+            packed_ctx_preloaded=packed_ctx,
         )
 
         cov_n: Union[int, str] = "NA"

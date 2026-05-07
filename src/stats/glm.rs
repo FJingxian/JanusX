@@ -361,47 +361,48 @@ pub fn lm_stream_bed_to_tsv(
         let total_scan = total_snp_hint;
         let mut next_progress_emit: usize = progress_block;
 
-        let prepare_row =
-            |mut row_sub: Vec<f32>, mut site: gfcore::SiteInfo| -> Option<(Vec<f32>, gfcore::SiteInfo, f32)> {
-                let keep = gfcore::process_snp_row(
-                    &mut row_sub,
-                    &mut site.ref_allele,
-                    &mut site.alt_allele,
-                    maf_threshold,
-                    max_missing_rate,
-                    true,
-                    model.as_str() != "add",
-                    het_threshold,
-                );
-                if !keep {
-                    return None;
-                }
-                if snps_only
-                    && (!is_simple_snp_allele(&site.ref_allele)
-                        || !is_simple_snp_allele(&site.alt_allele))
-                {
-                    return None;
-                }
+        let prepare_row = |mut row_sub: Vec<f32>,
+                           mut site: gfcore::SiteInfo|
+         -> Option<(Vec<f32>, gfcore::SiteInfo, f32)> {
+            let keep = gfcore::process_snp_row(
+                &mut row_sub,
+                &mut site.ref_allele,
+                &mut site.alt_allele,
+                maf_threshold,
+                max_missing_rate,
+                true,
+                model.as_str() != "add",
+                het_threshold,
+            );
+            if !keep {
+                return None;
+            }
+            if snps_only
+                && (!is_simple_snp_allele(&site.ref_allele)
+                    || !is_simple_snp_allele(&site.alt_allele))
+            {
+                return None;
+            }
 
-                let mut sum_model = 0.0_f64;
-                let mut maf_sum = 0.0_f64;
-                for v in row_sub.iter_mut() {
-                    let mv = transform_model_value(*v, model.as_str());
-                    *v = mv;
-                    sum_model += mv as f64;
-                    maf_sum += mv as f64;
-                }
-                let mean_model = (sum_model / n as f64) as f32;
-                for v in row_sub.iter_mut() {
-                    *v -= mean_model;
-                }
-                let maf_val = if model.as_str() == "add" {
-                    (maf_sum / n as f64 / 2.0) as f32
-                } else {
-                    (maf_sum / n as f64) as f32
-                };
-                Some((row_sub, site, maf_val))
+            let mut sum_model = 0.0_f64;
+            let mut maf_sum = 0.0_f64;
+            for v in row_sub.iter_mut() {
+                let mv = transform_model_value(*v, model.as_str());
+                *v = mv;
+                sum_model += mv as f64;
+                maf_sum += mv as f64;
+            }
+            let mean_model = (sum_model / n as f64) as f32;
+            for v in row_sub.iter_mut() {
+                *v -= mean_model;
+            }
+            let maf_val = if model.as_str() == "add" {
+                (maf_sum / n as f64 / 2.0) as f32
+            } else {
+                (maf_sum / n as f64) as f32
             };
+            Some((row_sub, site, maf_val))
+        };
 
         loop {
             chunk_rows.clear();
@@ -445,8 +446,7 @@ pub fn lm_stream_bed_to_tsv(
                         .collect()
                 })
             } else {
-                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> =
-                    Vec::with_capacity(batch_len);
+                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = Vec::with_capacity(batch_len);
                 for snp_idx in scan_idx..end_idx {
                     let maybe = if full_samples {
                         it.get_snp_row_raw(snp_idx)
@@ -555,9 +555,7 @@ pub fn lm_stream_bed_to_tsv(
             }
             let payload = text.into_bytes();
             tx.send(payload).map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "writer queue send failed for {out_tsv_path}: {e}"
-                ))
+                PyRuntimeError::new_err(format!("writer queue send failed for {out_tsv_path}: {e}"))
             })?;
 
             kept_total = kept_total.saturating_add(m);
@@ -570,9 +568,9 @@ pub fn lm_stream_bed_to_tsv(
             })?;
         }
         drop(tx);
-        let writer_result = writer_handle
-            .join()
-            .map_err(|_| PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}")))?;
+        let writer_result = writer_handle.join().map_err(|_| {
+            PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}"))
+        })?;
         if let Err(msg) = writer_result {
             return Err(PyRuntimeError::new_err(msg));
         }
@@ -1368,9 +1366,7 @@ pub fn glmf32_packed_assoc_to_tsv(
                 }
                 let payload = std::mem::take(&mut text_buf).into_bytes();
                 tx.send(payload).map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "writer queue send failed for {out_path}: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("writer queue send failed for {out_path}: {e}"))
                 })?;
 
                 let done = (i_marker + cnt).min(m);
@@ -1394,9 +1390,9 @@ pub fn glmf32_packed_assoc_to_tsv(
             runner()
         };
         drop(tx);
-        let writer_res = writer_handle
-            .join()
-            .map_err(|_| PyRuntimeError::new_err(format!("writer thread panicked for {out_path}")))?;
+        let writer_res = writer_handle.join().map_err(|_| {
+            PyRuntimeError::new_err(format!("writer thread panicked for {out_path}"))
+        })?;
         run_res?;
         if let Err(msg) = writer_res {
             return Err(PyRuntimeError::new_err(msg));

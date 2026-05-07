@@ -12,10 +12,11 @@ import numpy as np
 import pandas as pd
 import psutil
 
+from janusx.pyBLUP.QK2 import GRM, QK
+from janusx.pyBLUP.assoc import farmcpu
+
 from .workflow import (
     CliStatus,
-    GRM,
-    QK,
     _ProgressAdapter,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
@@ -43,7 +44,6 @@ from .workflow import (
     auto_mmap_window_mb,
     build_grm_streaming,
     detect_effective_threads,
-    farmcpu,
     format_elapsed,
     genotype_cache_prefix,
     inspect_genotype_file,

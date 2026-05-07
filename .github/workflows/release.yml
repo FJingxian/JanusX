@@ -350,9 +350,11 @@ jobs:
           & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
 
           if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
+            # Cross ARM64 build keeps static-md for simpler cross-linking on x64 host.
             $triplet = "arm64-windows-static-md"
           } else {
-            $triplet = "x64-windows-static-md"
+            # x64 wheel build (python -m build) requires runtime OpenBLAS DLL bundling.
+            $triplet = "x64-windows"
           }
 
           & "$vcpkgRoot\vcpkg.exe" install "openblas:$triplet"
@@ -361,6 +363,10 @@ jobs:
           }
 
           $installed = Join-Path $vcpkgRoot "installed\$triplet"
+          $binDir = Join-Path $installed "bin"
+          if (Test-Path $binDir) {
+            "OPENBLAS_BIN_DIR=$binDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
           "OPENBLAS_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPENBLAS_INCLUDE_DIR=$installed\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 

@@ -3,10 +3,55 @@
 
 from __future__ import annotations
 
-from . import workflow as wf
+import logging
+import os
+import time
+from typing import Union
 
-# Reuse shared symbols/utilities from workflow without duplicating imports.
-globals().update(wf.__dict__)
+import numpy as np
+import pandas as pd
+import psutil
+
+from .workflow import (
+    CliStatus,
+    GRM,
+    QK,
+    _ProgressAdapter,
+    _align_pheno_to_sample_order,
+    _as_plink_prefix,
+    _basename_only,
+    _cache_lock,
+    _emit_plain_info_line,
+    _emit_trait_header,
+    _emit_warning_line,
+    _grm_cache_paths,
+    _gwas_cache_prefix_with_params,
+    _gwas_eigh_from_grm,
+    _inspect_genotype_with_status,
+    _load_covariates_for_models,
+    _load_phenotype_with_status,
+    _log_file_only,
+    _normalize_cov_inputs,
+    _parse_qcov_dim,
+    _pca_cache_path,
+    _plrt_from_beta_se,
+    _read_id_file,
+    _rich_success,
+    _run_fastplot_from_tsv_with_status,
+    _run_result_write_with_status,
+    _trait_values_and_mask,
+    auto_mmap_window_mb,
+    build_grm_streaming,
+    detect_effective_threads,
+    farmcpu,
+    format_elapsed,
+    genotype_cache_prefix,
+    inspect_genotype_file,
+    jxrs,
+    latest_genotype_mtime,
+    load_genotype_chunks,
+    prepare_packed_ctx_from_plink,
+)
 
 
 def prepare_qk_and_filter(
@@ -1044,4 +1089,3 @@ def run_farmcpu_fullmem(
 # ======================================================================
 # CLI
 # ======================================================================
-

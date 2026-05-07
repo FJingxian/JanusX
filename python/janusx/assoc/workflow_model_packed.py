@@ -3,10 +3,41 @@
 
 from __future__ import annotations
 
-from . import workflow as wf
+import logging
+import os
+import time
+import uuid
+from typing import Optional, Union
 
-# Reuse shared symbols/utilities from workflow without duplicating imports.
-globals().update(wf.__dict__)
+import numpy as np
+import pandas as pd
+import psutil
+
+from .workflow import (
+    CliStatus,
+    LMM,
+    _ProgressAdapter,
+    _align_pheno_to_sample_order,
+    _as_plink_prefix,
+    _display_path,
+    _emit_trait_header,
+    _emit_warning_line,
+    _gwas_eigh_from_grm,
+    _gwas_evd_stage_ctx,
+    _gwas_scan_stage_ctx,
+    _log_file_only,
+    _log_model_line,
+    _read_bim_sites,
+    _resolve_stream_scan_chunk_size,
+    _rich_success,
+    _run_fastplot_from_tsv_with_status,
+    _run_result_write_with_status,
+    _trait_values_and_mask,
+    detect_effective_threads,
+    format_elapsed,
+    jxrs,
+    prepare_packed_ctx_from_plink,
+)
 
 
 def _prepare_packed_bed_once_for_gwas(

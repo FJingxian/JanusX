@@ -179,8 +179,12 @@ def _pick_cxx() -> str:
         p = Path(pref)
         if p.is_file():
             return str(p)
-        raise RuntimeError(
-            f"CXX is set to '{pref}', but compiler not found in PATH (or file does not exist)."
+        # Be robust to stale/cross-toolchain CXX values from user shells or CI.
+        # If requested compiler is unavailable, warn and fall back to detected defaults.
+        print(
+            f"[janusx.kmc_bind] Warning: CXX='{pref}' is not available; "
+            "falling back to auto-detected compiler.",
+            flush=True,
         )
 
     if _is_windows():

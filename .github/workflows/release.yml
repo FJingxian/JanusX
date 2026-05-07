@@ -519,6 +519,20 @@ jobs:
           PY
           "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
 
+      - name: Wheel runtime smoke test (GWAS + rrBLUP)
+        if: ${{ matrix.label == 'linux-x86_64' || matrix.label == 'macos-arm64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          # Install with dependencies to cover real runtime paths.
+          "$PY" -m pip install --force-reinstall dist/*.whl
+          JX_GGVAL_MODE=smoke \
+          JX_GGVAL_THREADS=2 \
+          JX_GGVAL_CV=2 \
+          bash scripts/ggval.sh
+
       - name: Verify macOS wheel links OpenBLAS only
         if: ${{ matrix.platform == 'macos' }}
         shell: bash
@@ -737,8 +751,9 @@ jobs:
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
-          git clone "https://x-access-token:${BIOCONDA_PAT}@github.com/${BIOCONDA_FORK}.git" bioconda-recipes
-          cd bioconda-recipes
+          rm -rf bioconda-fork
+          git clone "https://x-access-token:${BIOCONDA_PAT}@github.com/${BIOCONDA_FORK}.git" bioconda-fork
+          cd bioconda-fork
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin --depth=1 || true
@@ -759,14 +774,23 @@ jobs:
           python - <<'PY'
           import os
           import re
+          import shutil
           from pathlib import Path
 
           version = os.environ["VERSION"]
           sha = os.environ["SHA256"]
           md5 = os.environ.get("MD5", "").strip()
-          path = Path("bioconda-recipes/recipes/janusx/meta.yaml")
+          path = Path("bioconda-fork/recipes/janusx/meta.yaml")
+          template = Path("bioconda-recipes/recipes/janusx/meta.yaml")
           if not path.exists():
-              raise SystemExit(f"Bioconda recipe not found: {path}")
+              if template.exists():
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(template, path)
+                  print(f"Recipe missing in fork; created from template: {path}")
+              else:
+                  raise SystemExit(
+                      f"Bioconda recipe not found: {path}; template also missing: {template}"
+                  )
 
           text = path.read_text(encoding="utf-8")
 
@@ -808,7 +832,7 @@ jobs:
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
         run: |
-          cd bioconda-recipes
+          cd bioconda-fork
           git add recipes/janusx/meta.yaml
           if git diff --cached --quiet; then
             echo "No changes to commit."

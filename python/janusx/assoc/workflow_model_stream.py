@@ -3,10 +3,56 @@
 
 from __future__ import annotations
 
-from . import workflow as wf
+import concurrent.futures as cf
+import io
+import logging
+import os
+import time
+import uuid
+from typing import Optional, Union
 
-# Reuse shared symbols/utilities from workflow without duplicating imports.
-globals().update(wf.__dict__)
+import numpy as np
+import pandas as pd
+import psutil
+
+from janusx.gfreader import load_genotype_chunks
+from janusx.script._common.prefetch import prefetch_iter
+
+from .workflow import (
+    CliStatus,
+    FastLMM,
+    LM,
+    LMM,
+    _FASTLMM_PVE_HIGH,
+    _FASTLMM_PVE_LOW,
+    _GWAS_PROGRESS_BAR_WIDTH,
+    _ProgressAdapter,
+    _align_pheno_to_sample_order,
+    _as_plink_prefix,
+    _display_path,
+    _emit_trait_header,
+    _fastlmm_pve_is_degenerate,
+    _format_progress_metric,
+    _gwas_evd_stage_ctx,
+    _gwas_scan_stage_ctx,
+    _log_file_only,
+    _log_model_line,
+    _resolve_stream_scan_chunk_size,
+    _rich_success,
+    _run_fastplot_from_tsv_with_status,
+    _run_result_write_with_status,
+    _trait_values_and_mask,
+    auto_mmap_window_mb,
+    build_rich_progress,
+    detect_effective_threads,
+    format_elapsed,
+    jxrs,
+    rich_progress_available,
+    run_lm_packed_fullrank,
+    run_lm_stream_bed_single_entry,
+    run_lmm_packed_fullrank,
+    should_animate_status,
+)
 
 
 def run_chunked_gwas_lmm_lm(
@@ -1626,5 +1672,3 @@ def run_chunked_gwas_streaming_shared(
 # ======================================================================
 # High-memory FarmCPU: full genotype + QK
 # ======================================================================
-
-

@@ -474,7 +474,7 @@ def _run_fastplot_with_status(
 ) -> float:
     viz_t0 = time.time()
     if bool(use_spinner):
-        with CliStatus("Visualizing ...", enabled=True, use_process=True) as task:
+        with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:
                 fastplot(gwasresult, phenosub, xlabel=str(xlabel), outpdf=str(outpdf))
             except Exception:
@@ -498,7 +498,7 @@ def _run_fastplot_from_tsv_with_status(
 ) -> float:
     viz_t0 = time.time()
     if bool(use_spinner):
-        with CliStatus("Visualizing ...", enabled=True, use_process=True) as task:
+        with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:
                 plot_df = pd.read_csv(
                     out_tsv,
@@ -533,7 +533,7 @@ def _run_result_write_with_status(
 ) -> float:
     w_t0 = time.time()
     if bool(use_spinner):
-        with CliStatus("Writing results ...", enabled=True, use_process=True) as task:
+        with CliStatus("Writing results ...", enabled=True, use_process=False) as task:
             try:
                 write_fn()
             except Exception:

@@ -272,6 +272,8 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -286,6 +288,8 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -356,6 +360,8 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -370,6 +376,8 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -440,6 +448,7 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -454,6 +463,7 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -524,6 +534,7 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -538,6 +549,7 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -608,6 +620,7 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -622,6 +635,7 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -692,6 +706,7 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevd_"]
     fn lapack_dsyevd_openblas(
         jobz: *const std::os::raw::c_char,
@@ -706,6 +721,7 @@ unsafe extern "C" {
         liwork: *const CblasInt,
         info: *mut CblasInt,
     );
+    #[cfg(jx_openblas_lapack_available)]
     #[link_name = "dsyevr_"]
     fn lapack_dsyevr_openblas(
         jobz: *const std::os::raw::c_char,
@@ -1084,7 +1100,11 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
         }
         SgemmBackend::OpenBlas => {
             #[cfg(all(
-                any(target_os = "macos", target_os = "linux", target_os = "windows"),
+                any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    all(target_os = "windows", jx_openblas_lapack_available)
+                ),
                 feature = "blas-openblas",
                 jx_openblas_available
             ))]
@@ -1105,7 +1125,10 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
         return Ok(());
     }
     #[cfg(all(
-        any(target_os = "linux", target_os = "windows"),
+        any(
+            target_os = "linux",
+            all(target_os = "windows", jx_openblas_lapack_available)
+        ),
         feature = "blas-openblas",
         jx_openblas_available
     ))]
@@ -1113,10 +1136,7 @@ pub(crate) unsafe fn lapack_dsyevd_dispatch(
         lapack_dsyevd_openblas(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Ok(());
     }
-    #[cfg(all(
-        target_os = "windows",
-        not(all(feature = "blas-openblas", jx_openblas_available))
-    ))]
+    #[cfg(target_os = "windows")]
     {
         let _ = (jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info);
         return Err("lapack_dsyevd unavailable on this Windows build");
@@ -1166,7 +1186,11 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
         }
         SgemmBackend::OpenBlas => {
             #[cfg(all(
-                any(target_os = "macos", target_os = "linux", target_os = "windows"),
+                any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    all(target_os = "windows", jx_openblas_lapack_available)
+                ),
                 feature = "blas-openblas",
                 jx_openblas_available
             ))]
@@ -1193,7 +1217,10 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
         return Ok(());
     }
     #[cfg(all(
-        any(target_os = "linux", target_os = "windows"),
+        any(
+            target_os = "linux",
+            all(target_os = "windows", jx_openblas_lapack_available)
+        ),
         feature = "blas-openblas",
         jx_openblas_available
     ))]
@@ -1204,10 +1231,7 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
         );
         return Ok(());
     }
-    #[cfg(all(
-        target_os = "windows",
-        not(all(feature = "blas-openblas", jx_openblas_available))
-    ))]
+    #[cfg(target_os = "windows")]
     {
         let _ = (
             jobz, range, uplo, n, a, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,

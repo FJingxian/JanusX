@@ -216,6 +216,29 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
     }
     maybe_link_blas_family_from_dir(lib_dir_s, source_label);
     println!("cargo:rustc-cfg=jx_openblas_available");
+    let has_win_lapack = has_library_with_prefix(lib_dir_s, "liblapack")
+        || has_library_with_prefix(lib_dir_s, "lapack")
+        || has_library_with_prefix(lib_dir_s, "lapacke");
+    let mut lapack_available = !cfg!(target_os = "windows");
+    if cfg!(target_os = "windows") {
+        // vcpkg openblas on Windows is commonly built without LAPACK symbols
+        // (e.g. dsyevd_/dsyevr_), so default to disabled unless a lapack
+        // companion library is visible.
+        lapack_available = has_win_lapack;
+    }
+    if env_flag("JANUSX_FORCE_OPENBLAS_LAPACK") {
+        lapack_available = true;
+    }
+    if env_flag("JANUSX_DISABLE_OPENBLAS_LAPACK") {
+        lapack_available = false;
+    }
+    if lapack_available {
+        println!("cargo:rustc-cfg=jx_openblas_lapack_available");
+    } else {
+        emit_verbose_note(format!(
+            "OpenBLAS detected via {source_label}, but LAPACK symbols are treated as unavailable."
+        ));
+    }
     if cfg!(target_os = "windows") && has_win_openblas && !has_win_libopenblas {
         println!("cargo:rustc-cfg=jx_openblas_link_openblas_plain");
     }
@@ -239,6 +262,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_available)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas0)");
     println!("cargo:rustc-check-cfg=cfg(jx_openblas_link_openblas_plain)");
+    println!("cargo:rustc-check-cfg=cfg(jx_openblas_lapack_available)");
     println!("cargo:rustc-check-cfg=cfg(jx_blas_available)");
     println!("cargo:rerun-if-env-changed=JANUSX_REQUIRE_OPENBLAS");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
@@ -249,6 +273,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBRARY_LIB");
     println!("cargo:rerun-if-env-changed=LIBRARY_PREFIX");
     println!("cargo:rerun-if-env-changed=JANUSX_LINK_BLAS_FAMILY");
+    println!("cargo:rerun-if-env-changed=JANUSX_FORCE_OPENBLAS_LAPACK");
+    println!("cargo:rerun-if-env-changed=JANUSX_DISABLE_OPENBLAS_LAPACK");
     let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
 
     // Only probe OpenBLAS when user explicitly enabled the feature.

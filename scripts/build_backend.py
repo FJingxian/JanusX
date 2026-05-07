@@ -251,6 +251,10 @@ def _collect_windows_runtime_dlls() -> list[Path]:
     patterns = [
         "libopenblas*.dll",
         "openblas*.dll",
+        "liblapack*.dll",
+        "lapack*.dll",
+        "libblas*.dll",
+        "blas*.dll",
         "libgfortran*.dll",
         "libquadmath*.dll",
         "libgcc_s*.dll",

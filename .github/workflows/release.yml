@@ -354,12 +354,20 @@ jobs:
             $triplet = "arm64-windows-static-md"
           } else {
             # x64 wheel build (python -m build) requires runtime OpenBLAS DLL bundling.
+            # Use dynamic triplet and install LAPACK package so Rust eigh can link
+            # dsyevd_/dsyevr_ on Windows.
             $triplet = "x64-windows"
           }
 
           & "$vcpkgRoot\vcpkg.exe" install "openblas:$triplet"
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg install openblas failed for triplet $triplet"
+          }
+          if ("${{ matrix.target }}" -ne "aarch64-pc-windows-msvc") {
+            & "$vcpkgRoot\vcpkg.exe" install "lapack:$triplet"
+            if ($LASTEXITCODE -ne 0) {
+              throw "vcpkg install lapack failed for triplet $triplet"
+            }
           }
 
           $installed = Join-Path $vcpkgRoot "installed\$triplet"
@@ -462,6 +470,19 @@ jobs:
           print(f"[janusx] rust_sgemm_backend={backend}")
           if backend != "openblas":
               raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
+          PY
+
+      - name: Verify Rust eigh LAPACK backend (windows-x86_64)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import janusx.janusx as _jx
+          # require_lapack=True must fail fast if LAPACK symbols/backends are unavailable.
+          _ = _jx.rust_eigh_debug_f64(n=128, threads=4, driver="auto", jobz="V", require_lapack=True)
+          print("[janusx] rust_eigh_debug_f64(require_lapack=True) passed")
           PY
 
       - name: Verify KMC prebuilt in wheel (all except windows-arm64)

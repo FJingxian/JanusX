@@ -30,6 +30,7 @@ _DEFAULT_KMC_SOURCE_CANDIDATES = _default_kmc_source_candidates()
 _DEFAULT_KMC_CACHE_ENV = "JANUSX_KMC_BIND_CACHE"
 _MODULE_BASENAME = "_kmc_count"
 _PREBUILT_BLOB = f"{_MODULE_BASENAME}.prebuilt.bin"
+_BUILD_RECIPE_VERSION = "kmc-bind-v2"
 _LOADED: dict[str, ModuleType] = {}
 
 
@@ -391,12 +392,15 @@ def _compile_objects(
         extra: list[str] = []
         name = src.name
         if msvc_like:
+            # Keep ISA defines aligned with upstream KMC Visual Studio settings.
             if name == "raduls_avx.cpp":
-                extra = ["/arch:AVX"]
+                extra = ["/arch:AVX", "/D__AVX__"]
             elif name == "raduls_avx2.cpp":
-                extra = ["/arch:AVX2"]
+                extra = ["/arch:AVX2", "/D__AVX2__"]
             elif name == "raduls_sse41.cpp":
-                extra = ["/arch:AVX"]
+                extra = ["/arch:SSE2", "/D__SSE4_1__"]
+            elif name == "raduls_sse2.cpp":
+                extra = ["/arch:SSE2", "/D__SSE2__"]
             cmd = [cxx, *common, *extra, *inc_flags, "/c", str(src), f"/Fo{obj}"]
         else:
             if name == "raduls_sse2.cpp":
@@ -432,7 +436,9 @@ def build_kmc_bind_module(
     kmc_cpp = _kmc_sources(kmc_src_dir)
     src_fp = _source_fingerprint(kmc_src_dir, wrapper_cpp, kmc_cpp)
     sig = hashlib.sha1(
-        f"{src_fp}|{platform.system()}|{platform.machine()}|{sys.version_info[:2]}".encode("utf-8")
+        f"{src_fp}|{_BUILD_RECIPE_VERSION}|{platform.system()}|{platform.machine()}|{sys.version_info[:2]}".encode(
+            "utf-8"
+        )
     ).hexdigest()[:12]
     build_root = _build_cache_root() / f"build_{sig}"
     obj_dir = build_root / "obj"

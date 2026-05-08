@@ -299,6 +299,49 @@ jobs:
           print(f"Updated {path} to version={version}, url={source_url}, sha256={sha}")
           PY
 
+      - name: Validate recipe runtime deps
+        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("bioconda-fork/recipes/janusx/meta.yaml")
+          if not path.exists():
+              raise SystemExit(f"Recipe self-check failed: file not found: {path}")
+
+          text = path.read_text(encoding="utf-8")
+          req_match = re.search(
+              r"(?ms)^requirements:\s*\n(?P<body>.*?)(?:^\S|\Z)",
+              text,
+          )
+          if req_match is None:
+              raise SystemExit(
+                  "Recipe self-check failed: requirements block not found."
+              )
+          req_body = req_match.group("body")
+
+          run_match = re.search(
+              r"(?ms)^\s{2}run:\s*\n(?P<body>(?:^\s{4,}.*\n?)*)",
+              req_body,
+          )
+          if run_match is None:
+              raise SystemExit(
+                  "Recipe self-check failed: requirements.run block not found."
+              )
+          run_body = run_match.group("body")
+
+          if re.search(r"(?m)^\s*-\s*libopenblas(?:\s|$)", run_body) is None:
+              print("Detected requirements.run block:")
+              print(run_body.rstrip())
+              raise SystemExit(
+                  "Recipe self-check failed: requirements.run missing 'libopenblas'."
+              )
+
+          print("Recipe self-check passed: requirements.run contains libopenblas.")
+          PY
+
       - name: Commit and push
         id: commit_recipe
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}

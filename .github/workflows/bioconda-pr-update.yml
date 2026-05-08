@@ -105,24 +105,6 @@ jobs:
           raise SystemExit("PyPI sdist not available yet")
           PY
 
-      - name: Compute sdist hashes
-        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
-        id: sdist_hash
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, urllib.request, hashlib
-          version = os.environ["VERSION"]
-          url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-          data = urllib.request.urlopen(url, timeout=60).read()
-          sha = hashlib.sha256(data).hexdigest()
-          md5 = hashlib.md5(data).hexdigest()
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(out, "a", encoding="utf-8") as f:
-              f.write(f"sha256={sha}\n")
-              f.write(f"md5={md5}\n")
-          PY
-
       - name: Checkout bioconda fork
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
@@ -154,19 +136,16 @@ jobs:
       - name: Update recipe
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
-        env:
-          SHA256: ${{ steps.sdist_hash.outputs.sha256 }}
-          MD5: ${{ steps.sdist_hash.outputs.md5 }}
         run: |
           python - <<'PY'
+          import hashlib
           import os
           import re
           import shutil
+          import urllib.request
           from pathlib import Path
 
           version = os.environ["VERSION"]
-          sha = os.environ["SHA256"]
-          md5 = os.environ.get("MD5", "").strip()
           path = Path("bioconda-fork/recipes/janusx/meta.yaml")
           template = Path("bioconda-recipes/recipes/janusx/meta.yaml")
           if not path.exists():
@@ -237,6 +216,35 @@ jobs:
           if n_ver != 1:
               raise SystemExit("Failed to update recipe version line.")
 
+          name = "janusx"
+          m_name = re.search(
+              r'(?m)^\s*\{%\s*set\s+name\s*=\s*"([^"]+)"\s*%\}\s*$',
+              text,
+          )
+          if m_name:
+              name = m_name.group(1)
+          m_url = re.search(r'(?m)^(\s*url:\s*)(\S+)\s*$', text)
+          if m_url:
+              url_raw = m_url.group(2).strip().strip("'\"")
+              source_url = (
+                  url_raw.replace("{{ version }}", version)
+                  .replace("{{version}}", version)
+                  .replace("{{ name }}", name)
+                  .replace("{{name}}", name)
+                  .replace("{{ name|lower }}", name.lower())
+                  .replace("{{name|lower}}", name.lower())
+              )
+          else:
+              source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
+          if "{{" in source_url or "}}" in source_url:
+              raise SystemExit(
+                  f"Unable to resolve source URL from recipe template: {source_url}"
+              )
+
+          data = urllib.request.urlopen(source_url, timeout=120).read()
+          sha = hashlib.sha256(data).hexdigest()
+          md5 = hashlib.md5(data).hexdigest()
+
           text, n_sha = re.subn(
               r'(?m)^(\s*sha256:\s*)[0-9a-fA-F]{32,}\s*$',
               rf"\g<1>{sha}",
@@ -246,16 +254,15 @@ jobs:
           if n_sha != 1:
               raise SystemExit("Failed to update recipe sha256.")
 
-          if md5 != "":
-              text, _ = re.subn(
-                  r'(?m)^(\s*md5:\s*)[0-9a-fA-F]{32,}\s*$',
-                  rf"\g<1>{md5}",
-                  text,
-                  count=1,
-              )
+          text, _ = re.subn(
+              r'(?m)^(\s*md5:\s*)[0-9a-fA-F]{32,}\s*$',
+              rf"\g<1>{md5}",
+              text,
+              count=1,
+          )
 
           path.write_text(text, encoding="utf-8")
-          print(f"Updated {path} to version={version}, sha256={sha}")
+          print(f"Updated {path} to version={version}, url={source_url}, sha256={sha}")
           PY
 
       - name: Commit and push

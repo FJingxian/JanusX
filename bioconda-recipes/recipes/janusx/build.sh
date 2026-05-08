@@ -322,6 +322,10 @@ echo "[build.sh] project cargo config prepared"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
 export JANUSX_REQUIRE_OPENBLAS=1
+# v1.0.23 source build can fail to prebuild KMC on some Linux arches due to
+# hardcoded `-lz` linking without conda lib search flags. Disable that prebuild
+# in recipe build; runtime path can still lazy-build KMC when needed.
+export JANUSX_PREBUILD_KMC_BIND=0
 if [[ -n "${PREFIX:-}" ]]; then
   export OPENBLAS_LIB_DIR="${PREFIX}/lib"
   export OPENBLAS_INCLUDE_DIR="${PREFIX}/include"

@@ -146,8 +146,15 @@ jobs:
           from pathlib import Path
 
           version = os.environ["VERSION"]
+          source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
+          data = urllib.request.urlopen(source_url, timeout=120).read()
+          sha = hashlib.sha256(data).hexdigest()
+          md5 = hashlib.md5(data).hexdigest()
+
           path = Path("bioconda-fork/recipes/janusx/meta.yaml")
           template = Path("bioconda-recipes/recipes/janusx/meta.yaml")
+          build_path = Path("bioconda-fork/recipes/janusx/build.sh")
+          build_template = Path("bioconda-recipes/recipes/janusx/build.sh")
           if not path.exists():
               if template.exists():
                   path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +212,26 @@ jobs:
                   path.write_text(default_recipe, encoding="utf-8")
                   print(f"Recipe missing in fork and source template; created default: {path}")
 
+          if build_template.exists():
+              build_path.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(build_template, build_path)
+              try:
+                  build_path.chmod(0o755)
+              except Exception:
+                  pass
+              print(f"Synchronized build script from template: {build_path}")
+          elif not build_path.exists():
+              build_path.parent.mkdir(parents=True, exist_ok=True)
+              build_path.write_text(
+                  "#!/usr/bin/env bash\nset -euxo pipefail\nexport JANUSX_PREBUILD_KMC_BIND=0\npython -m pip install . --no-deps --no-build-isolation -vv\n",
+                  encoding="utf-8",
+              )
+              try:
+                  build_path.chmod(0o755)
+              except Exception:
+                  pass
+              print(f"Template missing; created fallback build script: {build_path}")
+
           text = path.read_text(encoding="utf-8")
 
           text, n_ver = re.subn(
@@ -241,12 +268,6 @@ jobs:
           if n_url != 1:
               raise SystemExit("Failed to update recipe source url.")
 
-          source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-
-          data = urllib.request.urlopen(source_url, timeout=120).read()
-          sha = hashlib.sha256(data).hexdigest()
-          md5 = hashlib.md5(data).hexdigest()
-
           text, n_sha = re.subn(
               r'(?m)^(\s*sha256:\s*)[0-9a-fA-F]{32,}\s*$',
               rf"\g<1>{sha}",
@@ -274,6 +295,9 @@ jobs:
         run: |
           cd bioconda-fork
           git add recipes/janusx/meta.yaml
+          if [[ -f recipes/janusx/build.sh ]]; then
+            git add recipes/janusx/build.sh
+          fi
           if git diff --cached --quiet; then
             echo "No changes to commit."
             echo "changed=false" >> "$GITHUB_OUTPUT"

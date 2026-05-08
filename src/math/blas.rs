@@ -498,7 +498,7 @@ unsafe extern "C" {
     jx_openblas_available,
     jx_openblas_link_openblas0
 ))]
-#[link(name = "openblas.0")]
+#[link(name = ":libopenblas.so.0")]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
     fn cblas_sgemm_openblas(

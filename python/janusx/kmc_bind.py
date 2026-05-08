@@ -401,6 +401,35 @@ def _run(cmd: list[str], *, cwd: Path | None = None, verbose: bool = False) -> N
         raise RuntimeError(msg)
 
 
+def _split_shell_flags(raw: str) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        return list(shlex.split(text, posix=(not _is_windows())))
+    except Exception:
+        return [text]
+
+
+def _collect_env_flags(*names: str) -> list[str]:
+    out: list[str] = []
+    for name in names:
+        out.extend(_split_shell_flags(os.environ.get(name, "")))
+    return out
+
+
+def _host_prefix_lib_flags() -> list[str]:
+    if _is_windows():
+        return []
+    prefix = str(os.environ.get("PREFIX", "")).strip()
+    if not prefix:
+        return []
+    lib_dir = Path(prefix) / "lib"
+    if not lib_dir.is_dir():
+        return []
+    return [f"-L{lib_dir}"]
+
+
 def _source_fingerprint(kmc_src_dir: Path, wrapper_cpp: Path, kmc_cpp: list[Path]) -> str:
     h = hashlib.sha1()
     files: list[Path] = list(kmc_cpp) + [wrapper_cpp, kmc_src_dir / "3rd_party" / "cloudflare" / "zlib.h"]
@@ -444,7 +473,14 @@ def _compile_objects(
         common = ["/nologo", "/O2", "/DNDEBUG", "/EHsc", "/std:c++14", "/MD", "/bigobj", "/DNOMINMAX"]
         inc_flags = [f"/I{d}" for d in include_dirs]
     else:
-        common = ["-O3", "-DNDEBUG", "-std=c++14", "-fPIC", "-Wall"]
+        common = [
+            "-O3",
+            "-DNDEBUG",
+            "-std=c++14",
+            "-fPIC",
+            "-Wall",
+            *_collect_env_flags("CPPFLAGS", "CFLAGS", "CXXFLAGS"),
+        ]
         inc_flags = [f"-I{d}" for d in include_dirs]
     for src in sources:
         if not src.is_file():
@@ -555,11 +591,17 @@ def build_kmc_bind_module(
         else:
             link_cmd.append("zlib.lib")
     else:
+        ldflags = _collect_env_flags("LDFLAGS")
+        extra_lib_dirs = _host_prefix_lib_flags()
+        for flag in extra_lib_dirs:
+            if flag not in ldflags:
+                ldflags.append(flag)
         link_cmd = [
             cxx,
             "-shared",
             "-o",
             str(out),
+            *ldflags,
             *(str(x) for x in (kmc_objs + wrapper_obj)),
             "-lpthread",
             "-lz",

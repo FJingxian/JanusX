@@ -46,6 +46,7 @@ requirements:
     - pip
     - maturin >=1.7,<2
     - numpy >=1.23
+    - zlib
     - openblas
   run:
     - python

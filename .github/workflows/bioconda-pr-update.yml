@@ -224,6 +224,14 @@ jobs:
               else:
                   raise SystemExit("Failed to inject compiler('cxx'): requirements.build block not found.")
 
+          if re.search(r"(?m)^\s*-\s*zlib\s*$", text) is None:
+              host_anchor = "  host:\n"
+              if host_anchor in text:
+                  text = text.replace(host_anchor, host_anchor + "    - zlib\n", 1)
+                  print("Injected missing zlib into requirements.host")
+              else:
+                  raise SystemExit("Failed to inject zlib: requirements.host block not found.")
+
           text, n_url = re.subn(
               r'(?m)^(\s*url:\s*).*$',
               r"\g<1>https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz",

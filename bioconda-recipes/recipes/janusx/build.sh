@@ -329,6 +329,17 @@ export JANUSX_PREBUILD_KMC_BIND=0
 if [[ -n "${PREFIX:-}" ]]; then
   export OPENBLAS_LIB_DIR="${PREFIX}/lib"
   export OPENBLAS_INCLUDE_DIR="${PREFIX}/include"
+  # Compatibility shim for upstream 1.0.23 source on Linux: some builds
+  # request `-lopenblas.0`, which resolves to `libopenblas.0.so`.
+  # conda-forge commonly ships `libopenblas.so.0` only, so create a local
+  # soname alias to keep both x86_64 and aarch64 builds linkable.
+  if [[ -d "${PREFIX}/lib" && ! -e "${PREFIX}/lib/libopenblas.0.so" ]]; then
+    if [[ -e "${PREFIX}/lib/libopenblas.so.0" ]]; then
+      ln -s "libopenblas.so.0" "${PREFIX}/lib/libopenblas.0.so"
+    elif [[ -e "${PREFIX}/lib/libopenblas.so" ]]; then
+      ln -s "libopenblas.so" "${PREFIX}/lib/libopenblas.0.so"
+    fi
+  fi
 fi
 python -m pip install . \
   --no-deps \

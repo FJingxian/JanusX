@@ -216,30 +216,16 @@ jobs:
           if n_ver != 1:
               raise SystemExit("Failed to update recipe version line.")
 
-          name = "janusx"
-          m_name = re.search(
-              r'(?m)^\s*\{%\s*set\s+name\s*=\s*"([^"]+)"\s*%\}\s*$',
+          text, n_url = re.subn(
+              r'(?m)^(\s*url:\s*).*$',
+              r"\g<1>https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz",
               text,
+              count=1,
           )
-          if m_name:
-              name = m_name.group(1)
-          m_url = re.search(r'(?m)^(\s*url:\s*)(\S+)\s*$', text)
-          if m_url:
-              url_raw = m_url.group(2).strip().strip("'\"")
-              source_url = (
-                  url_raw.replace("{{ version }}", version)
-                  .replace("{{version}}", version)
-                  .replace("{{ name }}", name)
-                  .replace("{{name}}", name)
-                  .replace("{{ name|lower }}", name.lower())
-                  .replace("{{name|lower}}", name.lower())
-              )
-          else:
-              source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-          if "{{" in source_url or "}}" in source_url:
-              raise SystemExit(
-                  f"Unable to resolve source URL from recipe template: {source_url}"
-              )
+          if n_url != 1:
+              raise SystemExit("Failed to update recipe source url.")
+
+          source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
 
           data = urllib.request.urlopen(source_url, timeout=120).read()
           sha = hashlib.sha256(data).hexdigest()

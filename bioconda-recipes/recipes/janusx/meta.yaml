@@ -7,8 +7,8 @@ package:
 
 source:
   url: https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz
-  sha256: 77313e5c045cf7c364f0a91100b43515ffaeb19c510629cc1878b1765fa91abe
-  md5: aa2f513c8790fe15e2e101f4b4213f89
+  sha256: e9bc111e1a5b5a634751d2a25f5330f54aec7176d2faef4cf30e99cce0af4f47
+  md5: 040b6c35509b05a762aee843e943fb6d
 
 build:
   number: 0

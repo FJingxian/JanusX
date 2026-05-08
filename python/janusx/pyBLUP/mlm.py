@@ -32,6 +32,7 @@ try:
         bed_packed_decode_rows_f32 as _bed_packed_decode_rows_f32,
         cross_grm_times_alpha_packed_f64 as _cross_grm_times_alpha_packed_f64,
         packed_malpha_f64 as _packed_malpha_f64,
+        packed_mtm_f64 as _packed_mtm_f64,
         grm_packed_f32 as _grm_packed_f32,
         grm_packed_f32_with_stats as _grm_packed_f32_with_stats,
         grm_packed_f64_with_stats as _grm_packed_f64_with_stats,
@@ -41,6 +42,7 @@ except Exception:
     _bed_packed_decode_rows_f32 = None
     _cross_grm_times_alpha_packed_f64 = None
     _packed_malpha_f64 = None
+    _packed_mtm_f64 = None
     _grm_packed_f32 = None
     _grm_packed_f32_with_stats = None
     _grm_packed_f64_with_stats = None
@@ -1599,9 +1601,29 @@ class BLUP:
                 "bed_packed_decode_stats_f64."
             )
         sample_idx_all = np.ascontiguousarray(self._packed_sample_indices, dtype=np.int64)
+        packed_exact_mtm_mode = _env_choice(
+            "JX_MLM_PACKED_EXACT_MTM_MODE",
+            "auto",
+            {"auto", "python", "rust", "rust_mtm"},
+        )
+        if packed_exact_mtm_mode == "rust":
+            packed_exact_mtm_mode = "rust_mtm"
+        use_rust_exact_mtm = bool(
+            (_packed_mtm_f64 is not None)
+            and (packed_exact_mtm_mode in {"auto", "rust_mtm"})
+        )
+        if packed_exact_mtm_mode == "rust_mtm" and _packed_mtm_f64 is None:
+            raise RuntimeError(
+                "JX_MLM_PACKED_EXACT_MTM_MODE=rust_mtm requires Rust extension function "
+                "packed_mtm_f64."
+            )
         if self._debug_stage:
             print(
                 f"[MLM-DEBUG] packed_exact_decode mode={('rust_decode' if use_rust_exact_decode else 'python')}",
+                flush=True,
+            )
+            print(
+                f"[MLM-DEBUG] packed_exact_mtm mode={('rust_mtm' if use_rust_exact_mtm else 'python_chunk')}",
                 flush=True,
             )
 
@@ -1640,11 +1662,44 @@ class BLUP:
             resident_bytes=int(self._packed_ctx["packed"].nbytes),
             force_fast=self._force_fast,
         )
-        gram = np.zeros(
-            (self.n, self.n),
-            dtype=np.float64,
-            order=("F" if gram_mode == "lowmem" else "C"),
-        )
+        used_rust_exact_mtm = False
+        if use_rust_exact_mtm:
+            try:
+                gram_raw = _packed_mtm_f64(
+                    self._packed_ctx["packed"],
+                    int(self._packed_ctx["n_samples"]),
+                    self._packed_ctx["row_flip"],
+                    self._packed_ctx["maf"],
+                    sample_indices=sample_idx_all,
+                    block_rows=max(1, row_step),
+                    threads=int(self._rust_threads),
+                    progress_callback=None,
+                    progress_every=0,
+                )
+                gram_np = np.asarray(gram_raw, dtype=np.float64)
+                if gram_np.ndim != 2 or gram_np.shape != (int(self.n), int(self.n)):
+                    raise RuntimeError(
+                        f"Rust packed_mtm shape mismatch: got {gram_np.shape}, expected ({self.n}, {self.n})"
+                    )
+                gram = (
+                    np.asfortranarray(gram_np)
+                    if gram_mode == "lowmem"
+                    else np.asarray(gram_np, dtype=np.float64)
+                )
+                used_rust_exact_mtm = True
+            except Exception:
+                used_rust_exact_mtm = False
+                gram = np.zeros(
+                    (self.n, self.n),
+                    dtype=np.float64,
+                    order=("F" if gram_mode == "lowmem" else "C"),
+                )
+        else:
+            gram = np.zeros(
+                (self.n, self.n),
+                dtype=np.float64,
+                order=("F" if gram_mode == "lowmem" else "C"),
+            )
         if self._debug_stage:
             print(
                 f"[MLM-DEBUG] packed_zzt_mode mode={gram_mode} "
@@ -1653,21 +1708,24 @@ class BLUP:
                 f"mem_limit_gib={((mem_limit / 1024**3) if mem_limit is not None else float('nan')):.3f}",
                 flush=True,
             )
+            if used_rust_exact_mtm:
+                print("[MLM-DEBUG] packed_zzt_source=rust_mtm", flush=True)
 
-        # Build ZZT = M^T M directly in row chunks without materializing dense M.
-        for st in range(0, m, row_step):
-            ed = min(st + row_step, m)
-            blk = _decode_row_block_f64(st, ed)
-            blk_t = (
-                np.asfortranarray(blk.T)
-                if gram_mode == "lowmem"
-                else np.asarray(blk.T, dtype=np.float64)
-            )
-            gram = _gram_rankk_update(
-                gram,
-                blk_t,
-                lowmem=(gram_mode == "lowmem"),
-            )
+        if not used_rust_exact_mtm:
+            # Build ZZT = M^T M directly in row chunks without materializing dense M.
+            for st in range(0, m, row_step):
+                ed = min(st + row_step, m)
+                blk = _decode_row_block_f64(st, ed)
+                blk_t = (
+                    np.asfortranarray(blk.T)
+                    if gram_mode == "lowmem"
+                    else np.asarray(blk.T, dtype=np.float64)
+                )
+                gram = _gram_rankk_update(
+                    gram,
+                    blk_t,
+                    lowmem=(gram_mode == "lowmem"),
+                )
 
         self._implicit_kinship_fast = False
         self._fast_v = None

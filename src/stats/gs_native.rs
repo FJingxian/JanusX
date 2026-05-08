@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::bedmath::{
-    adaptive_grm_block_rows, decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
-    decode_subset_row_from_full_scratch, decode_subset_row_from_full_scratch_f64,
-    is_identity_indices, packed_byte_lut,
+    adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut,
+    decode_row_centered_full_lut_f64, decode_subset_row_from_full_scratch,
+    decode_subset_row_from_full_scratch_f64, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
     cblas_dgemm_dispatch, cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
@@ -141,6 +141,77 @@ fn decode_grm_block(
                         }
                     },
                 );
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(&mut decode_run);
+    } else {
+        decode_run();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_raw_block_f64(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    code4_lut: &[[u8; 4]; 256],
+    row_start: usize,
+    row_end: usize,
+    n: usize,
+    out_block: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if out_block.len() < cur_rows.saturating_mul(n) {
+        return Err("decode_raw_block_f64: out_block too small".to_string());
+    }
+    let block = &mut out_block[..cur_rows * n];
+
+    let mut decode_run = || {
+        if full_sample_fast {
+            block.par_chunks_mut(n).enumerate().for_each(|(off, out_row)| {
+                let idx = row_start + off;
+                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                let flip = row_flip_vec[idx];
+                let mean_g = 2.0_f64 * row_maf_vec[idx] as f64;
+                let value_lut: [f64; 4] = if flip {
+                    [2.0_f64, -9.0_f64, 1.0_f64, 0.0_f64]
+                } else {
+                    [0.0_f64, -9.0_f64, 1.0_f64, 2.0_f64]
+                };
+                decode_row_centered_full_lut_f64(row, n_samples, code4_lut, &value_lut, out_row);
+                for v in out_row.iter_mut() {
+                    if *v < 0.0_f64 {
+                        *v = mean_g;
+                    }
+                }
+            });
+        } else {
+            block.par_chunks_mut(n).enumerate().for_each(|(off, out_row)| {
+                let idx = row_start + off;
+                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                let flip = row_flip_vec[idx];
+                let mean_g = 2.0_f64 * row_maf_vec[idx] as f64;
+                for (j, &sid) in sample_idx.iter().enumerate() {
+                    let b = row[sid >> 2];
+                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                    let mut gv = decode_plink_bed_hardcall(code).unwrap_or(mean_g);
+                    if flip && code != 0b01 {
+                        gv = 2.0_f64 - gv;
+                    }
+                    out_row[j] = gv;
+                }
+            });
         }
     };
 
@@ -2523,6 +2594,234 @@ pub fn grm_packed_f64_with_stats<'py>(
         progress_callback,
         progress_every,
     )
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices=None,
+    block_rows=2048,
+    threads=0,
+    progress_callback=None,
+    progress_every=0
+))]
+pub fn packed_mtm_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    block_rows: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
+    } else {
+        (0..n_samples).collect()
+    };
+    let n = sample_idx.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let row_step = adaptive_grm_block_rows(
+        block_rows.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        threads,
+    );
+    let notify_step = if progress_every == 0 {
+        row_step
+    } else {
+        progress_every.max(1)
+    };
+    let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(true);
+    let stage_timing = env_truthy("JX_MLM_PACKED_MTM_STAGE_TIMING");
+
+    let gram_vec = py
+        .detach(move || -> Result<Vec<f64>, String> {
+            let total_t0 = Instant::now();
+            let mut decode_secs = 0.0_f64;
+            let mut gemm_secs = 0.0_f64;
+            let mut gram = vec![0.0_f64; n * n];
+            let byte_lut = packed_byte_lut();
+            let mut block = vec![0.0_f64; row_step * n];
+            let mut last_notified = 0usize;
+
+            let mut cur_start = 0usize;
+            while cur_start < m {
+                check_ctrlc()?;
+                let cur_end = (cur_start + row_step).min(m);
+                let cur_rows = cur_end.saturating_sub(cur_start);
+                if cur_rows == 0 {
+                    break;
+                }
+
+                let decode_t0 = Instant::now();
+                decode_raw_block_f64(
+                    packed_flat.as_ref(),
+                    bytes_per_snp,
+                    n_samples,
+                    row_flip_vec.as_ref(),
+                    row_maf_vec.as_ref(),
+                    &sample_idx,
+                    full_sample_fast,
+                    &byte_lut.code4,
+                    cur_start,
+                    cur_end,
+                    n,
+                    &mut block,
+                    pool.as_ref(),
+                )?;
+                decode_secs += decode_t0.elapsed().as_secs_f64();
+
+                let gemm_t0 = Instant::now();
+                grm_rankk_update_f64(
+                    &mut gram,
+                    &block[..cur_rows * n],
+                    cur_rows,
+                    n,
+                    cblas_copy_rhs,
+                    cblas_beta_zero_accum,
+                )?;
+                gemm_secs += gemm_t0.elapsed().as_secs_f64();
+
+                if (cur_end >= last_notified.saturating_add(notify_step)) || (cur_end == m) {
+                    last_notified = cur_end;
+                    if let Some(cb) = progress_callback.as_ref() {
+                        Python::attach(|py2| -> PyResult<()> {
+                            py2.check_signals()?;
+                            cb.call1(py2, (cur_end, m))?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        check_ctrlc()?;
+                    }
+                }
+
+                cur_start = cur_end;
+            }
+
+            for i in 0..n {
+                for j in 0..i {
+                    let idx_ij = i * n + j;
+                    let idx_ji = j * n + i;
+                    let v = 0.5_f64 * (gram[idx_ij] + gram[idx_ji]);
+                    gram[idx_ij] = v;
+                    gram[idx_ji] = v;
+                }
+            }
+
+            if stage_timing {
+                let total_secs = total_t0.elapsed().as_secs_f64();
+                let other_secs = (total_secs - decode_secs - gemm_secs).max(0.0_f64);
+                let to_pct = |x: f64| -> f64 {
+                    if total_secs > 0.0 {
+                        x * 100.0 / total_secs
+                    } else {
+                        0.0
+                    }
+                };
+                eprintln!(
+                    "Packed MTM stage timing: decode={:.3}s ({:.1}%), gemm={:.3}s ({:.1}%), \
+other={:.3}s ({:.1}%), total={:.3}s, row_step={}, n_samples={}, full_sample={}, threads={}",
+                    decode_secs,
+                    to_pct(decode_secs),
+                    gemm_secs,
+                    to_pct(gemm_secs),
+                    other_secs,
+                    to_pct(other_secs),
+                    total_secs,
+                    row_step,
+                    n,
+                    if full_sample_fast { "yes" } else { "no" },
+                    if threads > 0 {
+                        threads
+                    } else {
+                        rayon::current_num_threads()
+                    },
+                );
+            }
+            Ok(gram)
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let gram_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), gram_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok(gram_arr)
 }
 
 #[pyfunction]

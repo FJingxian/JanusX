@@ -13,6 +13,26 @@ if [[ "${MODE}" == "smoke" ]]; then
   jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o test
   echo "============================================"
 
+  echo "SMOKE 1b. VCF cache split regression (-snps-only vs default)"
+  VCF_SRC="example/mouse_hs1940.vcf.gz"
+  VCF_PHENO="example/mouse_hs1940.pheno"
+  VCF_CACHE_BASE="example/~mouse_hs1940"
+  LOG_SNP0="/tmp/jx_gwas_vcf_snp0.log"
+  LOG_SNP1="/tmp/jx_gwas_vcf_snp1.log"
+  rm -f "${VCF_CACHE_BASE}.snp0.bed" "${VCF_CACHE_BASE}.snp0.bim" "${VCF_CACHE_BASE}.snp0.fam" \
+        "${VCF_CACHE_BASE}.snp1.bed" "${VCF_CACHE_BASE}.snp1.bim" "${VCF_CACHE_BASE}.snp1.fam"
+  jx gwas -vcf "${VCF_SRC}" -p "${VCF_PHENO}" -lm -n 0 -t "${THREADS}" -o test >"${LOG_SNP0}" 2>&1
+  jx gwas -vcf "${VCF_SRC}" -p "${VCF_PHENO}" -lm -n 0 -snps-only -t "${THREADS}" -o test >"${LOG_SNP1}" 2>&1
+  grep -Eq "Cache prefix: .*\\.snp0" "${LOG_SNP0}" || { echo "ERROR: default VCF GWAS did not use snp0 cache prefix."; cat "${LOG_SNP0}"; exit 1; }
+  grep -Eq "Cache prefix: .*\\.snp1" "${LOG_SNP1}" || { echo "ERROR: -snps-only VCF GWAS did not use snp1 cache prefix."; cat "${LOG_SNP1}"; exit 1; }
+  [[ -f "${VCF_CACHE_BASE}.snp0.bed" && -f "${VCF_CACHE_BASE}.snp0.bim" && -f "${VCF_CACHE_BASE}.snp0.fam" ]] \
+    || { echo "ERROR: missing VCF cache files for snp0 mode."; ls -l "${VCF_CACHE_BASE}".snp* 2>/dev/null || true; exit 1; }
+  [[ -f "${VCF_CACHE_BASE}.snp1.bed" && -f "${VCF_CACHE_BASE}.snp1.bim" && -f "${VCF_CACHE_BASE}.snp1.fam" ]] \
+    || { echo "ERROR: missing VCF cache files for snp1 mode."; ls -l "${VCF_CACHE_BASE}".snp* 2>/dev/null || true; exit 1; }
+  rm -f "${VCF_CACHE_BASE}.snp0.bed" "${VCF_CACHE_BASE}.snp0.bim" "${VCF_CACHE_BASE}.snp0.fam" \
+        "${VCF_CACHE_BASE}.snp1.bed" "${VCF_CACHE_BASE}.snp1.bim" "${VCF_CACHE_BASE}.snp1.fam"
+  echo "============================================"
+
   echo "SMOKE 2. GWAS runtime check (LM/LMM/FastLMM/FarmCPU)"
   jx grm -bfile test/mouse_hs1940 -o test
   jx pca -bfile test/mouse_hs1940 -o test

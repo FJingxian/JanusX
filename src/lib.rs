@@ -112,7 +112,7 @@ use glm::{
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use gs_native::{
     farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32,
-    grm_packed_f32_with_stats, grm_packed_f64_with_stats, rrblup_pcg_bed,
+    grm_packed_f32_with_stats, grm_packed_f64_with_stats, packed_mtm_f64, rrblup_pcg_bed,
 };
 use gwasio::load_gwas_triplet_fast;
 use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune_kernel_stats};
@@ -231,6 +231,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;

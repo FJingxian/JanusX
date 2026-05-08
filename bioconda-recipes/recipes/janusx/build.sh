@@ -329,15 +329,36 @@ export JANUSX_PREBUILD_KMC_BIND=0
 if [[ -n "${PREFIX:-}" ]]; then
   export OPENBLAS_LIB_DIR="${PREFIX}/lib"
   export OPENBLAS_INCLUDE_DIR="${PREFIX}/include"
+  libdir="${PREFIX}/lib"
   # Compatibility shim for upstream 1.0.23 source on Linux: some builds
   # request `-lopenblas.0`, which resolves to `libopenblas.0.so`.
   # conda-forge commonly ships `libopenblas.so.0` only, so create a local
   # soname alias to keep both x86_64 and aarch64 builds linkable.
-  if [[ -d "${PREFIX}/lib" && ! -e "${PREFIX}/lib/libopenblas.0.so" ]]; then
-    if [[ -e "${PREFIX}/lib/libopenblas.so.0" ]]; then
-      ln -s "libopenblas.so.0" "${PREFIX}/lib/libopenblas.0.so"
-    elif [[ -e "${PREFIX}/lib/libopenblas.so" ]]; then
-      ln -s "libopenblas.so" "${PREFIX}/lib/libopenblas.0.so"
+  if [[ -d "${libdir}" && ! -e "${libdir}/libopenblas.0.so" ]]; then
+    if [[ -e "${libdir}/libopenblas.so.0" ]]; then
+      ln -s "libopenblas.so.0" "${libdir}/libopenblas.0.so"
+    elif [[ -e "${libdir}/libopenblas.so" ]]; then
+      ln -s "libopenblas.so" "${libdir}/libopenblas.0.so"
+    fi
+  fi
+  # Runtime compatibility shim: some OpenBLAS builds expose only
+  # libopenblasp-r*.so or libopenblas.so; older JanusX binaries may require
+  # libopenblas.so.0 at import time.
+  if [[ -d "${libdir}" && ! -e "${libdir}/libopenblas.so.0" ]]; then
+    target_basename=""
+    for cand in \
+      "${libdir}/libopenblasp-r"*.so \
+      "${libdir}/libopenblas.so" \
+      "${libdir}/libopenblas.so."* \
+      "${libdir}/libopenblas"*.so
+    do
+      if [[ -e "${cand}" && "$(basename "${cand}")" != "libopenblas.so.0" ]]; then
+        target_basename="$(basename "${cand}")"
+        break
+      fi
+    done
+    if [[ -n "${target_basename}" ]]; then
+      ln -s "${target_basename}" "${libdir}/libopenblas.so.0"
     fi
   fi
 fi

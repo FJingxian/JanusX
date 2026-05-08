@@ -51,6 +51,7 @@ requirements:
   run:
     - python
     - numpy
+    - libopenblas
     - scipy
     - pandas >=1.5
     - matplotlib-base

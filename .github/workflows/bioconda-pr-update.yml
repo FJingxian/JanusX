@@ -132,13 +132,21 @@ jobs:
           cd bioconda-fork
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin --depth=1 || true
-          if git show-ref --verify --quiet "refs/remotes/origin/${BIOCONDA_BRANCH}"; then
-            git checkout -B "${BIOCONDA_BRANCH}" "origin/${BIOCONDA_BRANCH}"
+          git remote add upstream https://github.com/bioconda/bioconda-recipes.git
+          git fetch upstream --depth=1 || true
+          if git show-ref --verify --quiet refs/remotes/upstream/master; then
+            BASE_REF="upstream/master"
+          elif git show-ref --verify --quiet refs/remotes/upstream/main; then
+            BASE_REF="upstream/main"
           elif git show-ref --verify --quiet refs/remotes/origin/master; then
-            git checkout -B "${BIOCONDA_BRANCH}" origin/master
+            BASE_REF="origin/master"
           elif git show-ref --verify --quiet refs/remotes/origin/main; then
-            git checkout -B "${BIOCONDA_BRANCH}" origin/main
+            BASE_REF="origin/main"
+          else
+            BASE_REF=""
+          fi
+          if [[ -n "$BASE_REF" ]]; then
+            git checkout -B "${BIOCONDA_BRANCH}" "$BASE_REF"
           else
             git checkout -B "${BIOCONDA_BRANCH}"
           fi

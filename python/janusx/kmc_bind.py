@@ -6,6 +6,7 @@ import importlib.util
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -171,14 +172,32 @@ def _is_msvc_like_driver(cxx: str) -> bool:
 
 
 def _pick_cxx() -> str:
-    pref = str(os.environ.get("CXX", "")).strip()
-    if pref:
-        exe = shutil.which(pref)
+    def _resolve_exe(raw: str) -> str | None:
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        # Conda-build and some CI wrappers may export CXX as a command string
+        # with extra flags; only the executable token is resolvable.
+        try:
+            parts = shlex.split(s, posix=(not _is_windows()))
+        except Exception:
+            parts = [s]
+        if len(parts) == 0:
+            return None
+        cand = parts[0]
+        exe = shutil.which(cand)
         if exe:
             return exe
-        p = Path(pref)
+        p = Path(cand)
         if p.is_file():
             return str(p)
+        return None
+
+    pref = str(os.environ.get("CXX", "")).strip()
+    if pref:
+        resolved = _resolve_exe(pref)
+        if resolved:
+            return resolved
         # Be robust to stale/cross-toolchain CXX values from user shells or CI.
         # If requested compiler is unavailable, warn and fall back to detected defaults.
         print(
@@ -187,16 +206,54 @@ def _pick_cxx() -> str:
             flush=True,
         )
 
+    candidates: list[str] = []
     if _is_windows():
-        candidates = ["cl", "clang-cl", "clang++", "g++", "c++"]
+        candidates.extend(["cl", "clang-cl", "clang++", "g++", "c++"])
     else:
-        candidates = ["clang++", "g++", "c++"]
+        candidates.extend(["clang++", "g++", "c++"])
+
+    # Conda-build often provides target-prefixed compiler driver names.
+    for env_name in ("CHOST", "HOST", "BUILD", "TARGET"):
+        triple = str(os.environ.get(env_name, "")).strip()
+        if not triple:
+            continue
+        candidates.extend(
+            [
+                f"{triple}-c++",
+                f"{triple}-g++",
+                f"{triple}-clang++",
+            ]
+        )
+
+    # Some toolchains export CC/CXX_FOR_BUILD even when CXX is missing.
+    for env_name in ("CXX_FOR_BUILD", "CC"):
+        raw = str(os.environ.get(env_name, "")).strip()
+        if not raw:
+            continue
+        try:
+            parts = shlex.split(raw, posix=(not _is_windows()))
+        except Exception:
+            parts = [raw]
+        if len(parts) == 0:
+            continue
+        base = parts[0]
+        # Try direct, then common C->C++ substitutions.
+        candidates.append(base)
+        candidates.append(base.replace("-cc", "-c++"))
+        candidates.append(base.replace("gcc", "g++"))
+        candidates.append(base.replace("clang", "clang++"))
+
+    seen: set[str] = set()
     for cand in candidates:
         if not cand:
             continue
-        exe = shutil.which(cand)
-        if exe:
-            return exe
+        key = cand.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved = _resolve_exe(cand)
+        if resolved:
+            return resolved
     raise RuntimeError(
         "No C++ compiler found. Please install a supported compiler "
         "(Windows: cl/clang-cl; Linux/macOS: clang++/g++) and ensure it is in PATH."

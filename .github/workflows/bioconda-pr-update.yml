@@ -216,6 +216,14 @@ jobs:
           if n_ver != 1:
               raise SystemExit("Failed to update recipe version line.")
 
+          if "{{ compiler('cxx') }}" not in text:
+              anchor = "requirements:\n  build:\n"
+              if anchor in text:
+                  text = text.replace(anchor, anchor + "    - {{ compiler('cxx') }}\n", 1)
+                  print("Injected missing compiler('cxx') into requirements.build")
+              else:
+                  raise SystemExit("Failed to inject compiler('cxx'): requirements.build block not found.")
+
           text, n_url = re.subn(
               r'(?m)^(\s*url:\s*).*$',
               r"\g<1>https://files.pythonhosted.org/packages/source/j/janusx/janusx-{{ version }}.tar.gz",

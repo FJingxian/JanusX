@@ -1281,6 +1281,47 @@ def _compute_ld_from_genotypes(geno_sig: np.ndarray) -> np.ndarray:
     return r2
 
 
+def _collect_genotypes_for_bimranges(
+    genofile: str,
+    bimrange_tuples: list[tuple[str, int, int]],
+) -> tuple[np.ndarray, list[tuple[str, int]]]:
+    if len(bimrange_tuples) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    rows: list[np.ndarray] = []
+    keys: list[tuple[str, int]] = []
+
+    for bchrom, bstart, bend in bimrange_tuples:
+        for chunk, sites in load_genotype_chunks(
+            genofile,
+            chunk_size=50_000,
+            maf=0.0,
+            missing_rate=1.0,
+            impute=True,
+            bim_range=(str(bchrom), int(bstart), int(bend)),
+        ):
+            chunk_np = np.asarray(chunk, dtype=np.float32)
+            n_rows = min(int(chunk_np.shape[0]), len(sites))
+            if n_rows <= 0:
+                continue
+            for i in range(n_rows):
+                s = sites[i]
+                key = (_normalize_chr(s.chrom), int(s.pos))
+                rows.append(chunk_np[i, :].copy())
+                keys.append(key)
+
+    if len(rows) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    uniq: dict[tuple[str, int], np.ndarray] = {}
+    for k, r in zip(keys, rows):
+        if k not in uniq:
+            uniq[k] = r
+    sorted_keys = sorted(uniq.keys(), key=lambda x: (x[0], x[1]))
+    mat = np.stack([uniq[k] for k in sorted_keys], axis=0).astype(np.float32)
+    return mat, sorted_keys
+
+
 def _lead_vs_all_r2(geno_block: np.ndarray) -> np.ndarray:
     """
     Compute r^2 between the lead SNP (row 0) and all SNP rows.
@@ -3793,6 +3834,95 @@ def _run_one_postgwas_task(file: str, args, logger: logging.Logger) -> str:
     return str(file)
 
 
+def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
+    """
+    Draw LD block using genotype input only (no GWAS table).
+    """
+    if args.ldblock_ratio is None:
+        logger.warning("Warning: LD-only mode requires --ldblock/--ldblock-all.")
+        return
+    if args.bimrange_tuples is None or len(args.bimrange_tuples) == 0:
+        logger.warning("Warning: LD-only mode requires --bimrange; skipped.")
+        return
+
+    if args.ldblock_mode == "threshold":
+        logger.warning(
+            "Warning: --ldblock (threshold mode) requires GWAS p-values; "
+            "without --gwasfile it falls back to all SNPs in --bimrange."
+        )
+
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+    mpl.rcParams["font.size"] = 6
+    plt.rcParams["svg.fonttype"] = "none"
+    plt.rcParams["axes.unicode_minus"] = False
+    _prepare_cjk_plotting()
+
+    width_in = 8.0
+    ld_overlay_text: Optional[str] = None
+
+    if args.genofile is None:
+        logger.warning(
+            "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; "
+            "drawing zero-correlation LD block."
+        )
+        ld_mat = np.zeros((2, 2), dtype=np.float32)
+        ld_overlay_text = "No genotype"
+        n_sites = 0
+    else:
+        geno_sig, _ = _collect_genotypes_for_bimranges(
+            str(args.genofile),
+            list(args.bimrange_tuples),
+        )
+        n_sites = int(geno_sig.shape[0])
+        if n_sites < 2:
+            logger.warning(
+                "Warning: Fewer than 2 SNPs were found in selected --bimrange; "
+                "drawing empty LD block."
+            )
+            ld_mat = np.zeros((max(2, n_sites), max(2, n_sites)), dtype=np.float32)
+            ld_overlay_text = "Not enough SNPs"
+        else:
+            ld_mat = _compute_ld_from_genotypes(geno_sig)
+            logger.info(f"LD-only block built from {n_sites} SNPs.")
+
+    two_color_style = _resolve_two_color_style(args.palette_spec)
+    ld_cmap = "Greys"
+    if two_color_style is not None:
+        ld_cmap = two_color_style["ld_cmap"]
+
+    ld_h_in = width_in / float(args.ldblock_ratio)
+    ld_h_in = max(
+        float(ld_h_in),
+        float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))),
+    )
+    fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
+    ax_ld = fig_ld.add_subplot(111)
+    LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
+    n_ld = max(2, int(ld_mat.shape[0]))
+    ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
+    ax_ld.margins(x=0.0)
+    if ld_overlay_text:
+        ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
+
+    fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
+    if args.ldblock_xspan is not None:
+        cx0, cy0, cw, ch = ax_ld.get_position().bounds
+        fx0, fx1 = args.ldblock_xspan
+        new_x0 = float(cx0) + float(cw) * float(fx0)
+        new_w = float(cw) * float(fx1 - fx0)
+        ax_ld.set_position([new_x0, cy0, new_w, ch])
+        ax_ld.set_anchor("N")
+
+    ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
+    fig_ld.savefig(ld_path, transparent=True)
+    plt.close(fig_ld)
+    log_success(
+        logger,
+        f"LD block plot saved to:\n  {format_path_for_display(ld_path)}\n",
+    )
+
+
 def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     files = [str(f) for f in args.gwasfile]
     if len(files) == 0:
@@ -3973,16 +4103,84 @@ def main():
         epilog=minimal_help_epilog([
             "jx postgwas -gwasfile result.lmm.tsv -manh -qq",
             "jx postgwas -gwasfile result.lmm.tsv -a genes.bed -ab 50",
+            "jx postgwas -bfile test/geno -bimrange 1:1-2 -ldblock-all",
         ]),
     )
 
     # ------------------------------------------------------------------
-    # Required arguments
+    # Input arguments
     # ------------------------------------------------------------------
-    required_group = parser.add_argument_group("Required Arguments")
-    required_group.add_argument(
-        "-gwasfile", "--gwasfile", nargs="+", type=str, required=True,
-        help="One or more GWAS result files (tab-delimited).",
+    input_group = parser.add_argument_group("Input Arguments")
+    input_group.add_argument(
+        "-gwasfile", "--gwasfile", nargs="+", type=str, required=False, default=None,
+        help=(
+            "One or more GWAS result files (tab-delimited). "
+            "Optional when running LD block only with genotype input."
+        ),
+    )
+    geno_group = input_group.add_mutually_exclusive_group(required=False)
+    geno_group.add_argument(
+        "-bfile", "--bfile", type=str, default=None,
+        help="Genotype PLINK prefix (for LD block/LD clump).",
+    )
+    geno_group.add_argument(
+        "-vcf", "--vcf", type=str, default=None,
+        help="Genotype VCF/VCF.GZ file (for LD block/LD clump).",
+    )
+    geno_group.add_argument(
+        "-hmp", "--hmp", type=str, default=None,
+        help="Genotype HMP/HMP.GZ file (for LD block/LD clump).",
+    )
+    geno_group.add_argument(
+        "-file", "--file", dest="geno", type=str, default=None,
+        help=(
+            "Genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
+            "Requires sibling prefix.id. For LD/LDclump, also requires real prefix.site or prefix.bim."
+        ),
+    )
+    input_group.add_argument(
+        "-a", "--anno", type=str, default=None,
+        help="Annotation file: .gff/.gff3 or .bed.",
+    )
+
+    # ------------------------------------------------------------------
+    # Plot arguments
+    # ------------------------------------------------------------------
+    plot_group = parser.add_argument_group("Plot Arguments")
+    plot_group.add_argument(
+        "-manh", "--manh", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Enable Manhattan plotting with aspect ratio (width/height). "
+            "Examples: --manh (default 2), --manh 2, --manh 3/2."
+        ),
+    )
+    ldblock_group = plot_group.add_mutually_exclusive_group(required=False)
+    ldblock_group.add_argument(
+        "-ldblock", "--ldblock", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
+            "using only threshold-passing SNPs. Requires --bimrange. "
+            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
+            "(then ratio defaults to 2). "
+            "If only ratio is given, x-span defaults to 0:1."
+        ),
+    )
+    ldblock_group.add_argument(
+        "-ldblock-all", "--ldblock-all", dest="ldblock_all", type=str, nargs="?", const="2", default=None,
+        help=(
+            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
+            "using all SNPs in selected bimrange. Requires --bimrange. "
+            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
+            "(then ratio defaults to 2). "
+            "If only ratio is given, x-span defaults to 0:1."
+        ),
+    )
+    plot_group.add_argument(
+        "-qq", "--qq", type=str, nargs="?", const="on", default=None,
+        help=(
+            "Enable QQ plotting in auto mode. "
+            "QQ width/height ratio is fixed at 5:4; user-provided ratio is ignored."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -4023,7 +4221,7 @@ def main():
             "Enable LD clumping for annotation output using threshold-passing SNPs only. "
             "Format: --LDclump <window> <r2>, e.g. --LDclump 500kb 0.8. "
             "Window supports kb/mb/bp (no unit defaults to kb). "
-            "Requires genotype input via --bfile/--vcf/--file."
+            "Requires genotype input via --bfile/--vcf/--hmp/--file."
         ),
     )
     optional_group.add_argument(
@@ -4037,34 +4235,6 @@ def main():
         ),
     )
     optional_group.add_argument(
-        "-manh", "--manh", type=str, nargs="?", const="2", default=None,
-        help=(
-            "Enable Manhattan plotting with aspect ratio (width/height). "
-            "Examples: --manh (default 2), --manh 2, --manh 3/2."
-        ),
-    )
-    ldblock_group = optional_group.add_mutually_exclusive_group(required=False)
-    ldblock_group.add_argument(
-        "-ldblock", "--ldblock", type=str, nargs="?", const="2", default=None,
-        help=(
-            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
-            "using only threshold-passing SNPs. Requires --bimrange. "
-            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
-            "(then ratio defaults to 2). "
-            "If only ratio is given, x-span defaults to 0:1."
-        ),
-    )
-    ldblock_group.add_argument(
-        "-ldblock-all", "--ldblock-all", dest="ldblock_all", type=str, nargs="?", const="2", default=None,
-        help=(
-            "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
-            "using all SNPs in selected bimrange. Requires --bimrange. "
-            "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
-            "(then ratio defaults to 2). "
-            "If only ratio is given, x-span defaults to 0:1."
-        ),
-    )
-    optional_group.add_argument(
         "-ylim", "--ylim", type=str, default=None,
         help=(
             "Y range for Manhattan as <max>, <min:max>, <min:>, or <:max> "
@@ -4073,30 +4243,6 @@ def main():
             "Points outside this range are filtered before Manhattan scatter "
             "to speed plotting. QQ keeps all threshold-passing points and "
             "can down-sample sub-threshold points for speed."
-        ),
-    )
-    geno_group = optional_group.add_mutually_exclusive_group(required=False)
-    geno_group.add_argument(
-        "-bfile", "--bfile", type=str, default=None,
-        help="Optional genotype PLINK prefix for --ldblock/--ldblock-all.",
-    )
-    geno_group.add_argument(
-        "-vcf", "--vcf", type=str, default=None,
-        help="Optional genotype VCF/VCF.GZ file for --ldblock/--ldblock-all.",
-    )
-    geno_group.add_argument(
-        "-file", "--file", dest="geno", type=str, default=None,
-        help=(
-            "Optional genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix for "
-            "--ldblock/--ldblock-all. Requires sibling prefix.id. "
-            "For LD/LDclump, also requires real prefix.site or prefix.bim."
-        ),
-    )
-    optional_group.add_argument(
-        "-qq", "--qq", type=str, nargs="?", const="on", default=None,
-        help=(
-            "Enable QQ plotting in auto mode. "
-            "QQ width/height ratio is fixed at 5:4; user-provided ratio is ignored."
         ),
     )
     optional_group.add_argument(
@@ -4129,10 +4275,6 @@ def main():
         help="Output figure format: pdf, png, svg, tif (default: %(default)s).",
     )
     optional_group.add_argument(
-        "-a", "--anno", type=str, default=None,
-        help="Annotation file (.gff or .bed) for SNP annotation (default: %(default)s).",
-    )
-    optional_group.add_argument(
         "-ab", "--annobroaden", type=float, default=None,
         help="Broaden the annotation window around SNPs (Kb) (default: %(default)s).",
     )
@@ -4161,6 +4303,11 @@ def main():
     # `--highlight` was removed from CLI; keep a disabled attribute for
     # internal legacy branches that still check it.
     args.highlight = None
+    args.gwasfile = (
+        [str(x) for x in list(args.gwasfile)]
+        if args.gwasfile is not None
+        else []
+    )
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     args.prefix = "JanusX" if args.prefix is None else args.prefix
@@ -4288,7 +4435,7 @@ def main():
         args.ldblock_xspan = None
         args.ldblock_mode = None
 
-    args.genofile = args.bfile or args.vcf or args.geno
+    args.genofile = args.bfile or args.vcf or args.hmp or args.geno
     if args.ldblock_ratio is not None and args.genofile is None:
         logger.warning(
             "Warning: --ldblock/--ldblock-all enabled but no genotype file provided; zero-correlation LD block will be drawn."
@@ -4338,6 +4485,40 @@ def main():
             "Single GWAS input detected; forcing --thread to 1."
         )
         args.thread = 1
+
+    args.ldblock_only_mode = bool(
+        (not args.merge_mode)
+        and (len(args.gwasfile) == 0)
+        and (args.ldblock_ratio is not None)
+    )
+    if (not args.merge_mode) and len(args.gwasfile) == 0:
+        if args.manh_ratio is not None:
+            logger.warning(
+                "Warning: --manh requires GWAS result file(s); it is ignored in LD-only mode."
+            )
+            args.manh_ratio = None
+        if args.qq_ratio is not None:
+            logger.warning(
+                "Warning: --qq requires GWAS result file(s); it is ignored in LD-only mode."
+            )
+            args.qq_ratio = None
+        if args.anno is not None:
+            logger.warning(
+                "Warning: --anno requires GWAS result file(s); it is ignored in LD-only mode."
+            )
+            args.anno = None
+        if args.ldclump_window_bp is not None:
+            logger.warning(
+                "Warning: --LDclump requires GWAS result file(s); it is ignored in LD-only mode."
+            )
+            args.ldclump_window_bp = None
+            args.ldclump_r2 = None
+        if args.ldblock_ratio is None:
+            logger.error(
+                "No GWAS input file provided. "
+                "Use --gwasfile, or run LD-only mode with --ldblock/--ldblock-all + genotype input."
+            )
+            raise SystemExit(1)
 
     if not hasattr(args, "fullscatter"):
         args.fullscatter = bool(getattr(args, "full", False))
@@ -4405,7 +4586,11 @@ def main():
             f"ylim={args.ylim if args.ylim is not None else 'auto'}, "
             f"compression={comp_text}"
         )
-        qq_text = f"auto, palette={qq_pal_text}"
+        qq_text = (
+            f"auto, palette={qq_pal_text}"
+            if args.qq_ratio is not None
+            else "off"
+        )
         vis_rows = [
             ("Manhattan", manh_text),
             ("QQ", qq_text),
@@ -4536,6 +4721,8 @@ def main():
         checks.append(ensure_file_exists(logger, args.anno, "Annotation file"))
     if args.vcf:
         checks.append(ensure_file_exists(logger, args.vcf, "Genotype VCF file"))
+    if args.hmp:
+        checks.append(ensure_file_exists(logger, args.hmp, "Genotype HMP file"))
     if args.geno:
         checks.append(ensure_file_input_exists(logger, args.geno, "Genotype FILE input"))
         if args.ldblock_ratio is not None or args.ldclump_window_bp is not None:
@@ -4556,6 +4743,8 @@ def main():
     # ------------------------------------------------------------------
     if args.merge_mode:
         _run_postgwas_merge_manhattan(args, logger)
+    elif bool(getattr(args, "ldblock_only_mode", False)):
+        _run_postgwas_ldblock_only(args, logger)
     else:
         _run_postgwas_tasks(args, logger)
 

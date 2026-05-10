@@ -73,6 +73,8 @@ mod brent;
 mod eigh;
 #[path = "math/linalg.rs"]
 mod linalg;
+#[path = "math/pcg.rs"]
+mod pcg;
 #[path = "math/farmcpu.rs"]
 mod math_farmcpu;
 #[path = "math/ld.rs"]

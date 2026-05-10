@@ -26,6 +26,7 @@ use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::packed::{
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
 };
+use crate::pcg::pcg_solve_f32;
 use crate::stats_common::{
     check_ctrlc, env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64,
 };
@@ -1121,14 +1122,6 @@ fn pcg_xt_mul_rows(
 }
 
 #[inline]
-fn dot_f32_f64(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (*x as f64) * (*y as f64))
-        .sum()
-}
-
-#[inline]
 fn sample_var_f64(v: &[f64]) -> f64 {
     let n = v.len();
     if n <= 1 {
@@ -2123,103 +2116,75 @@ pub fn rrblup_pcg_bed<'py>(
                     }
                 }
 
-                let bnorm = dot_f32_f64(&b, &b).sqrt();
-                if !(bnorm.is_finite()) {
-                    return Err("rrBLUP-PCG invalid RHS norm.".to_string());
-                }
-                let denom_b = bnorm.max(1e-12);
-
-                let mut beta = vec![0.0_f32; m];
-                let mut r = b.clone();
-                let mut z = vec![0.0_f32; m];
-                for i in 0..m {
-                    z[i] = diag_inv[i] * r[i];
-                }
-                let mut p = z.clone();
-                let mut rz_old = dot_f32_f64(&r, &z);
-                let mut converged = false;
-                let mut rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
-                let mut iters_done = 0usize;
                 let mut last_notified = 0usize;
-                let tiny = 1e-20_f64;
-
-                for it in 0..max_iter {
-                    let xp = pcg_x_mul_samples(
-                        packed_keep.as_ref(),
-                        bytes_per_snp,
-                        n_samples,
-                        row_flip_keep.as_ref(),
-                        &row_mean,
-                        &row_inv_sd,
-                        &train_idx,
-                        full_train_fast,
-                        row_step,
-                        &p,
-                        &code4_lut,
-                        pool_ref,
-                    )?;
-                    let mut ap = pcg_xt_mul_rows(
-                        packed_keep.as_ref(),
-                        bytes_per_snp,
-                        n_samples,
-                        row_flip_keep.as_ref(),
-                        &row_mean,
-                        &row_inv_sd,
-                        &train_idx,
-                        full_train_fast,
-                        row_step,
-                        &xp,
-                        &code4_lut,
-                        pool_ref,
-                    )?;
-                    for j in 0..m {
-                        ap[j] += lambda_use * p[j];
-                    }
-                    let denom = dot_f32_f64(&p, &ap);
-                    if !(denom.is_finite()) || denom <= tiny {
-                        break;
-                    }
-                    let alpha = rz_old / denom;
-                    for j in 0..m {
-                        beta[j] += (alpha as f32) * p[j];
-                        r[j] -= (alpha as f32) * ap[j];
-                    }
-                    rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0);
-                    iters_done = it + 1;
-                    if (iters_done >= last_notified.saturating_add(notify_step))
-                        || (iters_done == max_iter)
-                    {
-                        last_notified = iters_done;
-                        if let Some(cb) = progress_callback.as_ref() {
-                            Python::attach(|py2| -> PyResult<()> {
-                                py2.check_signals()?;
-                                cb.call1(py2, (iters_done, max_iter))?;
-                                Ok(())
-                            })
-                            .map_err(|e| e.to_string())?;
+                let pcg_res = pcg_solve_f32(
+                    &b,
+                    max_iter,
+                    tol_use,
+                    1e-20_f64,
+                    |p| {
+                        let xp = pcg_x_mul_samples(
+                            packed_keep.as_ref(),
+                            bytes_per_snp,
+                            n_samples,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            full_train_fast,
+                            row_step,
+                            p,
+                            &code4_lut,
+                            pool_ref,
+                        )?;
+                        let mut ap = pcg_xt_mul_rows(
+                            packed_keep.as_ref(),
+                            bytes_per_snp,
+                            n_samples,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            full_train_fast,
+                            row_step,
+                            &xp,
+                            &code4_lut,
+                            pool_ref,
+                        )?;
+                        for j in 0..m {
+                            ap[j] += lambda_use * p[j];
                         }
-                    }
-                    if rel_res.is_finite() && rel_res <= tol_use {
-                        converged = true;
-                        break;
-                    }
-
-                    for j in 0..m {
-                        z[j] = diag_inv[j] * r[j];
-                    }
-                    let rz_new = dot_f32_f64(&r, &z);
-                    if !(rz_new.is_finite()) || rz_new <= tiny {
-                        break;
-                    }
-                    let beta_cg = rz_new / rz_old.max(tiny);
-                    for j in 0..m {
-                        p[j] = z[j] + (beta_cg as f32) * p[j];
-                    }
-                    rz_old = rz_new;
-                    if (it & 7) == 7 {
-                        check_ctrlc()?;
-                    }
-                }
+                        Ok(ap)
+                    },
+                    |r, z| {
+                        for j in 0..m {
+                            z[j] = diag_inv[j] * r[j];
+                        }
+                    },
+                    |iters_now, iters_max, _rel_res| {
+                        if (iters_now >= last_notified.saturating_add(notify_step))
+                            || (iters_now == iters_max)
+                        {
+                            last_notified = iters_now;
+                            if let Some(cb) = progress_callback.as_ref() {
+                                Python::attach(|py2| -> PyResult<()> {
+                                    py2.check_signals()?;
+                                    cb.call1(py2, (iters_now, iters_max))?;
+                                    Ok(())
+                                })
+                                .map_err(|e| e.to_string())?;
+                            }
+                        }
+                        if (iters_now & 7) == 0 {
+                            check_ctrlc()?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                let beta = pcg_res.x;
+                let converged = pcg_res.converged;
+                let iters_done = pcg_res.iters;
+                let rel_res = pcg_res.rel_res;
 
                 let need_train_pred_all = train_pred_pick.is_none();
                 let need_train_pred_subset = train_pred_pick

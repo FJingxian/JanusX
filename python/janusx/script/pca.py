@@ -20,7 +20,7 @@ PCA computation strategy
       * Optional: --rsvd uses Rust streaming randomized SVD directly.
 
   - For GRM:
-      * Read the precomputed GRM from .grm.txt or .grm.npy.
+      * Read the precomputed GRM from .cGRM/.sGRM (.txt/.npy), or legacy .grm.*.
       * Perform eigendecomposition via Rust LAPACK backend.
 
   - For QCOV:
@@ -712,8 +712,8 @@ def main(log: bool = True):
     geno_group.add_argument(
         "-k", "--grm", type=str,
         help=(
-            "GRM prefix for PCA (expects {prefix}.grm.id and "
-            "{prefix}.grm.txt or {prefix}.grm.npy)."
+            "GRM prefix for PCA (expects {prefix}.cGRM.* / {prefix}.sGRM.*; "
+            "legacy {prefix}.grm.* is also supported)."
         ),
     )
     geno_group.add_argument(
@@ -969,16 +969,24 @@ def main(log: bool = True):
     elif args.grm:
         if os.path.isfile(gfile):
             grm_input = gfile
-        elif os.path.isfile(f"{gfile}.grm.txt"):
-            grm_input = f"{gfile}.grm.txt"
-        elif os.path.isfile(f"{gfile}.grm.npy"):
-            grm_input = f"{gfile}.grm.npy"
         else:
+            grm_input = None
+            for cand in (
+                f"{gfile}.cGRM.txt",
+                f"{gfile}.sGRM.txt",
+                f"{gfile}.cGRM.npy",
+                f"{gfile}.sGRM.npy",
+                f"{gfile}.grm.txt",
+                f"{gfile}.grm.npy",
+            ):
+                if os.path.isfile(cand):
+                    grm_input = cand
+                    break
+        if grm_input is None:
             logger.error(
                 "GRM matrix not found: "
-                f"{gfile} (or {gfile}.grm.txt / {gfile}.grm.npy)"
+                f"{gfile} (or {gfile}.cGRM/.sGRM/.grm with .txt/.npy)"
             )
-            grm_input = None
             checks.append(False)
         if grm_input is not None:
             checks.append(ensure_file_exists(logger, f"{grm_input}.id", "GRM ID file"))
@@ -1191,13 +1199,22 @@ def main(log: bool = True):
         if os.path.isfile(gfile):
             grm_file = gfile
         else:
-            if os.path.exists(f"{gfile}.grm.txt"):
-                grm_file = f"{gfile}.grm.txt"
-            elif os.path.exists(f"{gfile}.grm.npy"):
-                grm_file = f"{gfile}.grm.npy"
+            for cand in (
+                f"{gfile}.cGRM.txt",
+                f"{gfile}.sGRM.txt",
+                f"{gfile}.cGRM.npy",
+                f"{gfile}.sGRM.npy",
+                f"{gfile}.grm.txt",
+                f"{gfile}.grm.npy",
+            ):
+                if os.path.exists(cand):
+                    grm_file = cand
+                    break
 
         if grm_file is None:
-            raise ValueError("GRM matrix (.grm.txt/.grm.npy or direct path) not found.")
+            raise ValueError(
+                "GRM matrix (.cGRM/.sGRM/.grm with .txt/.npy, or direct path) not found."
+            )
 
         grm_src = os.path.basename(str(grm_file).rstrip("/\\")) or str(grm_file)
         with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:

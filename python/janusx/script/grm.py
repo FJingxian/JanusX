@@ -17,10 +17,10 @@ Implementation:
   - SNPs are filtered by MAF and missing rate inside Rust kernels.
 
 Output:
-  - {prefix}.grm.txt     : GRM as plain text (if --npy is not used)
-  - {prefix}.grm.txt.id  : sample IDs for text GRM
-  - {prefix}.grm.npy     : binary GRM (if --npy is used)
-  - {prefix}.grm.npy.id  : sample IDs for NPY GRM
+  - {prefix}.cGRM.txt / {prefix}.sGRM.txt    : GRM as plain text (if --npy is not used)
+  - {prefix}.cGRM.txt.id / {prefix}.sGRM.txt.id : sample IDs for text GRM
+  - {prefix}.cGRM.npy / {prefix}.sGRM.npy    : binary GRM (if --npy is used)
+  - {prefix}.cGRM.npy.id / {prefix}.sGRM.npy.id : sample IDs for NPY GRM
 """
 
 import os
@@ -107,6 +107,10 @@ def _resolve_rust_grm_input(
             f"Failed to materialize BED cache from: {genofile}"
         )
     return str(cached)
+
+
+def _grm_method_tag(method: int) -> str:
+    return "cGRM" if int(method) == 1 else "sGRM"
 
 
 def build_grm_streaming(
@@ -452,10 +456,10 @@ def main(log: bool = True):
             f"using {int(args.thread)}."
         )
     apply_blas_thread_env(int(args.thread))
-    maybe_warn_non_openblas(
-        logger=logger,
-        strict=require_openblas_by_default(),
-    )
+    # maybe_warn_non_openblas(
+    #     logger=logger,
+    #     strict=require_openblas_by_default(),
+    # )
 
     if log:
         emit_cli_configuration(
@@ -534,20 +538,40 @@ def main(log: bool = True):
         if args.mmap_limit else None
     )
 
-    use_packed_kernel = bool(
+    # use_packed_kernel = bool(
+    #     _is_plink_prefix_path(str(grm_input))
+    #     and (_grm_packed_bed_f32 is not None)
+    # )
+    use_stream_kernel = bool(
         _is_plink_prefix_path(str(grm_input))
         and (_grm_packed_bed_f32 is not None)
     )
-    if use_packed_kernel:
-        logger.info(
-            "GRM backend: packed BED kernel "
-            "(Rust grm_packed_bed_f32 + unified prepare_bed_2bit_packed filtering)."
-        )
+    if use_stream_kernel:
+        # logger.info(
+        #     "GRM backend: streaming BED kernel"
+        # )
         if args.block_target_mb is not None:
             logger.info(f"Packed GRM block target override: {float(args.block_target_mb):.6g} MB.")
         if bool(args.stage_timing):
-            logger.info("Packed GRM stage timing is enabled (decode/GEMM/other).")
+            logger.info("Streaming GRM stage timing is enabled (decode/GEMM/other).")
         try:
+            grm, eff_m = build_grm_streaming(
+                genofile=grm_input,
+                n_samples=n_samples,
+                n_snps=n_snps,
+                method=args.method,
+                maf_threshold=maf_threshold,
+                max_missing_rate=max_missing_rate,
+                chunk_size=chunk_size,
+                mmap_window_mb=mmap_window_mb,
+                threads=int(args.thread),
+                logger=logger,
+            )
+        except Exception as ex:
+            logger.warning(
+                "Streaming GRM kernel failed; fallback to Packed backend. "
+                f"reason={ex}"
+            )
             grm, eff_m = build_grm_packed_bed(
                 genofile=grm_input,
                 n_samples=n_samples,
@@ -561,37 +585,20 @@ def main(log: bool = True):
                 stage_timing=bool(args.stage_timing),
                 logger=logger,
             )
-        except Exception as ex:
-            logger.warning(
-                "Packed GRM kernel failed; fallback to streaming backend. "
-                f"reason={ex}"
-            )
-            grm, eff_m = build_grm_streaming(
-                genofile=grm_input,
-                n_samples=n_samples,
-                n_snps=n_snps,
-                method=args.method,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                chunk_size=chunk_size,
-                mmap_window_mb=mmap_window_mb,
-                threads=int(args.thread),
-                logger=logger,
-            )
     else:
         if not _is_plink_prefix_path(str(grm_input)):
             raise RuntimeError(
-                "Rust GRM stream backend requires PLINK BED input/cache prefix. "
+                "Rust GRM Packed backend requires PLINK BED input/cache prefix. "
                 f"got={grm_input}"
             )
         if _grm_stream_bed_f32 is not None:
-            logger.info("Packed GRM kernel unavailable; fallback to Rust streaming BED backend.")
+            logger.info("Streaming GRM kernel unavailable; fallback to Rust Packed BED backend.")
         else:
             raise RuntimeError(
                 "Rust stream GRM kernel is unavailable (`grm_stream_bed_f32`). "
                 "Rebuild JanusX extension."
             )
-        grm, eff_m = build_grm_streaming(
+        grm, eff_m = build_grm_packed_bed(
             genofile=grm_input,
             n_samples=n_samples,
             n_snps=n_snps,
@@ -599,16 +606,18 @@ def main(log: bool = True):
             maf_threshold=maf_threshold,
             max_missing_rate=max_missing_rate,
             chunk_size=chunk_size,
-            mmap_window_mb=mmap_window_mb,
             threads=int(args.thread),
+            block_target_mb=args.block_target_mb,
+            stage_timing=bool(args.stage_timing),
             logger=logger,
         )
 
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
+    method_tag = _grm_method_tag(args.method)
     if args.npy:
-        grm_path = f"{outprefix}.grm.npy"
+        grm_path = f"{outprefix}.{method_tag}.npy"
         np.save(grm_path, grm)
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")
@@ -619,7 +628,7 @@ def main(log: bool = True):
             f"  {format_path_for_display(grm_path)}",
         )
     else:
-        grm_path = f"{outprefix}.grm.txt"
+        grm_path = f"{outprefix}.{method_tag}.txt"
         np.savetxt(grm_path, grm, fmt="%.6f")
         id_path = f"{grm_path}.id"
         np.savetxt(id_path, sample_ids, fmt="%s")

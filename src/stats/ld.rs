@@ -15,7 +15,11 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::bedmath::{packed_byte_lut, packed_pair_lut};
+use crate::bedmath::{decode_row_centered_full_lut, packed_byte_lut, packed_pair_lut};
+use crate::blas::{
+    cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_TRANS,
+    CBLAS_UPPER,
+};
 use crate::math_ld::{
     build_bitplanes_u64, build_row_bitplanes_u64_with_aux, classify_ld_pair_by_maf,
     compute_packed_row_stats, dot_nomiss_pair_bitplanes, dot_nomiss_pair_from_packed,
@@ -42,6 +46,36 @@ fn resolve_ld_prune_mode() -> LdPruneMode {
     match raw.as_str() {
         "strict" | "plink" | "exact" | "fast" | "" => LdPruneMode::Strict,
         _ => LdPruneMode::Strict,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LdR2Kernel {
+    Blas,
+    Bitwise,
+}
+
+#[inline]
+fn resolve_ld_r2_kernel() -> LdR2Kernel {
+    let raw = std::env::var("JX_LD_R2_KERNEL")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "".to_string());
+    match raw.as_str() {
+        "bitwise" | "packed" => LdR2Kernel::Bitwise,
+        "blas" | "syrk" | "" => LdR2Kernel::Blas,
+        _ => LdR2Kernel::Blas,
+    }
+}
+
+#[inline]
+fn effective_threads(threads: usize) -> usize {
+    if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
     }
 }
 
@@ -722,7 +756,7 @@ fn read_selected_bed_rows(
     Ok(out)
 }
 
-fn ld_r2_matrix_from_packed_rows(
+fn ld_r2_matrix_from_packed_rows_bitwise(
     packed_rows: &[u8],
     m: usize,
     bytes_per_snp: usize,
@@ -760,6 +794,33 @@ fn ld_r2_matrix_from_packed_rows(
     }
     let (bit_h, bit_l, bit_m, bit_words, bit_masks) =
         build_bitplanes_u64(packed_rows, m, bytes_per_snp, n_samples, pool.as_ref());
+    let mut bit_a = vec![0u64; m.saturating_mul(bit_words)];
+    let mut bit_v = vec![0u64; m.saturating_mul(bit_words)];
+    {
+        let tail_mask = bit_masks[bit_words - 1];
+        let mut run = || {
+            bit_a
+                .par_chunks_mut(bit_words)
+                .zip(bit_v.par_chunks_mut(bit_words))
+                .enumerate()
+                .for_each(|(i, (arow, vrow))| {
+                    let off = i * bit_words;
+                    let hrow = &bit_h[off..off + bit_words];
+                    let lrow = &bit_l[off..off + bit_words];
+                    let mrow = &bit_m[off..off + bit_words];
+                    for w in 0..bit_words {
+                        arow[w] = hrow[w] & lrow[w];
+                        vrow[w] = !mrow[w];
+                    }
+                    vrow[bit_words - 1] &= tail_mask;
+                });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
 
     let n_samples_f = n_samples as f64;
     let denom = (n_samples.saturating_sub(1)).max(1) as f64;
@@ -771,14 +832,14 @@ fn ld_r2_matrix_from_packed_rows(
                 let st_i = stats[i];
                 let off_i = i * bit_words;
                 let hi_i = &bit_h[off_i..off_i + bit_words];
-                let li_i = &bit_l[off_i..off_i + bit_words];
-                let mi_i = &bit_m[off_i..off_i + bit_words];
+                let ai_i = &bit_a[off_i..off_i + bit_words];
+                let vi_i = &bit_v[off_i..off_i + bit_words];
                 for j in (i + 1)..m {
                     let st_j = stats[j];
                     let off_j = j * bit_words;
                     let hi_j = &bit_h[off_j..off_j + bit_words];
-                    let li_j = &bit_l[off_j..off_j + bit_words];
-                    let mi_j = &bit_m[off_j..off_j + bit_words];
+                    let ai_j = &bit_a[off_j..off_j + bit_words];
+                    let vi_j = &bit_v[off_j..off_j + bit_words];
                     let r2 = if !st_i.has_missing && !st_j.has_missing {
                         let dot_imp = dot_nomiss_pair_bitplanes(
                             i, j, &bit_h, &bit_l, bit_words, &bit_masks,
@@ -792,8 +853,8 @@ fn ld_r2_matrix_from_packed_rows(
                         };
                         corr * corr
                     } else {
-                        r2_pairwise_complete_bitplanes(
-                            hi_i, li_i, mi_i, hi_j, li_j, mi_j, &bit_masks,
+                        r2_pairwise_complete_bitplanes_cached_masks(
+                            hi_i, ai_i, vi_i, hi_j, ai_j, vi_j,
                         )
                         .unwrap_or(f64::NAN)
                     };
@@ -819,6 +880,136 @@ fn ld_r2_matrix_from_packed_rows(
         }
     }
     Ok(out)
+}
+
+fn ld_r2_matrix_from_packed_rows_blas(
+    packed_rows: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    threads: usize,
+) -> Result<Vec<f32>, String> {
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    if m == 1 {
+        return Ok(vec![1.0_f32]);
+    }
+    if packed_rows.len() != m.saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "packed row length mismatch: got {}, expected {}",
+            packed_rows.len(),
+            m.saturating_mul(bytes_per_snp)
+        ));
+    }
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+
+    let total_threads = effective_threads(threads);
+    let pool = get_cached_pool(total_threads).map_err(|e| e.to_string())?;
+    let byte_lut = packed_byte_lut();
+    let code4_lut = &byte_lut.code4;
+
+    // Row-major (m x n_samples) buffer. Under ColMajor + TRANS in SYRK,
+    // this maps directly to C = X * X^T without an explicit transpose.
+    let mut x_row_major = vec![0.0_f32; m.saturating_mul(n_samples)];
+    {
+        let mut run = || {
+            x_row_major
+                .par_chunks_mut(n_samples)
+                .enumerate()
+                .for_each(|(i, out_row)| {
+                    let row = &packed_rows[i * bytes_per_snp..(i + 1) * bytes_per_snp];
+                    let st = compute_packed_row_stats(row, n_samples, byte_lut);
+                    let mean_g = st.mean as f32;
+                    // Missing code (0b01) maps to 0 after centering,
+                    // equivalent to mean-impute then center.
+                    let value_lut = [
+                        0.0_f32 - mean_g,
+                        0.0_f32,
+                        1.0_f32 - mean_g,
+                        2.0_f32 - mean_g,
+                    ];
+                    decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
+                });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+
+    let mut gram_col_major = vec![0.0_f32; m.saturating_mul(m)];
+    let _blas_guard = OpenBlasThreadGuard::enter(total_threads.max(1));
+    unsafe {
+        cblas_ssyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_TRANS,
+            m as CblasInt,
+            n_samples as CblasInt,
+            1.0,
+            x_row_major.as_ptr(),
+            n_samples as CblasInt,
+            0.0,
+            gram_col_major.as_mut_ptr(),
+            m as CblasInt,
+        );
+    }
+
+    let mut diag = vec![0.0_f32; m];
+    for i in 0..m {
+        diag[i] = gram_col_major[i + i * m].max(0.0_f32);
+    }
+
+    let mut out = vec![0.0_f32; m.saturating_mul(m)];
+    let eps = 1e-20_f32;
+    for col in 0..m {
+        for row in 0..=col {
+            let rr = if row == col {
+                1.0_f32
+            } else {
+                let cov = gram_col_major[row + col * m];
+                let den = (diag[row] * diag[col]).sqrt();
+                let corr = if den > eps { cov / den } else { 0.0_f32 };
+                let mut r2 = corr * corr;
+                if !r2.is_finite() {
+                    r2 = 0.0_f32;
+                }
+                r2.clamp(0.0_f32, 1.0_f32)
+            };
+            out[row * m + col] = rr;
+            out[col * m + row] = rr;
+        }
+    }
+    Ok(out)
+}
+
+fn ld_r2_matrix_from_packed_rows(
+    packed_rows: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    threads: usize,
+) -> Result<Vec<f32>, String> {
+    match resolve_ld_r2_kernel() {
+        LdR2Kernel::Bitwise => {
+            ld_r2_matrix_from_packed_rows_bitwise(packed_rows, m, bytes_per_snp, n_samples, threads)
+        }
+        LdR2Kernel::Blas => ld_r2_matrix_from_packed_rows_blas(
+            packed_rows,
+            m,
+            bytes_per_snp,
+            n_samples,
+            threads,
+        )
+        .or_else(|e_blas| {
+            ld_r2_matrix_from_packed_rows_bitwise(packed_rows, m, bytes_per_snp, n_samples, threads)
+                .map_err(|e_bw| format!("LD BLAS path failed: {e_blas}; bitwise fallback failed: {e_bw}"))
+        }),
+    }
 }
 
 fn read_bim_lines_chrom_pos(prefix: &str) -> Result<(Vec<String>, Vec<i32>, Vec<i64>), String> {

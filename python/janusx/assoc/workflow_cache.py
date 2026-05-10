@@ -191,7 +191,19 @@ def _grm_cache_paths(
     *,
     mgrm: str,
 ) -> tuple[str, str]:
-    grm_path = f"{cache_prefix_with_params}.grm{mgrm}.npy"
+    tag = _grm_method_cache_tag(str(mgrm), legacy=False)
+    grm_path = f"{cache_prefix_with_params}.{tag}.npy"
+    id_path = f"{grm_path}.id"
+    return grm_path, id_path
+
+
+def _grm_cache_paths_legacy(
+    cache_prefix_with_params: str,
+    *,
+    mgrm: str,
+) -> tuple[str, str]:
+    tag = _grm_method_cache_tag(str(mgrm), legacy=True)
+    grm_path = f"{cache_prefix_with_params}.{tag}.npy"
     id_path = f"{grm_path}.id"
     return grm_path, id_path
 
@@ -202,7 +214,27 @@ def _pca_cache_path(
     mgrm: str,
     qdim: Union[int, str],
 ) -> str:
-    return f"{cache_prefix_with_params}.grm{mgrm}.pc{qdim}.txt"
+    tag = _grm_method_cache_tag(str(mgrm), legacy=False)
+    return f"{cache_prefix_with_params}.{tag}.pc{qdim}.txt"
+
+
+def _pca_cache_path_legacy(
+    cache_prefix_with_params: str,
+    *,
+    mgrm: str,
+    qdim: Union[int, str],
+) -> str:
+    tag = _grm_method_cache_tag(str(mgrm), legacy=True)
+    return f"{cache_prefix_with_params}.{tag}.pc{qdim}.txt"
+
+
+def _grm_method_cache_tag(mgrm: str, *, legacy: bool = False) -> str:
+    s = str(mgrm).strip()
+    if s == "1":
+        return "grm1" if legacy else "cGRM"
+    if s == "2":
+        return "grm2" if legacy else "sGRM"
+    return s
 
 
 @contextmanager
@@ -240,4 +272,3 @@ def _cache_lock(lock_key: str, timeout_s: float = 7200.0, poll_s: float = 0.2):
             pass
         except Exception:
             pass
-

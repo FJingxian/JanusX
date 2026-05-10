@@ -23,6 +23,7 @@ from .workflow import (
     _emit_trait_header,
     _emit_warning_line,
     _grm_cache_paths,
+    _grm_cache_paths_legacy,
     _gwas_cache_prefix_with_params,
     _gwas_eigh_from_grm,
     _inspect_genotype_with_status,
@@ -32,6 +33,7 @@ from .workflow import (
     _normalize_cov_inputs,
     _parse_qcov_dim,
     _pca_cache_path,
+    _pca_cache_path_legacy,
     _read_id_file,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
@@ -217,7 +219,18 @@ def build_qmatrix_farmcpu(
 
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
         grm_path, id_path = _grm_cache_paths(gfile_prefix, mgrm="1")
+        legacy_grm_path, legacy_id_path = _grm_cache_paths_legacy(gfile_prefix, mgrm="1")
         with _cache_lock(grm_path):
+            if (not os.path.exists(grm_path)) and os.path.exists(legacy_grm_path):
+                try:
+                    os.replace(legacy_grm_path, grm_path)
+                    if os.path.exists(legacy_id_path) and (not os.path.exists(id_path)):
+                        os.replace(legacy_id_path, id_path)
+                    _farm_log(
+                        f"* Migrated legacy GRM cache name: {legacy_grm_path} -> {grm_path}"
+                    )
+                except Exception:
+                    pass
             cache_ready = os.path.exists(grm_path)
             if cache_ready:
                 g_mtime = latest_genotype_mtime(genofile)
@@ -260,7 +273,7 @@ def build_qmatrix_farmcpu(
                             _farm_log("GRM cache ID file not found; assuming genotype sample order.")
                         return np.asarray(grm, dtype="float32")
             if not cache_ready:
-                for p in (grm_path, id_path):
+                for p in (grm_path, id_path, legacy_grm_path, legacy_id_path):
                     if os.path.exists(p):
                         try:
                             os.remove(p)
@@ -309,7 +322,16 @@ def build_qmatrix_farmcpu(
         )
     else:
         q_path = _pca_cache_path(gfile_prefix, mgrm="1", qdim=int(q_int))
+        legacy_q_path = _pca_cache_path_legacy(gfile_prefix, mgrm="1", qdim=int(q_int))
         with _cache_lock(q_path):
+            if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
+                try:
+                    os.replace(legacy_q_path, q_path)
+                    _farm_log(
+                        f"* Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}"
+                    )
+                except Exception:
+                    pass
             cache_ready = os.path.isfile(q_path)
             if cache_ready:
                 g_mtime = latest_genotype_mtime(genofile)

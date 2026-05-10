@@ -56,7 +56,8 @@ jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt txt -o test
 echo "============================================"
 
 echo "STEP 2. Validation of GWAS-related modules"
-jx grm -bfile test/mouse_hs1940 -o test
+jx grm -bfile test/mouse_hs1940 -o test -m 1
+jx grm -bfile test/mouse_hs1940 -o test -m 2
 jx pca -bfile test/mouse_hs1940 -o test
 jx pca -bfile test/mouse_hs1940 -rsvd -o test
 jx gwas -bfile test/mouse_hs1940 -p example/mouse_hs1940.pheno \

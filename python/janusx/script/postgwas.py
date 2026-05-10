@@ -63,7 +63,7 @@ import matplotlib as mpl
 mpl.use("Agg")
 from janusx.bioplotkit import GWASPLOT, LDblock, apply_integer_yticks
 from janusx.bioplotkit.geneplot import draw_gene_structure_records
-from janusx.gfreader import load_genotype_chunks
+from janusx.gfreader import load_genotype_chunks, prepare_cli_input_cache
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
@@ -423,9 +423,38 @@ def _parse_rgb_triplet(token: str) -> str:
     return mcolors.to_hex([rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0])
 
 
+def _split_palette_tokens(text: str) -> list[str]:
+    """
+    Split palette string by ';' or ',' while preserving '(R,G,B)' tuples.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in str(text):
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            continue
+        if depth == 0 and ch in {";", ","}:
+            tok = "".join(buf).strip()
+            if tok != "":
+                out.append(tok)
+            buf = []
+            continue
+        buf.append(ch)
+    tok = "".join(buf).strip()
+    if tok != "":
+        out.append(tok)
+    return out
+
+
 def _parse_custom_palette(text: str) -> list[str]:
     colors: list[str] = []
-    for token in text.split(";"):
+    for token in _split_palette_tokens(text):
         tok = token.strip()
         if tok == "":
             continue
@@ -478,8 +507,10 @@ def _parse_palette_spec(value: object) -> Optional[Tuple[str, Any]]:
     text = str(value).strip()
     if text == "":
         raise ValueError("Invalid --palette: value is empty.")
-    if ";" in text:
-        return ("list", _parse_custom_palette(text))
+    if (";" in text) or ("," in text):
+        toks = _split_palette_tokens(text)
+        if len(toks) >= 2:
+            return ("list", _parse_custom_palette(text))
     try:
         plt.get_cmap(text)
         return ("cmap", text)
@@ -492,7 +523,7 @@ def _parse_palette_spec(value: object) -> Optional[Tuple[str, Any]]:
         except ValueError as e:
             raise ValueError(
                 f"Invalid --palette: {text}. "
-                "Use a cmap name (e.g. tab10) or ';'-separated colors."
+                "Use a cmap name (e.g. tab10) or ';' / ',' separated colors."
             ) from e
 
 
@@ -515,7 +546,7 @@ def _resolve_two_color_style(
     spec: Optional[Tuple[str, Any]],
 ) -> Optional[dict[str, Any]]:
     """
-    Return two-color style for LD/gene:
+    Return two-color style for QQ:
       - exactly two colors -> use as-is
       - single color       -> auto-expand by grayscale direction
     """
@@ -553,6 +584,57 @@ def _resolve_two_color_style(
         "janusx_ld_bicolor",
         [colors[0], colors[1]],
     )
+    return {
+        "colors": colors,
+        "ld_cmap": ld_cmap,
+        "gene_block_color": light,
+        "gene_line_color": dark,
+    }
+
+
+def _resolve_ldblock_style(
+    spec: Optional[Tuple[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """
+    Resolve LD-block colormap + matched gene colors.
+    Supports cmap names and custom color lists (2+ colors).
+    """
+    if spec is None:
+        return None
+
+    mode, payload = spec
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 0:
+            return None
+        if len(colors) == 1:
+            colors = _expand_single_palette_color(colors[0])
+        ld_cmap = mcolors.LinearSegmentedColormap.from_list(
+            "janusx_ld_custom",
+            colors,
+        )
+    elif mode == "cmap":
+        cmap = plt.get_cmap(str(payload))
+        ld_cmap = cmap
+        n_bins = int(getattr(cmap, "N", 256))
+        if n_bins <= 32:
+            colors = [
+                mcolors.to_hex(cmap(i / max(1, n_bins - 1)))
+                for i in range(max(2, n_bins))
+            ]
+        else:
+            colors = [mcolors.to_hex(cmap(x)) for x in (0.0, 0.5, 1.0)]
+    else:
+        return None
+
+    lums = np.asarray([_relative_luminance(c) for c in colors], dtype=float)
+    i_light = int(np.argmax(lums))
+    i_dark = int(np.argmin(lums))
+    light = colors[i_light]
+    dark = colors[i_dark]
+    if _relative_luminance(light) >= 0.98:
+        light = _blend_hex_color(light, dark, 0.2)
+
     return {
         "colors": colors,
         "ld_cmap": ld_cmap,
@@ -1227,58 +1309,285 @@ def _extract_ld_site_set(
     return out
 
 
+def _normalize_plink_prefix(path_or_prefix: object) -> str:
+    s = str(path_or_prefix).strip()
+    low = s.lower()
+    for ext in (".bed", ".bim", ".fam"):
+        if low.endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
+def _is_existing_plink_prefix(path_or_prefix: object) -> bool:
+    prefix = _normalize_plink_prefix(path_or_prefix)
+    if prefix == "":
+        return False
+    return (
+        os.path.isfile(f"{prefix}.bed")
+        and os.path.isfile(f"{prefix}.bim")
+        and os.path.isfile(f"{prefix}.fam")
+    )
+
+
+def _build_bimrange_lookup(
+    bimrange_tuples: list[tuple[str, int, int]],
+) -> dict[str, list[tuple[int, int]]]:
+    out: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in bimrange_tuples:
+        ck = _normalize_chr(chrom)
+        s = int(min(start, end))
+        e = int(max(start, end))
+        out.setdefault(ck, []).append((s, e))
+    return out
+
+
+def _site_in_bimrange_lookup(
+    chrom_norm: str,
+    pos: int,
+    bim_lookup: dict[str, list[tuple[int, int]]],
+) -> bool:
+    spans = bim_lookup.get(str(chrom_norm), [])
+    for s, e in spans:
+        if int(s) <= int(pos) <= int(e):
+            return True
+    return False
+
+
+def _expand_bimranges_for_reader(
+    bimrange_tuples: list[tuple[str, int, int]],
+) -> list[tuple[str, int, int]]:
+    out: list[tuple[str, int, int]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for chrom, start, end in bimrange_tuples:
+        s = int(min(start, end))
+        e = int(max(start, end))
+        raw = str(chrom).strip()
+        norm = _normalize_chr(raw)
+        candidates = [raw, norm]
+        if norm != "":
+            candidates.append(f"chr{norm}")
+        for c in candidates:
+            cc = str(c).strip()
+            if cc == "":
+                continue
+            key = (cc, s, e)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _ld_r2_from_geno_rows(geno_rows: np.ndarray) -> np.ndarray:
+    x = np.ascontiguousarray(np.asarray(geno_rows, dtype=np.float32))
+    if x.ndim != 2 or x.shape[0] == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    m = int(x.shape[0])
+    if m == 1:
+        return np.ones((1, 1), dtype=np.float32)
+
+    x64 = np.asarray(x, dtype=np.float64)
+    centered = x64 - x64.mean(axis=1, keepdims=True)
+    gram = centered @ centered.T
+    ss = np.einsum("ij,ij->i", centered, centered, dtype=np.float64, optimize=True)
+    den = np.sqrt(np.outer(ss, ss))
+
+    corr = np.zeros_like(gram, dtype=np.float64)
+    valid = den > 0.0
+    corr[valid] = gram[valid] / den[valid]
+    corr = np.clip(corr, -1.0, 1.0)
+    r2 = np.square(corr)
+    np.fill_diagonal(r2, 1.0)
+    r2 = np.nan_to_num(r2, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(r2.astype(np.float32, copy=False))
+
+
+def _compute_ld_from_genotype_generic(
+    genofile: str,
+    bimrange_tuples: list[tuple[str, int, int]],
+    *,
+    selected_sites: Optional[set[tuple[str, int]]] = None,
+) -> tuple[np.ndarray, list[tuple[str, int]]]:
+    if len(bimrange_tuples) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    bim_lookup = _build_bimrange_lookup(bimrange_tuples)
+    wanted: Optional[set[tuple[str, int]]] = None
+    if selected_sites is not None:
+        picked = {
+            (_normalize_chr(c), int(p))
+            for c, p in selected_sites
+            if _site_in_bimrange_lookup(_normalize_chr(c), int(p), bim_lookup)
+        }
+        if len(picked) == 0:
+            return np.zeros((0, 0), dtype=np.float32), []
+        wanted = picked
+
+    reader_ranges = _expand_bimranges_for_reader(bimrange_tuples)
+    if len(reader_ranges) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    chunk_size = 20_000
+    if wanted is not None:
+        chunk_size = max(1, min(20_000, len(wanted)))
+
+    geno_chunks: list[np.ndarray] = []
+    keys: list[tuple[str, int]] = []
+    for chunk, sites in load_genotype_chunks(
+        str(genofile),
+        chunk_size=chunk_size,
+        maf=0.0,
+        missing_rate=1.0,
+        impute=True,
+        ranges=reader_ranges,
+    ):
+        arr = np.asarray(chunk, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            continue
+
+        keep_idx: list[int] = []
+        keep_keys: list[tuple[str, int]] = []
+        for ridx, site in enumerate(sites):
+            chrom_norm = _normalize_chr(getattr(site, "chrom", ""))
+            try:
+                pos = int(getattr(site, "pos"))
+            except Exception:
+                continue
+            if not _site_in_bimrange_lookup(chrom_norm, pos, bim_lookup):
+                continue
+            key = (chrom_norm, pos)
+            if wanted is not None and key not in wanted:
+                continue
+            keep_idx.append(int(ridx))
+            keep_keys.append(key)
+
+        if len(keep_idx) == 0:
+            continue
+        if len(keep_idx) == int(arr.shape[0]):
+            geno_chunks.append(arr)
+        else:
+            idx_arr = np.asarray(keep_idx, dtype=np.int64)
+            geno_chunks.append(arr[idx_arr, :])
+        keys.extend(keep_keys)
+
+    if len(keys) == 0 or len(geno_chunks) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    x = geno_chunks[0] if len(geno_chunks) == 1 else np.vstack(geno_chunks)
+    if len(keys) > 1:
+        seen: set[tuple[str, int]] = set()
+        keep_rows: list[int] = []
+        for i, key in enumerate(keys):
+            if key in seen:
+                continue
+            seen.add(key)
+            keep_rows.append(i)
+        if len(keep_rows) != len(keys):
+            idx_arr = np.asarray(keep_rows, dtype=np.int64)
+            x = x[idx_arr, :]
+            keys = [keys[i] for i in keep_rows]
+
+    ld_mat = _ld_r2_from_geno_rows(x)
+    return ld_mat, keys
+
+
 def _compute_ld_from_bed_rust(
     genofile: str,
     bimrange_tuples: list[tuple[str, int, int]],
     *,
     selected_sites: Optional[set[tuple[str, int]]] = None,
     threads: int = 0,
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[np.ndarray, list[tuple[str, int]]]:
     """
-    Compute LD r2 matrix via Rust bitwise backend.
+    Compute LD r2 matrix with automatic backend routing.
+
+    Routing:
+      1) If an existing PLINK prefix can be resolved and Rust API is available,
+         use Rust backend (BLAS-first, bitwise fallback).
+      2) Otherwise, fallback to generic genotype reader + NumPy correlation.
 
     Returns:
       ld_r2 (float32, m x m), ld_keys [(chrom_norm, pos), ...] in matrix order.
     """
-    if not hasattr(jxrs, "bed_ldblock_r2_rust"):
-        raise RuntimeError(
-            "Rust extension missing bed_ldblock_r2_rust. Rebuild/install JanusX extension first."
-        )
     if len(bimrange_tuples) == 0:
         return np.zeros((0, 0), dtype=np.float32), []
 
-    chrom_ranges = [str(x[0]) for x in bimrange_tuples]
-    start_bp = [int(x[1]) for x in bimrange_tuples]
-    end_bp = [int(x[2]) for x in bimrange_tuples]
+    source = str(genofile).strip()
+    plink_prefix = _normalize_plink_prefix(source)
+    if not _is_existing_plink_prefix(plink_prefix):
+        plink_prefix = ""
+        source_low = source.lower()
+        delim = None
+        if source_low.endswith(".csv") or os.path.isfile(f"{source}.csv"):
+            delim = ","
+        try:
+            cached = prepare_cli_input_cache(
+                source,
+                snps_only=True,
+                delimiter=delim,
+                prefer_plink_for_txt=True,
+            )
+            cached_prefix = _normalize_plink_prefix(cached)
+            if _is_existing_plink_prefix(cached_prefix):
+                plink_prefix = cached_prefix
+                if logger is not None and cached_prefix != source:
+                    logger.info(
+                        "LD backend: using cached PLINK prefix for Rust path: "
+                        f"{format_path_for_display(cached_prefix)}"
+                    )
+        except Exception as ex:
+            if logger is not None:
+                logger.warning(
+                    "Warning: failed to materialize PLINK cache for LD backend; "
+                    f"falling back to generic path. Reason: {ex}"
+                )
+            plink_prefix = ""
 
-    kwargs: dict[str, object] = {}
-    if selected_sites is not None:
-        sel = sorted(
-            [(_normalize_chr(c), int(p)) for (c, p) in selected_sites],
-            key=lambda z: (str(z[0]), int(z[1])),
+    if plink_prefix != "" and hasattr(jxrs, "bed_ldblock_r2_rust"):
+        chrom_ranges = [str(x[0]) for x in bimrange_tuples]
+        start_bp = [int(x[1]) for x in bimrange_tuples]
+        end_bp = [int(x[2]) for x in bimrange_tuples]
+
+        kwargs: dict[str, object] = {}
+        if selected_sites is not None:
+            sel = sorted(
+                [(_normalize_chr(c), int(p)) for (c, p) in selected_sites],
+                key=lambda z: (str(z[0]), int(z[1])),
+            )
+            kwargs["selected_chrom"] = [str(x[0]) for x in sel]
+            kwargs["selected_pos"] = [int(x[1]) for x in sel]
+
+        ld_raw, chr_raw, pos_raw = jxrs.bed_ldblock_r2_rust(
+            str(plink_prefix),
+            chrom_ranges,
+            start_bp,
+            end_bp,
+            threads=int(max(0, int(threads))),
+            **kwargs,
         )
-        kwargs["selected_chrom"] = [str(x[0]) for x in sel]
-        kwargs["selected_pos"] = [int(x[1]) for x in sel]
+        ld_mat = np.ascontiguousarray(np.asarray(ld_raw, dtype=np.float32))
+        ld_keys = [(_normalize_chr(c), int(p)) for c, p in zip(list(chr_raw), list(pos_raw))]
+        if ld_mat.ndim != 2:
+            return np.zeros((0, 0), dtype=np.float32), []
+        if int(ld_mat.shape[0]) != int(ld_mat.shape[1]):
+            raise RuntimeError(f"Rust LD matrix is not square: shape={ld_mat.shape}")
+        if int(ld_mat.shape[0]) != int(len(ld_keys)):
+            raise RuntimeError(
+                f"Rust LD key count mismatch: matrix_n={ld_mat.shape[0]}, keys={len(ld_keys)}"
+            )
+        return ld_mat, ld_keys
 
-    ld_raw, chr_raw, pos_raw = jxrs.bed_ldblock_r2_rust(
-        str(genofile),
-        chrom_ranges,
-        start_bp,
-        end_bp,
-        threads=int(max(0, int(threads))),
-        **kwargs,
+    if logger is not None:
+        logger.warning(
+            "Warning: Rust LD matrix backend requires PLINK BED/BIM/FAM input; "
+            "falling back to generic genotype LD computation."
+        )
+    return _compute_ld_from_genotype_generic(
+        source,
+        bimrange_tuples,
+        selected_sites=selected_sites,
     )
-    ld_mat = np.ascontiguousarray(np.asarray(ld_raw, dtype=np.float32))
-    ld_keys = [(_normalize_chr(c), int(p)) for c, p in zip(list(chr_raw), list(pos_raw))]
-    if ld_mat.ndim != 2:
-        return np.zeros((0, 0), dtype=np.float32), []
-    if int(ld_mat.shape[0]) != int(ld_mat.shape[1]):
-        raise RuntimeError(f"Rust LD matrix is not square: shape={ld_mat.shape}")
-    if int(ld_mat.shape[0]) != int(len(ld_keys)):
-        raise RuntimeError(
-            f"Rust LD key count mismatch: matrix_n={ld_mat.shape[0]}, keys={len(ld_keys)}"
-        )
-    return ld_mat, ld_keys
 
 
 def _format_bimrange_title(item: tuple[str, int, int]) -> str:
@@ -2446,6 +2755,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
 
         plot_colors = None
         two_color_style = _resolve_two_color_style(args.palette_spec)
+        ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
         if plotmodel is not None:
             plot_colors = _manhattan_colors_for_subset(
                 args.palette_spec,
@@ -2773,6 +3083,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         args.bimrange_tuples if args.bimrange_tuples is not None else [],
                         selected_sites=ld_sites,
                         threads=int(max(0, int(getattr(args, "thread", 0)))),
+                        logger=logger,
                     )
                     # Keep Manhattan->gene/LD mapping lines even when genotype lookup fails:
                     # fallback to GWAS-derived ld_site_keys if no matched genotype SNP is returned.
@@ -2821,10 +3132,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             ld_cmap = "Greys"
             gene_block_color = "grey"
             gene_line_color = "black"
-            if two_color_style is not None:
-                ld_cmap = two_color_style["ld_cmap"]
-                gene_block_color = str(two_color_style["gene_block_color"])
-                gene_line_color = str(two_color_style["gene_line_color"])
+            if ldblock_style is not None:
+                ld_cmap = ldblock_style["ld_cmap"]
+                gene_block_color = str(ldblock_style["gene_block_color"])
+                gene_line_color = str(ldblock_style["gene_line_color"])
 
             def _draw_ld_axis(ax: plt.Axes) -> None:
                 LDblock(
@@ -3413,7 +3724,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     logger.info("* Visualizing merged Manhattan plot...")
 
     series_colors = _resolve_merge_series_colors(args.palette_spec, len(files))
-    two_color_style = _resolve_two_color_style(args.palette_spec)
+    ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
 
     frames_raw: list[pd.DataFrame] = []
     chrom_sets: list[tuple[int, str, set[str]]] = []
@@ -3808,6 +4119,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     region_ranges,
                     selected_sites=ld_sites,
                     threads=int(max(0, int(getattr(args, "thread", 0)))),
+                    logger=logger,
                 )
                 missing_n = int(len(ld_sites) - len(set(sig_keys)))
                 if missing_n > 0:
@@ -3829,10 +4141,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ld_cmap = "Greys"
         gene_block_color = "grey"
         gene_line_color = "black"
-        if two_color_style is not None:
-            ld_cmap = two_color_style["ld_cmap"]
-            gene_block_color = str(two_color_style["gene_block_color"])
-            gene_line_color = str(two_color_style["gene_line_color"])
+        if ldblock_style is not None:
+            ld_cmap = ldblock_style["ld_cmap"]
+            gene_block_color = str(ldblock_style["gene_block_color"])
+            gene_line_color = str(ldblock_style["gene_line_color"])
 
         ld_h_in = width_in / effective_ldblock_ratio
         ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
@@ -4014,6 +4326,7 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             list(args.bimrange_tuples),
             selected_sites=None,
             threads=int(max(0, int(getattr(args, "thread", 0)))),
+            logger=logger,
         )
         n_sites = int(ld_mat.shape[0])
         if n_sites < 2:
@@ -4028,14 +4341,14 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     if args.genofile is None:
         ld_site_keys = []
 
-    two_color_style = _resolve_two_color_style(args.palette_spec)
+    ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
     ld_cmap = "Greys"
     gene_block_color = "grey"
     gene_line_color = "black"
-    if two_color_style is not None:
-        ld_cmap = two_color_style["ld_cmap"]
-        gene_block_color = str(two_color_style["gene_block_color"])
-        gene_line_color = str(two_color_style["gene_line_color"])
+    if ldblock_style is not None:
+        ld_cmap = ldblock_style["ld_cmap"]
+        gene_block_color = str(ldblock_style["gene_block_color"])
+        gene_line_color = str(ldblock_style["gene_line_color"])
 
     region_ranges = list(args.bimrange_tuples)
     ld_spans = _ld_bimrange_spans(ld_site_keys, region_ranges)
@@ -4366,7 +4679,9 @@ def main():
             "using only threshold-passing SNPs. Requires --bimrange. "
             "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
             "(then ratio defaults to 2). "
-            "If only ratio is given, x-span defaults to 0:1."
+            "If only ratio is given, x-span defaults to 0:1. "
+            "You may also pass a colormap/palette token here (e.g. tab10 or white;yellow;red), "
+            "which keeps ratio=2 by default."
         ),
     )
     ldblock_group.add_argument(
@@ -4376,7 +4691,9 @@ def main():
             "using all SNPs in selected bimrange. Requires --bimrange. "
             "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
             "(then ratio defaults to 2). "
-            "If only ratio is given, x-span defaults to 0:1."
+            "If only ratio is given, x-span defaults to 0:1. "
+            "You may also pass a colormap/palette token here (e.g. tab10 or white;yellow;red), "
+            "which keeps ratio=2 by default."
         ),
     )
     plot_group.add_argument(
@@ -4455,9 +4772,21 @@ def main():
             "Manhattan color palette (QQ keeps black/grey). "
             "Supports cmap names (e.g. tab10, tab20) or ';'-separated colors "
             "(e.g. #1f77b4;#ff7f0e or (215,123,254);(1,1,1)). "
-            "A single color is also accepted and auto-expanded to light/dark pair "
-            "by grayscale direction for LD/gene (Manhattan keeps single-color). "
+            "A single color is also accepted; Manhattan keeps single-color, "
+            "and QQ auto-expands it to a light/dark pair. "
             "If omitted, use default black/grey."
+        ),
+    )
+    optional_group.add_argument(
+        "--ldblock-palette", "--ldblock-pallete",
+        dest="ldblock_palette",
+        type=str,
+        default=None,
+        help=(
+            "LD block colormap only (independent from --palette). "
+            "Supports cmap names (e.g. tab10/tab20) or color lists "
+            "like 'white;yellow;red' or 'white,yellow,red'. "
+            "If omitted, LD block keeps default greyscale."
         ),
     )
     optional_group.add_argument(
@@ -4564,6 +4893,11 @@ def main():
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
+    try:
+        args.ldblock_palette_spec = _parse_palette_spec(args.ldblock_palette)
+    except ValueError as e:
+        logger.error(str(e))
+        raise SystemExit(1)
 
     try:
         args.manh_ratio = _parse_ratio(args.manh, "Manhattan") if args.manh is not None else None
@@ -4581,20 +4915,49 @@ def main():
         args.qq_ratio = float(_QQ_FIXED_RATIO)
 
     try:
+        args.ldblock_ratio = None
+        args.ldblock_xspan = None
+        args.ldblock_mode = None
         if args.ldblock_all is not None:
-            args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
-                args.ldblock_all, "LDBlock-all", logger
-            )
+            try:
+                args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
+                    args.ldblock_all, "LDBlock-all", logger
+                )
+            except ValueError as ratio_err:
+                try:
+                    pal_spec = _parse_palette_spec(args.ldblock_all)
+                except ValueError:
+                    logger.error(str(ratio_err))
+                    raise SystemExit(1)
+                if pal_spec is None:
+                    logger.error(str(ratio_err))
+                    raise SystemExit(1)
+                args.ldblock_ratio, args.ldblock_xspan = 2.0, (0.0, 1.0)
+                if args.ldblock_palette_spec is None:
+                    args.ldblock_palette_spec = pal_spec
+                    args.ldblock_palette = str(args.ldblock_all)
             args.ldblock_mode = "all"
         elif args.ldblock is not None:
-            args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
-                args.ldblock, "LDBlock", logger
-            )
+            try:
+                args.ldblock_ratio, args.ldblock_xspan = _parse_ldblock_spec(
+                    args.ldblock, "LDBlock", logger
+                )
+            except ValueError as ratio_err:
+                try:
+                    pal_spec = _parse_palette_spec(args.ldblock)
+                except ValueError:
+                    logger.error(str(ratio_err))
+                    raise SystemExit(1)
+                if pal_spec is None:
+                    logger.error(str(ratio_err))
+                    raise SystemExit(1)
+                args.ldblock_ratio, args.ldblock_xspan = 2.0, (0.0, 1.0)
+                if args.ldblock_palette_spec is None:
+                    args.ldblock_palette_spec = pal_spec
+                    args.ldblock_palette = str(args.ldblock)
             args.ldblock_mode = "threshold"
-        else:
-            args.ldblock_ratio = None
-            args.ldblock_xspan = None
-            args.ldblock_mode = None
+    except SystemExit:
+        raise
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
@@ -4809,8 +5172,17 @@ def main():
                 if args.ldblock_xspan is None
                 else f"{args.ldblock_xspan[0]:g}-{args.ldblock_xspan[1]:g} (fraction of Manhattan width)"
             )
+            ld_pal_text = (
+                "default (greys)"
+                if args.ldblock_palette_spec is None
+                else str(args.ldblock_palette)
+            )
             vis_rows.append(
-                ("LDBlock", f"ratio={args.ldblock_ratio}, mode={ld_mode_text}, x-span={ld_xspan_text}")
+                (
+                    "LDBlock",
+                    f"ratio={args.ldblock_ratio}, mode={ld_mode_text}, "
+                    f"x-span={ld_xspan_text}, palette={ld_pal_text}",
+                ),
             )
     anno_rows: Optional[list[tuple[str, str]]] = None
     if args.anno:

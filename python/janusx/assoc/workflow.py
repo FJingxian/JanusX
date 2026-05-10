@@ -23,8 +23,8 @@ Caching
   - Genotype cache uses a single base cache prefix (no JSON cache metadata):
       * genotype cache (VCF/HMP): ~{geno_prefix}.bed/.bim/.fam
   - GRM and PCA caches for streaming LMM/LM runs remain parameterized:
-      * GRM cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.npy (+ .id)
-      * PCA cache:      ~{geno_prefix}.maf{maf}.geno{geno}.grm{k}.pc{q}.txt
+      * GRM cache:      ~{geno_prefix}.maf{maf}.geno{geno}.cGRM.npy / sGRM.npy (+ .id)
+      * PCA cache:      ~{geno_prefix}.maf{maf}.geno{geno}.cGRM.pc{q}.txt / sGRM.pc{q}.txt
   - If genotype directory is not writable, cache falls back to
     JANUSX_CACHE_DIR (configured from -o).
 
@@ -142,8 +142,10 @@ from janusx.assoc.workflow_cache import (
     _dedupe_cache_warning_messages,
     _gwas_cache_prefix_with_params,
     _grm_cache_paths,
+    _grm_cache_paths_legacy,
     _is_cache_warning_message,
     _pca_cache_path,
+    _pca_cache_path_legacy,
     _cache_lock,
     genotype_cache_prefix,
 )
@@ -620,8 +622,10 @@ def _split_cov_sources(cov_inputs: list[str]) -> tuple[list[str], list[tuple[str
 
 def _format_grm_display(grm_opt: object) -> str:
     s = str(grm_opt if grm_opt is not None else "").strip()
-    if s in {"1", "2"}:
-        return s
+    if s == "1":
+        return "cGRM"
+    if s == "2":
+        return "sGRM"
     if s == "":
         return ""
     return _basename_only(s)
@@ -1780,7 +1784,22 @@ def load_or_build_grm_with_cache(
     grm_ids = None
     if method_is_builtin:
         grm_path, id_path = _grm_cache_paths(cache_prefix, mgrm=str(mgrm))
+        legacy_grm_path, legacy_id_path = _grm_cache_paths_legacy(
+            cache_prefix, mgrm=str(mgrm)
+        )
         with _cache_lock(grm_path):
+            if (not os.path.exists(grm_path)) and os.path.exists(legacy_grm_path):
+                try:
+                    os.replace(legacy_grm_path, grm_path)
+                    if os.path.exists(legacy_id_path) and (not os.path.exists(id_path)):
+                        os.replace(legacy_id_path, id_path)
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"Migrated legacy GRM cache name: {legacy_grm_path} -> {grm_path}",
+                    )
+                except Exception:
+                    pass
             cache_is_stale = False
             if os.path.exists(grm_path):
                 g_mtime = latest_genotype_mtime(genofile)
@@ -1791,7 +1810,7 @@ def load_or_build_grm_with_cache(
                         "Genotype input is newer than cached GRM; rebuilding GRM cache."
                     )
             if cache_is_stale:
-                for p in (grm_path, id_path):
+                for p in (grm_path, id_path, legacy_grm_path, legacy_id_path):
                     if os.path.exists(p):
                         try:
                             os.remove(p)
@@ -1993,7 +2012,18 @@ def load_or_build_q_with_cache(
     if qdim > 0:
         dim = int(qdim)
         q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
+        legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(dim))
         with _cache_lock(q_path):
+            if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
+                try:
+                    os.replace(legacy_q_path, q_path)
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        f"Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}",
+                    )
+                except Exception:
+                    pass
             cache_ready = os.path.isfile(q_path)
             if cache_ready:
                 g_mtime = latest_genotype_mtime(genofile)
@@ -2224,6 +2254,17 @@ def prepare_streaming_context(
     if pcdim in np.arange(1, n_samples).astype(str):
         qdim = int(pcdim)
         q_path = _pca_cache_path(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
+        legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
+        if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
+            try:
+                os.replace(legacy_q_path, q_path)
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}",
+                )
+            except Exception:
+                pass
         if not os.path.isfile(q_path):
             need_generate_q = True
         else:

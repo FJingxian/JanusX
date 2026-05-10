@@ -61,7 +61,7 @@ jx grm -bfile test/mouse_hs1940 -o test -m 2
 jx pca -bfile test/mouse_hs1940 -o test
 jx pca -bfile test/mouse_hs1940 -rsvd -o test
 jx gwas -bfile test/mouse_hs1940 -p example/mouse_hs1940.pheno \
-    -farmcpu -lmm -lm -fastlmm -k test/mouse_hs1940.grm.txt -c test/mouse_hs1940.eigenvec \
+    -farmcpu -lmm -lm -fastlmm -k test/mouse_hs1940.cGRM.txt -c test/mouse_hs1940.eigenvec \
     -o test
 jx postgwas -gwasfile $(find test/mouse_hs1940.test*.tsv | grep -v gs) -bfile test/mouse_hs1940 \
     -manh 4 -qq -scatter-size 16 -fmt pdf -full -palette tab10 \

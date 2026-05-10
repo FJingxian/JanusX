@@ -4,18 +4,28 @@ from __future__ import annotations
 import argparse
 import ctypes
 import glob
+import importlib.util
 import os
 import subprocess
 import sys
 
 
-def _find_bundled_openblas() -> str:
-    import janusx.janusx as jx
+def _janusx_pkg_dir() -> str:
+    spec = importlib.util.find_spec("janusx")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("cannot locate installed janusx package directory")
+    for p in spec.submodule_search_locations:
+        if p:
+            return str(p)
+    raise RuntimeError("cannot locate installed janusx package directory")
 
-    root = os.path.dirname(jx.__file__)
+
+def _find_bundled_openblas() -> str:
+    pkg_dir = _janusx_pkg_dir()
+    root_parent = os.path.dirname(pkg_dir)
     cands = sorted(
-        glob.glob(os.path.join(os.path.dirname(root), "janusx.libs", "libopenblas*.so*"))
-        + glob.glob(os.path.join(os.path.dirname(root), "janusx.libs", "libopenblas*.dylib"))
+        glob.glob(os.path.join(root_parent, "janusx.libs", "libopenblas*.so*"))
+        + glob.glob(os.path.join(root_parent, "janusx.libs", "libopenblas*.dylib"))
     )
     if not cands:
         raise RuntimeError("bundled libopenblas not found in janusx.libs")
@@ -26,10 +36,8 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
     if sys.platform != "darwin":
         raise RuntimeError("--check-macos-bundled-openblas only supports macOS runners")
 
-    import janusx.janusx as jx
-
-    root = os.path.dirname(jx.__file__)
-    libs_dir = os.path.join(os.path.dirname(root), "janusx.libs")
+    pkg_dir = _janusx_pkg_dir()
+    libs_dir = os.path.join(os.path.dirname(pkg_dir), "janusx.libs")
     dylibs = sorted(glob.glob(os.path.join(libs_dir, "*.dylib")))
     if not dylibs:
         raise RuntimeError(f"no bundled dylibs found under {libs_dir}")
@@ -93,12 +101,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    import janusx.janusx as jx
+    need_native_import = (
+        args.require_openblas or args.require_threaded_openblas or args.check_kmc_load
+    )
+    if need_native_import:
+        import janusx.janusx as jx
 
-    backend = jx.rust_sgemm_backend()
-    print(f"[check_installed_runtime] rust_sgemm_backend={backend}")
-    if args.require_openblas and backend != "openblas":
-        raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
+        backend = jx.rust_sgemm_backend()
+        print(f"[check_installed_runtime] rust_sgemm_backend={backend}")
+        if args.require_openblas and backend != "openblas":
+            raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
 
     if args.require_threaded_openblas:
         libpath = _find_bundled_openblas()

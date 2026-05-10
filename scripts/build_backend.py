@@ -446,6 +446,18 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
     if len(dylibs) == 0:
         return
 
+    def _is_omp_family(name: str) -> bool:
+        low = name.lower()
+        return low.startswith("libomp") or low.startswith("libgomp")
+
+    omp_canonical_name: str | None = None
+    if "libomp.dylib" in by_name:
+        omp_canonical_name = "libomp.dylib"
+    else:
+        omp_candidates = sorted(n for n in by_name.keys() if _is_omp_family(n))
+        if len(omp_candidates) > 0:
+            omp_canonical_name = omp_candidates[0]
+
     def _run_install_name_tool(args: list[str]) -> None:
         try:
             subprocess.run(
@@ -483,12 +495,22 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
 
     # Normalize dylib id so dependencies can resolve from wheel-local directory.
     for lib in dylibs:
-        _run_install_name_tool(["-id", f"@loader_path/{lib.name}", str(lib)])
+        id_name = lib.name
+        # Keep one logical OpenMP runtime id across libomp/libgomp aliases.
+        # This prevents accidental double-loading of the same runtime family.
+        if omp_canonical_name is not None and _is_omp_family(lib.name):
+            id_name = omp_canonical_name
+        _run_install_name_tool(["-id", f"@loader_path/{id_name}", str(lib)])
 
     # Rewrite intra-bundle references to @loader_path/<name>.
     for lib in dylibs:
         for dep in _otool_libraries(lib):
             dep_name = Path(dep).name
+            if omp_canonical_name is not None and _is_omp_family(dep_name):
+                replacement = f"@loader_path/{omp_canonical_name}"
+                if dep != replacement:
+                    _run_install_name_tool(["-change", dep, replacement, str(lib)])
+                continue
             if dep_name not in by_name:
                 continue
             replacement = f"@loader_path/{dep_name}"

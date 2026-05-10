@@ -531,6 +531,14 @@ jobs:
               raise SystemExit(f"Strict mode failed: expected {expected!r} backend, got {backend!r}")
           PY
 
+      - name: Verify bundled macOS dylib signature + load probe
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" scripts/ci/check_installed_runtime.py --check-macos-bundled-openblas
+
       - name: Verify Rust eigh LAPACK backend (windows-x86_64)
         if: ${{ matrix.label == 'windows-x86_64' }}
         shell: bash

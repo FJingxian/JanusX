@@ -5,6 +5,8 @@ import argparse
 import ctypes
 import glob
 import os
+import subprocess
+import sys
 
 
 def _find_bundled_openblas() -> str:
@@ -18,6 +20,46 @@ def _find_bundled_openblas() -> str:
     if not cands:
         raise RuntimeError("bundled libopenblas not found in janusx.libs")
     return cands[0]
+
+
+def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("--check-macos-bundled-openblas only supports macOS runners")
+
+    import janusx.janusx as jx
+
+    root = os.path.dirname(jx.__file__)
+    libs_dir = os.path.join(os.path.dirname(root), "janusx.libs")
+    dylibs = sorted(glob.glob(os.path.join(libs_dir, "*.dylib")))
+    if not dylibs:
+        raise RuntimeError(f"no bundled dylibs found under {libs_dir}")
+
+    codesign_bin = "/usr/bin/codesign" if os.path.isfile("/usr/bin/codesign") else "codesign"
+    for dylib in dylibs:
+        proc = subprocess.run(
+            [codesign_bin, "--verify", "--verbose=2", dylib],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        print(
+            f"[check_installed_runtime] codesign_verify={os.path.basename(dylib)} rc={proc.returncode}"
+        )
+        if proc.returncode != 0:
+            detail = (proc.stdout or "").strip()
+            raise RuntimeError(
+                f"codesign verification failed for {dylib}: {detail}"
+            )
+
+    libpath = str(os.environ.get("JX_OPENBLAS_LIB_PATH", "")).strip()
+    if not libpath:
+        libpath = _find_bundled_openblas()
+    if not os.path.isfile(libpath):
+        raise RuntimeError(f"JX_OPENBLAS_LIB_PATH does not exist: {libpath}")
+
+    print(f"[check_installed_runtime] probing_cdll={libpath}")
+    _ = ctypes.CDLL(libpath)
+    print("[check_installed_runtime] macOS bundled OpenBLAS load probe passed")
 
 
 def main() -> int:
@@ -39,6 +81,15 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Try loading janusx.kmc_bind prebuilt module with CXX disabled.",
+    )
+    parser.add_argument(
+        "--check-macos-bundled-openblas",
+        action="store_true",
+        default=False,
+        help=(
+            "On macOS, verify codesign for bundled janusx.libs/*.dylib and probe "
+            "ctypes.CDLL load for bundled OpenBLAS."
+        ),
     )
     args = parser.parse_args()
 
@@ -76,6 +127,9 @@ def main() -> int:
 
         mod = load_kmc_bind_module(verbose=False)
         print(f"[check_installed_runtime] kmc_bind_loaded={mod.__name__}")
+
+    if args.check_macos_bundled_openblas:
+        _check_macos_bundled_openblas_signature_and_probe_load()
 
     return 0
 

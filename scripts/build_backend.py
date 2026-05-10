@@ -461,6 +461,26 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
                 f"install_name_tool failed: {' '.join(args)}; {out}"
             ) from exc
 
+    def _run_codesign(path: Path) -> None:
+        # install_name_tool mutates Mach-O load commands and invalidates the
+        # existing signature; re-sign ad-hoc so dlopen() will not be killed.
+        cmd = ["/usr/bin/codesign", "--force", "--sign", "-", str(path)]
+        if not Path(cmd[0]).is_file():
+            cmd[0] = "codesign"
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            out = str(exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(
+                f"codesign failed for {path.name}: {out}"
+            ) from exc
+
     # Normalize dylib id so dependencies can resolve from wheel-local directory.
     for lib in dylibs:
         _run_install_name_tool(["-id", f"@loader_path/{lib.name}", str(lib)])
@@ -475,6 +495,9 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
             if dep == replacement:
                 continue
             _run_install_name_tool(["-change", dep, replacement, str(lib)])
+
+    for lib in dylibs:
+        _run_codesign(lib)
 
 
 def _inject_artifacts_into_wheel(

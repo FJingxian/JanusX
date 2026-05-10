@@ -36,8 +36,17 @@ if [[ "${MODE}" == "smoke" ]]; then
   echo "SMOKE 2. GWAS runtime check (LM/LMM/FastLMM/FarmCPU)"
   jx grm -bfile test/mouse_hs1940 -o test
   jx pca -bfile test/mouse_hs1940 -o test
+  GRM_K="test/mouse_hs1940.cGRM.txt"
+  if [[ ! -f "${GRM_K}" && -f test/mouse_hs1940.grm.txt ]]; then
+    GRM_K="test/mouse_hs1940.grm.txt"
+  fi
+  [[ -f "${GRM_K}" ]] || {
+    echo "ERROR: GRM file not found for smoke GWAS (-k)."
+    ls -l test/mouse_hs1940*.cGRM.* test/mouse_hs1940*.sGRM.* test/mouse_hs1940*.grm.* 2>/dev/null || true
+    exit 1
+  }
   jx gwas -bfile test/mouse_hs1940 -p example/mouse_hs1940.pheno \
-      -farmcpu -lmm -lm -fastlmm -k test/mouse_hs1940.grm.txt -c test/mouse_hs1940.eigenvec \
+      -farmcpu -lmm -lm -fastlmm -k "${GRM_K}" -c test/mouse_hs1940.eigenvec \
       -t "${THREADS}" -o test
   echo "============================================"
 

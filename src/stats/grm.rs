@@ -221,8 +221,7 @@ fn decode_grm_stream_block_parallel_into(
             vars[..scan_rows].fill(0.0_f64);
         }
         let row_base = cur_rows;
-        let scan_slice =
-            &mut out_block[row_base * n_samples..(row_base + scan_rows) * n_samples];
+        let scan_slice = &mut out_block[row_base * n_samples..(row_base + scan_rows) * n_samples];
 
         let mut run = || {
             let it_ref: &BedSnpIter = &*it;
@@ -239,7 +238,13 @@ fn decode_grm_stream_block_parallel_into(
                         return;
                     };
                     let Some((prep, var)) = grm_stream_row_prepare_from_stats(
-                        method, maf_thr, miss_thr, eps, n_samples, alt_sum, non_missing,
+                        method,
+                        maf_thr,
+                        miss_thr,
+                        eps,
+                        n_samples,
+                        alt_sum,
+                        non_missing,
                     ) else {
                         return;
                     };
@@ -312,7 +317,9 @@ fn decode_grm_stream_block_dispatch(
             pool,
         )
     } else {
-        decode_grm_stream_block_into(it, out_block, row_step, n_samples, method, maf_thr, miss_thr, eps)
+        decode_grm_stream_block_into(
+            it, out_block, row_step, n_samples, method, maf_thr, miss_thr, eps,
+        )
     }
 }
 
@@ -565,9 +572,8 @@ fn write_npy_f32_matrix(path: &str, data: &[f32], rows: usize, cols: usize) -> R
     let f = File::create(path).map_err(|e| format!("create npy file failed: {e}"))?;
     let mut w = BufWriter::new(f);
 
-    let mut header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}"
-    );
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}");
     while (10 + header.len() + 1) % 16 != 0 {
         header.push(' ');
     }
@@ -721,10 +727,7 @@ fn grm_stream_block_rows(requested_block_rows: usize, m: usize, n_samples: usize
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(65_536usize);
-    base.min(cap_rows)
-        .min(max_rows)
-        .max(1)
-        .min(m.max(1))
+    base.min(cap_rows).min(max_rows).max(1).min(m.max(1))
 }
 
 #[inline]
@@ -896,7 +899,12 @@ fn grm_probe_accum_mode_f32(_block: &[f32], _rows: usize, _n: usize) -> GrmAccum
 }
 
 #[inline]
-fn resolve_grm_accum_mode_f32(mode: GrmAccumMode, block: &[f32], rows: usize, n: usize) -> GrmAccumMode {
+fn resolve_grm_accum_mode_f32(
+    mode: GrmAccumMode,
+    block: &[f32],
+    rows: usize,
+    n: usize,
+) -> GrmAccumMode {
     if mode == GrmAccumMode::Auto {
         grm_probe_accum_mode_f32(block, rows, n)
     } else {
@@ -1426,8 +1434,8 @@ pub fn grm_packed_f32<'py>(
             matches!(t.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false);
-    let accum_mode = grm_accum_mode_from_env("JX_GRM_PACKED_ACCUM")
-        .map_err(PyRuntimeError::new_err)?;
+    let accum_mode =
+        grm_accum_mode_from_env("JX_GRM_PACKED_ACCUM").map_err(PyRuntimeError::new_err)?;
 
     let grm_vec = py
         .detach(move || -> Result<Vec<f32>, String> {
@@ -1984,8 +1992,8 @@ pub fn grm_stream_bed_f32<'py>(
     } else {
         1usize
     };
-    let parallel_decode_pref = std::env::var("JX_GRM_STREAM_PAR_DECODE")
-        .unwrap_or_else(|_| "auto".to_string());
+    let parallel_decode_pref =
+        std::env::var("JX_GRM_STREAM_PAR_DECODE").unwrap_or_else(|_| "auto".to_string());
     let parallel_decode_pref_lc = parallel_decode_pref.trim().to_ascii_lowercase();
     let parallel_decode_min_samples = std::env::var("JX_GRM_STREAM_PAR_DECODE_MIN_SAMPLES")
         .ok()
@@ -2030,8 +2038,8 @@ pub fn grm_stream_bed_f32<'py>(
             matches!(t.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false);
-    let accum_mode = grm_accum_mode_from_env("JX_GRM_STREAM_ACCUM")
-        .map_err(PyRuntimeError::new_err)?;
+    let accum_mode =
+        grm_accum_mode_from_env("JX_GRM_STREAM_ACCUM").map_err(PyRuntimeError::new_err)?;
     let stream_prestat_core_requested = std::env::var("JX_GRM_STREAM_PRESTAT_CORE")
         .ok()
         .map(|s| {

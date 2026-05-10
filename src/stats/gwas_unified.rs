@@ -6,7 +6,7 @@ use pyo3::types::{PyDict, PyList};
 use crate::assoc::farmcpu_packed_to_tsv;
 use crate::glm::glmf32_packed_assoc_to_tsv;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
-use crate::lmm_scan::fastlmm_assoc_packed_f32_to_tsv;
+use crate::lmm_scan::{fastlmm_assoc_packed_f32_to_tsv, lmm_reml_assoc_packed_f32_to_tsv};
 
 fn req_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
     d.get_item(key)?.ok_or_else(|| {
@@ -404,7 +404,74 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                 )?;
                 result_obj.set_item("written_rows", n_written)?;
             }
-            "lmm" | "fastlmm" => {
+            "lmm" => {
+                let s: PyReadonlyArray1<'py, f64> = req_item(&job, "s")?.extract()?;
+                let xcov: PyReadonlyArray2<'py, f64> = req_item(&job, "xcov")?.extract()?;
+                let y_rot: PyReadonlyArray1<'py, f64> = req_item(&job, "y_rot")?.extract()?;
+                let u_t: PyReadonlyArray2<'py, f32> = req_item(&job, "u_t")?.extract()?;
+                let sample_indices: Option<PyReadonlyArray1<'py, i64>> =
+                    match opt_item(&job, "sample_indices")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let scan_progress_callback: Option<Py<PyAny>> =
+                    match opt_item(&job, "scan_progress_callback")? {
+                        Some(v) if !v.is_none() => Some(v.extract()?),
+                        _ => None,
+                    };
+                let low: f64 = opt_item(&job, "low")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(-5.0);
+                let high: f64 = opt_item(&job, "high")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(5.0);
+                let max_iter: usize = opt_item(&job, "max_iter")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(50);
+                let tol: f64 = opt_item(&job, "tol")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(1e-2);
+                let genetic_model: String = opt_item(&job, "genetic_model")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or_else(|| "add".to_string());
+                let nullml: Option<f64> = opt_item(&job, "nullml")?.and_then(|v| v.extract().ok());
+                let init_log10_lbd: Option<f64> =
+                    opt_item(&job, "init_log10_lbd")?.and_then(|v| v.extract().ok());
+                let rotate_block_rows: usize = opt_item(&job, "rotate_block_rows")?
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or(256usize);
+
+                let n_written = lmm_reml_assoc_packed_f32_to_tsv(
+                    py,
+                    packed.clone(),
+                    n_samples,
+                    row_flip.clone(),
+                    row_maf.clone(),
+                    s,
+                    xcov,
+                    y_rot,
+                    u_t,
+                    chrom.clone(),
+                    pos.clone(),
+                    allele0.clone(),
+                    allele1.clone(),
+                    out_tsv.as_str(),
+                    sample_indices,
+                    low,
+                    high,
+                    max_iter,
+                    tol,
+                    threads,
+                    genetic_model.as_str(),
+                    scan_progress_callback,
+                    progress_every_use,
+                    nullml,
+                    init_log10_lbd,
+                    rotate_block_rows,
+                )?;
+                result_obj.set_item("written_rows", n_written)?;
+            }
+            "fastlmm" => {
                 let y: PyReadonlyArray1<'py, f64> = req_item(&job, "y")?.extract()?;
                 let u: PyReadonlyArray2<'py, f32> = req_item(&job, "u")?.extract()?;
                 let s: PyReadonlyArray1<'py, f32> = req_item(&job, "s")?.extract()?;

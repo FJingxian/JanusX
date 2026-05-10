@@ -1922,6 +1922,8 @@ def build_pcs_from_grm(
 ) -> np.ndarray:
     """
     Compute leading principal components from GRM.
+
+    GWAS policy: enforce Rust eigh backend for PCA construction.
     """
     if use_spinner:
         with CliStatus(f"Computing top {dim} PCs from GRM...", enabled=True) as task:
@@ -1931,6 +1933,7 @@ def build_pcs_from_grm(
                     threads=int(threads),
                     logger=logger,
                     stage_label="GWAS-PCA",
+                    require_rust=True,
                 )
                 pcs = eigvec[:, -dim:]
             except Exception:
@@ -1949,6 +1952,7 @@ def build_pcs_from_grm(
         threads=int(threads),
         logger=logger,
         stage_label="GWAS-PCA",
+        require_rust=True,
     )
     pcs = eigvec[:, -dim:]
     logger.info("PC computation finished.")
@@ -1975,6 +1979,8 @@ def load_or_build_q_with_cache(
     Load or build Q matrix (PCs) with caching for streaming LMM/LM.
     Note: external Q file via -q is no longer supported; pass external
     covariate matrices via -c.
+
+    GWAS policy: when PCA needs to be computed from GRM, enforce Rust eigh.
     """
     n = int(n_samples)
     qdim = _parse_qcov_dim(pcdim)
@@ -2024,6 +2030,7 @@ def load_or_build_q_with_cache(
                     threads=int(threads),
                     logger=logger,
                     stage_label="GWAS-Q-build",
+                    require_rust=True,
                 )
                 qmatrix = np.asarray(eigvec[:, -dim:], dtype="float32")
                 pc_msg = (

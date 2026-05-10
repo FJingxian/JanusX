@@ -15,14 +15,13 @@ Input modes:
 PCA computation strategy
 ------------------------
   - For VCF/BFILE:
-      * Stream genotypes via rust2py.gfreader.load_genotype_chunks.
-      * Build the GRM in a low-memory, chunk-based fashion.
-      * Perform eigendecomposition of the GRM using numpy.linalg.eigh.
+      * Build GRM via Rust kernels from PLINK BED/cache.
+      * Perform eigendecomposition of GRM via Rust LAPACK backend.
       * Optional: --rsvd uses Rust streaming randomized SVD directly.
 
   - For GRM:
       * Read the precomputed GRM from .grm.txt or .grm.npy.
-      * Perform eigendecomposition using numpy.linalg.eigh.
+      * Perform eigendecomposition via Rust LAPACK backend.
 
   - For QCOV:
       * Load PC coordinates and eigenvalues directly.
@@ -83,7 +82,6 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
 from ._common.status import CliStatus, format_elapsed, log_success, stdout_is_tty
 from ._common.genocache import configure_genotype_cache_from_out
@@ -133,6 +131,29 @@ def _resolve_txt_matrix_path(path_or_prefix: str) -> Union[str, None]:
         if os.path.isfile(cand):
             return cand
     return None
+
+
+def _resolve_rust_grm_input_for_pca(
+    genofile: str,
+    *,
+    snps_only: bool,
+) -> str:
+    p = str(genofile).strip()
+    if _is_plink_prefix_path(p):
+        return p
+    delim = "," if p.lower().endswith(".csv") else None
+    cached = prepare_cli_input_cache(
+        p,
+        snps_only=bool(snps_only),
+        delimiter=delim,
+        prefer_plink_for_txt=True,
+    )
+    if not _is_plink_prefix_path(str(cached)):
+        raise RuntimeError(
+            "PCA Rust GRM backend requires PLINK BED input/cache prefix. "
+            f"failed source={genofile}"
+        )
+    return str(cached)
 
 
 def _txt_is_discrete_012_matrix(matrix_path: str) -> bool:
@@ -493,76 +514,84 @@ def build_grm_streaming_for_pca(
     inspected_meta: Optional[tuple[list[str], int]] = None,
     logger=None,
     emit_progress_done: bool = True,
+    snps_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
-    Construct the GRM in streaming mode via rust2py.gfreader.load_genotype_chunks
+    Construct the GRM in streaming mode via Rust BED kernel
     and return (GRM, sample_ids, effective_snp_count).
-
-    This follows the same strategy as the GWAS module:
-      - genotypes are read in chunks
-      - SNPs are filtered by MAF and missing rate inside the Rust reader
-      - genotypes are centered by allele frequency
-      - GRM is accumulated and symmetrized at the end
     """
+    if not hasattr(jxrs, "grm_stream_bed_f32"):
+        raise RuntimeError(
+            "Rust extension is missing grm_stream_bed_f32. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    rust_input = _resolve_rust_grm_input_for_pca(
+        str(genofile),
+        snps_only=bool(snps_only),
+    )
+
     # Inspect genotype meta information
-    if inspected_meta is None:
-        sample_ids_raw, n_snps = inspect_genotype_file(genofile)
+    if inspected_meta is None or (str(rust_input) != str(genofile)):
+        sample_ids_raw, n_snps = inspect_genotype_file(
+            rust_input,
+            snps_only=bool(snps_only),
+            maf=float(maf_threshold),
+            missing_rate=float(max_missing_rate),
+        )
     else:
         sample_ids_raw, n_snps = inspected_meta
     sample_ids = np.array(sample_ids_raw, dtype=str)
     n_samples = len(sample_ids)
-
-    grm = np.zeros((n_samples, n_samples), dtype="float32")
     pbar = ProgressAdapter(
         total=n_snps,
-        desc="GRM (streaming)",
+        desc="GRM (rust-stream)",
         emit_done=bool(emit_progress_done),
         force_animate=True,
     )
     process = psutil.Process()
 
-    varsum = 0.0
-    eff_m = 0
-    mmap_window_mb = (
-        auto_mmap_window_mb(genofile, n_samples, n_snps, chunk_size)
-        if mmap_limit else None
-    )
-    prefetch_depth = 2
-    chunk_iter = load_genotype_chunks(
-        genofile,
-        chunk_size,
-        maf_threshold,
-        max_missing_rate,
-        mmap_window_mb=mmap_window_mb,
-    )
-    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-        # genosub: (m_chunk, n_samples)
-        # MAF per SNP
-        maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2
-        # Center genotypes: G' = G - 2p
-        genosub = genosub - 2 * maf
+    mem_tick_span = max(1, 10 * int(chunk_size))
+    last_done = 0
 
-        # Method 1: standard centered GRM (same as GWAS module default)
-        grm += genosub.T @ genosub
-        varsum += float(np.sum(2 * maf * (1 - maf)))
-
-        eff_m += genosub.shape[0]
-        pbar.update(genosub.shape[0])
-
-        # Periodic memory logging
-        if eff_m % (10 * chunk_size) == 0:
+    def _progress_cb(done: int, _total: int) -> None:
+        nonlocal last_done
+        d = int(done)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    # Force progress bar to 100% even if some SNPs were filtered in Rust
-    pbar.finish()
-    pbar.close()
+    mmap_window_mb = (
+        auto_mmap_window_mb(rust_input, n_samples, n_snps, chunk_size)
+        if mmap_limit else None
+    )
+    try:
+        grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
+            str(rust_input),
+            method=1,
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            block_cols=max(1, int(chunk_size)),
+            threads=0,
+            progress_callback=_progress_cb,
+            progress_every=max(1, int(chunk_size)),
+            mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
 
-    if eff_m == 0 or varsum == 0:
+    if int(stream_n_raw) != int(n_samples):
+        raise RuntimeError(
+            f"PCA GRM sample count mismatch: stream={int(stream_n_raw)}, expected={int(n_samples)}"
+        )
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+    eff_m = int(eff_m_raw)
+    if eff_m <= 0:
         raise RuntimeError("No SNPs remained after filtering; GRM for PCA is empty.")
-
-    # Symmetrize and scale
-    grm = (grm + grm.T) / (2 * varsum)
 
     if logger is not None:
         logger.info(f"GRM construction finished. Effective SNPs: {eff_m}")
@@ -572,7 +601,7 @@ def build_grm_streaming_for_pca(
 
 def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.ndarray]:
     """
-    Perform eigen decomposition of a symmetric GRM:
+    Perform eigen decomposition of a symmetric GRM with Rust LAPACK backend:
       GRM = V Λ V^T
 
     Returns:
@@ -582,7 +611,50 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     if logger is not None:
         logger.info("* Performing eigen decomposition of GRM...")
 
-    eigval, eigvec = np.linalg.eigh(grm)
+    if not hasattr(jxrs, "rust_eigh_from_array_f64"):
+        raise RuntimeError(
+            "Rust extension is missing rust_eigh_from_array_f64. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    g0 = np.asarray(grm, dtype=np.float64)
+    if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
+        raise RuntimeError(f"PCA eigh expects non-empty square GRM, got shape={g0.shape}")
+    g = np.ascontiguousarray(g0)
+    n = int(g.shape[0])
+    threads = max(1, int(os.cpu_count() or 1))
+    driver = "dsyevr" if n >= 512 else "dsyevd"
+
+    def _run(driver_name: str, mat: np.ndarray):
+        if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
+            return jxrs.rust_eigh_from_array_f64_inplace(
+                mat,
+                threads=int(threads),
+                driver=str(driver_name),
+                jobz="V",
+                require_lapack=False,
+            )
+        return jxrs.rust_eigh_from_array_f64(
+            mat,
+            threads=int(threads),
+            driver=str(driver_name),
+            jobz="V",
+            require_lapack=False,
+        )
+
+    try:
+        eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack_used, _elapsed = _run(driver, g)
+    except Exception as ex:
+        if str(driver).lower() == "dsyevr":
+            g_retry = np.ascontiguousarray(g0)
+            eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack_used, _elapsed = _run("dsyevd", g_retry)
+        else:
+            raise RuntimeError(f"Rust eigh failed (driver={driver}): {ex}") from ex
+
+    if evec_raw is None:
+        raise RuntimeError("Rust eigh returned no eigenvectors for jobz=V.")
+    eigval = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
+    eigvec = np.asarray(evec_raw, dtype=np.float64)
     idx = np.argsort(eigval)[::-1]
     eigval = eigval[idx]
     eigvec = eigvec[:, idx]
@@ -974,6 +1046,7 @@ def main(log: bool = True):
                         inspected_meta=(meta_sample_ids, meta_n_snps),
                         logger=None,
                         emit_progress_done=False,
+                        snps_only=bool(rsvd_snps_only),
                     )
                     eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
                     _ = snp_local
@@ -1072,6 +1145,7 @@ def main(log: bool = True):
                     inspected_meta=(meta_sample_ids, meta_n_snps),
                     logger=None,
                     emit_progress_done=False,
+                    snps_only=bool(args.vcf),
                 )
                 eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
                 _ = snp_local

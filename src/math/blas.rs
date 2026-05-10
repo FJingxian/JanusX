@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
-use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::path::Path;
+use std::sync::OnceLock;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) type CblasInt = std::os::raw::c_int;
@@ -1858,7 +1858,10 @@ fn accelerate_blas_set_threading_mode(multithreaded: bool) -> Option<bool> {
     const BLAS_THREADING_SINGLE_THREADED: std::os::raw::c_uint = 1;
     let sym = b"BLASSetThreading\0";
     unsafe {
-        let fp = libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr() as *const std::os::raw::c_char);
+        let fp = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            sym.as_ptr() as *const std::os::raw::c_char,
+        );
         if fp.is_null() {
             return None;
         }
@@ -1887,7 +1890,10 @@ fn accelerate_blas_get_threading_mode() -> Option<isize> {
     const BLAS_THREADING_SINGLE_THREADED: std::os::raw::c_uint = 1;
     let sym = b"BLASGetThreading\0";
     unsafe {
-        let fp = libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr() as *const std::os::raw::c_char);
+        let fp = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            sym.as_ptr() as *const std::os::raw::c_char,
+        );
         if fp.is_null() {
             return None;
         }
@@ -2105,13 +2111,9 @@ unsafe fn openblas_lapack_dyn_load_once() -> Option<OpenBlasLapackDyn> {
         b"openblas_set_num_threads_\0".as_ptr() as *const std::os::raw::c_char,
     );
     let set_threads = if !d_set.is_null() {
-        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(
-            d_set,
-        ))
+        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(d_set))
     } else if !d_set_alt.is_null() {
-        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(
-            d_set_alt,
-        ))
+        Some(std::mem::transmute::<*mut libc::c_void, OpenBlasSetThreadsFn>(d_set_alt))
     } else {
         None
     };

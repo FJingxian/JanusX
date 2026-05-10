@@ -4,9 +4,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::bedmath::packed_byte_lut;
 use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
-use crate::bedmath::packed_byte_lut;
 
 const BED_HEADER_LEN: usize = 3;
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
@@ -1533,7 +1533,8 @@ impl BedSnpIter {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
         let n_samples = samples.len();
-        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let (file, bed_len, bytes_per_snp, n_snps) =
+            Self::open_bed_and_infer_shape(prefix, n_samples)?;
         if n_snps != sites.len() {
             return Err(format!(
                 "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
@@ -1580,7 +1581,8 @@ impl BedSnpIter {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
         let n_samples = samples.len();
-        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let (file, bed_len, bytes_per_snp, n_snps) =
+            Self::open_bed_and_infer_shape(prefix, n_samples)?;
         if n_snps != sites.len() {
             return Err(format!(
                 "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
@@ -1619,7 +1621,8 @@ impl BedSnpIter {
     /// parses FAM count and BED shape, skips full BIM metadata parse.
     pub fn new_for_grm(prefix: &str) -> Result<Self, String> {
         let n_samples = count_fam_samples(prefix)?;
-        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let (file, bed_len, bytes_per_snp, n_snps) =
+            Self::open_bed_and_infer_shape(prefix, n_samples)?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
         Ok(Self {
             prefix: prefix.to_string(),
@@ -1651,7 +1654,8 @@ impl BedSnpIter {
             return Err("mmap_window_mb must be > 0".into());
         }
         let n_samples = count_fam_samples(prefix)?;
-        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let (file, bed_len, bytes_per_snp, n_snps) =
+            Self::open_bed_and_infer_shape(prefix, n_samples)?;
         let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
         let window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
         let (mmap, mmap_offset, window_len_snps) =
@@ -1946,10 +1950,7 @@ impl BedSnpIter {
 
     /// Decode next SNP row into caller-provided buffer (len >= n_samples),
     /// and return (source_snp_index, alt_sum, non_missing_count).
-    pub fn next_snp_raw_into_with_stats(
-        &mut self,
-        out: &mut [f32],
-    ) -> Option<(usize, f64, usize)> {
+    pub fn next_snp_raw_into_with_stats(&mut self, out: &mut [f32]) -> Option<(usize, f64, usize)> {
         if out.len() < self.n_samples {
             return None;
         }

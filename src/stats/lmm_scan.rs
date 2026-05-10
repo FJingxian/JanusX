@@ -3176,6 +3176,478 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     Ok(out)
 }
 
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    s,
+    xcov,
+    y_rot,
+    u_t,
+    chrom,
+    pos,
+    allele0,
+    allele1,
+    out_tsv,
+    sample_indices=None,
+    low=-5.0,
+    high=5.0,
+    max_iter=50,
+    tol=1e-2,
+    threads=0,
+    model="add",
+    progress_callback=None,
+    progress_every=0,
+    nullml=None,
+    init_log10_lbd=None,
+    rotate_block_rows=256
+))]
+pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    allele0: Vec<String>,
+    allele1: Vec<String>,
+    out_tsv: &str,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    model: &str,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    nullml: Option<f64>,
+    init_log10_lbd: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<usize> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+    if low >= high {
+        return Err(PyRuntimeError::new_err("low must be < high"));
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyRuntimeError::new_err("tol must be positive and finite"));
+    }
+    let gm = PackedGeneticModel::parse(model)?;
+    let init_log10_lbd = init_log10_lbd
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(low, high));
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        )));
+    }
+    if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "TSV metadata length mismatch: rows={m}, chrom={}, pos={}, allele0={}, allele1={}",
+            chrom.len(),
+            pos.len(),
+            allele0.len(),
+            allele1.len()
+        )));
+    }
+
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(
+            "row_flip/row_maf length mismatch with packed rows",
+        ));
+    }
+
+    let y = y_rot.as_slice()?;
+    let n = y.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y_rot must not be empty"));
+    }
+    let s = s.as_slice()?;
+    if s.len() != n {
+        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
+    }
+
+    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
+        let sidx_slice = sidx.as_slice()?;
+        if sidx_slice.len() != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "sample_indices length mismatch: got {}, expected {n}",
+                sidx_slice.len()
+            )));
+        }
+        parse_index_vec_i64(sidx_slice, n_samples, "sample_indices")?
+    } else {
+        if n != n_samples {
+            return Err(PyRuntimeError::new_err(format!(
+                "len(y_rot)={} must equal n_samples={} when sample_indices is not provided",
+                n, n_samples
+            )));
+        }
+        (0..n_samples).collect()
+    };
+    let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+        None
+    } else {
+        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+    };
+    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+        None
+    } else {
+        Some(
+            sample_idx
+                .iter()
+                .map(|&sid| ((sid & 3) << 1) as u8)
+                .collect(),
+        )
+    };
+
+    let xcov_arr = xcov.as_array();
+    if xcov_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("xcov must be 2D (n, p_cov)"));
+    }
+    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
+    if xc_n != n {
+        return Err(PyRuntimeError::new_err("xcov.n_rows must equal len(y_rot)"));
+    }
+    if n <= p_cov + 1 {
+        return Err(PyRuntimeError::new_err("n must be > p_cov+1"));
+    }
+
+    let ut_arr = u_t.as_array();
+    if ut_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("u_t must be 2D (n, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be (n, n) and row-major U^T",
+        ));
+    }
+
+    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+        Ok(v) => Cow::Borrowed(v),
+        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+    };
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(v) => Cow::Borrowed(v),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(v) => Cow::Borrowed(v),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let out_cols = if with_plrt { 4usize } else { 3usize };
+
+    let pool = get_cached_pool(threads)?;
+    let block_rows = rotate_block_rows.max(1);
+    let progress_block = if progress_every == 0 {
+        block_rows.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let stage_timing = env_truthy("JX_LMM_PACKED_STAGE_TIMING");
+    let out_tsv_path = out_tsv.to_string();
+
+    py.detach(move || -> PyResult<()> {
+        let total_t0 = Instant::now();
+        let mut decode_secs = 0.0_f64;
+        let mut proj_secs = 0.0_f64;
+        let mut assoc_secs = 0.0_f64;
+        let mut tsv_secs = 0.0_f64;
+
+        let out_tsv_path_for_writer = out_tsv_path.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        let writer_handle = std::thread::spawn(move || -> Result<(), String> {
+            let out_file = File::create(&out_tsv_path_for_writer)
+                .map_err(|e| format!("create {out_tsv_path_for_writer}: {e}"))?;
+            let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, out_file);
+            if with_plrt {
+                writer
+                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                    .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
+            } else {
+                writer
+                    .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\n")
+                    .map_err(|e| format!("write header {out_tsv_path_for_writer}: {e}"))?;
+            }
+            for block in rx {
+                if !block.is_empty() {
+                    writer
+                        .write_all(&block)
+                        .map_err(|e| format!("write {out_tsv_path_for_writer}: {e}"))?;
+                }
+            }
+            writer
+                .flush()
+                .map_err(|e| format!("flush {out_tsv_path_for_writer}: {e}"))?;
+            Ok(())
+        });
+
+        let mut snp_buf = vec![0.0_f32; block_rows * n];
+        let mut rot_buf = vec![0.0_f32; block_rows * n];
+        let mut out_block = vec![0.0_f64; block_rows * out_cols];
+        let mut text_buf = String::with_capacity(block_rows * 128);
+
+        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            out_block
+                .par_chunks_mut(out_cols)
+                .enumerate()
+                .for_each_init(
+                    || (vec![0.0_f64; n], init_log10_lbd),
+                    |state, (idx, out_row)| {
+                        let (snp_vec, last_log10_lbd) = state;
+                        let row = &g_block[idx * n..(idx + 1) * n];
+                        for i in 0..n {
+                            snp_vec[i] = row[i] as f64;
+                        }
+
+                        let init_guess = (*last_log10_lbd).or(init_log10_lbd);
+                        let (best_log10_lbd, _best_cost) = brent_minimize_with_init(
+                            |x0| -reml_loglike(x0, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
+                            low,
+                            high,
+                            tol,
+                            max_iter,
+                            init_guess,
+                        );
+                        *last_log10_lbd = Some(best_log10_lbd);
+
+                        let (beta, se, _lbd) =
+                            final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
+                        let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
+                            let z = beta / se;
+                            (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
+                        } else {
+                            1.0
+                        };
+
+                        out_row[0] = beta;
+                        out_row[1] = se;
+                        out_row[2] = if p.is_finite() { p } else { 1.0 };
+
+                        if with_plrt {
+                            let ml = ml_loglike(
+                                best_log10_lbd,
+                                s,
+                                &xcov_flat,
+                                y,
+                                Some(&snp_vec[..]),
+                                n,
+                                p_cov,
+                            );
+                            out_row[3] = if ml.is_finite() {
+                                let mut stat = 2.0 * (ml - nullml_val);
+                                if !stat.is_finite() || stat < 0.0 {
+                                    stat = 0.0;
+                                }
+                                chi2_sf_df1(stat)
+                            } else {
+                                1.0
+                            };
+                        }
+                    },
+                );
+        };
+
+        for row_start in (0..m).step_by(progress_block) {
+            let row_end = (row_start + progress_block).min(m);
+            let mut start = row_start;
+            while start < row_end {
+                let rows = (row_end - start).min(block_rows);
+                let snp_block = &mut snp_buf[..rows * n];
+                let rot_block = &mut rot_buf[..rows * n];
+
+                let dt0 = Instant::now();
+                decode_centered_block_packed_f32(
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_flip,
+                    row_maf,
+                    start,
+                    rows,
+                    n,
+                    gm,
+                    sample_identity,
+                    sample_byte_idx.as_deref(),
+                    sample_bit_shift.as_deref(),
+                    snp_block,
+                );
+                decode_secs += dt0.elapsed().as_secs_f64();
+
+                let rotate_tile_rows = choose_rotate_tile_rows(
+                    rows,
+                    if threads > 0 {
+                        threads
+                    } else {
+                        rayon::current_num_threads()
+                    },
+                );
+                let pt0 = Instant::now();
+                if let Some(tp) = &pool {
+                    tp.install(|| {
+                        rotate_snp_block_with_ut_parallel(
+                            snp_block,
+                            rows,
+                            n,
+                            &ut_flat,
+                            rot_block,
+                            rotate_tile_rows,
+                        );
+                    });
+                } else {
+                    rotate_snp_block_with_ut_parallel(
+                        snp_block,
+                        rows,
+                        n,
+                        &ut_flat,
+                        rot_block,
+                        rotate_tile_rows,
+                    );
+                }
+                proj_secs += pt0.elapsed().as_secs_f64();
+
+                let out_sub = &mut out_block[..rows * out_cols];
+                let at0 = Instant::now();
+                if let Some(tp) = &pool {
+                    tp.install(|| run_rows(rot_block, out_sub));
+                } else {
+                    run_rows(rot_block, out_sub);
+                }
+                assoc_secs += at0.elapsed().as_secs_f64();
+
+                let tt0 = Instant::now();
+                text_buf.clear();
+                if text_buf.capacity() < rows * 128 {
+                    text_buf.reserve(rows * 128 - text_buf.capacity());
+                }
+                for off in 0..rows {
+                    let idx = start + off;
+                    let base = off * out_cols;
+                    if with_plrt {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            out_sub[base],
+                            out_sub[base + 1],
+                            out_sub[base + 2],
+                            out_sub[base + 3]
+                        );
+                    } else {
+                        let _ = write!(
+                            text_buf,
+                            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\n",
+                            chrom[idx],
+                            pos[idx],
+                            allele0[idx],
+                            allele1[idx],
+                            row_maf[idx],
+                            out_sub[base],
+                            out_sub[base + 1],
+                            out_sub[base + 2]
+                        );
+                    }
+                }
+                let payload = std::mem::take(&mut text_buf).into_bytes();
+                tx.send(payload).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "writer queue send failed for {out_tsv_path}: {e}"
+                    ))
+                })?;
+                tsv_secs += tt0.elapsed().as_secs_f64();
+
+                start += rows;
+            }
+
+            if let Some(cb) = progress_callback.as_ref() {
+                let done = row_end;
+                Python::attach(|py2| -> PyResult<()> {
+                    py2.check_signals()?;
+                    cb.call1(py2, (done, m))?;
+                    Ok(())
+                })?;
+            } else {
+                Python::attach(|py2| py2.check_signals())?;
+            }
+        }
+
+        let wt0 = Instant::now();
+        drop(tx);
+        let writer_result = writer_handle.join().map_err(|_| {
+            PyRuntimeError::new_err(format!("writer thread panicked for {out_tsv_path}"))
+        })?;
+        tsv_secs += wt0.elapsed().as_secs_f64();
+        if let Err(msg) = writer_result {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+
+        if stage_timing {
+            let total_secs = total_t0.elapsed().as_secs_f64();
+            let other_secs =
+                (total_secs - decode_secs - proj_secs - assoc_secs - tsv_secs).max(0.0_f64);
+            let to_pct = |x: f64| -> f64 {
+                if total_secs > 0.0 {
+                    x * 100.0 / total_secs
+                } else {
+                    0.0
+                }
+            };
+            eprintln!(
+                "LMM packed timing: decode={:.3}s ({:.1}%), proj={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, threads={}",
+                decode_secs,
+                to_pct(decode_secs),
+                proj_secs,
+                to_pct(proj_secs),
+                assoc_secs,
+                to_pct(assoc_secs),
+                tsv_secs,
+                to_pct(tsv_secs),
+                other_secs,
+                to_pct(other_secs),
+                total_secs,
+                m,
+                n,
+                if threads > 0 {
+                    threads
+                } else {
+                    rayon::current_num_threads()
+                }
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok(m)
+}
+
 #[derive(Clone, Copy)]
 enum PackedGeneticModel {
     Add,
@@ -3654,7 +4126,9 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         }
     }
     if s_vec.iter().any(|v| !v.is_finite()) {
-        return Err(PyRuntimeError::new_err("invalid s/tau produced non-finite values"));
+        return Err(PyRuntimeError::new_err(
+            "invalid s/tau produced non-finite values",
+        ));
     }
 
     let p0 = match &x {
@@ -4245,7 +4719,9 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         }
     }
     if s_vec.iter().any(|v| !v.is_finite()) {
-        return Err(PyRuntimeError::new_err("invalid s/tau produced non-finite values"));
+        return Err(PyRuntimeError::new_err(
+            "invalid s/tau produced non-finite values",
+        ));
     }
 
     let p0 = match &x {

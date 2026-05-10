@@ -10,12 +10,11 @@ Input:
   - FILE  : genotype numeric matrix (.txt/.tsv/.csv/.npy) with sibling prefix.id
 
 Implementation:
-  - Genotypes are streamed via rust2py.gfreader.load_genotype_chunks.
-  - SNPs are filtered by MAF and missing rate inside the Rust reader.
-  - GRM is accumulated chunk-by-chunk:
-      * method = 1 : centered GRM
-      * method = 2 : standardized/weighted GRM
-  - Memory usage is low and independent of the total SNP count.
+  - GRM construction is executed by Rust kernels:
+      * `grm_stream_bed_f32` (streaming BED)
+      * `grm_packed_bed_f32` (packed BED)
+  - For VCF/HMP/TXT-like input, CLI materializes PLINK BED cache first.
+  - SNPs are filtered by MAF and missing rate inside Rust kernels.
 
 Output:
   - {prefix}.grm.txt     : GRM as plain text (if --npy is not used)
@@ -33,9 +32,9 @@ from typing import Union
 import numpy as np
 import psutil
 from janusx.gfreader import (
-    load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
+    prepare_cli_input_cache,
 )
 from ._common.log import setup_logging
 from ._common.config_render import emit_cli_configuration
@@ -47,7 +46,6 @@ from ._common.pathcheck import (
     format_path_for_display,
     ensure_plink_prefix_exists,
 )
-from ._common.prefetch import prefetch_iter
 from ._common.progress import ProgressAdapter
 from ._common.status import format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
@@ -62,9 +60,53 @@ from ._common.threads import (
 try:
     from janusx.janusx import (
         grm_packed_bed_f32 as _grm_packed_bed_f32,
+        grm_stream_bed_f32 as _grm_stream_bed_f32,
     )
 except Exception:
     _grm_packed_bed_f32 = None
+    _grm_stream_bed_f32 = None
+
+
+def _is_plink_prefix_path(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix).strip()
+    if p == "":
+        return False
+    low = p.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        p = p[:-4]
+    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+
+
+def _resolve_rust_grm_input(
+    genofile: str,
+    *,
+    from_vcf: bool,
+    from_hmp: bool,
+    from_file: bool,
+) -> str:
+    if _is_plink_prefix_path(str(genofile)):
+        p = str(genofile).strip()
+        low = p.lower()
+        return p[:-4] if (low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam")) else p
+
+    if not bool(from_vcf or from_hmp or from_file):
+        raise RuntimeError(
+            f"Rust GRM backend requires PLINK BED input, got: {genofile}"
+        )
+
+    delim = "," if (from_file and str(genofile).lower().endswith(".csv")) else None
+    cached = prepare_cli_input_cache(
+        str(genofile),
+        snps_only=bool(from_vcf),
+        delimiter=delim,
+        prefer_plink_for_txt=True,
+    )
+    if not _is_plink_prefix_path(str(cached)):
+        raise RuntimeError(
+            "Rust GRM backend requires PLINK BED-compatible input. "
+            f"Failed to materialize BED cache from: {genofile}"
+        )
+    return str(cached)
 
 
 def build_grm_streaming(
@@ -76,10 +118,11 @@ def build_grm_streaming(
     max_missing_rate: float,
     chunk_size: int,
     mmap_window_mb: Union[int , None],
+    threads: int,
     logger,
 ) -> tuple[np.ndarray, int]:
     """
-    Build the GRM in streaming mode using rust2py.gfreader.load_genotype_chunks.
+    Build the GRM in streaming mode using Rust single-entry BED kernel.
 
     Parameters
     ----------
@@ -109,70 +152,58 @@ def build_grm_streaming(
     eff_m : int
         Effective number of SNPs after filtering.
     """
-    grm = np.zeros((n_samples, n_samples), dtype="float32")
+    if _grm_stream_bed_f32 is None:
+        raise RuntimeError(
+            "Rust stream GRM kernel is unavailable. Rebuild JanusX extension to export "
+            "`grm_stream_bed_f32`."
+        )
     pbar = ProgressAdapter(
         total=n_snps,
-        desc="GRM (streaming)",
+        desc="GRM (rust-stream)",
         emit_done=False,
         force_animate=True,
     )
     stream_t0 = time.monotonic()
     process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(chunk_size))
+    last_done = 0
 
-    varsum = 0.0
-    eff_m = 0
-    prefetch_depth = 2
-    chunk_iter = load_genotype_chunks(
-        genofile,
-        chunk_size,
-        maf_threshold,
-        max_missing_rate,
-        mmap_window_mb=mmap_window_mb,
-    )
-    for genosub, _sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-        # genosub: (m_chunk, n_samples)
-        maf = genosub.mean(axis=1, dtype="float32", keepdims=True) / 2  # (m_chunk,1)
-        genosub = genosub - 2 * maf  # center by 2p
-
-        if method == 1:
-            # Standard centered GRM
-            grm += genosub.T @ genosub
-            varsum += float(np.sum(2 * maf * (1 - maf)))
-        elif method == 2:
-            # Weighted / standardized GRM
-            w = 1.0 / (2 * maf * (1 - maf))      # (m_chunk,1)
-            grm += (genosub.T * w.ravel()) @ genosub
-        else:
-            raise ValueError(f"Unsupported GRM method: {method}")
-
-        m_chunk = genosub.shape[0]
-        eff_m += m_chunk
-        pbar.update(m_chunk)
-
-        # Show memory usage periodically
-        if eff_m % (10 * chunk_size) == 0:
+    def _progress_cb(done: int, _total: int) -> None:
+        nonlocal last_done
+        d = int(done)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        if d % mem_tick_span == 0:
             mem = process.memory_info().rss / 1024**3
             pbar.set_postfix(memory=f"{mem:.2f} GB")
 
-    # Force progress bar to 100%, even if some SNPs were filtered in Rust
-    pbar.finish()
-    pbar.close()
+    try:
+        grm_raw, eff_m, stream_n = _grm_stream_bed_f32(
+            str(genofile),
+            method=int(method),
+            maf_threshold=float(maf_threshold),
+            max_missing_rate=float(max_missing_rate),
+            block_cols=max(1, int(chunk_size)),
+            threads=max(1, int(threads)),
+            progress_callback=_progress_cb,
+            progress_every=max(1, int(chunk_size)),
+            mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+        )
+    finally:
+        pbar.finish()
+        pbar.close()
     stream_elapsed = max(0.0, time.monotonic() - stream_t0)
-
-    if eff_m == 0:
-        raise RuntimeError("No SNPs remained after filtering; GRM is empty.")
-
-    # Symmetrize and scale
-    if method == 1:
-        if varsum == 0:
-            raise RuntimeError("Variance sum is zero in method=1; check genotype input.")
-        grm = (grm + grm.T) / (2 * varsum)
-    else:  # method == 2
-        grm = (grm + grm.T) / (2 * eff_m)
+    if int(stream_n) != int(n_samples):
+        raise RuntimeError(
+            f"Stream sample count mismatch: stream={int(stream_n)}, expected={int(n_samples)}"
+        )
+    grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+    eff_m = int(eff_m)
 
     log_success(
         logger,
-        f"GRM (Effective SNPs: {eff_m}) ...Finished [{format_elapsed(stream_elapsed)}]",
+        f"GRM (Effective SNPs: {eff_m}, rust-stream kernel) ...Finished [{format_elapsed(stream_elapsed)}]",
         force_color=True,
     )
     return grm, eff_m
@@ -464,9 +495,32 @@ def main(log: bool = True):
         raise SystemExit(1)
 
     # ------------------------------------------------------------------
-    # Inspect genotype and build GRM in streaming mode
+    # Resolve Rust GRM input (PLINK BED or cache-converted BED)
     # ------------------------------------------------------------------
-    sample_ids, n_snps = inspect_genotype_file(gfile)
+    grm_input = str(gfile)
+    if _grm_stream_bed_f32 is not None:
+        try:
+            grm_input = _resolve_rust_grm_input(
+                str(gfile),
+                from_vcf=bool(args.vcf),
+                from_hmp=bool(args.hmp),
+                from_file=bool(args.file),
+            )
+            if str(grm_input) != str(gfile):
+                logger.info(
+                    f"GRM backend input switched to cache BED prefix: "
+                    f"{format_path_for_display(str(grm_input))}"
+                )
+        except Exception as ex:
+            raise RuntimeError(
+                "Unable to route GRM build to Rust BED backend. "
+                f"source={gfile}; reason={ex}"
+            ) from ex
+
+    # ------------------------------------------------------------------
+    # Inspect genotype and build GRM
+    # ------------------------------------------------------------------
+    sample_ids, n_snps = inspect_genotype_file(grm_input)
     sample_ids = np.array(sample_ids, dtype=str)
     n_samples = len(sample_ids)
     logger.info(f"Genotype meta: {n_samples} samples, {n_snps} SNPs.")
@@ -476,12 +530,12 @@ def main(log: bool = True):
     max_missing_rate = args.geno
     chunk_size = int(args.chunksize)
     mmap_window_mb = (
-        auto_mmap_window_mb(gfile, n_samples, n_snps, chunk_size)
+        auto_mmap_window_mb(grm_input, n_samples, n_snps, chunk_size)
         if args.mmap_limit else None
     )
 
     use_packed_kernel = bool(
-        bool(args.bfile)
+        _is_plink_prefix_path(str(grm_input))
         and (_grm_packed_bed_f32 is not None)
     )
     if use_packed_kernel:
@@ -495,7 +549,7 @@ def main(log: bool = True):
             logger.info("Packed GRM stage timing is enabled (decode/GEMM/other).")
         try:
             grm, eff_m = build_grm_packed_bed(
-                genofile=gfile,
+                genofile=grm_input,
                 n_samples=n_samples,
                 n_snps=n_snps,
                 method=args.method,
@@ -513,7 +567,7 @@ def main(log: bool = True):
                 f"reason={ex}"
             )
             grm, eff_m = build_grm_streaming(
-                genofile=gfile,
+                genofile=grm_input,
                 n_samples=n_samples,
                 n_snps=n_snps,
                 method=args.method,
@@ -521,13 +575,24 @@ def main(log: bool = True):
                 max_missing_rate=max_missing_rate,
                 chunk_size=chunk_size,
                 mmap_window_mb=mmap_window_mb,
+                threads=int(args.thread),
                 logger=logger,
             )
     else:
-        if bool(args.bfile):
-            logger.info("Packed GRM kernel unavailable; fallback to streaming dense-chunk backend.")
+        if not _is_plink_prefix_path(str(grm_input)):
+            raise RuntimeError(
+                "Rust GRM stream backend requires PLINK BED input/cache prefix. "
+                f"got={grm_input}"
+            )
+        if _grm_stream_bed_f32 is not None:
+            logger.info("Packed GRM kernel unavailable; fallback to Rust streaming BED backend.")
+        else:
+            raise RuntimeError(
+                "Rust stream GRM kernel is unavailable (`grm_stream_bed_f32`). "
+                "Rebuild JanusX extension."
+            )
         grm, eff_m = build_grm_streaming(
-            genofile=gfile,
+            genofile=grm_input,
             n_samples=n_samples,
             n_snps=n_snps,
             method=args.method,
@@ -535,6 +600,7 @@ def main(log: bool = True):
             max_missing_rate=max_missing_rate,
             chunk_size=chunk_size,
             mmap_window_mb=mmap_window_mb,
+            threads=int(args.thread),
             logger=logger,
         )
 

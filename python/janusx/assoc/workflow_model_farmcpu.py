@@ -357,6 +357,7 @@ def build_qmatrix_farmcpu(
                         threads=max(1, int(threads)),
                         logger=logger,
                         stage_label="FarmCPU-Q-build",
+                        require_rust=True,
                     )
                     qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"

@@ -1322,9 +1322,9 @@ def run_lmm_packed_fullrank(
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
 ) -> None:
-    if not hasattr(jxrs, "lmm_reml_assoc_packed_f32"):
+    if not hasattr(jxrs, "lmm_reml_assoc_packed_f32_to_tsv"):
         raise RuntimeError(
-            "Rust extension missing lmm_reml_assoc_packed_f32. Rebuild/install JanusX extension first."
+            "Rust extension missing lmm_reml_assoc_packed_f32_to_tsv. Rebuild/install JanusX extension first."
         )
     if str(genetic_model).lower() != "add":
         raise ValueError(
@@ -1524,7 +1524,7 @@ def run_lmm_packed_fullrank(
                 except Exception:
                     init_log10_lbd = None
 
-                res_raw = jxrs.lmm_reml_assoc_packed_f32(
+                _written_rows = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
                     packed,
                     int(packed_n),
                     row_flip,
@@ -1533,6 +1533,11 @@ def run_lmm_packed_fullrank(
                     x_rot,
                     y_rot,
                     u_t,
+                    chrom_all,
+                    pos_all,
+                    allele0_all,
+                    allele1_all,
+                    out_tsv,
                     sample_idx_trait,
                     -5.0,
                     5.0,
@@ -1544,6 +1549,12 @@ def run_lmm_packed_fullrank(
                     init_log10_lbd=init_log10_lbd,
                     **progress_kwargs,
                 )
+                if int(_written_rows) != int(len(sites_all)):
+                    _emit_warning_line(
+                        logger,
+                        f"LMM Rust writer row mismatch: expected={len(sites_all)} wrote={int(_written_rows)}",
+                        use_spinner=bool(use_spinner),
+                    )
                 try:
                     null_lbd = float(getattr(mod, "lbd_null"))
                 except Exception:
@@ -1562,44 +1573,6 @@ def run_lmm_packed_fullrank(
                 gwas_pbar.close(show_done=False)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
-        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
-        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
-            raise ValueError(
-                f"Unexpected LMM result shape: {res.shape}, expected ({len(sites_all)}, >=3)"
-            )
-
-        res_df = pd.DataFrame(
-            {
-                "chrom": chrom_all,
-                "pos": pos_all,
-                "allele0": allele0_all,
-                "allele1": allele1_all,
-                "maf": np.asarray(maf, dtype=np.float32),
-                "beta": np.asarray(res[:, 0], dtype=np.float64),
-                "se": np.asarray(res[:, 1], dtype=np.float64),
-                "pwald": np.asarray(res[:, 2], dtype=np.float64),
-            }
-        )
-        if res.shape[1] > 3:
-            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
-
-        cast_map: dict[str, object] = {"pwald": "object", "pos": int}
-        if "plrt" in res_df.columns:
-            cast_map["plrt"] = "object"
-
-        def _write_lmm() -> None:
-            nonlocal res_df
-            res_df = res_df.astype(cast_map)
-            res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
-            if "plrt" in res_df.columns:
-                res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
-            res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
-
-        _run_result_write_with_status(
-            _write_lmm,
-            use_spinner=bool(use_spinner),
-            emit_done_line=False,
-        )
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:

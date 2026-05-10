@@ -73,14 +73,14 @@ mod brent;
 mod eigh;
 #[path = "math/linalg.rs"]
 mod linalg;
-#[path = "math/pcg.rs"]
-mod pcg;
 #[path = "math/farmcpu.rs"]
 mod math_farmcpu;
 #[path = "math/ld.rs"]
 mod math_ld;
 #[path = "ml/mod.rs"]
 mod ml;
+#[path = "math/pcg.rs"]
+mod pcg;
 
 use admixture::{
     admx_adam_optimize_f32, admx_adam_update_p, admx_adam_update_p_inplace,
@@ -128,13 +128,17 @@ use gwas_unified::{
     gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
-use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune_kernel_stats};
+use ld::{
+    bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
+    packed_prune_kernel_stats,
+};
 use lmm::{fastlmm_reml_chunk_f32, fastlmm_reml_null_f32};
 use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
     fastlmm_assoc_packed_f32_to_tsv, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
-    lmm_reml_assoc_packed_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32,
-    lmm_rotate_x_y_with_ut_f64, ml_loglike_null_f32,
+    lmm_reml_assoc_packed_f32, lmm_reml_assoc_packed_f32_to_tsv, lmm_reml_chunk_f32,
+    lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
+    ml_loglike_null_f32,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -223,6 +227,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
     m.add_function(wrap_pyfunction!(packed_prune_kernel_stats, m)?)?;
     m.add_function(wrap_pyfunction!(bed_prune_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
@@ -270,6 +275,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32_to_tsv, m)?)?;

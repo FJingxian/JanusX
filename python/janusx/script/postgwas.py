@@ -80,6 +80,7 @@ import colorsys
 import concurrent.futures as cf
 from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from typing import Any, Optional, Tuple
+from janusx import janusx as jxrs
 from janusx.gtools.reader import GFFQuery, bedreader, readanno
 from joblib import Parallel, delayed
 import warnings
@@ -1226,100 +1227,237 @@ def _extract_ld_site_set(
     return out
 
 
-def _collect_genotypes_for_sites(
+def _compute_ld_from_bed_rust(
     genofile: str,
     bimrange_tuples: list[tuple[str, int, int]],
-    site_set: set[tuple[str, int]],
+    *,
+    selected_sites: Optional[set[tuple[str, int]]] = None,
+    threads: int = 0,
 ) -> tuple[np.ndarray, list[tuple[str, int]]]:
-    if len(site_set) == 0:
-        return np.zeros((0, 0), dtype=np.float32), []
+    """
+    Compute LD r2 matrix via Rust bitwise backend.
+
+    Returns:
+      ld_r2 (float32, m x m), ld_keys [(chrom_norm, pos), ...] in matrix order.
+    """
+    if not hasattr(jxrs, "bed_ldblock_r2_rust"):
+        raise RuntimeError(
+            "Rust extension missing bed_ldblock_r2_rust. Rebuild/install JanusX extension first."
+        )
     if len(bimrange_tuples) == 0:
         return np.zeros((0, 0), dtype=np.float32), []
 
-    rows: list[np.ndarray] = []
-    keys: list[tuple[str, int]] = []
+    chrom_ranges = [str(x[0]) for x in bimrange_tuples]
+    start_bp = [int(x[1]) for x in bimrange_tuples]
+    end_bp = [int(x[2]) for x in bimrange_tuples]
 
-    for bchrom, bstart, bend in bimrange_tuples:
-        for chunk, sites in load_genotype_chunks(
-            genofile,
-            chunk_size=50_000,
-            maf=0.0,
-            missing_rate=1.0,
-            impute=True,
-            bim_range=(str(bchrom), int(bstart), int(bend)),
-        ):
-            chunk_np = np.asarray(chunk, dtype=np.float32)
-            for i, s in enumerate(sites):
-                key = (_normalize_chr(s.chrom), int(s.pos))
-                if key in site_set:
-                    rows.append(chunk_np[i, :].copy())
-                    keys.append(key)
+    kwargs: dict[str, object] = {}
+    if selected_sites is not None:
+        sel = sorted(
+            [(_normalize_chr(c), int(p)) for (c, p) in selected_sites],
+            key=lambda z: (str(z[0]), int(z[1])),
+        )
+        kwargs["selected_chrom"] = [str(x[0]) for x in sel]
+        kwargs["selected_pos"] = [int(x[1]) for x in sel]
 
-    if len(rows) == 0:
+    ld_raw, chr_raw, pos_raw = jxrs.bed_ldblock_r2_rust(
+        str(genofile),
+        chrom_ranges,
+        start_bp,
+        end_bp,
+        threads=int(max(0, int(threads))),
+        **kwargs,
+    )
+    ld_mat = np.ascontiguousarray(np.asarray(ld_raw, dtype=np.float32))
+    ld_keys = [(_normalize_chr(c), int(p)) for c, p in zip(list(chr_raw), list(pos_raw))]
+    if ld_mat.ndim != 2:
         return np.zeros((0, 0), dtype=np.float32), []
-
-    # keep deterministic genomic order and deduplicate same-site entries
-    uniq: dict[tuple[str, int], np.ndarray] = {}
-    for k, r in zip(keys, rows):
-        if k not in uniq:
-            uniq[k] = r
-    sorted_keys = sorted(uniq.keys(), key=lambda x: (x[0], x[1]))
-    mat = np.stack([uniq[k] for k in sorted_keys], axis=0).astype(np.float32)
-    return mat, sorted_keys
+    if int(ld_mat.shape[0]) != int(ld_mat.shape[1]):
+        raise RuntimeError(f"Rust LD matrix is not square: shape={ld_mat.shape}")
+    if int(ld_mat.shape[0]) != int(len(ld_keys)):
+        raise RuntimeError(
+            f"Rust LD key count mismatch: matrix_n={ld_mat.shape[0]}, keys={len(ld_keys)}"
+        )
+    return ld_mat, ld_keys
 
 
-def _compute_ld_from_genotypes(geno_sig: np.ndarray) -> np.ndarray:
-    if geno_sig.shape[0] == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-    if geno_sig.shape[0] == 1:
-        return np.ones((1, 1), dtype=np.float32)
-    corr = np.corrcoef(geno_sig)
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    r2 = np.square(corr)
-    r2 = np.nan_to_num(r2, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    np.fill_diagonal(r2, 1.0)
-    return r2
+def _format_bimrange_title(item: tuple[str, int, int]) -> str:
+    chrom, start, end = item
+    return _sanitize_plot_text(f"{chrom}:{start / 1_000_000:g}-{end / 1_000_000:g}")
 
 
-def _collect_genotypes_for_bimranges(
-    genofile: str,
+def _ld_bimrange_spans(
+    ld_keys: list[tuple[str, int]],
     bimrange_tuples: list[tuple[str, int, int]],
-) -> tuple[np.ndarray, list[tuple[str, int]]]:
-    if len(bimrange_tuples) == 0:
-        return np.zeros((0, 0), dtype=np.float32), []
+) -> list[dict[str, object]]:
+    """
+    Build LD index spans for each bimrange.
+    x coordinate in LD panel:
+      SNP i center -> x = i + 0.5
+    """
+    if len(ld_keys) == 0 or len(bimrange_tuples) == 0:
+        return []
 
-    rows: list[np.ndarray] = []
-    keys: list[tuple[str, int]] = []
+    spans_meta: list[dict[str, object]] = []
+    for sid, (chrom, start, end) in enumerate(bimrange_tuples):
+        spans_meta.append(
+            {
+                "sid": int(sid),
+                "chrom_norm": _normalize_chr(chrom),
+                "chrom": str(chrom),
+                "start": int(start),
+                "end": int(end),
+                "first": None,
+                "last": None,
+                "count": 0,
+            }
+        )
 
-    for bchrom, bstart, bend in bimrange_tuples:
-        for chunk, sites in load_genotype_chunks(
-            genofile,
-            chunk_size=50_000,
-            maf=0.0,
-            missing_rate=1.0,
-            impute=True,
-            bim_range=(str(bchrom), int(bstart), int(bend)),
-        ):
-            chunk_np = np.asarray(chunk, dtype=np.float32)
-            n_rows = min(int(chunk_np.shape[0]), len(sites))
-            if n_rows <= 0:
+    for idx, (k_chrom, k_pos) in enumerate(ld_keys):
+        kk = str(k_chrom)
+        pp = int(k_pos)
+        hit_sid: Optional[int] = None
+        for s in spans_meta:
+            if kk != str(s["chrom_norm"]):
                 continue
-            for i in range(n_rows):
-                s = sites[i]
-                key = (_normalize_chr(s.chrom), int(s.pos))
-                rows.append(chunk_np[i, :].copy())
-                keys.append(key)
+            if int(s["start"]) <= pp <= int(s["end"]):
+                hit_sid = int(s["sid"])
+                break
+        if hit_sid is None:
+            continue
+        seg = spans_meta[hit_sid]
+        if seg["first"] is None:
+            seg["first"] = int(idx)
+        seg["last"] = int(idx)
+        seg["count"] = int(seg["count"]) + 1
 
+    out: list[dict[str, object]] = []
+    for s in spans_meta:
+        if int(s["count"]) <= 0:
+            continue
+        first = int(s["first"])
+        last = int(s["last"])
+        x_start = float(first) + 0.5
+        x_end = float(last) + 0.5
+        out.append(
+            {
+                "sid": int(s["sid"]),
+                "chrom": str(s["chrom"]),
+                "start": int(s["start"]),
+                "end": int(s["end"]),
+                "count": int(s["count"]),
+                "first": int(first),
+                "last": int(last),
+                "x_start": float(x_start),
+                "x_end": float(x_end),
+                "x_center": 0.5 * (float(x_start) + float(x_end)),
+                "label": _format_bimrange_title(
+                    (str(s["chrom"]), int(s["start"]), int(s["end"]))
+                ),
+            }
+        )
+    return out
+
+
+def _project_gene_records_to_ld_spans(
+    records: pd.DataFrame,
+    bimrange_tuples: list[tuple[str, int, int]],
+    ld_spans: list[dict[str, object]],
+) -> pd.DataFrame:
+    """
+    Project gene records to LD-index x space so gene track aligns with LD triangle.
+    """
+    out_cols = ["feature", "strand", "attribute", "x_start", "x_end"]
+    if records.shape[0] == 0 or len(bimrange_tuples) == 0 or len(ld_spans) == 0:
+        return pd.DataFrame(columns=out_cols)
+
+    span_by_sid: dict[int, dict[str, object]] = {
+        int(s["sid"]): s for s in ld_spans if int(s.get("count", 0)) > 0
+    }
+    rows: list[dict[str, object]] = []
+    for _, row in records.iterrows():
+        chrom = _normalize_chr(row["chrom_norm"])
+        r_start = int(min(int(row["start"]), int(row["end"])))
+        r_end = int(max(int(row["start"]), int(row["end"])))
+        feature = str(row["feature"])
+        strand = str(row["strand"])
+        attr = row["attribute"]
+        for sid, (bchrom, bstart, bend) in enumerate(bimrange_tuples):
+            if chrom != _normalize_chr(bchrom):
+                continue
+            ov_start = max(r_start, int(bstart))
+            ov_end = min(r_end, int(bend))
+            if ov_end < ov_start:
+                continue
+            span = span_by_sid.get(int(sid))
+            if span is None:
+                continue
+
+            seg_start_bp = int(bstart)
+            seg_end_bp = int(bend)
+            seg_len_bp = max(1, int(seg_end_bp - seg_start_bp))
+            x0 = float(span["x_start"])
+            x1 = float(span["x_end"])
+            # Keep one-SNP segments drawable.
+            if np.isclose(x0, x1):
+                x0 -= 0.45
+                x1 += 0.45
+            scale = (x1 - x0) / float(seg_len_bp)
+            gx0 = x0 + float(ov_start - seg_start_bp) * scale
+            gx1 = x0 + float(ov_end - seg_start_bp) * scale
+            rows.append(
+                {
+                    "feature": feature,
+                    "strand": strand,
+                    "attribute": attr,
+                    "x_start": float(min(gx0, gx1)),
+                    "x_end": float(max(gx0, gx1)),
+                }
+            )
     if len(rows) == 0:
-        return np.zeros((0, 0), dtype=np.float32), []
+        return pd.DataFrame(columns=out_cols)
+    return pd.DataFrame(rows, columns=out_cols)
 
-    uniq: dict[tuple[str, int], np.ndarray] = {}
-    for k, r in zip(keys, rows):
-        if k not in uniq:
-            uniq[k] = r
-    sorted_keys = sorted(uniq.keys(), key=lambda x: (x[0], x[1]))
-    mat = np.stack([uniq[k] for k in sorted_keys], axis=0).astype(np.float32)
-    return mat, sorted_keys
+
+def _draw_ld_bimrange_titles(
+    ax: plt.Axes,
+    spans: list[dict[str, object]],
+    *,
+    enabled: bool,
+    font_size: float = 5.5,
+) -> None:
+    if not enabled or len(spans) == 0:
+        return
+    trans = ax.get_xaxis_transform()
+    for i, seg in enumerate(spans):
+        ax.text(
+            float(seg["x_center"]),
+            1.015,
+            _sanitize_plot_text(seg["label"]),
+            transform=trans,
+            ha="center",
+            va="bottom",
+            fontsize=float(font_size),
+            clip_on=False,
+            zorder=40,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.55,
+                "pad": 0.2,
+            },
+        )
+        if i > 0:
+            prev = spans[i - 1]
+            xb = 0.5 * (float(prev["x_end"]) + float(seg["x_start"]))
+            ax.axvline(
+                x=float(xb),
+                color="black",
+                linestyle=":",
+                linewidth=0.7,
+                alpha=0.75,
+                zorder=5,
+            )
 
 
 def _lead_vs_all_r2(geno_block: np.ndarray) -> np.ndarray:
@@ -2630,23 +2768,23 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                     ld_overlay_text = "Not enough SNPs"
                 else:
-                    geno_sig, sig_keys = _collect_genotypes_for_sites(
-                        args.genofile,
+                    ld_mat, sig_keys = _compute_ld_from_bed_rust(
+                        str(args.genofile),
                         args.bimrange_tuples if args.bimrange_tuples is not None else [],
-                        ld_sites,
+                        selected_sites=ld_sites,
+                        threads=int(max(0, int(getattr(args, "thread", 0)))),
                     )
                     # Keep Manhattan->gene/LD mapping lines even when genotype lookup fails:
                     # fallback to GWAS-derived ld_site_keys if no matched genotype SNP is returned.
                     if len(sig_keys) > 0:
                         ld_site_keys = sig_keys
-                    if geno_sig.shape[0] < 2:
+                    if ld_mat.shape[0] < 2:
                         logger.warning(
                             "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
                         )
                         ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                         ld_overlay_text = "No matched SNPs"
                     else:
-                        ld_mat = _compute_ld_from_genotypes(geno_sig)
                         mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
                         logger.info(f"LD block built from {len(sig_keys)} {mode_text}.")
 
@@ -3665,10 +3803,11 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                 ld_overlay_text = "Not enough SNPs"
             else:
-                geno_sig, sig_keys = _collect_genotypes_for_sites(
-                    args.genofile,
+                ld_mat, sig_keys = _compute_ld_from_bed_rust(
+                    str(args.genofile),
                     region_ranges,
-                    ld_sites,
+                    selected_sites=ld_sites,
+                    threads=int(max(0, int(getattr(args, "thread", 0)))),
                 )
                 missing_n = int(len(ld_sites) - len(set(sig_keys)))
                 if missing_n > 0:
@@ -3677,14 +3816,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     )
                 if len(sig_keys) > 0:
                     ld_site_keys = sig_keys
-                if geno_sig.shape[0] < 2:
+                if ld_mat.shape[0] < 2:
                     logger.warning(
                         "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
                     )
                     ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                     ld_overlay_text = "No matched SNPs"
                 else:
-                    ld_mat = _compute_ld_from_genotypes(geno_sig)
                     mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
                     logger.info(f"Merge LD block built from {len(sig_keys)} {mode_text}.")
 
@@ -3867,14 +4005,17 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             "drawing zero-correlation LD block."
         )
         ld_mat = np.zeros((2, 2), dtype=np.float32)
+        ld_site_keys: list[tuple[str, int]] = []
         ld_overlay_text = "No genotype"
         n_sites = 0
     else:
-        geno_sig, _ = _collect_genotypes_for_bimranges(
+        ld_mat, ld_site_keys = _compute_ld_from_bed_rust(
             str(args.genofile),
             list(args.bimrange_tuples),
+            selected_sites=None,
+            threads=int(max(0, int(getattr(args, "thread", 0)))),
         )
-        n_sites = int(geno_sig.shape[0])
+        n_sites = int(ld_mat.shape[0])
         if n_sites < 2:
             logger.warning(
                 "Warning: Fewer than 2 SNPs were found in selected --bimrange; "
@@ -3883,36 +4024,99 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             ld_mat = np.zeros((max(2, n_sites), max(2, n_sites)), dtype=np.float32)
             ld_overlay_text = "Not enough SNPs"
         else:
-            ld_mat = _compute_ld_from_genotypes(geno_sig)
             logger.info(f"LD-only block built from {n_sites} SNPs.")
+    if args.genofile is None:
+        ld_site_keys = []
 
     two_color_style = _resolve_two_color_style(args.palette_spec)
     ld_cmap = "Greys"
+    gene_block_color = "grey"
+    gene_line_color = "black"
     if two_color_style is not None:
         ld_cmap = two_color_style["ld_cmap"]
+        gene_block_color = str(two_color_style["gene_block_color"])
+        gene_line_color = str(two_color_style["gene_line_color"])
+
+    region_ranges = list(args.bimrange_tuples)
+    ld_spans = _ld_bimrange_spans(ld_site_keys, region_ranges)
+    show_ld_titles = True  # LD-only has no Manhattan panel above.
+
+    gene_track_df = pd.DataFrame(columns=["feature", "strand", "attribute", "x_start", "x_end"])
+    use_gene_panel = False
+    if args.anno:
+        anno_suffix = str(args.anno).replace(".gz", "").split(".")[-1].lower()
+        gff_query_cache: Optional[GFFQuery] = None
+        if anno_suffix in {"gff", "gff3"}:
+            gff_query_cache = GFFQuery.from_file(args.anno)
+        gene_raw = _load_gene_like_records_from_anno(
+            args.anno,
+            region_ranges,
+            logger,
+            gff_query=gff_query_cache,
+        )
+        gene_track_df = _project_gene_records_to_ld_spans(
+            gene_raw,
+            region_ranges,
+            ld_spans,
+        )
+        if gene_track_df.shape[0] == 0:
+            logger.warning(
+                "Warning: No gene-structure records found in selected --bimrange; "
+                "gene track above LD block is skipped."
+            )
+        else:
+            use_gene_panel = True
 
     ld_h_in = width_in / float(args.ldblock_ratio)
     ld_h_in = max(
         float(ld_h_in),
         float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))),
     )
-    fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
-    ax_ld = fig_ld.add_subplot(111)
+    if use_gene_panel:
+        gene_h_in = width_in / 20.0
+        fig_ld = plt.figure(figsize=(width_in, gene_h_in + ld_h_in), dpi=300)
+        gs = fig_ld.add_gridspec(2, 1, height_ratios=[gene_h_in, ld_h_in], hspace=0.03)
+        ax_gene = fig_ld.add_subplot(gs[0, 0])
+        ax_ld = fig_ld.add_subplot(gs[1, 0])
+        _draw_gene_structure_axis(
+            ax_gene,
+            gene_track_df,
+            arrow_color=gene_line_color,
+            block_color=gene_block_color,
+            line_width=0.9,
+            arrow_step=1.0,
+        )
+    else:
+        fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
+        ax_ld = fig_ld.add_subplot(111)
+        ax_gene = None
+
     LDblock(ld_mat.copy(), ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
     n_ld = max(2, int(ld_mat.shape[0]))
     ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
     ax_ld.margins(x=0.0)
     if ld_overlay_text:
         ax_ld.text(n_ld / 2.0, -n_ld / 2.0, ld_overlay_text, ha="center", va="center", fontsize=6)
+    _draw_ld_bimrange_titles(ax_ld, ld_spans, enabled=show_ld_titles)
+
+    if ax_gene is not None:
+        ax_gene.set_xlim(0.5, float(n_ld) - 0.5)
 
     fig_ld.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.08)
     if args.ldblock_xspan is not None:
-        cx0, cy0, cw, ch = ax_ld.get_position().bounds
         fx0, fx1 = args.ldblock_xspan
+        if ax_gene is not None:
+            gx0, gy0, gw, gh = ax_gene.get_position().bounds
+            new_gx0 = float(gx0) + float(gw) * float(fx0)
+            new_gw = float(gw) * float(fx1 - fx0)
+            ax_gene.set_position([new_gx0, gy0, new_gw, gh])
+        cx0, cy0, cw, ch = ax_ld.get_position().bounds
         new_x0 = float(cx0) + float(cw) * float(fx0)
         new_w = float(cw) * float(fx1 - fx0)
         ax_ld.set_position([new_x0, cy0, new_w, ch])
         ax_ld.set_anchor("N")
+        if ax_gene is not None:
+            ax_gene.set_anchor("N")
 
     ld_path = os.path.join(args.out, f"{args.prefix}.ldblock.{args.format}")
     fig_ld.savefig(ld_path, transparent=True)
@@ -4503,10 +4707,9 @@ def main():
             )
             args.qq_ratio = None
         if args.anno is not None:
-            logger.warning(
-                "Warning: --anno requires GWAS result file(s); it is ignored in LD-only mode."
+            logger.info(
+                "LD-only mode: --anno will be used for gene-structure track above LD block."
             )
-            args.anno = None
         if args.ldclump_window_bp is not None:
             logger.warning(
                 "Warning: --LDclump requires GWAS result file(s); it is ignored in LD-only mode."

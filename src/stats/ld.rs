@@ -1,4 +1,6 @@
+use numpy::ndarray::Array2;
 use numpy::PyArray1;
+use numpy::PyArray2;
 use numpy::PyArrayMethods;
 use numpy::PyReadonlyArray1;
 use numpy::PyReadonlyArray2;
@@ -8,7 +10,7 @@ use pyo3::Bound;
 use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -574,6 +576,249 @@ fn normalize_plink_prefix(p: &str) -> String {
         return s[..s.len() - 4].to_string();
     }
     s.to_string()
+}
+
+#[inline]
+fn normalize_chr_token(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 3 && t[..3].eq_ignore_ascii_case("chr") {
+        t[3..].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn build_bimrange_map(
+    chrom_ranges: &[String],
+    start_bp: &[i64],
+    end_bp: &[i64],
+) -> Result<HashMap<String, Vec<(i64, i64)>>, String> {
+    if chrom_ranges.len() != start_bp.len() || chrom_ranges.len() != end_bp.len() {
+        return Err(format!(
+            "bimrange length mismatch: chrom_ranges={}, start_bp={}, end_bp={}",
+            chrom_ranges.len(),
+            start_bp.len(),
+            end_bp.len()
+        ));
+    }
+    if chrom_ranges.is_empty() {
+        return Err("bimrange list must not be empty".to_string());
+    }
+    let mut out: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for i in 0..chrom_ranges.len() {
+        let chrom = normalize_chr_token(&chrom_ranges[i]);
+        let mut s = start_bp[i];
+        let mut e = end_bp[i];
+        if s < 0 || e < 0 {
+            return Err(format!(
+                "bimrange[{i}] start/end must be >= 0, got ({s}, {e})"
+            ));
+        }
+        if s > e {
+            std::mem::swap(&mut s, &mut e);
+        }
+        out.entry(chrom).or_default().push((s, e));
+    }
+    Ok(out)
+}
+
+#[inline]
+fn pos_in_ranges(pos: i64, ranges: &[(i64, i64)]) -> bool {
+    for &(s, e) in ranges.iter() {
+        if pos >= s && pos <= e {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_bim_indices_for_ld(
+    prefix: &str,
+    bimrange_map: &HashMap<String, Vec<(i64, i64)>>,
+    selected_sites: Option<&HashSet<(String, i64)>>,
+) -> Result<(usize, Vec<usize>, Vec<String>, Vec<i64>), String> {
+    let bim_path = format!("{prefix}.bim");
+    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+    let reader = BufReader::new(file);
+
+    let mut total_snps = 0usize;
+    let mut selected_idx: Vec<usize> = Vec::new();
+    let mut selected_chr: Vec<String> = Vec::new();
+    let mut selected_pos: Vec<i64> = Vec::new();
+
+    for (line_no0, line) in reader.lines().enumerate() {
+        let line_no = line_no0 + 1;
+        let l = line.map_err(|e| format!("{bim_path}:{}: {}", line_no, e))?;
+        let (chrom_raw, pos) = parse_bim_line_chrom_pos(&l, line_no, &bim_path)?;
+        let chrom_norm = normalize_chr_token(&chrom_raw);
+        let mut keep = false;
+        if let Some(ranges) = bimrange_map.get(&chrom_norm) {
+            keep = pos_in_ranges(pos, ranges);
+        }
+        if keep {
+            if let Some(sel) = selected_sites {
+                if !sel.contains(&(chrom_norm.clone(), pos)) {
+                    keep = false;
+                }
+            }
+        }
+        if keep {
+            selected_idx.push(total_snps);
+            selected_chr.push(chrom_norm);
+            selected_pos.push(pos);
+        }
+        total_snps = total_snps.saturating_add(1);
+    }
+    if total_snps == 0 {
+        return Err(format!("no variant rows in {bim_path}"));
+    }
+    Ok((total_snps, selected_idx, selected_chr, selected_pos))
+}
+
+fn read_selected_bed_rows(
+    prefix: &str,
+    n_samples: usize,
+    total_snps: usize,
+    selected_idx: &[usize],
+) -> Result<Vec<u8>, String> {
+    if selected_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bed_path = format!("{prefix}.bed");
+    let mut bread = BufReader::new(File::open(&bed_path).map_err(|e| format!("{bed_path}: {e}"))?);
+    let mut header = [0u8; 3];
+    bread
+        .read_exact(&mut header)
+        .map_err(|e| format!("{bed_path}: {e}"))?;
+    if header != [0x6C, 0x1B, 0x01] {
+        return Err(format!(
+            "{bed_path}: unsupported BED header (expect SNP-major 0x6C 0x1B 0x01)"
+        ));
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let mut out = vec![0u8; selected_idx.len().saturating_mul(bytes_per_snp)];
+    let mut row = vec![0u8; bytes_per_snp];
+    let mut want_ptr = 0usize;
+    for ridx in 0..total_snps {
+        bread
+            .read_exact(&mut row)
+            .map_err(|e| format!("{bed_path}: row {}: {}", ridx + 1, e))?;
+        if want_ptr < selected_idx.len() && selected_idx[want_ptr] == ridx {
+            let off = want_ptr * bytes_per_snp;
+            out[off..off + bytes_per_snp].copy_from_slice(&row);
+            want_ptr = want_ptr.saturating_add(1);
+            if want_ptr >= selected_idx.len() {
+                break;
+            }
+        }
+    }
+    if want_ptr != selected_idx.len() {
+        return Err(format!(
+            "{bed_path}: selected rows truncated: got {}, expected {}",
+            want_ptr,
+            selected_idx.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn ld_r2_matrix_from_packed_rows(
+    packed_rows: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    n_samples: usize,
+    threads: usize,
+) -> Result<Vec<f32>, String> {
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    if m == 1 {
+        return Ok(vec![1.0_f32]);
+    }
+    if packed_rows.len() != m.saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "packed row length mismatch: got {}, expected {}",
+            packed_rows.len(),
+            m.saturating_mul(bytes_per_snp)
+        ));
+    }
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let byte_lut = packed_byte_lut();
+    let mut stats = vec![PackedRowStats::default(); m];
+    {
+        let mut run = || {
+            stats.par_iter_mut().enumerate().for_each(|(i, st)| {
+                let row = &packed_rows[i * bytes_per_snp..(i + 1) * bytes_per_snp];
+                *st = compute_packed_row_stats(row, n_samples, byte_lut);
+            });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+    let (bit_h, bit_l, bit_m, bit_words, bit_masks) =
+        build_bitplanes_u64(packed_rows, m, bytes_per_snp, n_samples, pool.as_ref());
+
+    let n_samples_f = n_samples as f64;
+    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
+    let mut out = vec![0.0_f32; m.saturating_mul(m)];
+    {
+        let mut run = || {
+            out.par_chunks_mut(m).enumerate().for_each(|(i, row)| {
+                row[i] = 1.0_f32;
+                let st_i = stats[i];
+                let off_i = i * bit_words;
+                let hi_i = &bit_h[off_i..off_i + bit_words];
+                let li_i = &bit_l[off_i..off_i + bit_words];
+                let mi_i = &bit_m[off_i..off_i + bit_words];
+                for j in (i + 1)..m {
+                    let st_j = stats[j];
+                    let off_j = j * bit_words;
+                    let hi_j = &bit_h[off_j..off_j + bit_words];
+                    let li_j = &bit_l[off_j..off_j + bit_words];
+                    let mi_j = &bit_m[off_j..off_j + bit_words];
+                    let r2 = if !st_i.has_missing && !st_j.has_missing {
+                        let dot_imp = dot_nomiss_pair_bitplanes(
+                            i, j, &bit_h, &bit_l, bit_words, &bit_masks,
+                        );
+                        let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
+                        let denom_corr = denom * st_i.std * st_j.std;
+                        let corr = if denom_corr > 0.0_f64 {
+                            cov / denom_corr
+                        } else {
+                            0.0_f64
+                        };
+                        corr * corr
+                    } else {
+                        r2_pairwise_complete_bitplanes(
+                            hi_i, li_i, mi_i, hi_j, li_j, mi_j, &bit_masks,
+                        )
+                        .unwrap_or(f64::NAN)
+                    };
+                    let rr = if r2.is_finite() {
+                        r2.clamp(0.0_f64, 1.0_f64) as f32
+                    } else {
+                        0.0_f32
+                    };
+                    row[j] = rr;
+                }
+            });
+        };
+        if let Some(tp) = &pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    }
+    for i in 1..m {
+        for j in 0..i {
+            let v = out[j * m + i];
+            out[i * m + j] = v;
+        }
+    }
+    Ok(out)
 }
 
 fn read_bim_lines_chrom_pos(prefix: &str) -> Result<(Vec<String>, Vec<i32>, Vec<i64>), String> {
@@ -2071,4 +2316,96 @@ pub fn bed_prune_to_plink_rust(
         })?;
     }
     Ok((kept, total))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    bfile,
+    chrom_ranges,
+    start_bp,
+    end_bp,
+    selected_chrom=None,
+    selected_pos=None,
+    threads=0
+))]
+pub fn bed_ldblock_r2_rust<'py>(
+    py: Python<'py>,
+    bfile: String,
+    chrom_ranges: Vec<String>,
+    start_bp: Vec<i64>,
+    end_bp: Vec<i64>,
+    selected_chrom: Option<Vec<String>>,
+    selected_pos: Option<Vec<i64>>,
+    threads: usize,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Vec<String>, Vec<i64>)> {
+    let prefix = normalize_plink_prefix(&bfile);
+    if prefix.is_empty() {
+        return Err(PyRuntimeError::new_err("bfile must not be empty"));
+    }
+
+    let bimrange_map = build_bimrange_map(&chrom_ranges, &start_bp, &end_bp)
+        .map_err(map_err_string_to_py)?;
+    let selected_sites: Option<HashSet<(String, i64)>> = match (selected_chrom, selected_pos) {
+        (None, None) => None,
+        (Some(ch), Some(ps)) => {
+            if ch.len() != ps.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "selected_chrom/selected_pos length mismatch: {} vs {}",
+                    ch.len(),
+                    ps.len()
+                )));
+            }
+            let mut set = HashSet::<(String, i64)>::with_capacity(ch.len());
+            for i in 0..ch.len() {
+                set.insert((normalize_chr_token(&ch[i]), ps[i]));
+            }
+            Some(set)
+        }
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "selected_chrom and selected_pos must be provided together",
+            ))
+        }
+    };
+
+    let (total_snps, selected_idx, selected_chr, selected_pos) =
+        select_bim_indices_for_ld(&prefix, &bimrange_map, selected_sites.as_ref())
+            .map_err(map_err_string_to_py)?;
+
+    if selected_idx.is_empty() {
+        let out = PyArray2::<f32>::zeros(py, [0, 0], false).into_bound();
+        return Ok((out, Vec::new(), Vec::new()));
+    }
+
+    let n_samples = crate::gfcore::read_fam(&prefix)
+        .map_err(map_err_string_to_py)?
+        .len();
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err(
+            "empty PLINK input (no samples in .fam)",
+        ));
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+
+    let r2_vec = py
+        .detach(|| -> Result<Vec<f32>, String> {
+            let packed_rows =
+                read_selected_bed_rows(&prefix, n_samples, total_snps, &selected_idx)?;
+            ld_r2_matrix_from_packed_rows(
+                &packed_rows,
+                selected_idx.len(),
+                bytes_per_snp,
+                n_samples,
+                threads,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let out = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((selected_idx.len(), selected_idx.len()), r2_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok((out, selected_chr, selected_pos))
 }

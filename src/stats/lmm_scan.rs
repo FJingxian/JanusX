@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use crate::brent::brent_minimize;
+use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
     chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
 };
@@ -44,6 +44,99 @@ fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
         x[i] = sum / a[i * dim + i];
     }
     x
+}
+
+#[pyfunction]
+#[pyo3(signature = (u_t, x, y, threads=0))]
+pub fn lmm_rotate_x_y_with_ut_f64<'py>(
+    py: Python<'py>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray1<'py, f64>,
+    threads: usize,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+    let y_slice = y.as_slice()?;
+    let n = y_slice.len();
+    if n == 0 {
+        return Err(PyRuntimeError::new_err("y must not be empty"));
+    }
+
+    let x_arr = x.as_array();
+    if x_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("x must be 2D (n, q)"));
+    }
+    let (xn, q) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "x rows must equal len(y): rows={xn}, len(y)={n}"
+        )));
+    }
+
+    let ut_arr = u_t.as_array();
+    if ut_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("u_t must be 2D (n, n)"));
+    }
+    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
+        return Err(PyRuntimeError::new_err(
+            "u_t must be shape (n, n) and row-major U^T",
+        ));
+    }
+
+    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+    };
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+
+    let pool = get_cached_pool(threads)?;
+    let dim = q + 1;
+    let mut utxy = vec![0.0_f64; n * dim];
+    {
+        let mut run = || {
+            utxy.par_chunks_mut(dim).enumerate().for_each(|(i, row)| {
+                let ut_row = &ut_flat[i * n..(i + 1) * n];
+                for c in 0..q {
+                    let mut acc = 0.0_f64;
+                    for j in 0..n {
+                        acc += (ut_row[j] as f64) * x_flat[j * q + c];
+                    }
+                    row[c] = acc;
+                }
+                let mut accy = 0.0_f64;
+                for j in 0..n {
+                    accy += (ut_row[j] as f64) * y_slice[j];
+                }
+                row[q] = accy;
+            });
+        };
+        if let Some(p) = &pool {
+            p.install(run);
+        } else {
+            run();
+        }
+    }
+
+    let mut utx = vec![0.0_f64; n * q];
+    let mut uty = vec![0.0_f64; n];
+    for i in 0..n {
+        let src = &utxy[i * dim..(i + 1) * dim];
+        if q > 0 {
+            utx[i * q..(i + 1) * q].copy_from_slice(&src[..q]);
+        }
+        uty[i] = src[q];
+    }
+
+    let utx_arr = numpy::ndarray::Array2::from_shape_vec((n, q), utx)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let uty_arr = numpy::ndarray::Array2::from_shape_vec((n, 1), uty)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok((
+        PyArray2::from_owned_array(py, utx_arr).into_bound(),
+        PyArray2::from_owned_array(py, uty_arr).into_bound(),
+    ))
 }
 
 // LMM REML chunk (lmm_reml_chunk_f32)
@@ -2731,6 +2824,7 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
     progress_callback=None,
     progress_every=0,
     nullml=None,
+    init_log10_lbd=None,
     rotate_block_rows=256
 ))]
 pub fn lmm_reml_assoc_packed_f32<'py>(
@@ -2753,6 +2847,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     nullml: Option<f64>,
+    init_log10_lbd: Option<f64>,
     rotate_block_rows: usize,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     if n_samples == 0 {
@@ -2765,6 +2860,9 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
         return Err(PyRuntimeError::new_err("tol must be positive and finite"));
     }
     let gm = PackedGeneticModel::parse(model)?;
+    let init_log10_lbd = init_log10_lbd
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(low, high));
 
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
@@ -2816,6 +2914,22 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
             )));
         }
         (0..n_samples).collect()
+    };
+    let sample_identity = sample_idx.iter().enumerate().all(|(i, &sid)| sid == i);
+    let sample_byte_idx: Option<Vec<usize>> = if sample_identity {
+        None
+    } else {
+        Some(sample_idx.iter().map(|&sid| sid >> 2).collect())
+    };
+    let sample_bit_shift: Option<Vec<u8>> = if sample_identity {
+        None
+    } else {
+        Some(
+            sample_idx
+                .iter()
+                .map(|&sid| ((sid & 3) << 1) as u8)
+                .collect(),
+        )
     };
 
     let xcov_arr = xcov.as_array();
@@ -2879,20 +2993,24 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
                 .par_chunks_mut(out_cols)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0_f64; n],
-                    |snp_vec, (idx, out_row)| {
+                    || (vec![0.0_f64; n], init_log10_lbd),
+                    |state, (idx, out_row)| {
+                        let (snp_vec, last_log10_lbd) = state;
                         let row = &g_block[idx * n..(idx + 1) * n];
                         for i in 0..n {
                             snp_vec[i] = row[i] as f64;
                         }
 
-                        let (best_log10_lbd, _best_cost) = brent_minimize(
+                        let init_guess = (*last_log10_lbd).or(init_log10_lbd);
+                        let (best_log10_lbd, _best_cost) = brent_minimize_with_init(
                             |x0| -reml_loglike(x0, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov),
                             low,
                             high,
                             tol,
                             max_iter,
+                            init_guess,
                         );
+                        *last_log10_lbd = Some(best_log10_lbd);
 
                         let (beta, se, _lbd) =
                             final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
@@ -2939,35 +3057,20 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
                 let snp_block = &mut snp_buf[..rows * n];
                 let rot_block = &mut rot_buf[..rows * n];
 
-                for off in 0..rows {
-                    let idx = start + off;
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let flip = row_flip[idx];
-                    let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                    let mut sum_g = 0.0_f64;
-
-                    let dst = &mut snp_block[off * n..(off + 1) * n];
-                    for (j, &sid) in sample_idx.iter().enumerate() {
-                        let b = row[sid >> 2];
-                        let code = (b >> ((sid & 3) * 2)) & 0b11;
-                        let mut gv = match code {
-                            0b00 => 0.0_f64,
-                            0b10 => 1.0_f64,
-                            0b11 => 2.0_f64,
-                            _ => mean_g,
-                        };
-                        if flip && code != 0b01 {
-                            gv = 2.0 - gv;
-                        }
-                        gv = gm.apply(gv);
-                        sum_g += gv;
-                        dst[j] = gv as f32;
-                    }
-                    let g_mean = (sum_g / (n as f64)) as f32;
-                    for v in dst.iter_mut() {
-                        *v -= g_mean;
-                    }
-                }
+                decode_centered_block_packed_f32(
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_flip,
+                    row_maf,
+                    start,
+                    rows,
+                    n,
+                    gm,
+                    sample_identity,
+                    sample_byte_idx.as_deref(),
+                    sample_bit_shift.as_deref(),
+                    snp_block,
+                );
 
                 let rotate_tile_rows = choose_rotate_tile_rows(
                     rows,
@@ -3068,6 +3171,97 @@ impl PackedGeneticModel {
             }
         }
     }
+}
+
+#[inline]
+fn decode_centered_block_packed_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_start: usize,
+    rows: usize,
+    n: usize,
+    gm: PackedGeneticModel,
+    sample_identity: bool,
+    sample_byte_idx: Option<&[usize]>,
+    sample_bit_shift: Option<&[u8]>,
+    out: &mut [f32],
+) {
+    if rows == 0 || n == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), rows * n);
+
+    if sample_identity {
+        out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
+            let idx = row_start + off;
+            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+            let flip = row_flip[idx];
+            let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+            let mut sum_g = 0.0_f64;
+
+            let mut j = 0usize;
+            for &b in row.iter() {
+                let mut lane = 0usize;
+                while lane < 4 && j < n {
+                    let code = (b >> (lane * 2)) & 0b11;
+                    let mut gv = match code {
+                        0b00 => 0.0_f64,
+                        0b10 => 1.0_f64,
+                        0b11 => 2.0_f64,
+                        _ => mean_g,
+                    };
+                    if flip && code != 0b01 {
+                        gv = 2.0_f64 - gv;
+                    }
+                    gv = gm.apply(gv);
+                    dst[j] = gv as f32;
+                    sum_g += gv;
+                    lane += 1;
+                    j += 1;
+                }
+                if j >= n {
+                    break;
+                }
+            }
+            let g_mean = (sum_g / (n as f64)) as f32;
+            for v in dst.iter_mut() {
+                *v -= g_mean;
+            }
+        });
+        return;
+    }
+
+    let byte_idx = sample_byte_idx.expect("sample_byte_idx must exist for non-identity mapping");
+    let bit_shift = sample_bit_shift.expect("sample_bit_shift must exist for non-identity mapping");
+    out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
+        let idx = row_start + off;
+        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+        let flip = row_flip[idx];
+        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
+        let mut sum_g = 0.0_f64;
+        for j in 0..n {
+            let b = row[byte_idx[j]];
+            let code = (b >> bit_shift[j]) & 0b11;
+            let mut gv = match code {
+                0b00 => 0.0_f64,
+                0b10 => 1.0_f64,
+                0b11 => 2.0_f64,
+                _ => mean_g,
+            };
+            if flip && code != 0b01 {
+                gv = 2.0_f64 - gv;
+            }
+            gv = gm.apply(gv);
+            dst[j] = gv as f32;
+            sum_g += gv;
+        }
+        let g_mean = (sum_g / (n as f64)) as f32;
+        for v in dst.iter_mut() {
+            *v -= g_mean;
+        }
+    });
 }
 
 struct PackedNullEval {
@@ -3687,78 +3881,20 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                 let proj_sub = &mut proj_block[..rows * n];
                 let u2_sub = &mut u2_block[..rows * n];
 
-                if sample_identity {
-                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                        let mut sum_g = 0.0_f64;
-
-                        let mut j = 0usize;
-                        for &b in row.iter() {
-                            let mut lane = 0usize;
-                            while lane < 4 && j < n {
-                                let code = (b >> (lane * 2)) & 0b11;
-                                let mut gv = match code {
-                                    0b00 => 0.0_f64,
-                                    0b10 => 1.0_f64,
-                                    0b11 => 2.0_f64,
-                                    _ => mean_g,
-                                };
-                                if flip && code != 0b01 {
-                                    gv = 2.0_f64 - gv;
-                                }
-                                gv = gm.apply(gv);
-                                dst[j] = gv as f32;
-                                sum_g += gv;
-                                lane += 1;
-                                j += 1;
-                            }
-                            if j >= n {
-                                break;
-                            }
-                        }
-                        let g_mean = (sum_g / (n as f64)) as f32;
-                        for v in dst.iter_mut() {
-                            *v -= g_mean;
-                        }
-                    });
-                } else {
-                    let byte_idx = sample_byte_idx
-                        .as_ref()
-                        .expect("sample_byte_idx must exist for non-identity mapping");
-                    let bit_shift = sample_bit_shift
-                        .as_ref()
-                        .expect("sample_bit_shift must exist for non-identity mapping");
-                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                        let mut sum_g = 0.0_f64;
-                        for j in 0..n {
-                            let b = row[byte_idx[j]];
-                            let code = (b >> bit_shift[j]) & 0b11;
-                            let mut gv = match code {
-                                0b00 => 0.0_f64,
-                                0b10 => 1.0_f64,
-                                0b11 => 2.0_f64,
-                                _ => mean_g,
-                            };
-                            if flip && code != 0b01 {
-                                gv = 2.0_f64 - gv;
-                            }
-                            gv = gm.apply(gv);
-                            dst[j] = gv as f32;
-                            sum_g += gv;
-                        }
-                        let g_mean = (sum_g / (n as f64)) as f32;
-                        for v in dst.iter_mut() {
-                            *v -= g_mean;
-                        }
-                    });
-                }
+                decode_centered_block_packed_f32(
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_flip,
+                    row_maf,
+                    start,
+                    rows,
+                    n,
+                    gm,
+                    sample_identity,
+                    sample_byte_idx.as_deref(),
+                    sample_bit_shift.as_deref(),
+                    g_sub,
+                );
 
                 let tile_rows = choose_rotate_tile_rows(
                     rows,
@@ -4565,78 +4701,20 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 let proj_sub = &mut proj_block[..rows * n];
                 let u2_sub = &mut u2_block[..rows * n];
 
-                if sample_identity {
-                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                        let mut sum_g = 0.0_f64;
-
-                        let mut j = 0usize;
-                        for &b in row.iter() {
-                            let mut lane = 0usize;
-                            while lane < 4 && j < n {
-                                let code = (b >> (lane * 2)) & 0b11;
-                                let mut gv = match code {
-                                    0b00 => 0.0_f64,
-                                    0b10 => 1.0_f64,
-                                    0b11 => 2.0_f64,
-                                    _ => mean_g,
-                                };
-                                if flip && code != 0b01 {
-                                    gv = 2.0_f64 - gv;
-                                }
-                                gv = gm.apply(gv);
-                                dst[j] = gv as f32;
-                                sum_g += gv;
-                                lane += 1;
-                                j += 1;
-                            }
-                            if j >= n {
-                                break;
-                            }
-                        }
-                        let g_mean = (sum_g / (n as f64)) as f32;
-                        for v in dst.iter_mut() {
-                            *v -= g_mean;
-                        }
-                    });
-                } else {
-                    let byte_idx = sample_byte_idx
-                        .as_ref()
-                        .expect("sample_byte_idx must exist for non-identity mapping");
-                    let bit_shift = sample_bit_shift
-                        .as_ref()
-                        .expect("sample_bit_shift must exist for non-identity mapping");
-                    g_sub.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
-                        let idx = start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip[idx];
-                        let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                        let mut sum_g = 0.0_f64;
-                        for j in 0..n {
-                            let b = row[byte_idx[j]];
-                            let code = (b >> bit_shift[j]) & 0b11;
-                            let mut gv = match code {
-                                0b00 => 0.0_f64,
-                                0b10 => 1.0_f64,
-                                0b11 => 2.0_f64,
-                                _ => mean_g,
-                            };
-                            if flip && code != 0b01 {
-                                gv = 2.0_f64 - gv;
-                            }
-                            gv = gm.apply(gv);
-                            dst[j] = gv as f32;
-                            sum_g += gv;
-                        }
-                        let g_mean = (sum_g / (n as f64)) as f32;
-                        for v in dst.iter_mut() {
-                            *v -= g_mean;
-                        }
-                    });
-                }
+                decode_centered_block_packed_f32(
+                    &packed_flat,
+                    bytes_per_snp,
+                    row_flip,
+                    row_maf,
+                    start,
+                    rows,
+                    n,
+                    gm,
+                    sample_identity,
+                    sample_byte_idx.as_deref(),
+                    sample_bit_shift.as_deref(),
+                    g_sub,
+                );
 
                 let tile_rows = choose_rotate_tile_rows(
                     rows,

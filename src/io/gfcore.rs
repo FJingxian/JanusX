@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
+use crate::bedmath::packed_byte_lut;
 
 const BED_HEADER_LEN: usize = 3;
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
@@ -64,6 +65,25 @@ pub fn read_fam(prefix: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(samples)
+}
+
+#[inline]
+fn count_fam_samples(prefix: &str) -> Result<usize, String> {
+    let fam_path = format!("{prefix}.fam");
+    let file = File::open(&fam_path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let mut n = 0usize;
+    for line in reader.lines() {
+        let l = line.map_err(|e| e.to_string())?;
+        if l.trim().is_empty() {
+            continue;
+        }
+        n = n.saturating_add(1);
+    }
+    if n == 0 {
+        return Err("FAM contains zero samples".to_string());
+    }
+    Ok(n)
 }
 
 pub fn read_bim(prefix: &str) -> Result<Vec<SiteInfo>, String> {
@@ -1406,7 +1426,102 @@ fn bed_code_to_dosage(code: u8) -> f32 {
     }
 }
 
+#[inline]
+fn prepare_grm_decoded_row_inplace(
+    row: &mut [f32],
+    method: usize,
+    maf_thr: f32,
+    miss_thr: f32,
+    eps: f64,
+    mut alt_sum: f64,
+    non_missing: usize,
+) -> Option<f64> {
+    let n = row.len();
+    if n == 0 {
+        return None;
+    }
+    let missing_rate = 1.0_f64 - (non_missing as f64 / n as f64);
+    if missing_rate > miss_thr as f64 {
+        return None;
+    }
+
+    if non_missing == 0 {
+        if maf_thr > 0.0_f32 {
+            return None;
+        }
+        row.fill(0.0_f32);
+        return Some(0.0_f64);
+    }
+
+    let mut alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
+    let flip_major = alt_freq > 0.5_f64;
+    if flip_major {
+        alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
+        alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
+    }
+
+    let maf = alt_freq.min(1.0_f64 - alt_freq);
+    if maf < maf_thr as f64 {
+        return None;
+    }
+
+    let mean_g = (alt_sum / non_missing as f64) as f32;
+    let var = (2.0_f64 * alt_freq * (1.0_f64 - alt_freq)).max(0.0_f64);
+    let std_scale = if method == 2 {
+        if var > eps {
+            (1.0_f64 / var.sqrt()) as f32
+        } else {
+            0.0_f32
+        }
+    } else {
+        1.0_f32
+    };
+
+    for g in row.iter_mut() {
+        if *g < 0.0_f32 {
+            *g = 0.0_f32;
+            continue;
+        }
+        let gv = if flip_major { 2.0_f32 - *g } else { *g };
+        *g = (gv - mean_g) * std_scale;
+    }
+    Some(var)
+}
+
 impl BedSnpIter {
+    #[inline]
+    fn open_bed_and_infer_shape(
+        prefix: &str,
+        n_samples: usize,
+    ) -> Result<(File, usize, usize, usize), String> {
+        if n_samples == 0 {
+            return Err("BED sample count is zero".to_string());
+        }
+        let bytes_per_snp = (n_samples + 3) / 4;
+        if bytes_per_snp == 0 {
+            return Err("invalid BED bytes_per_snp (zero)".to_string());
+        }
+        let bed_path = format!("{prefix}.bed");
+        let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
+        let bed_len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if bed_len < BED_HEADER_LEN {
+            return Err("BED too small".into());
+        }
+        let mut header = [0u8; BED_HEADER_LEN];
+        file.read_exact(&mut header).map_err(|e| e.to_string())?;
+        if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+            return Err("Only SNP-major BED supported".into());
+        }
+        let data_len = bed_len - BED_HEADER_LEN;
+        if data_len % bytes_per_snp != 0 {
+            return Err(format!(
+                "BED payload size mismatch: data_len={data_len} not divisible by bytes_per_snp={bytes_per_snp}"
+            ));
+        }
+        let n_snps = data_len / bytes_per_snp;
+        Ok((file, bed_len, bytes_per_snp, n_snps))
+    }
+
     pub fn new_with_fill(
         prefix: &str,
         maf: f32,
@@ -1418,21 +1533,14 @@ impl BedSnpIter {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
         let n_samples = samples.len();
-        let n_snps = sites.len();
-
-        let bed_path = format!("{prefix}.bed");
-        let file = File::open(&bed_path).map_err(|e| e.to_string())?;
+        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        if n_snps != sites.len() {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
+                sites.len()
+            ));
+        }
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
-        let bed_len = mmap.len();
-
-        if bed_len < BED_HEADER_LEN {
-            return Err("BED too small".into());
-        }
-        if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-            return Err("Only SNP-major BED supported".into());
-        }
-
-        let bytes_per_snp = (n_samples + 3) / 4;
 
         Ok(Self {
             prefix: prefix.to_string(),
@@ -1472,19 +1580,13 @@ impl BedSnpIter {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
         let n_samples = samples.len();
-        let n_snps = sites.len();
-
-        let bed_path = format!("{prefix}.bed");
-        let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
-        let bed_len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
-
-        let mut header = [0u8; BED_HEADER_LEN];
-        file.read_exact(&mut header).map_err(|e| e.to_string())?;
-        if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
-            return Err("Only SNP-major BED supported".into());
+        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        if n_snps != sites.len() {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
+                sites.len()
+            ));
         }
-
-        let bytes_per_snp = (n_samples + 3) / 4;
         let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
         let window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
         let (mmap, mmap_offset, window_len_snps) =
@@ -1510,6 +1612,70 @@ impl BedSnpIter {
             fill_missing,
             apply_het_filter,
             het_threshold,
+        })
+    }
+
+    /// Lightweight constructor for GRM streaming path:
+    /// parses FAM count and BED shape, skips full BIM metadata parse.
+    pub fn new_for_grm(prefix: &str) -> Result<Self, String> {
+        let n_samples = count_fam_samples(prefix)?;
+        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        Ok(Self {
+            prefix: prefix.to_string(),
+            samples: Vec::new(),
+            sites: Vec::new(),
+            mmap,
+            mmap_offset: 0,
+            window_snps: None,
+            window_start_snp: 0,
+            window_len_snps: n_snps,
+            bed_len,
+            bed_file: None,
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf: 0.0_f32,
+            miss: 1.0_f32,
+            fill_missing: false,
+            apply_het_filter: false,
+            het_threshold: 0.02_f32,
+        })
+    }
+
+    /// Lightweight constructor with mmap windowing for GRM streaming path:
+    /// parses FAM count and BED shape, skips full BIM metadata parse.
+    pub fn new_for_grm_window(prefix: &str, mmap_window_mb: usize) -> Result<Self, String> {
+        if mmap_window_mb == 0 {
+            return Err("mmap_window_mb must be > 0".into());
+        }
+        let n_samples = count_fam_samples(prefix)?;
+        let (file, bed_len, bytes_per_snp, n_snps) = Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
+        let window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
+        let (mmap, mmap_offset, window_len_snps) =
+            Self::map_window(&file, bed_len, 0, window_snps, bytes_per_snp)?;
+        Ok(Self {
+            prefix: prefix.to_string(),
+            samples: Vec::new(),
+            sites: Vec::new(),
+            mmap,
+            mmap_offset,
+            window_snps: Some(window_snps),
+            window_start_snp: 0,
+            window_len_snps,
+            bed_len,
+            bed_file: Some(file),
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf: 0.0_f32,
+            miss: 1.0_f32,
+            fill_missing: false,
+            apply_het_filter: false,
+            het_threshold: 0.02_f32,
         })
     }
 
@@ -1584,6 +1750,88 @@ impl BedSnpIter {
             return None;
         }
         Some(&self.mmap[rel..end])
+    }
+
+    #[inline]
+    fn decode_snp_bytes_into_with_stats(&self, snp_bytes: &[u8], out: &mut [f32]) -> (f64, usize) {
+        let byte_lut = packed_byte_lut();
+        let value_lut: [f32; 4] = [0.0_f32, -9.0_f32, 1.0_f32, 2.0_f32];
+        let mut alt_sum = 0.0_f64;
+        let mut non_missing = 0usize;
+        let full_bytes = self.n_samples / 4;
+        let rem = self.n_samples % 4;
+        let mut col = 0usize;
+
+        for &b in snp_bytes.iter().take(full_bytes) {
+            let idx = b as usize;
+            non_missing += byte_lut.nonmiss[idx] as usize;
+            alt_sum += byte_lut.alt_sum[idx] as f64;
+            let codes = &byte_lut.code4[idx];
+            out[col] = value_lut[codes[0] as usize];
+            out[col + 1] = value_lut[codes[1] as usize];
+            out[col + 2] = value_lut[codes[2] as usize];
+            out[col + 3] = value_lut[codes[3] as usize];
+            col += 4;
+        }
+        if rem > 0 {
+            let b = snp_bytes[full_bytes];
+            let idx = b as usize;
+            let codes = &byte_lut.code4[idx];
+            for lane in 0..rem {
+                out[col + lane] = value_lut[codes[lane] as usize];
+                if codes[lane] != 0b01 {
+                    non_missing += 1;
+                    alt_sum += value_lut[codes[lane] as usize] as f64;
+                }
+            }
+        }
+        (alt_sum, non_missing)
+    }
+
+    #[inline]
+    fn decode_snp_bytes_stats_only(&self, snp_bytes: &[u8]) -> (f64, usize) {
+        let byte_lut = packed_byte_lut();
+        let mut alt_sum = 0.0_f64;
+        let mut non_missing = 0usize;
+        let full_bytes = self.n_samples / 4;
+        let rem = self.n_samples % 4;
+        for &b in snp_bytes.iter().take(full_bytes) {
+            let idx = b as usize;
+            non_missing += byte_lut.nonmiss[idx] as usize;
+            alt_sum += byte_lut.alt_sum[idx] as f64;
+        }
+        if rem > 0 {
+            let b = snp_bytes[full_bytes];
+            let idx = b as usize;
+            let codes = &byte_lut.code4[idx];
+            for lane in 0..rem {
+                let code = codes[lane];
+                if code != 0b01 {
+                    non_missing += 1;
+                    alt_sum += match code {
+                        0b00 => 0.0_f64,
+                        0b10 => 1.0_f64,
+                        0b11 => 2.0_f64,
+                        _ => 0.0_f64,
+                    };
+                }
+            }
+        }
+        (alt_sum, non_missing)
+    }
+
+    /// Random-access decode for one SNP row into caller-provided buffer.
+    /// Returns (alt_sum, non_missing_count). Unsupported for windowed mmap mode.
+    pub fn decode_snp_raw_into_with_stats_at(
+        &self,
+        snp_idx: usize,
+        out: &mut [f32],
+    ) -> Option<(f64, usize)> {
+        if self.window_snps.is_some() || snp_idx >= self.n_snps || out.len() < self.n_samples {
+            return None;
+        }
+        let snp_bytes = self.snp_bytes(snp_idx)?;
+        Some(self.decode_snp_bytes_into_with_stats(snp_bytes, out))
     }
 
     fn decode_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
@@ -1686,6 +1934,105 @@ impl BedSnpIter {
 
     pub fn is_windowed(&self) -> bool {
         self.window_snps.is_some()
+    }
+
+    /// Decode next SNP row into caller-provided buffer (len >= n_samples)
+    /// and return the source SNP index.
+    #[allow(dead_code)]
+    pub fn next_snp_raw_into(&mut self, out: &mut [f32]) -> Option<usize> {
+        self.next_snp_raw_into_with_stats(out)
+            .map(|(snp_idx, _alt_sum, _non_missing)| snp_idx)
+    }
+
+    /// Decode next SNP row into caller-provided buffer (len >= n_samples),
+    /// and return (source_snp_index, alt_sum, non_missing_count).
+    pub fn next_snp_raw_into_with_stats(
+        &mut self,
+        out: &mut [f32],
+    ) -> Option<(usize, f64, usize)> {
+        if out.len() < self.n_samples {
+            return None;
+        }
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+
+            let (alt_sum, non_missing) = self.decode_snp_bytes_into_with_stats(snp_bytes, out);
+            return Some((snp_idx, alt_sum, non_missing));
+        }
+        None
+    }
+
+    /// Scan next SNP and return (source_snp_index, alt_sum, non_missing_count)
+    /// without decoding full row values into an output buffer.
+    pub fn next_snp_stats_only(&mut self) -> Option<(usize, f64, usize)> {
+        while self.cur < self.n_snps {
+            let snp_idx = self.cur;
+            self.cur += 1;
+
+            if self.window_snps.is_some() {
+                let window_end = self.window_start_snp + self.window_len_snps;
+                if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                    if let Err(e) = self.remap_window(snp_idx) {
+                        panic!("failed to remap BED window: {e}");
+                    }
+                }
+            }
+
+            let snp_bytes = match self.snp_bytes(snp_idx) {
+                Some(bytes) => bytes,
+                None => return None,
+            };
+
+            let (alt_sum, non_missing) = self.decode_snp_bytes_stats_only(snp_bytes);
+            return Some((snp_idx, alt_sum, non_missing));
+        }
+        None
+    }
+
+    /// Decode + QC/filter + centering/standardization for GRM streaming.
+    /// Returns (raw_scanned_snp_count, row_var_if_kept, reached_eof).
+    pub fn next_snp_grm_row_into(
+        &mut self,
+        out: &mut [f32],
+        method: usize,
+        maf_thr: f32,
+        miss_thr: f32,
+        eps: f64,
+    ) -> (usize, Option<f64>, bool) {
+        let mut scanned = 0usize;
+        loop {
+            let Some((_snp_idx, alt_sum, non_missing)) = self.next_snp_raw_into_with_stats(out)
+            else {
+                return (scanned, None, true);
+            };
+            scanned = scanned.saturating_add(1);
+            if let Some(var) = prepare_grm_decoded_row_inplace(
+                out,
+                method,
+                maf_thr,
+                miss_thr,
+                eps,
+                alt_sum,
+                non_missing,
+            ) {
+                return (scanned, Some(var), false);
+            }
+        }
     }
 
     pub fn next_snp_raw(&mut self) -> Option<(Vec<f32>, SiteInfo)> {

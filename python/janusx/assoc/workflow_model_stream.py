@@ -15,23 +15,17 @@ import numpy as np
 import pandas as pd
 import psutil
 
-from janusx.gfreader import load_genotype_chunks
-from janusx.script._common.prefetch import prefetch_iter
-
 from .workflow import (
     CliStatus,
     FastLMM,
     LM,
     LMM,
-    _FASTLMM_PVE_HIGH,
-    _FASTLMM_PVE_LOW,
     _GWAS_PROGRESS_BAR_WIDTH,
     _ProgressAdapter,
     _align_pheno_to_sample_order,
     _as_plink_prefix,
     _display_path,
     _emit_trait_header,
-    _fastlmm_pve_is_degenerate,
     _format_progress_metric,
     _gwas_evd_stage_ctx,
     _gwas_scan_stage_ctx,
@@ -53,6 +47,47 @@ from .workflow import (
     run_lmm_packed_fullrank,
     should_animate_status,
 )
+
+
+def _fastlmm_switch_to_lm_decision(
+    *,
+    y_vec: np.ndarray,
+    x_cov: np.ndarray,
+    lmm_ml0: Optional[float],
+    alpha: float = 0.05,
+) -> tuple[bool, Optional[float], Optional[float]]:
+    """
+    Decide whether FastLMM should switch to LM for a trait.
+
+    Rust null-LRT decision (H0: Va=0 boundary test), Rust-only mode.
+    """
+    ml0 = None
+    try:
+        if lmm_ml0 is not None:
+            ml0_tmp = float(lmm_ml0)
+            if np.isfinite(ml0_tmp):
+                ml0 = ml0_tmp
+    except Exception:
+        ml0 = None
+
+    if ml0 is None:
+        raise RuntimeError(
+            "FastLMM Rust-only switch decision requires finite LMM null ML (ml0)."
+        )
+    if not hasattr(jxrs, "gwas_lmm_lm_null_lrt_decision"):
+        raise RuntimeError(
+            "Rust symbol gwas_lmm_lm_null_lrt_decision is unavailable."
+        )
+    y_arr = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1))
+    x_arr = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64))
+    switch_to_lm, lrt_stat, pval, _lm_ml0 = jxrs.gwas_lmm_lm_null_lrt_decision(
+        y_arr,
+        x_arr,
+        float(ml0),
+        float(alpha),
+        True,  # boundary mixture: 0.5*chi2_1 for H0: Va=0
+    )
+    return bool(switch_to_lm), float(lrt_stat), float(pval)
 
 
 def run_chunked_gwas_lmm_lm(
@@ -463,15 +498,21 @@ def run_chunked_gwas_lmm_lm(
                 header_pve = None
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
-            if model_key == "fastlmm" and _fastlmm_pve_is_degenerate(header_pve):
-                logger.warning(
-                    f"Warning: FastLMM fallback to LMM for trait {pname}: "
-                    f"PVE(null)={float(header_pve):.3f} outside "
-                    f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
+            if model_key == "fastlmm":
+                switch_to_lm, lrt_stat, lrt_p = _fastlmm_switch_to_lm_decision(
+                    y_vec=y_vec,
+                    x_cov=X_cov,
+                    lmm_ml0=getattr(mod, "ML0", None),
+                    alpha=0.05,
                 )
-                effective_model_key = "lmm"
-                effective_model_label = "LMM"
-                effective_model_tag = "lmm"
+                if switch_to_lm:
+                    logger.warning(
+                        f"Warning: FastLMM switch to LM for trait {pname}: "
+                        f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                    )
+                    effective_model_key = "lm"
+                    effective_model_label = "LM"
+                    effective_model_tag = "lm"
             init_log_message = f"PVE(null) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
@@ -679,37 +720,68 @@ def run_chunked_gwas_lmm_lm(
         with _gwas_scan_stage_ctx(scan_threads):
             ex = cf.ThreadPoolExecutor(max_workers=workers)
             try:
-                chunk_iter = load_genotype_chunks(
-                    genofile,
-                    model_chunk_size,
-                    maf_threshold,
-                    max_missing_rate,
-                    model=genetic_model,
-                    het=het_threshold,
-                    snps_only=bool(snps_only),
-                    sample_ids=sample_sub,
-                    mmap_window_mb=mmap_window_mb,
+                bed_prefix = _as_plink_prefix(genofile)
+                if bed_prefix is None:
+                    raise RuntimeError(
+                        "Rust-only GWAS scan requires PLINK BED input/prefix."
+                    )
+                if not hasattr(jxrs, "BedChunkReader"):
+                    raise RuntimeError(
+                        "Rust-only GWAS scan requires rust symbol BedChunkReader."
+                    )
+                bed_reader = jxrs.BedChunkReader(
+                    str(bed_prefix),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    fill_missing=True,
+                    sample_ids=sample_sub.tolist(),
+                    model=str(genetic_model),
+                    het_threshold=float(het_threshold),
                 )
-                for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-                    genosub: np.ndarray
-                    if genosub.shape[1] != expected_n:
-                        # Backward-compatible fallback: if backend ignored sample_ids and
-                        # returned columns for full aligned IDs, apply sameidx here.
-                        if genosub.shape[1] == int(sameidx.shape[0]):
-                            genosub = genosub[:, sameidx]
-                        else:
-                            raise ValueError(
-                                f"Genotype sample dimension mismatch for trait {pname}: "
-                                f"chunk has {genosub.shape[1]} columns, "
-                                f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
-                            )
-                    if genetic_model != "add":
-                        keep_mask = _heter_keep_mask(genosub, het_threshold)
-                        if not np.any(keep_mask):
+                if not hasattr(bed_reader, "next_chunk_prepared"):
+                    raise RuntimeError(
+                        "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
+                    )
+
+                def _is_simple_allele_token(a: object) -> bool:
+                    s = str(a).strip().upper()
+                    return (len(s) == 1) and (s in {"A", "C", "G", "T"})
+
+                while True:
+                    out = bed_reader.next_chunk_prepared(
+                        int(model_chunk_size),
+                        coding=str(genetic_model),
+                    )
+                    if out is None:
+                        break
+                    geno_center_raw, sites, maf_chunk_raw = out
+                    geno_center = np.ascontiguousarray(
+                        np.asarray(geno_center_raw, dtype=np.float32),
+                        dtype=np.float32,
+                    )
+                    maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
+
+                    if bool(snps_only):
+                        keep = np.fromiter(
+                            (
+                                (
+                                    _is_simple_allele_token(getattr(s, "ref_allele", ""))
+                                    and _is_simple_allele_token(getattr(s, "alt_allele", ""))
+                                )
+                                for s in sites
+                            ),
+                            dtype=np.bool_,
+                            count=len(sites),
+                        )
+                        if not np.any(keep):
                             continue
-                        genosub = genosub[keep_mask]
-                        sites = [s for s, k in zip(sites, keep_mask) if k]
-                    m_chunk = genosub.shape[0]
+                        if not bool(np.all(keep)):
+                            ridx = np.flatnonzero(keep)
+                            geno_center = geno_center[ridx, :]
+                            maf_chunk = maf_chunk[ridx]
+                            sites = [sites[int(i)] for i in ridx.tolist()]
+
+                    m_chunk = int(geno_center.shape[0])
                     if m_chunk == 0:
                         continue
 
@@ -720,17 +792,6 @@ def run_chunked_gwas_lmm_lm(
                     if len(info_chunk) == 0:
                         continue
 
-                    geno_model = _apply_genetic_model(genosub, genetic_model)
-                    if genetic_model == "add":
-                        maf_chunk = np.mean(genosub, axis=1)
-                        maf_chunk = (maf_chunk / 2).astype(np.float32, copy=False)
-                    else:
-                        maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-                    # In-place centering avoids one extra (m_chunk, n_samples) allocation.
-                    geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
-                    geno_center -= np.mean(
-                        geno_center, axis=1, dtype=np.float32, keepdims=True
-                    )
                     fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
                     inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
                     chunk_seq += 1
@@ -1180,22 +1241,21 @@ def run_chunked_gwas_streaming_shared(
             except Exception:
                 pve_now = None
 
-        if mkey == "fastlmm" and _fastlmm_pve_is_degenerate(pve_now):
-            if share_evd_lmm_fast and shared_lmm_model is not None:
-                logger.warning(
-                    f"Warning: FastLMM skipped for trait {pname}: "
-                    f"PVE(null)={float(pve_now):.3f} outside "
-                    f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
-                )
-                continue
-            logger.warning(
-                f"Warning: FastLMM fallback to LMM for trait {pname}: "
-                f"PVE(null)={float(pve_now):.3f} outside "
-                f"[{_FASTLMM_PVE_LOW:.2f}, {_FASTLMM_PVE_HIGH:.2f}]."
+        if mkey == "fastlmm":
+            switch_to_lm, lrt_stat, lrt_p = _fastlmm_switch_to_lm_decision(
+                y_vec=y_vec,
+                x_cov=X_cov,
+                lmm_ml0=getattr(mod, "ML0", None),
+                alpha=0.05,
             )
-            effective_model_key = "lmm"
-            effective_model_label = "LMM"
-            effective_model_tag = "lmm"
+            if switch_to_lm:
+                logger.warning(
+                    f"Warning: FastLMM switch to LM for trait {pname}: "
+                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
+                )
+                effective_model_key = "lm"
+                effective_model_label = "LM"
+                effective_model_tag = "lm"
 
         cpu_after = process.cpu_times()
         ctx["cpu_used"] = float(
@@ -1385,116 +1445,74 @@ def run_chunked_gwas_streaming_shared(
     interrupted = False
     with _gwas_scan_stage_ctx(scan_threads):
         try:
-            use_bed_prepared_shared = False
-            bed_reader = None
             bed_prefix = _as_plink_prefix(genofile)
-            if bed_prefix is not None and hasattr(jxrs, "BedChunkReader"):
-                try:
-                    bed_reader = jxrs.BedChunkReader(
-                        str(bed_prefix),
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        fill_missing=True,
-                        sample_ids=sample_sub.tolist(),
-                        model=str(genetic_model),
-                        het_threshold=float(het_threshold),
-                    )
-                    if hasattr(bed_reader, "next_chunk_prepared"):
-                        use_bed_prepared_shared = True
-                        _log_file_only(
-                            logger,
-                            logging.INFO,
-                            "Shared GWAS scan: using Rust BED prepared-chunk stream.",
-                        )
-                except Exception as ex:
-                    use_bed_prepared_shared = False
-                    bed_reader = None
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        "Shared GWAS scan: prepared BED stream unavailable; "
-                        f"fallback to generic chunk path. reason={ex}",
-                    )
-
-            if use_bed_prepared_shared and bed_reader is not None:
-                def _is_simple_allele_token(a: object) -> bool:
-                    s = str(a).strip().upper()
-                    return (len(s) == 1) and (s in {"A", "C", "G", "T"})
-
-                while True:
-                    out = bed_reader.next_chunk_prepared(
-                        int(model_chunk_size),
-                        coding=str(genetic_model),
-                    )
-                    if out is None:
-                        break
-                    geno_center_raw, sites, maf_chunk_raw = out
-                    geno_center = np.asarray(geno_center_raw, dtype=np.float32)
-                    maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
-                    if bool(snps_only):
-                        keep = np.fromiter(
-                            (
-                                (
-                                    _is_simple_allele_token(getattr(s, "ref_allele", ""))
-                                    and _is_simple_allele_token(getattr(s, "alt_allele", ""))
-                                )
-                                for s in sites
-                            ),
-                            dtype=np.bool_,
-                            count=len(sites),
-                        )
-                        if not np.any(keep):
-                            continue
-                        if not bool(np.all(keep)):
-                            ridx = np.flatnonzero(keep)
-                            geno_center = geno_center[ridx, :]
-                            maf_chunk = maf_chunk[ridx]
-                            sites = [sites[int(i)] for i in ridx.tolist()]
-                    geno_center = np.ascontiguousarray(geno_center, dtype=np.float32)
-                    _consume_chunk(geno_center=geno_center, sites=sites, maf_chunk=maf_chunk)
-            else:
-                chunk_iter = load_genotype_chunks(
-                    genofile,
-                    model_chunk_size,
-                    maf_threshold,
-                    max_missing_rate,
-                    model=genetic_model,
-                    het=het_threshold,
-                    snps_only=bool(snps_only),
-                    sample_ids=sample_sub,
-                    mmap_window_mb=mmap_window_mb,
+            if bed_prefix is None:
+                raise RuntimeError(
+                    "Rust-only GWAS scan requires PLINK BED input/prefix."
                 )
-                for genosub, sites in prefetch_iter(chunk_iter, in_flight=prefetch_depth):
-                    genosub: np.ndarray
-                    if genosub.shape[1] != expected_n:
-                        if genosub.shape[1] == int(sameidx.shape[0]):
-                            genosub = genosub[:, sameidx]
-                        else:
-                            raise ValueError(
-                                f"Genotype sample dimension mismatch for trait {pname}: "
-                                f"chunk has {genosub.shape[1]} columns, "
-                                f"expected {expected_n} (or {sameidx.shape[0]} full aligned IDs)."
-                            )
-                    if genetic_model != "add":
-                        keep_mask = _heter_keep_mask(genosub, het_threshold)
-                        if not np.any(keep_mask):
-                            continue
-                        genosub = genosub[keep_mask]
-                        sites = [s for s, k in zip(sites, keep_mask) if k]
-                    if int(genosub.shape[0]) == 0:
-                        continue
+            if not hasattr(jxrs, "BedChunkReader"):
+                raise RuntimeError(
+                    "Rust-only GWAS scan requires rust symbol BedChunkReader."
+                )
+            try:
+                bed_reader = jxrs.BedChunkReader(
+                    str(bed_prefix),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    fill_missing=True,
+                    sample_ids=sample_sub.tolist(),
+                    model=str(genetic_model),
+                    het_threshold=float(het_threshold),
+                )
+            except Exception as ex:
+                raise RuntimeError(
+                    f"Failed to initialize Rust BedChunkReader for GWAS scan: {ex}"
+                ) from ex
+            if not hasattr(bed_reader, "next_chunk_prepared"):
+                raise RuntimeError(
+                    "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
+                )
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "Shared GWAS scan: using Rust BED prepared-chunk stream.",
+            )
 
-                    geno_model = _apply_genetic_model(genosub, genetic_model)
-                    if genetic_model == "add":
-                        maf_chunk = (np.mean(genosub, axis=1) / 2).astype(np.float32, copy=False)
-                    else:
-                        maf_chunk = np.mean(geno_model, axis=1).astype(np.float32, copy=False)
-                    # In-place centering avoids one extra (m_chunk, n_samples) allocation.
-                    geno_center = np.asarray(geno_model, dtype=np.float32, order="C")
-                    geno_center -= np.mean(
-                        geno_center, axis=1, dtype=np.float32, keepdims=True
+            def _is_simple_allele_token(a: object) -> bool:
+                s = str(a).strip().upper()
+                return (len(s) == 1) and (s in {"A", "C", "G", "T"})
+
+            while True:
+                out = bed_reader.next_chunk_prepared(
+                    int(model_chunk_size),
+                    coding=str(genetic_model),
+                )
+                if out is None:
+                    break
+                geno_center_raw, sites, maf_chunk_raw = out
+                geno_center = np.asarray(geno_center_raw, dtype=np.float32)
+                maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
+                if bool(snps_only):
+                    keep = np.fromiter(
+                        (
+                            (
+                                _is_simple_allele_token(getattr(s, "ref_allele", ""))
+                                and _is_simple_allele_token(getattr(s, "alt_allele", ""))
+                            )
+                            for s in sites
+                        ),
+                        dtype=np.bool_,
+                        count=len(sites),
                     )
-                    _consume_chunk(geno_center=geno_center, sites=sites, maf_chunk=maf_chunk)
+                    if not np.any(keep):
+                        continue
+                    if not bool(np.all(keep)):
+                        ridx = np.flatnonzero(keep)
+                        geno_center = geno_center[ridx, :]
+                        maf_chunk = maf_chunk[ridx]
+                        sites = [sites[int(i)] for i in ridx.tolist()]
+                geno_center = np.ascontiguousarray(geno_center, dtype=np.float32)
+                _consume_chunk(geno_center=geno_center, sites=sites, maf_chunk=maf_chunk)
 
             for ctx in model_ctxs:
                 writer = ctx.get("writer")

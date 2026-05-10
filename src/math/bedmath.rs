@@ -218,6 +218,16 @@ pub(crate) fn adaptive_grm_block_rows(
     threads: usize,
 ) -> usize {
     let base = requested_block_rows.max(1).min(m.max(1));
+    let exact_mode = std::env::var("JX_GRM_BLOCK_EXACT")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    if exact_mode {
+        return base;
+    }
     let target_mb = std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())

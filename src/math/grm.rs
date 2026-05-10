@@ -1,5 +1,5 @@
 use super::*;
-use crate::gs_native::{grm_rankk_update, grm_rankk_update_f64};
+use crate::grm::{grm_rankk_update, grm_rankk_update_f64};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
@@ -116,16 +116,17 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
         .ok()
         .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+    let cblas_force_tmp_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
         .ok()
         .map(|s| {
             let t = s.trim().to_ascii_lowercase();
             matches!(t.as_str(), "1" | "true" | "yes" | "on")
         })
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let (grm_vec, row_sum_vec, varsum_ret) = py
         .detach(move || -> Result<(Vec<f32>, Vec<f64>, f64), String> {
+            let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
             let mut grm = vec![0.0_f32; n * n];
             let mut block = vec![0.0_f32; row_step * n];
             let mut varsum_acc = varsum_full;
@@ -134,6 +135,7 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
             let mut row_sum_all = vec![0.0_f64; m];
 
             let mut last_notified = 0usize;
+            let mut is_first_block = true;
             for row_start in (0..m).step_by(row_step) {
                 let row_end = (row_start + row_step).min(m);
                 let cur_rows = row_end - row_start;
@@ -239,8 +241,10 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
                     cur_rows,
                     n,
                     cblas_copy_rhs,
-                    cblas_beta_zero_accum,
+                    is_first_block,
+                    cblas_force_tmp_accum,
                 )?;
+                is_first_block = false;
                 if method == 1 && !full_sample_fast {
                     varsum_acc += block_varsum.iter().sum::<f64>();
                 }
@@ -278,11 +282,11 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
                 let ii = i * n + i;
                 grm[ii] *= inv_scale;
                 for j in 0..i {
-                    let idx_ij = i * n + j;
-                    let idx_ji = j * n + i;
-                    let v = 0.5_f32 * (grm[idx_ij] + grm[idx_ji]) * inv_scale;
-                    grm[idx_ij] = v;
-                    grm[idx_ji] = v;
+                    let idx_lo = i * n + j;
+                    let idx_up = j * n + i;
+                    let v = grm[idx_lo] * inv_scale;
+                    grm[idx_lo] = v;
+                    grm[idx_up] = v;
                 }
             }
             let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
@@ -415,16 +419,17 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
         .ok()
         .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+    let cblas_force_tmp_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
         .ok()
         .map(|s| {
             let t = s.trim().to_ascii_lowercase();
             matches!(t.as_str(), "1" | "true" | "yes" | "on")
         })
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let (grm_vec, row_sum_vec, varsum_ret) = py
         .detach(move || -> Result<(Vec<f64>, Vec<f64>, f64), String> {
+            let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
             let mut grm = vec![0.0_f64; n * n];
             let mut block = vec![0.0_f64; row_step * n];
             let mut varsum_acc = varsum_full;
@@ -433,6 +438,7 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
             let mut row_sum_all = vec![0.0_f64; m];
 
             let mut last_notified = 0usize;
+            let mut is_first_block = true;
             for row_start in (0..m).step_by(row_step) {
                 let row_end = (row_start + row_step).min(m);
                 let cur_rows = row_end - row_start;
@@ -538,8 +544,10 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
                     cur_rows,
                     n,
                     cblas_copy_rhs,
-                    cblas_beta_zero_accum,
+                    is_first_block,
+                    cblas_force_tmp_accum,
                 )?;
+                is_first_block = false;
                 if method == 1 && !full_sample_fast {
                     varsum_acc += block_varsum.iter().sum::<f64>();
                 }
@@ -577,11 +585,11 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
                 let ii = i * n + i;
                 grm[ii] *= inv_scale;
                 for j in 0..i {
-                    let idx_ij = i * n + j;
-                    let idx_ji = j * n + i;
-                    let v = 0.5_f64 * (grm[idx_ij] + grm[idx_ji]) * inv_scale;
-                    grm[idx_ij] = v;
-                    grm[idx_ji] = v;
+                    let idx_lo = i * n + j;
+                    let idx_up = j * n + i;
+                    let v = grm[idx_lo] * inv_scale;
+                    grm[idx_lo] = v;
+                    grm[idx_up] = v;
                 }
             }
             let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };

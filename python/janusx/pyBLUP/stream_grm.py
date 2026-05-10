@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Literal, Optional, Tuple
 
+import os
 import numpy as np
 import psutil
 import time
+import warnings
 
 try:
     from scipy.linalg.blas import ssyrk as _ssyrk  # type: ignore
@@ -20,6 +22,28 @@ class StreamingGrmStats:
     eff_m: int
     varsum: float
     used_syrk: bool
+
+
+def resolve_stream_grm_accumulate_mode(
+    default: Literal["auto", "syrk", "gemm"] = "auto",
+) -> Literal["auto", "syrk", "gemm"]:
+    """
+    Resolve streaming GRM accumulation backend from environment.
+
+    Env:
+      - JX_GRM_STREAM_ACCUM=auto|gemm|syrk
+    """
+    raw = str(os.environ.get("JX_GRM_STREAM_ACCUM", "")).strip().lower()
+    if raw == "":
+        return default
+    if raw in {"auto", "gemm", "syrk"}:
+        return raw  # type: ignore[return-value]
+    warnings.warn(
+        f"Invalid JX_GRM_STREAM_ACCUM='{raw}', fallback to '{default}'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return default
 
 
 def auto_stream_grm_chunk_size(
@@ -75,13 +99,15 @@ def _syrk_accumulate_upper(grm_upper: np.ndarray, geno: np.ndarray) -> bool:
         if out is not grm_upper:
             grm_upper[...] = out
         return True
-    grm_upper += geno.T @ geno
-    return False
+    raise RuntimeError(
+        "Python GRM GEMM fallback is disabled in Rust-only GWAS mode."
+    )
 
 
 def _gemm_accumulate_upper(grm_upper: np.ndarray, geno: np.ndarray) -> bool:
-    grm_upper += geno.T @ geno
-    return False
+    raise RuntimeError(
+        "Python GRM GEMM fallback is disabled in Rust-only GWAS mode."
+    )
 
 
 def _select_accumulator(
@@ -100,15 +126,23 @@ def _select_accumulator(
     c0 = np.zeros((n, n), dtype=np.float32)
     c1 = np.zeros((n, n), dtype=np.float32)
 
-    t0 = time.perf_counter()
-    _gemm_accumulate_upper(c0, probe)
-    gemm_ticks = time.perf_counter() - t0
+    def _bench(fn: Callable[[np.ndarray, np.ndarray], bool], c: np.ndarray, rep: int = 2) -> float:
+        best = float("inf")
+        for _ in range(int(max(1, rep))):
+            c.fill(np.float32(0.0))
+            t0 = time.perf_counter()
+            fn(c, probe)
+            dt = time.perf_counter() - t0
+            if dt < best:
+                best = dt
+        return float(best)
 
-    t0 = time.perf_counter()
-    _syrk_accumulate_upper(c1, probe)
-    syrk_ticks = time.perf_counter() - t0
+    gemm_ticks = _bench(_gemm_accumulate_upper, c0)
+    syrk_ticks = _bench(_syrk_accumulate_upper, c1)
 
-    if syrk_ticks > 0 and syrk_ticks < gemm_ticks:
+    # Only prefer SYRK when it is clearly faster (>=10%).
+    # This avoids noisy probe mis-selection on some BLAS builds.
+    if syrk_ticks > 0 and syrk_ticks < (gemm_ticks * 0.90):
         return _syrk_accumulate_upper
     return _gemm_accumulate_upper
 
@@ -142,6 +176,11 @@ def build_streaming_grm_from_chunks(
     on_chunk:
         Optional callback called as on_chunk(added_snps, total_effective_snps).
     """
+    raise RuntimeError(
+        "Python/NumPy streaming GRM accumulation is disabled in Rust-only GWAS mode. "
+        "Use Rust single-entry GRM builders instead."
+    )
+
     n = int(max(1, n_samples))
     if method not in (1, 2):
         raise ValueError(f"Unsupported GRM method: {method}")

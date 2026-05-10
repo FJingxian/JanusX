@@ -56,11 +56,6 @@ from typing import Union, Optional
 import uuid
 from contextlib import contextmanager
 
-from janusx.pyBLUP.stream_grm import (
-    auto_stream_grm_chunk_size,
-    build_streaming_grm_from_chunks,
-)
-
 # ---- Matplotlib backend configuration (non-interactive, server-safe) ----
 for key in ["MPLBACKEND"]:
     if key in os.environ:
@@ -100,7 +95,6 @@ from janusx.script._common.pathcheck import (
     safe_expanduser,
     safe_resolve,
 )
-from janusx.script._common.prefetch import prefetch_iter
 from janusx.script._common.status import (
     CliStatus,
     is_skip_status_text,
@@ -251,6 +245,21 @@ def _gwas_use_packed_fastlmm_scan() -> bool:
     `JX_GWAS_USE_PACKED_FASTLMM_SCAN=0` to force streaming prepared-chunk scan.
     """
     raw = str(os.environ.get("JX_GWAS_USE_PACKED_FASTLMM_SCAN", "")).strip().lower()
+    if raw == "":
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _gwas_use_packed_grm_build() -> bool:
+    """
+    Whether GRM construction should prefer packed BED + Rust CBLAS route.
+
+    Default is True. In current GWAS policy, this toggle is mainly applied
+    in fast/farmcpu mode; non-fast mode prefers streaming GRM.
+    """
+    raw = str(os.environ.get("JX_GWAS_USE_PACKED_GRM", "")).strip().lower()
     if raw == "":
         return True
     if raw in {"0", "false", "no", "n", "off"}:
@@ -1534,144 +1543,202 @@ def build_grm_streaming(
     snps_only: bool = True,
     allow_packed_full_load: bool = False,
     preloaded_packed: Union[dict[str, object], None] = None,
+    cache_write_path: Union[str, None] = None,
 ) -> tuple[np.ndarray, int]:
     """
-    Build GRM in a streaming fashion using rust2py.gfreader.load_genotype_chunks.
+    Build GRM in Rust-only mode from PLINK BED input.
+
+    Route policy:
+    - non-fast/non-farmcpu: Rust streaming BED single-entry (`grm_stream_bed_f32`)
+    - fast/farmcpu: packed BED single-entry (`grm_packed_bed_f32` / preloaded packed reuse)
     """
     packed_prefix = _as_plink_prefix(genofile)
-    has_packed_kernel = bool(
-        hasattr(jxrs, "grm_packed_f32")
-        and hasattr(jxrs, "bed_packed_row_flip_mask")
+    if packed_prefix is None:
+        raise RuntimeError(
+            "Rust-only GWAS GRM build requires PLINK BED input/prefix."
+        )
+    use_packed_kernel = bool(allow_packed_full_load)
+    if use_packed_kernel:
+        if not hasattr(jxrs, "grm_packed_bed_f32"):
+            raise RuntimeError(
+                "Rust symbol grm_packed_bed_f32 is unavailable. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+    else:
+        if not hasattr(jxrs, "grm_stream_bed_f32"):
+            raise RuntimeError(
+                "Rust symbol grm_stream_bed_f32 is unavailable. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+
+    _log_info(
+        logger,
+        (
+            f"Building GRM (Rust {'packed-bed' if use_packed_kernel else 'stream-bed'} single-entry), "
+            f"method={method}"
+        ),
+        use_spinner=use_spinner,
     )
-    if bool(allow_packed_full_load) and packed_prefix is not None and has_packed_kernel:
-        _log_info(logger, f"Building GRM (packed BED + CBLAS), method={method}", use_spinner=use_spinner)
-        pbar = _ProgressAdapter(total=n_snps, desc="GRM (packed-bed)", force_animate=True)
-        process = psutil.Process()
-        mem_tick_span = max(1, 10 * int(chunk_size))
-        last_done = 0
+    pbar = _ProgressAdapter(
+        total=n_snps,
+        desc=("GRM (rust-bed)" if use_packed_kernel else "GRM (rust-stream)"),
+        force_animate=True,
+    )
+    process = psutil.Process()
+    mem_tick_span = max(1, 10 * int(chunk_size))
+    last_done = 0
+    next_mem_tick = mem_tick_span
+    last_mem_ts = 0.0
 
-        def _on_packed_progress(done: int, _total: int) -> None:
-            nonlocal last_done
-            d = int(done)
-            if d > last_done:
-                pbar.update(d - last_done)
-                last_done = d
-            if d % mem_tick_span == 0:
-                mem = process.memory_info().rss / 1024**3
-                pbar.set_postfix(memory=f"{mem:.2f}GB")
+    def _on_packed_progress(done: int, _total: int) -> None:
+        nonlocal last_done, next_mem_tick, last_mem_ts
+        d = int(done)
+        if d > last_done:
+            pbar.update(d - last_done)
+            last_done = d
+        now = time.monotonic()
+        if d >= next_mem_tick or (d >= int(n_snps) and (now - last_mem_ts) >= 0.2):
+            mem = process.memory_info().rss / 1024**3
+            pbar.set_postfix(memory=f"{mem:.2f}GB")
+            last_mem_ts = now
+            while next_mem_tick <= d:
+                next_mem_tick += mem_tick_span
 
-        try:
-            packed_ctx = None
+    try:
+        grm_raw = None
+        grm: Union[np.ndarray, None] = None
+        eff_m = 0
+        cache_target = str(cache_write_path).strip() if cache_write_path is not None else ""
+        if use_packed_kernel:
             pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
-            if pre is not None and str(pre.get("prefix", "")) == str(packed_prefix):
+            used_preloaded = False
+            if (
+                pre is not None
+                and str(pre.get("prefix", "")) == str(packed_prefix)
+                and hasattr(jxrs, "grm_packed_f32")
+            ):
                 packed_ctx_obj = pre.get("packed_ctx")
                 if isinstance(packed_ctx_obj, dict):
-                    packed_ctx = packed_ctx_obj
-            if packed_ctx is None:
-                _sample_ids, packed_ctx = prepare_packed_ctx_from_plink(
-                    str(packed_prefix),
-                    maf=float(maf_threshold),
-                    missing_rate=float(max_missing_rate),
-                    snps_only=bool(snps_only),
-                    expected_n_samples=int(n_samples),
-                )
-            packed = np.ascontiguousarray(
-                np.asarray(packed_ctx["packed"], dtype=np.uint8),
-                dtype=np.uint8,
-            )
-            maf = np.ascontiguousarray(
-                np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            eff_m = int(packed.shape[0])
-            row_flip = np.ascontiguousarray(
-                np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            grm = np.ascontiguousarray(
-                np.asarray(
-                    jxrs.grm_packed_f32(
-                        packed,
-                        int(n_samples),
-                        row_flip,
-                        maf,
+                    packed_pre = np.ascontiguousarray(
+                        np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
+                        dtype=np.uint8,
+                    )
+                    maf_pre = np.ascontiguousarray(
+                        np.asarray(packed_ctx_obj["maf"], dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    row_flip_pre = np.ascontiguousarray(
+                        np.asarray(packed_ctx_obj["row_flip"], dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    packed_n_pre = int(packed_ctx_obj["n_samples"])
+                    if packed_n_pre != int(n_samples):
+                        raise RuntimeError(
+                            "Preloaded packed sample count mismatch: "
+                            f"packed={packed_n_pre}, expected={int(n_samples)}"
+                        )
+                    if int(packed_pre.shape[0]) != int(maf_pre.shape[0]) or int(
+                        packed_pre.shape[0]
+                    ) != int(row_flip_pre.shape[0]):
+                        raise RuntimeError(
+                            "Preloaded packed metadata mismatch: "
+                            f"packed_rows={packed_pre.shape[0]}, maf={maf_pre.shape[0]}, row_flip={row_flip_pre.shape[0]}"
+                        )
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        "Packed GRM: reusing preloaded packed payload (skip BED repack).",
+                    )
+                    grm_raw = jxrs.grm_packed_f32(
+                        packed_pre,
+                        int(packed_n_pre),
+                        row_flip_pre,
+                        maf_pre,
                         sample_indices=None,
                         method=int(method),
                         block_cols=max(1, int(chunk_size)),
-                        threads=int(threads),
+                        threads=max(1, int(threads)),
                         progress_callback=_on_packed_progress,
                         progress_every=max(1, int(chunk_size)),
-                    ),
-                    dtype=np.float32,
+                    )
+                    eff_m = int(packed_pre.shape[0])
+                    used_preloaded = True
+
+            if not used_preloaded:
+                grm_raw, eff_m_raw, packed_n_raw = jxrs.grm_packed_bed_f32(
+                    str(packed_prefix),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_packed_progress,
+                    progress_every=max(1, int(chunk_size)),
                 )
-            )
-            pbar.finish()
-            _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
-            return grm, eff_m
-        except Exception as ex:
-            _emit_warning_line(
-                logger,
-                f"Packed GRM unavailable/failed; fallback to streaming backend. reason={ex}",
-                use_spinner=bool(use_spinner),
-            )
-        finally:
-            pbar.close(show_done=False)
+                packed_n = int(packed_n_raw)
+                if packed_n != int(n_samples):
+                    raise RuntimeError(
+                        f"Packed sample count mismatch: packed={packed_n}, expected={int(n_samples)}"
+                    )
+                eff_m = int(eff_m_raw)
+        else:
+            two_stage_raw = str(os.environ.get("JX_GRM_STREAM_TWO_STAGE", "")).strip().lower()
+            if two_stage_raw in {"1", "true", "yes", "on"}:
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    "GRM stream note: JX_GRM_STREAM_TWO_STAGE=1 is enabled; "
+                    "stream entry may internally switch to packed prebuild mode.",
+                )
+            if cache_target != "" and hasattr(jxrs, "grm_stream_bed_f32_to_npy"):
+                eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32_to_npy(
+                    str(packed_prefix),
+                    str(cache_target),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_packed_progress,
+                    progress_every=max(1, int(chunk_size)),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                )
+                stream_n = int(stream_n_raw)
+                if stream_n != int(n_samples):
+                    raise RuntimeError(
+                        f"Stream sample count mismatch: stream={stream_n}, expected={int(n_samples)}"
+                    )
+                eff_m = int(eff_m_raw)
+                grm = np.load(str(cache_target), mmap_mode="r")
+            else:
+                grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
+                    str(packed_prefix),
+                    method=int(method),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    block_cols=max(1, int(chunk_size)),
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_packed_progress,
+                    progress_every=max(1, int(chunk_size)),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                )
+                stream_n = int(stream_n_raw)
+                if stream_n != int(n_samples):
+                    raise RuntimeError(
+                        f"Stream sample count mismatch: stream={stream_n}, expected={int(n_samples)}"
+                    )
+                eff_m = int(eff_m_raw)
 
-    _log_info(logger, f"Building GRM (streaming), method={method}", use_spinner=use_spinner)
-    pbar = _ProgressAdapter(total=n_snps, desc="GRM (streaming)", force_animate=True)
-    process = psutil.Process()
-
-    prefetch_depth = 2
-    tuned_chunk_size = auto_stream_grm_chunk_size(
-        n_samples=n_samples,
-        requested_chunk_size=chunk_size,
-        threads=threads,
-        prefetch_depth=prefetch_depth,
-    )
-    if tuned_chunk_size != int(chunk_size):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            (
-                "Auto-tuned GRM chunk size: "
-                f"{chunk_size} -> {tuned_chunk_size} "
-                f"(n_samples={n_samples}, threads={threads})"
-            ),
-        )
-    mem_tick_span = max(1, 10 * int(tuned_chunk_size))
-
-    chunk_iter = load_genotype_chunks(
-        genofile,
-        tuned_chunk_size,
-        maf_threshold,
-        max_missing_rate,
-        model="add",
-        snps_only=bool(snps_only),
-        mmap_window_mb=mmap_window_mb,
-    )
-
-    def _on_grm_chunk(added_snps: int, total_eff: int) -> None:
-        pbar.update(int(added_snps))
-        if total_eff % mem_tick_span == 0:
-            mem = process.memory_info().rss / 1024**3
-            pbar.set_postfix(memory=f"{mem:.2f}GB")
-
-    try:
-        grm, grm_stats = build_streaming_grm_from_chunks(
-            prefetch_iter(chunk_iter, in_flight=prefetch_depth),
-            n_samples=n_samples,
-            method=method,
-            accumulate="auto",
-            on_chunk=_on_grm_chunk,
-        )
-        # force bar to 100% even if SNPs were filtered in Rust
+        if grm is None:
+            grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
+        mem = process.memory_info().rss / 1024**3
+        pbar.set_postfix(memory=f"{mem:.2f}GB")
         pbar.finish()
     finally:
-        # Always stop progress renderer on Ctrl+C / exceptions.
         pbar.close(show_done=False)
 
     _log_info(logger, "GRM construction finished.", use_spinner=use_spinner)
-    return grm, int(grm_stats.eff_m)
+    return grm, int(eff_m)
 
 def load_or_build_grm_with_cache(
     genofile: str,
@@ -1758,6 +1825,11 @@ def load_or_build_grm_with_cache(
             else:
                 method_int = int(mgrm)
                 grm_calc_t0 = time.monotonic()
+                tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
+                stream_direct_cache = bool(
+                    (not bool(allow_packed_full_load))
+                    and hasattr(jxrs, "grm_stream_bed_f32_to_npy")
+                )
                 grm, eff_m = build_grm_streaming(
                     genofile=genofile,
                     n_samples=n_samples,
@@ -1775,6 +1847,7 @@ def load_or_build_grm_with_cache(
                     snps_only=bool(snps_only),
                     allow_packed_full_load=bool(allow_packed_full_load),
                     preloaded_packed=preloaded_packed,
+                    cache_write_path=(tmp_grm if stream_direct_cache else None),
                 )
                 grm_msg = (
                     f"Calculating GRM from genotype (n={int(n_samples)}) "
@@ -1782,8 +1855,8 @@ def load_or_build_grm_with_cache(
                 )
                 _log_file_only(logger, logging.INFO, grm_msg)
                 print_success(grm_msg, force_color=bool(use_spinner))
-                tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
-                np.save(tmp_grm, grm)
+                if not os.path.exists(tmp_grm):
+                    np.save(tmp_grm, grm)
                 os.replace(tmp_grm, grm_path)
                 tmp_id = f"{id_path}.tmp.{os.getpid()}"
                 pd.Series(ids).to_csv(tmp_id, sep="\t", index=False, header=False)
@@ -2030,6 +2103,7 @@ def prepare_streaming_context(
     use_spinner: bool = False,
     snps_only: bool = True,
     allow_packed_grm: bool = False,
+    preload_packed_context: bool = False,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -2112,7 +2186,7 @@ def prepare_streaming_context(
 
     # In fast/farmcpu mode, preload packed BED once right after genotype meta
     # is known, then reuse for GRM and downstream GWAS/FarmCPU stages.
-    if bool(allow_packed_grm):
+    if bool(allow_packed_grm) and bool(preload_packed_context):
         try:
             prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
                 genofile=stream_genofile,
@@ -2238,7 +2312,7 @@ def prepare_streaming_context(
                 )
                 break
 
-    if preloaded_packed is None and bool(allow_packed_grm):
+    if preloaded_packed is None and bool(allow_packed_grm) and bool(preload_packed_context):
         try:
             prefix1, full_ids1, packed_ctx1, sites1 = _prepare_packed_bed_once_for_gwas(
                 genofile=stream_genofile,
@@ -2518,6 +2592,49 @@ def _gwas_scan_stage_ctx(threads: int):
         yield
 
 
+def _resolve_gwas_eigh_driver(n_samples: int) -> str:
+    raw = str(os.environ.get("JX_GWAS_EIGH_DRIVER", "")).strip().lower()
+    if raw in {"dsyevd", "dsyevr", "auto"}:
+        return raw
+    accel_try_dsyevr = str(os.environ.get("JX_GWAS_EIGH_ACCEL_DSYEVR", "")).strip().lower()
+    if accel_try_dsyevr in {"1", "true", "yes", "on"}:
+        backend = "unknown"
+        try:
+            probe = getattr(jxrs, "rust_sgemm_backend", None)
+            if callable(probe):
+                backend = str(probe()).strip().lower()
+        except Exception:
+            backend = "unknown"
+        if backend == "accelerate":
+            try:
+                switch_n = int(str(os.environ.get("JX_GWAS_EIGH_ACCEL_SWITCH_N", "2500")).strip())
+            except Exception:
+                switch_n = 2500
+            if int(n_samples) >= max(1, int(switch_n)):
+                return "dsyevr"
+    return "auto"
+
+
+def _resolve_gwas_eigh_impl(*, require_rust: bool) -> str:
+    if bool(require_rust):
+        return "rust"
+    raw = str(os.environ.get("JX_GWAS_EIGH_IMPL", "")).strip().lower()
+    if raw in {"rust", "scipy"}:
+        return raw
+    accel_try_scipy = str(os.environ.get("JX_GWAS_EIGH_ACCEL_SCIPY", "")).strip().lower()
+    if accel_try_scipy in {"1", "true", "yes", "on"}:
+        backend = "unknown"
+        try:
+            probe = getattr(jxrs, "rust_sgemm_backend", None)
+            if callable(probe):
+                backend = str(probe()).strip().lower()
+        except Exception:
+            backend = "unknown"
+        if backend == "accelerate":
+            return "scipy"
+    return "rust"
+
+
 def _gwas_eigh_from_grm(
     grm: np.ndarray,
     *,
@@ -2533,68 +2650,118 @@ def _gwas_eigh_from_grm(
     -------
     eigvals, eigvecs, backend_label, elapsed_seconds
     """
-    g = np.ascontiguousarray(np.asarray(grm, dtype=np.float64))
+    g0 = np.asarray(grm, dtype=np.float64)
+    if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
+        raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g0.shape}")
+    g = np.ascontiguousarray(g0)
     t = max(1, int(threads))
 
-    if hasattr(jxrs, "rust_eigh_from_array_f64"):
-        try:
-            with _gwas_evd_stage_ctx(t):
-                (
-                    eval_raw,
-                    evec_raw,
-                    _blas_backend,
-                    evd_backend,
-                    _n,
-                    _tb,
-                    _ti,
-                    _ta,
-                    _lapack_used,
-                    elapsed,
-                ) = jxrs.rust_eigh_from_array_f64(
-                    g,
-                    threads=int(t),
-                    driver="auto",
-                    jobz="V",
-                    require_lapack=False,
-                )
-            if evec_raw is None:
-                raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors for jobz=V.")
-            eigvals = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
-            eigvecs = np.asarray(evec_raw, dtype=np.float64)
-            backend = str(evd_backend)
-            if logger is not None:
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    f"{stage_label} eigh backend={backend} elapsed={float(elapsed):.3f}s",
-                )
-            return eigvals, eigvecs, backend, float(elapsed)
-        except Exception as ex:
-            if bool(require_rust):
-                raise RuntimeError(
-                    f"{stage_label} rust eigh failed under require_rust mode: {ex}"
-                ) from ex
-            if logger is not None:
-                _log_file_only(
-                    logger,
-                    logging.WARNING,
-                    f"{stage_label} rust eigh failed -> fallback numpy eigh. reason={ex}",
-                )
-    elif bool(require_rust):
+    if not hasattr(jxrs, "rust_eigh_from_array_f64"):
         raise RuntimeError(
             f"{stage_label} requires rust_eigh_from_array_f64, but the symbol is unavailable."
         )
+    impl_req = _resolve_gwas_eigh_impl(require_rust=bool(require_rust))
+    driver_req = _resolve_gwas_eigh_driver(int(g.shape[0]))
 
-    t0 = time.monotonic()
-    with _gwas_evd_stage_ctx(t):
-        eigvals, eigvecs = np.linalg.eigh(g)
-    elapsed = max(time.monotonic() - t0, 0.0)
-    return (
-        np.asarray(eigvals, dtype=np.float64),
-        np.asarray(eigvecs, dtype=np.float64),
-        "numpy_eigh",
-        float(elapsed),
-    )
+    def _run_eigh_rust(driver_name: str, mat: np.ndarray):
+        with _gwas_evd_stage_ctx(t):
+            if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
+                return jxrs.rust_eigh_from_array_f64_inplace(
+                    mat,
+                    threads=int(t),
+                    driver=str(driver_name),
+                    jobz="V",
+                    require_lapack=False,
+                )
+            return jxrs.rust_eigh_from_array_f64(
+                mat,
+                threads=int(t),
+                driver=str(driver_name),
+                jobz="V",
+                require_lapack=False,
+            )
+
+    def _run_eigh_scipy(driver_name: str, mat: np.ndarray):
+        try:
+            from scipy import linalg as _sp_linalg
+        except Exception as ex:
+            raise RuntimeError(
+                "SciPy eigh backend requested but scipy.linalg is unavailable."
+            ) from ex
+        drv = str(driver_name).strip().lower()
+        scipy_driver: Optional[str]
+        if drv in {"dsyevd", "syevd", "evd"}:
+            scipy_driver = "evd"
+        elif drv in {"dsyevr", "syevr", "evr"}:
+            scipy_driver = "evr"
+        else:
+            scipy_driver = None
+        kwargs = dict(lower=False, check_finite=False, overwrite_a=True)
+        if scipy_driver is not None:
+            kwargs["driver"] = scipy_driver
+        with _gwas_evd_stage_ctx(t):
+            t0 = time.monotonic()
+            eval_raw, evec_raw = _sp_linalg.eigh(mat, **kwargs)
+            elapsed = max(time.monotonic() - t0, 0.0)
+        return (
+            np.asarray(eval_raw, dtype=np.float64),
+            np.asarray(evec_raw, dtype=np.float64),
+            f"scipy_{scipy_driver or 'auto'}",
+            float(elapsed),
+        )
+
+    def _run_eigh(driver_name: str, mat: np.ndarray):
+        if impl_req == "scipy":
+            return _run_eigh_scipy(driver_name, mat)
+        (
+            eval_raw,
+            evec_raw,
+            _blas_backend,
+            evd_backend,
+            _n,
+            _tb,
+            _ti,
+            _ta,
+            _lapack_used,
+            elapsed,
+        ) = _run_eigh_rust(driver_name, mat)
+        return (
+            np.asarray(eval_raw, dtype=np.float64),
+            np.asarray(evec_raw, dtype=np.float64) if evec_raw is not None else None,
+            str(evd_backend),
+            float(elapsed),
+        )
+
+    try:
+        eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
+    except Exception as ex:
+        if str(driver_req).lower() == "dsyevr":
+            try:
+                g_retry = np.ascontiguousarray(np.asarray(g0, dtype=np.float64))
+                eval_raw, evec_raw, evd_backend, elapsed = _run_eigh("dsyevd", g_retry)
+                driver_req = "dsyevd(fallback)"
+            except Exception as ex2:
+                raise RuntimeError(
+                    f"{stage_label} eigh failed (impl={impl_req}, driver=dsyevd fallback): {ex2}"
+                ) from ex2
+        else:
+            raise RuntimeError(
+                f"{stage_label} eigh failed (impl={impl_req}, driver={driver_req}): {ex}"
+            ) from ex
+
+    if evec_raw is None:
+        raise RuntimeError(f"{stage_label} eigh returned no eigenvectors for jobz=V.")
+    eigvals = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
+    eigvecs = np.asarray(evec_raw, dtype=np.float64)
+    backend = str(evd_backend)
+    if logger is not None:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{stage_label} eigh impl={impl_req} backend={backend} driver={driver_req} "
+            f"elapsed={float(elapsed):.3f}s",
+        )
+    return eigvals, eigvecs, backend, float(elapsed)
 
 
 def _calibrate_lrlmm_spectrum(
@@ -3660,6 +3827,21 @@ def _run_gwas_pipeline(
             "FarmCPU keeps additive coding."
         )
     fast_mode = bool(getattr(args, "fast", False) or bool(args.farmcpu))
+    qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
+    # GRM route policy:
+    # - non-fast GWAS: prefer streaming GRM path (Rust reader + streaming accumulation)
+    # - fast/farmcpu GWAS: allow packed single-entry kernel when enabled
+    prefer_packed_grm = bool(
+        fast_mode
+        and (args.lmm or args.fastlmm or qcov_needs_grm)
+        and _gwas_use_packed_grm_build()
+    )
+    if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or qcov_needs_grm):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "Non-fast GWAS: GRM uses streaming path by default (packed single-entry disabled).",
+        )
     if bool(args.farmcpu) and (not bool(getattr(args, "fast", False))):
         _log_file_only(
             logger,
@@ -3708,7 +3890,8 @@ def _run_gwas_pipeline(
                 logger=logger,
                 use_spinner=use_spinner,
                 snps_only=bool(args.snps_only),
-                allow_packed_grm=bool(fast_mode),
+                allow_packed_grm=bool(prefer_packed_grm),
+                preload_packed_context=bool(fast_mode),
             )
             if bool(fast_mode) and (not isinstance(preloaded_packed, dict)):
                 try:
@@ -3770,7 +3953,9 @@ def _run_gwas_pipeline(
         # -------------------------------
         if len(stream_models) > 0:
             if bool(fast_mode):
-                use_trait_grouped_fast = bool((len(stream_models) > 1) or has_farmcpu)
+                # v3: fast mode always executes via trait/model task plan (Rust route planner
+                # + thin Python executor) so single-model paths no longer bypass the unified route.
+                use_trait_grouped_fast = True
                 if use_trait_grouped_fast:
                     farmcpu_cache_prefill: Union[dict[str, object], None] = None
                     farmcpu_cache_runtime: Union[dict[str, object], None] = None
@@ -3855,275 +4040,264 @@ def _run_gwas_pipeline(
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
                         )
-                    for trait_idx, trait_name in enumerate(trait_order):
-                        trait_name_use = trait_name
-                        for idx_model, model_key in enumerate(stream_models):
-                            mk = str(model_key).lower().strip()
-                            emit_trait_header_model = bool(idx_model == 0)
-                            trait_one = [trait_name_use]
+                    use_packed_fastlmm_scan = bool(_gwas_use_packed_fastlmm_scan())
+                    task_plan = None
+                    if hasattr(jxrs, "gwas_trait_model_dispatch_v2"):
+                        try:
+                            task_plan = jxrs.gwas_trait_model_dispatch_v2(
+                                [str(m) for m in stream_models],
+                                [str(t) for t in trait_order],
+                                bool(has_farmcpu),
+                                bool(use_packed_fastlmm_scan),
+                            )
+                        except Exception as ex:
+                            _emit_warning_line(
+                                logger,
+                                f"Rust v2 task dispatcher unavailable; fallback to v1/Python planner. reason={ex}",
+                                use_spinner=bool(use_spinner),
+                            )
+                            task_plan = None
+                    if task_plan is None and hasattr(jxrs, "gwas_trait_model_schedule"):
+                        try:
+                            task_plan = jxrs.gwas_trait_model_schedule(
+                                [str(m) for m in stream_models],
+                                [str(t) for t in trait_order],
+                                bool(has_farmcpu),
+                            )
+                        except Exception as ex:
+                            _emit_warning_line(
+                                logger,
+                                f"Rust task scheduler unavailable; fallback to Python planner. reason={ex}",
+                                use_spinner=bool(use_spinner),
+                            )
+                            task_plan = None
+                    if task_plan is None:
+                        task_plan = []
+                        trait_total = int(len(trait_order))
+                        for trait_idx, trait_name in enumerate(trait_order):
+                            ordered_models = [str(m).lower().strip() for m in stream_models]
+                            if bool(has_farmcpu):
+                                ordered_models.append("farmcpu")
+                            model_last = int(len(ordered_models)) - 1
+                            for idx_model, mk in enumerate(ordered_models):
+                                route = "unknown"
+                                if mk == "lm":
+                                    route = "lm_packed"
+                                elif mk == "lmm":
+                                    route = "lmm_packed"
+                                elif mk == "fastlmm":
+                                    route = (
+                                        "fastlmm_packed"
+                                        if bool(use_packed_fastlmm_scan)
+                                        else "fastlmm_stream"
+                                    )
+                                elif mk == "farmcpu":
+                                    route = "farmcpu"
+                                task_plan.append(
+                                    {
+                                        "model": str(mk),
+                                        "route": str(route),
+                                        "trait": str(trait_name),
+                                        "emit_trait_header": bool(idx_model == 0),
+                                        "emit_blank_after": bool(
+                                            (idx_model == model_last)
+                                            and ((trait_idx + 1) < trait_total)
+                                        ),
+                                    }
+                                )
+                    def _run_route_lm_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_lm_packed_fullrank(
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
+                        )
+
+                    def _run_route_lmm_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_lmm_packed_fullrank(
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            grm=grm,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
+                        )
+
+                    def _run_route_fastlmm_packed(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_fastlmm_packed_fullrank(
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            grm=grm,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            preloaded_packed=preloaded_packed,
+                        )
+
+                    def _run_route_fastlmm_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        _log_file_only(
+                            logger,
+                            logging.INFO,
+                            "Fast mode: FastLMM scan uses streaming prepared-chunk route "
+                            "(set JX_GWAS_USE_PACKED_FASTLMM_SCAN=1 or unset it to use packed scan).",
+                        )
+                        run_chunked_gwas_lmm_lm(
+                            model_name="fastlmm",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            genetic_model=args.model,
+                            het_threshold=args.het,
+                            chunk_size=args.chunksize,
+                            mmap_limit=args.mmap_limit,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            show_npve_line=True,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
+                            prefer_packed_fullrust=False,
+                        )
+
+                    def _run_route_farmcpu(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        nonlocal farmcpu_cache_runtime, farmcpu_handled_in_trait_loop
+                        farmcpu_cache_runtime = run_farmcpu_fullmem(
+                            args=args,
+                            gfile=gfile,
+                            prefix=prefix,
+                            logger=logger,
+                            pheno_preloaded=pheno,
+                            ids_preloaded=ids,
+                            n_snps_preloaded=n_snps,
+                            qmatrix_preloaded=qmatrix,
+                            cov_preloaded=cov_all,
+                            use_spinner=use_spinner,
+                            context_prepared=True,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            farmcpu_cache=farmcpu_cache_runtime,
+                            emit_trait_header=False,
+                            preloaded_packed=preloaded_packed,
+                        )
+                        farmcpu_handled_in_trait_loop = True
+
+                    route_handlers = {
+                        "lm_packed": _run_route_lm_packed,
+                        "lmm_packed": _run_route_lmm_packed,
+                        "fastlmm_packed": _run_route_fastlmm_packed,
+                        "fastlmm_stream": _run_route_fastlmm_stream,
+                        "farmcpu": _run_route_farmcpu,
+                    }
+
+                    for task_item in task_plan:
+                        mk = str(task_item.get("model", "")).lower().strip()
+                        route = str(task_item.get("route", "")).lower().strip()
+                        if not route:
                             if mk == "lm":
-                                run_lm_packed_fullrank(
-                                    genofile=genofile_stream,
-                                    pheno=pheno,
-                                    ids=ids,
-                                    outprefix=outprefix,
-                                    maf_threshold=args.maf,
-                                    max_missing_rate=args.geno,
-                                    genetic_model=args.model,
-                                    het_threshold=args.het,
-                                    chunk_size=args.chunksize,
-                                    qmatrix=qmatrix,
-                                    cov_all=cov_all,
-                                    plot=args.plot,
-                                    threads=args.thread,
-                                    logger=logger,
-                                    use_spinner=use_spinner,
-                                    snps_only=bool(args.snps_only),
-                                    eff_snp_by_trait=eff_snp_by_trait,
-                                    summary_rows=gwas_summary_rows,
-                                    saved_paths=saved_result_paths,
-                                    trait_names=trait_one,
-                                    emit_trait_header=bool(emit_trait_header_model),
-                                    preloaded_packed=preloaded_packed,
-                                )
+                                route = "lm_packed"
                             elif mk == "lmm":
-                                run_lmm_packed_fullrank(
-                                    genofile=genofile_stream,
-                                    pheno=pheno,
-                                    ids=ids,
-                                    grm=grm,
-                                    outprefix=outprefix,
-                                    maf_threshold=args.maf,
-                                    max_missing_rate=args.geno,
-                                    genetic_model=args.model,
-                                    het_threshold=args.het,
-                                    chunk_size=args.chunksize,
-                                    qmatrix=qmatrix,
-                                    cov_all=cov_all,
-                                    plot=args.plot,
-                                    threads=args.thread,
-                                    logger=logger,
-                                    use_spinner=use_spinner,
-                                    snps_only=bool(args.snps_only),
-                                    eff_snp_by_trait=eff_snp_by_trait,
-                                    summary_rows=gwas_summary_rows,
-                                    saved_paths=saved_result_paths,
-                                    trait_names=trait_one,
-                                    emit_trait_header=bool(emit_trait_header_model),
-                                    preloaded_packed=preloaded_packed,
-                                )
+                                route = "lmm_packed"
                             elif mk == "fastlmm":
-                                if _gwas_use_packed_fastlmm_scan():
-                                    run_fastlmm_packed_fullrank(
-                                        genofile=genofile_stream,
-                                        pheno=pheno,
-                                        ids=ids,
-                                        grm=grm,
-                                        outprefix=outprefix,
-                                        maf_threshold=args.maf,
-                                        max_missing_rate=args.geno,
-                                        genetic_model=args.model,
-                                        het_threshold=args.het,
-                                        chunk_size=args.chunksize,
-                                        qmatrix=qmatrix,
-                                        cov_all=cov_all,
-                                        plot=args.plot,
-                                        threads=args.thread,
-                                        logger=logger,
-                                        use_spinner=use_spinner,
-                                        snps_only=bool(args.snps_only),
-                                        eff_snp_by_trait=eff_snp_by_trait,
-                                        summary_rows=gwas_summary_rows,
-                                        saved_paths=saved_result_paths,
-                                        trait_names=trait_one,
-                                        emit_trait_header=bool(emit_trait_header_model),
-                                        preloaded_packed=preloaded_packed,
-                                    )
-                                else:
-                                    _log_file_only(
-                                        logger,
-                                        logging.INFO,
-                                        "Fast mode: FastLMM scan uses streaming prepared-chunk route "
-                                        "(set JX_GWAS_USE_PACKED_FASTLMM_SCAN=1 or unset it to use packed scan).",
-                                    )
-                                    run_chunked_gwas_lmm_lm(
-                                        model_name="fastlmm",
-                                        genofile=genofile_stream,
-                                        pheno=pheno,
-                                        ids=ids,
-                                        n_snps=n_snps,
-                                        outprefix=outprefix,
-                                        maf_threshold=args.maf,
-                                        max_missing_rate=args.geno,
-                                        genetic_model=args.model,
-                                        het_threshold=args.het,
-                                        chunk_size=args.chunksize,
-                                        mmap_limit=args.mmap_limit,
-                                        grm=grm,
-                                        qmatrix=qmatrix,
-                                        cov_all=cov_all,
-                                        eff_m=eff_m,
-                                        plot=args.plot,
-                                        threads=args.thread,
-                                        logger=logger,
-                                        use_spinner=use_spinner,
-                                        snps_only=bool(args.snps_only),
-                                        eff_snp_by_trait=eff_snp_by_trait,
-                                        summary_rows=gwas_summary_rows,
-                                        saved_paths=saved_result_paths,
-                                        trait_names=trait_one,
-                                        show_npve_line=True,
-                                        emit_trait_header=bool(emit_trait_header_model),
-                                        chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                                        prefer_packed_fullrust=False,
-                                    )
+                                route = (
+                                    "fastlmm_packed"
+                                    if bool(use_packed_fastlmm_scan)
+                                    else "fastlmm_stream"
+                                )
+                            elif mk == "farmcpu":
+                                route = "farmcpu"
                             else:
-                                logger.warning(f"Unknown model in fast mode: {model_key}")
-                        if has_farmcpu:
-                            farmcpu_cache_runtime = run_farmcpu_fullmem(
-                                args=args,
-                                gfile=gfile,
-                                prefix=prefix,
-                                logger=logger,
-                                pheno_preloaded=pheno,
-                                ids_preloaded=ids,
-                                n_snps_preloaded=n_snps,
-                                qmatrix_preloaded=qmatrix,
-                                cov_preloaded=cov_all,
-                                use_spinner=use_spinner,
-                                context_prepared=True,
-                                summary_rows=gwas_summary_rows,
-                                saved_paths=saved_result_paths,
-                                trait_names=[trait_name_use],
-                                farmcpu_cache=farmcpu_cache_runtime,
-                                emit_trait_header=False,
-                                preloaded_packed=preloaded_packed,
-                            )
-                            farmcpu_handled_in_trait_loop = True
-                        if trait_idx < len(trait_order) - 1:
-                            logger.info("")
-                else:
-                    for idx_model, model_key in enumerate(stream_models):
-                        mk = str(model_key).lower().strip()
-                        emit_trait_header_model = bool(idx_model == 0)
-                        if mk == "lmm":
-                            run_lmm_packed_fullrank(
-                                genofile=genofile_stream,
-                                pheno=pheno,
-                                ids=ids,
-                                grm=grm,
-                                outprefix=outprefix,
-                                maf_threshold=args.maf,
-                                max_missing_rate=args.geno,
-                                genetic_model=args.model,
-                                het_threshold=args.het,
-                                chunk_size=args.chunksize,
-                                qmatrix=qmatrix,
-                                cov_all=cov_all,
-                                plot=args.plot,
-                                threads=args.thread,
-                                logger=logger,
-                                use_spinner=use_spinner,
-                                snps_only=bool(args.snps_only),
-                                eff_snp_by_trait=eff_snp_by_trait,
-                                summary_rows=gwas_summary_rows,
-                                saved_paths=saved_result_paths,
-                                trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                                emit_trait_header=bool(emit_trait_header_model),
-                                preloaded_packed=preloaded_packed,
-                            )
-                        elif mk == "fastlmm":
-                            if _gwas_use_packed_fastlmm_scan():
-                                run_fastlmm_packed_fullrank(
-                                    genofile=genofile_stream,
-                                    pheno=pheno,
-                                    ids=ids,
-                                    grm=grm,
-                                    outprefix=outprefix,
-                                    maf_threshold=args.maf,
-                                    max_missing_rate=args.geno,
-                                    genetic_model=args.model,
-                                    het_threshold=args.het,
-                                    chunk_size=args.chunksize,
-                                    qmatrix=qmatrix,
-                                    cov_all=cov_all,
-                                    plot=args.plot,
-                                    threads=args.thread,
-                                    logger=logger,
-                                    use_spinner=use_spinner,
-                                    snps_only=bool(args.snps_only),
-                                    eff_snp_by_trait=eff_snp_by_trait,
-                                    summary_rows=gwas_summary_rows,
-                                    saved_paths=saved_result_paths,
-                                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                                    emit_trait_header=bool(emit_trait_header_model),
-                                    preloaded_packed=preloaded_packed,
-                                )
-                            else:
-                                _log_file_only(
-                                    logger,
-                                    logging.INFO,
-                                    "Fast mode: FastLMM scan uses streaming prepared-chunk route "
-                                    "(set JX_GWAS_USE_PACKED_FASTLMM_SCAN=1 or unset it to use packed scan).",
-                                )
-                                run_chunked_gwas_lmm_lm(
-                                    model_name="fastlmm",
-                                    genofile=genofile_stream,
-                                    pheno=pheno,
-                                    ids=ids,
-                                    n_snps=n_snps,
-                                    outprefix=outprefix,
-                                    maf_threshold=args.maf,
-                                    max_missing_rate=args.geno,
-                                    genetic_model=args.model,
-                                    het_threshold=args.het,
-                                    chunk_size=args.chunksize,
-                                    mmap_limit=args.mmap_limit,
-                                    grm=grm,
-                                    qmatrix=qmatrix,
-                                    cov_all=cov_all,
-                                    eff_m=eff_m,
-                                    plot=args.plot,
-                                    threads=args.thread,
-                                    logger=logger,
-                                    use_spinner=use_spinner,
-                                    snps_only=bool(args.snps_only),
-                                    eff_snp_by_trait=eff_snp_by_trait,
-                                    summary_rows=gwas_summary_rows,
-                                    saved_paths=saved_result_paths,
-                                    trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                                    show_npve_line=True,
-                                    emit_trait_header=bool(emit_trait_header_model),
-                                    chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                                    prefer_packed_fullrust=False,
-                                )
-                        elif mk == "lm":
-                            run_lm_packed_fullrank(
-                                genofile=genofile_stream,
-                                pheno=pheno,
-                                ids=ids,
-                                outprefix=outprefix,
-                                maf_threshold=args.maf,
-                                max_missing_rate=args.geno,
-                                genetic_model=args.model,
-                                het_threshold=args.het,
-                                chunk_size=args.chunksize,
-                                qmatrix=qmatrix,
-                                cov_all=cov_all,
-                                plot=args.plot,
-                                threads=args.thread,
-                                logger=logger,
-                                use_spinner=use_spinner,
-                                snps_only=bool(args.snps_only),
-                                eff_snp_by_trait=eff_snp_by_trait,
-                                summary_rows=gwas_summary_rows,
-                                saved_paths=saved_result_paths,
-                                trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                                emit_trait_header=bool(emit_trait_header_model),
-                                preloaded_packed=preloaded_packed,
-                            )
+                                route = "unknown"
+                        trait_name_use = str(task_item.get("trait", ""))
+                        emit_trait_header_model = bool(
+                            task_item.get("emit_trait_header", False)
+                        )
+                        emit_blank_after = bool(task_item.get("emit_blank_after", False))
+                        trait_one = [trait_name_use]
+                        route_handler = route_handlers.get(route)
+                        if route_handler is not None:
+                            route_handler(trait_one, bool(emit_trait_header_model))
                         else:
-                            logger.warning(f"Unknown model in fast mode: {model_key}")
+                            logger.warning(
+                                f"Unknown task route in fast mode: route={route}, model={mk}"
+                            )
+                        if emit_blank_after:
+                            logger.info("")
             else:
                 # If some models can use packed full-rust single-entry routes, run
                 # them separately first to avoid being merged into shared streaming.

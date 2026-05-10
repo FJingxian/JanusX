@@ -14,8 +14,12 @@ pub mod beam;
 mod bsa;
 #[path = "stats/glm.rs"]
 mod glm;
+#[path = "stats/grm.rs"]
+mod grm;
 #[path = "stats/gs_native.rs"]
 pub(crate) mod gs_native;
+#[path = "stats/gwas_unified.rs"]
+mod gwas_unified;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lmm.rs"]
@@ -106,13 +110,20 @@ use gfreader::{
     VcfChunkReader, VcfStreamWriter,
 };
 use glm::{
-    glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc, glmf32_packed_assoc_to_tsv,
-    lm_stream_bed_to_tsv,
+    glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
+    glmf32_packed_assoc_to_tsv, lm_stream_bed_to_tsv,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
+use grm::{
+    grm_packed_bed_f32, grm_packed_f32, grm_packed_f32_with_stats, grm_packed_f64_with_stats,
+    grm_sim_bench_f32, grm_stream_bed_f32, grm_stream_bed_f32_to_npy,
+};
 use gs_native::{
-    farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, grm_packed_bed_f32, grm_packed_f32,
-    grm_packed_f32_with_stats, grm_packed_f64_with_stats, packed_mtm_f64, rrblup_pcg_bed,
+    farmcpu_q_packed_grm_pca_f32, gblup_reml_packed_bed, packed_mtm_f64, rrblup_pcg_bed,
+};
+use gwas_unified::{
+    gwas_lmm_lm_null_lrt_decision, gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2,
+    gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
 use ld::{bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust, packed_prune_kernel_stats};
@@ -121,7 +132,7 @@ use lmm_scan::{
     ai_reml_multi_f64, ai_reml_null_f64, fastlmm_assoc_chunk_f32, fastlmm_assoc_packed_f32,
     fastlmm_assoc_packed_f32_to_tsv, lmm_assoc_chunk_f32, lmm_assoc_chunk_from_snp_f32,
     lmm_reml_assoc_packed_f32, lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_null_f32,
-    ml_loglike_null_f32,
+    lmm_rotate_x_y_with_ut_f64, ml_loglike_null_f32,
 };
 use logreg::fit_best_and_not_py;
 use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
@@ -200,10 +211,12 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_full, m)?)?;
+    m.add_function(wrap_pyfunction!(glm_ixx_from_x_qr, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc, m)?)?;
     m.add_function(wrap_pyfunction!(glmf32_packed_assoc_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_stats_f64, m)?)?;
@@ -228,6 +241,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_stream_bed_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(grm_stream_bed_f32_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
@@ -238,6 +253,10 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farmcpu_super_dense, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_lmm_lm_null_lrt_decision, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ml_loglike_null_f32, m)?)?;
@@ -247,6 +266,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_chunk_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_assoc_chunk_from_snp_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_assoc_packed_f32, m)?)?;

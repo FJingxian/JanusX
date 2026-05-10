@@ -9,6 +9,21 @@ pub(crate) fn brent_minimize<F>(
 where
     F: FnMut(f64) -> f64,
 {
+    brent_minimize_with_init(&mut f, low, high, tol, max_iter, None)
+}
+
+#[inline(always)]
+pub(crate) fn brent_minimize_with_init<F>(
+    mut f: F,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    init_x: Option<f64>,
+) -> (f64, f64)
+where
+    F: FnMut(f64) -> f64,
+{
     let mut a = low;
     let mut c = high;
     if !(a < c) {
@@ -18,7 +33,9 @@ where
     let eps = f64::EPSILON;
     let tol = tol.abs().max(1e-12);
 
-    let mut x = 0.5 * (a + c);
+    let mut x = init_x
+        .filter(|v| v.is_finite() && *v >= a && *v <= c)
+        .unwrap_or(0.5 * (a + c));
     let mut w = x;
     let mut v = x;
 

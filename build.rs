@@ -23,6 +23,17 @@ fn env_flag_default_true(name: &str) -> bool {
     }
 }
 
+fn should_prefer_accelerate_on_macos(require_openblas: bool) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    if require_openblas {
+        return false;
+    }
+    // Default policy on macOS: prefer Accelerate unless explicitly disabled.
+    env_flag_default_true("JANUSX_MACOS_PREFER_ACCELERATE")
+}
+
 fn emit_verbose_note(msg: impl AsRef<str>) {
     if env_flag("JANUSX_BUILD_VERBOSE") {
         println!("cargo:warning={}", msg.as_ref());
@@ -313,6 +324,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=JANUSX_LINK_BLAS_FAMILY");
     println!("cargo:rerun-if-env-changed=JANUSX_FORCE_OPENBLAS_LAPACK");
     println!("cargo:rerun-if-env-changed=JANUSX_DISABLE_OPENBLAS_LAPACK");
+    println!("cargo:rerun-if-env-changed=JANUSX_MACOS_PREFER_ACCELERATE");
     let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
 
     // Only probe OpenBLAS when user explicitly enabled the feature.
@@ -347,6 +359,14 @@ Enable default features or pass --features blas-openblas."
                 );
             }
         }
+        return;
+    }
+
+    if should_prefer_accelerate_on_macos(require_openblas) {
+        println!(
+            "cargo:warning=macOS build: prefer Accelerate backend by default \
+(set JANUSX_MACOS_PREFER_ACCELERATE=0 or JANUSX_REQUIRE_OPENBLAS=1 to enable OpenBLAS probing)."
+        );
         return;
     }
 

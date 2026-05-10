@@ -79,6 +79,30 @@ fn is_lapack_backend(name: &str) -> bool {
 }
 
 #[inline]
+fn lapack_dsyevd_backend_label() -> &'static str {
+    match crate::blas::rust_eigh_lapack_backend_tag() {
+        "openblas_dyn" => "lapack_dsyevd_openblas_dyn",
+        "openblas" => "lapack_dsyevd_openblas",
+        "accelerate" => "lapack_dsyevd_accelerate",
+        "blas" => "lapack_dsyevd_blas",
+        "rust" => "lapack_dsyevd_rust",
+        _ => "lapack_dsyevd",
+    }
+}
+
+#[inline]
+fn lapack_dsyevr_backend_label() -> &'static str {
+    match crate::blas::rust_eigh_lapack_backend_tag() {
+        "openblas_dyn" => "lapack_dsyevr_openblas_dyn",
+        "openblas" => "lapack_dsyevr_openblas",
+        "accelerate" => "lapack_dsyevr_accelerate",
+        "blas" => "lapack_dsyevr_blas",
+        "rust" => "lapack_dsyevr_rust",
+        _ => "lapack_dsyevr",
+    }
+}
+
+#[inline]
 fn resolve_eigh_driver_from_env() -> EighDriver {
     let req = std::env::var("JX_EIGH_DRIVER")
         .ok()
@@ -205,9 +229,9 @@ fn lapack_dsyevr_row_major_inplace(
 
     if need_vec {
         let u_row = copy_col_major_to_row_major(&z, n);
-        Ok((w, Some(u_row), "lapack_dsyevr"))
+        Ok((w, Some(u_row), lapack_dsyevr_backend_label()))
     } else {
-        Ok((w, None, "lapack_dsyevr"))
+        Ok((w, None, lapack_dsyevr_backend_label()))
     }
 }
 
@@ -287,9 +311,9 @@ fn lapack_dsyevd_row_major_inplace(
 
     if need_vec {
         let u_row = copy_col_major_to_row_major(a_row_major, n);
-        Ok((w, Some(u_row), "lapack_dsyevd"))
+        Ok((w, Some(u_row), lapack_dsyevd_backend_label()))
     } else {
-        Ok((w, None, "lapack_dsyevd"))
+        Ok((w, None, lapack_dsyevd_backend_label()))
     }
 }
 

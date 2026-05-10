@@ -139,6 +139,15 @@ pub(crate) fn gblup_marker_fast_packed(
     }
     let scale = var_sum.sqrt().max(1e-12_f64);
 
+    // rank-k path accumulates lower triangle directly; mirror once before
+    // centered correction to keep downstream math unchanged.
+    for i in 0..m {
+        for j in 0..i {
+            let v = gram_raw[i * m + j];
+            gram_raw[j * m + i] = v;
+        }
+    }
+
     let mut gram = vec![0.0_f64; m * m];
     for i in 0..m {
         let mi = m_mean[i];

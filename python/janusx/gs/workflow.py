@@ -201,17 +201,30 @@ _GBLUP_METHOD_AD = "GBLUP_AD"
 _GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
 
 
-def _warn_rust_gblup_backend_fallback_once(backend: str) -> None:
+def _warn_rust_gblup_backend_fallback_once(backend: str, allowed: set[str]) -> None:
     b = str(backend).strip().lower() or "unknown"
     with _RUST_GBLUP_BACKEND_WARN_LOCK:
         if b in _RUST_GBLUP_BACKEND_WARNED:
             return
         _RUST_GBLUP_BACKEND_WARNED.add(b)
+    allowed_txt = ",".join(sorted(str(x).strip().lower() for x in set(allowed) if str(x).strip() != ""))
+    if allowed_txt == "":
+        allowed_txt = "none"
     logging.getLogger(__name__).warning(
-        "Warning: Packed Rust GBLUP detected rust BLAS backend='%s' (OpenBLAS preferred). "
+        "Warning: Packed Rust GBLUP detected rust BLAS backend='%s' (allowed=%s on %s). "
         "Falling back to compatibility GS path; this may run slower.",
         b,
+        allowed_txt,
+        sys.platform,
     )
+
+
+def _rust_gblup_allowed_blas_backends() -> set[str]:
+    # macOS: Accelerate is a first-class backend and can be faster than OpenBLAS
+    # on this path; do not force fallback.
+    if sys.platform == "darwin":
+        return {"openblas", "accelerate"}
+    return {"openblas"}
 
 
 def _is_gblup_method(method: str) -> bool:
@@ -3130,8 +3143,9 @@ def GSapi(
                 and hasattr(_jxrs, "gblup_reml_packed_bed")
             )
             rust_backend = str(detect_rust_blas_backend()).strip().lower() if can_use_rust_gblup else "unknown"
-            if can_use_rust_gblup and (rust_backend != "openblas"):
-                _warn_rust_gblup_backend_fallback_once(rust_backend)
+            allowed_rust_backends = _rust_gblup_allowed_blas_backends()
+            if can_use_rust_gblup and (rust_backend not in allowed_rust_backends):
+                _warn_rust_gblup_backend_fallback_once(rust_backend, allowed_rust_backends)
                 can_use_rust_gblup = False
             if can_use_rust_gblup:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)

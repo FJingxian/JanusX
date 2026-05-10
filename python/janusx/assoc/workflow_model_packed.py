@@ -40,6 +40,45 @@ from .workflow import (
 )
 
 
+def _gwas_use_rust_unified_v1() -> bool:
+    """
+    Toggle packed GWAS unified Rust dispatcher (v1).
+
+    Default enabled when Rust symbol exists; set
+    JX_GWAS_USE_RUST_UNIFIED_V1=0 to disable quickly.
+    """
+    raw = str(os.environ.get("JX_GWAS_USE_RUST_UNIFIED_V1", "")).strip().lower()
+    enabled = raw not in {"0", "false", "no", "off"}
+    return bool(enabled and hasattr(jxrs, "gwas_packed_unified_to_tsv"))
+
+
+def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
+    """
+    Stable LM precompute for IXX without explicitly forming/inverting X'X.
+
+    Let X = QR (reduced QR). Then
+      (X'X)^+ = (R'R)^+ = R^+ (R^+)'
+    which is numerically more stable than pinv(X'X) under collinearity.
+    """
+    x = np.ascontiguousarray(np.asarray(x_design, dtype=np.float64))
+    if x.ndim != 2:
+        raise ValueError(f"x_design must be 2D, got ndim={x.ndim}")
+    n, q0 = int(x.shape[0]), int(x.shape[1])
+    if n <= q0:
+        raise ValueError(f"n too small for LM design: require n > q0, got n={n}, q0={q0}")
+
+    _q, r = np.linalg.qr(x, mode="reduced")
+    r = np.asarray(r, dtype=np.float64)
+    eye = np.eye(q0, dtype=np.float64)
+    try:
+        r_inv = np.linalg.solve(r, eye)
+    except np.linalg.LinAlgError:
+        # Rank-deficient fallback: still avoid forming X'X explicitly.
+        r_inv = np.linalg.pinv(r)
+    ixx = r_inv @ r_inv.T
+    return np.ascontiguousarray(ixx, dtype=np.float64)
+
+
 def _prepare_packed_bed_once_for_gwas(
     *,
     genofile: str,
@@ -451,32 +490,85 @@ def run_fastlmm_packed_fullrank(
                         "progress_callback": _fastlmm_progress,
                         "progress_every": int(max(1, min(gwas_total, int(max(1, chunk_size))))),
                     }
-                lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
-                    packed,
-                    int(packed_n),
-                    row_flip,
-                    maf,
-                    u_trait,
-                    s_trait,
-                    y_vec,
-                    x_arg,
-                    sample_idx_trait,
-                    -5.0,
-                    5.0,
-                    50,
-                    1e-2,
-                    0.0,
-                    int(threads),
-                    str(genetic_model),
-                    chrom_all,
-                    pos_all,
-                    allele0_all,
-                    allele1_all,
-                    out_tsv,
-                    fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
-                    fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
-                    **progress_kwargs,
-                )
+                unified_done = False
+                if _gwas_use_rust_unified_v1():
+                    try:
+                        jobs = [
+                            {
+                                "model": "fastlmm",
+                                "trait": str(pname),
+                                "out_tsv": str(out_tsv),
+                                "y": y_vec,
+                                "x": x_arg,
+                                "u": u_trait,
+                                "s": s_trait,
+                                "sample_indices": sample_idx_trait,
+                                "low": -5.0,
+                                "high": 5.0,
+                                "max_iter": 50,
+                                "tol": 1e-2,
+                                "tau": 0.0,
+                                "genetic_model": str(genetic_model),
+                                "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
+                                "fixed_ml0": (float(fixed_ml0) if fixed_ml0 is not None else None),
+                                "scan_progress_callback": _fastlmm_progress,
+                                "progress_every": int(max(1, int(chunk_size))),
+                            }
+                        ]
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
+                            packed,
+                            int(packed_n),
+                            row_flip,
+                            maf,
+                            chrom_all,
+                            pos_all,
+                            allele0_all,
+                            allele1_all,
+                            int(max(1, int(chunk_size))),
+                            int(threads),
+                            None,
+                            int(max(1, int(chunk_size))),
+                        )
+                        r0 = _res[0]
+                        lbd = float(r0.get("lbd", np.nan))
+                        ml0 = float(r0.get("ml0", np.nan))
+                        reml0 = float(r0.get("reml0", np.nan))
+                        unified_done = True
+                    except Exception as ex:
+                        _emit_warning_line(
+                            logger,
+                            f"FastLMM unified Rust dispatcher unavailable; fallback to legacy packed FastLMM. reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                        unified_done = False
+                if not unified_done:
+                    lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        u_trait,
+                        s_trait,
+                        y_vec,
+                        x_arg,
+                        sample_idx_trait,
+                        -5.0,
+                        5.0,
+                        50,
+                        1e-2,
+                        0.0,
+                        int(threads),
+                        str(genetic_model),
+                        chrom_all,
+                        pos_all,
+                        allele0_all,
+                        allele1_all,
+                        out_tsv,
+                        fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
+                        fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
+                        **progress_kwargs,
+                    )
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
             gwas_ok = True
         finally:
@@ -677,7 +769,6 @@ def run_lm_packed_fullrank(
             ),
             dtype=np.float64,
         )
-        ixx = np.ascontiguousarray(np.linalg.pinv(x_design.T @ x_design), dtype=np.float64)
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
         gm_tag = str(genetic_model).lower()
         if gm_tag == "add":
@@ -732,24 +823,92 @@ def run_lm_packed_fullrank(
                         "progress_callback": _lm_progress,
                         "progress_every": int(max(1, int(chunk_size))),
                     }
-                _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
-                    y_vec,
-                    x_design,
-                    ixx,
-                    packed,
-                    int(packed_n),
-                    row_flip,
-                    maf,
-                    chrom_all,
-                    pos_all,
-                    allele0_all,
-                    allele1_all,
-                    out_tsv,
-                    sample_idx_trait,
-                    int(max(1, int(chunk_size))),
-                    int(threads),
-                    **kwargs_assoc,
-                )
+                unified_done = False
+                if _gwas_use_rust_unified_v1():
+                    try:
+                        jobs = [
+                            {
+                                "model": "lm",
+                                "trait": str(pname),
+                                "out_tsv": str(out_tsv),
+                                "y": y_vec,
+                                "x": x_design,
+                                "ixx": None,
+                                "sample_indices": sample_idx_trait,
+                                "step": int(max(1, int(chunk_size))),
+                                "scan_progress_callback": _lm_progress,
+                                "progress_every": int(max(1, int(chunk_size))),
+                            }
+                        ]
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
+                            packed,
+                            int(packed_n),
+                            row_flip,
+                            maf,
+                            chrom_all,
+                            pos_all,
+                            allele0_all,
+                            allele1_all,
+                            int(max(1, int(chunk_size))),
+                            int(threads),
+                            None,
+                            int(max(1, int(chunk_size))),
+                        )
+                        try:
+                            _written_rows = int(_res[0].get("written_rows", len(chrom_all)))
+                        except Exception:
+                            _written_rows = int(len(chrom_all))
+                        unified_done = True
+                    except Exception as ex:
+                        _emit_warning_line(
+                            logger,
+                            f"LM unified Rust dispatcher unavailable; fallback to legacy packed LM. reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                        unified_done = False
+
+                if not unified_done:
+                    try:
+                        _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
+                            y_vec,
+                            x_design,
+                            None,
+                            packed,
+                            int(packed_n),
+                            row_flip,
+                            maf,
+                            chrom_all,
+                            pos_all,
+                            allele0_all,
+                            allele1_all,
+                            out_tsv,
+                            sample_idx_trait,
+                            int(max(1, int(chunk_size))),
+                            int(threads),
+                            **kwargs_assoc,
+                        )
+                    except TypeError:
+                        # Backward-compat fallback for older extensions that require ixx.
+                        ixx = _lm_precompute_ixx_qr(x_design)
+                        _written_rows = jxrs.glmf32_packed_assoc_to_tsv(
+                            y_vec,
+                            x_design,
+                            ixx,
+                            packed,
+                            int(packed_n),
+                            row_flip,
+                            maf,
+                            chrom_all,
+                            pos_all,
+                            allele0_all,
+                            allele1_all,
+                            out_tsv,
+                            sample_idx_trait,
+                            int(max(1, int(chunk_size))),
+                            int(threads),
+                            **kwargs_assoc,
+                        )
             gwas_ok = True
         finally:
             if gwas_pbar is not None:
@@ -903,7 +1062,6 @@ def run_lm_stream_bed_single_entry(
             ),
             dtype=np.float64,
         )
-        ixx = np.ascontiguousarray(np.linalg.pinv(x_design.T @ x_design), dtype=np.float64)
 
         model_chunk_size = _resolve_stream_scan_chunk_size(
             int(chunk_size),
@@ -980,22 +1138,42 @@ def run_lm_stream_bed_single_entry(
                         "progress_callback": _lm_progress,
                         "progress_every": int(max(1, int(model_chunk_size))),
                     }
-                kept_rows, scan_all_rows = jxrs.lm_stream_bed_to_tsv(
-                    str(prefix),
-                    y_vec,
-                    x_design,
-                    ixx,
-                    str(tmp_tsv),
-                    sample_ids=trait_ids.tolist(),
-                    maf_threshold=float(maf_threshold),
-                    max_missing_rate=float(max_missing_rate),
-                    genetic_model=str(genetic_model),
-                    het_threshold=float(het_threshold),
-                    snps_only=bool(snps_only),
-                    chunk_size=int(max(1, int(model_chunk_size))),
-                    threads=int(max(1, scan_threads)),
-                    **kwargs_stream,
-                )
+                try:
+                    kept_rows, scan_all_rows = jxrs.lm_stream_bed_to_tsv(
+                        str(prefix),
+                        y_vec,
+                        x_design,
+                        None,
+                        str(tmp_tsv),
+                        sample_ids=trait_ids.tolist(),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        genetic_model=str(genetic_model),
+                        het_threshold=float(het_threshold),
+                        snps_only=bool(snps_only),
+                        chunk_size=int(max(1, int(model_chunk_size))),
+                        threads=int(max(1, scan_threads)),
+                        **kwargs_stream,
+                    )
+                except TypeError:
+                    # Backward-compat fallback for older extensions that require ixx.
+                    ixx = _lm_precompute_ixx_qr(x_design)
+                    kept_rows, scan_all_rows = jxrs.lm_stream_bed_to_tsv(
+                        str(prefix),
+                        y_vec,
+                        x_design,
+                        ixx,
+                        str(tmp_tsv),
+                        sample_ids=trait_ids.tolist(),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        genetic_model=str(genetic_model),
+                        het_threshold=float(het_threshold),
+                        snps_only=bool(snps_only),
+                        chunk_size=int(max(1, int(model_chunk_size))),
+                        threads=int(max(1, scan_threads)),
+                        **kwargs_stream,
+                    )
             scan_ok = True
         finally:
             if warm_active and warm_task is not None:
@@ -1144,9 +1322,9 @@ def run_lmm_packed_fullrank(
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
 ) -> None:
-    if not hasattr(jxrs, "fastlmm_assoc_packed_f32"):
+    if not hasattr(jxrs, "lmm_reml_assoc_packed_f32"):
         raise RuntimeError(
-            "Rust extension missing fastlmm_assoc_packed_f32. Rebuild/install JanusX extension first."
+            "Rust extension missing lmm_reml_assoc_packed_f32. Rebuild/install JanusX extension first."
         )
     if str(genetic_model).lower() != "add":
         raise ValueError(
@@ -1261,19 +1439,18 @@ def run_lmm_packed_fullrank(
         )
 
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
+        # Exact LMM route: per-SNP REML lambda re-estimation.
         s_trait = np.ascontiguousarray(
             np.maximum(np.asarray(mod.S, dtype=np.float64).reshape(-1), 0.0),
-            dtype=np.float32,
+            dtype=np.float64,
         )
-        u_sub = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32).T, dtype=np.float32)
-        if u_sub.shape != (n_idv, n_idv):
+        u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
+        if u_t.shape != (n_idv, n_idv):
             raise ValueError(
-                f"Trait eigenvector shape mismatch: got {u_sub.shape}, expected ({n_idv}, {n_idv})."
+                f"Trait eigenvector shape mismatch: got {u_t.shape}, expected ({n_idv}, {n_idv})."
             )
-        u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
-        u_trait[sample_idx_trait, :] = u_sub
-        x_cov = np.ascontiguousarray(x_cov, dtype=np.float64)
-        x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
+        x_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
+        y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
 
         gwas_t0 = time.monotonic()
         gwas_total = int(len(sites_all))
@@ -1314,9 +1491,7 @@ def run_lmm_packed_fullrank(
                 gwas_last_done = d
 
         gwas_ok = False
-        lbd = float("nan")
-        ml0 = float("nan")
-        reml0 = float("nan")
+        null_lbd = float("nan")
         chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
         pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
         allele0_all = [str(v) for (_c, _p, v, _a1) in sites_all]
@@ -1334,30 +1509,45 @@ def run_lmm_packed_fullrank(
                     "progress_every": int(max(1, int(chunk_size))),
                 }
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                lbd, ml0, reml0 = jxrs.fastlmm_assoc_packed_f32_to_tsv(
+                null_ml0: Optional[float] = None
+                init_log10_lbd: Optional[float] = None
+                try:
+                    ml0_tmp = float(getattr(mod, "ML0"))
+                    if np.isfinite(ml0_tmp):
+                        null_ml0 = ml0_tmp
+                except Exception:
+                    null_ml0 = None
+                try:
+                    lbd0_tmp = float(getattr(mod, "lbd_null"))
+                    if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
+                        init_log10_lbd = float(np.log10(lbd0_tmp))
+                except Exception:
+                    init_log10_lbd = None
+
+                res_raw = jxrs.lmm_reml_assoc_packed_f32(
                     packed,
                     int(packed_n),
                     row_flip,
                     maf,
-                    u_trait,
                     s_trait,
-                    y_vec,
-                    x_arg,
+                    x_rot,
+                    y_rot,
+                    u_t,
                     sample_idx_trait,
                     -5.0,
                     5.0,
                     50,
                     1e-2,
-                    0.0,
                     int(threads),
                     "add",
-                    chrom_all,
-                    pos_all,
-                    allele0_all,
-                    allele1_all,
-                    out_tsv,
+                    nullml=null_ml0,
+                    init_log10_lbd=init_log10_lbd,
                     **progress_kwargs,
                 )
+                try:
+                    null_lbd = float(getattr(mod, "lbd_null"))
+                except Exception:
+                    null_lbd = float("nan")
             gwas_ok = True
         finally:
             if gwas_pbar is not None:
@@ -1372,6 +1562,44 @@ def run_lmm_packed_fullrank(
                 gwas_pbar.close(show_done=False)
 
         gwas_secs = max(time.monotonic() - gwas_t0, 0.0)
+        res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+        if res.ndim != 2 or res.shape[0] != len(sites_all) or res.shape[1] < 3:
+            raise ValueError(
+                f"Unexpected LMM result shape: {res.shape}, expected ({len(sites_all)}, >=3)"
+            )
+
+        res_df = pd.DataFrame(
+            {
+                "chrom": chrom_all,
+                "pos": pos_all,
+                "allele0": allele0_all,
+                "allele1": allele1_all,
+                "maf": np.asarray(maf, dtype=np.float32),
+                "beta": np.asarray(res[:, 0], dtype=np.float64),
+                "se": np.asarray(res[:, 1], dtype=np.float64),
+                "pwald": np.asarray(res[:, 2], dtype=np.float64),
+            }
+        )
+        if res.shape[1] > 3:
+            res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+
+        cast_map: dict[str, object] = {"pwald": "object", "pos": int}
+        if "plrt" in res_df.columns:
+            cast_map["plrt"] = "object"
+
+        def _write_lmm() -> None:
+            nonlocal res_df
+            res_df = res_df.astype(cast_map)
+            res_df.loc[:, "pwald"] = res_df["pwald"].map(lambda x: f"{x:.4e}")
+            if "plrt" in res_df.columns:
+                res_df.loc[:, "plrt"] = res_df["plrt"].map(lambda x: f"{x:.4e}")
+            res_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=None)
+
+        _run_result_write_with_status(
+            _write_lmm,
+            use_spinner=bool(use_spinner),
+            emit_done_line=False,
+        )
         saved_paths.append(str(out_tsv))
         viz_secs = 0.0
         if plot:
@@ -1394,7 +1622,11 @@ def run_lmm_packed_fullrank(
         _log_model_line(
             logger,
             "LMM",
-            f"full-rust packed scan; lambda={float(lbd):.4g}",
+            (
+                f"full-rust packed exact REML scan (per-SNP lambda); null lambda={float(null_lbd):.4g}"
+                if np.isfinite(float(null_lbd))
+                else "full-rust packed exact REML scan (per-SNP lambda)"
+            ),
             use_spinner=bool(use_spinner),
         )
         _log_model_line(
@@ -1421,16 +1653,7 @@ def run_lmm_packed_fullrank(
                 "pve": (
                     float(header_pve)
                     if header_pve is not None
-                    else (
-                        float(np.mean(np.asarray(s_trait, dtype=np.float64)))
-                        / (
-                            float(np.mean(np.asarray(s_trait, dtype=np.float64)))
-                            + float(lbd)
-                        )
-                        if np.isfinite(float(lbd))
-                        and (float(np.mean(np.asarray(s_trait, dtype=np.float64))) + float(lbd)) > 0.0
-                        else None
-                    )
+                    else None
                 ),
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),

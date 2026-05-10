@@ -143,6 +143,10 @@ from janusx.janusx import (
     fastlmm_reml_null_f32,
     fastlmm_assoc_chunk_f32,
 )
+try:
+    from janusx.janusx import glm_ixx_from_x_qr as _glm_ixx_from_x_qr
+except Exception:
+    _glm_ixx_from_x_qr = None
 
 try:
     from janusx.janusx import (
@@ -152,6 +156,10 @@ try:
 except Exception:
     _lmm_reml_chunk_from_snp_f32 = None
     _lmm_assoc_chunk_from_snp_f32 = None
+try:
+    from janusx.janusx import lmm_rotate_x_y_with_ut_f64 as _lmm_rotate_x_y_with_ut_f64
+except Exception:
+    _lmm_rotate_x_y_with_ut_f64 = None
 
 try:
     from janusx.janusx import rust_eigh_from_array_f64 as _rust_eigh_from_array_f64
@@ -223,18 +231,8 @@ def _lmm_from_snp_use_py_rotate(
         return True
     if m in {"rust", "native"}:
         return False
-
-    # Auto baseline: for large dense chunks, NumPy/BLAS rotation can be faster.
-    prefer_py = (int(n) >= 512) and (int(m_chunk) >= 2048)
-    if not prefer_py:
-        return False
-
-    # If scan stage pins BLAS to 1 thread while Rust uses multiple workers,
-    # prefer Rust-side rotation+scan to avoid serial BLAS bottleneck.
-    blas_threads = _infer_blas_threads_from_env()
-    if (blas_threads is not None) and (blas_threads <= 1) and (int(threads) > 1):
-        return False
-    return True
+    # Rust-only GWAS mode: auto/default always uses Rust path.
+    return False
 
 
 def _coerce_bed_packed_ctx(M: Any) -> Optional[Dict[str, Any]]:
@@ -448,8 +446,23 @@ def FEM(
     X = np.ascontiguousarray(X, dtype=np.float64)
 
     # Precompute (X'X)^(-1) once unless caller provides a cached matrix.
+    # Rust-only: do not fallback to NumPy pinv.
     if ixx is None:
-        ixx = np.ascontiguousarray(np.linalg.pinv(X.T @ X), dtype=np.float64)
+        if _glm_ixx_from_x_qr is None:
+            raise RuntimeError(
+                "Rust extension missing glm_ixx_from_x_qr. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+        ixx = np.ascontiguousarray(
+            np.asarray(
+                _glm_ixx_from_x_qr(
+                    y,
+                    X,
+                ),
+                dtype=np.float64,
+            ),
+            dtype=np.float64,
+        )
     else:
         ixx = np.ascontiguousarray(ixx, dtype=np.float64)
 
@@ -641,21 +654,15 @@ def lmm_reml_from_snp(
         threads=threads,
     )
 
-    if (_lmm_reml_chunk_from_snp_f32 is None) or use_py_rotate:
-        # Backward compatibility: extension not rebuilt yet.
-        snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
-        u_t = np.ascontiguousarray(u_t, dtype=np.float32)
-        g_rot_chunk = snp_chunk @ u_t.T
-        return lmm_reml(
-            S,
-            utx,
-            uty,
-            g_rot_chunk,
-            bounds,
-            max_iter=max_iter,
-            tol=tol,
-            threads=threads,
-            nullml=nullml,
+    if _lmm_reml_chunk_from_snp_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing lmm_reml_chunk_from_snp_f32. "
+            "Rebuild janusx extension for Rust-only GWAS mode."
+        )
+    if use_py_rotate:
+        raise RuntimeError(
+            "Python rotate fallback for lmm_reml_from_snp is disabled in Rust-only GWAS mode. "
+            "Please use JX_LMM_FROM_SNP_BACKEND=rust (or auto with Rust-preferred path)."
         )
 
     low, high = bounds
@@ -1082,19 +1089,15 @@ def lmm_assoc_fixed_from_snp(
         threads=threads,
     )
 
-    if (_lmm_assoc_chunk_from_snp_f32 is None) or use_py_rotate:
-        # Backward compatibility: extension not rebuilt yet.
-        snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
-        u_t = np.ascontiguousarray(u_t, dtype=np.float32)
-        g_rot_chunk = snp_chunk @ u_t.T
-        return lmm_assoc_fixed(
-            S,
-            utx,
-            uty,
-            log10_lbd,
-            g_rot_chunk,
-            threads=threads,
-            nullml=nullml,
+    if _lmm_assoc_chunk_from_snp_f32 is None:
+        raise RuntimeError(
+            "Rust extension missing lmm_assoc_chunk_from_snp_f32. "
+            "Rebuild janusx extension for Rust-only GWAS mode."
+        )
+    if use_py_rotate:
+        raise RuntimeError(
+            "Python rotate fallback for lmm_assoc_fixed_from_snp is disabled in Rust-only GWAS mode. "
+            "Please use JX_LMM_FROM_SNP_BACKEND=rust (or auto with Rust-preferred path)."
         )
 
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
@@ -1167,14 +1170,13 @@ class LMM:
             else np.ones((y.shape[0], 1))
         )
 
-        # Eigen decomposition of kinship (stabilized)
+        # Eigen decomposition of kinship (stabilized, Rust-only)
         kinship.flat[::kinship.shape[0]+1] += 1e-6
         t_start = time.time()
-        eig_done = False
         kinship_eigh = np.ascontiguousarray(kinship, dtype=np.float64)
+        eig_thr = int(_infer_blas_threads_from_env() or 0)
         if _rust_eigh_from_array_f64_inplace is not None:
             try:
-                eig_thr = int(_infer_blas_threads_from_env() or 0)
                 eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
                     _rust_eigh_from_array_f64_inplace(
                         kinship_eigh,
@@ -1184,31 +1186,12 @@ class LMM:
                         require_lapack=False,
                     )
                 )
-                if evec_raw is None:
-                    raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
-                self.S = np.asarray(eval_raw, dtype=np.float64)
-                self.Dh = np.asarray(evec_raw, dtype=np.float64)
-                if not str(_evd_backend).lower().startswith("lapack_"):
-                    _emit_runtime_warning_once(
-                        "eigh_non_lapack",
-                        (
-                            "Rust eigh did not use LAPACK backend "
-                            f"(backend={_evd_backend}); performance may degrade."
-                        ),
-                )
-                eig_done = True
             except Exception as ex:
-                _emit_runtime_warning_once(
-                    "eigh_scipy_fallback",
-                    (
-                        "Rust eigh failed; fallback to scipy.linalg.eigh "
-                        f"(reason: {ex})."
-                    ),
-                )
-                eig_done = False
+                raise RuntimeError(
+                    f"Rust eigh failed in LMM initialization (inplace): {ex}"
+                ) from ex
         elif _rust_eigh_from_array_f64 is not None:
             try:
-                eig_thr = int(_infer_blas_threads_from_env() or 0)
                 eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
                     _rust_eigh_from_array_f64(
                         kinship_eigh,
@@ -1218,38 +1201,46 @@ class LMM:
                         require_lapack=False,
                     )
                 )
-                if evec_raw is None:
-                    raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
-                self.S = np.asarray(eval_raw, dtype=np.float64)
-                self.Dh = np.asarray(evec_raw, dtype=np.float64)
-                if not str(_evd_backend).lower().startswith("lapack_"):
-                    _emit_runtime_warning_once(
-                        "eigh_non_lapack",
-                        (
-                            "Rust eigh did not use LAPACK backend "
-                            f"(backend={_evd_backend}); performance may degrade."
-                        ),
-                    )
-                eig_done = True
             except Exception as ex:
-                _emit_runtime_warning_once(
-                    "eigh_scipy_fallback",
-                    (
-                        "Rust eigh failed; fallback to scipy.linalg.eigh "
-                        f"(reason: {ex})."
-                    ),
-                )
-                eig_done = False
-        if not eig_done:
-            self.S, self.Dh = eigh(kinship, overwrite_a=True, check_finite=False)
+                raise RuntimeError(
+                    f"Rust eigh failed in LMM initialization: {ex}"
+                ) from ex
+        else:
+            raise RuntimeError(
+                "Rust extension missing rust_eigh_from_array_f64(_inplace). "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+        if evec_raw is None:
+            raise RuntimeError("rust_eigh_from_array_f64 returned no eigenvectors")
+        self.S = np.asarray(eval_raw, dtype=np.float64)
+        self.Dh = np.asarray(evec_raw, dtype=np.float64)
+        if not str(_evd_backend).lower().startswith("lapack_"):
+            _emit_runtime_warning_once(
+                "eigh_non_lapack",
+                (
+                    "Rust eigh did not use LAPACK backend "
+                    f"(backend={_evd_backend}); performance may degrade."
+                ),
+            )
         self.evd_secs = float(time.time() - t_start)
         # Drop kinship to save memory
         del kinship
         self.Dh = self.Dh.T.astype('float32')
 
-        # Pre-rotate covariates and phenotype once
-        self.Xcov:np.ndarray = self.Dh @ X
-        self.y:np.ndarray = self.Dh @ y
+        # Pre-rotate covariates and phenotype once (Rust-only).
+        if _lmm_rotate_x_y_with_ut_f64 is None:
+            raise RuntimeError(
+                "Rust extension missing lmm_rotate_x_y_with_ut_f64. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+        xcov_rot, y_rot = _lmm_rotate_x_y_with_ut_f64(
+            np.ascontiguousarray(self.Dh, dtype=np.float32),
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y.reshape(-1), dtype=np.float64),
+            int(_infer_blas_threads_from_env() or 0),
+        )
+        self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
+        self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
 
         # ---- Estimate null lambda via scalar optimization (Python) ----
         lbd_null, ml0, reml = lmm_reml_null(self.S, self.Xcov, self.y, (-5, 5), max_iter=50, tol=1e-3)
@@ -1409,7 +1400,16 @@ class LM:
             else np.ones((self.y.shape[0], 1))
         )
         # Cache (X'X)^(-1) for repeated chunk scans on the same trait.
-        self.ixx = np.ascontiguousarray(np.linalg.pinv(self.X.T @ self.X), dtype=np.float64)
+        # Rust-only: compute via Rust QR path, no NumPy pinv fallback.
+        if _glm_ixx_from_x_qr is None:
+            raise RuntimeError(
+                "Rust extension missing glm_ixx_from_x_qr. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
+            )
+        self.ixx = np.ascontiguousarray(
+            np.asarray(_glm_ixx_from_x_qr(self.y.ravel(), self.X), dtype=np.float64),
+            dtype=np.float64,
+        )
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
         """

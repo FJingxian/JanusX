@@ -4,7 +4,7 @@ version = "1.0.23"
 description = "A Suite of Genotyping Tools for Genome-Wide Association Study and Genomic Selection"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy", "scipy",
+    "numpy!=2.4.3", "scipy",
     "pandas>=1.5",
     "matplotlib",
     "psutil",
@@ -58,7 +58,7 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
 
 [build-system]
-requires = ["maturin>=1.7,<2", "numpy>=1.23", "pybind11>=2.13.0"]
+requires = ["maturin>=1.7,<2", "numpy>=1.23,!=2.4.3", "pybind11>=2.13.0"]
 build-backend = "build_backend"
 backend-path = ["scripts"]
 

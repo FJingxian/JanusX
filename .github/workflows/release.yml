@@ -360,9 +360,9 @@ jobs:
             $triplet = "x64-windows"
           }
 
-          & "$vcpkgRoot\vcpkg.exe" install "openblas:$triplet"
+          & "$vcpkgRoot\vcpkg.exe" install "openblas[threads]:$triplet"
           if ($LASTEXITCODE -ne 0) {
-            throw "vcpkg install openblas failed for triplet $triplet"
+            throw "vcpkg install openblas[threads] failed for triplet $triplet"
           }
           if ("${{ matrix.target }}" -ne "aarch64-pc-windows-msvc") {
             & "$vcpkgRoot\vcpkg.exe" install "lapack:$triplet"
@@ -487,6 +487,41 @@ jobs:
           # require_lapack=True must fail fast if LAPACK symbols/backends are unavailable.
           _ = _jx.rust_eigh_debug_f64(n=128, threads=4, driver="auto", jobz="V", require_lapack=True)
           print("[janusx] rust_eigh_debug_f64(require_lapack=True) passed")
+          PY
+
+      - name: Verify OpenBLAS threading (windows-x86_64)
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import os
+          import janusx.janusx as _jx
+
+          target = 8
+          for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+              os.environ[k] = str(target)
+
+          ok = bool(_jx.rust_blas_set_num_threads(target))
+          got = int(_jx.rust_blas_get_num_threads())
+          print(f"[janusx] rust_blas_set_num_threads({target}) -> {ok}")
+          print(f"[janusx] rust_blas_get_num_threads() -> {got}")
+          if not ok:
+              raise SystemExit("Strict mode failed: rust_blas_set_num_threads returned False")
+          if got < 2:
+              raise SystemExit(
+                  "Strict mode failed: OpenBLAS thread control ineffective "
+                  f"(expected >=2, got {got})."
+              )
+          _ = _jx.rust_eigh_debug_f64(
+              n=256,
+              threads=target,
+              driver="auto",
+              jobz="V",
+              require_lapack=True,
+          )
+          print("[janusx] OpenBLAS threading self-check passed")
           PY
 
       - name: Verify KMC prebuilt in wheel (all except windows-arm64)
@@ -632,7 +667,7 @@ jobs:
           path: dist/*.tar.gz
 
   publish:
-    name: Publish to PyPI
+    name: Publish to TestPyPI
     if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     needs:
@@ -664,11 +699,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4
 
-      - name: Publish to PyPI
+      - name: Publish to TestPyPI
         env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          MATURIN_PYPI_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
         run: |
-          maturin upload --non-interactive --skip-existing dist/*.whl dist/*.tar.gz
+          if [[ -z "${MATURIN_PYPI_TOKEN:-}" ]]; then
+            echo "Missing TEST_PYPI_API_TOKEN secret."
+            exit 1
+          fi
+          maturin upload \
+            --repository-url https://test.pypi.org/legacy/ \
+            --non-interactive \
+            --skip-existing \
+            dist/*.whl dist/*.tar.gz
 
   update-bioconda-pr:
     name: Update Bioconda PR

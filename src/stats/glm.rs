@@ -1,7 +1,9 @@
+use nalgebra::DMatrix;
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 use pyo3::Bound;
 use pyo3::BoundObject;
 use rayon::prelude::*;
@@ -10,7 +12,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use crate::bedmath::decode_plink_bed_hardcall;
+use crate::bedmath::{decode_plink_bed_hardcall, is_identity_indices, packed_byte_lut};
 use crate::gfcore;
 use crate::gfcore::BedSnpIter;
 use crate::gfreader::build_sample_selection;
@@ -19,6 +21,95 @@ use crate::stats_common::{get_cached_pool, parse_index_vec_i64};
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn pinv_svd_square(a: &DMatrix<f64>) -> Result<DMatrix<f64>, String> {
+    let q = a.nrows();
+    if q != a.ncols() {
+        return Err("pinv_svd_square expects a square matrix".to_string());
+    }
+    let svd = a.clone().svd(true, true);
+    let u = svd.u.ok_or_else(|| "SVD failed to produce U".to_string())?;
+    let vt = svd
+        .v_t
+        .ok_or_else(|| "SVD failed to produce V^T".to_string())?;
+    let mut s_inv = DMatrix::<f64>::zeros(q, q);
+    let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
+    let rcond = 1e-12_f64;
+    let cutoff = rcond * smax.max(1.0);
+    for i in 0..q {
+        let s = svd.singular_values[i];
+        if s.is_finite() && s > cutoff {
+            s_inv[(i, i)] = 1.0 / s;
+        }
+    }
+    let v = vt.transpose();
+    Ok(v * s_inv * u.transpose())
+}
+
+fn ixx_from_x_qr(x_flat: &[f64], n: usize, q0: usize) -> Result<Vec<f64>, String> {
+    if q0 == 0 {
+        return Err("X has zero columns".to_string());
+    }
+    if x_flat.len() != n * q0 {
+        return Err("X shape mismatch".to_string());
+    }
+    if n <= q0 {
+        return Err(format!("n too small for LM design: n={n}, q0={q0}"));
+    }
+
+    let xmat = DMatrix::<f64>::from_row_slice(n, q0, x_flat);
+    let qr = xmat.qr();
+    let r = qr.r();
+    if r.nrows() != q0 || r.ncols() != q0 {
+        return Err(format!(
+            "unexpected R shape from QR: got {}x{}, expected {}x{}",
+            r.nrows(),
+            r.ncols(),
+            q0,
+            q0
+        ));
+    }
+
+    let eye = DMatrix::<f64>::identity(q0, q0);
+    let r_inv = if let Some(inv) = r.clone().qr().solve(&eye) {
+        inv
+    } else {
+        pinv_svd_square(&r)?
+    };
+    let ixx = &r_inv * r_inv.transpose();
+    Ok(ixx.as_slice().to_vec())
+}
+
+#[pyfunction]
+#[pyo3(signature = (y, x))]
+pub fn glm_ixx_from_x_qr<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let y_slice = y.as_slice()?;
+    let x_arr = x.as_array();
+    if x_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err("x must be a 2D matrix"));
+    }
+    let n = y_slice.len();
+    let xn = x_arr.shape()[0];
+    let q0 = x_arr.shape()[1];
+    if xn != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "x rows must equal len(y): rows={}, len(y)={n}",
+            xn
+        )));
+    }
+    let x_flat: Cow<[f64]> = match x.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+    };
+    let ixx = ixx_from_x_qr(x_flat.as_ref(), n, q0).map_err(PyRuntimeError::new_err)?;
+    let arr = numpy::ndarray::Array2::from_shape_vec((q0, q0), ixx)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyArray2::from_owned_array(py, arr).into_bound())
 }
 
 fn betacf(a: f64, b: f64, x: f64) -> f64 {
@@ -206,6 +297,25 @@ fn transform_alleles_by_model(a0: &str, a1: &str, model: &str) -> (String, Strin
     }
 }
 
+#[inline]
+fn decode_plink_dosage_with_mean(code: u8, mean_g: f64, flip: bool) -> f64 {
+    if !flip {
+        match code {
+            0b00 => 0.0,
+            0b10 => 1.0,
+            0b11 => 2.0,
+            _ => mean_g, // 0b01 => missing
+        }
+    } else {
+        match code {
+            0b00 => 2.0,
+            0b10 => 1.0,
+            0b11 => 0.0,
+            _ => mean_g, // 0b01 => missing
+        }
+    }
+}
+
 /// End-to-end LM streaming scan on PLINK BED:
 /// read BED chunk -> per-row filter/model/center -> parallel LM assoc -> write TSV
 #[pyfunction]
@@ -231,7 +341,7 @@ pub fn lm_stream_bed_to_tsv(
     prefix: String,
     y: PyReadonlyArray1<'_, f64>,
     x: PyReadonlyArray2<'_, f64>,
-    ixx: PyReadonlyArray2<'_, f64>,
+    ixx: Option<PyReadonlyArray2<'_, f64>>,
     out_tsv: String,
     sample_ids: Option<Vec<String>>,
     maf_threshold: f32,
@@ -271,14 +381,10 @@ pub fn lm_stream_bed_to_tsv(
 
     let y = y.as_slice()?;
     let x_arr = x.as_array();
-    let ixx_arr = ixx.as_array();
     let n = y.len();
     let (xn, q0) = (x_arr.shape()[0], x_arr.shape()[1]);
     if xn != n {
         return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
-    }
-    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
-        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
     }
     if n <= q0 + 1 {
         return Err(PyRuntimeError::new_err(format!(
@@ -290,9 +396,17 @@ pub fn lm_stream_bed_to_tsv(
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
     };
-    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    let ixx_flat: Cow<[f64]> = if let Some(ixx_in) = ixx {
+        let ixx_arr = ixx_in.as_array();
+        if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+            return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+        }
+        match ixx_in.as_slice() {
+            Ok(s) => Cow::Owned(s.to_vec()),
+            Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+        }
+    } else {
+        Cow::Owned(ixx_from_x_qr(x_flat.as_ref(), n, q0).map_err(PyRuntimeError::new_err)?)
     };
 
     let mut xy = vec![0.0_f64; q0];
@@ -713,7 +827,6 @@ pub fn glmf32_packed<'py>(
     } else {
         (0..n_samples).collect()
     };
-
     let n = y.len();
     if sample_idx.len() != n {
         return Err(PyRuntimeError::new_err(format!(
@@ -928,7 +1041,6 @@ pub fn glmf32_packed_assoc<'py>(
     } else {
         (0..n_samples).collect()
     };
-
     let n = y.len();
     if sample_idx.len() != n {
         return Err(PyRuntimeError::new_err(format!(
@@ -1116,7 +1228,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     py: Python<'_>,
     y: PyReadonlyArray1<'_, f64>,
     x: PyReadonlyArray2<'_, f64>,
-    ixx: PyReadonlyArray2<'_, f64>,
+    ixx: Option<PyReadonlyArray2<'_, f64>>,
     packed: PyReadonlyArray2<'_, u8>,
     n_samples: usize,
     row_flip: PyReadonlyArray1<'_, bool>,
@@ -1137,7 +1249,6 @@ pub fn glmf32_packed_assoc_to_tsv(
     }
     let y = y.as_slice()?;
     let x_arr = x.as_array();
-    let ixx_arr = ixx.as_array();
     let packed_arr = packed.as_array();
 
     if packed_arr.ndim() != 2 {
@@ -1183,6 +1294,18 @@ pub fn glmf32_packed_assoc_to_tsv(
     } else {
         (0..n_samples).collect()
     };
+    let sample_idx_is_identity = is_identity_indices(&sample_idx, n_samples);
+    let (sample_byte_idx, sample_lane_idx): (Vec<usize>, Vec<usize>) = if sample_idx_is_identity {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut byte_idx = Vec::with_capacity(sample_idx.len());
+        let mut lane_idx = Vec::with_capacity(sample_idx.len());
+        for &s in &sample_idx {
+            byte_idx.push(s >> 2);
+            lane_idx.push(s & 3);
+        }
+        (byte_idx, lane_idx)
+    };
 
     let n = y.len();
     if sample_idx.len() != n {
@@ -1196,9 +1319,6 @@ pub fn glmf32_packed_assoc_to_tsv(
     if xn != n {
         return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
     }
-    if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
-        return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
-    }
     if n <= q0 + 1 {
         return Err(PyRuntimeError::new_err(format!(
             "n too small: require n > q0+1, got n={n}, q0={q0}"
@@ -1210,9 +1330,17 @@ pub fn glmf32_packed_assoc_to_tsv(
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
     };
-    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+    let ixx_flat: Cow<[f64]> = if let Some(ixx_in) = ixx {
+        let ixx_arr = ixx_in.as_array();
+        if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
+            return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
+        }
+        match ixx_in.as_slice() {
+            Ok(s) => Cow::Owned(s.to_vec()),
+            Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+        }
+    } else {
+        Cow::Owned(ixx_from_x_qr(x_flat.as_ref(), n, q0).map_err(PyRuntimeError::new_err)?)
     };
     let packed_flat: Cow<[u8]> = match packed.as_slice() {
         Ok(s) => Cow::Borrowed(s),
@@ -1263,6 +1391,7 @@ pub fn glmf32_packed_assoc_to_tsv(
 
         let mut out_block = vec![0.0_f64; step * 4];
         let mut text_buf = String::with_capacity(step * 96);
+        let code4_lut = &packed_byte_lut().code4;
 
         let mut runner = || -> PyResult<()> {
             let mut i_marker = 0usize;
@@ -1281,22 +1410,48 @@ pub fn glmf32_packed_assoc_to_tsv(
 
                         let mut sy = 0.0_f64;
                         let mut ss = 0.0_f64;
-                        for (k, &sidx) in sample_idx.iter().enumerate() {
-                            let b = row[sidx >> 2];
-                            let code = (b >> ((sidx & 3) * 2)) & 0b11;
-                            let mut gv = match decode_plink_bed_hardcall(code) {
-                                Some(v) => v,
-                                None => mean_g,
-                            };
-                            if flip && code != 0b01 {
-                                gv = 2.0 - gv;
+                        if sample_idx_is_identity {
+                            let full_bytes = n_samples / 4;
+                            let rem = n_samples % 4;
+                            let mut k = 0usize;
+                            for &b in row.iter().take(full_bytes) {
+                                let codes = &code4_lut[b as usize];
+                                for &code in codes.iter().take(4) {
+                                    let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
+                                    sy += gv * y[k];
+                                    ss += gv * gv;
+                                    let xrow = &x_flat[k * q0..(k + 1) * q0];
+                                    for j in 0..q0 {
+                                        scr.xs[j] += xrow[j] * gv;
+                                    }
+                                    k += 1;
+                                }
                             }
+                            if rem > 0 {
+                                let codes = &code4_lut[row[full_bytes] as usize];
+                                for &code in codes.iter().take(rem) {
+                                    let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
+                                    sy += gv * y[k];
+                                    ss += gv * gv;
+                                    let xrow = &x_flat[k * q0..(k + 1) * q0];
+                                    for j in 0..q0 {
+                                        scr.xs[j] += xrow[j] * gv;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                        } else {
+                            for k in 0..n {
+                                let b = row[sample_byte_idx[k]];
+                                let code = code4_lut[b as usize][sample_lane_idx[k]];
+                                let gv = decode_plink_dosage_with_mean(code, mean_g, flip);
 
-                            sy += gv * y[k];
-                            ss += gv * gv;
-                            let xrow = &x_flat[k * q0..(k + 1) * q0];
-                            for j in 0..q0 {
-                                scr.xs[j] += xrow[j] * gv;
+                                sy += gv * y[k];
+                                ss += gv * gv;
+                                let xrow = &x_flat[k * q0..(k + 1) * q0];
+                                for j in 0..q0 {
+                                    scr.xs[j] += xrow[j] * gv;
+                                }
                             }
                         }
 

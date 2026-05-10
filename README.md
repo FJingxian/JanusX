@@ -101,6 +101,8 @@ conda create -n janusx \
 
 ## BLAS backend and threads
 
+- macOS default: prefer Accelerate backend.
+- Linux/Windows default: prefer OpenBLAS (fallback when unavailable).
 - OpenBLAS is available on macOS/Linux/Windows.
 - JanusX now applies `-t/--thread` to BLAS thread env vars (`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, etc.) in major analysis CLIs.
 - For strongest cross-platform numerical/performance consistency, prefer a conda-forge OpenBLAS environment.
@@ -112,8 +114,13 @@ conda create -n jx_openblas -c conda-forge python=3.14 numpy scipy "libblas=*=*o
 conda activate jx_openblas
 ```
 
-Default behavior is: prefer OpenBLAS, warn when unavailable, and automatically
-fallback to platform-priority backends.
+macOS users who want OpenBLAS instead of Accelerate can set:
+
+```bash
+export JANUSX_MACOS_PREFER_ACCELERATE=0
+# or force strict OpenBLAS detection
+export JANUSX_REQUIRE_OPENBLAS=1
+```
 
 ---
 

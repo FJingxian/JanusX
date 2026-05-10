@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -47,6 +48,53 @@ def _init_windows_dll_search_path() -> None:
 
 
 _init_windows_dll_search_path()
+
+
+def _init_macos_openblas_path() -> None:
+    if sys.platform != "darwin":
+        return
+
+    # Honor explicit user override first.
+    explicit = str(os.environ.get("JX_OPENBLAS_LIB_PATH", "")).strip()
+    if explicit:
+        return
+
+    pkg_dir = Path(__file__).resolve().parent
+    cands: list[Path] = []
+    cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
+    cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+    if len(cands) == 0:
+        return
+
+    # Prefer canonical soname-style names first.
+    preferred_order = [
+        "libopenblas.dylib",
+        "libopenblas.0.dylib",
+    ]
+    picked: Path | None = None
+    by_name = {p.name: p for p in cands}
+    for name in preferred_order:
+        if name in by_name:
+            picked = by_name[name]
+            break
+    if picked is None:
+        picked = cands[0]
+
+    os.environ.setdefault("JX_OPENBLAS_LIB_PATH", str(picked))
+
+    # Help dependent dylib resolution for @rpath/@loader_path fallbacks.
+    libs_dir = str(picked.parent)
+    fallback_key = "DYLD_FALLBACK_LIBRARY_PATH"
+    current = str(os.environ.get(fallback_key, "")).strip()
+    if current == "":
+        os.environ[fallback_key] = libs_dir
+    else:
+        parts = current.split(":")
+        if libs_dir not in parts:
+            os.environ[fallback_key] = f"{libs_dir}:{current}"
+
+
+_init_macos_openblas_path()
 
 from . import linalg as linalg
 

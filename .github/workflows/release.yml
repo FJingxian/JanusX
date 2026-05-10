@@ -254,7 +254,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
     runs-on: ${{ matrix.runner }}
     env:
-      JANUSX_REQUIRE_OPENBLAS: "1"
+      JANUSX_REQUIRE_OPENBLAS: ${{ matrix.require_openblas }}
+      JANUSX_MACOS_PREFER_ACCELERATE: ${{ matrix.prefer_accelerate }}
     strategy:
       fail-fast: false
       matrix:
@@ -268,6 +269,10 @@ jobs:
             manylinux_image: quay.io/pypa/manylinux2014_x86_64:latest
             interpreter: /opt/python/cp310-cp310/bin/python
             target: x86_64-unknown-linux-gnu
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "true"
           - label: linux-aarch64
             runner: ubuntu-24.04-arm
             platform: linux
@@ -276,21 +281,59 @@ jobs:
             manylinux_image: quay.io/pypa/manylinux2014_aarch64:latest
             interpreter: /opt/python/cp310-cp310/bin/python
             target: aarch64-unknown-linux-gnu
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "true"
           - label: macos-x86_64
             runner: macos-15-intel
             platform: macos
             python-version: "3.10"
             target: x86_64-apple-darwin
+            blas_backend: openblas
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "false"
           - label: macos-arm64
             runner: macos-14
             platform: macos
             python-version: "3.10"
             target: aarch64-apple-darwin
+            blas_backend: openblas
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "false"
+          - label: macos-x86_64-accelerate
+            runner: macos-15-intel
+            platform: macos
+            python-version: "3.10"
+            target: x86_64-apple-darwin
+            blas_backend: accelerate
+            require_openblas: "0"
+            prefer_accelerate: "1"
+            expected_backend: accelerate
+            upload_wheel: "true"
+          - label: macos-arm64-accelerate
+            runner: macos-14
+            platform: macos
+            python-version: "3.10"
+            target: aarch64-apple-darwin
+            blas_backend: accelerate
+            require_openblas: "0"
+            prefer_accelerate: "1"
+            expected_backend: accelerate
+            upload_wheel: "true"
           - label: windows-x86_64
             runner: windows-latest
             platform: windows
             python-version: "3.10"
             target: x86_64-pc-windows-msvc
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "true"
           # Build Windows ARM64 wheel via cross-target on windows-latest.
           # If your org has native ARM runners, you can switch runner to windows-11-arm.
           - label: windows-arm64
@@ -298,6 +341,10 @@ jobs:
             platform: windows
             python-version: "3.10"
             target: aarch64-pc-windows-msvc
+            require_openblas: "1"
+            prefer_accelerate: "0"
+            expected_backend: openblas
+            upload_wheel: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -449,6 +496,8 @@ jobs:
         run: |
           if [[ "${{ matrix.platform }}" == "macos" ]]; then
             export JANUSX_STRICT_KMC_BIND=1
+            export JANUSX_BUNDLE_OPENBLAS_DYLIB=1
+            export JANUSX_STRICT_OPENBLAS_BUNDLE=1
             python -m build --wheel --outdir dist --no-isolation
           elif [[ "${{ matrix.label }}" == "windows-x86_64" ]]; then
             export JANUSX_STRICT_KMC_BIND=1
@@ -476,9 +525,10 @@ jobs:
           "$PY" - <<'PY'
           import janusx.janusx as _jx
           backend = _jx.rust_sgemm_backend()
+          expected = "${{ matrix.expected_backend }}"
           print(f"[janusx] rust_sgemm_backend={backend}")
-          if backend != "openblas":
-              raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
+          if backend != expected:
+              raise SystemExit(f"Strict mode failed: expected {expected!r} backend, got {backend!r}")
           PY
 
       - name: Verify Rust eigh LAPACK backend (windows-x86_64)
@@ -560,7 +610,7 @@ jobs:
           "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
 
       - name: Wheel runtime smoke test (GWAS + rrBLUP)
-        if: ${{ matrix.label == 'linux-x86_64' || matrix.label == 'macos-arm64' }}
+        if: ${{ matrix.label == 'linux-x86_64' || matrix.label == 'macos-arm64-accelerate' }}
         shell: bash
         run: |
           PY=python
@@ -574,7 +624,7 @@ jobs:
           bash scripts/ggval.sh
 
       - name: Verify macOS wheel links OpenBLAS only
-        if: ${{ matrix.platform == 'macos' }}
+        if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'openblas' }}
         shell: bash
         run: |
           PY=python
@@ -594,6 +644,61 @@ jobs:
             echo "ERROR: Accelerate linkage detected in macOS wheel; expected OpenBLAS-only runtime path."
             exit 1
           fi
+
+      - name: Verify macOS wheel links Accelerate only
+        if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'accelerate' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          EXT_PATH="$("$PY" - <<'PY'
+          import janusx.janusx as _jx
+          print(_jx.__file__)
+          PY
+          )"
+          echo "[janusx] extension path: ${EXT_PATH}"
+          otool -L "${EXT_PATH}"
+          if ! otool -L "${EXT_PATH}" | grep -q "Accelerate.framework"; then
+            echo "ERROR: Expected Accelerate linkage in macOS wheel."
+            exit 1
+          fi
+          if otool -L "${EXT_PATH}" | grep -qi "libopenblas"; then
+            echo "ERROR: OpenBLAS linkage detected in macOS Accelerate variant."
+            exit 1
+          fi
+
+      - name: Accelerate GRM smoke test (macOS)
+        if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'accelerate' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install --force-reinstall dist/*.whl
+          jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o test
+          jx grm -bfile test/mouse_hs1940 -o test
+          "$PY" - <<'PY'
+          import os
+          import janusx.janusx as _jx
+          bundled = os.environ.get("JX_OPENBLAS_LIB_PATH", "")
+          print(f"[janusx] JX_OPENBLAS_LIB_PATH={bundled}")
+          backend, evd_backend, *_ = _jx.rust_eigh_debug_f64(
+              n=128,
+              threads=2,
+              driver="auto",
+              jobz="V",
+              require_lapack=True,
+          )
+          print(f"[janusx] rust_sgemm_backend={backend}")
+          print(f"[janusx] rust_eigh_backend={evd_backend}")
+          if backend != "accelerate":
+              raise SystemExit(f"Strict mode failed: expected accelerate BLAS backend, got {backend!r}")
+          if "openblas_dyn" not in evd_backend:
+              raise SystemExit(
+                  "Strict mode failed: expected macOS dynamic OpenBLAS LAPACK path "
+                  f"(openblas_dyn), got {evd_backend!r}"
+              )
+          PY
 
       - name: Sanity check wheel artifact (windows-arm64 cross-build)
         if: ${{ matrix.label == 'windows-arm64' }}
@@ -621,6 +726,7 @@ jobs:
           PY
 
       - name: Upload wheel artifact
+        if: ${{ matrix.upload_wheel == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.label }}

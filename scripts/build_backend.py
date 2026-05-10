@@ -283,6 +283,200 @@ def _collect_windows_runtime_dlls() -> list[Path]:
     return sorted(picked.values(), key=lambda p: p.name.lower())
 
 
+def _macos_runtime_dirs() -> list[Path]:
+    dirs: list[Path] = []
+
+    for var in ("OPENBLAS_LIB_DIR", "OPENBLAS_INCLUDE_DIR"):
+        raw = str(os.environ.get(var, "")).strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        # OPENBLAS_INCLUDE_DIR may point to include/, so also try sibling lib/.
+        dirs.append(p)
+        if p.name.lower() == "include":
+            dirs.append(p.parent / "lib")
+        else:
+            dirs.append(p.parent)
+
+    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix:
+        cp = Path(conda_prefix)
+        dirs.extend(
+            [
+                cp / "lib",
+                cp / "Library" / "lib",
+            ]
+        )
+
+    # Common Homebrew prefixes.
+    dirs.extend(
+        [
+            Path("/opt/homebrew/opt/openblas/lib"),
+            Path("/usr/local/opt/openblas/lib"),
+            Path("/opt/homebrew/opt/gcc/lib/gcc/current"),
+            Path("/usr/local/opt/gcc/lib/gcc/current"),
+            Path("/opt/homebrew/opt/libomp/lib"),
+            Path("/usr/local/opt/libomp/lib"),
+        ]
+    )
+    return _iter_unique_existing_dirs(dirs)
+
+
+def _otool_libraries(path: Path) -> list[str]:
+    try:
+        out = subprocess.check_output(
+            ["otool", "-L", str(path)],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return []
+
+    lines = [ln.rstrip() for ln in out.splitlines()]
+    if len(lines) <= 1:
+        return []
+
+    deps: list[str] = []
+    for ln in lines[1:]:
+        s = ln.strip()
+        if not s:
+            continue
+        dep = s.split(" (", 1)[0].strip()
+        if dep:
+            deps.append(dep)
+    return deps
+
+
+def _is_macos_system_lib(dep: str) -> bool:
+    return dep.startswith("/usr/lib/") or dep.startswith("/System/Library/")
+
+
+def _collect_macos_openblas_dylibs() -> list[Path]:
+    if sys.platform != "darwin":
+        return []
+
+    if str(os.environ.get("JANUSX_BUNDLE_OPENBLAS_DYLIB", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return []
+
+    strict = str(os.environ.get("JANUSX_STRICT_OPENBLAS_BUNDLE", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    prefer = [
+        "libopenblas.dylib",
+        "libopenblas.0.dylib",
+    ]
+    primary: Path | None = None
+    source_dir: Path | None = None
+    for d in _macos_runtime_dirs():
+        picked: list[Path] = []
+        for name in prefer:
+            p = d / name
+            if p.is_file():
+                picked.append(p)
+        if len(picked) == 0:
+            picked.extend(sorted(p for p in d.glob("libopenblas*.dylib") if p.is_file()))
+        if len(picked) > 0:
+            primary = picked[0]
+            source_dir = d
+            break
+
+    if primary is None or source_dir is None:
+        if strict:
+            raise RuntimeError(
+                "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but no macOS OpenBLAS dylib was found. "
+                "Set OPENBLAS_LIB_DIR to a directory containing libopenblas*.dylib."
+            )
+        return []
+
+    # Keep all OpenBLAS aliases from the selected source directory so loader
+    # can resolve both libopenblas.dylib and libopenblas.0.dylib references.
+    seed: list[Path] = []
+    seen_seed: set[str] = set()
+    for p in sorted(source_dir.glob("libopenblas*.dylib")):
+        if not p.is_file():
+            continue
+        key = p.name.lower()
+        if key in seen_seed:
+            continue
+        seen_seed.add(key)
+        seed.append(p.resolve())
+    if len(seed) == 0:
+        seed.append(primary.resolve())
+
+    # Recursive dependency closure for non-system absolute dylibs.
+    picked: dict[str, Path] = {}
+    queue: list[Path] = list(seed)
+    while len(queue) > 0:
+        cur = queue.pop(0)
+        key = cur.name.lower()
+        if key in picked:
+            continue
+        picked[key] = cur
+        for dep in _otool_libraries(cur):
+            if dep.startswith("@"):
+                continue
+            if not dep.startswith("/"):
+                continue
+            if _is_macos_system_lib(dep):
+                continue
+            dep_path = Path(dep)
+            if dep_path.is_file() and dep_path.name.lower() not in picked:
+                queue.append(dep_path)
+    return sorted(picked.values(), key=lambda p: p.name.lower())
+
+
+def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]) -> None:
+    if sys.platform != "darwin" or len(rel_paths) == 0:
+        return
+
+    dylibs: list[Path] = []
+    by_name: dict[str, Path] = {}
+    for rel in rel_paths:
+        p = extract_root / rel
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".dylib":
+            continue
+        dylibs.append(p)
+        by_name[p.name] = p
+
+    if len(dylibs) == 0:
+        return
+
+    def _run_install_name_tool(args: list[str]) -> None:
+        try:
+            subprocess.run(
+                ["install_name_tool", *args],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            out = str(exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(
+                f"install_name_tool failed: {' '.join(args)}; {out}"
+            ) from exc
+
+    # Normalize dylib id so dependencies can resolve from wheel-local directory.
+    for lib in dylibs:
+        _run_install_name_tool(["-id", f"@loader_path/{lib.name}", str(lib)])
+
+    # Rewrite intra-bundle references to @loader_path/<name>.
+    for lib in dylibs:
+        for dep in _otool_libraries(lib):
+            dep_name = Path(dep).name
+            if dep_name not in by_name:
+                continue
+            replacement = f"@loader_path/{dep_name}"
+            if dep == replacement:
+                continue
+            _run_install_name_tool(["-change", dep, replacement, str(lib)])
+
+
 def _inject_artifacts_into_wheel(
     wheel_path: Path,
     artifacts: list[tuple[Path, Path]],
@@ -300,6 +494,14 @@ def _inject_artifacts_into_wheel(
             target = root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, target)
+
+        # For macOS wheel-local dylibs, fix install names to avoid dependence
+        # on host-specific Homebrew/Conda absolute paths.
+        mac_rel = [
+            rel for _src, rel in artifacts
+            if rel.as_posix().startswith("janusx.libs/")
+        ]
+        _rewrite_macos_dylib_install_names(root, mac_rel)
 
         _rewrite_record(root)
 
@@ -369,6 +571,7 @@ def build_wheel(
 ) -> str:
     ext_path = _build_kmc_extension_for_wheel()
     win_dlls = _collect_windows_runtime_dlls()
+    mac_dylibs = _collect_macos_openblas_dylibs()
     if sys.platform.startswith("win") and _env_flag("JANUSX_REQUIRE_OPENBLAS"):
         has_openblas_dll = any("openblas" in p.name.lower() for p in win_dlls)
         if not has_openblas_dll:
@@ -411,6 +614,8 @@ def build_wheel(
         artifacts.append((ext_path, Path("janusx") / ext_path.name))
     for dll in win_dlls:
         artifacts.append((dll, Path("janusx") / dll.name))
+    for dylib in mac_dylibs:
+        artifacts.append((dylib, Path("janusx.libs") / dylib.name))
 
     if len(artifacts) > 0:
         wheel_path = Path(wheel_directory).resolve() / wheel_name
@@ -420,4 +625,7 @@ def build_wheel(
         if win_dlls:
             joined = ", ".join(sorted(d.name for d in win_dlls))
             print(f"[build-backend] injected runtime DLLs: {joined}", flush=True)
+        if mac_dylibs:
+            joined = ", ".join(sorted(d.name for d in mac_dylibs))
+            print(f"[build-backend] injected macOS dylibs: {joined}", flush=True)
     return wheel_name

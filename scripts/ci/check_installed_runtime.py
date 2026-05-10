@@ -11,7 +11,10 @@ def _find_bundled_openblas() -> str:
     import janusx.janusx as jx
 
     root = os.path.dirname(jx.__file__)
-    cands = sorted(glob.glob(os.path.join(os.path.dirname(root), "janusx.libs", "libopenblas*.so*")))
+    cands = sorted(
+        glob.glob(os.path.join(os.path.dirname(root), "janusx.libs", "libopenblas*.so*"))
+        + glob.glob(os.path.join(os.path.dirname(root), "janusx.libs", "libopenblas*.dylib"))
+    )
     if not cands:
         raise RuntimeError("bundled libopenblas not found in janusx.libs")
     return cands[0]

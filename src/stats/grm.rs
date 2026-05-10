@@ -2038,7 +2038,8 @@ pub fn grm_stream_bed_f32<'py>(
             let t = s.trim().to_ascii_lowercase();
             !matches!(t.as_str(), "0" | "false" | "no" | "off")
         })
-        .unwrap_or(true);
+        // Default to one-stage true streaming unless explicitly enabled.
+        .unwrap_or(false);
     let stream_prestat_core = stream_prestat_core_requested && !it.is_windowed();
     let stage_timing = env_truthy("JX_GRM_STREAM_STAGE_TIMING");
 

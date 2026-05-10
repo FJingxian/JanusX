@@ -1473,12 +1473,15 @@ fn matmul_rowmajor_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: 
     if m == 0 || k == 0 || n == 0 {
         return;
     }
+    debug_assert!(a.len() >= m.saturating_mul(k));
+    debug_assert!(b.len() >= k.saturating_mul(n));
+    debug_assert!(out.len() >= m.saturating_mul(n));
     // C(m, n) = A(m, k) * B(k, n), all row-major contiguous.
     unsafe {
         sgemm(
             m,
-            n,
             k,
+            n,
             1.0,
             a.as_ptr(),
             k as isize,
@@ -1535,14 +1538,17 @@ fn matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
     if m == 0 || k == 0 || n == 0 {
         return;
     }
+    debug_assert!(a.len() >= m.saturating_mul(k));
+    debug_assert!(b_rowmajor_nk.len() >= n.saturating_mul(k));
+    debug_assert!(out.len() >= m.saturating_mul(n));
     // C(m, n) = A(m, k) * B^T(k, n)
     // `b_rowmajor_nk` stores B(n, k) row-major. Expose B^T by setting
     // B strides to: row_stride=1, col_stride=k.
     unsafe {
         sgemm(
             m,
-            n,
             k,
+            n,
             1.0,
             a.as_ptr(),
             k as isize,

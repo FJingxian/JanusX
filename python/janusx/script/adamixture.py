@@ -589,10 +589,10 @@ def _parse_k_spec(k_spec: str) -> list[int]:
     """
     Parse K specification:
       - single value: "8"
-      - inclusive range: "2..10" or "2:10"
-      - inclusive range with step: "2..10..3", "2:10:3", or "2..10:3"
-      - list: "2,5,8"
-      - mixed: "2..10:3,5,8"
+      - inclusive range: "1..10" or "1:10"
+      - inclusive range with step: "1..10..3", "1:10:3", or "1..10:3"
+      - list: "1,5,8"
+      - mixed: "1..10:3,5,8"
     """
     raw = str(k_spec or "").strip()
     if raw == "":
@@ -600,7 +600,7 @@ def _parse_k_spec(k_spec: str) -> list[int]:
     if ";" in raw:
         raise ValueError(
             "Semicolon-separated K list is not supported for shell compatibility. "
-            "Use comma-separated form, e.g. -k 2,5,8."
+            "Use comma-separated form, e.g. -k 1,5,8."
         )
 
     tokens = []
@@ -646,8 +646,8 @@ def _parse_k_spec(k_spec: str) -> list[int]:
     deduped: list[int] = []
     seen = set()
     for v in values:
-        if int(v) < 2:
-            raise ValueError(f"K must be >= 2, got {v}.")
+        if int(v) < 1:
+            raise ValueError(f"K must be >= 1, got {v}.")
         if int(v) not in seen:
             deduped.append(int(v))
             seen.add(int(v))
@@ -1029,14 +1029,14 @@ def _build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
             "jx adamixture -bfile data/geno -k 8 -o out -prefix cohort",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2..10 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2..10..3 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2,5,8 -t 16",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2..10 -cv",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2..10 -cv 5",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -t 16",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1..10..3 -t 16",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1,3,5 -t 16",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv 5",
             "jx adamixture -vcf data/geno.vcf.gz -k 6 -tag sample1,sample2",
             "jx adamixture -vcf data/geno.vcf.gz -k 6 --tag tag_samples.txt",
-            "jx adamixture -vcf data/geno.vcf.gz -k 2..10 -cv --k-warmstart",
+            "jx adamixture -vcf data/geno.vcf.gz -k 1..10 -cv --k-warmstart",
         ]),
     )
 
@@ -1058,8 +1058,8 @@ def _build_parser() -> CliArgumentParser:
         type=str,
         required=True,
         help=(
-            "K spec: single (8), range (2..10 or 2:10), "
-            "stepped range (2..10..3, 2:10:3, or 2..10:3), or list (2,5,8)."
+            "K spec: single (8), range (1..10 or 1:10), "
+            "stepped range (1..10..3, 1:10:3, or 1..10:3), or list (1,5,8)."
         ),
     )
     input_output = parser.add_argument_group("Input/Output Arguments")

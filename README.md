@@ -24,7 +24,7 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 **Main capabilities**:
 
-- GWAS: `LM`, `LMM`, `FastLMM`, `LRLMM`, `FarmCPU`
+- GWAS: `LM`, `LMM`, `FastLMM`, `FarmCPU`
 - Genomic selection: `GBLUP`, `adBLUP`, `rrBLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
 - Streaming genotype IO for VCF/HMP/PLINK/TXT/NPY
 - Post-analysis workflows: `postgwas`, `postgarfield`, `postbsa`

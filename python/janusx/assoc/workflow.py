@@ -3781,10 +3781,10 @@ def _run_gwas_pipeline(
             f"using {int(args.thread)}."
         )
     apply_outer_thread_cap(int(args.thread))
-    maybe_warn_non_openblas(
-        logger=logger,
-        strict=require_openblas_by_default(),
-    )
+    # maybe_warn_non_openblas(
+    #     logger=logger,
+    #     strict=require_openblas_by_default(),
+    # )
     gwas_summary_rows: list[dict[str, object]] = []
     saved_result_paths: list[str] = []
     ordered_result_paths: list[str] = []

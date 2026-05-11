@@ -46,6 +46,17 @@ def _normalize_tag(tag: str) -> str:
     return t
 
 
+def _rust_semver_from_python_version(version: str) -> str:
+    """
+    Convert Python package version to a Rust/Cargo-safe version.
+
+    We keep Cargo versions stable for TestPyPI dev uploads:
+      - 1.0.24.dev1 -> 1.0.24
+      - 1.0.24      -> 1.0.24
+    """
+    return re.sub(r"\.dev\d+$", "", version)
+
+
 def _replace_section_version(path: Path, section: str, new_version: str) -> bool:
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     in_section = False
@@ -118,16 +129,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     version = _normalize_tag(args[0])
+    rust_version = _rust_semver_from_python_version(version)
     build_date = _git_head_date()
     _replace_section_version(PYPROJECT, "project", version)
-    _replace_section_version(CARGO, "package", version)
-    _replace_section_version(LAUNCHER_CARGO, "package", version)
+    _replace_section_version(CARGO, "package", rust_version)
+    _replace_section_version(LAUNCHER_CARGO, "package", rust_version)
     _replace_build_date_fallback(JANUSX_CLI, build_date)
     _replace_recipe_version(BIOCONDA_META, version)
     _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)
     print(
         "Synchronized version/build date:\n"
-        f"  version    = {version}\n"
+        f"  py_version = {version}\n"
+        f"  rs_version = {rust_version}\n"
         f"  build_date = {build_date}\n"
         f"  bioconda   = {BIOCONDA_META.relative_to(ROOT)}\n"
         f"  localcheck = {BIOCONDA_LOCALCHECK_META.relative_to(ROOT)}"

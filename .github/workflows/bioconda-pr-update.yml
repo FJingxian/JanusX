@@ -85,26 +85,6 @@ jobs:
           echo "BIOCONDA_BRANCH=update-janusx-v${VERSION}" >> "$GITHUB_ENV"
           echo "BIOCONDA_FORK=${{ inputs.bioconda_fork }}" >> "$GITHUB_ENV"
 
-      - name: Wait for PyPI sdist
-        if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, time, urllib.request, sys
-          version = os.environ["VERSION"]
-          url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-          for _ in range(40):
-              try:
-                  with urllib.request.urlopen(url, timeout=20) as r:
-                      if r.status == 200:
-                          print("Found:", url)
-                          sys.exit(0)
-              except Exception:
-                  pass
-              time.sleep(15)
-          raise SystemExit("PyPI sdist not available yet")
-          PY
-
       - name: Checkout bioconda fork
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}
         shell: bash
@@ -147,7 +127,12 @@ jobs:
 
           version = os.environ["VERSION"]
           source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-          data = urllib.request.urlopen(source_url, timeout=120).read()
+          try:
+              data = urllib.request.urlopen(source_url, timeout=120).read()
+          except Exception as exc:
+              raise SystemExit(
+                  f"Failed to fetch PyPI sdist once (no polling): {source_url}; {exc}"
+              ) from exc
           sha = hashlib.sha256(data).hexdigest()
           md5 = hashlib.md5(data).hexdigest()
 

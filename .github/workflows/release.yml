@@ -249,9 +249,94 @@ jobs:
           name: installer-${{ matrix.asset_suffix }}
           path: ${{ env.PACKAGED_FILE }}
 
+  resolve-package-version:
+    name: Resolve package version
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.resolve.outputs.package_version }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
+      is_dev: ${{ steps.resolve.outputs.is_dev }}
+    steps:
+      - name: Resolve package version for TestPyPI/PyPI
+        id: resolve
+        shell: bash
+        env:
+          RAW_REF: ${{ github.event.inputs.ref || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_PYPI: ${{ github.event.inputs.publish_pypi }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          raw_ref = (os.environ.get("RAW_REF") or "").strip()
+          event_name = (os.environ.get("EVENT_NAME") or "").strip()
+          publish_pypi = (os.environ.get("PUBLISH_PYPI") or "").strip().lower() == "true"
+          out = os.environ["GITHUB_OUTPUT"]
+
+          ref = raw_ref
+          if ref.startswith("refs/tags/"):
+              ref = ref[len("refs/tags/") :]
+
+          if not ref.startswith("v"):
+              with open(out, "a", encoding="utf-8") as f:
+                  f.write("base_version=\n")
+                  f.write("package_version=\n")
+                  f.write("is_dev=false\n")
+              print(f"[version-resolve] non-tag ref, skip sync: {raw_ref!r}")
+              raise SystemExit(0)
+
+          base_version = ref[1:]
+          if base_version == "":
+              raise SystemExit(f"Invalid empty version from ref: {raw_ref!r}")
+          if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-+]*", base_version):
+              raise SystemExit(f"Unsupported version format from ref: {raw_ref!r}")
+
+          use_dev_suffix = not (event_name == "workflow_dispatch" and publish_pypi)
+          package_version = base_version
+          is_dev = False
+
+          if use_dev_suffix:
+              def version_exists(ver: str) -> bool:
+                  url = f"https://test.pypi.org/pypi/janusx/{ver}/json"
+                  try:
+                      with urllib.request.urlopen(url, timeout=20) as r:
+                          return getattr(r, "status", 200) == 200
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          return False
+                      raise
+                  except Exception:
+                      raise
+
+              try:
+                  if version_exists(base_version):
+                      next_dev = 1
+                      while next_dev <= 9999 and version_exists(f"{base_version}.dev{next_dev}"):
+                          next_dev += 1
+                      package_version = f"{base_version}.dev{next_dev}"
+                      is_dev = True
+              except Exception as exc:
+                  raise SystemExit(f"Failed to query TestPyPI version index: {exc}")
+
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"base_version={base_version}\n")
+              f.write(f"package_version={package_version}\n")
+              f.write(f"is_dev={'true' if is_dev else 'false'}\n")
+          print(
+              f"[version-resolve] base={base_version} package={package_version} "
+              f"use_dev_suffix={use_dev_suffix}"
+          )
+          PY
+
   build-wheels:
     name: Build wheels (${{ matrix.label }})
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
+    needs:
+      - resolve-package-version
     runs-on: ${{ matrix.runner }}
     env:
       JANUSX_REQUIRE_OPENBLAS: ${{ matrix.require_openblas }}
@@ -351,20 +436,18 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Sync version from tag
+      - name: Sync version for package build
         shell: bash
         run: |
-          REF="${{ github.event.inputs.ref || github.ref_name }}"
-          if [[ "$REF" == refs/tags/* ]]; then
-            REF="${REF#refs/tags/}"
-          fi
-          if [[ ! "$REF" =~ ^v ]]; then
-            echo "Skip sync_version_from_tag.py (non-tag ref: $REF)"
+          VERSION="${{ needs.resolve-package-version.outputs.package_version }}"
+          if [[ -z "$VERSION" ]]; then
+            echo "Skip sync_version_from_tag.py (non-tag ref)"
             exit 0
           fi
+          echo "Using package version: $VERSION"
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          $PY scripts/sync_version_from_tag.py "$REF"
+          $PY scripts/sync_version_from_tag.py "$VERSION"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -743,6 +826,8 @@ jobs:
   build-sdist:
     name: Build sdist
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true' }}
+    needs:
+      - resolve-package-version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -750,20 +835,18 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Sync version from tag
+      - name: Sync version for package build
         shell: bash
         run: |
-          REF="${{ github.event.inputs.ref || github.ref_name }}"
-          if [[ "$REF" == refs/tags/* ]]; then
-            REF="${REF#refs/tags/}"
-          fi
-          if [[ ! "$REF" =~ ^v ]]; then
-            echo "Skip sync_version_from_tag.py (non-tag ref: $REF)"
+          VERSION="${{ needs.resolve-package-version.outputs.package_version }}"
+          if [[ -z "$VERSION" ]]; then
+            echo "Skip sync_version_from_tag.py (non-tag ref)"
             exit 0
           fi
+          echo "Using package version: $VERSION"
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          $PY scripts/sync_version_from_tag.py "$REF"
+          $PY scripts/sync_version_from_tag.py "$VERSION"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -880,12 +963,12 @@ jobs:
 
   update-bioconda-pr:
     name: Update Bioconda PR
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.installers_only != 'true') && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.installers_only != 'true' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.release_tag, 'v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
     needs:
-      - publish
+      - publish-pypi
     uses: ./.github/workflows/bioconda-pr-update.yml
     with:
-      release_tag: ${{ github.event.inputs.ref || github.ref_name }}
+      release_tag: ${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}
       source_ref: ${{ github.event.inputs.ref || github.ref }}
       bioconda_fork: FJingxian/bioconda-recipes
     secrets: inherit

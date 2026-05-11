@@ -20,6 +20,8 @@ mod grm;
 pub(crate) mod gs_native;
 #[path = "stats/gwas_unified.rs"]
 mod gwas_unified;
+#[path = "stats/he.rs"]
+mod he;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lmm.rs"]
@@ -106,10 +108,11 @@ use blas::{rust_blas_get_num_threads, rust_blas_set_num_threads, rust_sgemm_back
 use bsa::preprocess_bsa;
 use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace};
 use gfreader::{
-    bed_filter_to_plink_rust, count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block,
-    load_bed_2bit_packed, load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed,
-    BedChunkReader, HmpChunkReader, HmpStreamWriter, PlinkStreamWriter, SiteInfo, TxtChunkReader,
-    VcfChunkReader, VcfStreamWriter,
+    bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
+    count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
+    load_bed_u8_matrix, load_site_info, prepare_bed_2bit_packed, BedChunkReader, BedMmapReader,
+    GwasAssocTsvWriter, HmpChunkReader, HmpStreamWriter, NpyMmapReader, PlinkStreamWriter,
+    SiteInfo, TxtChunkReader, VcfChunkReader, VcfStreamWriter,
 };
 use glm::{
     glm_ixx_from_x_qr, glmf32, glmf32_full, glmf32_packed, glmf32_packed_assoc,
@@ -128,6 +131,7 @@ use gwas_unified::{
     gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
+use he::he_pcg_bed;
 use ld::{
     bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority, bed_prune_to_plink_rust,
     packed_prune_kernel_stats,
@@ -159,6 +163,8 @@ use tree::{
     geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
     nj_newick_from_distance_matrix,
 };
+
+pub use he::{he_variance_components_packed, HePcgResult};
 // ============================================================
 // PyO3 module exports
 // ============================================================
@@ -166,12 +172,15 @@ use tree::{
 #[pymodule]
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<BedChunkReader>()?;
+    m.add_class::<BedMmapReader>()?;
+    m.add_class::<NpyMmapReader>()?;
     m.add_class::<VcfChunkReader>()?;
     m.add_class::<HmpChunkReader>()?;
     m.add_class::<TxtChunkReader>()?;
     m.add_class::<PlinkStreamWriter>()?;
     m.add_class::<VcfStreamWriter>()?;
     m.add_class::<HmpStreamWriter>()?;
+    m.add_class::<GwasAssocTsvWriter>()?;
     m.add_class::<SimChunkGenerator>()?;
     m.add_class::<SimEngine>()?;
     m.add_class::<SimTraitAccumulator>()?;
@@ -233,9 +242,12 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_ztz_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_kernels_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_filter_stream_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_filter_to_plink_rust, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_mmap_filter_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;

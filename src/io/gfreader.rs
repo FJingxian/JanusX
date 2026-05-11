@@ -2,13 +2,20 @@ use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
 
+use memmap2::{Advice, Mmap};
 use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use rayon::prelude::*;
+#[cfg(target_arch = "x86")]
+use std::arch::x86 as x86_avx2;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64 as x86_avx2;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+use std::sync::OnceLock;
 
 use crate::bitwise::and_popcount;
 use crate::gfcore as core;
@@ -50,6 +57,185 @@ impl SiteInfo {
             ref_allele,
             alt_allele,
         }
+    }
+}
+
+#[inline]
+fn transform_alleles_by_model_local(
+    ref_allele: &str,
+    alt_allele: &str,
+    model_key: &str,
+) -> (String, String) {
+    match model_key {
+        "dom" => (
+            format!("{ref_allele}{ref_allele}"),
+            format!("{ref_allele}{alt_allele}/{alt_allele}{alt_allele}"),
+        ),
+        "rec" => (
+            format!("{ref_allele}{alt_allele}/{ref_allele}{ref_allele}"),
+            format!("{alt_allele}{alt_allele}"),
+        ),
+        "het" => (
+            format!("{ref_allele}{ref_allele}/{alt_allele}{alt_allele}"),
+            format!("{ref_allele}{alt_allele}"),
+        ),
+        _ => (ref_allele.to_string(), alt_allele.to_string()),
+    }
+}
+
+#[pyclass]
+pub struct GwasAssocTsvWriter {
+    model_key: String,
+    with_plrt: Option<bool>,
+    rows_written: usize,
+    writer: Option<BufWriter<File>>,
+}
+
+#[pymethods]
+impl GwasAssocTsvWriter {
+    #[new]
+    #[pyo3(signature = (path, genetic_model="add"))]
+    fn new(path: String, genetic_model: &str) -> PyResult<Self> {
+        let model_key = genetic_model.trim().to_ascii_lowercase();
+        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+            return Err(PyValueError::new_err(
+                "genetic_model must be one of: add, dom, rec, het",
+            ));
+        }
+        let out =
+            File::create(&path).map_err(|e| PyIOError::new_err(format!("create {path}: {e}")))?;
+        let writer = BufWriter::with_capacity(64 * 1024 * 1024, out);
+        Ok(Self {
+            model_key,
+            with_plrt: None,
+            rows_written: 0,
+            writer: Some(writer),
+        })
+    }
+
+    fn write_chunk(
+        &mut self,
+        sites: Vec<SiteInfo>,
+        maf: PyReadonlyArray1<'_, f32>,
+        results: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<usize> {
+        if sites.is_empty() {
+            return Ok(0);
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
+
+        let maf_arr = maf.as_slice()?;
+        if maf_arr.len() != sites.len() {
+            return Err(PyValueError::new_err(format!(
+                "maf length mismatch: maf={}, sites={}",
+                maf_arr.len(),
+                sites.len()
+            )));
+        }
+
+        let res = results.as_array();
+        let shape = res.shape();
+        if shape.len() != 2 {
+            return Err(PyValueError::new_err("results must be 2D"));
+        }
+        if shape[0] != sites.len() {
+            return Err(PyValueError::new_err(format!(
+                "results row mismatch: results={}, sites={}",
+                shape[0],
+                sites.len()
+            )));
+        }
+        if shape[1] < 3 {
+            return Err(PyValueError::new_err(format!(
+                "results must have at least 3 columns, got {}",
+                shape[1]
+            )));
+        }
+        let has_plrt = shape[1] > 3;
+        match self.with_plrt {
+            None => {
+                self.with_plrt = Some(has_plrt);
+                if has_plrt {
+                    writer
+                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\tplrt\n")
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                } else {
+                    writer
+                        .write_all(b"chrom\tpos\tallele0\tallele1\tmaf\tbeta\tse\tpwald\n")
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                }
+            }
+            Some(prev) => {
+                if prev != has_plrt {
+                    return Err(PyValueError::new_err(
+                        "inconsistent results columns across chunks",
+                    ));
+                }
+            }
+        }
+
+        for i in 0..sites.len() {
+            let s = &sites[i];
+            let (a0, a1) =
+                transform_alleles_by_model_local(&s.ref_allele, &s.alt_allele, &self.model_key);
+            if has_plrt {
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}\t{:.4e}",
+                    s.chrom,
+                    s.pos,
+                    a0,
+                    a1,
+                    maf_arr[i],
+                    res[[i, 0]],
+                    res[[i, 1]],
+                    res[[i, 2]],
+                    res[[i, 3]]
+                )
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            } else {
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4e}",
+                    s.chrom,
+                    s.pos,
+                    a0,
+                    a1,
+                    maf_arr[i],
+                    res[[i, 0]],
+                    res[[i, 1]],
+                    res[[i, 2]],
+                )
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+        }
+        self.rows_written = self.rows_written.saturating_add(sites.len());
+        Ok(sites.len())
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("writer is closed"))?;
+        writer
+            .flush()
+            .map_err(|e| PyIOError::new_err(e.to_string()))
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        if let Some(mut w) = self.writer.take() {
+            w.flush().map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn rows_written(&self) -> usize {
+        self.rows_written
     }
 }
 
@@ -214,6 +400,98 @@ fn normalize_chr_key_local(chrom: &str) -> String {
     s.trim().to_ascii_uppercase()
 }
 
+fn parse_npy_shape_local(header: &str) -> Result<(usize, usize), String> {
+    let shape_key_pos = header
+        .find("'shape'")
+        .or_else(|| header.find("\"shape\""))
+        .ok_or_else(|| "NPY header missing shape field".to_string())?;
+    let after = &header[shape_key_pos..];
+    let open = after
+        .find('(')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let close = after[open + 1..]
+        .find(')')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let inside = &after[open + 1..open + 1 + close];
+
+    let dims: Vec<usize> = inside
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| format!("invalid NPY shape dimension: {s}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match dims.as_slice() {
+        [rows] => Ok((*rows, 1)),
+        [rows, cols] => Ok((*rows, *cols)),
+        _ => Err(format!("unsupported NPY shape rank: {:?}", dims)),
+    }
+}
+
+fn parse_npy_f32_header_local(bytes: &[u8]) -> Result<(usize, usize, usize), String> {
+    if bytes.len() < 10 {
+        return Err("NPY file too small".into());
+    }
+    if &bytes[0..6] != b"\x93NUMPY" {
+        return Err("invalid NPY magic".into());
+    }
+
+    let major = bytes[6];
+    let minor = bytes[7];
+    let (header_len, header_start) = match major {
+        1 => {
+            let len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+            (len, 10usize)
+        }
+        2 | 3 => {
+            if bytes.len() < 12 {
+                return Err("NPY file too small for v2/v3 header".into());
+            }
+            let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+            (len, 12usize)
+        }
+        _ => return Err(format!("unsupported NPY version: {major}.{minor}")),
+    };
+
+    let header_end = header_start
+        .checked_add(header_len)
+        .ok_or_else(|| "NPY header overflow".to_string())?;
+    if header_end > bytes.len() {
+        return Err("NPY header exceeds file size".into());
+    }
+
+    let header =
+        std::str::from_utf8(&bytes[header_start..header_end]).map_err(|e| e.to_string())?;
+    if !header.contains("descr': '<f4'")
+        && !header.contains("descr': '|f4'")
+        && !header.contains("descr\": \"<f4\"")
+        && !header.contains("descr\": \"|f4\"")
+    {
+        return Err("NPY dtype is not float32".into());
+    }
+    if header.contains("fortran_order': True") || header.contains("fortran_order\": true") {
+        return Err("fortran_order=True NPY is not supported".into());
+    }
+
+    let (rows, cols) = parse_npy_shape_local(header)?;
+    let data_offset = header_end;
+    let data_bytes = rows
+        .checked_mul(cols)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| "NPY data size overflow".to_string())?;
+    let expected_end = data_offset
+        .checked_add(data_bytes)
+        .ok_or_else(|| "NPY file size overflow".to_string())?;
+    if expected_end > bytes.len() {
+        return Err("NPY data truncated".into());
+    }
+
+    Ok((rows, cols, data_offset))
+}
+
 #[derive(Default, Clone)]
 struct SiteFilterExpr {
     site_set: Option<HashSet<(String, i32)>>,
@@ -366,37 +644,86 @@ fn sample_indices_are_identity(indices: &[usize]) -> bool {
 
 #[inline]
 fn write_bim_site_line(w: &mut BufWriter<File>, site: &core::SiteInfo) -> Result<(), String> {
-    let snp_id = format!("{}_{}", site.chrom, site.pos);
+    write_bim_site_line_with_flip(w, site, false)
+}
+
+#[inline]
+fn write_bim_site_line_with_flip(
+    w: &mut BufWriter<File>,
+    site: &core::SiteInfo,
+    flip: bool,
+) -> Result<(), String> {
+    let (ref_allele, alt_allele) = if flip {
+        (&site.alt_allele, &site.ref_allele)
+    } else {
+        (&site.ref_allele, &site.alt_allele)
+    };
     writeln!(
         w,
-        "{}\t{}\t0\t{}\t{}\t{}",
-        site.chrom, snp_id, site.pos, site.ref_allele, site.alt_allele
+        "{}\t{}_{}\t0\t{}\t{}\t{}",
+        site.chrom, site.chrom, site.pos, site.pos, ref_allele, alt_allele
     )
     .map_err(|e| e.to_string())
 }
 
 #[inline]
-fn flip_bed_code(code: u8) -> u8 {
-    match code & 0b11 {
-        0b00 => 0b11,
-        0b11 => 0b00,
-        v => v,
+fn flip_bed_byte_fast(byte: u8) -> u8 {
+    let lo = byte & 0x55u8;
+    let hi = (byte >> 1) & 0x55u8;
+    let eq = (!(lo ^ hi)) & 0x55u8;
+    byte ^ (eq | (eq << 1))
+}
+
+#[inline]
+fn flip_bed_word64(word: u64) -> u64 {
+    const M55: u64 = 0x5555_5555_5555_5555_u64;
+    let lo = word & M55;
+    let hi = (word >> 1) & M55;
+    let eq = (!(lo ^ hi)) & M55;
+    word ^ (eq | (eq << 1))
+}
+
+#[inline]
+fn flip_bed_bytes_into(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let mut i = 0usize;
+    let n = src.len();
+    while i + 8 <= n {
+        // SAFETY: i + 8 <= n ensures the unaligned u64 load stays within src bounds.
+        let word = unsafe { std::ptr::read_unaligned(src.as_ptr().add(i) as *const u64) };
+        let flipped = flip_bed_word64(u64::from_le(word));
+        // SAFETY: i + 8 <= n and src.len() == dst.len() ensure destination is in-bounds.
+        unsafe {
+            std::ptr::write_unaligned(dst.as_mut_ptr().add(i) as *mut u64, flipped.to_le());
+        }
+        i += 8;
+    }
+    while i < n {
+        dst[i] = flip_bed_byte_fast(src[i]);
+        i += 1;
     }
 }
 
-fn build_bed_flip_byte_table() -> [u8; 256] {
-    let mut table = [0u8; 256];
-    for b in 0u16..=255u16 {
-        let byte = b as u8;
-        let mut out = 0u8;
-        for k in 0..4usize {
-            let code = (byte >> (k * 2)) & 0b11;
-            let flip = flip_bed_code(code);
-            out |= flip << (k * 2);
+#[inline]
+fn flip_bed_bytes_in_place(bytes: &mut [u8]) {
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i + 8 <= n {
+        // SAFETY: i + 8 <= n ensures the unaligned u64 load/store stays within bounds.
+        let ptr = unsafe { bytes.as_mut_ptr().add(i) };
+        // SAFETY: ptr points to a valid contiguous 8-byte region of bytes.
+        let word = unsafe { std::ptr::read_unaligned(ptr as *const u64) };
+        let flipped = flip_bed_word64(u64::from_le(word));
+        // SAFETY: ptr points to the same valid contiguous 8-byte region.
+        unsafe {
+            std::ptr::write_unaligned(ptr as *mut u64, flipped.to_le());
         }
-        table[b as usize] = out;
+        i += 8;
     }
-    table
+    while i < n {
+        bytes[i] = flip_bed_byte_fast(bytes[i]);
+        i += 1;
+    }
 }
 
 fn build_bed_low_high_nibble_tables() -> ([u8; 256], [u8; 256]) {
@@ -418,58 +745,322 @@ fn build_bed_low_high_nibble_tables() -> ([u8; 256], [u8; 256]) {
     (low, high)
 }
 
-fn build_bed_count_byte_table() -> [(u8, u8, u8); 256] {
-    // For each BED byte (4 genotypes), return:
-    //   (missing_count, het_count, hom_alt_count)
-    let mut table = [(0u8, 0u8, 0u8); 256];
-    for b in 0u16..=255u16 {
-        let byte = b as u8;
-        let mut missing = 0u8;
-        let mut het = 0u8;
-        let mut hom_alt = 0u8;
-        for k in 0..4usize {
-            let code = (byte >> (k * 2)) & 0b11;
-            match code {
-                0b01 => missing = missing.saturating_add(1),
-                0b10 => het = het.saturating_add(1),
-                0b11 => hom_alt = hom_alt.saturating_add(1),
-                _ => {}
-            }
-        }
-        table[b as usize] = (missing, het, hom_alt);
-    }
-    table
-}
-
 #[inline]
-fn count_packed_row_counts(
-    row: &[u8],
-    n_samples: usize,
-    byte_counts: &[(u8, u8, u8); 256],
-) -> (usize, usize, usize) {
-    let full_bytes = n_samples / 4;
-    let rem_pairs = n_samples & 3;
+fn count_packed_row_full_bytes_popcnt(row_full: &[u8]) -> (usize, usize, usize) {
     let mut missing = 0usize;
     let mut het = 0usize;
     let mut hom_alt = 0usize;
+    let m55 = 0x5555_5555_5555_5555_u64;
 
-    for &b in row.iter().take(full_bytes) {
-        let (m, h, ha) = byte_counts[b as usize];
-        missing = missing.saturating_add(m as usize);
-        het = het.saturating_add(h as usize);
-        hom_alt = hom_alt.saturating_add(ha as usize);
+    let mut chunks = row_full.chunks_exact(8);
+    for chunk in &mut chunks {
+        // SAFETY: chunks_exact(8) guarantees chunk length is exactly 8 bytes.
+        let word = unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const u64) };
+        let word = u64::from_le(word);
+        let odd = (word >> 1) & m55;
+        let even = word & m55;
+        missing = missing.saturating_add(((!odd) & even).count_ones() as usize);
+        het = het.saturating_add((odd & (!even)).count_ones() as usize);
+        hom_alt = hom_alt.saturating_add((odd & even).count_ones() as usize);
     }
-    if rem_pairs > 0 {
-        let b = row[full_bytes];
-        for k in 0..rem_pairs {
-            let code = (b >> (k * 2)) & 0b11;
-            match code {
-                0b01 => missing = missing.saturating_add(1),
-                0b10 => het = het.saturating_add(1),
-                0b11 => hom_alt = hom_alt.saturating_add(1),
-                _ => {}
+    for &b in chunks.remainder().iter() {
+        let word = b as u64;
+        let odd = (word >> 1) & 0x55_u64;
+        let even = word & 0x55_u64;
+        missing = missing.saturating_add(((!odd) & even).count_ones() as usize);
+        het = het.saturating_add((odd & (!even)).count_ones() as usize);
+        hom_alt = hom_alt.saturating_add((odd & even).count_ones() as usize);
+    }
+    (missing, het, hom_alt)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+const BED_COUNT_SIMD_MIN_BYTES: usize = 64;
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn bed_neon_runtime_available() -> bool {
+    static NEON: OnceLock<bool> = OnceLock::new();
+    *NEON.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn popcount_u8x16_neon(v: std::arch::aarch64::uint8x16_t) -> u64 {
+    use std::arch::aarch64::*;
+    let cnt8 = vcntq_u8(v);
+    let sum16 = vpaddlq_u8(cnt8);
+    let sum32 = vpaddlq_u16(sum16);
+    let sum64 = vpaddlq_u32(sum32);
+    vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn count_packed_row_full_bytes_neon(row_full: &[u8]) -> (usize, usize, usize) {
+    use std::arch::aarch64::*;
+    let even_mask = vdupq_n_u8(0x55u8);
+    let mut lo_sum = 0u64;
+    let mut hi_sum = 0u64;
+    let mut ha_sum = 0u64;
+    let mut i = 0usize;
+    let n = row_full.len();
+
+    while i + 64 <= n {
+        let v0 = vld1q_u8(row_full.as_ptr().add(i));
+        let lo0 = vandq_u8(v0, even_mask);
+        let hi0 = vandq_u8(vshrq_n_u8(v0, 1), even_mask);
+        let ha0 = vandq_u8(lo0, hi0);
+        lo_sum += popcount_u8x16_neon(lo0);
+        hi_sum += popcount_u8x16_neon(hi0);
+        ha_sum += popcount_u8x16_neon(ha0);
+
+        let v1 = vld1q_u8(row_full.as_ptr().add(i + 16));
+        let lo1 = vandq_u8(v1, even_mask);
+        let hi1 = vandq_u8(vshrq_n_u8(v1, 1), even_mask);
+        let ha1 = vandq_u8(lo1, hi1);
+        lo_sum += popcount_u8x16_neon(lo1);
+        hi_sum += popcount_u8x16_neon(hi1);
+        ha_sum += popcount_u8x16_neon(ha1);
+
+        let v2 = vld1q_u8(row_full.as_ptr().add(i + 32));
+        let lo2 = vandq_u8(v2, even_mask);
+        let hi2 = vandq_u8(vshrq_n_u8(v2, 1), even_mask);
+        let ha2 = vandq_u8(lo2, hi2);
+        lo_sum += popcount_u8x16_neon(lo2);
+        hi_sum += popcount_u8x16_neon(hi2);
+        ha_sum += popcount_u8x16_neon(ha2);
+
+        let v3 = vld1q_u8(row_full.as_ptr().add(i + 48));
+        let lo3 = vandq_u8(v3, even_mask);
+        let hi3 = vandq_u8(vshrq_n_u8(v3, 1), even_mask);
+        let ha3 = vandq_u8(lo3, hi3);
+        lo_sum += popcount_u8x16_neon(lo3);
+        hi_sum += popcount_u8x16_neon(hi3);
+        ha_sum += popcount_u8x16_neon(ha3);
+
+        i += 64;
+    }
+
+    while i + 16 <= n {
+        let v = vld1q_u8(row_full.as_ptr().add(i));
+        let lo = vandq_u8(v, even_mask);
+        let hi = vandq_u8(vshrq_n_u8(v, 1), even_mask);
+        let ha = vandq_u8(lo, hi);
+        lo_sum += popcount_u8x16_neon(lo);
+        hi_sum += popcount_u8x16_neon(hi);
+        ha_sum += popcount_u8x16_neon(ha);
+        i += 16;
+    }
+
+    let (sm, sh, sha) = count_packed_row_full_bytes_popcnt(&row_full[i..]);
+    let hom_alt = (ha_sum as usize).saturating_add(sha);
+    let missing = (lo_sum.saturating_sub(ha_sum) as usize).saturating_add(sm);
+    let het = (hi_sum.saturating_sub(ha_sum) as usize).saturating_add(sh);
+    (missing, het, hom_alt)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+type BedX86M256i = x86_avx2::__m256i;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bed_avx2_runtime_available() -> bool {
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BedAvx2Mode {
+    Baseline,
+    Aggressive,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bed_avx2_runtime_mode() -> BedAvx2Mode {
+    static MODE: OnceLock<BedAvx2Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = std::env::var("JANUSX_BED_AVX2_MODE").unwrap_or_default();
+        let key = raw.trim().to_ascii_lowercase();
+        if key == "baseline" || key == "base" || key == "0" {
+            BedAvx2Mode::Baseline
+        } else {
+            BedAvx2Mode::Aggressive
+        }
+    })
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn popcount_u8x32_avx2(v: BedX86M256i) -> u64 {
+    use x86_avx2::*;
+    let lut = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    );
+    let low_mask = _mm256_set1_epi8(0x0F_i8);
+    let lo = _mm256_and_si256(v, low_mask);
+    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
+    let cnt_lo = _mm256_shuffle_epi8(lut, lo);
+    let cnt_hi = _mm256_shuffle_epi8(lut, hi);
+    let cnt = _mm256_add_epi8(cnt_lo, cnt_hi);
+    let sad = _mm256_sad_epu8(cnt, _mm256_setzero_si256());
+    let mut sums = [0u64; 4];
+    _mm256_storeu_si256(sums.as_mut_ptr() as *mut BedX86M256i, sad);
+    sums[0] + sums[1] + sums[2] + sums[3]
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn bed_avx2_accumulate_block(
+    v: BedX86M256i,
+    even_mask: BedX86M256i,
+    lo_sum: &mut u64,
+    hi_sum: &mut u64,
+    ha_sum: &mut u64,
+) {
+    use x86_avx2::*;
+    let lo = _mm256_and_si256(v, even_mask);
+    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 1), even_mask);
+    let ha = _mm256_and_si256(lo, hi);
+    *lo_sum += popcount_u8x32_avx2(lo);
+    *hi_sum += popcount_u8x32_avx2(hi);
+    *ha_sum += popcount_u8x32_avx2(ha);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn count_packed_row_full_bytes_avx2_baseline(row_full: &[u8]) -> (usize, usize, usize) {
+    use x86_avx2::*;
+    let even_mask = _mm256_set1_epi8(0x55_i8);
+    let mut lo_sum = 0u64;
+    let mut hi_sum = 0u64;
+    let mut ha_sum = 0u64;
+    let mut i = 0usize;
+    let n = row_full.len();
+
+    while i + 128 <= n {
+        let v0 = _mm256_loadu_si256(row_full.as_ptr().add(i) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v0, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+
+        let v1 = _mm256_loadu_si256(row_full.as_ptr().add(i + 32) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v1, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+
+        let v2 = _mm256_loadu_si256(row_full.as_ptr().add(i + 64) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v2, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+
+        let v3 = _mm256_loadu_si256(row_full.as_ptr().add(i + 96) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v3, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+
+        i += 128;
+    }
+
+    while i + 32 <= n {
+        let v = _mm256_loadu_si256(row_full.as_ptr().add(i) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        i += 32;
+    }
+
+    let (sm, sh, sha) = count_packed_row_full_bytes_popcnt(&row_full[i..]);
+    let hom_alt = (ha_sum as usize).saturating_add(sha);
+    let missing = (lo_sum.saturating_sub(ha_sum) as usize).saturating_add(sm);
+    let het = (hi_sum.saturating_sub(ha_sum) as usize).saturating_add(sh);
+    (missing, het, hom_alt)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const BED_AVX2_PREFETCH_DISTANCE_BYTES: usize = 1024;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn count_packed_row_full_bytes_avx2_aggressive(row_full: &[u8]) -> (usize, usize, usize) {
+    use x86_avx2::*;
+    let even_mask = _mm256_set1_epi8(0x55_i8);
+    let mut lo_sum = 0u64;
+    let mut hi_sum = 0u64;
+    let mut ha_sum = 0u64;
+    let mut i = 0usize;
+    let n = row_full.len();
+
+    while i + 256 <= n {
+        if let Some(pf_idx) = i.checked_add(BED_AVX2_PREFETCH_DISTANCE_BYTES) {
+            if pf_idx < n {
+                _mm_prefetch(row_full.as_ptr().add(pf_idx) as *const i8, _MM_HINT_T0);
             }
         }
+
+        let v0 = _mm256_loadu_si256(row_full.as_ptr().add(i) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v0, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v1 = _mm256_loadu_si256(row_full.as_ptr().add(i + 32) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v1, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v2 = _mm256_loadu_si256(row_full.as_ptr().add(i + 64) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v2, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v3 = _mm256_loadu_si256(row_full.as_ptr().add(i + 96) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v3, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v4 = _mm256_loadu_si256(row_full.as_ptr().add(i + 128) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v4, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v5 = _mm256_loadu_si256(row_full.as_ptr().add(i + 160) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v5, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v6 = _mm256_loadu_si256(row_full.as_ptr().add(i + 192) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v6, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+        let v7 = _mm256_loadu_si256(row_full.as_ptr().add(i + 224) as *const BedX86M256i);
+        bed_avx2_accumulate_block(v7, even_mask, &mut lo_sum, &mut hi_sum, &mut ha_sum);
+
+        i += 256;
+    }
+
+    let (sm, sh, sha) = count_packed_row_full_bytes_avx2_baseline(&row_full[i..]);
+    let hom_alt = (ha_sum as usize).saturating_add(sha);
+    let missing = (lo_sum.saturating_sub(ha_sum) as usize).saturating_add(sm);
+    let het = (hi_sum.saturating_sub(ha_sum) as usize).saturating_add(sh);
+    (missing, het, hom_alt)
+}
+
+#[inline]
+fn count_packed_row_full_bytes_dispatch(row_full: &[u8]) -> (usize, usize, usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if row_full.len() >= BED_COUNT_SIMD_MIN_BYTES && bed_avx2_runtime_available() {
+            // SAFETY: runtime-gated by AVX2 feature detection.
+            return unsafe {
+                match bed_avx2_runtime_mode() {
+                    BedAvx2Mode::Baseline => count_packed_row_full_bytes_avx2_baseline(row_full),
+                    BedAvx2Mode::Aggressive => {
+                        count_packed_row_full_bytes_avx2_aggressive(row_full)
+                    }
+                }
+            };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if row_full.len() >= BED_COUNT_SIMD_MIN_BYTES && bed_neon_runtime_available() {
+            // SAFETY: runtime-gated by NEON feature detection.
+            return unsafe { count_packed_row_full_bytes_neon(row_full) };
+        }
+    }
+    count_packed_row_full_bytes_popcnt(row_full)
+}
+
+#[inline]
+fn count_packed_row_counts(row: &[u8], n_samples: usize) -> (usize, usize, usize) {
+    let full_bytes = n_samples / 4;
+    let rem_pairs = n_samples & 3;
+    let (mut missing, mut het, mut hom_alt) =
+        count_packed_row_full_bytes_dispatch(&row[..full_bytes]);
+
+    if rem_pairs > 0 {
+        let b = row[full_bytes];
+        let mask = (1u8 << (rem_pairs * 2)) - 1u8;
+        let word = (b & mask) as u64;
+        let odd = (word >> 1) & 0x55_u64;
+        let even = word & 0x55_u64;
+        missing = missing.saturating_add(((!odd) & even).count_ones() as usize);
+        het = het.saturating_add((odd & (!even)).count_ones() as usize);
+        hom_alt = hom_alt.saturating_add((odd & even).count_ones() as usize);
     }
     (missing, het, hom_alt)
 }
@@ -542,21 +1133,21 @@ struct SubsetPackPlanByte {
     n_pairs: u8,
 }
 
-fn collapse_bed_row_sorted_subset(
-    src_row: &[u8],
-    include_words: &[u64],
-    out_row: &mut [u8],
-) -> Result<(), String> {
-    let mut cur_output_word = 0u64;
-    let mut word_write_halfshift: u32 = 0;
-    let mut out_word_idx = 0usize;
-    let mut raw_word_idx = 0usize;
+#[derive(Clone, Copy)]
+struct SubsetPackRunOp {
+    raw_word_idx: u32,
+    start_pair: u8,
+    run_len: u8,
+}
+
+fn build_subset_run_plan(include_words: &[u64]) -> Vec<SubsetPackRunOp> {
+    let mut plan: Vec<SubsetPackRunOp> = Vec::new();
+    let mut raw_word_idx = 0u32;
 
     for &include_word in include_words.iter() {
         let mut include_half = include_word as u32;
         for half_idx in 0..2usize {
             if include_half != 0 {
-                let raw_word = load_u64_le_partial(src_row, raw_word_idx.saturating_mul(8));
                 let mut run_mask = include_half as u64;
                 while run_mask != 0 {
                     let start = run_mask.trailing_zeros();
@@ -567,30 +1158,11 @@ fn collapse_bed_row_sorted_subset(
                         run_len = max_len;
                     }
 
-                    let raw_shifted = raw_word >> (start * 2);
-                    let block_limit = 32u32.saturating_sub(word_write_halfshift);
-                    cur_output_word |= raw_shifted << (word_write_halfshift * 2);
-
-                    if run_len < block_limit {
-                        word_write_halfshift += run_len;
-                        if word_write_halfshift < 32 {
-                            cur_output_word &= (1u64 << (word_write_halfshift * 2)) - 1u64;
-                        }
-                    } else {
-                        store_u64_le_partial(
-                            out_row,
-                            out_word_idx.saturating_mul(8),
-                            cur_output_word,
-                        );
-                        out_word_idx = out_word_idx.saturating_add(1);
-                        word_write_halfshift = run_len - block_limit;
-                        if word_write_halfshift > 0 {
-                            cur_output_word = (raw_shifted >> (block_limit * 2))
-                                & ((1u64 << (word_write_halfshift * 2)) - 1u64);
-                        } else {
-                            cur_output_word = 0u64;
-                        }
-                    }
+                    plan.push(SubsetPackRunOp {
+                        raw_word_idx,
+                        start_pair: start as u8,
+                        run_len: run_len as u8,
+                    });
 
                     let clear_through = start.saturating_add(run_len) as usize;
                     if clear_through >= 64 {
@@ -604,6 +1176,43 @@ fn collapse_bed_row_sorted_subset(
             raw_word_idx = raw_word_idx.saturating_add(1);
             if half_idx == 0 {
                 include_half = (include_word >> 32) as u32;
+            }
+        }
+    }
+
+    plan
+}
+
+fn collapse_bed_row_sorted_subset_with_plan(
+    src_row: &[u8],
+    plan: &[SubsetPackRunOp],
+    out_row: &mut [u8],
+) -> Result<(), String> {
+    let mut cur_output_word = 0u64;
+    let mut word_write_halfshift: u32 = 0;
+    let mut out_word_idx = 0usize;
+
+    for op in plan.iter().copied() {
+        let raw_word = load_u64_le_partial(src_row, (op.raw_word_idx as usize).saturating_mul(8));
+        let raw_shifted = raw_word >> ((op.start_pair as u32) * 2);
+        let run_len = op.run_len as u32;
+        let block_limit = 32u32.saturating_sub(word_write_halfshift);
+        cur_output_word |= raw_shifted << (word_write_halfshift * 2);
+
+        if run_len < block_limit {
+            word_write_halfshift += run_len;
+            if word_write_halfshift < 32 {
+                cur_output_word &= (1u64 << (word_write_halfshift * 2)) - 1u64;
+            }
+        } else {
+            store_u64_le_partial(out_row, out_word_idx.saturating_mul(8), cur_output_word);
+            out_word_idx = out_word_idx.saturating_add(1);
+            word_write_halfshift = run_len - block_limit;
+            if word_write_halfshift > 0 {
+                cur_output_word = (raw_shifted >> (block_limit * 2))
+                    & ((1u64 << (word_write_halfshift * 2)) - 1u64);
+            } else {
+                cur_output_word = 0u64;
             }
         }
     }
@@ -666,6 +1275,27 @@ fn evaluate_packed_row_keep_and_flip(
         return (false, false);
     }
     (true, flip)
+}
+
+#[inline]
+fn packed_row_stats_from_counts(
+    n_samples: usize,
+    non_missing: usize,
+    alt_sum: usize,
+) -> (f32, f32, f32) {
+    let miss = if n_samples > 0 {
+        (n_samples.saturating_sub(non_missing) as f32) / (n_samples as f32)
+    } else {
+        0.0_f32
+    };
+    if non_missing == 0 {
+        return (miss, 0.0_f32, 0.0_f32);
+    }
+    let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
+    let maf = p.min(1.0_f64 - p) as f32;
+    let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
+    let std = if d.is_finite() { d } else { 0.0_f32 };
+    (miss, maf, std)
 }
 
 fn write_plink_subset_filtered_packed(
@@ -738,10 +1368,16 @@ fn write_plink_subset_filtered_packed(
         ));
     }
 
-    let mut wbed = BufWriter::new(File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?);
+    let mut wbed = BufWriter::with_capacity(
+        8 * 1024 * 1024,
+        File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+    );
     wbed.write_all(&header)
         .map_err(|e| format!("{out_bed}: {e}"))?;
-    let mut wbim = BufWriter::new(File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?);
+    let mut wbim = BufWriter::with_capacity(
+        4 * 1024 * 1024,
+        File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+    );
 
     if selected_snp_indices.iter().any(|&idx| idx >= sites.len()) {
         return Err("selected SNP index out of range".to_string());
@@ -766,9 +1402,6 @@ fn write_plink_subset_filtered_packed(
     } else {
         ((1u16 << (tail_pairs * 2)) - 1) as u8
     };
-
-    let flip_table = build_bed_flip_byte_table();
-    let byte_counts = build_bed_count_byte_table();
 
     let mut kept = 0usize;
     let mut out_row = vec![0u8; out_bytes_per_snp];
@@ -830,8 +1463,7 @@ fn write_plink_subset_filtered_packed(
             let decisions: Vec<(bool, bool)> = block
                 .par_chunks(src_bytes_per_snp)
                 .map(|row| {
-                    let (missing, het, hom_alt) =
-                        count_packed_row_counts(row, n_out_samples, &byte_counts);
+                    let (missing, het, hom_alt) = count_packed_row_counts(row, n_out_samples);
                     let non_missing = n_out_samples.saturating_sub(missing);
                     let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
                     let het_count = if apply_het_filter { het } else { 0usize };
@@ -856,11 +1488,8 @@ fn write_plink_subset_filtered_packed(
                 if !keep {
                     continue;
                 }
-                let mut site = sites[snp_idx].clone();
-                if flip {
-                    std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
-                }
-                write_bim_site_line(&mut wbim, &site)?;
+                let site = &sites[snp_idx];
+                write_bim_site_line_with_flip(&mut wbim, site, flip)?;
 
                 if !flip {
                     if tail_pairs == 0 {
@@ -881,14 +1510,12 @@ fn write_plink_subset_filtered_packed(
                     }
                 } else {
                     if full_bytes_out > 0 {
-                        for i in 0..full_bytes_out {
-                            out_row[i] = flip_table[row[i] as usize];
-                        }
+                        flip_bed_bytes_into(&row[..full_bytes_out], &mut out_row[..full_bytes_out]);
                         wbed.write_all(&out_row[..full_bytes_out])
                             .map_err(|e| format!("{out_bed}: {e}"))?;
                     }
                     if tail_pairs > 0 {
-                        let last = flip_table[row[full_bytes_out] as usize] & tail_mask;
+                        let last = flip_bed_byte_fast(row[full_bytes_out]) & tail_mask;
                         wbed.write_all(&[last])
                             .map_err(|e| format!("{out_bed}: {e}"))?;
                     }
@@ -924,40 +1551,145 @@ fn write_plink_subset_filtered_packed(
             selected_mask_words[w] |= 1u64 << b;
         }
 
-        let mut pack_plan: Vec<SubsetPackPlanByte> = Vec::new();
-        if !sample_indices_strictly_increasing {
-            pack_plan = vec![
-                SubsetPackPlanByte {
-                    word_idx: [0u32; 4],
-                    bit_idx: [0u8; 4],
-                    n_pairs: 0u8,
-                };
-                out_bytes_per_snp
-            ];
-            for (out_i, &sidx) in sample_indices.iter().enumerate() {
-                let out_b = out_i >> 2;
-                let lane = out_i & 3;
-                let plan = &mut pack_plan[out_b];
-                plan.word_idx[lane] = (sidx >> 6) as u32;
-                plan.bit_idx[lane] = (sidx & 63) as u8;
-                let lane_pairs = (lane as u8) + 1;
-                if plan.n_pairs < lane_pairs {
-                    plan.n_pairs = lane_pairs;
+        // Fast path for strictly-increasing sample subsets:
+        // read BED rows in blocks, collapse/evaluate rows in parallel, then
+        // serialize writes in SNP order.
+        if sample_indices_strictly_increasing {
+            let block_target_bytes = 8 * 1024 * 1024usize;
+            let block_rows = std::cmp::max(
+                64usize,
+                std::cmp::min(
+                    4096usize,
+                    std::cmp::max(
+                        1usize,
+                        block_target_bytes / std::cmp::max(1usize, src_bytes_per_snp),
+                    ),
+                ),
+            );
+            let subset_run_plan = build_subset_run_plan(selected_mask_words.as_slice());
+            let mut prev_idx_opt: Option<usize> = None;
+
+            for snp_chunk in selected_snp_indices.chunks(block_rows) {
+                let rows_n = snp_chunk.len();
+                let mut block = vec![0u8; rows_n.saturating_mul(src_bytes_per_snp)];
+
+                for (r, &snp_idx) in snp_chunk.iter().enumerate() {
+                    match prev_idx_opt {
+                        None => {
+                            let off = 3usize
+                                .checked_add(
+                                    snp_idx
+                                        .checked_mul(src_bytes_per_snp)
+                                        .ok_or_else(|| "BED row offset overflow".to_string())?,
+                                )
+                                .ok_or_else(|| "BED row offset overflow".to_string())?;
+                            rbed.seek(SeekFrom::Start(off as u64))
+                                .map_err(|e| format!("{src_bed}: {e}"))?;
+                        }
+                        Some(prev) => {
+                            if snp_idx <= prev {
+                                return Err(
+                                    "selected SNP indices must be strictly increasing".to_string()
+                                );
+                            }
+                            let skip_rows = snp_idx - prev - 1;
+                            if skip_rows > 0 {
+                                let skip_bytes = skip_rows
+                                    .checked_mul(src_bytes_per_snp)
+                                    .ok_or_else(|| "BED seek offset overflow".to_string())?;
+                                rbed.seek(SeekFrom::Current(skip_bytes as i64))
+                                    .map_err(|e| format!("{src_bed}: {e}"))?;
+                            }
+                        }
+                    }
+                    let st = r.saturating_mul(src_bytes_per_snp);
+                    let ed = st.saturating_add(src_bytes_per_snp);
+                    rbed.read_exact(&mut block[st..ed])
+                        .map_err(|e| format!("{src_bed}: {e}"))?;
+                    prev_idx_opt = Some(snp_idx);
                 }
+
+                let decisions: Vec<Result<(bool, bool, Vec<u8>), String>> = block
+                    .par_chunks(src_bytes_per_snp)
+                    .map(|src_row| {
+                        let mut collapsed = vec![0u8; out_bytes_per_snp];
+                        collapse_bed_row_sorted_subset_with_plan(
+                            src_row,
+                            subset_run_plan.as_slice(),
+                            collapsed.as_mut_slice(),
+                        )?;
+                        let (missing, het, hom_alt) =
+                            count_packed_row_counts(collapsed.as_slice(), n_out_samples);
+                        let non_missing = n_out_samples.saturating_sub(missing);
+                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                        let het_count = if apply_het_filter { het } else { 0usize };
+                        let (keep, flip) = evaluate_packed_row_keep_and_flip(
+                            n_out_samples,
+                            non_missing,
+                            alt_sum,
+                            het_count,
+                            maf_threshold,
+                            max_missing_rate,
+                            apply_het_filter,
+                            het_threshold,
+                        );
+                        Ok((keep, flip, collapsed))
+                    })
+                    .collect();
+
+                for (&snp_idx, decision) in snp_chunk.iter().zip(decisions.into_iter()) {
+                    let (keep, flip, mut collapsed) = decision?;
+                    if !keep {
+                        continue;
+                    }
+                    let site = &sites[snp_idx];
+                    write_bim_site_line_with_flip(&mut wbim, site, flip)?;
+
+                    if flip {
+                        if full_bytes_out > 0 {
+                            flip_bed_bytes_in_place(&mut collapsed[..full_bytes_out]);
+                        }
+                        if tail_pairs > 0 {
+                            collapsed[full_bytes_out] =
+                                flip_bed_byte_fast(collapsed[full_bytes_out]);
+                        }
+                    }
+                    if tail_pairs > 0 {
+                        collapsed[full_bytes_out] &= tail_mask;
+                    }
+                    wbed.write_all(&collapsed)
+                        .map_err(|e| format!("{out_bed}: {e}"))?;
+                    kept = kept.saturating_add(1);
+                }
+            }
+            wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+            wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+            return Ok(kept);
+        }
+
+        let mut pack_plan: Vec<SubsetPackPlanByte> = vec![
+            SubsetPackPlanByte {
+                word_idx: [0u32; 4],
+                bit_idx: [0u8; 4],
+                n_pairs: 0u8,
+            };
+            out_bytes_per_snp
+        ];
+        for (out_i, &sidx) in sample_indices.iter().enumerate() {
+            let out_b = out_i >> 2;
+            let lane = out_i & 3;
+            let plan = &mut pack_plan[out_b];
+            plan.word_idx[lane] = (sidx >> 6) as u32;
+            plan.bit_idx[lane] = (sidx & 63) as u8;
+            let lane_pairs = (lane as u8) + 1;
+            if plan.n_pairs < lane_pairs {
+                plan.n_pairs = lane_pairs;
             }
         }
 
         let mut src_row = vec![0u8; src_bytes_per_snp];
-        let mut low_words = if sample_indices_strictly_increasing {
-            Vec::new()
-        } else {
-            vec![0u64; n_words_src]
-        };
-        let mut high_words = if sample_indices_strictly_increasing {
-            Vec::new()
-        } else {
-            vec![0u64; n_words_src]
-        };
+        let mut low_words = vec![0u64; n_words_src];
+        let mut high_words = vec![0u64; n_words_src];
 
         for (k, &snp_idx) in selected_snp_indices.iter().enumerate() {
             if k == 0 {
@@ -987,113 +1719,79 @@ fn write_plink_subset_filtered_packed(
             rbed.read_exact(&mut src_row)
                 .map_err(|e| format!("{src_bed}: {e}"))?;
 
-            let (keep, flip) = if sample_indices_strictly_increasing {
-                collapse_bed_row_sorted_subset(
-                    src_row.as_slice(),
-                    selected_mask_words.as_slice(),
-                    out_row.as_mut_slice(),
-                )?;
-                let (missing, het, hom_alt) =
-                    count_packed_row_counts(out_row.as_slice(), n_out_samples, &byte_counts);
-                let non_missing = n_out_samples.saturating_sub(missing);
-                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let het_count = if apply_het_filter { het } else { 0usize };
-                evaluate_packed_row_keep_and_flip(
-                    n_out_samples,
-                    non_missing,
-                    alt_sum,
-                    het_count,
-                    maf_threshold,
-                    max_missing_rate,
-                    apply_het_filter,
-                    het_threshold,
-                )
-            } else {
-                let (low_lut, high_lut) = low_high_lut
-                    .as_ref()
-                    .ok_or_else(|| "subset low/high LUT missing".to_string())?;
-                for w in 0..n_words_src {
-                    let base = w.saturating_mul(16);
-                    let mut lo_w = 0u64;
-                    let mut hi_w = 0u64;
-                    for j in 0..16usize {
-                        let bi = base + j;
-                        if bi >= src_bytes_per_snp {
-                            break;
-                        }
-                        let b = src_row[bi] as usize;
-                        lo_w |= (low_lut[b] as u64) << (j * 4);
-                        hi_w |= (high_lut[b] as u64) << (j * 4);
+            let (low_lut, high_lut) = low_high_lut
+                .as_ref()
+                .ok_or_else(|| "subset low/high LUT missing".to_string())?;
+            for w in 0..n_words_src {
+                let base = w.saturating_mul(16);
+                let mut lo_w = 0u64;
+                let mut hi_w = 0u64;
+                for j in 0..16usize {
+                    let bi = base + j;
+                    if bi >= src_bytes_per_snp {
+                        break;
                     }
-                    low_words[w] = lo_w;
-                    high_words[w] = hi_w;
+                    let b = src_row[bi] as usize;
+                    lo_w |= (low_lut[b] as u64) << (j * 4);
+                    hi_w |= (high_lut[b] as u64) << (j * 4);
                 }
-                if n_words_src > 0 && tail_bits_src_word != 0 {
-                    low_words[last_word_src] &= tail_mask_src_word;
-                    high_words[last_word_src] &= tail_mask_src_word;
-                }
+                low_words[w] = lo_w;
+                high_words[w] = hi_w;
+            }
+            if n_words_src > 0 && tail_bits_src_word != 0 {
+                low_words[last_word_src] &= tail_mask_src_word;
+                high_words[last_word_src] &= tail_mask_src_word;
+            }
 
-                let low_pop =
-                    and_popcount(low_words.as_slice(), selected_mask_words.as_slice()) as usize;
-                let high_pop =
-                    and_popcount(high_words.as_slice(), selected_mask_words.as_slice()) as usize;
-                let hom_alt = and_and_mask_popcount(
-                    low_words.as_slice(),
-                    high_words.as_slice(),
-                    selected_mask_words.as_slice(),
-                ) as usize;
-                let missing = low_pop.saturating_sub(hom_alt);
-                let het = high_pop.saturating_sub(hom_alt);
-                let non_missing = n_out_samples.saturating_sub(missing);
-                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let het_count = if apply_het_filter { het } else { 0usize };
-                evaluate_packed_row_keep_and_flip(
-                    n_out_samples,
-                    non_missing,
-                    alt_sum,
-                    het_count,
-                    maf_threshold,
-                    max_missing_rate,
-                    apply_het_filter,
-                    het_threshold,
-                )
-            };
+            let low_pop =
+                and_popcount(low_words.as_slice(), selected_mask_words.as_slice()) as usize;
+            let high_pop =
+                and_popcount(high_words.as_slice(), selected_mask_words.as_slice()) as usize;
+            let hom_alt = and_and_mask_popcount(
+                low_words.as_slice(),
+                high_words.as_slice(),
+                selected_mask_words.as_slice(),
+            ) as usize;
+            let missing = low_pop.saturating_sub(hom_alt);
+            let het = high_pop.saturating_sub(hom_alt);
+            let non_missing = n_out_samples.saturating_sub(missing);
+            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+            let het_count = if apply_het_filter { het } else { 0usize };
+            let (keep, flip) = evaluate_packed_row_keep_and_flip(
+                n_out_samples,
+                non_missing,
+                alt_sum,
+                het_count,
+                maf_threshold,
+                max_missing_rate,
+                apply_het_filter,
+                het_threshold,
+            );
             if !keep {
                 continue;
             }
 
-            let mut site = sites[snp_idx].clone();
-            if flip {
-                std::mem::swap(&mut site.ref_allele, &mut site.alt_allele);
-            }
-            write_bim_site_line(&mut wbim, &site)?;
+            let site = &sites[snp_idx];
+            write_bim_site_line_with_flip(&mut wbim, site, flip)?;
 
-            if sample_indices_strictly_increasing {
+            let spread4 = spread4
+                .as_ref()
+                .ok_or_else(|| "subset spread table missing".to_string())?;
+            for (out_b, plan) in pack_plan.iter().enumerate() {
+                let mut lo_nib = 0u8;
+                let mut hi_nib = 0u8;
+                for lane in 0..(plan.n_pairs as usize) {
+                    let w = plan.word_idx[lane] as usize;
+                    let bit = plan.bit_idx[lane];
+                    lo_nib |= (((low_words[w] >> bit) & 1u64) as u8) << lane;
+                    hi_nib |= (((high_words[w] >> bit) & 1u64) as u8) << lane;
+                }
+                let mut packed =
+                    spread4[lo_nib as usize] | (spread4[hi_nib as usize].wrapping_shl(1u32));
                 if flip {
-                    for b in out_row.iter_mut() {
-                        *b = flip_table[*b as usize];
-                    }
+                    packed = flip_bed_byte_fast(packed);
                 }
-            } else {
-                let spread4 = spread4
-                    .as_ref()
-                    .ok_or_else(|| "subset spread table missing".to_string())?;
-                for (out_b, plan) in pack_plan.iter().enumerate() {
-                    let mut lo_nib = 0u8;
-                    let mut hi_nib = 0u8;
-                    for lane in 0..(plan.n_pairs as usize) {
-                        let w = plan.word_idx[lane] as usize;
-                        let bit = plan.bit_idx[lane];
-                        lo_nib |= (((low_words[w] >> bit) & 1u64) as u8) << lane;
-                        hi_nib |= (((high_words[w] >> bit) & 1u64) as u8) << lane;
-                    }
-                    let mut packed =
-                        spread4[lo_nib as usize] | (spread4[hi_nib as usize].wrapping_shl(1u32));
-                    if flip {
-                        packed = flip_table[packed as usize];
-                    }
-                    out_row[out_b] = packed;
-                }
+                out_row[out_b] = packed;
             }
             if tail_pairs > 0 {
                 out_row[full_bytes_out] &= tail_mask;
@@ -1107,6 +1805,389 @@ fn write_plink_subset_filtered_packed(
     wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
     wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
     Ok(kept)
+}
+
+#[inline]
+fn plink2bits_from_g_f32(g: f32) -> u8 {
+    if !g.is_finite() || g < 0.0 {
+        return 0b01;
+    }
+    match g.round().clamp(0.0, 2.0) as i32 {
+        0 => 0b00,
+        1 => 0b10,
+        _ => 0b11,
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    src_prefix,
+    out_prefix,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    model=None,
+    het_threshold=None,
+))]
+pub fn bed_filter_stream_to_plink_rust(
+    py: Python<'_>,
+    src_prefix: String,
+    out_prefix: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    model: Option<String>,
+    het_threshold: Option<f32>,
+) -> PyResult<(usize, usize, usize)> {
+    let src = normalize_plink_prefix_local(&src_prefix);
+    let out = normalize_plink_prefix_local(&out_prefix);
+    if src.is_empty() || out.is_empty() {
+        return Err(PyValueError::new_err(
+            "src_prefix/out_prefix must not be empty",
+        ));
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+
+    let model_key = model
+        .unwrap_or_else(|| "add".to_string())
+        .to_ascii_lowercase();
+    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+        return Err(PyValueError::new_err(
+            "model must be one of: add, dom, rec, het",
+        ));
+    }
+    let het = het_threshold.unwrap_or(0.02);
+    if !(0.0..=0.5).contains(&het) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 0.5]",
+        ));
+    }
+    let apply_het_filter = model_key != "add";
+
+    let outv = py
+        .detach(move || -> Result<(usize, usize, usize), String> {
+            let mut it = BedSnpIter::new_with_fill(&src, 0.0, 1.0, false, false, het)?;
+            let n_samples = it.n_samples();
+            if n_samples == 0 {
+                return Err("source contains no samples".to_string());
+            }
+
+            let out_bed = format!("{out}.bed");
+            let out_bim = format!("{out}.bim");
+            let out_fam = format!("{out}.fam");
+            if let Some(parent) = Path::new(&out_bed).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+            }
+
+            write_fam_simple(Path::new(&out_fam), it.samples.as_slice(), None)?;
+
+            let mut wbed = BufWriter::with_capacity(
+                8 * 1024 * 1024,
+                File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+            );
+            wbed.write_all(&[0x6C, 0x1B, 0x01])
+                .map_err(|e| format!("{out_bed}: {e}"))?;
+            let mut wbim = BufWriter::with_capacity(
+                4 * 1024 * 1024,
+                File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+            );
+
+            let bytes_per_snp = n_samples.div_ceil(4);
+            let mut row_buf = vec![0u8; bytes_per_snp];
+            let mut n_scanned = 0usize;
+            let mut n_kept = 0usize;
+
+            while let Some((mut row, mut site)) = it.next_snp_raw() {
+                n_scanned = n_scanned.saturating_add(1);
+                let keep = core::process_snp_row(
+                    &mut row,
+                    &mut site.ref_allele,
+                    &mut site.alt_allele,
+                    maf_threshold,
+                    max_missing_rate,
+                    false,
+                    apply_het_filter,
+                    het,
+                );
+                if !keep {
+                    continue;
+                }
+
+                write_bim_site_line(&mut wbim, &site)?;
+                let mut i = 0usize;
+                for b in 0..bytes_per_snp {
+                    let mut packed = 0u8;
+                    for lane in 0..4usize {
+                        let si = i + lane;
+                        let code = if si < n_samples {
+                            plink2bits_from_g_f32(row[si])
+                        } else {
+                            0b01
+                        };
+                        packed |= code << (lane * 2);
+                    }
+                    row_buf[b] = packed;
+                    i += 4;
+                }
+                wbed.write_all(row_buf.as_slice())
+                    .map_err(|e| format!("{out_bed}: {e}"))?;
+                n_kept = n_kept.saturating_add(1);
+            }
+
+            wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+            wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+            Ok((n_kept, n_scanned, n_samples))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    Ok(outv)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    src_prefix,
+    out_prefix,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=0.0,
+    block_rows=8192,
+    parallel=true,
+))]
+pub fn bed_mmap_filter_to_plink_rust(
+    py: Python<'_>,
+    src_prefix: String,
+    out_prefix: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    block_rows: usize,
+    parallel: bool,
+) -> PyResult<(usize, usize, usize, usize)> {
+    let src = normalize_plink_prefix_local(&src_prefix);
+    let out = normalize_plink_prefix_local(&out_prefix);
+    if src.is_empty() || out.is_empty() {
+        return Err(PyValueError::new_err(
+            "src_prefix/out_prefix must not be empty",
+        ));
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=0.5).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 0.5]",
+        ));
+    }
+
+    let outv = py
+        .detach(move || -> Result<(usize, usize, usize, usize), String> {
+            let engine = BedMmapEngine::open(&src)?;
+            let sites = core::read_bim(&src)?;
+            if sites.len() != engine.n_snps {
+                return Err(format!(
+                    "BED/BIM SNP count mismatch: bed={}, bim={}",
+                    engine.n_snps,
+                    sites.len()
+                ));
+            }
+            let sample_ids = core::read_fam(&src)?;
+            if sample_ids.len() != engine.n_samples {
+                return Err(format!(
+                    "BED/FAM sample count mismatch: bed={}, fam={}",
+                    engine.n_samples,
+                    sample_ids.len()
+                ));
+            }
+
+            let out_bed = format!("{out}.bed");
+            let out_bim = format!("{out}.bim");
+            let out_fam = format!("{out}.fam");
+            if let Some(parent) = Path::new(&out_bed).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+            }
+            write_fam_simple(Path::new(&out_fam), sample_ids.as_slice(), None)?;
+
+            let mut wbed = BufWriter::with_capacity(
+                8 * 1024 * 1024,
+                File::create(&out_bed).map_err(|e| format!("{out_bed}: {e}"))?,
+            );
+            wbed.write_all(&[0x6C, 0x1B, 0x01])
+                .map_err(|e| format!("{out_bed}: {e}"))?;
+            let mut wbim = BufWriter::with_capacity(
+                4 * 1024 * 1024,
+                File::create(&out_bim).map_err(|e| format!("{out_bim}: {e}"))?,
+            );
+
+            let n_samples = engine.n_samples;
+            let bytes_per_snp = engine.bytes_per_snp;
+            let tail_pairs = n_samples & 3;
+            let full_bytes_out = if tail_pairs == 0 {
+                bytes_per_snp
+            } else {
+                bytes_per_snp.saturating_sub(1)
+            };
+            let tail_mask: u8 = if tail_pairs == 0 {
+                0xFF
+            } else {
+                ((1u16 << (tail_pairs * 2)) - 1) as u8
+            };
+            let apply_het_filter = het_threshold > 0.0_f32;
+            let mut out_row = vec![0u8; bytes_per_snp];
+
+            let blk = std::cmp::max(1usize, block_rows);
+            let mut n_scanned = 0usize;
+            let mut n_blocks = 0usize;
+            let mut n_kept = 0usize;
+            let rows_per_task = 512usize;
+            let pretouch_pages = std::env::var("JANUSX_BED_MMAP_PRETOUCH")
+                .ok()
+                .map(|v| {
+                    let k = v.trim().to_ascii_lowercase();
+                    matches!(k.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+
+            while n_scanned < engine.n_snps {
+                let take = std::cmp::min(blk, engine.n_snps - n_scanned);
+                let (block_bytes, got_rows) = engine.get_rows_slice(n_scanned, take)?;
+                if got_rows != take {
+                    return Err(format!(
+                        "BED scan rows mismatch: got_rows={got_rows}, expected={take}"
+                    ));
+                }
+
+                if pretouch_pages && parallel {
+                    // Optional dummy read to fault pages in before parallel scan.
+                    // This can help some kernels/filesystems but may hurt others.
+                    let mut dummy = 0u8;
+                    let mut pg = 0usize;
+                    while pg < block_bytes.len() {
+                        dummy ^= block_bytes[pg];
+                        pg = pg.saturating_add(4096);
+                    }
+                    std::hint::black_box(dummy);
+                }
+
+                let eval_row = |row: &[u8]| {
+                    let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                    let non_missing = n_samples.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let het_count = if apply_het_filter { het } else { 0usize };
+                    evaluate_packed_row_keep_and_flip(
+                        n_samples,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het_filter,
+                        het_threshold,
+                    )
+                };
+
+                let mut decisions: Vec<(bool, bool)> = vec![(false, false); take];
+                if parallel && take >= 128 {
+                    decisions
+                        .par_chunks_mut(rows_per_task)
+                        .enumerate()
+                        .for_each(|(chunk_idx, out_chunk)| {
+                            let row_start = chunk_idx.saturating_mul(rows_per_task);
+                            let byte_start = row_start.saturating_mul(bytes_per_snp);
+                            let byte_end = byte_start
+                                .saturating_add(out_chunk.len().saturating_mul(bytes_per_snp));
+                            let super_row = &block_bytes[byte_start..byte_end];
+                            for (dst, row) in
+                                out_chunk.iter_mut().zip(super_row.chunks(bytes_per_snp))
+                            {
+                                *dst = eval_row(row);
+                            }
+                        });
+                } else {
+                    for (dst, row) in decisions.iter_mut().zip(block_bytes.chunks(bytes_per_snp)) {
+                        *dst = eval_row(row);
+                    }
+                }
+                if decisions.len() != take {
+                    return Err(format!(
+                        "internal decision row mismatch: got {}, expected {}",
+                        decisions.len(),
+                        take
+                    ));
+                }
+
+                for row_idx in 0..take {
+                    let snp_idx = n_scanned + row_idx;
+                    let row_start = row_idx * bytes_per_snp;
+                    let row_end = row_start + bytes_per_snp;
+                    let row = &block_bytes[row_start..row_end];
+                    let (keep, flip) = decisions[row_idx];
+                    if !keep {
+                        continue;
+                    }
+
+                    let site = &sites[snp_idx];
+                    write_bim_site_line_with_flip(&mut wbim, site, flip)?;
+
+                    if !flip {
+                        if tail_pairs == 0 {
+                            wbed.write_all(row).map_err(|e| format!("{out_bed}: {e}"))?;
+                        } else {
+                            if full_bytes_out > 0 {
+                                out_row[..full_bytes_out].copy_from_slice(&row[..full_bytes_out]);
+                            }
+                            out_row[full_bytes_out] = row[full_bytes_out] & tail_mask;
+                            wbed.write_all(&out_row)
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        }
+                    } else {
+                        if full_bytes_out > 0 {
+                            flip_bed_bytes_into(
+                                &row[..full_bytes_out],
+                                &mut out_row[..full_bytes_out],
+                            );
+                        }
+                        if tail_pairs > 0 {
+                            out_row[full_bytes_out] =
+                                flip_bed_byte_fast(row[full_bytes_out]) & tail_mask;
+                            wbed.write_all(&out_row)
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        } else {
+                            wbed.write_all(&out_row[..full_bytes_out])
+                                .map_err(|e| format!("{out_bed}: {e}"))?;
+                        }
+                    }
+                    n_kept = n_kept.saturating_add(1);
+                }
+
+                n_scanned = n_scanned.saturating_add(take);
+                n_blocks = n_blocks.saturating_add(1);
+            }
+
+            wbed.flush().map_err(|e| format!("{out_bed}: {e}"))?;
+            wbim.flush().map_err(|e| format!("{out_bim}: {e}"))?;
+            Ok((n_kept, n_scanned, n_samples, n_blocks))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    Ok(outv)
 }
 
 #[pyfunction]
@@ -1175,6 +2256,11 @@ pub fn bed_filter_to_plink_rust(
             "het_threshold must be within [0, 0.5]",
         ));
     }
+    if fill_missing {
+        return Err(PyValueError::new_err(
+            "bed_filter_to_plink_rust is a 2-bit native filter engine and does not support fill_missing=true",
+        ));
+    }
     let apply_het_filter = model_key != "add";
     let outv = py
         .detach(move || -> Result<(usize, usize, usize), String> {
@@ -1185,7 +2271,6 @@ pub fn bed_filter_to_plink_rust(
                 return Err("No samples selected.".to_string());
             }
             let n_out_samples = out_sample_ids.len();
-            let full_samples = sample_indices.len() == it.n_samples();
             let site_filter =
                 SiteFilterExpr::from_parts(snp_sites, bim_range, chr_keys, bp_min, bp_max, ranges)?;
             let mut selected_snp_indices: Vec<usize> = Vec::new();
@@ -1200,96 +2285,19 @@ pub fn bed_filter_to_plink_rust(
                 selected_snp_indices.extend(0..it.sites.len());
             }
             let n_scanned: usize = selected_snp_indices.len();
-
-            if !fill_missing {
-                let n_kept = write_plink_subset_filtered_packed(
-                    &src,
-                    &out,
-                    &out_sample_ids,
-                    &it.sites,
-                    &selected_snp_indices,
-                    &sample_indices,
-                    it.n_samples(),
-                    maf_threshold,
-                    max_missing_rate,
-                    apply_het_filter,
-                    het,
-                )?;
-                return Ok((n_kept, n_scanned, n_out_samples));
-            }
-
-            let bed_path = format!("{out}.bed");
-            let bim_path = format!("{out}.bim");
-            let fam_path = format!("{out}.fam");
-
-            write_fam_simple(Path::new(&fam_path), &out_sample_ids, None)?;
-            let mut bed = BufWriter::new(File::create(&bed_path).map_err(|e| e.to_string())?);
-            bed.write_all(&[0x6C, 0x1B, 0x01])
-                .map_err(|e| e.to_string())?;
-            let mut bim = BufWriter::new(File::create(&bim_path).map_err(|e| e.to_string())?);
-
-            let bytes_per_snp = (n_out_samples + 3) / 4;
-            let mut n_kept: usize = 0;
-
-            for &snp_idx in selected_snp_indices.iter() {
-                let maybe = if full_samples {
-                    it.get_snp_row_raw(snp_idx)
-                } else {
-                    it.get_snp_row_selected_raw(snp_idx, &sample_indices)
-                };
-                let (mut row, mut site) = match maybe {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let keep = core::process_snp_row(
-                    &mut row,
-                    &mut site.ref_allele,
-                    &mut site.alt_allele,
-                    maf_threshold,
-                    max_missing_rate,
-                    fill_missing,
-                    apply_het_filter,
-                    het,
-                );
-                if !keep {
-                    continue;
-                }
-
-                let snp_id = format!("{}_{}", site.chrom, site.pos);
-                writeln!(
-                    bim,
-                    "{}\t{}\t0\t{}\t{}\t{}",
-                    site.chrom, snp_id, site.pos, site.ref_allele, site.alt_allele
-                )
-                .map_err(|e| e.to_string())?;
-
-                let mut si = 0usize;
-                for _ in 0..bytes_per_snp {
-                    let mut byte: u8 = 0;
-                    for k in 0..4usize {
-                        let bits = if si < row.len() {
-                            let g = row[si];
-                            let gi: i8 = if !g.is_finite() || g < 0.0 {
-                                -9_i8
-                            } else {
-                                g.round().clamp(0.0, 2.0) as i8
-                            };
-                            plink2bits_from_g_i8(gi)
-                        } else {
-                            0b00
-                        };
-                        byte |= bits << (k * 2);
-                        si += 1;
-                    }
-                    bed.write_all(&[byte]).map_err(|e| e.to_string())?;
-                }
-
-                n_kept = n_kept.saturating_add(1);
-            }
-
-            bed.flush().map_err(|e| e.to_string())?;
-            bim.flush().map_err(|e| e.to_string())?;
+            let n_kept = write_plink_subset_filtered_packed(
+                &src,
+                &out,
+                &out_sample_ids,
+                &it.sites,
+                &selected_snp_indices,
+                &sample_indices,
+                it.n_samples(),
+                maf_threshold,
+                max_missing_rate,
+                apply_het_filter,
+                het,
+            )?;
             Ok((n_kept, n_scanned, n_out_samples))
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -1310,6 +2318,42 @@ pub struct BedChunkReader {
     fill_missing: bool,
     apply_het_filter: bool,
     het_threshold: f32,
+}
+
+#[derive(Clone, Copy)]
+enum BedPreparedCodingMode {
+    Add,
+    Dom,
+    Rec,
+    Het,
+}
+
+#[inline]
+fn bed_apply_coding_value(v: f32, mode: BedPreparedCodingMode) -> f32 {
+    match mode {
+        BedPreparedCodingMode::Add => v,
+        BedPreparedCodingMode::Dom => {
+            if (v - 1.0_f32).abs() <= 1e-6_f32 || (v - 2.0_f32).abs() <= 1e-6_f32 {
+                1.0_f32
+            } else {
+                0.0_f32
+            }
+        }
+        BedPreparedCodingMode::Rec => {
+            if (v - 2.0_f32).abs() <= 1e-6_f32 {
+                1.0_f32
+            } else {
+                0.0_f32
+            }
+        }
+        BedPreparedCodingMode::Het => {
+            if (v - 1.0_f32).abs() <= 1e-6_f32 {
+                1.0_f32
+            } else {
+                0.0_f32
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -1460,7 +2504,8 @@ impl BedChunkReader {
         let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let full_samples = self.sample_indices.len() == self.it.n_samples();
-        let can_parallel = !self.it.is_windowed();
+        let windowed_mode = self.it.is_windowed();
+        let can_parallel_random = !windowed_mode;
         let mut m: usize = 0;
 
         if let Some(ref snp_indices) = self.snp_indices {
@@ -1470,7 +2515,7 @@ impl BedChunkReader {
                 let batch = &snp_indices[self.snp_pos..end];
                 self.snp_pos = end;
 
-                if can_parallel {
+                if can_parallel_random {
                     let it = &self.it;
                     let sample_indices = &self.sample_indices;
                     let maf = self.maf;
@@ -1538,7 +2583,7 @@ impl BedChunkReader {
                 }
             }
         } else {
-            if can_parallel {
+            if can_parallel_random {
                 while m < chunk_size && self.it.cursor() < self.it.n_snps() {
                     let need = chunk_size - m;
                     let start = self.it.cursor();
@@ -1576,6 +2621,83 @@ impl BedChunkReader {
                             }
                         })
                         .collect();
+                    for item in decoded.into_iter().flatten() {
+                        let (row_sub, site) = item;
+                        data.extend_from_slice(&row_sub);
+                        sites.push(site);
+                        m += 1;
+                    }
+                }
+            } else if windowed_mode {
+                while m < chunk_size {
+                    let need = chunk_size - m;
+                    let mut raw_rows: Vec<(Vec<f32>, core::SiteInfo)> = Vec::with_capacity(need);
+                    for _ in 0..need {
+                        let maybe = if full_samples {
+                            self.it.next_snp_raw()
+                        } else {
+                            self.it.next_snp_selected_raw(&self.sample_indices)
+                        };
+                        if let Some(v) = maybe {
+                            raw_rows.push(v);
+                        } else {
+                            break;
+                        }
+                    }
+                    if raw_rows.is_empty() {
+                        break;
+                    }
+
+                    let maf = self.maf;
+                    let miss = self.miss;
+                    let fill_missing = self.fill_missing;
+                    let apply_het_filter = self.apply_het_filter;
+                    let het_threshold = self.het_threshold;
+
+                    let decoded: Vec<Option<(Vec<f32>, SiteInfo)>> = if raw_rows.len() >= 64 {
+                        raw_rows
+                            .into_par_iter()
+                            .map(|(mut row_sub, mut site)| {
+                                let keep = core::process_snp_row(
+                                    &mut row_sub,
+                                    &mut site.ref_allele,
+                                    &mut site.alt_allele,
+                                    maf,
+                                    miss,
+                                    fill_missing,
+                                    apply_het_filter,
+                                    het_threshold,
+                                );
+                                if keep {
+                                    Some((row_sub, site.into()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        raw_rows
+                            .into_iter()
+                            .map(|(mut row_sub, mut site)| {
+                                let keep = core::process_snp_row(
+                                    &mut row_sub,
+                                    &mut site.ref_allele,
+                                    &mut site.alt_allele,
+                                    maf,
+                                    miss,
+                                    fill_missing,
+                                    apply_het_filter,
+                                    het_threshold,
+                                );
+                                if keep {
+                                    Some((row_sub, site.into()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+
                     for item in decoded.into_iter().flatten() {
                         let (row_sub, site) = item;
                         data.extend_from_slice(&row_sub);
@@ -1631,12 +2753,13 @@ impl BedChunkReader {
     /// where `maf` is:
     ///   - additive: mean(additive dosage)/2
     ///   - dom/rec/het: mean(coded value)
-    #[pyo3(signature = (chunk_size, coding=None))]
+    #[pyo3(signature = (chunk_size, coding=None, snps_only=false))]
     fn next_chunk_prepared<'py>(
         &mut self,
         py: Python<'py>,
         chunk_size: usize,
         coding: Option<String>,
+        snps_only: bool,
     ) -> PyResult<
         Option<(
             Bound<'py, PyArray2<f32>>,
@@ -1644,81 +2767,222 @@ impl BedChunkReader {
             Bound<'py, PyArray1<f32>>,
         )>,
     > {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be > 0",
+            ));
+        }
         let coding_key = coding
             .unwrap_or_else(|| "add".to_string())
             .trim()
             .to_ascii_lowercase();
-        if !matches!(coding_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "coding must be one of: add, dom, rec, het",
-            ));
-        }
-
-        let base = self.next_chunk(py, chunk_size)?;
-        let Some((geno_chunk, sites)) = base else {
-            return Ok(None);
+        let coding_mode = match coding_key.as_str() {
+            "add" => BedPreparedCodingMode::Add,
+            "dom" => BedPreparedCodingMode::Dom,
+            "rec" => BedPreparedCodingMode::Rec,
+            "het" => BedPreparedCodingMode::Het,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "coding must be one of: add, dom, rec, het",
+                ))
+            }
         };
-        let ro = geno_chunk.readonly();
-        let g = ro.as_slice().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err("chunk matrix is not contiguous")
-        })?;
-        let sh = ro.shape();
-        if sh.len() != 2 {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "chunk matrix must be 2D",
-            ));
-        }
-        let m = sh[0];
-        let n = sh[1];
-        if m == 0 || n == 0 {
+        let additive_mode = matches!(coding_mode, BedPreparedCodingMode::Add);
+
+        let n = self.sample_indices.len();
+        if n == 0 {
             return Ok(None);
         }
 
-        let mut out = vec![0.0_f32; m * n];
-        let mut maf = vec![0.0_f32; m];
+        let full_samples = self.sample_indices.len() == self.it.n_samples();
+        let windowed_mode = self.it.is_windowed();
+        let can_parallel_random = !windowed_mode;
 
-        for i in 0..m {
-            let row = &g[i * n..(i + 1) * n];
-            let out_row = &mut out[i * n..(i + 1) * n];
+        let mut out: Vec<f32> = Vec::with_capacity(chunk_size * n);
+        let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut maf: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut m = 0usize;
+        let maf_thr = self.maf;
+        let miss_thr = self.miss;
+        let fill_missing = self.fill_missing;
+        let apply_het_filter = self.apply_het_filter;
+        let het_thr = self.het_threshold;
+
+        let prepare_one = |mut row_sub: Vec<f32>, mut site: core::SiteInfo| {
+            let keep = core::process_snp_row(
+                &mut row_sub,
+                &mut site.ref_allele,
+                &mut site.alt_allele,
+                maf_thr,
+                miss_thr,
+                fill_missing,
+                apply_het_filter,
+                het_thr,
+            );
+            if !keep {
+                return None;
+            }
+            if snps_only
+                && (!_is_simple_snp_allele(&site.ref_allele)
+                    || !_is_simple_snp_allele(&site.alt_allele))
+            {
+                return None;
+            }
+
             let mut sum = 0.0_f64;
-            for (j, &v) in row.iter().enumerate() {
-                let mv = match coding_key.as_str() {
-                    "add" => v,
-                    "dom" => {
-                        if (v - 1.0_f32).abs() <= 1e-6_f32 || (v - 2.0_f32).abs() <= 1e-6_f32 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    "rec" => {
-                        if (v - 2.0_f32).abs() <= 1e-6_f32 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    "het" => {
-                        if (v - 1.0_f32).abs() <= 1e-6_f32 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    _ => v,
-                };
-                out_row[j] = mv;
+            for v in row_sub.iter_mut() {
+                let mv = bed_apply_coding_value(*v, coding_mode);
+                *v = mv;
                 sum += mv as f64;
             }
             let mean = (sum / n as f64) as f32;
-            for v in out_row.iter_mut() {
+            for v in row_sub.iter_mut() {
                 *v -= mean;
             }
-            maf[i] = if coding_key == "add" {
+            let maf_v = if additive_mode {
                 (sum / n as f64 / 2.0) as f32
             } else {
                 (sum / n as f64) as f32
             };
+            Some((row_sub, site.into(), maf_v))
+        };
+
+        if let Some(ref snp_indices) = self.snp_indices {
+            if windowed_mode {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "windowed mmap mode does not support explicit snp index selection",
+                ));
+            }
+            while m < chunk_size && self.snp_pos < snp_indices.len() {
+                let need = chunk_size - m;
+                let end = (self.snp_pos + need).min(snp_indices.len());
+                let batch = &snp_indices[self.snp_pos..end];
+                self.snp_pos = end;
+
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = if can_parallel_random {
+                    let it = &self.it;
+                    let sample_indices = &self.sample_indices;
+                    batch
+                        .par_iter()
+                        .map(|&snp_idx| {
+                            let maybe = if full_samples {
+                                it.get_snp_row_raw(snp_idx)
+                            } else {
+                                it.get_snp_row_selected_raw(snp_idx, sample_indices)
+                            };
+                            maybe.and_then(|(row_sub, site)| prepare_one(row_sub, site))
+                        })
+                        .collect()
+                } else {
+                    let mut tmp: Vec<Option<(Vec<f32>, SiteInfo, f32)>> =
+                        Vec::with_capacity(batch.len());
+                    for &snp_idx in batch.iter() {
+                        let maybe = if full_samples {
+                            self.it.get_snp_row_raw(snp_idx)
+                        } else {
+                            self.it
+                                .get_snp_row_selected_raw(snp_idx, &self.sample_indices)
+                        };
+                        tmp.push(maybe.and_then(|(row_sub, site)| prepare_one(row_sub, site)));
+                    }
+                    tmp
+                };
+
+                for item in decoded.into_iter().flatten() {
+                    let (row_sub, site, maf_v) = item;
+                    out.extend_from_slice(&row_sub);
+                    sites.push(site);
+                    maf.push(maf_v);
+                    m += 1;
+                }
+            }
+        } else if can_parallel_random {
+            while m < chunk_size && self.it.cursor() < self.it.n_snps() {
+                let need = chunk_size - m;
+                let start = self.it.cursor();
+                let end = (start + need).min(self.it.n_snps());
+                self.it.set_cursor(end);
+                let it = &self.it;
+                let sample_indices = &self.sample_indices;
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = (start..end)
+                    .into_par_iter()
+                    .map(|snp_idx| {
+                        let maybe = if full_samples {
+                            it.get_snp_row_raw(snp_idx)
+                        } else {
+                            it.get_snp_row_selected_raw(snp_idx, sample_indices)
+                        };
+                        maybe.and_then(|(row_sub, site)| prepare_one(row_sub, site))
+                    })
+                    .collect();
+                for item in decoded.into_iter().flatten() {
+                    let (row_sub, site, maf_v) = item;
+                    out.extend_from_slice(&row_sub);
+                    sites.push(site);
+                    maf.push(maf_v);
+                    m += 1;
+                }
+            }
+        } else if windowed_mode {
+            while m < chunk_size {
+                let need = chunk_size - m;
+                let mut raw_rows: Vec<(Vec<f32>, core::SiteInfo)> = Vec::with_capacity(need);
+                for _ in 0..need {
+                    let maybe = if full_samples {
+                        self.it.next_snp_raw()
+                    } else {
+                        self.it.next_snp_selected_raw(&self.sample_indices)
+                    };
+                    if let Some(v) = maybe {
+                        raw_rows.push(v);
+                    } else {
+                        break;
+                    }
+                }
+                if raw_rows.is_empty() {
+                    break;
+                }
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32)>> = if raw_rows.len() >= 64 {
+                    raw_rows
+                        .into_par_iter()
+                        .map(|(row_sub, site)| prepare_one(row_sub, site))
+                        .collect()
+                } else {
+                    raw_rows
+                        .into_iter()
+                        .map(|(row_sub, site)| prepare_one(row_sub, site))
+                        .collect()
+                };
+                for item in decoded.into_iter().flatten() {
+                    let (row_sub, site, maf_v) = item;
+                    out.extend_from_slice(&row_sub);
+                    sites.push(site);
+                    maf.push(maf_v);
+                    m += 1;
+                }
+            }
+        } else {
+            while m < chunk_size {
+                let maybe = if full_samples {
+                    self.it.next_snp_raw()
+                } else {
+                    self.it.next_snp_selected_raw(&self.sample_indices)
+                };
+                if let Some((row_sub, site)) = maybe {
+                    if let Some((row_sub2, site2, maf_v)) = prepare_one(row_sub, site) {
+                        out.extend_from_slice(&row_sub2);
+                        sites.push(site2);
+                        maf.push(maf_v);
+                        m += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if m == 0 {
+            return Ok(None);
         }
 
         let mat = Array2::from_shape_vec((m, n), out)
@@ -2321,51 +3585,38 @@ pub fn load_bed_2bit_packed<'py>(
             }
 
             let bed_path = format!("{bed_prefix}.bed");
-            let mut bed_file = File::open(&bed_path)
+            let bed_file = File::open(&bed_path)
                 .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
-            let bed_len = bed_file
-                .metadata()
-                .map_err(|e| format!("failed to stat {bed_path}: {e}"))?
-                .len() as usize;
-            if bed_len < 3 {
+            let mmap = unsafe { Mmap::map(&bed_file) }
+                .map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 {
                 return Err("BED too small".to_string());
             }
-
-            let mut header = [0u8; 3];
-            bed_file
-                .read_exact(&mut header)
-                .map_err(|e| format!("failed to read BED header: {e}"))?;
-            if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+            if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
                 return Err("Only SNP-major BED supported".to_string());
             }
 
             let bytes_per_snp = (n_samples + 3) / 4;
-            let data_len = bed_len - 3;
+            let data_len = mmap.len() - 3;
             if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
                 return Err(format!(
                     "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
                 ));
             }
             let n_snps = data_len / bytes_per_snp;
-
-            let mut packed: Vec<u8> = vec![0u8; data_len];
-            bed_file
-                .read_exact(&mut packed)
-                .map_err(|e| format!("failed to read BED payload: {e}"))?;
+            let packed_src = &mmap[3..];
 
             let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
             let mut maf: Vec<f32> = vec![0.0; n_snps];
             let mut std_denom: Vec<f32> = vec![0.0; n_snps];
-            let byte_counts = build_bed_count_byte_table();
             missing_rate
                 .par_iter_mut()
                 .zip(maf.par_iter_mut())
                 .zip(std_denom.par_iter_mut())
                 .enumerate()
                 .for_each(|(snp_idx, ((miss_dst, maf_dst), std_dst))| {
-                    let row = &packed[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
-                    let (missing, het, hom_alt) =
-                        count_packed_row_counts(row, n_samples, &byte_counts);
+                    let row = &packed_src[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                    let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
                     let non_missing = n_samples.saturating_sub(missing);
                     let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
 
@@ -2381,6 +3632,7 @@ pub fn load_bed_2bit_packed<'py>(
                         *std_dst = 0.0_f32;
                     }
                 });
+            let packed = packed_src.to_vec();
             Ok((
                 packed,
                 missing_rate,
@@ -2489,26 +3741,19 @@ pub fn prepare_bed_2bit_packed<'py>(
             }
 
             let bed_path = format!("{bed_prefix}.bed");
-            let mut bed_file = File::open(&bed_path)
+            let bed_file = File::open(&bed_path)
                 .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
-            let bed_len = bed_file
-                .metadata()
-                .map_err(|e| format!("failed to stat {bed_path}: {e}"))?
-                .len() as usize;
-            if bed_len < 3 {
+            let mmap = unsafe { Mmap::map(&bed_file) }
+                .map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 {
                 return Err("BED too small".to_string());
             }
-
-            let mut header = [0u8; 3];
-            bed_file
-                .read_exact(&mut header)
-                .map_err(|e| format!("failed to read BED header: {e}"))?;
-            if header[0] != 0x6C || header[1] != 0x1B || header[2] != 0x01 {
+            if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
                 return Err("Only SNP-major BED supported".to_string());
             }
 
             let bytes_per_snp = (n_samples + 3) / 4;
-            let data_len = bed_len - 3;
+            let data_len = mmap.len() - 3;
             if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
                 return Err(format!(
                     "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
@@ -2521,76 +3766,58 @@ pub fn prepare_bed_2bit_packed<'py>(
                 ));
             }
 
-            let mut packed_full: Vec<u8> = vec![0u8; data_len];
-            bed_file
-                .read_exact(&mut packed_full)
-                .map_err(|e| format!("failed to read BED payload: {e}"))?;
+            let packed_full = &mmap[3..];
 
-            let byte_counts = build_bed_count_byte_table();
-            let row_stats: Vec<(f32, f32, f32, f32, bool)> = packed_full
+            let apply_het_filter = het_threshold > 0.0_f32;
+            #[derive(Clone, Copy)]
+            struct RowScanLite {
+                non_missing: u32,
+                alt_sum: u32,
+                keep: bool,
+                flip: bool,
+            }
+
+            let row_scan: Vec<RowScanLite> = packed_full
                 .par_chunks(bytes_per_snp)
-                .map(|row| {
-                    let (missing, het, hom_alt) =
-                        count_packed_row_counts(row, n_samples, &byte_counts);
+                .enumerate()
+                .map(|(i, row)| {
+                    let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
                     let non_missing = n_samples.saturating_sub(missing);
                     let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                    let miss = (missing as f32) / (n_samples as f32);
-                    if non_missing > 0 {
-                        let p = alt_sum as f64 / (2.0_f64 * non_missing as f64);
-                        let flip = p > 0.5_f64;
-                        let maf_v = p.min(1.0_f64 - p) as f32;
-                        let het_rate = het as f32 / non_missing as f32;
-                        let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
-                        let std = if d.is_finite() { d } else { 0.0_f32 };
-                        (miss, maf_v, std, het_rate, flip)
+                    let het_count = if apply_het_filter { het } else { 0usize };
+                    let (pass_num, flip) = evaluate_packed_row_keep_and_flip(
+                        n_samples,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het_filter,
+                        het_threshold,
+                    );
+                    let pass_snp = if snps_only {
+                        _is_simple_snp_allele(&sites[i].ref_allele)
+                            && _is_simple_snp_allele(&sites[i].alt_allele)
                     } else {
-                        (miss, 0.0_f32, 0.0_f32, 0.0_f32, false)
+                        true
+                    };
+                    RowScanLite {
+                        non_missing: non_missing as u32,
+                        alt_sum: alt_sum as u32,
+                        keep: pass_num && pass_snp,
+                        flip,
                     }
                 })
                 .collect();
-            if row_stats.len() != n_snps {
+            if row_scan.len() != n_snps {
                 return Err(format!(
                     "internal error: stats rows {} != n_snps {n_snps}",
-                    row_stats.len()
+                    row_scan.len()
                 ));
             }
 
-            let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
-            let mut maf: Vec<f32> = vec![0.0; n_snps];
-            let mut std_denom: Vec<f32> = vec![0.0; n_snps];
-            let mut het_rate: Vec<f32> = vec![0.0; n_snps];
-            let mut row_flip: Vec<bool> = vec![false; n_snps];
-            for (i, (miss, maf_v, std, het, flip)) in row_stats.iter().copied().enumerate() {
-                missing_rate[i] = miss;
-                maf[i] = maf_v;
-                std_denom[i] = std;
-                het_rate[i] = het;
-                row_flip[i] = flip;
-            }
-
-            let mut keep: Vec<bool> = vec![true; n_snps];
-            for i in 0..n_snps {
-                let maf_i = maf[i];
-                let miss_i = missing_rate[i];
-                let pass_num = (maf_i >= maf_threshold)
-                    && (maf_i <= (1.0_f32 - maf_threshold))
-                    && (miss_i <= max_missing_rate)
-                    && (if het_threshold > 0.0_f32 {
-                        let h = het_rate[i];
-                        h >= het_threshold && h <= (1.0_f32 - het_threshold)
-                    } else {
-                        true
-                    });
-                let pass_snp = if snps_only {
-                    _is_simple_snp_allele(&sites[i].ref_allele)
-                        && _is_simple_snp_allele(&sites[i].alt_allele)
-                } else {
-                    true
-                };
-                keep[i] = pass_num && pass_snp;
-            }
-
-            let kept_n = keep.iter().filter(|&&x| x).count();
+            let site_keep: Vec<bool> = row_scan.iter().map(|x| x.keep).collect();
+            let kept_n = site_keep.iter().filter(|&&x| x).count();
             if kept_n == 0 {
                 return Err(
                     "No SNPs left after packed BED filtering. Please relax thresholds."
@@ -2599,7 +3826,23 @@ pub fn prepare_bed_2bit_packed<'py>(
             }
 
             let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep) = if kept_n == n_snps {
-                (packed_full, missing_rate, maf, std_denom, row_flip)
+                let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut maf_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut std_keep = Vec::<f32>::with_capacity(kept_n);
+                let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
+                for rs in row_scan.iter() {
+                    let (miss_v, maf_v, std_v) =
+                        packed_row_stats_from_counts(
+                            n_samples,
+                            rs.non_missing as usize,
+                            rs.alt_sum as usize,
+                        );
+                    miss_keep.push(miss_v);
+                    maf_keep.push(maf_v);
+                    std_keep.push(std_v);
+                    row_flip_keep.push(rs.flip);
+                }
+                (packed_full.to_vec(), miss_keep, maf_keep, std_keep, row_flip_keep)
             } else {
                 let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
                 let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
@@ -2608,17 +3851,24 @@ pub fn prepare_bed_2bit_packed<'py>(
                 let mut row_flip_keep = Vec::<bool>::with_capacity(kept_n);
                 let mut dst = 0usize;
                 for i in 0..n_snps {
-                    if !keep[i] {
+                    if !site_keep[i] {
                         continue;
                     }
+                    let rs = row_scan[i];
                     let src_off = i * bytes_per_snp;
                     let dst_off = dst * bytes_per_snp;
                     packed_keep[dst_off..dst_off + bytes_per_snp]
                         .copy_from_slice(&packed_full[src_off..src_off + bytes_per_snp]);
-                    miss_keep.push(missing_rate[i]);
-                    maf_keep.push(maf[i]);
-                    std_keep.push(std_denom[i]);
-                    row_flip_keep.push(row_flip[i]);
+                    let (miss_v, maf_v, std_v) =
+                        packed_row_stats_from_counts(
+                            n_samples,
+                            rs.non_missing as usize,
+                            rs.alt_sum as usize,
+                        );
+                    miss_keep.push(miss_v);
+                    maf_keep.push(maf_v);
+                    std_keep.push(std_v);
+                    row_flip_keep.push(rs.flip);
                     dst = dst.saturating_add(1);
                 }
                 debug_assert_eq!(dst, kept_n);
@@ -2631,7 +3881,7 @@ pub fn prepare_bed_2bit_packed<'py>(
                 maf_keep,
                 std_keep,
                 row_flip_keep,
-                keep,
+                site_keep,
                 n_samples,
                 n_snps,
                 bytes_per_snp,
@@ -2725,6 +3975,877 @@ pub fn load_bed_u8_matrix<'py>(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     #[allow(deprecated)]
     Ok(PyArray2::from_owned_array(py, mat).into_bound())
+}
+
+struct BedMmapEngine {
+    prefix: String,
+    mmap: Mmap,
+    n_samples: usize,
+    n_snps: usize,
+    bytes_per_snp: usize,
+    cursor: usize,
+}
+
+impl BedMmapEngine {
+    fn open(prefix: &str) -> Result<Self, String> {
+        let bed_prefix = normalize_plink_prefix_local(prefix);
+        if bed_prefix.is_empty() {
+            return Err("prefix must not be empty".to_string());
+        }
+
+        let n_samples = core::read_fam(&bed_prefix)
+            .map_err(|e| e.to_string())?
+            .len();
+        if n_samples == 0 {
+            return Err("no samples found in PLINK FAM input".to_string());
+        }
+        let n_snps_bim = core::read_bim(&bed_prefix)
+            .map_err(|e| e.to_string())?
+            .len();
+
+        let bed_path = format!("{bed_prefix}.bed");
+        let file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+        let _ = mmap.advise(Advice::Sequential);
+        if mmap.len() < 3 {
+            return Err(format!("{bed_path}: file too small for BED header"));
+        }
+        if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+            return Err(format!(
+                "{bed_path}: only SNP-major BED (0x6C 0x1B 0x01) is supported"
+            ));
+        }
+
+        let bytes_per_snp = n_samples.div_ceil(4);
+        if bytes_per_snp == 0 {
+            return Err("invalid BED: bytes_per_snp is zero".to_string());
+        }
+        let payload = mmap.len() - 3;
+        if payload % bytes_per_snp != 0 {
+            return Err(format!(
+                "{bed_path}: invalid BED payload length {}, bytes_per_snp={}",
+                payload, bytes_per_snp
+            ));
+        }
+        let n_snps = payload / bytes_per_snp;
+        if n_snps != n_snps_bim {
+            return Err(format!(
+                "{bed_path}: BED/BIM SNP count mismatch: bed={n_snps}, bim={n_snps_bim}"
+            ));
+        }
+
+        Ok(Self {
+            prefix: bed_prefix,
+            mmap,
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cursor: 0,
+        })
+    }
+
+    #[inline]
+    fn wrapping_checksum(bytes: &[u8]) -> u64 {
+        let mut acc = 0u64;
+        let mut i = 0usize;
+        while i + 8 <= bytes.len() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[i..i + 8]);
+            acc = acc.wrapping_add(u64::from_le_bytes(b));
+            i += 8;
+        }
+        if i < bytes.len() {
+            acc = acc.wrapping_add(load_u64_le_partial(bytes, i));
+        }
+        acc
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn seek(&mut self, snp_index: usize) -> Result<(), String> {
+        if snp_index > self.n_snps {
+            return Err(format!(
+                "snp_index out of range: {snp_index} > n_snps={}",
+                self.n_snps
+            ));
+        }
+        self.cursor = snp_index;
+        Ok(())
+    }
+
+    fn row_bounds(&self, snp_idx: usize) -> Result<(usize, usize), String> {
+        if snp_idx >= self.n_snps {
+            return Err(format!(
+                "snp_index out of range: {snp_idx} >= n_snps={}",
+                self.n_snps
+            ));
+        }
+        let start = 3usize
+            .checked_add(
+                snp_idx
+                    .checked_mul(self.bytes_per_snp)
+                    .ok_or_else(|| "BED row offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "BED row offset overflow".to_string())?;
+        let end = start
+            .checked_add(self.bytes_per_snp)
+            .ok_or_else(|| "BED row end overflow".to_string())?;
+        if end > self.mmap.len() {
+            return Err(format!(
+                "BED row exceeds mmap length: end={}, mmap_len={}",
+                end,
+                self.mmap.len()
+            ));
+        }
+        Ok((start, end))
+    }
+
+    fn row_slice(&self, snp_idx: usize) -> Result<&[u8], String> {
+        let (start, end) = self.row_bounds(snp_idx)?;
+        Ok(&self.mmap[start..end])
+    }
+
+    fn rows_range(
+        &self,
+        start_snp: usize,
+        max_rows: usize,
+    ) -> Result<(usize, usize, usize), String> {
+        if start_snp > self.n_snps {
+            return Err(format!(
+                "start_snp out of range: {start_snp} > n_snps={}",
+                self.n_snps
+            ));
+        }
+        if start_snp == self.n_snps || max_rows == 0 {
+            return Ok((3usize, 3usize, 0usize));
+        }
+
+        let end_snp = std::cmp::min(self.n_snps, start_snp.saturating_add(max_rows));
+        let rows = end_snp.saturating_sub(start_snp);
+        let start_byte = 3usize
+            .checked_add(
+                start_snp
+                    .checked_mul(self.bytes_per_snp)
+                    .ok_or_else(|| "BED byte offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "BED byte offset overflow".to_string())?;
+        let span = rows
+            .checked_mul(self.bytes_per_snp)
+            .ok_or_else(|| "BED row span overflow".to_string())?;
+        let end_byte = start_byte
+            .checked_add(span)
+            .ok_or_else(|| "BED end byte overflow".to_string())?;
+        if end_byte > self.mmap.len() {
+            return Err(format!(
+                "BED slice exceeds mmap length: end_byte={}, mmap_len={}",
+                end_byte,
+                self.mmap.len()
+            ));
+        }
+        Ok((start_byte, end_byte, rows))
+    }
+
+    /// Internal zero-copy slice API (engine-only).
+    fn get_rows_slice(&self, start_snp: usize, max_rows: usize) -> Result<(&[u8], usize), String> {
+        let (start_byte, end_byte, rows) = self.rows_range(start_snp, max_rows)?;
+        if rows == 0 {
+            return Ok((&self.mmap[3..3], 0usize));
+        }
+        Ok((&self.mmap[start_byte..end_byte], rows))
+    }
+
+    fn next_rows_slice(&mut self, max_rows: usize) -> Result<(&[u8], usize), String> {
+        let start = self.cursor;
+        let (start_byte, end_byte, rows) = self.rows_range(start, max_rows)?;
+        self.cursor = start.saturating_add(rows);
+        if rows == 0 {
+            return Ok((&self.mmap[3..3], 0usize));
+        }
+        Ok((&self.mmap[start_byte..end_byte], rows))
+    }
+
+    fn scan_rows_checksum(
+        &mut self,
+        max_rows: usize,
+        block_rows: usize,
+    ) -> Result<(u64, usize, usize), String> {
+        let remaining = self.n_snps.saturating_sub(self.cursor);
+        if remaining == 0 {
+            return Ok((0u64, 0usize, 0usize));
+        }
+        let target = if max_rows == 0 {
+            remaining
+        } else {
+            std::cmp::min(max_rows, remaining)
+        };
+        if target == 0 {
+            return Ok((0u64, 0usize, 0usize));
+        }
+
+        let blk = std::cmp::max(1usize, block_rows);
+        let mut scanned = 0usize;
+        let mut blocks = 0usize;
+        let mut checksum = 0u64;
+
+        while scanned < target {
+            let take = std::cmp::min(blk, target - scanned);
+            let start_snp = self.cursor + scanned;
+            let (slice, got_rows) = self.get_rows_slice(start_snp, take)?;
+            if got_rows != take {
+                return Err(format!(
+                    "BED scan rows mismatch: got_rows={got_rows}, expected={take}"
+                ));
+            }
+            checksum = checksum.wrapping_add(Self::wrapping_checksum(slice));
+            scanned += take;
+            blocks += 1;
+        }
+
+        self.cursor = self.cursor.saturating_add(scanned);
+        Ok((checksum, scanned, blocks))
+    }
+
+    fn random_rows_checksum(&self, snp_indices: Vec<usize>) -> Result<u64, String> {
+        let mut checksum = 0u64;
+        for snp_idx in snp_indices.into_iter() {
+            let row = self.row_slice(snp_idx)?;
+            checksum = checksum.wrapping_add(Self::wrapping_checksum(row));
+        }
+        Ok(checksum)
+    }
+
+    fn scan_rows_qc_counts(
+        &mut self,
+        max_rows: usize,
+        block_rows: usize,
+        parallel: bool,
+    ) -> Result<(u64, u64, u64, usize, usize), String> {
+        let remaining = self.n_snps.saturating_sub(self.cursor);
+        if remaining == 0 {
+            return Ok((0u64, 0u64, 0u64, 0usize, 0usize));
+        }
+        let target = if max_rows == 0 {
+            remaining
+        } else {
+            std::cmp::min(max_rows, remaining)
+        };
+        if target == 0 {
+            return Ok((0u64, 0u64, 0u64, 0usize, 0usize));
+        }
+
+        let blk = std::cmp::max(1usize, block_rows);
+        let mut scanned = 0usize;
+        let mut blocks = 0usize;
+        let mut missing_total = 0u64;
+        let mut het_total = 0u64;
+        let mut hom_alt_total = 0u64;
+        let rows_per_task = 512usize;
+        let task_bytes = std::cmp::max(
+            self.bytes_per_snp,
+            self.bytes_per_snp.saturating_mul(rows_per_task),
+        );
+
+        while scanned < target {
+            let take = std::cmp::min(blk, target - scanned);
+            let start_snp = self.cursor + scanned;
+            let (block_bytes, got_rows) = self.get_rows_slice(start_snp, take)?;
+            if got_rows != take {
+                return Err(format!(
+                    "BED scan rows mismatch: got_rows={got_rows}, expected={take}"
+                ));
+            }
+
+            let (m, h, ha) = if parallel && take >= 128 {
+                block_bytes
+                    .par_chunks(task_bytes)
+                    .map(|super_row| {
+                        let mut m = 0u64;
+                        let mut h = 0u64;
+                        let mut ha = 0u64;
+                        for row in super_row.chunks(self.bytes_per_snp) {
+                            let (xm, xh, xha) = count_packed_row_counts(row, self.n_samples);
+                            m = m.saturating_add(xm as u64);
+                            h = h.saturating_add(xh as u64);
+                            ha = ha.saturating_add(xha as u64);
+                        }
+                        (m, h, ha)
+                    })
+                    .reduce(
+                        || (0u64, 0u64, 0u64),
+                        |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                    )
+            } else {
+                let mut m = 0u64;
+                let mut h = 0u64;
+                let mut ha = 0u64;
+                for row in block_bytes.chunks(self.bytes_per_snp) {
+                    let (xm, xh, xha) = count_packed_row_counts(row, self.n_samples);
+                    m = m.saturating_add(xm as u64);
+                    h = h.saturating_add(xh as u64);
+                    ha = ha.saturating_add(xha as u64);
+                }
+                (m, h, ha)
+            };
+            missing_total = missing_total.saturating_add(m);
+            het_total = het_total.saturating_add(h);
+            hom_alt_total = hom_alt_total.saturating_add(ha);
+            scanned += take;
+            blocks += 1;
+        }
+
+        self.cursor = self.cursor.saturating_add(scanned);
+        Ok((missing_total, het_total, hom_alt_total, scanned, blocks))
+    }
+
+    fn scan_rows_filter_counts(
+        &mut self,
+        maf_threshold: f32,
+        max_missing_rate: f32,
+        het_threshold: f32,
+        max_rows: usize,
+        block_rows: usize,
+        parallel: bool,
+    ) -> Result<(u64, usize, usize), String> {
+        if !(0.0..=0.5).contains(&maf_threshold) {
+            return Err("maf_threshold must be within [0, 0.5]".to_string());
+        }
+        if !(0.0..=1.0).contains(&max_missing_rate) {
+            return Err("max_missing_rate must be within [0, 1.0]".to_string());
+        }
+        if !(0.0..=0.5).contains(&het_threshold) {
+            return Err("het_threshold must be within [0, 0.5]".to_string());
+        }
+
+        let remaining = self.n_snps.saturating_sub(self.cursor);
+        if remaining == 0 {
+            return Ok((0u64, 0usize, 0usize));
+        }
+        let target = if max_rows == 0 {
+            remaining
+        } else {
+            std::cmp::min(max_rows, remaining)
+        };
+        if target == 0 {
+            return Ok((0u64, 0usize, 0usize));
+        }
+
+        let blk = std::cmp::max(1usize, block_rows);
+        let mut scanned = 0usize;
+        let mut blocks = 0usize;
+        let mut kept_total = 0u64;
+        let apply_het_filter = het_threshold > 0.0_f32;
+        let rows_per_task = 512usize;
+        let task_bytes = std::cmp::max(
+            self.bytes_per_snp,
+            self.bytes_per_snp.saturating_mul(rows_per_task),
+        );
+
+        while scanned < target {
+            let take = std::cmp::min(blk, target - scanned);
+            let start_snp = self.cursor + scanned;
+            let (block_bytes, got_rows) = self.get_rows_slice(start_snp, take)?;
+            if got_rows != take {
+                return Err(format!(
+                    "BED scan rows mismatch: got_rows={got_rows}, expected={take}"
+                ));
+            }
+
+            let kept_blk = if parallel && take >= 128 {
+                block_bytes
+                    .par_chunks(task_bytes)
+                    .map(|super_row| {
+                        let mut kept = 0u64;
+                        for row in super_row.chunks(self.bytes_per_snp) {
+                            let (missing, het, hom_alt) =
+                                count_packed_row_counts(row, self.n_samples);
+                            let non_missing = self.n_samples.saturating_sub(missing);
+                            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                            let het_count = if apply_het_filter { het } else { 0usize };
+                            let (keep, _flip) = evaluate_packed_row_keep_and_flip(
+                                self.n_samples,
+                                non_missing,
+                                alt_sum,
+                                het_count,
+                                maf_threshold,
+                                max_missing_rate,
+                                apply_het_filter,
+                                het_threshold,
+                            );
+                            if keep {
+                                kept = kept.saturating_add(1);
+                            }
+                        }
+                        kept
+                    })
+                    .sum::<u64>()
+            } else {
+                let mut kept = 0u64;
+                for row in block_bytes.chunks(self.bytes_per_snp) {
+                    let (missing, het, hom_alt) = count_packed_row_counts(row, self.n_samples);
+                    let non_missing = self.n_samples.saturating_sub(missing);
+                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                    let het_count = if apply_het_filter { het } else { 0usize };
+                    let (keep, _flip) = evaluate_packed_row_keep_and_flip(
+                        self.n_samples,
+                        non_missing,
+                        alt_sum,
+                        het_count,
+                        maf_threshold,
+                        max_missing_rate,
+                        apply_het_filter,
+                        het_threshold,
+                    );
+                    if keep {
+                        kept = kept.saturating_add(1);
+                    }
+                }
+                kept
+            };
+
+            kept_total = kept_total.saturating_add(kept_blk);
+            scanned += take;
+            blocks += 1;
+        }
+
+        self.cursor = self.cursor.saturating_add(scanned);
+        Ok((kept_total, scanned, blocks))
+    }
+
+    fn random_rows_qc_counts(
+        &self,
+        snp_indices: Vec<usize>,
+        parallel: bool,
+    ) -> Result<(u64, u64, u64, usize), String> {
+        if snp_indices.is_empty() {
+            return Ok((0u64, 0u64, 0u64, 0usize));
+        }
+        for &idx in snp_indices.iter() {
+            if idx >= self.n_snps {
+                return Err(format!(
+                    "snp_index out of range: {idx} >= n_snps={}",
+                    self.n_snps
+                ));
+            }
+        }
+        let rows_per_task = 512usize;
+        let (m, h, ha) = if parallel && snp_indices.len() >= 256 {
+            snp_indices
+                .par_chunks(rows_per_task)
+                .map(|idx_chunk| {
+                    let mut m = 0u64;
+                    let mut h = 0u64;
+                    let mut ha = 0u64;
+                    for &idx in idx_chunk.iter() {
+                        let start = 3usize + idx * self.bytes_per_snp;
+                        let end = start + self.bytes_per_snp;
+                        let row = &self.mmap[start..end];
+                        let (xm, xh, xha) = count_packed_row_counts(row, self.n_samples);
+                        m = m.saturating_add(xm as u64);
+                        h = h.saturating_add(xh as u64);
+                        ha = ha.saturating_add(xha as u64);
+                    }
+                    (m, h, ha)
+                })
+                .reduce(
+                    || (0u64, 0u64, 0u64),
+                    |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                )
+        } else {
+            let mut m = 0u64;
+            let mut h = 0u64;
+            let mut ha = 0u64;
+            for idx in snp_indices.iter().copied() {
+                let start = 3usize + idx * self.bytes_per_snp;
+                let end = start + self.bytes_per_snp;
+                let row = &self.mmap[start..end];
+                let (xm, xh, xha) = count_packed_row_counts(row, self.n_samples);
+                m = m.saturating_add(xm as u64);
+                h = h.saturating_add(xh as u64);
+                ha = ha.saturating_add(xha as u64);
+            }
+            (m, h, ha)
+        };
+        Ok((m, h, ha, snp_indices.len()))
+    }
+}
+
+#[pyclass]
+pub struct BedMmapReader {
+    engine: BedMmapEngine,
+}
+
+#[pymethods]
+impl BedMmapReader {
+    #[new]
+    fn new(prefix: String) -> PyResult<Self> {
+        let engine = BedMmapEngine::open(prefix.as_str()).map_err(PyRuntimeError::new_err)?;
+        Ok(Self { engine })
+    }
+
+    fn reset(&mut self) {
+        self.engine.reset();
+    }
+
+    fn seek(&mut self, snp_index: usize) -> PyResult<()> {
+        self.engine.seek(snp_index).map_err(PyIndexError::new_err)
+    }
+
+    fn next_rows_packed<'py>(
+        &mut self,
+        py: Python<'py>,
+        max_rows: usize,
+    ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        let bps = self.engine.bytes_per_snp;
+        let (packed, rows) = self
+            .engine
+            .next_rows_slice(max_rows)
+            .map_err(PyRuntimeError::new_err)?;
+        let mat = Array2::from_shape_vec((rows, bps), packed.to_vec())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        Ok(PyArray2::from_owned_array(py, mat).into_bound())
+    }
+
+    fn read_rows_packed<'py>(
+        &self,
+        py: Python<'py>,
+        start_snp: usize,
+        max_rows: usize,
+    ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        let bps = self.engine.bytes_per_snp;
+        let (packed, rows) = self
+            .engine
+            .get_rows_slice(start_snp, max_rows)
+            .map_err(PyRuntimeError::new_err)?;
+        let mat = Array2::from_shape_vec((rows, bps), packed.to_vec())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        Ok(PyArray2::from_owned_array(py, mat).into_bound())
+    }
+
+    fn get_row_packed<'py>(
+        &self,
+        py: Python<'py>,
+        snp_index: usize,
+    ) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        let row = self
+            .engine
+            .row_slice(snp_index)
+            .map_err(PyIndexError::new_err)?
+            .to_vec();
+        #[allow(deprecated)]
+        Ok(PyArray1::from_owned_array(py, Array1::from_vec(row)).into_bound())
+    }
+
+    #[pyo3(signature = (max_rows=0, block_rows=8192))]
+    fn scan_rows_checksum(
+        &mut self,
+        max_rows: usize,
+        block_rows: usize,
+    ) -> PyResult<(u64, usize, usize)> {
+        self.engine
+            .scan_rows_checksum(max_rows, block_rows)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    fn random_rows_checksum(&self, snp_indices: Vec<usize>) -> PyResult<u64> {
+        self.engine
+            .random_rows_checksum(snp_indices)
+            .map_err(PyIndexError::new_err)
+    }
+
+    #[pyo3(signature = (max_rows=0, block_rows=8192, parallel=true))]
+    fn scan_rows_qc_counts(
+        &mut self,
+        max_rows: usize,
+        block_rows: usize,
+        parallel: bool,
+    ) -> PyResult<(u64, u64, u64, usize, usize)> {
+        self.engine
+            .scan_rows_qc_counts(max_rows, block_rows, parallel)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(signature = (
+        maf_threshold=0.0,
+        max_missing_rate=1.0,
+        het_threshold=0.0,
+        max_rows=0,
+        block_rows=8192,
+        parallel=true,
+    ))]
+    fn scan_rows_filter_counts(
+        &mut self,
+        maf_threshold: f32,
+        max_missing_rate: f32,
+        het_threshold: f32,
+        max_rows: usize,
+        block_rows: usize,
+        parallel: bool,
+    ) -> PyResult<(u64, usize, usize)> {
+        self.engine
+            .scan_rows_filter_counts(
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                max_rows,
+                block_rows,
+                parallel,
+            )
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(signature = (snp_indices, parallel=true))]
+    fn random_rows_qc_counts(
+        &self,
+        snp_indices: Vec<usize>,
+        parallel: bool,
+    ) -> PyResult<(u64, u64, u64, usize)> {
+        self.engine
+            .random_rows_qc_counts(snp_indices, parallel)
+            .map_err(PyIndexError::new_err)
+    }
+
+    #[getter]
+    fn prefix(&self) -> String {
+        self.engine.prefix.clone()
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.engine.n_samples
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.engine.n_snps
+    }
+
+    #[getter]
+    fn bytes_per_snp(&self) -> usize {
+        self.engine.bytes_per_snp
+    }
+
+    #[getter]
+    fn cursor(&self) -> usize {
+        self.engine.cursor
+    }
+}
+
+#[pyclass]
+pub struct NpyMmapReader {
+    path: String,
+    mmap: Mmap,
+    n_rows: usize,
+    n_cols: usize,
+    data_offset: usize,
+    row_bytes: usize,
+    cursor: usize,
+}
+
+impl NpyMmapReader {
+    fn copy_rows_f32(
+        &self,
+        start_row: usize,
+        max_rows: usize,
+    ) -> Result<(Vec<f32>, usize), String> {
+        if start_row > self.n_rows {
+            return Err(format!(
+                "start_row out of range: {start_row} > n_rows={}",
+                self.n_rows
+            ));
+        }
+        if start_row == self.n_rows || max_rows == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let end_row = std::cmp::min(self.n_rows, start_row.saturating_add(max_rows));
+        let rows = end_row.saturating_sub(start_row);
+        let start_byte = self
+            .data_offset
+            .checked_add(
+                start_row
+                    .checked_mul(self.row_bytes)
+                    .ok_or_else(|| "NPY byte offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "NPY byte offset overflow".to_string())?;
+        let span = rows
+            .checked_mul(self.row_bytes)
+            .ok_or_else(|| "NPY row span overflow".to_string())?;
+        let end_byte = start_byte
+            .checked_add(span)
+            .ok_or_else(|| "NPY end byte overflow".to_string())?;
+        if end_byte > self.mmap.len() {
+            return Err(format!(
+                "NPY slice exceeds mmap length: end_byte={}, mmap_len={}",
+                end_byte,
+                self.mmap.len()
+            ));
+        }
+
+        let bytes = &self.mmap[start_byte..end_byte];
+        let total = rows
+            .checked_mul(self.n_cols)
+            .ok_or_else(|| "NPY output size overflow".to_string())?;
+        let mut out = Vec::<f32>::with_capacity(total);
+        for chunk in bytes.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        if out.len() != total {
+            return Err(format!(
+                "NPY decode size mismatch: got {}, expected {}",
+                out.len(),
+                total
+            ));
+        }
+        Ok((out, rows))
+    }
+
+    fn row_bounds(&self, row_idx: usize) -> Result<(usize, usize), String> {
+        if row_idx >= self.n_rows {
+            return Err(format!(
+                "row_index out of range: {row_idx} >= n_rows={}",
+                self.n_rows
+            ));
+        }
+        let start = self
+            .data_offset
+            .checked_add(
+                row_idx
+                    .checked_mul(self.row_bytes)
+                    .ok_or_else(|| "NPY row offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "NPY row offset overflow".to_string())?;
+        let end = start
+            .checked_add(self.row_bytes)
+            .ok_or_else(|| "NPY row end overflow".to_string())?;
+        if end > self.mmap.len() {
+            return Err(format!(
+                "NPY row exceeds mmap length: end={}, mmap_len={}",
+                end,
+                self.mmap.len()
+            ));
+        }
+        Ok((start, end))
+    }
+}
+
+#[pymethods]
+impl NpyMmapReader {
+    #[new]
+    fn new(path: String) -> PyResult<Self> {
+        let file = File::open(&path)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open {path}: {e}")))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to mmap {path}: {e}")))?;
+        let (n_rows, n_cols, data_offset) =
+            parse_npy_f32_header_local(&mmap[..]).map_err(PyRuntimeError::new_err)?;
+        let row_bytes = n_cols
+            .checked_mul(4)
+            .ok_or_else(|| PyRuntimeError::new_err("NPY row byte size overflow"))?;
+
+        Ok(Self {
+            path,
+            mmap,
+            n_rows,
+            n_cols,
+            data_offset,
+            row_bytes,
+            cursor: 0,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn seek(&mut self, row_index: usize) -> PyResult<()> {
+        if row_index > self.n_rows {
+            return Err(PyIndexError::new_err(format!(
+                "row_index out of range: {row_index} > n_rows={}",
+                self.n_rows
+            )));
+        }
+        self.cursor = row_index;
+        Ok(())
+    }
+
+    fn next_rows<'py>(
+        &mut self,
+        py: Python<'py>,
+        max_rows: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let start = self.cursor;
+        let (data, rows) = self
+            .copy_rows_f32(start, max_rows)
+            .map_err(PyRuntimeError::new_err)?;
+        self.cursor = start.saturating_add(rows);
+        let mat = Array2::from_shape_vec((rows, self.n_cols), data)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        Ok(PyArray2::from_owned_array(py, mat).into_bound())
+    }
+
+    fn read_rows<'py>(
+        &self,
+        py: Python<'py>,
+        start_row: usize,
+        max_rows: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let (data, rows) = self
+            .copy_rows_f32(start_row, max_rows)
+            .map_err(PyRuntimeError::new_err)?;
+        let mat = Array2::from_shape_vec((rows, self.n_cols), data)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        #[allow(deprecated)]
+        Ok(PyArray2::from_owned_array(py, mat).into_bound())
+    }
+
+    fn get_row<'py>(
+        &self,
+        py: Python<'py>,
+        row_index: usize,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let (start, end) = self.row_bounds(row_index).map_err(PyIndexError::new_err)?;
+        let bytes = &self.mmap[start..end];
+        let mut row = Vec::<f32>::with_capacity(self.n_cols);
+        for chunk in bytes.chunks_exact(4) {
+            row.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        if row.len() != self.n_cols {
+            return Err(PyRuntimeError::new_err(format!(
+                "NPY row decode size mismatch: got {}, expected {}",
+                row.len(),
+                self.n_cols
+            )));
+        }
+        #[allow(deprecated)]
+        Ok(PyArray1::from_owned_array(py, Array1::from_vec(row)).into_bound())
+    }
+
+    #[getter]
+    fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    #[getter]
+    fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    #[getter]
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    #[getter]
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
 }
 
 #[pyfunction]
@@ -3007,14 +5128,16 @@ impl PlinkStreamWriter {
             .map_err(|e| PyErr::new::<PyIOError, _>(e))?;
 
         // 2) open .bed and write header once (SNP-major)
-        let mut bed = BufWriter::new(
+        let mut bed = BufWriter::with_capacity(
+            8 * 1024 * 1024,
             File::create(&bed_path).map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?,
         );
         bed.write_all(&[0x6C, 0x1B, 0x01])
             .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
 
         // 3) open .bim
-        let bim = BufWriter::new(
+        let bim = BufWriter::with_capacity(
+            4 * 1024 * 1024,
             File::create(&bim_path).map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?,
         );
 
@@ -3062,11 +5185,10 @@ impl PlinkStreamWriter {
 
         // Write BIM lines for this chunk
         for s in sites.iter() {
-            let snp_id = format!("{}_{}", s.chrom, s.pos);
             writeln!(
                 self.bim,
-                "{}\t{}\t0\t{}\t{}\t{}",
-                s.chrom, snp_id, s.pos, s.ref_allele, s.alt_allele
+                "{}\t{}_{}\t0\t{}\t{}\t{}",
+                s.chrom, s.chrom, s.pos, s.pos, s.ref_allele, s.alt_allele
             )
             .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
         }
@@ -3080,12 +5202,12 @@ impl PlinkStreamWriter {
         let s1 = strides[1] as isize; // col stride
         let base = arr.as_ptr(); // *const i8
 
+        let mut row_buf = vec![0u8; bytes_per_snp];
         unsafe {
             for snp in 0..m_chunk {
                 let snp_off = (snp as isize) * s0;
-
                 let mut i = 0usize;
-                for _ in 0..bytes_per_snp {
+                for out_b in 0..bytes_per_snp {
                     let mut byte: u8 = 0;
                     for k in 0..4 {
                         let si = i + k;
@@ -3098,12 +5220,12 @@ impl PlinkStreamWriter {
                         };
                         byte |= two << (k * 2);
                     }
-                    self.bed
-                        .write_all(&[byte])
-                        .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+                    row_buf[out_b] = byte;
                     i += 4;
                 }
-
+                self.bed
+                    .write_all(&row_buf)
+                    .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
                 self.written_snps += 1;
             }
         }

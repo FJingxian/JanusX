@@ -739,14 +739,23 @@ struct PlinkBfileWriter {
     bed: BufWriter<File>,
     n_samples: usize,
     bytes_per_snp: usize,
+    row_buf: Vec<u8>,
 }
 
 impl PlinkBfileWriter {
     fn new(prefix: &str, samples: &[SampleKey]) -> Result<Self, String> {
-        let fam = BufWriter::new(File::create(format!("{prefix}.fam")).map_err(|e| e.to_string())?);
-        let bim = BufWriter::new(File::create(format!("{prefix}.bim")).map_err(|e| e.to_string())?);
-        let mut bed =
-            BufWriter::new(File::create(format!("{prefix}.bed")).map_err(|e| e.to_string())?);
+        let fam = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(format!("{prefix}.fam")).map_err(|e| e.to_string())?,
+        );
+        let bim = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(format!("{prefix}.bim")).map_err(|e| e.to_string())?,
+        );
+        let mut bed = BufWriter::with_capacity(
+            8 * 1024 * 1024,
+            File::create(format!("{prefix}.bed")).map_err(|e| e.to_string())?,
+        );
 
         // SNP-major BED header
         bed.write_all(&[0x6C, 0x1B, 0x01])
@@ -763,6 +772,7 @@ impl PlinkBfileWriter {
 
             let n_samples = samples.len();
             let bytes_per_snp = (n_samples + 3) / 4;
+            let row_buf = vec![0u8; bytes_per_snp];
 
             Ok(Self {
                 fam,
@@ -770,18 +780,19 @@ impl PlinkBfileWriter {
                 bed,
                 n_samples,
                 bytes_per_snp,
+                row_buf,
             })
         }
     }
 
     #[inline]
-    fn encode_row_i8(&self, row: &[i8]) -> Vec<u8> {
+    fn encode_row_i8_into(&mut self, row: &[i8]) {
         // PLINK 2-bit:
         // 00 -> homo A1 (0)
         // 10 -> het    (1)
         // 11 -> homo A2 (2)
         // 01 -> missing
-        let mut out = vec![0u8; self.bytes_per_snp];
+        debug_assert_eq!(self.row_buf.len(), self.bytes_per_snp);
         for byte_idx in 0..self.bytes_per_snp {
             let mut b: u8 = 0;
             for within in 0..4 {
@@ -798,9 +809,8 @@ impl PlinkBfileWriter {
                 };
                 b |= code << (within * 2);
             }
-            out[byte_idx] = b;
+            self.row_buf[byte_idx] = b;
         }
-        out
     }
 
     fn write_site_and_row(
@@ -824,8 +834,10 @@ impl PlinkBfileWriter {
         )
         .map_err(|e| e.to_string())?;
 
-        let bytes = self.encode_row_i8(row_i8);
-        self.bed.write_all(&bytes).map_err(|e| e.to_string())?;
+        self.encode_row_i8_into(row_i8);
+        self.bed
+            .write_all(&self.row_buf)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

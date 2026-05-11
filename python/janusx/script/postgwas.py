@@ -1592,7 +1592,8 @@ def _compute_ld_from_bed_rust(
 
 def _format_bimrange_title(item: tuple[str, int, int]) -> str:
     chrom, start, end = item
-    return _sanitize_plot_text(f"{chrom}:{start / 1_000_000:g}-{end / 1_000_000:g}")
+    # return _sanitize_plot_text(f"{chrom}:{start / 1_000_000:g}-{end / 1_000_000:g}")
+    return _sanitize_plot_text(f"")
 
 
 def _ld_bimrange_spans(

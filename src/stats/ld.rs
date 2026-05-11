@@ -17,8 +17,7 @@ use std::path::Path;
 
 use crate::bedmath::{decode_row_centered_full_lut, packed_byte_lut, packed_pair_lut};
 use crate::blas::{
-    cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_TRANS,
-    CBLAS_UPPER,
+    cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::math_ld::{
     build_bitplanes_u64, build_row_bitplanes_u64_with_aux, classify_ld_pair_by_maf,
@@ -841,9 +840,8 @@ fn ld_r2_matrix_from_packed_rows_bitwise(
                     let ai_j = &bit_a[off_j..off_j + bit_words];
                     let vi_j = &bit_v[off_j..off_j + bit_words];
                     let r2 = if !st_i.has_missing && !st_j.has_missing {
-                        let dot_imp = dot_nomiss_pair_bitplanes(
-                            i, j, &bit_h, &bit_l, bit_words, &bit_masks,
-                        );
+                        let dot_imp =
+                            dot_nomiss_pair_bitplanes(i, j, &bit_h, &bit_l, bit_words, &bit_masks);
                         let cov = dot_imp - n_samples_f * st_i.mean * st_j.mean;
                         let denom_corr = denom * st_i.std * st_j.std;
                         let corr = if denom_corr > 0.0_f64 {
@@ -998,17 +996,21 @@ fn ld_r2_matrix_from_packed_rows(
         LdR2Kernel::Bitwise => {
             ld_r2_matrix_from_packed_rows_bitwise(packed_rows, m, bytes_per_snp, n_samples, threads)
         }
-        LdR2Kernel::Blas => ld_r2_matrix_from_packed_rows_blas(
-            packed_rows,
-            m,
-            bytes_per_snp,
-            n_samples,
-            threads,
-        )
-        .or_else(|e_blas| {
-            ld_r2_matrix_from_packed_rows_bitwise(packed_rows, m, bytes_per_snp, n_samples, threads)
-                .map_err(|e_bw| format!("LD BLAS path failed: {e_blas}; bitwise fallback failed: {e_bw}"))
-        }),
+        LdR2Kernel::Blas => {
+            ld_r2_matrix_from_packed_rows_blas(packed_rows, m, bytes_per_snp, n_samples, threads)
+                .or_else(|e_blas| {
+                    ld_r2_matrix_from_packed_rows_bitwise(
+                        packed_rows,
+                        m,
+                        bytes_per_snp,
+                        n_samples,
+                        threads,
+                    )
+                    .map_err(|e_bw| {
+                        format!("LD BLAS path failed: {e_blas}; bitwise fallback failed: {e_bw}")
+                    })
+                })
+        }
     }
 }
 
@@ -2534,8 +2536,8 @@ pub fn bed_ldblock_r2_rust<'py>(
         return Err(PyRuntimeError::new_err("bfile must not be empty"));
     }
 
-    let bimrange_map = build_bimrange_map(&chrom_ranges, &start_bp, &end_bp)
-        .map_err(map_err_string_to_py)?;
+    let bimrange_map =
+        build_bimrange_map(&chrom_ranges, &start_bp, &end_bp).map_err(map_err_string_to_py)?;
     let selected_sites: Option<HashSet<(String, i64)>> = match (selected_chrom, selected_pos) {
         (None, None) => None,
         (Some(ch), Some(ps)) => {

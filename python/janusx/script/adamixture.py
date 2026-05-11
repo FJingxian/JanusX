@@ -1256,10 +1256,10 @@ def main() -> None:
             f"using {int(resolved_threads)}."
         )
     apply_blas_thread_env(int(resolved_threads))
-    maybe_warn_non_openblas(
-        logger=tmp_logger,
-        strict=require_openblas_by_default(),
-    )
+    # maybe_warn_non_openblas(
+    #     logger=tmp_logger,
+    #     strict=require_openblas_by_default(),
+    # )
     shared_g: Optional[np.ndarray] = None
     if use_geno_cache:
         shared_g = load_genotype_u8_matrix(

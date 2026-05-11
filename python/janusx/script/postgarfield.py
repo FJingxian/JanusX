@@ -308,10 +308,10 @@ def main() -> None:
             f"using {int(args.thread)}."
         )
     apply_blas_thread_env(int(args.thread))
-    maybe_warn_non_openblas(
-        logger=logger,
-        strict=require_openblas_by_default(),
-    )
+    # maybe_warn_non_openblas(
+    #     logger=logger,
+    #     strict=require_openblas_by_default(),
+    # )
 
     emit_cli_configuration(
         logger,

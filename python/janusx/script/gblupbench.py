@@ -3746,7 +3746,7 @@ def main() -> None:
     # Keep CLI-level thread env aligned with --thread and enforce OpenBLAS policy
     # consistently across JanusX entrypoints.
     apply_blas_thread_env(int(args.thread))
-    maybe_warn_non_openblas(strict=require_openblas_by_default())
+    # maybe_warn_non_openblas(strict=require_openblas_by_default())
 
     if args.check:
         checks = _collect_env_checks(engines)

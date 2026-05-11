@@ -48,6 +48,66 @@ from .workflow import (
     should_animate_status,
 )
 
+_WARNED_BED_MMAP_LIMIT_LEGACY = False
+
+
+def _new_bed_chunk_reader_for_stream(
+    *,
+    bed_prefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    sample_ids: list[str],
+    model: str,
+    het_threshold: float,
+    mmap_window_mb: Union[int, None],
+    logger: logging.Logger,
+) -> object:
+    """
+    Construct Rust BedChunkReader for GWAS streaming with optional mmap window.
+
+    Backward compatibility:
+    - Older compiled extensions may not expose `mmap_window_mb` in constructor.
+      In that case we transparently retry without mmap-window and emit one warning.
+    """
+    global _WARNED_BED_MMAP_LIMIT_LEGACY
+
+    base_kwargs = dict(
+        prefix=str(bed_prefix),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        fill_missing=True,
+        sample_ids=list(sample_ids),
+        model=str(model),
+        het_threshold=float(het_threshold),
+    )
+    if mmap_window_mb is not None:
+        base_kwargs["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
+
+    try:
+        return jxrs.BedChunkReader(**base_kwargs)
+    except TypeError as ex:
+        # Extension compatibility fallback: if mmap window kw is unsupported,
+        # retry without it so pipeline can still run.
+        mmap_req = ("mmap_window_mb" in base_kwargs)
+        msg = str(ex).lower()
+        kw_err = ("mmap_window_mb" in msg) or ("unexpected keyword argument" in msg)
+        if (not mmap_req) or (not kw_err):
+            raise
+        legacy_kwargs = dict(base_kwargs)
+        legacy_kwargs.pop("mmap_window_mb", None)
+        reader = jxrs.BedChunkReader(**legacy_kwargs)
+        if not _WARNED_BED_MMAP_LIMIT_LEGACY:
+            _WARNED_BED_MMAP_LIMIT_LEGACY = True
+            _log_file_only(
+                logger,
+                logging.WARNING,
+                (
+                    "BedChunkReader extension does not support mmap_window_mb; "
+                    "--mmap-limit is ignored on this build. Rebuild/reinstall JanusX extension."
+                ),
+            )
+        return reader
+
 
 def _fastlmm_switch_to_lm_decision(
     *,
@@ -154,7 +214,19 @@ def run_chunked_gwas_lmm_lm(
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
             and hasattr(jxrs, "lm_stream_bed_to_tsv")
+            and (not bool(mmap_limit))
         )
+        if (
+            (not can_single_entry)
+            and bool(mmap_limit)
+            and _as_plink_prefix(genofile) is not None
+            and hasattr(jxrs, "lm_stream_bed_to_tsv")
+        ):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "LM route: --mmap-limit enabled, use chunked BedChunkReader path (disable single-entry route).",
+            )
         if can_single_entry:
             _log_file_only(
                 logger,
@@ -729,14 +801,15 @@ def run_chunked_gwas_lmm_lm(
                     raise RuntimeError(
                         "Rust-only GWAS scan requires rust symbol BedChunkReader."
                     )
-                bed_reader = jxrs.BedChunkReader(
-                    str(bed_prefix),
+                bed_reader = _new_bed_chunk_reader_for_stream(
+                    bed_prefix=str(bed_prefix),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
-                    fill_missing=True,
                     sample_ids=sample_sub.tolist(),
                     model=str(genetic_model),
                     het_threshold=float(het_threshold),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    logger=logger,
                 )
                 if not hasattr(bed_reader, "next_chunk_prepared"):
                     raise RuntimeError(
@@ -1455,14 +1528,15 @@ def run_chunked_gwas_streaming_shared(
                     "Rust-only GWAS scan requires rust symbol BedChunkReader."
                 )
             try:
-                bed_reader = jxrs.BedChunkReader(
-                    str(bed_prefix),
+                bed_reader = _new_bed_chunk_reader_for_stream(
+                    bed_prefix=str(bed_prefix),
                     maf_threshold=float(maf_threshold),
                     max_missing_rate=float(max_missing_rate),
-                    fill_missing=True,
                     sample_ids=sample_sub.tolist(),
                     model=str(genetic_model),
                     het_threshold=float(het_threshold),
+                    mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    logger=logger,
                 )
             except Exception as ex:
                 raise RuntimeError(

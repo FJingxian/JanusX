@@ -17,7 +17,7 @@ PCA computation strategy
   - For VCF/BFILE:
       * Build GRM via Rust kernels from PLINK BED/cache.
       * Perform eigendecomposition of GRM via Rust LAPACK backend.
-      * Optional: --rsvd uses Rust streaming randomized SVD directly.
+      * Optional: --rsvd uses Rust memmap-aware randomized SVD directly.
 
   - For GRM:
       * Read the precomputed GRM from .cGRM/.sGRM (.txt/.npy), or legacy .grm.*.
@@ -50,7 +50,6 @@ import multiprocessing as mp
 import tempfile
 import shutil
 import sys
-import threading
 
 import numpy as np
 import pandas as pd
@@ -427,45 +426,19 @@ def _run_with_algo_progress(
     n_snps: Optional[int] = None,
 ):
     t0 = time.monotonic()
-    stop_event = threading.Event()
-    ticker = None
+    suffix = _algo_metrics_suffix(n_samples=n_samples, n_snps=n_snps)
+    status_desc = f"Process of {algo_name}{suffix} ..."
 
     if stdout_is_tty():
-        _print_algo_progress(
-            algo_name,
-            0.0,
-            n_samples=n_samples,
-            n_snps=n_snps,
-        )
-
-        def _tick() -> None:
-            while not stop_event.wait(0.1):
-                _print_algo_progress(
-                    algo_name,
-                    max(0.0, time.monotonic() - t0),
-                    n_samples=n_samples,
-                    n_snps=n_snps,
-                )
-
-        ticker = threading.Thread(target=_tick, daemon=True)
-        ticker.start()
-    elif logger is not None:
-        logger.info(
-            _algo_progress_text(
-                algo_name,
-                0.0,
-                n_samples=n_samples,
-                n_snps=n_snps,
-            )
-        )
-
-    try:
-        return fn(), max(0.0, time.monotonic() - t0)
-    finally:
-        stop_event.set()
-        if ticker is not None:
-            ticker.join(timeout=0.2)
-        _clear_algo_progress_line()
+        with CliStatus(status_desc, enabled=True, use_process=True) as task:
+            try:
+                result = fn()
+            except Exception:
+                task.fail(f"{algo_name}{suffix} ...Failed")
+                raise
+    else:
+        result = fn()
+    return result, max(0.0, time.monotonic() - t0)
 
 
 def _log_saved_eigen_results(logger, outprefix: str) -> None:
@@ -510,14 +483,14 @@ def build_grm_streaming_for_pca(
     maf_threshold: float = 0.02,
     max_missing_rate: float = 0.05,
     chunk_size: int = 100_000,
-    mmap_limit: bool = False,
+    mmap_limit: bool = True,
     inspected_meta: Optional[tuple[list[str], int]] = None,
     logger=None,
     emit_progress_done: bool = True,
     snps_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
-    Construct the GRM in streaming mode via Rust BED kernel
+    Construct the GRM in memmap mode via Rust BED kernel
     and return (GRM, sample_ids, effective_snp_count).
     """
     if not hasattr(jxrs, "grm_stream_bed_f32"):
@@ -545,7 +518,7 @@ def build_grm_streaming_for_pca(
     n_samples = len(sample_ids)
     pbar = ProgressAdapter(
         total=n_snps,
-        desc="GRM (rust-stream)",
+        desc="GRM (rust-memmap)",
         emit_done=bool(emit_progress_done),
         force_animate=True,
     )
@@ -586,7 +559,7 @@ def build_grm_streaming_for_pca(
 
     if int(stream_n_raw) != int(n_samples):
         raise RuntimeError(
-            f"PCA GRM sample count mismatch: stream={int(stream_n_raw)}, expected={int(n_samples)}"
+            f"PCA GRM sample count mismatch: memmap={int(stream_n_raw)}, expected={int(n_samples)}"
         )
     grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float32))
     eff_m = int(eff_m_raw)
@@ -743,7 +716,7 @@ def main(log: bool = True):
     )
     optional_group.add_argument(
         "-mmap-limit", "--mmap-limit", action="store_true", default=False,
-        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
+        help="Enable windowed mmap for BED inputs (default backend; auto: 2x chunk size).",
     )
     optional_group.add_argument(
         "-maf", "--maf", type=float, default=0.02,
@@ -757,7 +730,7 @@ def main(log: bool = True):
     )
     optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=100_000,
-        help="Number of SNPs per chunk for streaming GRM "
+        help="Number of SNPs per chunk for memmap GRM "
              "(default: %(default)s).",
     )
     optional_group.add_argument(
@@ -789,7 +762,7 @@ def main(log: bool = True):
         default=None,
         metavar="RSVD_ARG",
         help=(
-            "Use streaming Rust RSVD for PCA from genotype input. "
+            "Use Rust RSVD for PCA from genotype input (memmap default). "
             "Accepted forms: '-rsvd', '-rsvd 3', or '-rsvd 3 0.1' "
             "(defaults: power=3, tol=0.1)."
         ),
@@ -876,6 +849,8 @@ def main(log: bool = True):
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
+    genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile)
+    mmap_limit_effective = bool(args.mmap_limit or genotype_input_mode)
 
     # Keep index for logging and validate after logger is ready
     palette_idx = int(args.color)
@@ -887,6 +862,8 @@ def main(log: bool = True):
     logger = setup_logging(log_path)
     # Keep algorithm status visible immediately.
     use_spinner = True
+    if genotype_input_mode and (not bool(args.mmap_limit)):
+        logger.info("PCA backend policy: memmap (default).")
 
     if palette_idx == -1:
         args.color = None
@@ -917,7 +894,8 @@ def main(log: bool = True):
                     ("MAF threshold", args.maf),
                     ("Missing rate", args.geno),
                     ("Chunk size", args.chunksize),
-                    ("Mmap limit", args.mmap_limit),
+                    ("BED backend", "memmap (default)"),
+                    ("Mmap limit flag", args.mmap_limit),
                     ("RSVD mode", args.rsvd),
                 ]
             )
@@ -1007,8 +985,9 @@ def main(log: bool = True):
     eigenval = None
     samples = None
 
-    # --- Case 1: VCF / BFILE -> streaming GRM -> PCA (aligned with GWAS) ---
+    # --- Case 1: VCF / BFILE -> memmap GRM -> PCA (aligned with GWAS) ---
     if args.vcf or args.hmp or args.file or args.bfile:
+        load_src_disp = os.path.basename(str(gfile).rstrip("/\\")) or format_path_for_display(str(gfile))
         if bool(args.rsvd):
             rsvd_input = str(gfile)
             txt_force_eig = False
@@ -1035,37 +1014,50 @@ def main(log: bool = True):
                     delimiter=txt_delim,
                     prefer_plink_for_txt=True,
                 )
-            load_src_disp = format_path_for_display(str(gfile))
-            log_success(logger, f"Loading genotype from {load_src_disp}", force_color=True)
 
             algo_name = "Eigen-Decomposition" if txt_force_eig else "Random-SVD"
             if txt_force_eig:
-                meta_sample_ids, meta_n_snps = inspect_genotype_file(rsvd_input)
-                algo_n = int(len(meta_sample_ids))
-                algo_snp = int(meta_n_snps)
-
-                def _run_txt_force_eig():
-                    grm, samples_local, snp_local = build_grm_streaming_for_pca(
-                        genofile=rsvd_input,
-                        maf_threshold=args.maf,
-                        max_missing_rate=args.geno,
-                        chunk_size=int(args.chunksize),
-                        mmap_limit=args.mmap_limit,
-                        inspected_meta=(meta_sample_ids, meta_n_snps),
-                        logger=None,
-                        emit_progress_done=False,
-                        snps_only=bool(rsvd_snps_only),
+                meta_sample_ids, meta_n_snps = inspect_genotype_file(
+                    rsvd_input,
+                    snps_only=bool(rsvd_snps_only),
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
+                )
+                with CliStatus(
+                    f"Loading genotype from {load_src_disp}...",
+                    enabled=use_spinner,
+                    use_process=True,
+                ) as task:
+                    try:
+                        grm, samples, algo_snp = build_grm_streaming_for_pca(
+                            genofile=rsvd_input,
+                            maf_threshold=args.maf,
+                            max_missing_rate=args.geno,
+                            chunk_size=int(args.chunksize),
+                            mmap_limit=mmap_limit_effective,
+                            inspected_meta=(meta_sample_ids, meta_n_snps),
+                            logger=None,
+                            emit_progress_done=False,
+                            snps_only=bool(rsvd_snps_only),
+                        )
+                    except Exception:
+                        task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                        raise
+                    algo_n = int(len(samples))
+                    task.complete(
+                        f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
                     )
-                    eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
-                    _ = snp_local
-                    return eigenvec_local, eigenval_local, samples_local
 
-                (eigenvec, eigenval, samples), algo_elapsed_s = _run_with_algo_progress(
+                def _run_txt_force_eig_only():
+                    eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
+                    return eigenvec_local, eigenval_local
+
+                (eigenvec, eigenval), algo_elapsed_s = _run_with_algo_progress(
                     algo_name,
-                    _run_txt_force_eig,
+                    _run_txt_force_eig_only,
                     logger=logger,
                     n_samples=algo_n,
-                    n_snps=algo_snp,
+                    n_snps=int(algo_snp),
                 )
             else:
                 if not hasattr(jxrs, "admx_rsvd_stream_sample"):
@@ -1073,39 +1065,34 @@ def main(log: bool = True):
                         "Rust extension is missing admx_rsvd_stream_sample. "
                         "Rebuild/install JanusX extension first."
                     )
-                sample_ids, _n_snps_total = inspect_genotype_file(rsvd_input)
-                samples = np.asarray(sample_ids, dtype=str)
-                algo_n = int(samples.shape[0])
-                algo_snp = _count_effective_snps_from_input(
-                    str(rsvd_input),
-                    maf_threshold=float(args.maf),
-                    max_missing_rate=float(args.geno),
-                    snps_only=bool(rsvd_snps_only),
-                    chunk_size=int(args.chunksize),
-                )
+                with CliStatus(
+                    f"Loading genotype from {load_src_disp}...",
+                    enabled=use_spinner,
+                    use_process=True,
+                ) as task:
+                    try:
+                        sample_ids, algo_snp = inspect_genotype_file(
+                            rsvd_input,
+                            snps_only=bool(rsvd_snps_only),
+                            maf=float(args.maf),
+                            missing_rate=float(args.geno),
+                        )
+                        samples = np.asarray(sample_ids, dtype=str)
+                    except Exception:
+                        task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                        raise
+                    algo_n = int(samples.shape[0])
+                    task.complete(
+                        f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
+                    )
+
                 mmap_window_mb = (
                     auto_mmap_window_mb(rsvd_input, len(samples), int(algo_snp), int(args.chunksize))
-                    if args.mmap_limit else None
+                    if mmap_limit_effective else None
                 )
-                if stdout_is_tty():
-                    _print_algo_progress(
-                        algo_name,
-                        0.0,
-                        n_samples=algo_n,
-                        n_snps=algo_snp,
-                    )
-                else:
-                    logger.info(
-                        _algo_progress_text(
-                            algo_name,
-                            0.0,
-                            n_samples=algo_n,
-                            n_snps=algo_snp,
-                        )
-                    )
-                algo_t0 = time.monotonic()
-                try:
-                    eigenval, eigenvec = _run_rsvd_subprocess(
+
+                def _run_rsvd_only():
+                    return _run_rsvd_subprocess(
                         genotype_path=str(rsvd_input),
                         dim=int(args.dim),
                         seed=int(args.rsvd_seed),
@@ -1116,18 +1103,16 @@ def main(log: bool = True):
                         missing_rate=float(args.geno),
                         mmap_window_mb=int(mmap_window_mb) if mmap_window_mb is not None else 0,
                         force_packed_bed=bool(_is_plink_prefix_path(rsvd_input)),
-                        progress_callback=(
-                            lambda sec: _print_algo_progress(
-                                algo_name,
-                                sec,
-                                n_samples=algo_n,
-                                n_snps=algo_snp,
-                            )
-                        ),
+                        progress_callback=None,
                     )
-                finally:
-                    _clear_algo_progress_line()
-                algo_elapsed_s = max(0.0, time.monotonic() - algo_t0)
+
+                (eigenval, eigenvec), algo_elapsed_s = _run_with_algo_progress(
+                    algo_name,
+                    _run_rsvd_only,
+                    logger=logger,
+                    n_samples=algo_n,
+                    n_snps=int(algo_snp),
+                )
                 if eigenvec.shape[0] != samples.shape[0]:
                     samples = samples[: eigenvec.shape[0]]
             log_success(
@@ -1137,34 +1122,41 @@ def main(log: bool = True):
                 force_color=True,
             )
         else:
-            load_src_disp = format_path_for_display(str(gfile))
-            log_success(logger, f"Loading genotype from {load_src_disp}", force_color=True)
-            meta_sample_ids, meta_n_snps = inspect_genotype_file(gfile)
-            algo_n = int(len(meta_sample_ids))
-            algo_snp = int(meta_n_snps)
-
-            def _run_streaming_eig():
-                grm, samples_local, snp_local = build_grm_streaming_for_pca(
-                    genofile=gfile,
-                    maf_threshold=args.maf,
-                    max_missing_rate=args.geno,
-                    chunk_size=int(args.chunksize),
-                    mmap_limit=args.mmap_limit,
-                    inspected_meta=(meta_sample_ids, meta_n_snps),
-                    logger=None,
-                    emit_progress_done=False,
-                    snps_only=bool(args.vcf),
+            with CliStatus(
+                f"Loading genotype from {load_src_disp}...",
+                enabled=use_spinner,
+                use_process=True,
+            ) as task:
+                try:
+                    grm, samples, algo_snp = build_grm_streaming_for_pca(
+                        genofile=gfile,
+                        maf_threshold=args.maf,
+                        max_missing_rate=args.geno,
+                        chunk_size=int(args.chunksize),
+                        mmap_limit=mmap_limit_effective,
+                        inspected_meta=None,
+                        logger=None,
+                        emit_progress_done=False,
+                        snps_only=bool(args.vcf),
+                    )
+                except Exception:
+                    task.fail(f"Loading genotype from {load_src_disp} ...Failed")
+                    raise
+                algo_n = int(len(samples))
+                task.complete(
+                    f"Loading genotype from {load_src_disp} (n={algo_n}, nSNP={int(algo_snp)})"
                 )
-                eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
-                _ = snp_local
-                return eigenvec_local, eigenval_local, samples_local
 
-            (eigenvec, eigenval, samples), algo_elapsed_s = _run_with_algo_progress(
+            def _run_memmap_eig_only():
+                eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
+                return eigenvec_local, eigenval_local
+
+            (eigenvec, eigenval), algo_elapsed_s = _run_with_algo_progress(
                 "Eigen-Decomposition",
-                _run_streaming_eig,
+                _run_memmap_eig_only,
                 logger=logger,
                 n_samples=algo_n,
-                n_snps=algo_snp,
+                n_snps=int(algo_snp),
             )
             log_success(
                 logger,

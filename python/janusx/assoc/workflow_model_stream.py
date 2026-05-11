@@ -49,6 +49,7 @@ from .workflow import (
 )
 
 _WARNED_BED_MMAP_LIMIT_LEGACY = False
+_WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
 
 
 def _new_bed_chunk_reader_for_stream(
@@ -65,9 +66,9 @@ def _new_bed_chunk_reader_for_stream(
     """
     Construct Rust BedChunkReader for GWAS streaming with optional mmap window.
 
-    Backward compatibility:
-    - Older compiled extensions may not expose `mmap_window_mb` in constructor.
-      In that case we transparently retry without mmap-window and emit one warning.
+    Rust-only strict mode:
+    - `mmap_window_mb` support must exist when requested.
+    - No Python-side fallback is allowed.
     """
     global _WARNED_BED_MMAP_LIMIT_LEGACY
 
@@ -86,27 +87,61 @@ def _new_bed_chunk_reader_for_stream(
     try:
         return jxrs.BedChunkReader(**base_kwargs)
     except TypeError as ex:
-        # Extension compatibility fallback: if mmap window kw is unsupported,
-        # retry without it so pipeline can still run.
         mmap_req = ("mmap_window_mb" in base_kwargs)
         msg = str(ex).lower()
         kw_err = ("mmap_window_mb" in msg) or ("unexpected keyword argument" in msg)
-        if (not mmap_req) or (not kw_err):
-            raise
-        legacy_kwargs = dict(base_kwargs)
-        legacy_kwargs.pop("mmap_window_mb", None)
-        reader = jxrs.BedChunkReader(**legacy_kwargs)
-        if not _WARNED_BED_MMAP_LIMIT_LEGACY:
-            _WARNED_BED_MMAP_LIMIT_LEGACY = True
-            _log_file_only(
-                logger,
-                logging.WARNING,
-                (
-                    "BedChunkReader extension does not support mmap_window_mb; "
-                    "--mmap-limit is ignored on this build. Rebuild/reinstall JanusX extension."
-                ),
-            )
-        return reader
+        if mmap_req and kw_err:
+            raise RuntimeError(
+                "Rust-only GWAS mode requires BedChunkReader(..., mmap_window_mb=...) support. "
+                "Rebuild/reinstall JanusX extension."
+            ) from ex
+        raise
+
+
+def _bed_next_chunk_prepared_compat(
+    *,
+    bed_reader: object,
+    chunk_size: int,
+    coding: str,
+    snps_only: bool,
+    logger: logging.Logger,
+) -> tuple[object, bool]:
+    """
+    Call BedChunkReader.next_chunk_prepared with snps_only (strict Rust-only).
+
+    Returns (out, False). The second value is kept for API compatibility.
+    """
+    global _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY
+    try:
+        out = bed_reader.next_chunk_prepared(
+            int(chunk_size),
+            coding=str(coding),
+            snps_only=bool(snps_only),
+        )
+        return out, False
+    except TypeError as ex:
+        msg = str(ex).lower()
+        kw_err = ("snps_only" in msg) and (
+            "unexpected keyword argument" in msg
+            or "got an unexpected keyword argument" in msg
+        )
+        if kw_err:
+            raise RuntimeError(
+                "Rust-only GWAS mode requires BedChunkReader.next_chunk_prepared(..., snps_only=...). "
+                "Rebuild/reinstall JanusX extension."
+            ) from ex
+        raise
+
+
+def _filter_snps_only_chunk_python_fallback(
+    *,
+    geno_center: np.ndarray,
+    maf_chunk: np.ndarray,
+    sites: list[object],
+) -> tuple[np.ndarray, np.ndarray, list[object]]:
+    raise RuntimeError(
+        "Rust-only GWAS mode disables Python snps_only chunk fallback."
+    )
 
 
 def _fastlmm_switch_to_lm_decision(
@@ -187,6 +222,10 @@ def run_chunked_gwas_lmm_lm(
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
     """
+    raise RuntimeError(
+        "Rust-only GWAS mode disables Python streaming GWAS orchestrator "
+        "(run_chunked_gwas_lmm_lm). Use Rust packed/fullrank routes."
+    )
     model_map = {
         "lmm": LMM,
         "lm": LM,
@@ -214,24 +253,13 @@ def run_chunked_gwas_lmm_lm(
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
             and hasattr(jxrs, "lm_stream_bed_to_tsv")
-            and (not bool(mmap_limit))
         )
-        if (
-            (not can_single_entry)
-            and bool(mmap_limit)
-            and _as_plink_prefix(genofile) is not None
-            and hasattr(jxrs, "lm_stream_bed_to_tsv")
-        ):
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "LM route: --mmap-limit enabled, use chunked BedChunkReader path (disable single-entry route).",
-            )
         if can_single_entry:
             _log_file_only(
                 logger,
                 logging.INFO,
-                "LM route: using rust single-entry BED streaming pipeline.",
+                "LM route: using rust single-entry BED streaming pipeline "
+                "(mmap window supported by default memmap backend; --mmap-limit keeps this explicit).",
             )
             run_lm_stream_bed_single_entry(
                 genofile=genofile,
@@ -257,6 +285,7 @@ def run_chunked_gwas_lmm_lm(
                 trait_names=trait_names,
                 emit_trait_header=emit_trait_header,
                 chunk_size_user_set=bool(chunk_size_user_set),
+                mmap_limit=bool(mmap_limit),
             )
             return
         packed_fullrust_enabled = bool(prefer_packed_fullrust)
@@ -647,10 +676,7 @@ def run_chunked_gwas_lmm_lm(
             scan_warmup_task.__enter__()
             scan_warmup_active = True
 
-        inflight: dict[
-            int,
-            tuple[cf.Future, int, list[tuple[str, int, str, str]], np.ndarray],
-        ] = {}
+        inflight: dict[int, tuple[cf.Future, int, object, np.ndarray]] = {}
         chunk_seq = 0
         interrupted = False
 
@@ -702,7 +728,16 @@ def run_chunked_gwas_lmm_lm(
             def wrote_header(self) -> bool:
                 return bool(self._wrote_header)
 
-        writer = _ChunkBatchWriter(str(tmp_tsv), batch_chunks=8)
+        use_rust_assoc_writer = bool(hasattr(jxrs, "GwasAssocTsvWriter"))
+        if not use_rust_assoc_writer:
+            raise RuntimeError(
+                "Rust-only GWAS mode requires GwasAssocTsvWriter symbol. "
+                "Rebuild/reinstall JanusX extension."
+            )
+        writer: object = jxrs.GwasAssocTsvWriter(
+            str(tmp_tsv),
+            genetic_model=str(genetic_model),
+        )
 
         def _format_chunk_tsv_text(
             results: np.ndarray,
@@ -754,19 +789,26 @@ def run_chunked_gwas_lmm_lm(
             done_seq = sorted(
                 [
                     seq
-                    for seq, (fut, _m, _info, _maf) in inflight.items()
+                    for seq, (fut, _m, _meta, _maf) in inflight.items()
                     if fut in done_set
                 ]
             )
             for seq in done_seq:
-                fut, m_chunk, info_chunk, maf_chunk = inflight.pop(seq)
+                fut, m_chunk, meta_chunk, maf_chunk = inflight.pop(seq)
                 results = fut.result()
-                chunk_text, has_plrt, n_rows = _format_chunk_tsv_text(
-                    results,
-                    info_chunk,
-                    maf_chunk,
-                )
-                writer.append(chunk_text, has_plrt=has_plrt, rows=n_rows)
+                if use_rust_assoc_writer:
+                    writer.write_chunk(
+                        meta_chunk,
+                        np.asarray(maf_chunk, dtype=np.float32),
+                        np.asarray(results, dtype=np.float64),
+                    )
+                else:
+                    chunk_text, has_plrt, n_rows = _format_chunk_tsv_text(
+                        results,
+                        meta_chunk,
+                        maf_chunk,
+                    )
+                    writer.append(chunk_text, has_plrt=has_plrt, rows=n_rows)
                 done_snps += int(m_chunk)
                 if pbar is None:
                     if scan_warmup_active and scan_warmup_task is not None:
@@ -816,14 +858,13 @@ def run_chunked_gwas_lmm_lm(
                         "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
                     )
 
-                def _is_simple_allele_token(a: object) -> bool:
-                    s = str(a).strip().upper()
-                    return (len(s) == 1) and (s in {"A", "C", "G", "T"})
-
                 while True:
-                    out = bed_reader.next_chunk_prepared(
-                        int(model_chunk_size),
+                    out, legacy_snps_only = _bed_next_chunk_prepared_compat(
+                        bed_reader=bed_reader,
+                        chunk_size=int(model_chunk_size),
                         coding=str(genetic_model),
+                        snps_only=bool(snps_only),
+                        logger=logger,
                     )
                     if out is None:
                         break
@@ -833,40 +874,27 @@ def run_chunked_gwas_lmm_lm(
                         dtype=np.float32,
                     )
                     maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
-
-                    if bool(snps_only):
-                        keep = np.fromiter(
-                            (
-                                (
-                                    _is_simple_allele_token(getattr(s, "ref_allele", ""))
-                                    and _is_simple_allele_token(getattr(s, "alt_allele", ""))
-                                )
-                                for s in sites
-                            ),
-                            dtype=np.bool_,
-                            count=len(sites),
+                    if legacy_snps_only and bool(snps_only):
+                        geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
+                            geno_center=geno_center,
+                            maf_chunk=maf_chunk,
+                            sites=sites,
                         )
-                        if not np.any(keep):
-                            continue
-                        if not bool(np.all(keep)):
-                            ridx = np.flatnonzero(keep)
-                            geno_center = geno_center[ridx, :]
-                            maf_chunk = maf_chunk[ridx]
-                            sites = [sites[int(i)] for i in ridx.tolist()]
 
                     m_chunk = int(geno_center.shape[0])
                     if m_chunk == 0:
                         continue
 
-                    info_chunk = [
-                        (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
-                        for s in sites
-                    ]
-                    if len(info_chunk) == 0:
+                    if len(sites) == 0:
                         continue
+                    meta_chunk: object
+                    if use_rust_assoc_writer:
+                        meta_chunk = sites
+                    else:
+                        raise RuntimeError("Rust-only GWAS mode requires Rust TSV writer path.")
 
                     fut = ex.submit(mod.gwas, geno_center, threads=threads_per_worker)
-                    inflight[chunk_seq] = (fut, int(m_chunk), info_chunk, maf_chunk)
+                    inflight[chunk_seq] = (fut, int(m_chunk), meta_chunk, maf_chunk)
                     chunk_seq += 1
 
                     if len(inflight) >= max_inflight:
@@ -877,13 +905,17 @@ def run_chunked_gwas_lmm_lm(
                 while len(inflight) > 0:
                     _drain_completed(wait_for_one=True)
                 writer.flush()
-                wrote_header = bool(writer.wrote_header)
-                has_results = int(writer.rows_written) > 0
+                if use_rust_assoc_writer:
+                    has_results = int(writer.rows_written) > 0
+                    wrote_header = bool(has_results)
+                else:
+                    wrote_header = bool(writer.wrote_header)
+                    has_results = int(writer.rows_written) > 0
                 if pbar is not None:
                     pbar.finish()
             except KeyboardInterrupt:
                 interrupted = True
-                for fut, _m, _info, _maf in inflight.values():
+                for fut, _m, _meta, _maf in inflight.values():
                     try:
                         fut.cancel()
                     except Exception:
@@ -900,6 +932,10 @@ def run_chunked_gwas_lmm_lm(
                 if pbar is not None:
                     pbar.close(show_done=False)
                 ex.shutdown(wait=False, cancel_futures=True)
+                try:
+                    writer.close()
+                except Exception:
+                    pass
                 if interrupted and os.path.exists(tmp_tsv):
                     try:
                         os.remove(tmp_tsv)
@@ -1038,6 +1074,10 @@ def run_chunked_gwas_streaming_shared(
     Decode/filter each chunk once, then run all selected streaming models on the
     same chunk before moving to the next chunk.
     """
+    raise RuntimeError(
+        "Rust-only GWAS mode disables Python shared streaming GWAS orchestrator "
+        "(run_chunked_gwas_streaming_shared). Use Rust packed/fullrank routes."
+    )
     model_order = [str(m).lower() for m in model_names]
     model_map = {"lmm": LMM, "lm": LM, "fastlmm": FastLMM}
     model_order = [m for m in model_order if m in model_map]
@@ -1134,6 +1174,13 @@ def run_chunked_gwas_streaming_shared(
         het_rate[idx] = het_count[idx] / non_missing[idx]
         keep &= (het_rate >= het) & (het_rate <= (1.0 - het))
         return keep
+
+    use_rust_assoc_writer = bool(hasattr(jxrs, "GwasAssocTsvWriter"))
+    if not use_rust_assoc_writer:
+        raise RuntimeError(
+            "Rust-only GWAS mode requires GwasAssocTsvWriter symbol. "
+            "Rebuild/reinstall JanusX extension."
+        )
 
     class _ChunkBatchWriter:
         """
@@ -1262,7 +1309,10 @@ def run_chunked_gwas_streaming_shared(
             "writer": None,
             "init_log": None,
         }
-        ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
+        ctx["writer"] = jxrs.GwasAssocTsvWriter(
+            str(ctx["tmp_tsv"]),
+            genetic_model=str(genetic_model),
+        )
 
         cpu_before = process.cpu_times()
         init_t0 = time.monotonic()
@@ -1343,7 +1393,10 @@ def run_chunked_gwas_streaming_shared(
                 f"{out_base}.tsv.tmp.{os.getpid()}.{uuid.uuid4().hex}"
             )
             ctx["out_tsv"] = f"{out_base}.tsv"
-            ctx["writer"] = _ChunkBatchWriter(str(ctx["tmp_tsv"]), batch_chunks=8)
+            ctx["writer"] = jxrs.GwasAssocTsvWriter(
+                str(ctx["tmp_tsv"]),
+                genetic_model=str(genetic_model),
+            )
         ctx["mod"] = mod
         model_ctxs.append(ctx)
 
@@ -1482,11 +1535,7 @@ def run_chunked_gwas_streaming_shared(
         m_chunk = int(np.asarray(geno_center).shape[0])
         if m_chunk == 0:
             return
-        info_chunk = [
-            (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
-            for s in sites
-        ]
-        if len(info_chunk) == 0:
+        if len(sites) == 0:
             return
 
         for ctx in model_ctxs:
@@ -1500,11 +1549,24 @@ def run_chunked_gwas_streaming_shared(
                 (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
             )
 
-            chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
             writer = ctx.get("writer")
             if writer is None:
                 raise RuntimeError("Internal error: shared GWAS writer not initialized.")
-            writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
+            if use_rust_assoc_writer:
+                writer.write_chunk(
+                    sites,
+                    np.asarray(maf_chunk, dtype=np.float32),
+                    np.asarray(results, dtype=np.float64),
+                )
+            else:
+                info_chunk = [
+                    (str(s.chrom), int(s.pos), str(s.ref_allele), str(s.alt_allele))
+                    for s in sites
+                ]
+                if len(info_chunk) == 0:
+                    continue
+                chunk_text, has_plrt = _format_chunk_tsv_text(results, info_chunk, maf_chunk)
+                writer.append(chunk_text, has_plrt=bool(has_plrt), rows=m_chunk)
             ctx["has_results"] = True
 
             mem_info = process.memory_info()
@@ -1552,39 +1614,25 @@ def run_chunked_gwas_streaming_shared(
                 "Shared GWAS scan: using Rust BED prepared-chunk stream.",
             )
 
-            def _is_simple_allele_token(a: object) -> bool:
-                s = str(a).strip().upper()
-                return (len(s) == 1) and (s in {"A", "C", "G", "T"})
-
             while True:
-                out = bed_reader.next_chunk_prepared(
-                    int(model_chunk_size),
+                out, legacy_snps_only = _bed_next_chunk_prepared_compat(
+                    bed_reader=bed_reader,
+                    chunk_size=int(model_chunk_size),
                     coding=str(genetic_model),
+                    snps_only=bool(snps_only),
+                    logger=logger,
                 )
                 if out is None:
                     break
                 geno_center_raw, sites, maf_chunk_raw = out
                 geno_center = np.asarray(geno_center_raw, dtype=np.float32)
                 maf_chunk = np.asarray(maf_chunk_raw, dtype=np.float32).reshape(-1)
-                if bool(snps_only):
-                    keep = np.fromiter(
-                        (
-                            (
-                                _is_simple_allele_token(getattr(s, "ref_allele", ""))
-                                and _is_simple_allele_token(getattr(s, "alt_allele", ""))
-                            )
-                            for s in sites
-                        ),
-                        dtype=np.bool_,
-                        count=len(sites),
+                if legacy_snps_only and bool(snps_only):
+                    geno_center, maf_chunk, sites = _filter_snps_only_chunk_python_fallback(
+                        geno_center=geno_center,
+                        maf_chunk=maf_chunk,
+                        sites=sites,
                     )
-                    if not np.any(keep):
-                        continue
-                    if not bool(np.all(keep)):
-                        ridx = np.flatnonzero(keep)
-                        geno_center = geno_center[ridx, :]
-                        maf_chunk = maf_chunk[ridx]
-                        sites = [sites[int(i)] for i in ridx.tolist()]
                 geno_center = np.ascontiguousarray(geno_center, dtype=np.float32)
                 _consume_chunk(geno_center=geno_center, sites=sites, maf_chunk=maf_chunk)
 
@@ -1592,8 +1640,12 @@ def run_chunked_gwas_streaming_shared(
                 writer = ctx.get("writer")
                 if writer is not None:
                     writer.flush()
-                    ctx["wrote_header"] = bool(writer.wrote_header)
-                    ctx["has_results"] = int(writer.rows_written) > 0
+                    if use_rust_assoc_writer:
+                        ctx["has_results"] = int(writer.rows_written) > 0
+                        ctx["wrote_header"] = bool(ctx["has_results"])
+                    else:
+                        ctx["wrote_header"] = bool(writer.wrote_header)
+                        ctx["has_results"] = int(writer.rows_written) > 0
 
             first_done = 0
             if progress_started:
@@ -1630,6 +1682,12 @@ def run_chunked_gwas_streaming_shared(
                 if pbar_obj is not None:
                     try:
                         pbar_obj.close(show_done=False)
+                    except Exception:
+                        pass
+                writer_obj = ctx.get("writer")
+                if writer_obj is not None:
+                    try:
+                        writer_obj.close()
                     except Exception:
                         pass
                 if interrupted:

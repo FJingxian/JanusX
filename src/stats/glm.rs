@@ -335,6 +335,7 @@ fn decode_plink_dosage_with_mean(code: u8, mean_g: f64, flip: bool) -> f64 {
     threads=0,
     progress_callback=None,
     progress_every=0,
+    mmap_window_mb=None,
 ))]
 pub fn lm_stream_bed_to_tsv(
     py: Python<'_>,
@@ -353,6 +354,7 @@ pub fn lm_stream_bed_to_tsv(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<(usize, usize)> {
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be > 0"));
@@ -377,6 +379,11 @@ pub fn lm_stream_bed_to_tsv(
         return Err(PyValueError::new_err(
             "genetic_model must be one of: add, dom, rec, het",
         ));
+    }
+    if let Some(window_mb) = mmap_window_mb {
+        if window_mb == 0 {
+            return Err(PyValueError::new_err("mmap_window_mb must be > 0"));
+        }
     }
 
     let y = y.as_slice()?;
@@ -421,8 +428,13 @@ pub fn lm_stream_bed_to_tsv(
     let dim = q0 + 1;
 
     let norm_prefix = normalize_plink_prefix_local(&prefix);
-    let it = BedSnpIter::new_with_fill(&norm_prefix, 0.0, 1.0, false, false, 0.02)
-        .map_err(PyRuntimeError::new_err)?;
+    let mut it = if let Some(window_mb) = mmap_window_mb {
+        BedSnpIter::new_with_fill_window(&norm_prefix, 0.0, 1.0, false, false, 0.02, window_mb)
+            .map_err(PyRuntimeError::new_err)?
+    } else {
+        BedSnpIter::new_with_fill(&norm_prefix, 0.0, 1.0, false, false, 0.02)
+            .map_err(PyRuntimeError::new_err)?
+    };
     let (sample_indices, _sample_ids_ordered) =
         build_sample_selection(&it.samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
     if sample_indices.len() != n {
@@ -433,6 +445,7 @@ pub fn lm_stream_bed_to_tsv(
     }
     let full_samples = sample_indices.len() == it.n_samples();
     let total_snp_hint = it.n_snps();
+    let windowed_mode = it.is_windowed();
 
     let out_tsv_path = out_tsv.clone();
 
@@ -525,8 +538,7 @@ pub fn lm_stream_bed_to_tsv(
             if scan_idx >= total_scan {
                 break;
             }
-            let end_idx = (scan_idx + chunk_size).min(total_scan);
-            let batch_len = end_idx.saturating_sub(scan_idx);
+            let batch_len = (chunk_size).min(total_scan.saturating_sub(scan_idx));
             seen_total = seen_total.saturating_add(batch_len);
             if let Some(cb) = progress_callback.as_ref() {
                 if seen_total >= next_progress_emit {
@@ -545,8 +557,26 @@ pub fn lm_stream_bed_to_tsv(
                 }
             }
 
-            let decoded: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = if let Some(p) = &pool {
+            let decoded: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = if windowed_mode {
+                let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = Vec::with_capacity(batch_len);
+                for _ in 0..batch_len {
+                    let maybe = if full_samples {
+                        it.next_snp_raw()
+                    } else {
+                        it.next_snp_selected_raw(&sample_indices)
+                    };
+                    if let Some((row_sub, site)) = maybe {
+                        if let Some(ok) = prepare_row(row_sub, site) {
+                            tmp.push(ok);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                tmp
+            } else if let Some(p) = &pool {
                 p.install(|| {
+                    let end_idx = (scan_idx + batch_len).min(total_scan);
                     (scan_idx..end_idx)
                         .into_par_iter()
                         .filter_map(|snp_idx| {
@@ -561,6 +591,7 @@ pub fn lm_stream_bed_to_tsv(
                 })
             } else {
                 let mut tmp: Vec<(Vec<f32>, gfcore::SiteInfo, f32)> = Vec::with_capacity(batch_len);
+                let end_idx = (scan_idx + batch_len).min(total_scan);
                 for snp_idx in scan_idx..end_idx {
                     let maybe = if full_samples {
                         it.get_snp_row_raw(snp_idx)
@@ -575,7 +606,7 @@ pub fn lm_stream_bed_to_tsv(
                 }
                 tmp
             };
-            scan_idx = end_idx;
+            scan_idx = scan_idx.saturating_add(batch_len);
 
             for (row_sub, site, maf_val) in decoded.into_iter() {
                 chunk_rows.extend_from_slice(&row_sub);

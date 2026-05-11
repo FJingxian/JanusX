@@ -33,11 +33,14 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _trait_values_and_mask,
+    auto_mmap_window_mb,
     detect_effective_threads,
     format_elapsed,
     jxrs,
     prepare_packed_ctx_from_plink,
 )
+
+_WARNED_LM_STREAM_MMAP_LEGACY = False
 
 
 def _gwas_use_rust_unified_v1() -> bool:
@@ -189,6 +192,84 @@ def _prepare_packed_bed_once_for_gwas(
             f"packed_rows={np.asarray(packed_ctx['packed']).shape[0]}"
         )
     return str(prefix), full_ids, packed_ctx, sites_all
+
+
+def prepare_memmap_filtered_bed_for_gwas(
+    *,
+    genofile: str,
+    outprefix: str,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    block_rows: int,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+) -> tuple[str, dict[str, int]]:
+    """
+    Build a temporary filtered PLINK BED prefix via Rust mmap engine.
+
+    This performs one Rust-side BED mmap pass with QC filtering, then emits a
+    temporary BED/BIM/FAM prefix for downstream GWAS routes.
+    """
+    prefix = _as_plink_prefix(genofile)
+    if prefix is None:
+        raise ValueError("memmap BED route requires PLINK BED input/prefix.")
+    if not hasattr(jxrs, "bed_mmap_filter_to_plink_rust"):
+        raise RuntimeError(
+            "Rust extension missing bed_mmap_filter_to_plink_rust. "
+            "Rebuild/install JanusX extension first."
+        )
+
+    out_mm_prefix = f"{outprefix}.mmapbed.{os.getpid()}.{uuid.uuid4().hex}"
+    block_rows_use = int(max(1024, int(block_rows)))
+    scan_threads = int(max(1, int(threads)))
+    parallel = bool(scan_threads > 1)
+
+    with CliStatus(
+        "Preparing memmap BED cache...",
+        enabled=bool(use_spinner),
+        use_process=True,
+    ) as task:
+        try:
+            with _gwas_scan_stage_ctx(scan_threads):
+                kept, scanned, n_samples, n_blocks = jxrs.bed_mmap_filter_to_plink_rust(
+                    str(prefix),
+                    str(out_mm_prefix),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    block_rows=int(block_rows_use),
+                    parallel=bool(parallel),
+                )
+        except Exception:
+            task.fail("Preparing memmap BED cache ...Failed")
+            raise
+        task.complete("Preparing memmap BED cache ...Finished")
+
+    kept_i = int(kept)
+    if kept_i <= 0:
+        raise ValueError(
+            "No SNPs remained after memmap BED filtering. "
+            "Please relax --maf/--geno/--het thresholds."
+        )
+    info = {
+        "kept_snps": kept_i,
+        "scanned_snps": int(scanned),
+        "n_samples": int(n_samples),
+        "n_blocks": int(n_blocks),
+    }
+    _log_file_only(
+        logger,
+        logging.INFO,
+        (
+            "Memmap BED cache ready: "
+            f"kept={info['kept_snps']}, scanned={info['scanned_snps']}, "
+            f"samples={info['n_samples']}, blocks={info['n_blocks']}, "
+            f"prefix={_display_path(str(out_mm_prefix))}"
+        ),
+    )
+    return str(out_mm_prefix), info
 
 
 def run_fastlmm_packed_fullrank(
@@ -997,6 +1078,7 @@ def run_lm_stream_bed_single_entry(
     trait_names: Union[list[str], None] = None,
     emit_trait_header: bool = True,
     chunk_size_user_set: bool = True,
+    mmap_limit: bool = False,
 ) -> None:
     if not hasattr(jxrs, "lm_stream_bed_to_tsv"):
         raise RuntimeError(
@@ -1071,6 +1153,11 @@ def run_lm_stream_bed_single_entry(
             model_keys="lm",
             user_specified=bool(chunk_size_user_set),
         )
+        mmap_window_mb = (
+            auto_mmap_window_mb(genofile, len(ids), n_snps, int(model_chunk_size))
+            if bool(mmap_limit)
+            else None
+        )
         if (not bool(chunk_size_user_set)) and int(model_chunk_size) != int(chunk_size):
             _log_file_only(
                 logger,
@@ -1138,42 +1225,65 @@ def run_lm_stream_bed_single_entry(
                         "progress_callback": _lm_progress,
                         "progress_every": int(max(1, int(model_chunk_size))),
                     }
+                lm_base_kwargs = {
+                    "sample_ids": trait_ids.tolist(),
+                    "maf_threshold": float(maf_threshold),
+                    "max_missing_rate": float(max_missing_rate),
+                    "genetic_model": str(genetic_model),
+                    "het_threshold": float(het_threshold),
+                    "snps_only": bool(snps_only),
+                    "chunk_size": int(max(1, int(model_chunk_size))),
+                    "threads": int(max(1, scan_threads)),
+                    **kwargs_stream,
+                }
+
+                def _call_lm_stream(ixx_opt: object) -> tuple[int, int]:
+                    global _WARNED_LM_STREAM_MMAP_LEGACY
+                    kwargs_use = dict(lm_base_kwargs)
+                    if mmap_window_mb is not None:
+                        kwargs_use["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
+                    try:
+                        return jxrs.lm_stream_bed_to_tsv(
+                            str(prefix),
+                            y_vec,
+                            x_design,
+                            ixx_opt,
+                            str(tmp_tsv),
+                            **kwargs_use,
+                        )
+                    except TypeError as ex:
+                        msg = str(ex).lower()
+                        mmap_kw_err = (
+                            "mmap_window_mb" in msg
+                            or "unexpected keyword argument" in msg
+                        )
+                        if ("mmap_window_mb" in kwargs_use) and mmap_kw_err:
+                            kwargs_use.pop("mmap_window_mb", None)
+                            if not _WARNED_LM_STREAM_MMAP_LEGACY:
+                                _WARNED_LM_STREAM_MMAP_LEGACY = True
+                                _emit_warning_line(
+                                    logger,
+                                    (
+                                        "Rust extension missing lm_stream_bed_to_tsv(mmap_window_mb=...); "
+                                        "falling back to full-mmap LM stream path. Rebuild JanusX to enable memmap window mode."
+                                    ),
+                                    use_spinner=bool(use_spinner),
+                                )
+                            return jxrs.lm_stream_bed_to_tsv(
+                                str(prefix),
+                                y_vec,
+                                x_design,
+                                ixx_opt,
+                                str(tmp_tsv),
+                                **kwargs_use,
+                            )
+                        raise
                 try:
-                    kept_rows, scan_all_rows = jxrs.lm_stream_bed_to_tsv(
-                        str(prefix),
-                        y_vec,
-                        x_design,
-                        None,
-                        str(tmp_tsv),
-                        sample_ids=trait_ids.tolist(),
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        genetic_model=str(genetic_model),
-                        het_threshold=float(het_threshold),
-                        snps_only=bool(snps_only),
-                        chunk_size=int(max(1, int(model_chunk_size))),
-                        threads=int(max(1, scan_threads)),
-                        **kwargs_stream,
-                    )
+                    kept_rows, scan_all_rows = _call_lm_stream(None)
                 except TypeError:
                     # Backward-compat fallback for older extensions that require ixx.
                     ixx = _lm_precompute_ixx_qr(x_design)
-                    kept_rows, scan_all_rows = jxrs.lm_stream_bed_to_tsv(
-                        str(prefix),
-                        y_vec,
-                        x_design,
-                        ixx,
-                        str(tmp_tsv),
-                        sample_ids=trait_ids.tolist(),
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        genetic_model=str(genetic_model),
-                        het_threshold=float(het_threshold),
-                        snps_only=bool(snps_only),
-                        chunk_size=int(max(1, int(model_chunk_size))),
-                        threads=int(max(1, scan_threads)),
-                        **kwargs_stream,
-                    )
+                    kept_rows, scan_all_rows = _call_lm_stream(ixx)
             scan_ok = True
         finally:
             if warm_active and warm_task is not None:

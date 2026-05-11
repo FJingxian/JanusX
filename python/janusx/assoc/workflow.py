@@ -13,7 +13,7 @@ Models:
 Execution mode (automatic)
 --------------------------
   - No explicit "low-memory" flag is required.
-  - Default: LM/LMM/FastLMM run in streaming mode.
+  - Default: LM/LMM/FastLMM run in memmap BED mode.
   - With `-fast` (or when `-farmcpu` is selected), packed BED is loaded once
     and reused for full-rust packed routes when available.
   - FarmCPU always runs on the full in-memory genotype matrix.
@@ -3430,6 +3430,10 @@ def _prepare_packed_bed_once_for_gwas(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import _prepare_packed_bed_once_for_gwas as _impl
     return _impl(*args, **kwargs)
 
+def prepare_memmap_filtered_bed_for_gwas(*args, **kwargs):
+    from janusx.assoc.workflow_model_packed import prepare_memmap_filtered_bed_for_gwas as _impl
+    return _impl(*args, **kwargs)
+
 def run_fastlmm_packed_fullrank(*args, **kwargs):
     from janusx.assoc.workflow_model_packed import run_fastlmm_packed_fullrank as _impl
     return _impl(*args, **kwargs)
@@ -3553,11 +3557,11 @@ def parse_args(argv: Optional[list[str]] = None):
     models_group = parser.add_argument_group("Model Arguments")
     models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
-        help="Run the linear mixed model (streaming, low-memory; default: %(default)s).",
+        help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-fastlmm", "--fastlmm", action="store_true", default=False,
-        help="Run the linear mixed model with fixed lambda estimated in null model (streaming, low-memory; default: %(default)s).",
+        help="Run the linear mixed model with fixed lambda estimated in null model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu", action="store_true", default=False,
@@ -3565,11 +3569,11 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
-        help="Run the linear model (streaming, low-memory; default: %(default)s).",
+        help="Run the linear model (memmap, low-memory; default: %(default)s).",
     )
     models_group.add_argument(
         "-model", "--model", type=str, choices=["add", "dom", "rec", "het"], default="add",
-        help="Genetic effect coding model for streaming LM/LMM/FastLMM (default: %(default)s).",
+        help="Genetic effect coding model for memmap LM/LMM/FastLMM (default: %(default)s).",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -3665,7 +3669,7 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     optional_group.add_argument(
         "-chunksize", "--chunksize", type=int, default=10_000,
-        help="Number of SNPs per chunk for streaming LMM/LM and RSVD mmap sizing "
+        help="Number of SNPs per chunk for memmap LMM/LM and RSVD mmap sizing "
              "(affects GRM and GWAS; default: %(default)s).",
     )
     optional_group.add_argument(
@@ -3800,12 +3804,15 @@ def _run_gwas_pipeline(
             model_tokens.append("LMM")
         if args.farmcpu:
             model_tokens.append("FarmCPU")
+        cli_fast_mode = bool(getattr(args, "fast", False) or bool(args.farmcpu))
+        bed_backend_policy = "packed (-fast/-farmcpu)" if cli_fast_mode else "memmap (default)"
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
             ("Phenotype cols", args.ncol if args.ncol is not None else "All"),
             ("Mmap limit", args.mmap_limit),
-            ("Fast mode", bool(getattr(args, "fast", False) or bool(args.farmcpu))),
+            ("BED backend", bed_backend_policy),
+            ("Fast mode", cli_fast_mode),
             ("Models", " ".join(model_tokens) if len(model_tokens) > 0 else "None"),
             ("Genetic model", args.model),
             ("SNPs only", args.snps_only),
@@ -3871,10 +3878,39 @@ def _run_gwas_pipeline(
         raise SystemExit(1)
     if args.farmcpu and args.model != "add":
         logger.warning(
-            "Warning: --model/--het currently apply to streaming LM/LMM/FastLMM; "
+            "Warning: --model/--het currently apply to memmap LM/LMM/FastLMM; "
             "FarmCPU keeps additive coding."
         )
+    maf_threshold_scan = float(args.maf)
+    max_missing_rate_scan = float(args.geno)
+    het_threshold_scan = float(args.het)
+
+    input_is_bed = _as_plink_prefix(gfile) is not None
     fast_mode = bool(getattr(args, "fast", False) or bool(args.farmcpu))
+    memmap_mode = not bool(fast_mode)
+    mmap_limit_effective = bool(args.mmap_limit or memmap_mode)
+    _log_file_only(
+        logger,
+        logging.INFO,
+        (
+            "BED backend policy: packed (-fast/-farmcpu)."
+            if fast_mode
+            else "BED backend policy: memmap (default)."
+        ),
+    )
+    if memmap_mode and (not bool(args.mmap_limit)):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "Default memmap route enabled: stream-aligned windowed mmap will be used on BED/cache input "
+            "(no temporary mmapbed.* PLINK cache will be created).",
+        )
+    if (not input_is_bed) and memmap_mode:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED.",
+        )
     qcov_needs_grm = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     # GRM route policy:
     # - non-fast GWAS: prefer streaming GRM path (Rust reader + streaming accumulation)
@@ -3882,13 +3918,12 @@ def _run_gwas_pipeline(
     prefer_packed_grm = bool(
         fast_mode
         and (args.lmm or args.fastlmm or qcov_needs_grm)
-        and _gwas_use_packed_grm_build()
     )
     if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or qcov_needs_grm):
         _log_file_only(
             logger,
             logging.INFO,
-            "Non-fast GWAS: GRM uses streaming path by default (packed single-entry disabled).",
+            "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled).",
         )
     if bool(args.farmcpu) and (not bool(getattr(args, "fast", False))):
         _log_file_only(
@@ -3896,7 +3931,6 @@ def _run_gwas_pipeline(
             logging.INFO,
             "FarmCPU selected: enabling fast mode automatically.",
         )
-
     try:
 
         # --- prepare streaming context once if needed ---
@@ -3914,26 +3948,26 @@ def _run_gwas_pipeline(
         shared_context_needed = bool(stream_selected or fast_mode)
         preloaded_packed: Union[dict[str, object], None] = None
         if shared_context_needed:
-            _section(logger, "Streaming task")
+            _section(logger, "GWAS task")
             _log_file_only(
                 logger,
                 logging.INFO,
                 "Prepare shared context (phenotype/genotype meta/GRM/Q/cov)",
             )
             pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
-                genofile=gfile,
+                genofile=genofile_stream,
                 phenofile=args.pheno,
                 pheno_cols=args.ncol,
-                maf_threshold=args.maf,
-                max_missing_rate=args.geno,
+                maf_threshold=maf_threshold_scan,
+                max_missing_rate=max_missing_rate_scan,
                 genetic_model=args.model,
-                het_threshold=args.het,
+                het_threshold=het_threshold_scan,
                 chunk_size=args.chunksize,
                 mgrm=args.grm,
                 pcdim=args.qcov,
                 cov_inputs=args.cov,
                 threads=args.thread,
-                mmap_limit=args.mmap_limit,
+                mmap_limit=mmap_limit_effective,
                 require_kinship=(args.lmm or args.fastlmm),
                 logger=logger,
                 use_spinner=use_spinner,
@@ -3945,9 +3979,9 @@ def _run_gwas_pipeline(
                 try:
                     prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
                         genofile=genofile_stream,
-                        maf_threshold=float(args.maf),
-                        max_missing_rate=float(args.geno),
-                        het_threshold=float(args.het),
+                        maf_threshold=float(maf_threshold_scan),
+                        max_missing_rate=float(max_missing_rate_scan),
+                        het_threshold=float(het_threshold_scan),
                         snps_only=bool(args.snps_only),
                         use_spinner=bool(use_spinner),
                         preloaded_packed=None,
@@ -3995,12 +4029,14 @@ def _run_gwas_pipeline(
         else:
             for idx0, trait_name in enumerate(trait_order):
                 trait_col_map[str(trait_name)] = int(idx0)
+        farmcpu_genofile = str(gfile)
 
         # -------------------------------
-        # 1) Streaming models first
+        # 1) Rust-only model routes
         # -------------------------------
         if len(stream_models) > 0:
-            if bool(fast_mode):
+            rust_only_model_routes = True
+            if rust_only_model_routes:
                 # v3: fast mode always executes via trait/model task plan (Rust route planner
                 # + thin Python executor) so single-model paths no longer bypass the unified route.
                 use_trait_grouped_fast = True
@@ -4070,7 +4106,7 @@ def _run_gwas_pipeline(
                                 farmcpu_cache_prefill = None
                         farmcpu_cache_runtime = run_farmcpu_fullmem(
                             args=args,
-                            gfile=gfile,
+                            gfile=farmcpu_genofile,
                             prefix=prefix,
                             logger=logger,
                             pheno_preloaded=pheno,
@@ -4088,8 +4124,9 @@ def _run_gwas_pipeline(
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
                         )
-                    use_packed_fastlmm_scan = bool(_gwas_use_packed_fastlmm_scan())
+                    use_packed_fastlmm_scan = True
                     task_plan = None
+                    rust_plan_errors: list[str] = []
                     if hasattr(jxrs, "gwas_trait_model_dispatch_v2"):
                         try:
                             task_plan = jxrs.gwas_trait_model_dispatch_v2(
@@ -4099,12 +4136,7 @@ def _run_gwas_pipeline(
                                 bool(use_packed_fastlmm_scan),
                             )
                         except Exception as ex:
-                            _emit_warning_line(
-                                logger,
-                                f"Rust v2 task dispatcher unavailable; fallback to v1/Python planner. reason={ex}",
-                                use_spinner=bool(use_spinner),
-                            )
-                            task_plan = None
+                            rust_plan_errors.append(f"gwas_trait_model_dispatch_v2: {ex}")
                     if task_plan is None and hasattr(jxrs, "gwas_trait_model_schedule"):
                         try:
                             task_plan = jxrs.gwas_trait_model_schedule(
@@ -4113,46 +4145,13 @@ def _run_gwas_pipeline(
                                 bool(has_farmcpu),
                             )
                         except Exception as ex:
-                            _emit_warning_line(
-                                logger,
-                                f"Rust task scheduler unavailable; fallback to Python planner. reason={ex}",
-                                use_spinner=bool(use_spinner),
-                            )
-                            task_plan = None
+                            rust_plan_errors.append(f"gwas_trait_model_schedule: {ex}")
                     if task_plan is None:
-                        task_plan = []
-                        trait_total = int(len(trait_order))
-                        for trait_idx, trait_name in enumerate(trait_order):
-                            ordered_models = [str(m).lower().strip() for m in stream_models]
-                            if bool(has_farmcpu):
-                                ordered_models.append("farmcpu")
-                            model_last = int(len(ordered_models)) - 1
-                            for idx_model, mk in enumerate(ordered_models):
-                                route = "unknown"
-                                if mk == "lm":
-                                    route = "lm_packed"
-                                elif mk == "lmm":
-                                    route = "lmm_packed"
-                                elif mk == "fastlmm":
-                                    route = (
-                                        "fastlmm_packed"
-                                        if bool(use_packed_fastlmm_scan)
-                                        else "fastlmm_stream"
-                                    )
-                                elif mk == "farmcpu":
-                                    route = "farmcpu"
-                                task_plan.append(
-                                    {
-                                        "model": str(mk),
-                                        "route": str(route),
-                                        "trait": str(trait_name),
-                                        "emit_trait_header": bool(idx_model == 0),
-                                        "emit_blank_after": bool(
-                                            (idx_model == model_last)
-                                            and ((trait_idx + 1) < trait_total)
-                                        ),
-                                    }
-                                )
+                        err_text = "; ".join(rust_plan_errors) if len(rust_plan_errors) > 0 else "no rust scheduler symbols"
+                        raise RuntimeError(
+                            "Rust-only GWAS mode requires Rust task scheduler/dispatcher; "
+                            f"unable to build model task plan ({err_text})."
+                        )
                     def _run_route_lm_packed(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -4161,10 +4160,10 @@ def _run_gwas_pipeline(
                             pheno=pheno,
                             ids=ids,
                             outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
                             genetic_model=args.model,
-                            het_threshold=args.het,
+                            het_threshold=het_threshold_scan,
                             chunk_size=args.chunksize,
                             qmatrix=qmatrix,
                             cov_all=cov_all,
@@ -4190,10 +4189,10 @@ def _run_gwas_pipeline(
                             ids=ids,
                             grm=grm,
                             outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
                             genetic_model=args.model,
-                            het_threshold=args.het,
+                            het_threshold=het_threshold_scan,
                             chunk_size=args.chunksize,
                             qmatrix=qmatrix,
                             cov_all=cov_all,
@@ -4219,10 +4218,10 @@ def _run_gwas_pipeline(
                             ids=ids,
                             grm=grm,
                             outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
                             genetic_model=args.model,
-                            het_threshold=args.het,
+                            het_threshold=het_threshold_scan,
                             chunk_size=args.chunksize,
                             qmatrix=qmatrix,
                             cov_all=cov_all,
@@ -4239,54 +4238,13 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                         )
 
-                    def _run_route_fastlmm_stream(
-                        trait_one: list[str], emit_trait_header_model: bool
-                    ) -> None:
-                        _log_file_only(
-                            logger,
-                            logging.INFO,
-                            "Fast mode: FastLMM scan uses streaming prepared-chunk route "
-                            "(set JX_GWAS_USE_PACKED_FASTLMM_SCAN=1 or unset it to use packed scan).",
-                        )
-                        run_chunked_gwas_lmm_lm(
-                            model_name="fastlmm",
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            n_snps=n_snps,
-                            outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
-                            genetic_model=args.model,
-                            het_threshold=args.het,
-                            chunk_size=args.chunksize,
-                            mmap_limit=args.mmap_limit,
-                            grm=grm,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            eff_m=eff_m,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            show_npve_line=True,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                            prefer_packed_fullrust=False,
-                        )
-
                     def _run_route_farmcpu(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
                         nonlocal farmcpu_cache_runtime, farmcpu_handled_in_trait_loop
                         farmcpu_cache_runtime = run_farmcpu_fullmem(
                             args=args,
-                            gfile=gfile,
+                            gfile=farmcpu_genofile,
                             prefix=prefix,
                             logger=logger,
                             pheno_preloaded=pheno,
@@ -4309,8 +4267,19 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
-                        "fastlmm_stream": _run_route_fastlmm_stream,
                         "farmcpu": _run_route_farmcpu,
+                    }
+                    route_aliases = {
+                        "lm_stream": "lm_packed",
+                        "lm_memmap": "lm_packed",
+                        "lm_rust": "lm_packed",
+                        "lmm_stream": "lmm_packed",
+                        "lmm_memmap": "lmm_packed",
+                        "lmm_rust": "lmm_packed",
+                        "fastlmm_stream": "fastlmm_packed",
+                        "fastlmm_memmap": "fastlmm_packed",
+                        "fastlmm_rust": "fastlmm_packed",
+                        "farm": "farmcpu",
                     }
 
                     for task_item in task_plan:
@@ -4322,15 +4291,12 @@ def _run_gwas_pipeline(
                             elif mk == "lmm":
                                 route = "lmm_packed"
                             elif mk == "fastlmm":
-                                route = (
-                                    "fastlmm_packed"
-                                    if bool(use_packed_fastlmm_scan)
-                                    else "fastlmm_stream"
-                                )
+                                route = "fastlmm_packed"
                             elif mk == "farmcpu":
                                 route = "farmcpu"
                             else:
                                 route = "unknown"
+                        route = route_aliases.get(route, route)
                         trait_name_use = str(task_item.get("trait", ""))
                         emit_trait_header_model = bool(
                             task_item.get("emit_trait_header", False)
@@ -4341,135 +4307,16 @@ def _run_gwas_pipeline(
                         if route_handler is not None:
                             route_handler(trait_one, bool(emit_trait_header_model))
                         else:
-                            logger.warning(
-                                f"Unknown task route in fast mode: route={route}, model={mk}"
+                            raise RuntimeError(
+                                "Rust-only GWAS mode received unsupported task route: "
+                                f"route={route}, model={mk}"
                             )
                         if emit_blank_after:
                             logger.info("")
             else:
-                # If some models can use packed full-rust single-entry routes, run
-                # them separately first to avoid being merged into shared streaming.
-                if len(stream_models) > 1:
-                    packed_fullrust_enabled = False
-                    packed_prefix_ok = _as_plink_prefix(genofile_stream) is not None
-
-                    def _can_fullrust_model(mkey: str) -> bool:
-                        mk = str(mkey).lower().strip()
-                        if mk == "lmm":
-                            if not packed_fullrust_enabled:
-                                return False
-                            if not packed_prefix_ok:
-                                return False
-                            return (
-                                str(args.model).lower() == "add"
-                                and (grm is not None)
-                                and hasattr(jxrs, "lmm_reml_assoc_packed_f32")
-                            )
-                        if mk == "lm":
-                            return False
-                        return False
-
-                    for model_sep in ("lmm", "lm"):
-                        if (model_sep not in stream_models) or (not _can_fullrust_model(model_sep)):
-                            continue
-                        run_chunked_gwas_lmm_lm(
-                            model_name=model_sep,
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            n_snps=n_snps,
-                            outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
-                            genetic_model=args.model,
-                            het_threshold=args.het,
-                            chunk_size=args.chunksize,
-                            mmap_limit=args.mmap_limit,
-                            grm=grm,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            eff_m=eff_m,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                            show_npve_line=True,
-                            emit_trait_header=True,
-                            chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                        )
-                        stream_models = [m for m in stream_models if str(m).lower() != model_sep]
-                        if len(stream_models) > 0:
-                            logger.info("")
-
-                if len(stream_models) == 1:
-                    model_key = stream_models[0]
-                    pve_line_model = model_key if model_key in {"lmm", "fastlmm"} else None
-                    run_chunked_gwas_lmm_lm(
-                        model_name=model_key,
-                        genofile=genofile_stream,
-                        pheno=pheno,
-                        ids=ids,
-                        n_snps=n_snps,
-                        outprefix=outprefix,
-                        maf_threshold=args.maf,
-                        max_missing_rate=args.geno,
-                        genetic_model=args.model,
-                        het_threshold=args.het,
-                        chunk_size=args.chunksize,
-                        mmap_limit=args.mmap_limit,
-                        grm=grm,
-                        qmatrix=qmatrix,
-                        cov_all=cov_all,
-                        eff_m=eff_m,
-                        plot=args.plot,
-                        threads=args.thread,
-                        logger=logger,
-                        use_spinner=use_spinner,
-                        snps_only=bool(args.snps_only),
-                        eff_snp_by_trait=eff_snp_by_trait,
-                        summary_rows=gwas_summary_rows,
-                        saved_paths=saved_result_paths,
-                        trait_names=[str(t) for t in trait_order] if len(trait_order) > 0 else None,
-                        show_npve_line=True if pve_line_model is None else (model_key == pve_line_model),
-                        emit_trait_header=True,
-                        chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                    )
-                elif len(stream_models) > 1:
-                    for trait_idx, pname in enumerate(trait_order):
-                        run_chunked_gwas_streaming_shared(
-                            model_names=stream_models,
-                            trait_name=str(pname),
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            n_snps=n_snps,
-                            outprefix=outprefix,
-                            maf_threshold=args.maf,
-                            max_missing_rate=args.geno,
-                            genetic_model=args.model,
-                            het_threshold=args.het,
-                            chunk_size=args.chunksize,
-                            mmap_limit=args.mmap_limit,
-                            grm=grm,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            chunk_size_user_set=bool(getattr(args, "_chunksize_user_set", False)),
-                        )
-                        if trait_idx < len(trait_order) - 1:
-                            logger.info("")
+                raise RuntimeError(
+                    "Rust-only GWAS mode cannot enter Python streaming fallback routes."
+                )
 
         # FarmCPU (same model flow; no separate task section banner)
         if has_farmcpu and (not farmcpu_handled_in_trait_loop):
@@ -4539,7 +4386,7 @@ def _run_gwas_pipeline(
                     farmcpu_cache_prefill = None
             _ = run_farmcpu_fullmem(
                 args=args,
-                gfile=gfile,
+                gfile=farmcpu_genofile,
                 prefix=prefix,
                 logger=logger,
                 pheno_preloaded=pheno,
@@ -4607,6 +4454,8 @@ def _run_gwas_pipeline(
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),
+                "bed_backend": ("packed" if bool(args.fast or args.farmcpu) else "memmap"),
+                "bed_loader": ("packed" if bool(args.fast or args.farmcpu) else "memmap"),
                 "snps_only": bool(args.snps_only),
                 "maf": float(args.maf),
                 "geno": float(args.geno),

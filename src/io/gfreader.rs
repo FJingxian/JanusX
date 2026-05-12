@@ -2,7 +2,9 @@ use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
 
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::Advice;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use rayon::prelude::*;
@@ -4007,6 +4009,7 @@ impl BedMmapEngine {
         let file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
         let mmap =
             unsafe { Mmap::map(&file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+        #[cfg(unix)]
         let _ = mmap.advise(Advice::Sequential);
         if mmap.len() < 3 {
             return Err(format!("{bed_path}: file too small for BED header"));

@@ -15,11 +15,13 @@ pub struct HePcgResult {
     pub sigma_g2: f64,
     pub sigma_e2: f64,
     pub h2: f64,
+    pub lambda: f64,
     pub converged: bool,
     pub iters: usize,
     pub rel_res: f64,
     pub m_effective: usize,
     pub tr_k2: f64,
+    pub tr_k2_solve: f64,
     pub y_ky: f64,
     pub y_y: f64,
 }
@@ -42,6 +44,92 @@ fn mean_center_in_place_f32(v: &mut [f32]) {
     for x in v.iter_mut() {
         *x -= mean;
     }
+}
+
+#[inline]
+fn oriented_minor_freq_from_input(raw_freq: f32, flip: bool) -> Result<f32, String> {
+    if !raw_freq.is_finite() {
+        return Err("row_maf contains non-finite values".to_string());
+    }
+    let af = raw_freq.clamp(0.0_f32, 1.0_f32);
+    // Backward-compatible interpretation:
+    // - <=0.5 is assumed to already be MAF.
+    // - >0.5 is treated as allele-frequency input; when flip=true we convert to
+    //   minor-allele frequency, otherwise keep orientation consistent with decode.
+    let p = if af <= 0.5_f32 {
+        af
+    } else if flip {
+        1.0_f32 - af
+    } else {
+        af
+    };
+    Ok(p.clamp(0.0_f32, 1.0_f32))
+}
+
+fn build_row_standardization_stats(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    std_eps32: f32,
+    use_train_maf: bool,
+    row_mean: &mut [f32],
+    row_inv_sd: &mut [f32],
+) -> Result<usize, String> {
+    let m = row_flip.len();
+    if row_mean.len() != m || row_inv_sd.len() != m || row_maf.len() != m {
+        return Err("build_row_standardization_stats: length mismatch".to_string());
+    }
+    let mut m_effective = 0usize;
+    for j in 0..m {
+        let flip = row_flip[j];
+        let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
+        if use_train_maf {
+            let row = &packed_flat[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+            let mut non_missing = 0usize;
+            let mut alt_sum = 0usize;
+            for &sid in sample_idx {
+                let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+                match code {
+                    0b00 => {
+                        non_missing += 1;
+                    }
+                    0b10 => {
+                        non_missing += 1;
+                        alt_sum += 1;
+                    }
+                    0b11 => {
+                        non_missing += 1;
+                        alt_sum += 2;
+                    }
+                    _ => {}
+                }
+            }
+            if non_missing > 0 {
+                let dosage_sum = if flip {
+                    2usize
+                        .saturating_mul(non_missing)
+                        .saturating_sub(alt_sum)
+                } else {
+                    alt_sum
+                };
+                p = (dosage_sum as f32) / (2.0_f32 * non_missing as f32);
+            }
+        }
+
+        let p = p.clamp(0.0_f32, 1.0_f32);
+        let mean = 2.0_f32 * p;
+        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
+        row_mean[j] = mean;
+        if var > std_eps32 {
+            row_inv_sd[j] = 1.0_f32 / var.sqrt();
+            m_effective += 1;
+        } else {
+            row_inv_sd[j] = 0.0_f32;
+        }
+    }
+    Ok(m_effective)
 }
 
 #[inline]
@@ -387,6 +475,7 @@ pub fn he_variance_components_packed(
     trace_samples: usize,
     block_rows: usize,
     std_eps: f64,
+    use_train_maf: bool,
     max_iter: usize,
     tol: f64,
     seed: u64,
@@ -441,19 +530,17 @@ pub fn he_variance_components_packed(
     let std_eps32 = std_eps.max(1e-12_f64) as f32;
     let mut row_mean = vec![0.0_f32; m];
     let mut row_inv_sd = vec![0.0_f32; m];
-    let mut m_effective = 0usize;
-    for j in 0..m {
-        let p = row_maf[j].clamp(0.0_f32, 0.5_f32);
-        let mean = 2.0_f32 * p;
-        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
-        row_mean[j] = mean;
-        if var > std_eps32 {
-            row_inv_sd[j] = 1.0_f32 / var.sqrt();
-            m_effective += 1;
-        } else {
-            row_inv_sd[j] = 0.0_f32;
-        }
-    }
+    let m_effective = build_row_standardization_stats(
+        packed_flat,
+        bytes_per_snp,
+        row_flip,
+        row_maf,
+        sample_idx,
+        std_eps32,
+        use_train_maf,
+        &mut row_mean,
+        &mut row_inv_sd,
+    )?;
     if m_effective == 0 {
         return Err("No effective SNPs after std_eps filtering".to_string());
     }
@@ -530,7 +617,13 @@ pub fn he_variance_components_packed(
     let tr_p = ((n as f64) - 1.0_f64).max(1.0_f64);
     // Stochastic trace estimation can slightly undershoot the PSD lower bound.
     // Add a tiny floor to keep the 2x2 normal matrix strictly SPD for direct solve.
-    let tr_k2_solve = tr_k2.max((tr_k * tr_k) / tr_p + tr_p * 1e-6_f64);
+    let tr_k2_floor = (tr_k * tr_k) / tr_p + tr_p * 1e-6_f64;
+    let tr_k2_solve = tr_k2.max(tr_k2_floor);
+    if tr_k2_solve > tr_k2 * 1.05_f64 {
+        return Err(format!(
+            "Tr((PKP)^2) stochastic estimate violates PSD bound too much: raw={tr_k2}, adjusted={tr_k2_solve}. Increase trace_samples."
+        ));
+    }
     let a00 = tr_k2_solve;
     let a01 = tr_k;
     let a11 = tr_p;
@@ -547,8 +640,8 @@ pub fn he_variance_components_packed(
         sigma_unconstrained_e2,
     );
     let rel_res = {
-        let res0 = a00.mul_add(sigma_unconstrained_g2, a01 * sigma_unconstrained_e2) - b0;
-        let res1 = a01.mul_add(sigma_unconstrained_g2, a11 * sigma_unconstrained_e2) - b1;
+        let res0 = a00.mul_add(sigma_g2, a01 * sigma_e2) - b0;
+        let res1 = a01.mul_add(sigma_g2, a11 * sigma_e2) - b1;
         let rhs_norm = (b0 * b0 + b1 * b1).sqrt().max(1e-20_f64);
         ((res0 * res0 + res1 * res1).sqrt()) / rhs_norm
     };
@@ -561,16 +654,23 @@ pub fn he_variance_components_packed(
             f64::NAN
         }
     };
+    let lambda = if sigma_g2.is_finite() && sigma_g2 > 0.0_f64 {
+        sigma_e2 / sigma_g2
+    } else {
+        f64::INFINITY
+    };
 
     Ok(HePcgResult {
         sigma_g2,
         sigma_e2,
         h2,
+        lambda,
         converged,
         iters: 1,
         rel_res,
         m_effective,
         tr_k2,
+        tr_k2_solve,
         y_ky,
         y_y,
     })
@@ -587,6 +687,7 @@ pub fn he_variance_components_packed(
     max_iter=32,
     block_rows=4096,
     std_eps=1e-12_f64,
+    use_train_maf=true,
     threads=0,
     seed=20260512_u64,
     packed=None,
@@ -605,13 +706,14 @@ pub fn he_pcg_bed<'py>(
     max_iter: usize,
     block_rows: usize,
     std_eps: f64,
+    use_train_maf: bool,
     threads: usize,
     seed: u64,
     packed: Option<PyReadonlyArray2<'py, u8>>,
     packed_n_samples: usize,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
-) -> PyResult<(f64, f64, f64, bool, usize, f64, usize, f64, f64, f64)> {
+) -> PyResult<(f64, f64, f64, bool, usize, f64, usize, f64, f64, f64, f64, f64)> {
     if trace_samples == 0 {
         return Err(PyRuntimeError::new_err("trace_samples must be > 0"));
     }
@@ -782,7 +884,7 @@ pub fn he_pcg_bed<'py>(
                 let dst_off = dst_row * bytes_per_snp;
                 packed_subset[dst_off..dst_off + bytes_per_snp]
                     .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
-                maf_subset[dst_row] = maf_full[src_row].clamp(0.0_f32, 0.5_f32);
+                maf_subset[dst_row] = maf_full[src_row];
                 row_flip_subset[dst_row] = row_flip_full[src_row];
             }
             packed_keep = Cow::Owned(packed_subset);
@@ -833,6 +935,7 @@ pub fn he_pcg_bed<'py>(
                 trace_samples,
                 block_rows,
                 std_eps,
+                use_train_maf,
                 max_iter,
                 tol,
                 seed,
@@ -852,5 +955,7 @@ pub fn he_pcg_bed<'py>(
         he_res.tr_k2,
         he_res.y_ky,
         he_res.y_y,
+        he_res.lambda,
+        he_res.tr_k2_solve,
     ))
 }

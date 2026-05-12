@@ -68,6 +68,7 @@ import pickle
 import threading
 import subprocess
 import shutil
+import hashlib
 from dataclasses import dataclass
 from collections import OrderedDict
 import multiprocessing as mp
@@ -637,6 +638,185 @@ def _is_plink_prefix(path_or_prefix: str) -> bool:
     if p == "":
         return False
     return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+
+
+def _is_txt_like_input(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix).strip().lower()
+    return p.endswith(".txt") or p.endswith(".tsv") or p.endswith(".csv")
+
+
+def _is_vcf_or_hmp_like_input(path_or_prefix: str) -> bool:
+    p = str(path_or_prefix).strip().lower()
+    return (
+        p.endswith(".vcf")
+        or p.endswith(".vcf.gz")
+        or p.endswith(".hmp")
+        or p.endswith(".hmp.gz")
+    )
+
+
+def _decode_packed_subset_to_dense_raw_f32(
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+) -> np.ndarray:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    n_samples = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Invalid packed payload: packed must be 2D.")
+    if int(maf.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed payload mismatch: maf length does not match packed SNP rows.")
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    if np.any(sidx < 0) or np.any(sidx >= int(n_samples)):
+        raise ValueError("Packed sample_indices are out of range.")
+    ridx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64), dtype=np.int64)
+    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    decoded = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+        packed,
+        int(n_samples),
+        ridx,
+        row_flip,
+        maf,
+        sidx,
+    )
+    dense = np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
+    if dense.ndim != 2 or int(dense.shape[0]) != int(packed.shape[0]):
+        raise ValueError(f"Packed subset decode returned invalid shape: {dense.shape}")
+    return dense
+
+
+def _build_memmap_cache_from_chunks(
+    *,
+    genotype_path: str,
+    maf: float,
+    missing_rate: float,
+    cache_root: str,
+    chunk_size: int = 50_000,
+) -> tuple[np.ndarray, np.memmap]:
+    sample_ids_raw, n_snps_hint_raw = inspect_genotype_file(
+        genotype_path,
+        snps_only=False,
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+    )
+    sample_ids = np.asarray(sample_ids_raw, dtype=str)
+    n_samples = int(sample_ids.shape[0])
+    n_snps_hint = int(max(0, int(n_snps_hint_raw)))
+    if n_samples <= 0:
+        raise ValueError("No samples detected for memmap genotype input.")
+
+    os.makedirs(cache_root, mode=0o755, exist_ok=True)
+    abs_src = os.path.abspath(str(genotype_path))
+    src_tag = os.path.basename(str(genotype_path).rstrip("/\\")).replace(" ", "_")
+    key = hashlib.sha1(
+        f"{abs_src}|maf={float(maf):.8g}|miss={float(missing_rate):.8g}".encode("utf-8")
+    ).hexdigest()[:16]
+    mm_path = os.path.join(cache_root, f"{src_tag}.gs.filtered.{key}.npy")
+
+    def _open_existing_or_none(path: str) -> np.memmap | None:
+        if not os.path.isfile(path):
+            return None
+        try:
+            arr = np.load(path, mmap_mode="r")
+        except Exception:
+            return None
+        if not isinstance(arr, np.memmap):
+            return None
+        if arr.ndim != 2:
+            return None
+        if int(arr.shape[1]) != int(n_samples):
+            return None
+        return arr
+
+    mm_existing = _open_existing_or_none(mm_path)
+    if mm_existing is not None:
+        return sample_ids, mm_existing
+
+    # Build filtered SNP-major float32 cache by streaming Rust chunks.
+    n_rows_alloc = int(max(1, n_snps_hint))
+    mm_out = np.lib.format.open_memmap(
+        mm_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_rows_alloc, n_samples),
+    )
+    written = 0
+    try:
+        chunks = load_genotype_chunks(
+            genotype_path,
+            chunk_size=int(max(1, int(chunk_size))),
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            impute=True,
+        )
+        for geno_chunk, _sites in chunks:
+            arr = np.asarray(geno_chunk, dtype=np.float32)
+            if arr.ndim != 2 or int(arr.shape[0]) == 0:
+                continue
+            n_rows = int(arr.shape[0])
+            need_rows = int(written + n_rows)
+            if need_rows > int(mm_out.shape[0]):
+                grow_rows = int(max(need_rows, int(mm_out.shape[0]) * 2))
+                tmp_path = f"{mm_path}.grow.tmp"
+                mm_grow = np.lib.format.open_memmap(
+                    tmp_path,
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(grow_rows, n_samples),
+                )
+                if written > 0:
+                    step = 10_000
+                    for st in range(0, int(written), step):
+                        ed = min(int(written), st + step)
+                        mm_grow[st:ed, :] = mm_out[st:ed, :]
+                mm_grow.flush()
+                del mm_out
+                del mm_grow
+                os.replace(tmp_path, mm_path)
+                mm_out = np.lib.format.open_memmap(
+                    mm_path,
+                    mode="r+",
+                    dtype=np.float32,
+                    shape=(grow_rows, n_samples),
+                )
+            mm_out[written:written + n_rows, :] = arr
+            written += n_rows
+    finally:
+        mm_out.flush()
+        del mm_out
+
+    if int(written) <= 0:
+        raise ValueError(
+            "No SNPs left after Rust-side filtering for memmap genotype input. "
+            "Please relax --maf/--geno thresholds."
+        )
+
+    if int(written) != int(n_rows_alloc):
+        tmp_trim = f"{mm_path}.trim.tmp"
+        mm_trim = np.lib.format.open_memmap(
+            tmp_trim,
+            mode="w+",
+            dtype=np.float32,
+            shape=(int(written), n_samples),
+        )
+        mm_src = np.load(mm_path, mmap_mode="r")
+        step = 10_000
+        for st in range(0, int(written), step):
+            ed = min(int(written), st + step)
+            mm_trim[st:ed, :] = np.asarray(mm_src[st:ed, :], dtype=np.float32)
+        mm_trim.flush()
+        del mm_trim
+        del mm_src
+        os.replace(tmp_trim, mm_path)
+
+    mm_final = np.load(mm_path, mmap_mode="r")
+    if not isinstance(mm_final, np.memmap):
+        raise RuntimeError(f"Failed to open memmap cache as np.memmap: {mm_path}")
+    return sample_ids, mm_final
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -3089,8 +3269,53 @@ def GSapi(
                 "GBLUP(d/ad) (JAX backend) is unavailable. "
                 f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
             )
-        gadd_train = np.asarray(Xtrain, dtype=np.float32)
-        gadd_test = np.asarray(Xtest, dtype=np.float32)
+        if is_packed_input:
+            if not _looks_like_packed_payload(Xtrain):
+                raise ValueError("GBLUP(d/ad) packed route requires packed train payload.")
+            packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+            n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
+            if packed_train_indices is None:
+                if int(packed_train["n_samples"]) != n_train_expected:
+                    raise ValueError(
+                        "Packed GBLUP(d/ad) requires packed_train_indices when "
+                        "n_train differs from packed n_samples."
+                    )
+                train_abs = np.ascontiguousarray(
+                    np.arange(int(packed_train["n_samples"]), dtype=np.int64),
+                    dtype=np.int64,
+                )
+            else:
+                train_abs = np.ascontiguousarray(
+                    np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            if int(train_abs.shape[0]) != n_train_expected:
+                raise ValueError(
+                    "Packed GBLUP(d/ad) train index mismatch: "
+                    f"indices={train_abs.shape[0]}, y={n_train_expected}."
+                )
+            if packed_test_indices is None:
+                test_abs = np.zeros((0,), dtype=np.int64)
+            else:
+                test_abs = np.ascontiguousarray(
+                    np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            gadd_train = _decode_packed_subset_to_dense_raw_f32(
+                packed_train,
+                train_abs,
+            )
+            gadd_test = (
+                np.zeros((int(gadd_train.shape[0]), 0), dtype=np.float32)
+                if int(test_abs.size) == 0
+                else _decode_packed_subset_to_dense_raw_f32(
+                    typing.cast(dict[str, typing.Any], Xtest),
+                    test_abs,
+                )
+            )
+        else:
+            gadd_train = np.asarray(Xtrain, dtype=np.float32)
+            gadd_test = np.asarray(Xtest, dtype=np.float32)
         if gadd_train.ndim != 2 or gadd_test.ndim != 2:
             raise ValueError(
                 f"GBLUP(d/ad) expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
@@ -4654,9 +4879,11 @@ def GSapi(
         )
 
     if method in _ML_METHOD_MAP:
+        Xtrain_ml = np.ascontiguousarray(np.asarray(Xtrain, dtype=np.float32), dtype=np.float32)
+        Xtest_ml = np.ascontiguousarray(np.asarray(Xtest, dtype=np.float32), dtype=np.float32)
         model = MLGS(
             y=Y.reshape(-1),
-            M=Xtrain,
+            M=Xtrain_ml,
             method=typing.cast(typing.Any, _ML_METHOD_MAP[method]),
             seed=42,
             cv=_mlgs_inner_cv(int(Y.shape[0])),
@@ -4670,15 +4897,15 @@ def GSapi(
             model.fit()
         if need_train_pred:
             if train_pred_idx is None:
-                yhat_train = model.predict(Xtrain)
+                yhat_train = model.predict(Xtrain_ml)
             elif int(train_pred_idx.size) == 0:
                 yhat_train = np.zeros((0, 1), dtype=float)
             else:
-                yhat_train = model.predict(np.asarray(Xtrain)[:, train_pred_idx])
+                yhat_train = model.predict(np.asarray(Xtrain_ml)[:, train_pred_idx])
         else:
             yhat_train = np.zeros((0, 1), dtype=float)
-        if int(Xtest.shape[1]) > 0:
-            yhat_test = model.predict(Xtest)
+        if int(Xtest_ml.shape[1]) > 0:
+            yhat_test = model.predict(Xtest_ml)
         else:
             yhat_test = np.zeros((0, 1), dtype=float)
         pve = float(
@@ -4792,7 +5019,15 @@ def _run_method_task(
     rrblup_cfg_base = dict(rrblup_adamw_cfg or {})
     if method == "rrBLUP":
         rrblup_cfg_base["auto_pcg_ref_n"] = int(np.asarray(train_pheno).reshape(-1).shape[0])
-    packed_lmm_methods = {"GBLUP", "rrBLUP", "BayesA", "BayesB", "BayesCpi"}
+    packed_lmm_methods = {
+        _GBLUP_METHOD_ADD,
+        _GBLUP_METHOD_DOM,
+        _GBLUP_METHOD_AD,
+        "rrBLUP",
+        "BayesA",
+        "BayesB",
+        "BayesCpi",
+    }
     bayes_methods = {"BayesA", "BayesB", "BayesCpi"}
     bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
     bayes_cv_reuse_enabled = bool(
@@ -6569,6 +6804,97 @@ def _run_methods_parallel(
     # and keep runtime behavior consistent.
     method_parallel_jobs = 1
     bayes_auto_r2_cache_shared: dict[str, float] = {}
+    train_snp_runtime = train_snp
+    test_snp_runtime = test_snp
+    train_snp_add_runtime = train_snp_add
+    test_snp_add_runtime = test_snp_add
+    train_snp_ml_runtime = train_snp_ml
+    test_snp_ml_runtime = test_snp_ml
+    ml_dense_materialized = False
+
+    def _ensure_ml_dense_runtime() -> None:
+        nonlocal train_snp_runtime, test_snp_runtime
+        nonlocal train_snp_add_runtime, test_snp_add_runtime
+        nonlocal train_snp_ml_runtime, test_snp_ml_runtime
+        nonlocal ml_dense_materialized
+        if ml_dense_materialized:
+            return
+        # If dense/ml arrays are already provided (including memmap-backed slices),
+        # materialize once to in-RAM float32 for sklearn/XGBoost routes.
+        if train_snp_ml_runtime is not None and test_snp_ml_runtime is not None:
+            train_snp_ml_runtime = np.ascontiguousarray(
+                np.asarray(train_snp_ml_runtime, dtype=np.float32),
+                dtype=np.float32,
+            )
+            test_snp_ml_runtime = np.ascontiguousarray(
+                np.asarray(test_snp_ml_runtime, dtype=np.float32),
+                dtype=np.float32,
+            )
+            if train_snp_runtime is None:
+                train_snp_runtime = train_snp_ml_runtime
+            if test_snp_runtime is None:
+                test_snp_runtime = test_snp_ml_runtime
+            ml_dense_materialized = True
+            return
+        if _looks_like_packed_payload(packed_ctx):
+            if train_sample_indices is None or test_sample_indices is None:
+                raise ValueError("Packed->ML dense decode requires train/test sample indices.")
+            packed_payload = typing.cast(dict[str, typing.Any], packed_ctx)
+            train_snp_ml_runtime = _decode_packed_subset_to_dense_raw_f32(
+                packed_payload,
+                np.ascontiguousarray(
+                    np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+            )
+            test_snp_ml_runtime = _decode_packed_subset_to_dense_raw_f32(
+                packed_payload,
+                np.ascontiguousarray(
+                    np.asarray(test_sample_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                ),
+            )
+            if train_snp_runtime is None:
+                train_snp_runtime = train_snp_ml_runtime
+            if test_snp_runtime is None:
+                test_snp_runtime = test_snp_ml_runtime
+            if train_snp_add_runtime is None:
+                train_snp_add_runtime = train_snp_ml_runtime
+            if test_snp_add_runtime is None:
+                test_snp_add_runtime = test_snp_ml_runtime
+            ml_dense_materialized = True
+            return
+        if train_snp_runtime is None or test_snp_runtime is None:
+            raise ValueError("ML models require dense train/test genotype matrices.")
+        train_snp_ml_runtime = np.ascontiguousarray(
+            np.asarray(train_snp_runtime, dtype=np.float32),
+            dtype=np.float32,
+        )
+        test_snp_ml_runtime = np.ascontiguousarray(
+            np.asarray(test_snp_runtime, dtype=np.float32),
+            dtype=np.float32,
+        )
+        ml_dense_materialized = True
+
+    def _runtime_inputs_for_method(method_name: str) -> tuple[
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
+        m_key = str(method_name)
+        if m_key in _ML_METHOD_MAP:
+            _ensure_ml_dense_runtime()
+        return (
+            train_snp_runtime,
+            test_snp_runtime,
+            train_snp_add_runtime,
+            test_snp_add_runtime,
+            train_snp_ml_runtime,
+            test_snp_ml_runtime,
+        )
     if method_parallel_jobs <= 1:
         out: list[dict[str, typing.Any]] = []
         fold_total_map = {
@@ -6587,7 +6913,7 @@ def _run_methods_parallel(
                     show_remaining=False,
                     field_templates_before_elapsed=["{task.fields[counter]}"],
                     finished_text=" ",
-                    transient=False,
+                    transient=True,
                 )
                 assert progress is not None
                 m_disp = _method_display(str(m))
@@ -7212,15 +7538,23 @@ def _run_methods_parallel(
                     if show_method_progress and (not has_search_stage):
                         _ensure_cv_task()
                     try:
+                        (
+                            train_snp_cur,
+                            test_snp_cur,
+                            train_snp_add_cur,
+                            test_snp_add_cur,
+                            train_snp_ml_cur,
+                            test_snp_ml_cur,
+                        ) = _runtime_inputs_for_method(str(m))
                         res = _run_method_task(
                             m,
                             train_pheno,
-                            train_snp,
-                            test_snp,
-                            train_snp_add,
-                            test_snp_add,
-                            train_snp_ml,
-                            test_snp_ml,
+                            train_snp_cur,
+                            test_snp_cur,
+                            train_snp_add_cur,
+                            test_snp_add_cur,
+                            train_snp_ml_cur,
+                            test_snp_ml_cur,
                             pca_dec,
                             cv_splits,
                             model_n_jobs,
@@ -7856,15 +8190,23 @@ def _run_methods_parallel(
                 method_status.__enter__()
             try:
                 try:
+                    (
+                        train_snp_cur,
+                        test_snp_cur,
+                        train_snp_add_cur,
+                        test_snp_add_cur,
+                        train_snp_ml_cur,
+                        test_snp_ml_cur,
+                    ) = _runtime_inputs_for_method(str(m))
                     res = _run_method_task(
                         m,
                         train_pheno,
-                        train_snp,
-                        test_snp,
-                        train_snp_add,
-                        test_snp_add,
-                        train_snp_ml,
-                        test_snp_ml,
+                        train_snp_cur,
+                        test_snp_cur,
+                        train_snp_add_cur,
+                        test_snp_add_cur,
+                        train_snp_ml_cur,
+                        test_snp_ml_cur,
                         pca_dec,
                         cv_splits,
                         model_n_jobs,
@@ -10648,6 +10990,31 @@ def _run_gs_pipeline(
         (args.hash_dim is not None) or (getattr(args, "ldprune_spec", None) is not None)
     )
     rr_solver_mode = str(rrblup_solver).strip().lower()
+    file_input_requested = bool(args.file)
+    file_txt_like_requested = bool(file_input_requested and _is_txt_like_input(str(gfile)))
+    input_vcf_hmp_requested = bool(
+        bool(args.vcf)
+        or bool(args.hmp)
+        or (
+            file_input_requested
+            and _is_vcf_or_hmp_like_input(str(gfile))
+        )
+    )
+    file_memmap_preferred = bool(
+        file_input_requested
+        and (
+            file_txt_like_requested
+            or str(gfile).strip().lower().endswith(".npy")
+            or str(gfile).strip().lower().endswith(".bin")
+        )
+    )
+    if file_memmap_preferred and rr_solver_mode == "pcg":
+        rrblup_solver = "auto"
+        rr_solver_mode = "auto"
+        logger.warning(
+            "rrBLUP solver=pcg is unavailable for FILE memmap inputs; "
+            "falling back to solver=auto (non-packed backend)."
+        )
     pcg_requested = bool(
         bool(args.rrBLUP) and (rr_solver_mode == "pcg")
     )
@@ -10674,12 +11041,12 @@ def _run_gs_pipeline(
         (not gfile_is_plink)
         and _cfg_truthy(getattr(args, "packed_lmm_auto", "on"), default=True)
         and packed_only_requested
-        and (bool(args.vcf) or bool(args.hmp) or bool(args.file))
+        and input_vcf_hmp_requested
     ):
         # For Bayes on VCF/HMP inputs, prefer packed path by default to avoid
         # dense genotype peak memory. Keep legacy size-threshold probing for
         # other packed-eligible model combinations.
-        if bayes_requested and (bool(args.vcf) or bool(args.hmp)):
+        if bayes_requested and input_vcf_hmp_requested:
             auto_packed_lmm_requested = True
         else:
             try:
@@ -10705,7 +11072,7 @@ def _run_gs_pipeline(
         and bool(args.rrBLUP)
         and (rr_solver_mode == "auto")
         and (not gfile_is_plink)
-        and (bool(args.vcf) or bool(args.hmp) or bool(args.file))
+        and input_vcf_hmp_requested
     ):
         if probe_n_samples is None:
             try:
@@ -10726,13 +11093,14 @@ def _run_gs_pipeline(
     pcg_packed_preprocess_requested = bool(
         (not gfile_is_plink)
         and pcg_requested
-        and (bool(args.vcf) or bool(args.hmp) or bool(args.file))
+        and input_vcf_hmp_requested
     )
     hard_packed_preprocess_requested = bool(
         manual_packed_preprocess_requested or pcg_packed_preprocess_requested
     )
+    always_packed_for_vcf_hmp = bool(input_vcf_hmp_requested)
     packed_preprocess_requested = bool(
-        hard_packed_preprocess_requested or auto_packed_lmm_requested
+        hard_packed_preprocess_requested or auto_packed_lmm_requested or always_packed_for_vcf_hmp
     )
 
     checks: list[bool] = []
@@ -11000,9 +11368,9 @@ def _run_gs_pipeline(
                         str(gfile),
                         snps_only=False,
                         delimiter=None,
-                        # For -file inputs, allow TXT/TSV/CSV sources to be packed
-                        # into PLINK BED for packed preprocessing / auto packed LMM flow.
-                        prefer_plink_for_txt=True,
+                        # GS FILE-input policy keeps TXT/TSV/CSV on NPY+memmap path.
+                        # VCF/HMP still resolve to PLINK BED cache in prepare_cli_input_cache.
+                        prefer_plink_for_txt=False,
                     )
                 except Exception as ex:
                     if hard_packed_preprocess_requested:
@@ -11163,18 +11531,7 @@ def _run_gs_pipeline(
     # Load genotype
     # ------------------------------------------------------------------
     gsrc = os.path.basename(str(gfile).rstrip("/\\")) or str(gfile)
-    packed_eligible_methods = {
-        _GBLUP_METHOD_ADD,
-        "rrBLUP",
-        "BayesA",
-        "BayesB",
-        "BayesCpi",
-    }
-    use_packed_lmm = bool(
-        gfile_is_plink
-        and len(methods) > 0
-        and all(m in packed_eligible_methods for m in methods)
-    )
+    use_packed_lmm = bool(gfile_is_plink and len(methods) > 0)
     ldprune_spec = typing.cast(
         _GsLdPruneSpec | None,
         getattr(args, "ldprune_spec", None),
@@ -11184,6 +11541,17 @@ def _run_gs_pipeline(
     )
     packed_lmm_ctx: dict[str, typing.Any] | None = None
     packed_qc_baseline_ctx: dict[str, typing.Any] | None = None
+    geno_is_memmap = False
+    rrblup_aux_packed_ctx_requested = bool(
+        bool(args.rrBLUP)
+        and (str(rr_solver_mode) in {"pcg", "auto"})
+        and gfile_is_plink
+        and (not use_packed_lmm)
+        and (args.hash_dim is None)
+        and (ldprune_spec is None)
+    )
+    rrblup_aux_packed_ctx: dict[str, typing.Any] | None = None
+    rrblup_aux_dense_to_packed_idx: np.ndarray | None = None
     if use_packed_lmm:
         with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
             try:
@@ -11498,7 +11866,11 @@ def _run_gs_pipeline(
         need_add_raw = _methods_need_additive_dense(methods)
         need_raw_geno = bool(need_add_raw or any(m in ml_methods for m in methods))
         geno_raw = (
-            np.asarray(geno, dtype=np.float32, copy=need_std_geno)
+            np.asarray(
+                geno,
+                dtype=np.float32,
+                copy=bool(need_std_geno and (not geno_is_memmap)),
+            )
             if need_raw_geno
             else None
         )
@@ -11617,16 +11989,29 @@ def _run_gs_pipeline(
     else:
         with CliStatus(f"Loading genotype from {gsrc}...", enabled=use_spinner) as task:
             try:
-                sample_ids, geno = _load_genotype_with_rust_gfreader(
-                    gfile,
-                    maf=args.maf,
-                    missing_rate=args.geno,
-                )
+                if file_memmap_preferred:
+                    sample_ids, geno = _build_memmap_cache_from_chunks(
+                        genotype_path=str(gfile),
+                        maf=float(args.maf),
+                        missing_rate=float(args.geno),
+                        cache_root=os.path.join(args.out, ".janusx_gs_memmap"),
+                        chunk_size=50_000,
+                    )
+                    geno_is_memmap = isinstance(geno, np.memmap)
+                else:
+                    sample_ids, geno = _load_genotype_with_rust_gfreader(
+                        gfile,
+                        maf=args.maf,
+                        missing_rate=args.geno,
+                    )
             except Exception:
                 task.fail(f"Loading genotype from {gsrc} ...Failed")
                 raise
             m, n = geno.shape
-            task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
+            if geno_is_memmap:
+                task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, memmap)")
+            else:
+                task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m})")
 
         samples = sample_ids
         # GBLUP computes kinship-driven scaling inside MLMBLUP(kinship=1),
@@ -11641,10 +12026,54 @@ def _run_gs_pipeline(
         )
         geno_add_raw = geno_raw if need_add_raw else None
         geno_ml_raw = geno_raw if any(m in ml_methods for m in methods) else None
-        if need_std_geno:
+        if need_std_geno and (not geno_is_memmap):
             geno = (geno - geno.mean(axis=1, keepdims=True)) / (
                 geno.std(axis=1, keepdims=True) + 1e-6
             )  # standardization for marker-effect models
+
+    if rrblup_aux_packed_ctx_requested:
+        with CliStatus(
+            f"Loading packed rrBLUP helper from {gsrc}...",
+            enabled=use_spinner,
+        ) as task:
+            try:
+                rrblup_aux_sample_ids, rrblup_aux_packed_ctx = _load_plink_packed_for_lmm(
+                    str(gfile),
+                    maf=float(args.maf),
+                    missing_rate=float(args.geno),
+                )
+            except Exception:
+                task.fail("Loading packed rrBLUP helper ...Failed")
+                raise
+            dense_ids = np.asarray(samples, dtype=str).reshape(-1)
+            packed_ids = np.asarray(rrblup_aux_sample_ids, dtype=str).reshape(-1)
+            if int(dense_ids.shape[0]) != int(packed_ids.shape[0]):
+                raise RuntimeError(
+                    "Packed rrBLUP helper sample-size mismatch: "
+                    f"dense n={int(dense_ids.shape[0])}, packed n={int(packed_ids.shape[0])}."
+                )
+            if np.array_equal(dense_ids, packed_ids):
+                rrblup_aux_dense_to_packed_idx = np.arange(int(dense_ids.shape[0]), dtype=np.int64)
+            else:
+                packed_pos = {str(sid): int(i) for i, sid in enumerate(packed_ids)}
+                mapped_idx = np.fromiter(
+                    (packed_pos.get(str(sid), -1) for sid in dense_ids),
+                    dtype=np.int64,
+                    count=int(dense_ids.shape[0]),
+                )
+                if np.any(mapped_idx < 0):
+                    missing_ids = dense_ids[mapped_idx < 0]
+                    preview = ",".join([str(x) for x in missing_ids[:3]])
+                    raise RuntimeError(
+                        "Packed rrBLUP helper could not align sample IDs with dense genotype order. "
+                        f"Missing examples: {preview}"
+                    )
+                rrblup_aux_dense_to_packed_idx = np.ascontiguousarray(mapped_idx, dtype=np.int64)
+            m_aux = int(rrblup_aux_packed_ctx["packed"].shape[0]) if rrblup_aux_packed_ctx is not None else 0
+            task.complete(
+                "Loading packed rrBLUP helper ...Finished "
+                f"(n={int(packed_ids.shape[0])}, nSNP={m_aux})"
+            )
 
     # Cache for repeated trait train/test partitions in GBLUP-only hash kinship mode.
     # Key: (train_idx bytes, test_idx bytes) in genotype sample order.
@@ -11814,6 +12243,11 @@ def _run_gs_pipeline(
         test_snp_ml = None
         trait_use_packed_lmm = bool(use_packed_lmm)
         trait_packed_ctx: dict[str, typing.Any] | None = packed_lmm_ctx
+        trait_packed_index_map: np.ndarray | None = None
+        if (not trait_use_packed_lmm) and (trait_packed_ctx is None) and (rrblup_aux_packed_ctx is not None):
+            # Mixed-method runs may still need packed BED for rrBLUP(pcg/auto).
+            trait_packed_ctx = typing.cast(dict[str, typing.Any], rrblup_aux_packed_ctx)
+            trait_packed_index_map = rrblup_aux_dense_to_packed_idx
         gblup_backend_label: str | None = None
         gblup_backend_n: int | None = None
         gblup_backend_m: int | None = None
@@ -12540,6 +12974,52 @@ def _run_gs_pipeline(
             )
             outpred_partial.to_csv(out_tsv, sep="\t", float_format="%.4f")
 
+        method_train_sample_idx = np.ascontiguousarray(train_sample_idx, dtype=np.int64)
+        method_test_sample_idx = np.ascontiguousarray(test_sample_idx, dtype=np.int64)
+        if (
+            (not trait_use_packed_lmm)
+            and _looks_like_packed_payload(trait_packed_ctx)
+            and (trait_packed_index_map is not None)
+        ):
+            method_train_sample_idx = np.ascontiguousarray(
+                np.asarray(trait_packed_index_map[train_sample_idx], dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+            method_test_sample_idx = np.ascontiguousarray(
+                np.asarray(trait_packed_index_map[test_sample_idx], dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
+
+        loaded_train_snp_ml = train_snp_ml
+        loaded_test_snp_ml = test_snp_ml
+        if model_mode and any(str(mm) in _ML_METHOD_MAP for mm in trait_methods):
+            if loaded_train_snp_ml is None or loaded_test_snp_ml is None:
+                if _looks_like_packed_payload(trait_packed_ctx):
+                    packed_payload_local = typing.cast(dict[str, typing.Any], trait_packed_ctx)
+                    loaded_train_snp_ml = _decode_packed_subset_to_dense_raw_f32(
+                        packed_payload_local,
+                        np.ascontiguousarray(
+                            np.asarray(method_train_sample_idx, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        ),
+                    )
+                    loaded_test_snp_ml = _decode_packed_subset_to_dense_raw_f32(
+                        packed_payload_local,
+                        np.ascontiguousarray(
+                            np.asarray(method_test_sample_idx, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        ),
+                    )
+                elif train_snp is not None and test_snp is not None:
+                    loaded_train_snp_ml = np.ascontiguousarray(
+                        np.asarray(train_snp, dtype=np.float32),
+                        dtype=np.float32,
+                    )
+                    loaded_test_snp_ml = np.ascontiguousarray(
+                        np.asarray(test_snp, dtype=np.float32),
+                        dtype=np.float32,
+                    )
+
         t_stage = time.time()
         if model_mode:
             method_results = []
@@ -12585,11 +13065,11 @@ def _run_gs_pipeline(
                     train_pheno=train_pheno,
                     train_snp=train_snp,
                     test_snp=test_snp,
-                    train_snp_ml=train_snp_ml,
-                    test_snp_ml=test_snp_ml,
+                    train_snp_ml=loaded_train_snp_ml,
+                    test_snp_ml=loaded_test_snp_ml,
                     packed_ctx=trait_packed_ctx if _looks_like_packed_payload(trait_packed_ctx) else None,
-                    train_sample_indices=train_sample_idx,
-                    test_sample_indices=test_sample_idx,
+                    train_sample_indices=method_train_sample_idx,
+                    test_sample_indices=method_test_sample_idx,
                     cv_splits=None,
                     limit_predtrain=args.limit_predtrain,
                 )
@@ -12613,8 +13093,8 @@ def _run_gs_pipeline(
                 strict_cv=bool(args.strict_cv),
                 force_fast=bool(args.force_fast),
                 packed_ctx=trait_packed_ctx,
-                train_sample_indices=train_sample_idx,
-                test_sample_indices=test_sample_idx,
+                train_sample_indices=method_train_sample_idx,
+                test_sample_indices=method_test_sample_idx,
                 train_sample_ids=np.asarray(samples[trainmask], dtype=str).reshape(-1),
                 limit_predtrain=args.limit_predtrain,
                 elapsed_offset_by_method=method_elapsed_offsets,

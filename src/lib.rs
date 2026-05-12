@@ -63,6 +63,8 @@ mod vcfout;
 mod workflow;
 
 // math
+#[path = "math/aireml.rs"]
+mod aireml;
 #[path = "math/bedmath.rs"]
 mod bedmath;
 #[path = "math/bitwise.rs"]
@@ -164,6 +166,7 @@ use tree::{
     nj_newick_from_distance_matrix,
 };
 
+pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
 pub use he::{he_variance_components_packed, HePcgResult};
 // ============================================================
 // PyO3 module exports

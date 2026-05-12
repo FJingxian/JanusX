@@ -79,7 +79,7 @@ echo "============================================"
 
 echo "STEP 3. Validation of GS-related modules"
 jx gs -bfile test/mouse_hs1940 -p example/mouse_hs1940.pheno -n 0 \
-    -GBLUP -rrBLUP -BayesA -BayesB -BayesCpi \
+    -GBLUP -GBLUP ad -rrBLUP -BayesA -BayesB -BayesCpi \
     -cv 5 -o test
 jx reml -file example/rice6048.reml.tsv -n Plant_height \
     -rh year -rh loc -o test

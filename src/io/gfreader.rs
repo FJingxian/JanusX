@@ -2,9 +2,9 @@ use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
 
-use memmap2::Mmap;
 #[cfg(unix)]
 use memmap2::Advice;
+use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use rayon::prelude::*;

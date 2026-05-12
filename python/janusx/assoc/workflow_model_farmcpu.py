@@ -35,6 +35,7 @@ from .workflow import (
     _pca_cache_path,
     _pca_cache_path_legacy,
     _read_id_file,
+    _replace_file_with_retry,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _trait_values_and_mask,
@@ -223,9 +224,9 @@ def build_qmatrix_farmcpu(
         with _cache_lock(grm_path):
             if (not os.path.exists(grm_path)) and os.path.exists(legacy_grm_path):
                 try:
-                    os.replace(legacy_grm_path, grm_path)
+                    _replace_file_with_retry(legacy_grm_path, grm_path)
                     if os.path.exists(legacy_id_path) and (not os.path.exists(id_path)):
-                        os.replace(legacy_id_path, id_path)
+                        _replace_file_with_retry(legacy_id_path, id_path)
                     _farm_log(
                         f"* Migrated legacy GRM cache name: {legacy_grm_path} -> {grm_path}"
                     )
@@ -296,13 +297,13 @@ def build_qmatrix_farmcpu(
                     ) from ex
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 np.save(tmp_grm, grm)
-                os.replace(tmp_grm, grm_path)
+                _replace_file_with_retry(tmp_grm, grm_path)
                 if sid_arr is not None:
                     tmp_id = f"{id_path}.tmp.{os.getpid()}"
                     pd.Series(sid_arr).to_csv(
                         tmp_id, sep="\t", index=False, header=False
                     )
-                    os.replace(tmp_id, id_path)
+                    _replace_file_with_retry(tmp_id, id_path)
                 _farm_log(f"Cached GRM written to {grm_path}")
                 return grm
 
@@ -326,7 +327,7 @@ def build_qmatrix_farmcpu(
         with _cache_lock(q_path):
             if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
                 try:
-                    os.replace(legacy_q_path, q_path)
+                    _replace_file_with_retry(legacy_q_path, q_path)
                     _farm_log(
                         f"* Migrated legacy PCA cache name: {legacy_q_path} -> {q_path}"
                     )
@@ -384,7 +385,7 @@ def build_qmatrix_farmcpu(
                     qmatrix = np.asarray(eigvec[:, -q_int:], dtype="float32")
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
-                os.replace(tmp_q, q_path)
+                _replace_file_with_retry(tmp_q, q_path)
                 _farm_log(f"Cached PCA written to {q_path}")
 
     if cov_inputs:

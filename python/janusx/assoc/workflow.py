@@ -172,6 +172,32 @@ def _phase_split(logger: logging.Logger) -> None:
     logger.info("-" * _SECTION_WIDTH)
 
 
+def _replace_file_with_retry(
+    src: str,
+    dst: str,
+    *,
+    attempts: int = 40,
+    base_sleep_s: float = 0.05,
+) -> None:
+    """
+    Atomic replace with short retries for transient Windows file locks.
+
+    On Windows, antivirus/indexers or delayed file-handle release can trigger
+    PermissionError(winerror=32/5) for a short period.
+    """
+    n = max(1, int(attempts))
+    for i in range(n):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as ex:
+            winerr = int(getattr(ex, "winerror", 0) or 0)
+            if os.name == "nt" and winerr in {5, 32} and (i + 1) < n:
+                time.sleep(float(base_sleep_s) * float(min(i + 1, 10)))
+                continue
+            raise
+
+
 def _fastlmm_pve_is_degenerate(pve: Optional[float]) -> bool:
     if pve is None:
         return False
@@ -1713,7 +1739,11 @@ def build_grm_streaming(
                         f"Stream sample count mismatch: stream={stream_n}, expected={int(n_samples)}"
                     )
                 eff_m = int(eff_m_raw)
-                grm = np.load(str(cache_target), mmap_mode="r")
+                # Keep cache writer output on disk only; caller will atomically
+                # move tmp -> final path and then reopen the final cache.
+                # This avoids holding a memmap handle on tmp cache files, which
+                # can block os.replace on Windows (WinError 32).
+                grm = np.empty((0, 0), dtype=np.float32)
             else:
                 grm_raw, eff_m_raw, stream_n_raw = jxrs.grm_stream_bed_f32(
                     str(packed_prefix),
@@ -1790,9 +1820,9 @@ def load_or_build_grm_with_cache(
         with _cache_lock(grm_path):
             if (not os.path.exists(grm_path)) and os.path.exists(legacy_grm_path):
                 try:
-                    os.replace(legacy_grm_path, grm_path)
+                    _replace_file_with_retry(legacy_grm_path, grm_path)
                     if os.path.exists(legacy_id_path) and (not os.path.exists(id_path)):
-                        os.replace(legacy_id_path, id_path)
+                        _replace_file_with_retry(legacy_id_path, id_path)
                     _log_file_only(
                         logger,
                         logging.INFO,
@@ -1875,11 +1905,16 @@ def load_or_build_grm_with_cache(
                 _log_file_only(logger, logging.INFO, grm_msg)
                 print_success(grm_msg, force_color=bool(use_spinner))
                 if not os.path.exists(tmp_grm):
+                    if stream_direct_cache:
+                        raise RuntimeError(
+                            "Rust GRM stream-to-NPY cache writer did not produce the "
+                            f"expected tmp file: {tmp_grm}"
+                        )
                     np.save(tmp_grm, grm)
-                os.replace(tmp_grm, grm_path)
+                _replace_file_with_retry(tmp_grm, grm_path)
                 tmp_id = f"{id_path}.tmp.{os.getpid()}"
                 pd.Series(ids).to_csv(tmp_id, sep="\t", index=False, header=False)
-                os.replace(tmp_id, id_path)
+                _replace_file_with_retry(tmp_id, id_path)
                 grm_ids = ids
                 grm = np.load(grm_path, mmap_mode='r')
                 if grm.ndim != 2 or grm.shape[0] != grm.shape[1]:
@@ -2016,7 +2051,7 @@ def load_or_build_q_with_cache(
         with _cache_lock(q_path):
             if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
                 try:
-                    os.replace(legacy_q_path, q_path)
+                    _replace_file_with_retry(legacy_q_path, q_path)
                     _log_file_only(
                         logger,
                         logging.INFO,
@@ -2071,7 +2106,7 @@ def load_or_build_q_with_cache(
                 print_success(pc_msg, force_color=bool(use_spinner))
                 tmp_q = f"{q_path}.tmp.{os.getpid()}"
                 np.savetxt(tmp_q, qmatrix, fmt="%.8g", delimiter="\t")
-                os.replace(tmp_q, q_path)
+                _replace_file_with_retry(tmp_q, q_path)
                 q_ids = ids
                 _log_file_only(
                     logger,
@@ -2257,7 +2292,7 @@ def prepare_streaming_context(
         legacy_q_path = _pca_cache_path_legacy(cache_prefix, mgrm=str(mgrm), qdim=int(qdim))
         if (not os.path.isfile(q_path)) and os.path.isfile(legacy_q_path):
             try:
-                os.replace(legacy_q_path, q_path)
+                _replace_file_with_retry(legacy_q_path, q_path)
                 _log_file_only(
                     logger,
                     logging.INFO,

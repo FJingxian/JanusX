@@ -4311,6 +4311,78 @@ def _run_gwas_pipeline(
                             prefer_packed_fullrust=bool(fast_mode),
                         )
 
+                    def _run_route_lm_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="lm",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            prefer_packed_fullrust=bool(fast_mode),
+                        )
+
+                    def _run_route_lmm_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="lmm",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            prefer_packed_fullrust=bool(fast_mode),
+                        )
+
                     def _run_route_farmcpu(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -4340,16 +4412,18 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
+                        "lm_stream": _run_route_lm_stream,
+                        "lmm_stream": _run_route_lmm_stream,
                         "fastlmm_stream": _run_route_fastlmm_stream,
                         "farmcpu": _run_route_farmcpu,
                     }
                     route_aliases = {
-                        "lm_stream": "lm_packed",
-                        "lm_memmap": "lm_packed",
-                        "lm_rust": "lm_packed",
-                        "lmm_stream": "lmm_packed",
-                        "lmm_memmap": "lmm_packed",
-                        "lmm_rust": "lmm_packed",
+                        "lm_stream": "lm_stream",
+                        "lm_memmap": "lm_stream",
+                        "lm_rust": "lm_stream",
+                        "lmm_stream": "lmm_stream",
+                        "lmm_memmap": "lmm_stream",
+                        "lmm_rust": "lmm_stream",
                         "fastlmm_memmap": "fastlmm_stream",
                         "fastlmm_rust": "fastlmm_stream",
                         "farm": "farmcpu",
@@ -4360,9 +4434,9 @@ def _run_gwas_pipeline(
                         route = str(task_item.get("route", "")).lower().strip()
                         if not route:
                             if mk == "lm":
-                                route = "lm_packed"
+                                route = "lm_packed" if bool(fast_mode) else "lm_stream"
                             elif mk == "lmm":
-                                route = "lmm_packed"
+                                route = "lmm_packed" if bool(fast_mode) else "lmm_stream"
                             elif mk == "fastlmm":
                                 route = (
                                     "fastlmm_packed"
@@ -4374,6 +4448,19 @@ def _run_gwas_pipeline(
                             else:
                                 route = "unknown"
                         route = route_aliases.get(route, route)
+                        # Policy guardrail:
+                        # only -fast/-farmcpu runs may use packed single-entry routes.
+                        # Non-fast LM/LMM/FastLMM must stay on memmap/stream path.
+                        if (not bool(fast_mode)) and route in {
+                            "lm_packed",
+                            "lmm_packed",
+                            "fastlmm_packed",
+                        }:
+                            route = {
+                                "lm_packed": "lm_stream",
+                                "lmm_packed": "lmm_stream",
+                                "fastlmm_packed": "fastlmm_stream",
+                            }[route]
                         trait_name_use = str(task_item.get("trait", ""))
                         emit_trait_header_model = bool(
                             task_item.get("emit_trait_header", False)

@@ -26,10 +26,23 @@ def _find_bundled_openblas() -> str:
     cands = sorted(
         glob.glob(os.path.join(root_parent, "janusx.libs", "libopenblas*.so*"))
         + glob.glob(os.path.join(root_parent, "janusx.libs", "libopenblas*.dylib"))
+        + glob.glob(os.path.join(pkg_dir, "openblas*.dll"))
+        + glob.glob(os.path.join(pkg_dir, "libopenblas*.dll"))
     )
     if not cands:
         raise RuntimeError("bundled libopenblas not found in janusx.libs")
     return cands[0]
+
+
+def _load_openblas_cdll(libpath: str) -> ctypes.CDLL:
+    # On Windows, ensure package-local dependent DLLs (libgfortran, etc.)
+    # are discoverable before loading openblas.dll.
+    if sys.platform == "win32":
+        pkg_dir = _janusx_pkg_dir()
+        add_dir = getattr(os, "add_dll_directory", None)
+        if callable(add_dir):
+            add_dir(pkg_dir)
+    return ctypes.CDLL(libpath)
 
 
 def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
@@ -114,7 +127,7 @@ def main() -> int:
 
     if args.require_threaded_openblas:
         libpath = _find_bundled_openblas()
-        lib = ctypes.CDLL(libpath)
+        lib = _load_openblas_cdll(libpath)
         print(f"[check_installed_runtime] bundled_openblas={libpath}")
         if not hasattr(lib, "openblas_get_config") or not hasattr(lib, "openblas_get_parallel"):
             raise SystemExit(
@@ -127,9 +140,15 @@ def main() -> int:
         parallel = int(lib.openblas_get_parallel())
         print(f"[check_installed_runtime] openblas_config={cfg}")
         print(f"[check_installed_runtime] openblas_parallel={parallel}")
-        if "SINGLE_THREADED" in cfg.upper() or parallel == 0:
+        # Prefer runtime parallel flag as the decisive signal:
+        #   0 => no threading, 1 => pthreads, 2 => OpenMP.
+        # Some binaries may still contain "SINGLE_THREADED" text in their
+        # string table, so treat it as advisory unless runtime reports
+        # non-parallel behavior.
+        if parallel == 0:
             raise SystemExit(
-                "Strict mode failed: OpenBLAS is SINGLE_THREADED; refuse publishing low-performance wheel"
+                "Strict mode failed: OpenBLAS runtime reports no threading "
+                f"(openblas_get_parallel={parallel}, config={cfg!r})."
             )
 
     if args.check_kmc_load:

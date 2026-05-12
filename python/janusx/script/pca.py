@@ -427,14 +427,15 @@ def _run_with_algo_progress(
 ):
     t0 = time.monotonic()
     suffix = _algo_metrics_suffix(n_samples=n_samples, n_snps=n_snps)
-    status_desc = f"Process of {algo_name}{suffix} ..."
+    # CliStatus animates only for loading/computing-like prefixes.
+    status_desc = f"Computing {algo_name}{suffix} ..."
 
     if stdout_is_tty():
         with CliStatus(status_desc, enabled=True, use_process=True) as task:
             try:
                 result = fn()
             except Exception:
-                task.fail(f"{algo_name}{suffix} ...Failed")
+                task.fail(f"Computing {algo_name}{suffix} ...Failed")
                 raise
     else:
         result = fn()

@@ -9,17 +9,19 @@ name = "janusx"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["blas-openblas"]
+default = ["blas-openblas", "python-extension"]
 # Compile-time BLAS selection:
 # - macOS default uses Accelerate.
 # - enable `blas-openblas` to link OpenBLAS and prefer it at runtime.
 blas-openblas = []
+python-extension = ["pyo3/extension-module"]
 # Optional AVX-512 bitwise kernels (nightly-only intrinsics on many stable toolchains).
 # Keep off by default so release wheels build on stable Rust.
 simd-avx512 = []
+metal-gpu = ["dep:metal"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
+pyo3 = { version = "0.27.2", features = ["abi3-py310", "generate-import-lib"] }
 numpy = "0.27.1"
 csv = "1.4.0"
 flate2 = "1.1.8"
@@ -31,6 +33,7 @@ nalgebra = "0.34.1"
 rand = "0.9.2"
 rand_distr = "0.5.1"
 matrixmultiply = "0.3.10"
+metal = { version = "0.32.0", optional = true }
 
 [build-dependencies]
 pkg-config = "0.3"

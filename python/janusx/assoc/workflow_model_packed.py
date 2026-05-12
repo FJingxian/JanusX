@@ -435,13 +435,25 @@ def run_fastlmm_packed_fullrank(
                 )
         np.fill_diagonal(grm_fit, np.diag(grm_fit) + 1e-6)
 
-        eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
-            grm_fit,
-            threads=max(1, int(threads)),
-            logger=logger,
-            stage_label=f"FastLMM-fullrank:{pname}",
-            require_rust=True,
-        )
+        evd_t0 = time.monotonic()
+        with CliStatus(
+            "Running FastLMM Eigen-Decomposition...",
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                eigvals, eigvecs, evd_backend, evd_secs = _gwas_eigh_from_grm(
+                    grm_fit,
+                    threads=max(1, int(threads)),
+                    logger=logger,
+                    stage_label=f"FastLMM-fullrank:{pname}",
+                    require_rust=True,
+                )
+            except Exception:
+                task.fail("FastLMM Eigen-Decomposition ...Failed")
+                raise
+        # Keep explicit elapsed in case backend timing is unavailable/zero.
+        evd_secs = max(float(evd_secs), max(time.monotonic() - evd_t0, 0.0))
         # LAPACK eigh returns ascending eigenvalues. The packed Rust scan kernel
         # consumes leading k components, so reorder to descending first and
         # implicitly drop the smallest component when k = n-1.

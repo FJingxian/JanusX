@@ -4124,7 +4124,9 @@ def _run_gwas_pipeline(
                             emit_trait_header=False,
                             preloaded_packed=preloaded_packed,
                         )
-                    use_packed_fastlmm_scan = True
+                    use_packed_fastlmm_scan = bool(
+                        fast_mode and _gwas_use_packed_fastlmm_scan()
+                    )
                     task_plan = None
                     rust_plan_errors: list[str] = []
                     if hasattr(jxrs, "gwas_trait_model_dispatch_v2"):
@@ -4238,6 +4240,42 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                         )
 
+                    def _run_route_fastlmm_stream(
+                        trait_one: list[str], emit_trait_header_model: bool
+                    ) -> None:
+                        run_chunked_gwas_lmm_lm(
+                            model_name="fastlmm",
+                            genofile=genofile_stream,
+                            pheno=pheno,
+                            ids=ids,
+                            n_snps=n_snps,
+                            outprefix=outprefix,
+                            maf_threshold=maf_threshold_scan,
+                            max_missing_rate=max_missing_rate_scan,
+                            genetic_model=args.model,
+                            het_threshold=het_threshold_scan,
+                            chunk_size=args.chunksize,
+                            mmap_limit=mmap_limit_effective,
+                            grm=grm,
+                            qmatrix=qmatrix,
+                            cov_all=cov_all,
+                            eff_m=eff_m,
+                            plot=args.plot,
+                            threads=args.thread,
+                            logger=logger,
+                            use_spinner=use_spinner,
+                            snps_only=bool(args.snps_only),
+                            eff_snp_by_trait=eff_snp_by_trait,
+                            summary_rows=gwas_summary_rows,
+                            saved_paths=saved_result_paths,
+                            trait_names=trait_one,
+                            emit_trait_header=bool(emit_trait_header_model),
+                            chunk_size_user_set=bool(
+                                getattr(args, "_chunksize_user_set", True)
+                            ),
+                            prefer_packed_fullrust=bool(fast_mode),
+                        )
+
                     def _run_route_farmcpu(
                         trait_one: list[str], emit_trait_header_model: bool
                     ) -> None:
@@ -4267,6 +4305,7 @@ def _run_gwas_pipeline(
                         "lm_packed": _run_route_lm_packed,
                         "lmm_packed": _run_route_lmm_packed,
                         "fastlmm_packed": _run_route_fastlmm_packed,
+                        "fastlmm_stream": _run_route_fastlmm_stream,
                         "farmcpu": _run_route_farmcpu,
                     }
                     route_aliases = {
@@ -4276,9 +4315,8 @@ def _run_gwas_pipeline(
                         "lmm_stream": "lmm_packed",
                         "lmm_memmap": "lmm_packed",
                         "lmm_rust": "lmm_packed",
-                        "fastlmm_stream": "fastlmm_packed",
-                        "fastlmm_memmap": "fastlmm_packed",
-                        "fastlmm_rust": "fastlmm_packed",
+                        "fastlmm_memmap": "fastlmm_stream",
+                        "fastlmm_rust": "fastlmm_stream",
                         "farm": "farmcpu",
                     }
 
@@ -4291,7 +4329,11 @@ def _run_gwas_pipeline(
                             elif mk == "lmm":
                                 route = "lmm_packed"
                             elif mk == "fastlmm":
-                                route = "fastlmm_packed"
+                                route = (
+                                    "fastlmm_packed"
+                                    if bool(use_packed_fastlmm_scan)
+                                    else "fastlmm_stream"
+                                )
                             elif mk == "farmcpu":
                                 route = "farmcpu"
                             else:

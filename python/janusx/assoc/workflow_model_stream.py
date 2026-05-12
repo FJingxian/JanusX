@@ -222,10 +222,6 @@ def run_chunked_gwas_lmm_lm(
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
     """
-    raise RuntimeError(
-        "Rust-only GWAS mode disables Python streaming GWAS orchestrator "
-        "(run_chunked_gwas_lmm_lm). Use Rust packed/fullrank routes."
-    )
     model_map = {
         "lmm": LMM,
         "lm": LM,
@@ -1074,10 +1070,6 @@ def run_chunked_gwas_streaming_shared(
     Decode/filter each chunk once, then run all selected streaming models on the
     same chunk before moving to the next chunk.
     """
-    raise RuntimeError(
-        "Rust-only GWAS mode disables Python shared streaming GWAS orchestrator "
-        "(run_chunked_gwas_streaming_shared). Use Rust packed/fullrank routes."
-    )
     model_order = [str(m).lower() for m in model_names]
     model_map = {"lmm": LMM, "lm": LM, "fastlmm": FastLMM}
     model_order = [m for m in model_order if m in model_map]

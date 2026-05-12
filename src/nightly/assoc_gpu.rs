@@ -380,6 +380,63 @@ pub fn compare_lm_metal_vs_cpu<'a>(
     })
 }
 
+/// Compare fixed-variance LMM Metal vs CPU reference.
+///
+/// `lmm_fixed.l_row_major` must be shape `(n_selected_samples, n_selected_samples)`.
+pub fn compare_lmm_fixed_metal_vs_cpu<'a>(
+    bed_input: BedInput<'a>,
+    y: &[f32],
+    sample_indices: Option<&[usize]>,
+    snp_indices: Option<&[usize]>,
+    cfg: &MetalAssocConfig,
+    lmm_fixed: FixedVarLmmSpec<'_>,
+) -> Result<LmCompareReport, String> {
+    let peak_before_cpu = process_peak_rss_raw();
+    let t0 = Instant::now();
+    let cpu = lmm_fixed_scan_cpu(
+        clone_bed_input(&bed_input),
+        y,
+        sample_indices,
+        snp_indices,
+        cfg,
+        lmm_fixed.clone(),
+    )?;
+    let cpu_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let peak_after_cpu = process_peak_rss_raw();
+
+    let peak_before_gpu = process_peak_rss_raw();
+    let t1 = Instant::now();
+    let gpu = lmm_fixed_scan_metal(bed_input, y, sample_indices, snp_indices, cfg, lmm_fixed)?;
+    let gpu_elapsed_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let peak_after_gpu = process_peak_rss_raw();
+
+    let consistency = compare_assoc_output(&cpu, &gpu)?;
+    let unit = peak_rss_unit();
+
+    let cpu_perf = LmRunPerf {
+        backend: cpu.backend.clone(),
+        elapsed_ms: cpu_elapsed_ms,
+        peak_rss_raw: rss_delta_raw(peak_before_cpu, peak_after_cpu),
+        peak_rss_unit: unit,
+        n_scanned: cpu.n_scanned,
+        n_kept: cpu.n_kept,
+    };
+    let gpu_perf = LmRunPerf {
+        backend: gpu.backend.clone(),
+        elapsed_ms: gpu_elapsed_ms,
+        peak_rss_raw: rss_delta_raw(peak_before_gpu, peak_after_gpu),
+        peak_rss_unit: unit,
+        n_scanned: gpu.n_scanned,
+        n_kept: gpu.n_kept,
+    };
+
+    Ok(LmCompareReport {
+        cpu: cpu_perf,
+        metal: gpu_perf,
+        consistency,
+    })
+}
+
 fn clone_bed_input<'a>(bed_input: &BedInput<'a>) -> BedInput<'a> {
     match bed_input {
         BedInput::Prefix(p) => BedInput::Prefix(p),
@@ -466,7 +523,8 @@ fn run_assoc_scan_metal<'a>(
     let chunk_cap = cfg.chunk_snps;
 
     let use_gpu_packed_decode = model == ScanModel::Lm && l_row_major.is_none();
-    if use_gpu_packed_decode {
+    let use_gpu_packed_lmm_fixed = model == ScanModel::LmmFixed && l_row_major.is_some();
+    if use_gpu_packed_decode || use_gpu_packed_lmm_fixed {
         let bps = row_source.bytes_per_snp();
         let mut sample_idx_u32: Vec<u32> = Vec::with_capacity(sample_idx.len());
         for &idx in sample_idx.iter() {
@@ -474,7 +532,19 @@ fn run_assoc_scan_metal<'a>(
                 .map_err(|_| format!("sample index {} exceeds u32 range for GPU path", idx))?;
             sample_idx_u32.push(v);
         }
-        scanner.prepare_packed_lm_pipeline(&y_star, &sample_idx_u32, bps, chunk_cap)?;
+        if use_gpu_packed_lmm_fixed {
+            let l = l_row_major
+                .ok_or_else(|| "internal error: fixed-LMM GPU path requires L".to_string())?;
+            scanner.prepare_packed_lmm_fixed_pipeline(
+                &y_star,
+                &sample_idx_u32,
+                l,
+                bps,
+                chunk_cap,
+            )?;
+        } else {
+            scanner.prepare_packed_lm_pipeline(&y_star, &sample_idx_u32, bps, chunk_cap)?;
+        }
 
         let mut slot_sites = [Vec::<usize>::new(), Vec::<usize>::new()];
         slot_sites[0].reserve(chunk_cap);
@@ -550,16 +620,29 @@ fn run_assoc_scan_metal<'a>(
                 }
             }
 
-            scanner.submit_packed_lm_prepared_slot(
-                slot,
-                n,
-                bps,
-                m,
-                cfg.maf_threshold,
-                cfg.max_missing_rate,
-                cfg.fill_missing,
-                cfg.epsilon,
-            )?;
+            if use_gpu_packed_lmm_fixed {
+                scanner.submit_packed_lmm_fixed_prepared_slot(
+                    slot,
+                    n,
+                    bps,
+                    m,
+                    cfg.maf_threshold,
+                    cfg.max_missing_rate,
+                    cfg.fill_missing,
+                    cfg.epsilon,
+                )?;
+            } else {
+                scanner.submit_packed_lm_prepared_slot(
+                    slot,
+                    n,
+                    bps,
+                    m,
+                    cfg.maf_threshold,
+                    cfg.max_missing_rate,
+                    cfg.fill_missing,
+                    cfg.epsilon,
+                )?;
+            }
             slot_counts[slot] = m;
             slot_inflight[slot] = true;
         }
@@ -1540,6 +1623,143 @@ mod metal_impl {
         ses[tid] = se;
         keep_flags[tid] = 1u;
     }
+
+    // Decode packed BED rows + QC/impute into dense SNP-major rows.
+    kernel void packed_bed_decode_qc(
+        device const uchar* packed_rows  [[ buffer(0) ]],
+        device const uint* sample_idx    [[ buffer(1) ]],
+        device float* x_imputed          [[ buffer(2) ]],   // SNP-major dense rows
+        device float* mafs               [[ buffer(3) ]],
+        device uint* n_non_missing       [[ buffer(4) ]],
+        device uint* keep_flags          [[ buffer(5) ]],
+        constant PackedAssocParams& prm  [[ buffer(6) ]],
+        uint tid                         [[ thread_position_in_grid ]]
+    ) {
+        if (tid >= prm.n_snps) return;
+
+        uint N = prm.n_samples;
+        uint row_off_packed = tid * prm.bytes_per_snp;
+        uint row_off_dense = tid * N;
+        float alt_sum = 0.0f;
+        uint missing = 0u;
+
+        for (uint i = 0; i < N; i++) {
+            uint si = sample_idx[i];
+            uint byte_idx = si >> 2;
+            uint pair = si & 3u;
+            uchar b = packed_rows[row_off_packed + byte_idx];
+            uint code = (uint(b) >> (pair * 2u)) & 0x3u;
+            if (code == 1u) {
+                missing += 1u;
+            } else if (code == 2u) {
+                alt_sum += 1.0f;
+            } else if (code == 3u) {
+                alt_sum += 2.0f;
+            }
+        }
+
+        uint non_missing = N - missing;
+        n_non_missing[tid] = non_missing;
+        keep_flags[tid] = 0u;
+        mafs[tid] = 0.0f;
+        if (non_missing == 0u) {
+            return;
+        }
+
+        float miss_rate = float(missing) / float(N);
+        if (miss_rate > prm.max_missing_rate) {
+            return;
+        }
+
+        float p = alt_sum / (2.0f * float(non_missing));
+        float maf = min(p, 1.0f - p);
+        mafs[tid] = maf;
+        if (maf < prm.maf_threshold) {
+            return;
+        }
+
+        float impute = prm.fill_missing != 0u ? (alt_sum / float(non_missing)) : 0.0f;
+        for (uint i = 0; i < N; i++) {
+            uint si = sample_idx[i];
+            uint byte_idx = si >> 2;
+            uint pair = si & 3u;
+            uchar b = packed_rows[row_off_packed + byte_idx];
+            uint code = (uint(b) >> (pair * 2u)) & 0x3u;
+
+            float xv = 0.0f;
+            if (code == 2u) {
+                xv = 1.0f;
+            } else if (code == 3u) {
+                xv = 2.0f;
+            } else if (code == 1u) {
+                xv = impute;
+            }
+            x_imputed[row_off_dense + i] = xv;
+        }
+        keep_flags[tid] = 1u;
+    }
+
+    // Fixed-variance LMM scan: rotate each decoded SNP row with dense L and run OLS on (x*, y*).
+    kernel void packed_bed_lmm_fixed_scanner(
+        device const float* y_star        [[ buffer(0) ]],
+        device const float* l_row_major   [[ buffer(1) ]],   // (n x n)
+        device const float* x_imputed     [[ buffer(2) ]],   // SNP-major dense rows
+        device const uint* keep_flags     [[ buffer(3) ]],
+        device float* betas               [[ buffer(4) ]],
+        device float* ses                 [[ buffer(5) ]],
+        constant AssocParams& prm         [[ buffer(6) ]],
+        uint tid                          [[ thread_position_in_grid ]]
+    ) {
+        if (tid >= prm.n_snps) return;
+        if (keep_flags[tid] == 0u) {
+            betas[tid] = 0.0f;
+            ses[tid] = -1.0f;
+            return;
+        }
+
+        uint N = prm.n_samples;
+        uint off = tid * N;
+
+        float sx = 0.0f;
+        float sy = 0.0f;
+        float sxx = 0.0f;
+        float sxy = 0.0f;
+        float syy = 0.0f;
+
+        for (uint r = 0; r < N; r++) {
+            float xv = 0.0f;
+            uint l_row_off = r * N;
+            for (uint c = 0; c < N; c++) {
+                xv += l_row_major[l_row_off + c] * x_imputed[off + c];
+            }
+            float yv = y_star[r];
+            sx += xv;
+            sy += yv;
+            sxx += xv * xv;
+            sxy += xv * yv;
+            syy += yv * yv;
+        }
+
+        float fn = float(N);
+        float Sxx = sxx - (sx * sx) / fn;
+        float Sxy = sxy - (sx * sy) / fn;
+        float Syy = syy - (sy * sy) / fn;
+        if (Sxx <= prm.epsilon) {
+            betas[tid] = 0.0f;
+            ses[tid] = -1.0f;
+            return;
+        }
+
+        float beta = Sxy / Sxx;
+        float sse = Syy - beta * Sxy;
+        if (sse < 0.0f) sse = 0.0f;
+        float dof = max(fn - 2.0f, 1.0f);
+        float sigma2 = sse / dof;
+        float se = sqrt(sigma2 / max(Sxx, prm.epsilon));
+
+        betas[tid] = beta;
+        ses[tid] = se;
+    }
     "#;
 
     #[repr(C)]
@@ -1566,6 +1786,7 @@ mod metal_impl {
 
     struct PackedSlotBuffers {
         packed_rows_buf: Option<Buffer>,
+        decoded_rows_buf: Option<Buffer>,
         beta_buf: Option<Buffer>,
         se_buf: Option<Buffer>,
         maf_buf: Option<Buffer>,
@@ -1578,6 +1799,7 @@ mod metal_impl {
         fn new() -> Self {
             Self {
                 packed_rows_buf: None,
+                decoded_rows_buf: None,
                 beta_buf: None,
                 se_buf: None,
                 maf_buf: None,
@@ -1592,10 +1814,14 @@ mod metal_impl {
         device: Device,
         pipeline_dense: ComputePipelineState,
         pipeline_packed: ComputePipelineState,
+        pipeline_packed_decode_qc: ComputePipelineState,
+        pipeline_packed_lmm_fixed: ComputePipelineState,
         queue: metal::CommandQueue,
         threads_per_threadgroup: usize,
         y_buf: Option<Buffer>,
         y_capacity_samples: usize,
+        l_buf: Option<Buffer>,
+        l_capacity_samples: usize,
         x_buf: Option<Buffer>,
         beta_buf: Option<Buffer>,
         se_buf: Option<Buffer>,
@@ -1626,14 +1852,32 @@ mod metal_impl {
             let pipeline_packed = device
                 .new_compute_pipeline_state_with_function(&fun_packed)
                 .map_err(|e| format!("failed to create packed Metal pipeline: {e}"))?;
+            let fun_packed_decode_qc = lib
+                .get_function("packed_bed_decode_qc", None)
+                .map_err(|e| format!("failed to load Metal kernel packed_bed_decode_qc: {e}"))?;
+            let pipeline_packed_decode_qc = device
+                .new_compute_pipeline_state_with_function(&fun_packed_decode_qc)
+                .map_err(|e| format!("failed to create packed decode Metal pipeline: {e}"))?;
+            let fun_packed_lmm_fixed = lib
+                .get_function("packed_bed_lmm_fixed_scanner", None)
+                .map_err(|e| {
+                    format!("failed to load Metal kernel packed_bed_lmm_fixed_scanner: {e}")
+                })?;
+            let pipeline_packed_lmm_fixed = device
+                .new_compute_pipeline_state_with_function(&fun_packed_lmm_fixed)
+                .map_err(|e| format!("failed to create packed fixed-LMM Metal pipeline: {e}"))?;
             Ok(Self {
                 device,
                 pipeline_dense,
                 pipeline_packed,
+                pipeline_packed_decode_qc,
+                pipeline_packed_lmm_fixed,
                 queue,
                 threads_per_threadgroup: threads_per_threadgroup.max(1),
                 y_buf: None,
                 y_capacity_samples: 0,
+                l_buf: None,
+                l_capacity_samples: 0,
                 x_buf: None,
                 beta_buf: None,
                 se_buf: None,
@@ -1654,6 +1898,20 @@ mod metal_impl {
                     .new_buffer(y_bytes, MTLResourceOptions::StorageModeShared),
             );
             self.y_capacity_samples = n_samples;
+        }
+
+        fn ensure_l_buffer(&mut self, n_samples: usize) {
+            if self.l_capacity_samples == n_samples {
+                return;
+            }
+            let l_bytes = (n_samples
+                .saturating_mul(n_samples)
+                .saturating_mul(size_of::<f32>())) as u64;
+            self.l_buf = Some(
+                self.device
+                    .new_buffer(l_bytes, MTLResourceOptions::StorageModeShared),
+            );
+            self.l_capacity_samples = n_samples;
         }
 
         fn ensure_dense_buffers(&mut self, n_samples: usize, max_snps: usize) {
@@ -1704,6 +1962,9 @@ mod metal_impl {
             }
 
             let packed_bytes = (max_snps.saturating_mul(bytes_per_snp)) as u64;
+            let decoded_bytes = (max_snps
+                .saturating_mul(n_samples)
+                .saturating_mul(size_of::<f32>())) as u64;
             let sample_idx_bytes = (n_samples.saturating_mul(size_of::<u32>())) as u64;
             let out_f32_bytes = (max_snps.saturating_mul(size_of::<f32>())) as u64;
             let out_u32_bytes = (max_snps.saturating_mul(size_of::<u32>())) as u64;
@@ -1716,6 +1977,10 @@ mod metal_impl {
                 slot.packed_rows_buf = Some(
                     self.device
                         .new_buffer(packed_bytes, MTLResourceOptions::StorageModeShared),
+                );
+                slot.decoded_rows_buf = Some(
+                    self.device
+                        .new_buffer(decoded_bytes, MTLResourceOptions::StorageModeShared),
                 );
                 slot.beta_buf = Some(
                     self.device
@@ -1898,6 +2163,39 @@ mod metal_impl {
             Ok(())
         }
 
+        pub fn prepare_packed_lmm_fixed_pipeline(
+            &mut self,
+            y_star: &[f32],
+            sample_indices: &[u32],
+            l_row_major: &[f32],
+            bytes_per_snp: usize,
+            max_snps: usize,
+        ) -> Result<(), String> {
+            self.prepare_packed_lm_pipeline(y_star, sample_indices, bytes_per_snp, max_snps)?;
+            let n_samples = sample_indices.len();
+            let expected_l = n_samples.saturating_mul(n_samples);
+            if l_row_major.len() != expected_l {
+                return Err(format!(
+                    "fixed-LMM L shape mismatch: len={}, expected={}",
+                    l_row_major.len(),
+                    expected_l
+                ));
+            }
+            self.ensure_l_buffer(n_samples);
+            let l_buf = self
+                .l_buf
+                .as_ref()
+                .ok_or_else(|| "internal error: fixed-LMM L buffer not allocated".to_string())?;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    l_row_major.as_ptr(),
+                    l_buf.contents() as *mut f32,
+                    l_row_major.len(),
+                );
+            }
+            Ok(())
+        }
+
         pub fn packed_slot_input_ptr(&self, slot: usize) -> Result<*mut u8, String> {
             let slot_idx = Self::packed_slot_index(slot)?;
             let slot_state = self
@@ -2019,6 +2317,153 @@ mod metal_impl {
                 let tgs = MTLSize::new(tg, 1, 1);
                 enc.dispatch_threads(grid, tgs);
                 enc.end_encoding();
+            }
+
+            cmd.commit();
+            self.packed_slots[slot_idx].inflight_cmd = Some(cmd);
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn submit_packed_lmm_fixed_prepared_slot(
+            &mut self,
+            slot: usize,
+            n_samples: usize,
+            bytes_per_snp: usize,
+            n_snps: usize,
+            maf_threshold: f32,
+            max_missing_rate: f32,
+            fill_missing: bool,
+            epsilon: f32,
+        ) -> Result<(), String> {
+            let slot_idx = Self::packed_slot_index(slot)?;
+            if n_samples == 0 || n_snps == 0 {
+                return Err("packed fixed-LMM submit requires n_samples>0 and n_snps>0".to_string());
+            }
+            if bytes_per_snp == 0 {
+                return Err("metal packed bytes_per_snp must be > 0".to_string());
+            }
+            if n_samples > self.packed_capacity.0
+                || n_snps > self.packed_capacity.1
+                || bytes_per_snp != self.packed_capacity.2
+            {
+                return Err(format!(
+                    "packed fixed-LMM prepared capacity mismatch: need (n={}, m={}, bps={}), have {:?}",
+                    n_samples, n_snps, bytes_per_snp, self.packed_capacity
+                ));
+            }
+            if self.packed_slots[slot_idx].inflight_cmd.is_some() {
+                return Err(format!("packed slot {} is still in flight", slot_idx));
+            }
+            if self.l_capacity_samples != n_samples {
+                return Err(format!(
+                    "fixed-LMM L capacity mismatch: L_n={}, submit_n={}",
+                    self.l_capacity_samples, n_samples
+                ));
+            }
+
+            let bps_u32 = u32::try_from(bytes_per_snp)
+                .map_err(|_| format!("bytes_per_snp {} exceeds u32 range", bytes_per_snp))?;
+            let y_buf = self
+                .y_buf
+                .as_ref()
+                .ok_or_else(|| "internal error: packed y buffer not allocated".to_string())?;
+            let l_buf = self
+                .l_buf
+                .as_ref()
+                .ok_or_else(|| "internal error: fixed-LMM L buffer not allocated".to_string())?;
+            let sample_idx_buf = self.sample_idx_buf.as_ref().ok_or_else(|| {
+                "internal error: packed sample index buffer not allocated".to_string()
+            })?;
+            let prm_decode = PackedAssocParams {
+                n_samples: n_samples as u32,
+                n_snps: n_snps as u32,
+                bytes_per_snp: bps_u32,
+                maf_threshold,
+                max_missing_rate,
+                epsilon,
+                fill_missing: if fill_missing { 1 } else { 0 },
+            };
+            let prm_assoc = AssocParams {
+                n_samples: n_samples as u32,
+                n_snps: n_snps as u32,
+                epsilon,
+            };
+
+            let cmd = self.queue.new_command_buffer().to_owned();
+            {
+                let slot_state = self
+                    .packed_slots
+                    .get(slot_idx)
+                    .ok_or_else(|| format!("invalid packed slot index {}", slot_idx))?;
+                let packed_rows_buf = slot_state.packed_rows_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed rows buffer {slot_idx} missing")
+                })?;
+                let decoded_rows_buf = slot_state.decoded_rows_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed decoded buffer {slot_idx} missing")
+                })?;
+                let beta_buf = slot_state.beta_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed beta buffer {slot_idx} missing")
+                })?;
+                let se_buf = slot_state.se_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed se buffer {slot_idx} missing")
+                })?;
+                let maf_buf = slot_state.maf_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed maf buffer {slot_idx} missing")
+                })?;
+                let n_non_missing_buf = slot_state.n_non_missing_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed non-missing buffer {slot_idx} missing")
+                })?;
+                let keep_flag_buf = slot_state.keep_flag_buf.as_ref().ok_or_else(|| {
+                    format!("internal error: packed keep buffer {slot_idx} missing")
+                })?;
+
+                let tg_decode = min(
+                    self.threads_per_threadgroup as u64,
+                    self.pipeline_packed_decode_qc
+                        .max_total_threads_per_threadgroup(),
+                )
+                .max(1);
+                let grid = MTLSize::new(n_snps as u64, 1, 1);
+                let tgs_decode = MTLSize::new(tg_decode, 1, 1);
+                let enc_decode = cmd.new_compute_command_encoder();
+                enc_decode.set_compute_pipeline_state(&self.pipeline_packed_decode_qc);
+                enc_decode.set_buffer(0, Some(packed_rows_buf), 0);
+                enc_decode.set_buffer(1, Some(sample_idx_buf), 0);
+                enc_decode.set_buffer(2, Some(decoded_rows_buf), 0);
+                enc_decode.set_buffer(3, Some(maf_buf), 0);
+                enc_decode.set_buffer(4, Some(n_non_missing_buf), 0);
+                enc_decode.set_buffer(5, Some(keep_flag_buf), 0);
+                enc_decode.set_bytes(
+                    6,
+                    size_of::<PackedAssocParams>() as u64,
+                    &prm_decode as *const PackedAssocParams as *const c_void,
+                );
+                enc_decode.dispatch_threads(grid, tgs_decode);
+                enc_decode.end_encoding();
+
+                let tg_assoc = min(
+                    self.threads_per_threadgroup as u64,
+                    self.pipeline_packed_lmm_fixed
+                        .max_total_threads_per_threadgroup(),
+                )
+                .max(1);
+                let tgs_assoc = MTLSize::new(tg_assoc, 1, 1);
+                let enc_assoc = cmd.new_compute_command_encoder();
+                enc_assoc.set_compute_pipeline_state(&self.pipeline_packed_lmm_fixed);
+                enc_assoc.set_buffer(0, Some(y_buf), 0);
+                enc_assoc.set_buffer(1, Some(l_buf), 0);
+                enc_assoc.set_buffer(2, Some(decoded_rows_buf), 0);
+                enc_assoc.set_buffer(3, Some(keep_flag_buf), 0);
+                enc_assoc.set_buffer(4, Some(beta_buf), 0);
+                enc_assoc.set_buffer(5, Some(se_buf), 0);
+                enc_assoc.set_bytes(
+                    6,
+                    size_of::<AssocParams>() as u64,
+                    &prm_assoc as *const AssocParams as *const c_void,
+                );
+                enc_assoc.dispatch_threads(grid, tgs_assoc);
+                enc_assoc.end_encoding();
             }
 
             cmd.commit();
@@ -2229,12 +2674,38 @@ mod metal_impl {
             Err("Metal backend is only available on macOS".to_string())
         }
 
+        pub fn prepare_packed_lmm_fixed_pipeline(
+            &mut self,
+            _y_star: &[f32],
+            _sample_indices: &[u32],
+            _l_row_major: &[f32],
+            _bytes_per_snp: usize,
+            _max_snps: usize,
+        ) -> Result<(), String> {
+            Err("Metal backend is only available on macOS".to_string())
+        }
+
         pub fn packed_slot_input_ptr(&self, _slot: usize) -> Result<*mut u8, String> {
             Err("Metal backend is only available on macOS".to_string())
         }
 
         #[allow(clippy::too_many_arguments)]
         pub fn submit_packed_lm_prepared_slot(
+            &mut self,
+            _slot: usize,
+            _n_samples: usize,
+            _bytes_per_snp: usize,
+            _n_snps: usize,
+            _maf_threshold: f32,
+            _max_missing_rate: f32,
+            _fill_missing: bool,
+            _epsilon: f32,
+        ) -> Result<(), String> {
+            Err("Metal backend is only available on macOS".to_string())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn submit_packed_lmm_fixed_prepared_slot(
             &mut self,
             _slot: usize,
             _n_samples: usize,

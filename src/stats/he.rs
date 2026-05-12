@@ -8,7 +8,6 @@ use std::sync::Arc;
 use crate::bedmath::{decode_row_centered_full_lut, is_identity_indices, packed_byte_lut};
 use crate::blas::{cblas_sgemm_dispatch, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS};
 use crate::packed::bed_packed_row_flip_mask;
-use crate::pcg::pcg_solve_f32;
 use crate::stats_common::{get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +30,102 @@ fn dot_f32_f64(a: &[f32], b: &[f32]) -> f64 {
         .zip(b.iter())
         .map(|(x, y)| (*x as f64) * (*y as f64))
         .sum()
+}
+
+#[inline]
+fn mean_center_in_place_f32(v: &mut [f32]) {
+    let n = v.len();
+    if n == 0 {
+        return;
+    }
+    let mean = v.iter().copied().sum::<f32>() / (n as f32);
+    for x in v.iter_mut() {
+        *x -= mean;
+    }
+}
+
+#[inline]
+fn he_residual_sq_2x2(a00: f64, a01: f64, a11: f64, b0: f64, b1: f64, x0: f64, x1: f64) -> f64 {
+    let r0 = a00.mul_add(x0, a01 * x1) - b0;
+    let r1 = a01.mul_add(x0, a11 * x1) - b1;
+    r0 * r0 + r1 * r1
+}
+
+#[inline]
+fn he_project_nnls_2x2(
+    a00: f64,
+    a01: f64,
+    a11: f64,
+    b0: f64,
+    b1: f64,
+    x0_unconstrained: f64,
+    x1_unconstrained: f64,
+) -> (f64, f64) {
+    let mut best = (0.0_f64, 0.0_f64, f64::INFINITY);
+    let mut consider = |x0: f64, x1: f64| {
+        if !x0.is_finite() || !x1.is_finite() {
+            return;
+        }
+        if x0 < 0.0_f64 || x1 < 0.0_f64 {
+            return;
+        }
+        let obj = he_residual_sq_2x2(a00, a01, a11, b0, b1, x0, x1);
+        if obj.is_finite() && obj < best.2 {
+            best = (x0, x1, obj);
+        }
+    };
+
+    // Candidate A: unconstrained HE solution (if already feasible).
+    consider(x0_unconstrained, x1_unconstrained);
+
+    // Candidate B: sigma_g2 = 0 boundary, solve least-squares for sigma_e2 >= 0.
+    let col1_norm2 = a01 * a01 + a11 * a11;
+    if col1_norm2.is_finite() && col1_norm2 > 0.0_f64 {
+        let x1 = ((a01 * b0 + a11 * b1) / col1_norm2).max(0.0_f64);
+        consider(0.0_f64, x1);
+    }
+
+    // Candidate C: sigma_e2 = 0 boundary, solve least-squares for sigma_g2 >= 0.
+    let col0_norm2 = a00 * a00 + a01 * a01;
+    if col0_norm2.is_finite() && col0_norm2 > 0.0_f64 {
+        let x0 = ((a00 * b0 + a01 * b1) / col0_norm2).max(0.0_f64);
+        consider(x0, 0.0_f64);
+    }
+
+    // Candidate D: origin.
+    consider(0.0_f64, 0.0_f64);
+
+    if best.2.is_finite() {
+        (best.0, best.1)
+    } else {
+        (0.0_f64, 0.0_f64)
+    }
+}
+
+#[inline]
+fn he_solve_2x2(a00: f64, a01: f64, a11: f64, b0: f64, b1: f64) -> Result<(f64, f64), String> {
+    if !a00.is_finite()
+        || !a01.is_finite()
+        || !a11.is_finite()
+        || !b0.is_finite()
+        || !b1.is_finite()
+    {
+        return Err("HE 2x2 solve received non-finite inputs".to_string());
+    }
+    let det = a00.mul_add(a11, -(a01 * a01));
+    let det_scale = (a00.abs() + a11.abs() + 2.0_f64 * a01.abs()).max(1.0_f64);
+    let det_floor = det_scale * det_scale * f64::EPSILON;
+    if !det.is_finite() || det.abs() <= det_floor {
+        return Err(format!(
+            "HE 2x2 solve is singular/ill-conditioned: det={det}, floor={det_floor}"
+        ));
+    }
+    let x0 = (b0.mul_add(a11, -(b1 * a01))) / det;
+    let x1 = (a00.mul_add(b1, -(a01 * b0))) / det;
+    if !x0.is_finite() || !x1.is_finite() {
+        return Err("HE 2x2 solve produced non-finite outputs".to_string());
+    }
+    Ok((x0, x1))
 }
 
 #[inline]
@@ -366,7 +461,9 @@ pub fn he_variance_components_packed(
     let n = sample_idx.len();
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
     let m_scale = m_effective as f32;
-    let y_f32: Vec<f32> = y.iter().map(|v| *v as f32).collect();
+    let y_mean = y.iter().sum::<f64>() / (n as f64);
+    let y_centered: Vec<f64> = y.iter().map(|v| *v - y_mean).collect();
+    let y_f32: Vec<f32> = y_centered.iter().map(|v| *v as f32).collect();
     let code4_lut = &packed_byte_lut().code4;
 
     let k_y = apply_grm_to_vec_f32(
@@ -388,10 +485,14 @@ pub fn he_variance_components_packed(
     let y_y = dot_f32_f64(&y_f32, &y_f32);
 
     let mut probe = vec![0.0_f32; n];
+    let mut tr_k_acc = 0.0_f64;
     let mut tr_k2_acc = 0.0_f64;
     for b in 0..trace_samples {
         fill_rademacher_f32(&mut probe, seed, b);
-        let kv = apply_grm_to_vec_f32(
+        // Project probe to the intercept-orthogonal subspace:
+        // z <- P z,  P = I - 11'/n
+        mean_center_in_place_f32(&mut probe);
+        let mut kv = apply_grm_to_vec_f32(
             packed_flat,
             bytes_per_snp,
             n_samples,
@@ -406,46 +507,52 @@ pub fn he_variance_components_packed(
             code4_lut,
             pool,
         )?;
+        // Complete the left projection for PKP and use the same probe stream
+        // to estimate both tr(PKP) and tr((PKP)^2).
+        mean_center_in_place_f32(&mut kv);
+        tr_k_acc += dot_f32_f64(&probe, &kv);
         tr_k2_acc += dot_f32_f64(&kv, &kv);
     }
+    let tr_k = tr_k_acc / (trace_samples as f64);
     let tr_k2 = tr_k2_acc / (trace_samples as f64);
-    let tr_k = n as f64;
+    if !(tr_k.is_finite() && tr_k > 0.0_f64) {
+        return Err(format!(
+            "estimated Tr(PKP) is invalid: {tr_k}. Try increasing trace_samples."
+        ));
+    }
     if !(tr_k2.is_finite() && tr_k2 > 0.0_f64) {
         return Err(format!(
-            "estimated Tr(K^2) is invalid: {tr_k2}. Try increasing trace_samples."
+            "estimated Tr((PKP)^2) is invalid: {tr_k2}. Try increasing trace_samples."
         ));
     }
 
-    // Stochastic trace estimation can slightly undershoot Tr(K) for small probe counts.
-    // Add a tiny floor to keep the 2x2 normal matrix SPD for PCG.
-    let tr_k2_solve = tr_k2.max(tr_k + tr_k.max(1.0_f64) * 1e-6_f64);
-    let a00 = tr_k2_solve as f32;
-    let a01 = tr_k as f32;
-    let a11 = n as f32;
-    let b_vec = [y_ky as f32, y_y as f32];
-    let d0_inv = 1.0_f32 / a00.max(1e-12_f32);
-    let d1_inv = 1.0_f32 / a11.max(1e-12_f32);
-
-    let pcg_res = pcg_solve_f32(
-        &b_vec,
-        max_iter,
-        tol.max(1e-12_f64),
-        1e-20_f64,
-        |x| {
-            if x.len() != 2 {
-                return Err(format!("HE 2x2 apply_a expects len=2, got {}", x.len()));
-            }
-            Ok(vec![a00 * x[0] + a01 * x[1], a01 * x[0] + a11 * x[1]])
-        },
-        |r, z| {
-            z[0] = d0_inv * r[0];
-            z[1] = d1_inv * r[1];
-        },
-        |_iters_now, _iters_max, _rel_res| Ok(()),
-    )?;
-
-    let sigma_g2 = pcg_res.x[0] as f64;
-    let sigma_e2 = pcg_res.x[1] as f64;
+    // In the centered space, tr(P)=n-1 (intercept removed).
+    let tr_p = ((n as f64) - 1.0_f64).max(1.0_f64);
+    // Stochastic trace estimation can slightly undershoot the PSD lower bound.
+    // Add a tiny floor to keep the 2x2 normal matrix strictly SPD for direct solve.
+    let tr_k2_solve = tr_k2.max((tr_k * tr_k) / tr_p + tr_p * 1e-6_f64);
+    let a00 = tr_k2_solve;
+    let a01 = tr_k;
+    let a11 = tr_p;
+    let b0 = y_ky;
+    let b1 = y_y;
+    let (sigma_unconstrained_g2, sigma_unconstrained_e2) = he_solve_2x2(a00, a01, a11, b0, b1)?;
+    let (sigma_g2, sigma_e2) = he_project_nnls_2x2(
+        a00,
+        a01,
+        a11,
+        b0,
+        b1,
+        sigma_unconstrained_g2,
+        sigma_unconstrained_e2,
+    );
+    let rel_res = {
+        let res0 = a00.mul_add(sigma_unconstrained_g2, a01 * sigma_unconstrained_e2) - b0;
+        let res1 = a01.mul_add(sigma_unconstrained_g2, a11 * sigma_unconstrained_e2) - b1;
+        let rhs_norm = (b0 * b0 + b1 * b1).sqrt().max(1e-20_f64);
+        ((res0 * res0 + res1 * res1).sqrt()) / rhs_norm
+    };
+    let converged = rel_res.is_finite() && rel_res <= tol.max(1e-12_f64);
     let h2 = {
         let denom = sigma_g2 + sigma_e2;
         if denom.is_finite() && denom > 0.0_f64 {
@@ -459,9 +566,9 @@ pub fn he_variance_components_packed(
         sigma_g2,
         sigma_e2,
         h2,
-        converged: pcg_res.converged,
-        iters: pcg_res.iters,
-        rel_res: pcg_res.rel_res,
+        converged,
+        iters: 1,
+        rel_res,
         m_effective,
         tr_k2,
         y_ky,

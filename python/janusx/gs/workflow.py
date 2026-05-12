@@ -1539,8 +1539,8 @@ def _resolve_rrblup_solver(
     n_ref = int(cfg_use.get("auto_pcg_ref_n", n_train))
     n_use = int(max(0, int(n_ref)))
     # Adaptive rrBLUP policy:
-    #   n <= 10k: exact REML/FaST path (stable, no subsample lambda)
-    #   n > 10k : PCG path (subsample REML lambda, no AdamW by default)
+    #   n <= 10k: exact REML/FaST path.
+    #   n > 10k : PCG path (HE-based lambda auto-estimation when enabled).
     return "pcg" if n_use > auto_pcg_min_n else "exact"
 
 
@@ -1589,11 +1589,12 @@ def _estimate_rrblup_lambda_subsample_reml(
     if n_train <= 1 or y_vec.shape[0] != n_train:
         return {
             "lambda_equation": float("nan"),
+            "lambda_k": float("nan"),
             "n_sub": 0,
             "repeats": 0,
             "ok_repeats": 0,
+            "strategy": "invalid_input",
         }
-
     sub_min = int(max(16, int(cfg_use.get("lambda_subsample_min_n", _RRBLUP_LAMBDA_SUBSAMPLE_MIN_N))))
     sub_max = int(max(sub_min, int(cfg_use.get("lambda_subsample_max_n", _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N))))
     sub_target = int(max(sub_min, int(cfg_use.get("lambda_subsample_n", _RRBLUP_LAMBDA_SUBSAMPLE_MAX_N))))
@@ -1602,8 +1603,18 @@ def _estimate_rrblup_lambda_subsample_reml(
     repeats = int(min(20, max(5, rep_cfg)))
     seed = int(cfg_use.get("lambda_subsample_seed", 42))
     rng = np.random.default_rng(seed)
-    log10_vals: list[float] = []
     std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("pcg_std_eps", 1e-12))))
+    exact_reml_max_n = int(
+        max(
+            2,
+            int(
+                cfg_use.get(
+                    "lambda_exact_reml_max_n",
+                    cfg_use.get("auto_pcg_min_n", _RRBLUP_AUTO_PCG_MIN_N),
+                )
+            ),
+        )
+    )
 
     maf_all = np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
     site_keep_raw = packed_ctx.get("site_keep", None)
@@ -1631,12 +1642,79 @@ def _estimate_rrblup_lambda_subsample_reml(
         except Exception:
             return
 
+    def _fit_once(local_idx: np.ndarray) -> tuple[float, float]:
+        sub_abs = np.ascontiguousarray(train_abs[local_idx], dtype=np.int64)
+        y_sub = np.ascontiguousarray(y_vec[local_idx], dtype=np.float64)
+        grm_sub = _build_gblup_cv_grm_once(
+            train_snp=None,
+            packed_ctx=packed_ctx,
+            train_sample_indices=sub_abs,
+            n_jobs=max(1, int(n_jobs)),
+        )
+        if grm_sub is None:
+            raise RuntimeError("Packed GRM builder returned None.")
+        fit_sub = _fit_gblup_reml_from_grm(y_sub, grm_sub)
+        lam_sub_k = float(fit_sub.get("lambda_reml", np.nan))
+        lam_sub_eq = (
+            float(lam_sub_k * m_scale)
+            if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0)
+            else float("nan")
+        )
+        return lam_sub_k, lam_sub_eq
+
+    # Small/medium sample: exact REML on full training GRM.
+    if n_train <= exact_reml_max_n:
+        _emit(
+            "pcg_lambda_subsample_start",
+            total=1,
+            n_sub=int(n_train),
+            n_train=int(n_train),
+            strategy="reml_exact",
+        )
+        lam_k = float("nan")
+        lam_eq = float("nan")
+        try:
+            full_idx = np.arange(n_train, dtype=np.int64)
+            lam_k, lam_eq = _fit_once(full_idx)
+        except Exception:
+            pass
+        lam_ok = bool(np.isfinite(lam_eq) and lam_eq > 0.0)
+        _emit(
+            "pcg_lambda_subsample_iter",
+            iter=1,
+            total=1,
+            lambda_equation=float(lam_eq),
+            lambda_k=float(lam_k),
+            m_effective=int(m_effective),
+            strategy="reml_exact",
+        )
+        _emit(
+            "pcg_lambda_subsample_end",
+            repeats=1,
+            ok_repeats=int(1 if lam_ok else 0),
+            lambda_equation=float(lam_eq),
+            m_effective=int(m_effective),
+            strategy="reml_exact",
+        )
+        return {
+            "lambda_equation": float(lam_eq),
+            "lambda_k": float(lam_k),
+            "n_sub": int(n_train),
+            "repeats": 1,
+            "ok_repeats": int(1 if lam_ok else 0),
+            "m_effective": int(m_effective),
+            "strategy": ("reml_exact" if lam_ok else "reml_exact_failed"),
+        }
+
+    # Large sample: estimate lambda from repeated subsample REML.
     _emit(
         "pcg_lambda_subsample_start",
         total=int(repeats),
         n_sub=int(n_sub),
         n_train=int(n_train),
+        strategy="subsample_reml",
     )
+    log10_vals: list[float] = []
     for rep in range(repeats):
         if n_sub >= n_train:
             local_idx = np.arange(n_train, dtype=np.int64)
@@ -1646,22 +1724,11 @@ def _estimate_rrblup_lambda_subsample_reml(
                 dtype=np.int64,
             )
             local_idx.sort()
-        sub_abs = np.ascontiguousarray(train_abs[local_idx], dtype=np.int64)
-        y_sub = np.ascontiguousarray(y_vec[local_idx], dtype=np.float64)
         try:
-            grm_sub = _build_gblup_cv_grm_once(
-                train_snp=None,
-                packed_ctx=packed_ctx,
-                train_sample_indices=sub_abs,
-                n_jobs=max(1, int(n_jobs)),
-            )
-            if grm_sub is None:
-                raise RuntimeError("Packed GRM builder returned None.")
-            fit_sub = _fit_gblup_reml_from_grm(y_sub, grm_sub)
-            lam_sub_k = float(fit_sub.get("lambda_reml", np.nan))
+            lam_sub_k, lam_sub_eq = _fit_once(local_idx)
         except Exception:
             lam_sub_k = float("nan")
-        lam_sub_eq = float(lam_sub_k * m_scale) if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0) else float("nan")
+            lam_sub_eq = float("nan")
         if np.isfinite(lam_sub_eq) and lam_sub_eq > 0.0:
             log10_vals.append(float(np.log10(lam_sub_eq)))
         _emit(
@@ -1671,34 +1738,46 @@ def _estimate_rrblup_lambda_subsample_reml(
             lambda_equation=float(lam_sub_eq),
             lambda_k=float(lam_sub_k),
             m_effective=int(m_effective),
+            strategy="subsample_reml",
         )
+
     if len(log10_vals) == 0:
         _emit(
             "pcg_lambda_subsample_end",
             repeats=int(repeats),
             ok_repeats=0,
             lambda_equation=float("nan"),
+            m_effective=int(m_effective),
+            strategy="subsample_reml",
         )
         return {
             "lambda_equation": float("nan"),
+            "lambda_k": float("nan"),
             "n_sub": int(n_sub),
             "repeats": int(repeats),
             "ok_repeats": 0,
+            "m_effective": int(m_effective),
+            "strategy": "subsample_reml_failed",
         }
+
     lam_eq = float(10.0 ** float(np.median(np.asarray(log10_vals, dtype=np.float64))))
+    lam_k = float(lam_eq / m_scale) if m_scale > 0.0 else float("nan")
     _emit(
         "pcg_lambda_subsample_end",
         repeats=int(repeats),
         ok_repeats=int(len(log10_vals)),
         lambda_equation=float(lam_eq),
         m_effective=int(m_effective),
+        strategy="subsample_reml",
     )
     return {
         "lambda_equation": float(lam_eq),
+        "lambda_k": float(lam_k),
         "n_sub": int(n_sub),
         "repeats": int(repeats),
         "ok_repeats": int(len(log10_vals)),
         "m_effective": int(m_effective),
+        "strategy": "subsample_reml",
     }
 
 
@@ -1844,14 +1923,14 @@ def _build_rrblup_adamw_grid(
     cfg: dict[str, typing.Any] | None,
 ) -> list[tuple[float, float]]:
     cfg_use = cfg or {}
-    lam0 = float(cfg_use.get("lambda_value", 10000.0))
+    lam0 = float(cfg_use.get("lambda_value", 1.0))
     lr0 = float(cfg_use.get("lr", 1e-2))
     if (not np.isfinite(lam0)) or lam0 < 0.0:
-        lam0 = 10000.0
+        lam0 = 1.0
     if (not np.isfinite(lr0)) or lr0 <= 0.0:
         lr0 = 1e-2
     grid_size = int(max(1, min(4, int(cfg_use.get("grid_size", 4)))))
-    lam_anchor = float(max(lam0, 10000.0))
+    lam_anchor = float(max(lam0, 1e-8))
     cands = [
         (lam_anchor, lr0),
         (lam_anchor * 0.5, lr0),
@@ -2292,7 +2371,7 @@ def _fit_rrblup_adamw_cpu(
     if n_train <= 0:
         raise ValueError("rrBLUP AdamW training requires at least one sample.")
 
-    lambda_value = float(cfg_use.get("lambda_value", 10000.0))
+    lambda_value = float(cfg_use.get("lambda_value", 1.0))
     lambda_scale = str(cfg_use.get("lambda_scale", "equation")).strip().lower()
     lr = float(cfg_use.get("lr", 1e-2))
     epochs = int(max(1, int(cfg_use.get("epochs", 60))))
@@ -3396,7 +3475,7 @@ def GSapi(
                     )
 
                 rr_cfg = dict(rrblup_adamw_cfg or {})
-                lambda_raw = float(rr_cfg.get("lambda_value", 10000.0))
+                lambda_raw = float(rr_cfg.get("lambda_value", 1.0))
                 lambda_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
                 if (not np.isfinite(lambda_raw)) or (lambda_raw < 0.0):
                     raise ValueError(f"rrBLUP lambda must be finite and >= 0, got {lambda_raw!r}.")
@@ -3412,16 +3491,8 @@ def GSapi(
                 )
                 lambda_source = "manual"
                 lambda_auto_info: dict[str, typing.Any] | None = None
-                auto_pcg_min_n = int(
-                    max(2, int(rr_cfg.get("auto_pcg_min_n", _RRBLUP_AUTO_PCG_MIN_N)))
-                )
-                auto_pcg_ref_n = int(max(0, int(rr_cfg.get("auto_pcg_ref_n", n_train_local))))
                 lambda_auto_enabled = _cfg_truthy(rr_cfg.get("lambda_auto", "on"), default=True)
-                if (
-                    str(requested_rr_solver) == "auto"
-                    and int(auto_pcg_ref_n) > int(auto_pcg_min_n)
-                    and bool(lambda_auto_enabled)
-                ):
+                if bool(lambda_auto_enabled):
                     lambda_auto_info = _estimate_rrblup_lambda_subsample_reml(
                         y_train=np.asarray(Y, dtype=np.float64).reshape(-1),
                         packed_ctx=packed_train,
@@ -3434,16 +3505,27 @@ def GSapi(
                         ),
                     )
                     lam_auto = float(lambda_auto_info.get("lambda_equation", np.nan))
-                    if np.isfinite(lam_auto) and lam_auto > 0.0:
+                    lam_auto_strategy = (
+                        str(lambda_auto_info.get("strategy", "lambda_auto")).strip() or "lambda_auto"
+                    )
+                    if np.isfinite(lam_auto) and lam_auto >= 0.0:
                         lambda_equation = float(lam_auto)
                         lambda_raw = _rrblup_lambda_equation_to_raw(
                             lambda_equation=float(lambda_equation),
                             lambda_scale=lambda_scale,
                             n_train=int(n_train_local),
                         )
-                        lambda_source = "subsample_reml"
-                if (not np.isfinite(lambda_equation)) or (lambda_equation <= 0.0):
+                        lambda_source = lam_auto_strategy
+                    else:
+                        lambda_source = f"{lam_auto_strategy}_fallback_manual"
+                if (not np.isfinite(lambda_equation)) or (lambda_equation < 0.0):
                     lambda_equation = float(1e-8)
+                lambda_equation = float(max(lambda_equation, 1e-8))
+                lambda_raw = _rrblup_lambda_equation_to_raw(
+                    lambda_equation=float(lambda_equation),
+                    lambda_scale=lambda_scale,
+                    n_train=int(n_train_local),
+                )
                 pcg_tol = float(rr_cfg.get("pcg_tol", 1e-4))
                 pcg_max_iter = int(max(1, int(rr_cfg.get("pcg_max_iter", 100))))
                 pcg_block_rows = int(
@@ -3630,6 +3712,56 @@ def GSapi(
                         rrblup_runtime_state["lambda_subsample_ok_repeats"] = int(
                             lambda_auto_info.get("ok_repeats", 0)
                         )
+                        auto_strategy = str(lambda_auto_info.get("strategy", "")).strip().lower()
+                        if auto_strategy.startswith("he"):
+                            rrblup_runtime_state["lambda_he_sigma_g2"] = float(
+                                lambda_auto_info.get("sigma_g2", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_sigma_e2"] = float(
+                                lambda_auto_info.get("sigma_e2", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_h2"] = float(
+                                lambda_auto_info.get("h2", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_converged"] = bool(
+                                lambda_auto_info.get("he_converged", False)
+                            )
+                            rrblup_runtime_state["lambda_he_iters"] = int(
+                                lambda_auto_info.get("he_iters", 0)
+                            )
+                            rrblup_runtime_state["lambda_he_rel_res"] = float(
+                                lambda_auto_info.get("he_rel_res", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_lambda_k"] = float(
+                                lambda_auto_info.get("lambda_k", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_lambda_equation"] = float(
+                                lambda_auto_info.get("lambda_equation", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_raw_k"] = float(
+                                lambda_auto_info.get("lambda_he_raw_k", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_raw_equation"] = float(
+                                lambda_auto_info.get("lambda_he_raw_equation", np.nan)
+                            )
+                            rrblup_runtime_state["lambda_he_trace_samples_used"] = int(
+                                lambda_auto_info.get("trace_samples_used", 0)
+                            )
+                        else:
+                            for k in (
+                                "lambda_he_sigma_g2",
+                                "lambda_he_sigma_e2",
+                                "lambda_he_h2",
+                                "lambda_he_converged",
+                                "lambda_he_iters",
+                                "lambda_he_rel_res",
+                                "lambda_he_lambda_k",
+                                "lambda_he_lambda_equation",
+                                "lambda_he_raw_k",
+                                "lambda_he_raw_equation",
+                                "lambda_he_trace_samples_used",
+                            ):
+                                rrblup_runtime_state.pop(str(k), None)
                     rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
                     rrblup_runtime_state["pve_used"] = float(pve)
                     rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
@@ -3677,6 +3809,57 @@ def GSapi(
                 )
         if method == "rrBLUP" and resolved_rr_solver == "adamw":
             rr_cfg_base = dict(rrblup_adamw_cfg or {})
+            adamw_lambda_auto_info: dict[str, typing.Any] | None = None
+            adamw_lambda_auto_enabled = _cfg_truthy(
+                rr_cfg_base.get("lambda_auto", "on"),
+                default=True,
+            )
+            if bool(adamw_lambda_auto_enabled) and bool(is_packed_input):
+                try:
+                    packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+                    n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
+                    if packed_train_indices is None:
+                        if int(packed_train["n_samples"]) != n_train_expected:
+                            raise ValueError(
+                                "Packed rrBLUP-AdamW lambda-auto requires packed_train_indices "
+                                "when n_train differs from packed n_samples."
+                            )
+                        train_abs_auto = np.ascontiguousarray(
+                            np.arange(int(packed_train["n_samples"]), dtype=np.int64),
+                            dtype=np.int64,
+                        )
+                    else:
+                        train_abs_auto = np.ascontiguousarray(
+                            np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        )
+                    if int(train_abs_auto.shape[0]) != n_train_expected:
+                        raise ValueError(
+                            "Packed rrBLUP-AdamW lambda-auto train index mismatch: "
+                            f"indices={train_abs_auto.shape[0]}, y={n_train_expected}."
+                        )
+                    adamw_lambda_auto_info = _estimate_rrblup_lambda_subsample_reml(
+                        y_train=np.asarray(Y, dtype=np.float64).reshape(-1),
+                        packed_ctx=packed_train,
+                        train_sample_indices=train_abs_auto,
+                        n_jobs=max(1, int(n_jobs)),
+                        cfg=rr_cfg_base,
+                        progress_hook=lambda event, payload: _emit_rrblup_progress(
+                            str(event),
+                            **dict(payload),
+                        ),
+                    )
+                    lam_auto = float(adamw_lambda_auto_info.get("lambda_equation", np.nan))
+                    if np.isfinite(lam_auto) and lam_auto > 0.0:
+                        lam_auto_raw = _rrblup_lambda_equation_to_raw(
+                            lambda_equation=float(lam_auto),
+                            lambda_scale=str(rr_cfg_base.get("lambda_scale", "equation")),
+                            n_train=int(n_train_local),
+                        )
+                        rr_cfg_base["lambda_value"] = float(lam_auto_raw)
+                except Exception:
+                    adamw_lambda_auto_info = None
+
             auto_grid_enabled = _cfg_truthy(rr_cfg_base.get("auto_grid", "on"), default=True)
             grid_candidates = _build_rrblup_adamw_grid(rr_cfg_base) if auto_grid_enabled else []
             min_grid_samples = int(max(16, int(rr_cfg_base.get("grid_min_samples", 256))))
@@ -3705,7 +3888,7 @@ def GSapi(
                     )
                     best_score = np.inf
                     best_row: dict[str, typing.Any] | None = None
-                    base_lambda = float(max(float(rr_cfg_base.get("lambda_value", 10000.0)), 10000.0))
+                    base_lambda = float(max(float(rr_cfg_base.get("lambda_value", 1.0)), 1e-8))
                     base_lr = float(rr_cfg_base.get("lr", 1e-2))
                     baseline_row: dict[str, typing.Any] | None = None
                     for trial_id, (lam_try, lr_try) in enumerate(grid_candidates, start=1):
@@ -3822,12 +4005,54 @@ def GSapi(
             if rrblup_runtime_state is not None:
                 rrblup_runtime_state["auto_grid_enabled"] = bool(use_auto_grid)
                 rrblup_runtime_state["selected_lambda"] = float(selected_cfg.get("lambda_value", np.nan))
+                rrblup_runtime_state["lambda_source"] = (
+                    str(adamw_lambda_auto_info.get("strategy", "lambda_auto")).strip()
+                    if (adamw_lambda_auto_info is not None)
+                    else "manual"
+                )
+                rrblup_runtime_state["lambda_auto_enabled"] = bool(adamw_lambda_auto_enabled)
                 rrblup_runtime_state["selected_lr"] = float(selected_cfg.get("lr", np.nan))
                 rrblup_runtime_state["selected_epochs"] = int(selected_cfg.get("epochs", fit.get("best_epoch", 1)))
                 rrblup_runtime_state["best_epoch"] = int(max(1, int(fit.get("best_epoch", 1))))
                 rrblup_runtime_state["epochs_ran"] = int(max(1, int(fit.get("epochs_ran", fit.get("best_epoch", 1)))))
                 rrblup_runtime_state["stopped_early"] = bool(fit.get("stopped_early", False))
                 rrblup_runtime_state["best_val_loss"] = float(fit.get("best_val_loss", np.nan))
+                if adamw_lambda_auto_info is not None:
+                    auto_strategy = str(adamw_lambda_auto_info.get("strategy", "")).strip().lower()
+                    if auto_strategy.startswith("he"):
+                        rrblup_runtime_state["lambda_he_sigma_g2"] = float(
+                            adamw_lambda_auto_info.get("sigma_g2", np.nan)
+                        )
+                        rrblup_runtime_state["lambda_he_sigma_e2"] = float(
+                            adamw_lambda_auto_info.get("sigma_e2", np.nan)
+                        )
+                        rrblup_runtime_state["lambda_he_h2"] = float(
+                            adamw_lambda_auto_info.get("h2", np.nan)
+                        )
+                        rrblup_runtime_state["lambda_he_converged"] = bool(
+                            adamw_lambda_auto_info.get("he_converged", False)
+                        )
+                        rrblup_runtime_state["lambda_he_iters"] = int(
+                            adamw_lambda_auto_info.get("he_iters", 0)
+                        )
+                        rrblup_runtime_state["lambda_he_rel_res"] = float(
+                            adamw_lambda_auto_info.get("he_rel_res", np.nan)
+                        )
+                    else:
+                        for k in (
+                            "lambda_he_sigma_g2",
+                            "lambda_he_sigma_e2",
+                            "lambda_he_h2",
+                            "lambda_he_converged",
+                            "lambda_he_iters",
+                            "lambda_he_rel_res",
+                            "lambda_he_lambda_k",
+                            "lambda_he_lambda_equation",
+                            "lambda_he_raw_k",
+                            "lambda_he_raw_equation",
+                            "lambda_he_trace_samples_used",
+                        ):
+                            rrblup_runtime_state.pop(str(k), None)
                 if len(trial_rows) > 0:
                     rrblup_runtime_state["auto_grid_trials"] = trial_rows
             if _GS_DEBUG_STAGE:
@@ -5006,7 +5231,11 @@ def _run_method_task(
                 rr_state_call: dict[str, typing.Any] | None = None
                 if method == "rrBLUP":
                     rr_cfg_call = dict(rrblup_cfg_base)
-                    if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+                    if (
+                        rrblup_cv_reuse_enabled
+                        and rrblup_cv_selected is not None
+                        and ("lr" in rrblup_cv_selected)
+                    ):
                         rr_cfg_call["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
                         rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
                         if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
@@ -5078,19 +5307,25 @@ def _run_method_task(
                 ):
                     sel_lam = float(rr_state_call.get("selected_lambda", np.nan))
                     sel_lr = float(rr_state_call.get("selected_lr", np.nan))
-                    if np.isfinite(sel_lam) and sel_lam >= 0.0:
+                    solver_eff_call = str(
+                        rr_state_call.get(
+                            "solver_effective",
+                            rr_state_call.get("solver", ""),
+                        )
+                    ).strip().lower()
+                    if (
+                        np.isfinite(sel_lam)
+                        and sel_lam >= 0.0
+                        and solver_eff_call == "adamw"
+                        and np.isfinite(sel_lr)
+                        and sel_lr > 0.0
+                    ):
                         rrblup_cv_selected = {"lambda_value": float(sel_lam)}
-                        if np.isfinite(sel_lr) and sel_lr > 0.0:
-                            rrblup_cv_selected["lr"] = float(sel_lr)
+                        rrblup_cv_selected["lr"] = float(sel_lr)
                         if _GS_DEBUG_STAGE:
-                            msg_lr = (
-                                f" lr={float(sel_lr):.6g}"
-                                if (np.isfinite(sel_lr) and sel_lr > 0.0)
-                                else ""
-                            )
                             print(
                                 "[GS-DEBUG] rrBLUP CV reuse armed "
-                                f"lambda={sel_lam:.6g}{msg_lr}",
+                                f"lambda={sel_lam:.6g} lr={float(sel_lr):.6g}",
                                 flush=True,
                             )
                 if method == "rrBLUP" and rr_state_call is not None:
@@ -5361,7 +5596,11 @@ def _run_method_task(
             pve_final = float("nan")
         if method == "rrBLUP":
             rrblup_final_cfg = dict(rrblup_cfg_base)
-            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+            if (
+                rrblup_cv_reuse_enabled
+                and rrblup_cv_selected is not None
+                and ("lr" in rrblup_cv_selected)
+            ):
                 rrblup_final_cfg["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
                 rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
                 if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
@@ -5456,7 +5695,11 @@ def _run_method_task(
         bayes_r2_final_key: str | None = None
         if method == "rrBLUP":
             rr_cfg_final = dict(rrblup_cfg_base)
-            if rrblup_cv_reuse_enabled and rrblup_cv_selected is not None:
+            if (
+                rrblup_cv_reuse_enabled
+                and rrblup_cv_selected is not None
+                and ("lr" in rrblup_cv_selected)
+            ):
                 rr_cfg_final["lambda_value"] = float(rrblup_cv_selected["lambda_value"])
                 rr_sel_lr = float(rrblup_cv_selected.get("lr", np.nan))
                 if np.isfinite(rr_sel_lr) and rr_sel_lr > 0.0:
@@ -6093,6 +6336,9 @@ def _run_methods_parallel(
             solver_fallback_reason = str(rr_state.get("solver_fallback_reason", "")).strip()
             if solver_fallback_reason != "":
                 rows.append(("solver note", solver_fallback_reason))
+            lambda_source = str(rr_state.get("lambda_source", "")).strip()
+            if lambda_source != "":
+                rows.append(("lambda source", lambda_source))
 
             if solver_used == "pcg":
                 lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
@@ -6123,6 +6369,70 @@ def _run_methods_parallel(
                         ),
                     )
                 )
+
+            he_sigma_g2 = float(rr_state.get("lambda_he_sigma_g2", np.nan))
+            he_sigma_e2 = float(rr_state.get("lambda_he_sigma_e2", np.nan))
+            he_h2 = float(rr_state.get("lambda_he_h2", np.nan))
+            he_lambda_k = float(rr_state.get("lambda_he_raw_k", np.nan))
+            if (
+                (not np.isfinite(he_lambda_k))
+                and np.isfinite(he_sigma_g2)
+                and np.isfinite(he_sigma_e2)
+                and he_sigma_g2 > 0.0
+            ):
+                he_lambda_k = float(he_sigma_e2 / he_sigma_g2)
+            he_lambda_eq = float(rr_state.get("lambda_he_raw_equation", np.nan))
+            he_lambda_k_selected = float(rr_state.get("lambda_he_lambda_k", np.nan))
+            he_lambda_eq_selected = float(rr_state.get("lambda_he_lambda_equation", np.nan))
+            if np.isfinite(he_sigma_g2):
+                rows.append(("HE sigma_g2", f"{he_sigma_g2:.6g}"))
+            if np.isfinite(he_sigma_e2):
+                rows.append(("HE sigma_e2", f"{he_sigma_e2:.6g}"))
+            if np.isfinite(he_h2):
+                rows.append(("HE h2", f"{he_h2:.6g}"))
+            if np.isfinite(he_lambda_k):
+                rows.append(("HE lambda_k", f"{he_lambda_k:.6g}"))
+            if np.isfinite(he_lambda_eq):
+                rows.append(("HE lambda_eq", f"{he_lambda_eq:.6g}"))
+            if (
+                np.isfinite(he_lambda_eq_selected)
+                and np.isfinite(he_lambda_eq)
+                and abs(he_lambda_eq_selected - he_lambda_eq) > 1e-12
+            ):
+                rows.append(("HE selected lambda_k", f"{he_lambda_k_selected:.6g}"))
+                rows.append(("HE selected lambda_eq", f"{he_lambda_eq_selected:.6g}"))
+            if (
+                (not np.isfinite(he_sigma_g2))
+                and (not np.isfinite(he_sigma_e2))
+                and (not np.isfinite(he_h2))
+                and lambda_source != ""
+                and str(lambda_source).strip().lower().startswith("he")
+            ):
+                rows.append(("HE", f"NA (lambda_source={lambda_source})"))
+            he_converged_raw = rr_state.get("lambda_he_converged", None)
+            he_iters_raw = rr_state.get("lambda_he_iters", None)
+            he_rel_res = float(rr_state.get("lambda_he_rel_res", np.nan))
+            has_he_diag = (
+                (he_converged_raw is not None)
+                or (he_iters_raw is not None)
+                or np.isfinite(he_rel_res)
+            )
+            if has_he_diag:
+                he_diag_parts: list[str] = []
+                if he_converged_raw is not None:
+                    he_diag_parts.append(f"converged={int(bool(he_converged_raw))}")
+                if he_iters_raw is not None:
+                    try:
+                        he_diag_parts.append(f"iters={int(he_iters_raw)}")
+                    except Exception:
+                        pass
+                if np.isfinite(he_rel_res):
+                    he_diag_parts.append(f"rel_res={he_rel_res:.3e}")
+                he_trace_used = int(rr_state.get("lambda_he_trace_samples_used", 0))
+                if he_trace_used > 0:
+                    he_diag_parts.append(f"trace_samples={he_trace_used}")
+                if len(he_diag_parts) > 0:
+                    rows.append(("HE diag", ", ".join(he_diag_parts)))
 
             pve_mode = str(rr_state.get("pve_mode_used", rr_cfg.get("pve_mode", "lambda"))).strip().lower()
             if pve_mode != "":
@@ -9680,7 +9990,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "--rrblup-lambda",
         type=float,
-        default=10000.0,
+        default=1.0,
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(

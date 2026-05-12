@@ -32,6 +32,9 @@ on:
       BIOCONDA_PAT:
         required: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   update-bioconda-pr:
     name: Update Bioconda PR

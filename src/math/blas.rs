@@ -1522,7 +1522,7 @@ pub(crate) unsafe fn cblas_ddot_dispatch(
         SgemmBackend::Rust => {
             return cblas_ddot_rust(n, x, incx, y, incy);
         }
-    }
+    };
 
     #[cfg(all(
         target_os = "macos",
@@ -1554,6 +1554,16 @@ pub(crate) unsafe fn cblas_ddot_dispatch(
     #[cfg(target_os = "windows")]
     {
         return cblas_ddot_openblas(n, x, incx, y, incy);
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        all(feature = "blas-openblas", jx_openblas_available)
+    ))]
+    {
+        // In OpenBLAS-only macOS builds, all compile-time fallback blocks above
+        // are intentionally unavailable; keep a concrete return path.
+        return cblas_ddot_rust(n, x, incx, y, incy);
     }
 }
 

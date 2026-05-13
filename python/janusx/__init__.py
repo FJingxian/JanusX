@@ -138,7 +138,16 @@ def _warn_macos_eigh_lapack_fallback() -> None:
     except Exception:
         return
     try:
+        probe_sgemm = getattr(_jx, "rust_sgemm_backend", None)
         probe_eigh = getattr(_jx, "rust_eigh_lapack_backend", None)
+        if not callable(probe_sgemm):
+            return
+        sgemm_backend = str(probe_sgemm()).strip().lower()
+        # Only inspect eigh LAPACK fallback on BLAS=Accelerate builds.
+        # OpenBLAS BLAS builds do not need this probe, and skipping it avoids
+        # unnecessary dynamic OpenBLAS LAPACK loading during import.
+        if sgemm_backend != "accelerate":
+            return
         if not callable(probe_eigh):
             return
         lapack_backend = str(probe_eigh()).strip().lower()

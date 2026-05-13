@@ -167,7 +167,13 @@ use tree::{
 };
 
 pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
-pub use he::{he_variance_components_packed, HePcgResult};
+pub use eigh::symmetric_eigh_f64_row_major;
+pub use grm::grm_packed_f64_from_stats_rust;
+pub use he::{
+    he_variance_components_packed, he_variance_components_packed_with_covariates, HePcgResult,
+    RowStdStats, HE_BOUNDARY_INTERIOR, HE_BOUNDARY_ORIGIN, HE_BOUNDARY_SIGMA_E_ZERO,
+    HE_BOUNDARY_SIGMA_G_ZERO,
+};
 // ============================================================
 // PyO3 module exports
 // ============================================================

@@ -146,6 +146,306 @@ fn decode_grm_block(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_grm_block_f64(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip_vec: &[bool],
+    row_maf_vec: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    method: usize,
+    eps: f64,
+    code4_lut: &[[u8; 4]; 256],
+    row_start: usize,
+    row_end: usize,
+    n: usize,
+    out_block: &mut [f64],
+    out_varsum: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let cur_rows = row_end.saturating_sub(row_start);
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    if out_block.len() < cur_rows.saturating_mul(n) {
+        return Err("decode_grm_block_f64: out_block too small".to_string());
+    }
+    if out_varsum.len() < cur_rows {
+        return Err("decode_grm_block_f64: out_varsum too small".to_string());
+    }
+    let block = &mut out_block[..cur_rows * n];
+    let varsum = &mut out_varsum[..cur_rows];
+
+    let mut decode_run = || {
+        if full_sample_fast {
+            block
+                .par_chunks_mut(n)
+                .zip(varsum.par_iter_mut())
+                .enumerate()
+                .for_each(|(off, (out_row, row_varsum_dst))| {
+                    let idx = row_start + off;
+                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                    let flip = row_flip_vec[idx];
+                    let p = row_maf_vec[idx].clamp(0.0, 0.5) as f64;
+                    let mean_g = 2.0_f64 * p;
+                    let var = 2.0_f64 * p * (1.0_f64 - p);
+                    let std_scale = if method == 2 {
+                        if var > eps {
+                            1.0_f64 / var.sqrt()
+                        } else {
+                            0.0_f64
+                        }
+                    } else {
+                        1.0_f64
+                    };
+                    let value_lut: [f64; 4] = if flip {
+                        [
+                            (2.0_f64 - mean_g) * std_scale,
+                            0.0_f64,
+                            (1.0_f64 - mean_g) * std_scale,
+                            (0.0_f64 - mean_g) * std_scale,
+                        ]
+                    } else {
+                        [
+                            (0.0_f64 - mean_g) * std_scale,
+                            0.0_f64,
+                            (1.0_f64 - mean_g) * std_scale,
+                            (2.0_f64 - mean_g) * std_scale,
+                        ]
+                    };
+                    decode_row_centered_full_lut_f64(
+                        row, n_samples, code4_lut, &value_lut, out_row,
+                    );
+                    if method == 1 {
+                        *row_varsum_dst = var;
+                    }
+                });
+        } else {
+            block
+                .par_chunks_mut(n)
+                .zip(varsum.par_iter_mut())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f64; n_samples],
+                    |full_row, (off, (out_row, row_varsum_dst))| {
+                        let idx = row_start + off;
+                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let flip = row_flip_vec[idx];
+                        let p = row_maf_vec[idx].clamp(0.0, 0.5) as f64;
+                        let default_mean_g = 2.0_f64 * p;
+                        let (var_centered, _row_sum) = decode_subset_row_from_full_scratch_f64(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            flip,
+                            default_mean_g,
+                            method,
+                            eps,
+                            code4_lut,
+                            full_row.as_mut_slice(),
+                            out_row,
+                        );
+                        if method == 1 {
+                            *row_varsum_dst = var_centered;
+                        }
+                    },
+                );
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(&mut decode_run);
+    } else {
+        decode_run();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grm_packed_f64_from_stats_rust(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_indices: &[usize],
+    method: usize,
+    block_cols: usize,
+    threads: usize,
+) -> Result<(Vec<f64>, f64), String> {
+    if n_samples == 0 {
+        return Err("n_samples must be > 0".to_string());
+    }
+    if method != 1 && method != 2 {
+        return Err(format!(
+            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
+        ));
+    }
+    if bytes_per_snp == 0 {
+        return Err("bytes_per_snp must be > 0".to_string());
+    }
+    let expected_bps = n_samples.div_ceil(4);
+    if bytes_per_snp != expected_bps {
+        return Err(format!(
+            "bytes_per_snp mismatch: got {bytes_per_snp}, expected {expected_bps}"
+        ));
+    }
+
+    let m = row_flip.len();
+    if m == 0 {
+        return Err("row_flip must contain at least one SNP row".to_string());
+    }
+    if row_maf.len() != m {
+        return Err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf.len()
+        ));
+    }
+    if packed_flat.len() != m.saturating_mul(bytes_per_snp) {
+        return Err(format!(
+            "packed size mismatch: got {}, expected {}",
+            packed_flat.len(),
+            m.saturating_mul(bytes_per_snp)
+        ));
+    }
+    if sample_indices.is_empty() {
+        return Err("sample_indices must not be empty".to_string());
+    }
+    if let Some(&bad) = sample_indices.iter().find(|&&sid| sid >= n_samples) {
+        return Err(format!("sample index out of range: {bad} >= {n_samples}"));
+    }
+
+    let sample_idx = sample_indices;
+    let n = sample_idx.len();
+    let full_sample_fast = is_identity_indices(sample_idx, n_samples);
+
+    let varsum_full = if method == 1 && full_sample_fast {
+        let mut acc = 0.0_f64;
+        for &maf in row_maf {
+            let p = maf as f64;
+            let v = 2.0_f64 * p * (1.0_f64 - p);
+            if v.is_finite() && v > 0.0 {
+                acc += v;
+            }
+        }
+        if !(acc.is_finite() && acc > 0.0) {
+            return Err("invalid centered GRM denominator: sum(2p(1-p)) <= 0".to_string());
+        }
+        acc
+    } else {
+        0.0_f64
+    };
+
+    let total_threads = effective_threads(threads);
+    let pool = if total_threads > 1 {
+        Some(Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(total_threads)
+                .build()
+                .map_err(|e| format!("rayon pool: {e}"))?,
+        ))
+    } else {
+        None
+    };
+    let row_step = adaptive_grm_block_rows(
+        block_cols.max(1),
+        m.max(1),
+        n,
+        if full_sample_fast { 0 } else { n_samples },
+        total_threads,
+    )
+    .max(1);
+    let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cblas_force_tmp_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
+        .ok()
+        .map(|s| {
+            let t = s.trim().to_ascii_lowercase();
+            matches!(t.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+
+    let mut grm = vec![0.0_f64; n * n];
+    let mut block = vec![0.0_f64; row_step * n];
+    let mut block_varsum = vec![0.0_f64; row_step];
+    let mut varsum_acc = varsum_full;
+    let mut is_first_block = true;
+    let eps = 1e-12_f64;
+    let byte_lut = packed_byte_lut();
+
+    for row_start in (0..m).step_by(row_step) {
+        let row_end = (row_start + row_step).min(m);
+        let cur_rows = row_end.saturating_sub(row_start);
+        if cur_rows == 0 {
+            continue;
+        }
+
+        decode_grm_block_f64(
+            packed_flat,
+            bytes_per_snp,
+            n_samples,
+            row_flip,
+            row_maf,
+            sample_idx,
+            full_sample_fast,
+            method,
+            eps,
+            &byte_lut.code4,
+            row_start,
+            row_end,
+            n,
+            &mut block,
+            &mut block_varsum,
+            pool.as_ref(),
+        )?;
+
+        grm_rankk_update_f64(
+            &mut grm,
+            &block[..cur_rows * n],
+            cur_rows,
+            n,
+            cblas_copy_rhs,
+            is_first_block,
+            cblas_force_tmp_accum,
+        )?;
+        is_first_block = false;
+        if method == 1 && !full_sample_fast {
+            varsum_acc += block_varsum[..cur_rows].iter().sum::<f64>();
+        }
+    }
+
+    let scale = if method == 1 {
+        if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+            return Err("invalid centered GRM denominator in subset path".to_string());
+        }
+        varsum_acc
+    } else {
+        m as f64
+    };
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("invalid GRM scale factor".to_string());
+    }
+
+    let inv_scale = 1.0_f64 / scale;
+    for i in 0..n {
+        let ii = i * n + i;
+        grm[ii] *= inv_scale;
+        for j in 0..i {
+            let idx_lo = i * n + j;
+            let v = grm[idx_lo] * inv_scale;
+            grm[idx_lo] = v;
+            grm[j * n + i] = v;
+        }
+    }
+
+    let varsum_ret = if method == 1 { varsum_acc } else { m as f64 };
+    Ok((grm, varsum_ret))
+}
+
 #[inline]
 fn decode_grm_stream_block_into(
     it: &mut BedSnpIter,

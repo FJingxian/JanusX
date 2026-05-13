@@ -422,7 +422,7 @@ def _ensure_plink_cache_from_source_at(
             ex_msg = str(ex).lower()
             source_low = str(source_path).lower()
             hmp_src = source_low.endswith((".hmp", ".hmp.gz"))
-            txt_src = source_low.endswith((".txt", ".tsv", ".csv"))
+            txt_src = source_low.endswith((".txt", ".tsv", ".csv", ".npy", ".bin"))
             looks_like_old_hmp_bug = (
                 "plink prefix not found or missing .bed/.bim/.fam" in ex_msg
                 and hmp_src
@@ -811,10 +811,26 @@ def prepare_cli_input_cache(
             )
         return _ensure_txt_npy_cache_for_cli(prefix, src_path, delimiter=delimiter)
     if kind == "npy":
+        if bool(prefer_plink_for_txt):
+            src = src_path if src_path is not None else f"{prefix}.npy"
+            return _ensure_plink_cache_for_cli_source(
+                prefix,
+                src,
+                source_label="TXT",
+                snps_only=bool(snps_only),
+            )
         if src_path is not None:
             return src_path
         return f"{prefix}.npy"
     if kind == "bin":
+        if bool(prefer_plink_for_txt):
+            src = src_path if src_path is not None else f"{prefix}.bin"
+            return _ensure_plink_cache_for_cli_source(
+                prefix,
+                src,
+                source_label="TXT",
+                snps_only=bool(snps_only),
+            )
         if src_path is not None:
             return src_path
         return f"{prefix}.bin"

@@ -1,4 +1,9 @@
-use std::sync::OnceLock;
+use rayon::prelude::*;
+#[cfg(target_arch = "x86")]
+use std::arch::x86 as x86_simd;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64 as x86_simd;
+use std::sync::{Arc, OnceLock};
 
 #[inline]
 pub(crate) fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
@@ -156,7 +161,7 @@ pub(crate) fn is_identity_indices(sample_idx: &[usize], n_samples: usize) -> boo
 }
 
 #[inline]
-pub(crate) fn decode_row_centered_full_lut(
+fn decode_row_centered_full_lut_scalar(
     row: &[u8],
     n_samples: usize,
     code4_lut: &[[u8; 4]; 256],
@@ -180,6 +185,258 @@ pub(crate) fn decode_row_centered_full_lut(
             out_row[col + lane] = value_lut[codes[lane] as usize];
         }
     }
+}
+
+#[inline]
+fn bed_decode_simd_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("JX_BED_DECODE_SIMD").unwrap_or_else(|_| "0".to_string());
+        let key = raw.trim().to_ascii_lowercase();
+        matches!(key.as_str(), "1" | "true" | "on" | "yes")
+    })
+}
+
+const BED_DECODE_SIMD_MIN_BYTES: usize = 32;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bed_decode_avx2_runtime_available() -> bool {
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_row_centered_full_lut_avx2(
+    row: &[u8],
+    full_bytes: usize,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    use x86_simd::*;
+    const CHUNK_BYTES: usize = 16;
+    const CHUNK_CODES: usize = CHUNK_BYTES * 4;
+    let mut code_buf = [0u8; CHUNK_CODES];
+    let mut byte_pos = 0usize;
+    let mut out_pos = 0usize;
+    let idx0 = _mm256_set1_epi32(0);
+    let idx1 = _mm256_set1_epi32(1);
+    let idx2 = _mm256_set1_epi32(2);
+    let v0 = _mm256_set1_ps(value_lut[0]);
+    let v1 = _mm256_set1_ps(value_lut[1]);
+    let v2 = _mm256_set1_ps(value_lut[2]);
+    let v3 = _mm256_set1_ps(value_lut[3]);
+
+    while byte_pos + CHUNK_BYTES <= full_bytes {
+        let src = &row[byte_pos..byte_pos + CHUNK_BYTES];
+        for (k, &b) in src.iter().enumerate() {
+            let codes = code4_lut[b as usize];
+            let dst = k * 4;
+            code_buf[dst] = codes[0];
+            code_buf[dst + 1] = codes[1];
+            code_buf[dst + 2] = codes[2];
+            code_buf[dst + 3] = codes[3];
+        }
+
+        for cst in (0..CHUNK_CODES).step_by(8) {
+            let cp = &code_buf[cst..cst + 8];
+            let idx = _mm256_setr_epi32(
+                cp[0] as i32,
+                cp[1] as i32,
+                cp[2] as i32,
+                cp[3] as i32,
+                cp[4] as i32,
+                cp[5] as i32,
+                cp[6] as i32,
+                cp[7] as i32,
+            );
+            let mut outv = v3;
+            let m2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx2));
+            outv = _mm256_blendv_ps(outv, v2, m2);
+            let m1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx1));
+            outv = _mm256_blendv_ps(outv, v1, m1);
+            let m0 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx0));
+            outv = _mm256_blendv_ps(outv, v0, m0);
+            _mm256_storeu_ps(out_row.as_mut_ptr().add(out_pos + cst), outv);
+        }
+        byte_pos += CHUNK_BYTES;
+        out_pos += CHUNK_CODES;
+    }
+
+    if byte_pos < full_bytes {
+        let tail = &row[byte_pos..full_bytes];
+        let tail_codes = tail.len() * 4;
+        for (k, &b) in tail.iter().enumerate() {
+            let codes = code4_lut[b as usize];
+            let dst = k * 4;
+            code_buf[dst] = codes[0];
+            code_buf[dst + 1] = codes[1];
+            code_buf[dst + 2] = codes[2];
+            code_buf[dst + 3] = codes[3];
+        }
+        let simd_codes = tail_codes - (tail_codes % 8);
+        for cst in (0..simd_codes).step_by(8) {
+            let cp = &code_buf[cst..cst + 8];
+            let idx = _mm256_setr_epi32(
+                cp[0] as i32,
+                cp[1] as i32,
+                cp[2] as i32,
+                cp[3] as i32,
+                cp[4] as i32,
+                cp[5] as i32,
+                cp[6] as i32,
+                cp[7] as i32,
+            );
+            let mut outv = v3;
+            let m2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx2));
+            outv = _mm256_blendv_ps(outv, v2, m2);
+            let m1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx1));
+            outv = _mm256_blendv_ps(outv, v1, m1);
+            let m0 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx0));
+            outv = _mm256_blendv_ps(outv, v0, m0);
+            _mm256_storeu_ps(out_row.as_mut_ptr().add(out_pos + cst), outv);
+        }
+        for t in simd_codes..tail_codes {
+            out_row[out_pos + t] = value_lut[code_buf[t] as usize];
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn bed_decode_neon_runtime_available() -> bool {
+    static NEON: OnceLock<bool> = OnceLock::new();
+    *NEON.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn decode_row_centered_full_lut_neon(
+    row: &[u8],
+    full_bytes: usize,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    const CHUNK_BYTES: usize = 16;
+    const CHUNK_CODES: usize = CHUNK_BYTES * 4;
+    let mut code_buf = [0u8; CHUNK_CODES];
+    let mut byte_pos = 0usize;
+    let mut out_pos = 0usize;
+    let idx0 = vdupq_n_u32(0);
+    let idx1 = vdupq_n_u32(1);
+    let idx2 = vdupq_n_u32(2);
+    let v0 = vdupq_n_f32(value_lut[0]);
+    let v1 = vdupq_n_f32(value_lut[1]);
+    let v2 = vdupq_n_f32(value_lut[2]);
+    let v3 = vdupq_n_f32(value_lut[3]);
+
+    while byte_pos + CHUNK_BYTES <= full_bytes {
+        let src = &row[byte_pos..byte_pos + CHUNK_BYTES];
+        for (k, &b) in src.iter().enumerate() {
+            let codes = code4_lut[b as usize];
+            let dst = k * 4;
+            code_buf[dst] = codes[0];
+            code_buf[dst + 1] = codes[1];
+            code_buf[dst + 2] = codes[2];
+            code_buf[dst + 3] = codes[3];
+        }
+
+        for cst in (0..CHUNK_CODES).step_by(4) {
+            let p = code_buf.as_ptr().add(cst);
+            let idx_u8 = vld1_u8(p);
+            let idx_u16 = vmovl_u8(idx_u8);
+            let idx_u32 = vmovl_u16(vget_low_u16(idx_u16));
+            let mut outv = v3;
+            let m2 = vceqq_u32(idx_u32, idx2);
+            outv = vbslq_f32(m2, v2, outv);
+            let m1 = vceqq_u32(idx_u32, idx1);
+            outv = vbslq_f32(m1, v1, outv);
+            let m0 = vceqq_u32(idx_u32, idx0);
+            outv = vbslq_f32(m0, v0, outv);
+            vst1q_f32(out_row.as_mut_ptr().add(out_pos + cst), outv);
+        }
+        byte_pos += CHUNK_BYTES;
+        out_pos += CHUNK_CODES;
+    }
+
+    if byte_pos < full_bytes {
+        let tail = &row[byte_pos..full_bytes];
+        let tail_codes = tail.len() * 4;
+        for (k, &b) in tail.iter().enumerate() {
+            let codes = code4_lut[b as usize];
+            let dst = k * 4;
+            code_buf[dst] = codes[0];
+            code_buf[dst + 1] = codes[1];
+            code_buf[dst + 2] = codes[2];
+            code_buf[dst + 3] = codes[3];
+        }
+        let simd_codes = tail_codes - (tail_codes % 4);
+        for cst in (0..simd_codes).step_by(4) {
+            let p = code_buf.as_ptr().add(cst);
+            let idx_u8 = vld1_u8(p);
+            let idx_u16 = vmovl_u8(idx_u8);
+            let idx_u32 = vmovl_u16(vget_low_u16(idx_u16));
+            let mut outv = v3;
+            let m2 = vceqq_u32(idx_u32, idx2);
+            outv = vbslq_f32(m2, v2, outv);
+            let m1 = vceqq_u32(idx_u32, idx1);
+            outv = vbslq_f32(m1, v1, outv);
+            let m0 = vceqq_u32(idx_u32, idx0);
+            outv = vbslq_f32(m0, v0, outv);
+            vst1q_f32(out_row.as_mut_ptr().add(out_pos + cst), outv);
+        }
+        for t in simd_codes..tail_codes {
+            out_row[out_pos + t] = value_lut[code_buf[t] as usize];
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn decode_row_centered_full_lut(
+    row: &[u8],
+    n_samples: usize,
+    code4_lut: &[[u8; 4]; 256],
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    let full_bytes = n_samples / 4;
+    let rem = n_samples % 4;
+    if full_bytes >= BED_DECODE_SIMD_MIN_BYTES && bed_decode_simd_enabled() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if bed_decode_avx2_runtime_available() {
+            unsafe {
+                decode_row_centered_full_lut_avx2(row, full_bytes, code4_lut, value_lut, out_row);
+            }
+            if rem > 0 {
+                let base = full_bytes * 4;
+                let codes = &code4_lut[row[full_bytes] as usize];
+                for lane in 0..rem {
+                    out_row[base + lane] = value_lut[codes[lane] as usize];
+                }
+            }
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if bed_decode_neon_runtime_available() {
+            unsafe {
+                decode_row_centered_full_lut_neon(row, full_bytes, code4_lut, value_lut, out_row);
+            }
+            if rem > 0 {
+                let base = full_bytes * 4;
+                let codes = &code4_lut[row[full_bytes] as usize];
+                for lane in 0..rem {
+                    out_row[base + lane] = value_lut[codes[lane] as usize];
+                }
+            }
+            return;
+        }
+    }
+    decode_row_centered_full_lut_scalar(row, n_samples, code4_lut, value_lut, out_row);
 }
 
 #[inline]
@@ -207,6 +464,241 @@ pub(crate) fn decode_row_centered_full_lut_f64(
             out_row[col + lane] = value_lut[codes[lane] as usize];
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SubsetDecodePlan {
+    byte_idx: Vec<usize>,
+    shift_bits: Vec<u8>,
+}
+
+impl SubsetDecodePlan {
+    #[inline]
+    pub(crate) fn from_sample_idx(sample_idx: &[usize]) -> Self {
+        let mut byte_idx = Vec::with_capacity(sample_idx.len());
+        let mut shift_bits = Vec::with_capacity(sample_idx.len());
+        for &sid in sample_idx {
+            byte_idx.push(sid >> 2);
+            shift_bits.push(((sid & 3) * 2) as u8);
+        }
+        Self {
+            byte_idx,
+            shift_bits,
+        }
+    }
+}
+
+#[inline]
+fn bed_subset_decode_simd_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("JX_BED_SUBSET_SIMD").unwrap_or_else(|_| "1".to_string());
+        let key = raw.trim().to_ascii_lowercase();
+        !matches!(key.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
+const BED_SUBSET_SIMD_MIN_LEN: usize = 32;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bed_subset_decode_avx2_runtime_available() -> bool {
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_subset_with_plan_avx2(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    use x86_simd::*;
+    let n = plan.byte_idx.len();
+    let idx0 = _mm256_set1_epi32(0);
+    let idx1 = _mm256_set1_epi32(1);
+    let idx2 = _mm256_set1_epi32(2);
+    let v0 = _mm256_set1_ps(value_lut[0]);
+    let v1 = _mm256_set1_ps(value_lut[1]);
+    let v2 = _mm256_set1_ps(value_lut[2]);
+    let v3 = _mm256_set1_ps(value_lut[3]);
+    let mut j = 0usize;
+    while j + 8 <= n {
+        let c0 = ((row[plan.byte_idx[j]] >> plan.shift_bits[j]) & 0b11) as i32;
+        let c1 = ((row[plan.byte_idx[j + 1]] >> plan.shift_bits[j + 1]) & 0b11) as i32;
+        let c2 = ((row[plan.byte_idx[j + 2]] >> plan.shift_bits[j + 2]) & 0b11) as i32;
+        let c3 = ((row[plan.byte_idx[j + 3]] >> plan.shift_bits[j + 3]) & 0b11) as i32;
+        let c4 = ((row[plan.byte_idx[j + 4]] >> plan.shift_bits[j + 4]) & 0b11) as i32;
+        let c5 = ((row[plan.byte_idx[j + 5]] >> plan.shift_bits[j + 5]) & 0b11) as i32;
+        let c6 = ((row[plan.byte_idx[j + 6]] >> plan.shift_bits[j + 6]) & 0b11) as i32;
+        let c7 = ((row[plan.byte_idx[j + 7]] >> plan.shift_bits[j + 7]) & 0b11) as i32;
+        let idx = _mm256_setr_epi32(c0, c1, c2, c3, c4, c5, c6, c7);
+        let mut outv = v3;
+        let m2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx2));
+        outv = _mm256_blendv_ps(outv, v2, m2);
+        let m1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx1));
+        outv = _mm256_blendv_ps(outv, v1, m1);
+        let m0 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx, idx0));
+        outv = _mm256_blendv_ps(outv, v0, m0);
+        _mm256_storeu_ps(out_row.as_mut_ptr().add(j), outv);
+        j += 8;
+    }
+    for t in j..n {
+        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        out_row[t] = value_lut[code as usize];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn bed_subset_decode_neon_runtime_available() -> bool {
+    static NEON: OnceLock<bool> = OnceLock::new();
+    *NEON.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn decode_subset_with_plan_neon(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let n = plan.byte_idx.len();
+    let idx0 = vdupq_n_u32(0);
+    let idx1 = vdupq_n_u32(1);
+    let idx2 = vdupq_n_u32(2);
+    let v0 = vdupq_n_f32(value_lut[0]);
+    let v1 = vdupq_n_f32(value_lut[1]);
+    let v2 = vdupq_n_f32(value_lut[2]);
+    let v3 = vdupq_n_f32(value_lut[3]);
+    let mut j = 0usize;
+    while j + 4 <= n {
+        let codes = [
+            ((row[plan.byte_idx[j]] >> plan.shift_bits[j]) & 0b11) as u32,
+            ((row[plan.byte_idx[j + 1]] >> plan.shift_bits[j + 1]) & 0b11) as u32,
+            ((row[plan.byte_idx[j + 2]] >> plan.shift_bits[j + 2]) & 0b11) as u32,
+            ((row[plan.byte_idx[j + 3]] >> plan.shift_bits[j + 3]) & 0b11) as u32,
+        ];
+        let idx = vld1q_u32(codes.as_ptr());
+        let mut outv = v3;
+        let m2 = vceqq_u32(idx, idx2);
+        outv = vbslq_f32(m2, v2, outv);
+        let m1 = vceqq_u32(idx, idx1);
+        outv = vbslq_f32(m1, v1, outv);
+        let m0 = vceqq_u32(idx, idx0);
+        outv = vbslq_f32(m0, v0, outv);
+        vst1q_f32(out_row.as_mut_ptr().add(j), outv);
+        j += 4;
+    }
+    for t in j..n {
+        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        out_row[t] = value_lut[code as usize];
+    }
+}
+
+#[inline]
+fn decode_subset_with_plan(
+    row: &[u8],
+    plan: &SubsetDecodePlan,
+    value_lut: &[f32; 4],
+    out_row: &mut [f32],
+) {
+    let n = plan.byte_idx.len();
+    if n >= BED_SUBSET_SIMD_MIN_LEN && bed_subset_decode_simd_enabled() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if bed_subset_decode_avx2_runtime_available() {
+            unsafe { decode_subset_with_plan_avx2(row, plan, value_lut, out_row) };
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if bed_subset_decode_neon_runtime_available() {
+            unsafe { decode_subset_with_plan_neon(row, plan, value_lut, out_row) };
+            return;
+        }
+    }
+    for t in 0..n {
+        let code = (row[plan.byte_idx[t]] >> plan.shift_bits[t]) & 0b11;
+        out_row[t] = value_lut[code as usize];
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_standardized_packed_block_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    row_start: usize,
+    out: &mut [f32],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Ok(());
+    }
+    if out.len() % n_out != 0 {
+        return Err("decode_standardized_packed_block_f32: output length mismatch".to_string());
+    }
+    let cur_rows = out.len() / n_out;
+    if cur_rows == 0 {
+        return Ok(());
+    }
+    let subset_plan = if full_sample_fast {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx(sample_idx))
+    };
+
+    let decode_one = |local_row: usize, out_row: &mut [f32]| {
+        let row_idx = row_start + local_row;
+        let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+        let mean_g = row_mean[row_idx];
+        let inv_sd = row_inv_sd[row_idx];
+        let value_lut: [f32; 4] = if row_flip[row_idx] {
+            [
+                (2.0_f32 - mean_g) * inv_sd,
+                0.0_f32,
+                (1.0_f32 - mean_g) * inv_sd,
+                (0.0_f32 - mean_g) * inv_sd,
+            ]
+        } else {
+            [
+                (0.0_f32 - mean_g) * inv_sd,
+                0.0_f32,
+                (1.0_f32 - mean_g) * inv_sd,
+                (2.0_f32 - mean_g) * inv_sd,
+            ]
+        };
+        if full_sample_fast {
+            decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
+            return;
+        }
+        if let Some(plan) = subset_plan.as_ref() {
+            decode_subset_with_plan(row, plan, &value_lut, out_row);
+        }
+    };
+
+    if let Some(tp) = pool {
+        tp.install(|| {
+            out.par_chunks_mut(n_out)
+                .enumerate()
+                .for_each(|(local_row, out_row)| decode_one(local_row, out_row));
+        });
+    } else {
+        for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
+            decode_one(local_row, out_row);
+        }
+    }
+    Ok(())
 }
 
 #[inline]

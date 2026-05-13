@@ -1,6 +1,54 @@
 use super::*;
 use crate::bedmath::decode_plink_bed_hardcall;
-use crate::gs_native::grm_rankk_update;
+
+#[inline]
+fn marker_rankk_update_from_snp_major(
+    gram: &mut [f32],
+    block_snp_major: &[f32],
+    n_snps: usize,
+    n_samples_chunk: usize,
+    is_first_block: bool,
+) {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    unsafe {
+        let beta = if is_first_block { 0.0_f32 } else { 1.0_f32 };
+        // `block_snp_major` is row-major (m, cur), layout-equivalent to
+        // col-major A(cur, m). We want G += A^T * A with shape (m, m).
+        cblas_sgemm_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            n_snps as CblasInt,
+            n_snps as CblasInt,
+            n_samples_chunk as CblasInt,
+            1.0_f32,
+            block_snp_major.as_ptr(),
+            n_samples_chunk as CblasInt,
+            block_snp_major.as_ptr(),
+            n_samples_chunk as CblasInt,
+            beta,
+            gram.as_mut_ptr(),
+            n_snps as CblasInt,
+        );
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        if is_first_block {
+            gram.fill(0.0_f32);
+        }
+        for i in 0..n_snps {
+            let row_i = &block_snp_major[i * n_samples_chunk..(i + 1) * n_samples_chunk];
+            for j in 0..=i {
+                let row_j = &block_snp_major[j * n_samples_chunk..(j + 1) * n_samples_chunk];
+                let mut acc = 0.0_f32;
+                for k in 0..n_samples_chunk {
+                    acc += row_i[k] * row_j[k];
+                }
+                gram[i * n_snps + j] += acc;
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gblup_marker_fast_packed(
@@ -21,8 +69,23 @@ pub(crate) fn gblup_marker_fast_packed(
     high: f64,
     tol: f64,
     max_iter: usize,
+    estimate_only: bool,
     pool_ref: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, String, f64), String> {
+) -> Result<
+    (
+        Vec<f64>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        String,
+        f64,
+        f64,
+        f64,
+    ),
+    String,
+> {
     // Enforce OpenBLAS threads inside Rust hot path so eig stage
     // is not affected by external Python-side thread drift.
     let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
@@ -47,7 +110,9 @@ pub(crate) fn gblup_marker_fast_packed(
     let mut row_sq_sum = vec![0.0_f64; m];
     let mut my_raw = vec![0.0_f64; m];
     let mut decode_blk = vec![0.0_f32; m * sample_chunk];
-    let mut gram_blk_t = vec![0.0_f32; sample_chunk * m];
+    let mut blk_sum = vec![0.0_f64; m];
+    let mut blk_sq = vec![0.0_f64; m];
+    let mut blk_my = vec![0.0_f64; m];
     let mut tick = 0usize;
 
     for st in (0..n).step_by(sample_chunk) {
@@ -56,9 +121,6 @@ pub(crate) fn gblup_marker_fast_packed(
         let idx_blk = &train_idx[st..ed];
         let y_blk = &y_vec[st..ed];
         let blk_slice = &mut decode_blk[..m * cur];
-        let mut blk_sum = vec![0.0_f64; m];
-        let mut blk_sq = vec![0.0_f64; m];
-        let mut blk_my = vec![0.0_f64; m];
 
         let mut decode_run = || {
             blk_slice
@@ -105,15 +167,7 @@ pub(crate) fn gblup_marker_fast_packed(
             row_sq_sum[j] += blk_sq[j];
             my_raw[j] += blk_my[j];
         }
-
-        let blk_t = &mut gram_blk_t[..cur * m];
-        for row in 0..m {
-            let src = &blk_slice[row * cur..(row + 1) * cur];
-            for col in 0..cur {
-                blk_t[col * m + row] = src[col];
-            }
-        }
-        grm_rankk_update(&mut gram_raw, blk_t, cur, m, false, true)?;
+        marker_rankk_update_from_snp_major(&mut gram_raw, blk_slice, m, cur, st == 0);
 
         tick += cur;
         if tick >= sample_chunk.saturating_mul(16).max(1) {
@@ -260,61 +314,65 @@ pub(crate) fn gblup_marker_fast_packed(
     for k in 0..r {
         rhs[k] = y_proj[k] / (s[k] + lambda).max(v_floor);
     }
-    let mut tmp_u = vec![0.0_f64; r];
-    for k in 0..r {
-        tmp_u[k] = inv_s[k] * ((s[k] + g_eps) * rhs[k]);
-    }
-    let mut q_u = vec![0.0_f64; m];
-    for row in 0..m {
-        let mut acc = 0.0_f64;
+
+    let (pred_train_local, pred_test_local) = if estimate_only {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut tmp_u = vec![0.0_f64; r];
         for k in 0..r {
-            acc += v[row * r + k] * tmp_u[k];
+            // `s[k]` already comes from eig(G + g_eps*I), so do not add `g_eps` again.
+            tmp_u[k] = inv_s[k] * (s[k] * rhs[k]);
         }
-        q_u[row] = acc;
-    }
-    let mu_dot_u = m_mean
-        .iter()
-        .zip(q_u.iter())
-        .map(|(a, b)| (*a) * (*b))
-        .sum::<f64>();
-
-    let predict_samples = |sample_abs: &[usize]| -> Result<Vec<f64>, String> {
-        let n_out = sample_abs.len();
-        if n_out == 0 {
-            return Ok(Vec::new());
+        let mut q_u = vec![0.0_f64; m];
+        for row in 0..m {
+            let mut acc = 0.0_f64;
+            for k in 0..r {
+                acc += v[row * r + k] * tmp_u[k];
+            }
+            q_u[row] = acc;
         }
-        let mut out = vec![0.0_f64; n_out];
-        let mut run = || {
-            out.par_iter_mut().enumerate().for_each(|(i, dst)| {
-                let sid = sample_abs[i];
-                let mut acc = 0.0_f64;
-                for row_idx in 0..m {
-                    let row = &packed_keep[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                    let b = row[sid >> 2];
-                    let code = (b >> ((sid & 3) * 2)) & 0b11;
-                    let mean_g = 2.0_f64 * (maf_keep[row_idx] as f64);
-                    let mut gv = match decode_plink_bed_hardcall(code) {
-                        Some(v0) => v0,
-                        None => mean_g,
-                    };
-                    if row_flip_keep[row_idx] && code != 0b01 {
-                        gv = 2.0_f64 - gv;
+        let mu_dot_u = m_mean
+            .iter()
+            .zip(q_u.iter())
+            .map(|(a, b)| (*a) * (*b))
+            .sum::<f64>();
+        let predict_samples = |sample_abs: &[usize]| -> Result<Vec<f64>, String> {
+            let n_out = sample_abs.len();
+            if n_out == 0 {
+                return Ok(Vec::new());
+            }
+            let mut out = vec![0.0_f64; n_out];
+            let mut run = || {
+                out.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                    let sid = sample_abs[i];
+                    let mut acc = 0.0_f64;
+                    for row_idx in 0..m {
+                        let row =
+                            &packed_keep[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                        let b = row[sid >> 2];
+                        let code = (b >> ((sid & 3) * 2)) & 0b11;
+                        let mean_g = 2.0_f64 * (maf_keep[row_idx] as f64);
+                        let mut gv = match decode_plink_bed_hardcall(code) {
+                            Some(v0) => v0,
+                            None => mean_g,
+                        };
+                        if row_flip_keep[row_idx] && code != 0b01 {
+                            gv = 2.0_f64 - gv;
+                        }
+                        acc += gv * q_u[row_idx];
                     }
-                    acc += gv * q_u[row_idx];
-                }
-                *dst = y_mean + (acc - mu_dot_u) / scale;
-            });
+                    *dst = y_mean + (acc - mu_dot_u) / scale;
+                });
+            };
+            if let Some(tp) = pool_ref {
+                tp.install(&mut run);
+            } else {
+                run();
+            }
+            Ok(out)
         };
-        if let Some(tp) = pool_ref {
-            tp.install(&mut run);
-        } else {
-            run();
-        }
-        Ok(out)
+        (predict_samples(train_pred_abs)?, predict_samples(test_idx)?)
     };
-
-    let pred_train_local = predict_samples(train_pred_abs)?;
-    let pred_test_local = predict_samples(test_idx)?;
 
     let sigma_g2 = rtv_invr / n_eff.max(1.0);
     let sigma_e2 = lambda * sigma_g2;
@@ -336,5 +394,7 @@ pub(crate) fn gblup_marker_fast_packed(
         reml_best,
         format!("marker_fast:{}", evd_backend_inner),
         evd_elapsed_inner,
+        sigma_g2,
+        sigma_e2,
     ))
 }

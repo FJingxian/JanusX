@@ -488,7 +488,7 @@ fn symmetric_eigh_f64_row_major_inplace_single_driver(
     )
 }
 
-pub(crate) fn symmetric_eigh_f64_row_major(
+pub fn symmetric_eigh_f64_row_major(
     a_row_major: &[f64],
     n: usize,
 ) -> Result<(Vec<f64>, Vec<f64>, &'static str), String> {

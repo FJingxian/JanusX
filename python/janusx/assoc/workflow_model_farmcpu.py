@@ -11,6 +11,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import psutil
+from janusx.pyBLUP.assoc import farmcpu
 
 from .workflow import (
     CliStatus,
@@ -36,14 +37,15 @@ from .workflow import (
     _pca_cache_path_legacy,
     _read_id_file,
     _replace_file_with_retry,
+    _resolve_file_input_matrix,
     _rich_success,
     _run_fastplot_from_tsv_with_status,
     _trait_values_and_mask,
     detect_effective_threads,
     format_elapsed,
     genotype_cache_prefix,
-    inspect_genotype_file,
     jxrs,
+    load_genotype_chunks,
     latest_genotype_mtime,
     prepare_packed_ctx_from_plink,
 )
@@ -218,6 +220,57 @@ def build_qmatrix_farmcpu(
             )
         return grm
 
+    def _build_grm_from_dense_f32(geno_f32: np.ndarray) -> np.ndarray:
+        g = np.asarray(geno_f32, dtype=np.float32)
+        if g.ndim != 2:
+            raise ValueError("FarmCPU dense GRM build requires 2D genotype matrix (m, n).")
+        m_rows, n_cols = int(g.shape[0]), int(g.shape[1])
+        if m_rows <= 0 or n_cols <= 0:
+            raise ValueError("FarmCPU dense GRM build got empty genotype matrix.")
+        if n_cols != int(n):
+            raise ValueError(
+                f"FarmCPU dense GRM sample size mismatch: geno_n={n_cols}, expected={n}."
+            )
+
+        # Dense fallback for FILE matrix inputs (txt/npy/bin), accumulated by SNP blocks
+        # to avoid materializing an extra full centered matrix.
+        grm64 = np.zeros((n_cols, n_cols), dtype=np.float64)
+        var_sum = 0.0
+        block_rows = max(1, min(int(max(1, int(chunk_size))), 4096, m_rows))
+
+        pbar = _ProgressAdapter(
+            total=int(max(1, m_rows)),
+            desc="GRM (dense)",
+            force_animate=True,
+        )
+        process = psutil.Process()
+        mem_tick_span = max(1, 10 * int(block_rows))
+        done = 0
+        try:
+            for start in range(0, m_rows, block_rows):
+                end = min(start + block_rows, m_rows)
+                blk = np.asarray(g[start:end, :], dtype=np.float64)
+                row_mean = np.mean(blk, axis=1, keepdims=True, dtype=np.float64)
+                blk -= row_mean
+                var_sum += float(np.sum(np.mean(blk * blk, axis=1, dtype=np.float64), dtype=np.float64))
+                grm64 += blk.T @ blk
+
+                step = end - start
+                done += step
+                pbar.update(step)
+                if (done % mem_tick_span) == 0:
+                    mem = process.memory_info().rss / 1024**3
+                    pbar.set_postfix(memory=f"{mem:.2f}GB")
+            pbar.finish()
+        finally:
+            pbar.close(show_done=False)
+
+        if not np.isfinite(var_sum) or var_sum <= 0.0:
+            raise ValueError("FarmCPU dense GRM variance sum is non-positive.")
+        grm64 /= var_sum
+        grm64 = (grm64 + grm64.T) * 0.5
+        return np.asarray(grm64, dtype=np.float32)
+
     def _load_or_build_grm_cache_for_pca() -> np.ndarray:
         grm_path, id_path = _grm_cache_paths(gfile_prefix, mgrm="1")
         legacy_grm_path, legacy_id_path = _grm_cache_paths_legacy(gfile_prefix, mgrm="1")
@@ -281,20 +334,28 @@ def build_qmatrix_farmcpu(
                         except Exception:
                             pass
 
-                _farm_log("* Building GRM cache for FarmCPU PCA (packed Rust)...")
-                if not isinstance(packed_ctx_preloaded, dict):
+                _farm_log("* Building GRM cache for FarmCPU PCA...")
+                if isinstance(packed_ctx_preloaded, dict):
+                    try:
+                        grm = _build_grm_from_packed_ctx_rust(
+                            packed_ctx_preloaded,
+                            qdim=int(q_int),
+                        )
+                    except Exception as ex:
+                        raise RuntimeError(
+                            f"FarmCPU packed-Rust GRM build failed in Rust-only mode: {ex}"
+                        ) from ex
+                elif geno is not None:
+                    try:
+                        grm = _build_grm_from_dense_f32(np.asarray(geno, dtype=np.float32))
+                    except Exception as ex:
+                        raise RuntimeError(
+                            f"FarmCPU dense GRM build failed for FILE matrix input: {ex}"
+                        ) from ex
+                else:
                     raise RuntimeError(
-                        "FarmCPU Rust-only Q build requires a preloaded packed BED context."
+                        "FarmCPU Q build requires packed BED context or dense genotype matrix."
                     )
-                try:
-                    grm = _build_grm_from_packed_ctx_rust(
-                        packed_ctx_preloaded,
-                        qdim=int(q_int),
-                    )
-                except Exception as ex:
-                    raise RuntimeError(
-                        f"FarmCPU packed-Rust GRM build failed in Rust-only mode: {ex}"
-                    ) from ex
                 tmp_grm = f"{grm_path}.tmp.{os.getpid()}.npy"
                 np.save(tmp_grm, grm)
                 _replace_file_with_retry(tmp_grm, grm_path)
@@ -444,6 +505,7 @@ def run_farmcpu_fullmem(
     prepare_only: bool = False,
     emit_trait_header: bool = True,
     preloaded_packed: Union[dict[str, object], None] = None,
+    emit_file_dense_warning: bool = True,
 ) -> dict[str, object]:
     """
     Run FarmCPU in high-memory mode (full genotype + QK + PCA).
@@ -605,110 +667,195 @@ def run_farmcpu_fullmem(
             )
             packed_prefix = _as_plink_prefix(cache_guess_plain)
 
+        _matrix_prefix_cli, matrix_path_cli = _resolve_file_input_matrix(str(gfile))
         can_use_packed = (
             bool(getattr(args, "model", "add") == "add")
             and packed_prefix is not None
+            and matrix_path_cli is None
         )
-        if not can_use_packed:
-            raise RuntimeError(
-                "FarmCPU Rust-only mode requires additive model with PLINK BED input."
-            )
-        packed_load_t0 = time.monotonic()
-        packed_ctx_raw = None
-        pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
-        if pre is not None and str(pre.get("prefix", "")) == str(packed_prefix):
-            packed_ctx_obj = pre.get("packed_ctx")
-            if isinstance(packed_ctx_obj, dict):
-                packed_ctx_raw = packed_ctx_obj
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    "Reusing preloaded packed BED genotype for FarmCPU.",
+        if can_use_packed:
+            packed_load_t0 = time.monotonic()
+            packed_ctx_raw = None
+            pre = preloaded_packed if isinstance(preloaded_packed, dict) else None
+            if pre is not None and str(pre.get("prefix", "")) == str(packed_prefix):
+                packed_ctx_obj = pre.get("packed_ctx")
+                if isinstance(packed_ctx_obj, dict):
+                    packed_ctx_raw = packed_ctx_obj
+                    _log_file_only(
+                        logger,
+                        logging.INFO,
+                        "Reusing preloaded packed BED genotype for FarmCPU.",
+                    )
+            if packed_ctx_raw is None:
+                packed_status = CliStatus(
+                    "Loading genotype (Full)...",
+                    enabled=bool(use_spinner),
                 )
-        if packed_ctx_raw is None:
-            packed_status = CliStatus(
+                with packed_status as task:
+                    try:
+                        _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
+                            str(packed_prefix),
+                            maf=float(args.maf),
+                            missing_rate=float(args.geno),
+                            snps_only=False,
+                            expected_n_samples=int(famid.shape[0]),
+                        )
+                    except Exception:
+                        task.fail("Loading genotype (Full) ...Failed")
+                        raise
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Loading genotype (Full, {int(n_snps)} SNPs) "
+                f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
+            )
+
+            keep_numeric = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
+            )
+
+            ref_alt, keep_final = _load_bim_ref_alt_filtered(
+                str(packed_prefix),
+                keep_numeric,
+                snps_only_mode=bool(snps_only),
+            )
+            if not np.any(keep_final):
+                raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
+
+            packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
+            miss_num = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            maf_num = np.ascontiguousarray(
+                np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            if np.array_equal(keep_final, keep_numeric):
+                packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
+                miss_arr = np.ascontiguousarray(miss_num, dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_num, dtype=np.float32)
+            else:
+                kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
+                keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
+                packed = np.ascontiguousarray(packed_num[keep_local], dtype=np.uint8)
+                miss_arr = np.ascontiguousarray(miss_num[keep_local], dtype=np.float32)
+                maf_arr = np.ascontiguousarray(maf_num[keep_local], dtype=np.float32)
+
+            row_flip_raw = packed_ctx_raw.get("row_flip")
+            if row_flip_raw is None:
+                if hasattr(jxrs, "bed_packed_row_flip_mask"):
+                    row_flip_raw = jxrs.bed_packed_row_flip_mask(
+                        packed,
+                        int(packed_ctx_raw["n_samples"]),
+                    )
+                else:
+                    row_flip_raw = np.zeros(int(packed.shape[0]), dtype=np.bool_)
+            row_flip_arr = np.ascontiguousarray(
+                np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            if int(row_flip_arr.shape[0]) != int(packed.shape[0]):
+                raise ValueError(
+                    "Packed row_flip length mismatch for FarmCPU packed context."
+                )
+
+            loaded_snps = int(ref_alt.shape[0])
+            packed_ctx = {
+                "packed": packed,
+                "missing_rate": miss_arr,
+                "maf": maf_arr,
+                "row_flip": row_flip_arr,
+                "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
+                "n_samples": int(packed_ctx_raw["n_samples"]),
+                "source_prefix": str(packed_prefix),
+            }
+            geno = None
+        else:
+            if matrix_path_cli is not None and bool(emit_file_dense_warning):
+                _emit_warning_line(
+                    logger,
+                    "FarmCPU FILE matrix input detected; using dense float32 fallback path (packed fast disabled).",
+                    use_spinner=bool(use_spinner),
+                )
+            dense_t0 = time.monotonic()
+            dense_chunks: list[np.ndarray] = []
+            chrom_col: list[str] = []
+            pos_col: list[int] = []
+            allele0_col: list[str] = []
+            allele1_col: list[str] = []
+
+            src_path = str(matrix_path_cli) if matrix_path_cli is not None else str(gfile)
+            src_low = src_path.lower()
+            delim = "," if src_low.endswith(".csv") else None
+            dense_status = CliStatus(
                 "Loading genotype (Full)...",
                 enabled=bool(use_spinner),
             )
-            with packed_status as task:
+            with dense_status as task:
                 try:
-                    _sample_ids_packed, packed_ctx_raw = prepare_packed_ctx_from_plink(
-                        str(packed_prefix),
+                    for geno_chunk, site_chunk in load_genotype_chunks(
+                        src_path,
+                        chunk_size=max(1, int(args.chunksize)),
                         maf=float(args.maf),
                         missing_rate=float(args.geno),
-                        snps_only=False,
-                        expected_n_samples=int(famid.shape[0]),
-                    )
+                        impute=True,
+                        model="add",
+                        het=0.0,
+                        snps_only=bool(snps_only),
+                        sample_ids=famid.astype(str).tolist(),
+                        delimiter=delim,
+                    ):
+                        chunk_arr = np.ascontiguousarray(np.asarray(geno_chunk, dtype=np.float32))
+                        if chunk_arr.ndim != 2:
+                            raise ValueError(
+                                f"FarmCPU dense genotype chunk must be 2D, got ndim={chunk_arr.ndim}."
+                            )
+                        if int(chunk_arr.shape[1]) != int(famid.shape[0]):
+                            raise ValueError(
+                                "FarmCPU dense genotype chunk sample count mismatch: "
+                                f"chunk_n={chunk_arr.shape[1]}, expected={famid.shape[0]}."
+                            )
+                        if int(chunk_arr.shape[0]) == 0:
+                            continue
+                        dense_chunks.append(chunk_arr)
+                        for s in site_chunk:
+                            chrom_col.append(str(getattr(s, "chrom", ".")))
+                            try:
+                                pos_col.append(int(getattr(s, "pos", 0)))
+                            except Exception:
+                                try:
+                                    pos_col.append(int(float(getattr(s, "pos", 0))))
+                                except Exception:
+                                    pos_col.append(0)
+                            allele0_col.append(str(getattr(s, "ref_allele", "N")))
+                            allele1_col.append(str(getattr(s, "alt_allele", "N")))
                 except Exception:
                     task.fail("Loading genotype (Full) ...Failed")
                     raise
-        _log_file_only(
-            logger,
-            logging.INFO,
-            f"Loading genotype (Full, {int(n_snps)} SNPs) "
-            f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
-        )
 
-        keep_numeric = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw["site_keep"], dtype=np.bool_).reshape(-1), dtype=np.bool_
-        )
-
-        ref_alt, keep_final = _load_bim_ref_alt_filtered(
-            str(packed_prefix),
-            keep_numeric,
-            snps_only_mode=bool(snps_only),
-        )
-        if not np.any(keep_final):
-            raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
-
-        packed_num = np.ascontiguousarray(np.asarray(packed_ctx_raw["packed"], dtype=np.uint8))
-        miss_num = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw["missing_rate"], dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        maf_num = np.ascontiguousarray(
-            np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        if np.array_equal(keep_final, keep_numeric):
-            packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
-            miss_arr = np.ascontiguousarray(miss_num, dtype=np.float32)
-            maf_arr = np.ascontiguousarray(maf_num, dtype=np.float32)
-        else:
-            kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
-            keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
-            packed = np.ascontiguousarray(packed_num[keep_local], dtype=np.uint8)
-            miss_arr = np.ascontiguousarray(miss_num[keep_local], dtype=np.float32)
-            maf_arr = np.ascontiguousarray(maf_num[keep_local], dtype=np.float32)
-
-        row_flip_raw = packed_ctx_raw.get("row_flip")
-        if row_flip_raw is None:
-            if hasattr(jxrs, "bed_packed_row_flip_mask"):
-                row_flip_raw = jxrs.bed_packed_row_flip_mask(
-                    packed,
-                    int(packed_ctx_raw["n_samples"]),
-                )
-            else:
-                row_flip_raw = np.zeros(int(packed.shape[0]), dtype=np.bool_)
-        row_flip_arr = np.ascontiguousarray(
-            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
-        if int(row_flip_arr.shape[0]) != int(packed.shape[0]):
-            raise ValueError(
-                "Packed row_flip length mismatch for FarmCPU packed context."
+            if len(dense_chunks) == 0:
+                raise ValueError("After filtering, number of SNPs is zero for FarmCPU.")
+            geno = np.ascontiguousarray(np.vstack(dense_chunks), dtype=np.float32)
+            loaded_snps = int(geno.shape[0])
+            ref_alt = pd.DataFrame(
+                {
+                    "chrom": chrom_col,
+                    "pos": np.asarray(pos_col, dtype=np.int64),
+                    "allele0": allele0_col,
+                    "allele1": allele1_col,
+                }
             )
-
-        loaded_snps = int(ref_alt.shape[0])
-        packed_ctx = {
-            "packed": packed,
-            "missing_rate": miss_arr,
-            "maf": maf_arr,
-            "row_flip": row_flip_arr,
-            "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
-            "n_samples": int(packed_ctx_raw["n_samples"]),
-            "source_prefix": str(packed_prefix),
-        }
+            if int(ref_alt.shape[0]) != int(loaded_snps):
+                raise ValueError(
+                    "FarmCPU dense site metadata row count mismatch with genotype matrix."
+                )
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"Loading genotype (Full, {loaded_snps} SNPs) "
+                f"[{format_elapsed(time.monotonic() - dense_t0)}]",
+            )
 
         t_loaded = time.time() - t_loading
         if (not bool(context_prepared)) and (not bool(prepare_only)):
@@ -1041,14 +1188,94 @@ def run_farmcpu_fullmem(
             if int(rust_qtn_written) > 0 and os.path.exists(pseudo_tsv_hint):
                 pseudo_tsv = pseudo_tsv_hint
         else:
+            farm_ret: object
             try:
+                farm_ret = farmcpu(
+                    y=np.ascontiguousarray(p_sub, dtype=np.float64).reshape(-1),
+                    M=m_input,
+                    X=np.ascontiguousarray(q_sub, dtype=np.float64),
+                    chrlist=np.asarray(chrom_col, dtype=object),
+                    poslist=np.asarray(pos_col, dtype=np.int64),
+                    szbin=[float(x) for x in farm_szbin],
+                    nbin=int(farm_nbin),
+                    QTNbound=farm_qtn_bound,
+                    iter=int(farm_iter),
+                    threshold=float(farm_threshold),
+                    threads=int(args.thread),
+                    sample_indices=sample_idx_arg,
+                    progress_cb=_farmcpu_progress,
+                    return_info=True,
+                )
+                farm_pbar.finish()
+            finally:
                 farm_pbar.close(show_done=False)
-            except Exception:
-                pass
-            raise RuntimeError(
-                "FarmCPU Rust-only mode requires farmcpu_packed_to_tsv (or unified packed controller). "
-                "Python FarmCPU fallback path is disabled."
+
+            if isinstance(farm_ret, tuple) and len(farm_ret) >= 2:
+                farm_out_raw, farm_info_raw = farm_ret[0], farm_ret[1]
+            else:
+                farm_out_raw, farm_info_raw = farm_ret, {}
+            farm_out = np.ascontiguousarray(np.asarray(farm_out_raw, dtype=np.float64))
+            if farm_out.ndim != 2 or int(farm_out.shape[0]) != int(eff_snp) or int(farm_out.shape[1]) < 3:
+                raise ValueError(
+                    "FarmCPU dense output shape mismatch: "
+                    f"got {farm_out.shape}, expected ({eff_snp}, >=3)."
+                )
+            farm_info = farm_info_raw if isinstance(farm_info_raw, dict) else {}
+            qtn_idx_arr = np.ascontiguousarray(
+                np.asarray(farm_info.get("qtn_idx", []), dtype=np.int64).reshape(-1),
+                dtype=np.int64,
             )
+            n_pseudo_qtn = int(max(0, int(farm_info.get("n_pseudo_qtn", qtn_idx_arr.shape[0]))))
+
+            beta_arr = np.ascontiguousarray(farm_out[:, 0], dtype=np.float64)
+            se_arr = np.ascontiguousarray(farm_out[:, 1], dtype=np.float64)
+            pwald_arr = np.ascontiguousarray(farm_out[:, 2], dtype=np.float64)
+            maf_arr = np.ascontiguousarray(np.asarray(maf, dtype=np.float32).reshape(-1), dtype=np.float32)
+            if int(maf_arr.shape[0]) != int(eff_snp):
+                raise ValueError(
+                    f"FarmCPU dense MAF length mismatch: maf={maf_arr.shape[0]}, eff_snp={eff_snp}."
+                )
+
+            if hasattr(jxrs, "farmcpu_write_assoc_tsv"):
+                df_lrt = int(max(1, n_idv - max(1, int(np.asarray(q_sub).shape[1])) - 1))
+                _m_written, qtn_written = jxrs.farmcpu_write_assoc_tsv(
+                    [str(x) for x in chrom_col],
+                    [int(x) for x in pos_col],
+                    [str(x) for x in allele0_col],
+                    [str(x) for x in allele1_col],
+                    maf_arr,
+                    beta_arr,
+                    se_arr,
+                    pwald_arr,
+                    int(n_idv),
+                    int(df_lrt),
+                    str(out_tsv),
+                    qtn_idx=qtn_idx_arr,
+                    pseudo_tsv=str(pseudo_tsv_hint),
+                )
+                n_pseudo_qtn = int(max(n_pseudo_qtn, int(qtn_written)))
+                if int(qtn_written) > 0 and os.path.exists(pseudo_tsv_hint):
+                    pseudo_tsv = pseudo_tsv_hint
+            else:
+                out_df = pd.DataFrame(
+                    {
+                        "chrom": [str(x) for x in chrom_col],
+                        "pos": [int(x) for x in pos_col],
+                        "allele0": [str(x) for x in allele0_col],
+                        "allele1": [str(x) for x in allele1_col],
+                        "maf": maf_arr,
+                        "beta": beta_arr,
+                        "se": se_arr,
+                        "pwald": pwald_arr,
+                        "plrt": np.full((eff_snp,), np.nan, dtype=np.float64),
+                    }
+                )
+                out_df.to_csv(str(out_tsv), sep="\t", index=False)
+                if int(qtn_idx_arr.size) > 0:
+                    uniq_idx = np.unique(qtn_idx_arr[(qtn_idx_arr >= 0) & (qtn_idx_arr < eff_snp)])
+                    if int(uniq_idx.size) > 0:
+                        out_df.iloc[uniq_idx.tolist(), :].to_csv(str(pseudo_tsv_hint), sep="\t", index=False)
+                        pseudo_tsv = pseudo_tsv_hint
 
         gwas_secs = max(time.time() - gwas_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)

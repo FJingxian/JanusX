@@ -80,6 +80,7 @@ from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
     auto_mmap_window_mb,
+    prepare_cli_input_cache,
 )
 from janusx.pyBLUP.QK2 import QK
 from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
@@ -1795,12 +1796,41 @@ def load_or_build_grm_with_cache(
     """
     Load or build a GRM with caching for streaming LMM/LM runs.
     """
+    genofile_for_grm = str(genofile)
+    if _as_plink_prefix(genofile_for_grm) is None:
+        cached_candidate = ""
+        try:
+            delim = "," if str(genofile_for_grm).lower().endswith(".csv") else None
+            cached_candidate = str(
+                prepare_cli_input_cache(
+                    str(genofile_for_grm),
+                    snps_only=bool(snps_only),
+                    delimiter=delim,
+                    prefer_plink_for_txt=True,
+                )
+            )
+        except Exception as ex:
+            _log_file_only(
+                logger,
+                logging.WARNING,
+                "GRM cache materialization to PLINK BED failed; "
+                f"input={genofile_for_grm}, reason={ex}",
+            )
+        cached_prefix = _as_plink_prefix(cached_candidate) if cached_candidate != "" else None
+        if cached_prefix is not None:
+            genofile_for_grm = str(cached_prefix)
+            _log_file_only(
+                logger,
+                logging.INFO,
+                f"GRM input switched to PLINK cache prefix: {genofile_for_grm}",
+            )
+
     if ids_preloaded is not None and n_snps_preloaded is not None:
         ids = np.asarray(ids_preloaded, dtype=str)
         n_snps = int(n_snps_preloaded)
     else:
         ids0, n_snps0 = inspect_genotype_file(
-            genofile,
+            genofile_for_grm,
             snps_only=bool(snps_only),
             maf=float(maf_threshold),
             missing_rate=float(max_missing_rate),
@@ -1880,7 +1910,7 @@ def load_or_build_grm_with_cache(
                     and hasattr(jxrs, "grm_stream_bed_f32_to_npy")
                 )
                 grm, eff_m = build_grm_streaming(
-                    genofile=genofile,
+                    genofile=genofile_for_grm,
                     n_samples=n_samples,
                     n_snps=n_snps,
                     maf_threshold=maf_threshold,
@@ -1888,7 +1918,7 @@ def load_or_build_grm_with_cache(
                     chunk_size=chunk_size,
                     method=method_int,
                     mmap_window_mb=auto_mmap_window_mb(
-                        genofile, n_samples, n_snps, chunk_size
+                        genofile_for_grm, n_samples, n_snps, chunk_size
                     ) if mmap_limit else None,
                     threads=threads,
                     logger=logger,
@@ -2255,6 +2285,34 @@ def prepare_streaming_context(
         if all(os.path.isfile(f"{cp}.{ext}") for ext in ("bed", "bim", "fam")):
             stream_genofile = str(cp)
             break
+
+    need_bed_cache_now = bool(require_kinship or allow_packed_grm or preload_packed_context)
+    if need_bed_cache_now and (_as_plink_prefix(stream_genofile) is None):
+        try:
+            delim = "," if str(stream_genofile).lower().endswith(".csv") else None
+            cached_cli = str(
+                prepare_cli_input_cache(
+                    str(stream_genofile),
+                    snps_only=bool(snps_only),
+                    delimiter=delim,
+                    prefer_plink_for_txt=True,
+                )
+            )
+            cached_prefix = _as_plink_prefix(cached_cli)
+            if cached_prefix is not None:
+                stream_genofile = str(cached_prefix)
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"Streaming genotype switched to PLINK cache: {stream_genofile}",
+                )
+        except Exception as ex:
+            _emit_warning_line(
+                logger,
+                "Genotype BED cache materialization unavailable; "
+                f"continuing with source input. reason={ex}",
+                use_spinner=bool(use_spinner),
+            )
 
     # In fast/farmcpu mode, preload packed BED once right after genotype meta
     # is known, then reuse for GRM and downstream GWAS/FarmCPU stages.
@@ -3508,6 +3566,554 @@ def run_farmcpu_fullmem(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def _run_file_dense_fast_once(
+    *,
+    args,
+    gfile: str,
+    prefix: str,
+    outprefix: str,
+    logger: logging.Logger,
+    use_spinner: bool,
+    stream_models: list[str],
+    has_farmcpu: bool,
+    summary_rows: list[dict[str, object]],
+    saved_paths: list[str],
+) -> tuple[pd.DataFrame, np.ndarray, int]:
+    from janusx.pyBLUP.QK2 import GRM as _calc_grm
+
+    def _extract_ref_alt(
+        ref_alt_obj: object,
+        n_markers: int,
+    ) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+        if isinstance(ref_alt_obj, pd.DataFrame):
+            ref_alt_df = ref_alt_obj.reset_index(drop=True)
+            cols_need = {"chrom", "pos", "allele0", "allele1"}
+            if not cols_need.issubset(set(ref_alt_df.columns)):
+                raise ValueError(
+                    "FarmCPU dense cache ref_alt missing required columns: "
+                    "chrom/pos/allele0/allele1."
+                )
+            if int(ref_alt_df.shape[0]) != int(n_markers):
+                raise ValueError(
+                    f"FarmCPU dense cache ref_alt rows={ref_alt_df.shape[0]} "
+                    f"!= genotype markers={n_markers}."
+                )
+            chrom = ref_alt_df["chrom"].astype(str).to_numpy(dtype=object)
+            pos = (
+                pd.to_numeric(ref_alt_df["pos"], errors="coerce")
+                .fillna(0)
+                .astype(np.int64)
+                .to_numpy()
+            )
+            allele0 = ref_alt_df["allele0"].astype(str).tolist()
+            allele1 = ref_alt_df["allele1"].astype(str).tolist()
+            return chrom, pos, allele0, allele1
+
+        if isinstance(ref_alt_obj, dict):
+            chrom_obj = ref_alt_obj.get("chrom")
+            pos_obj = ref_alt_obj.get("pos")
+            a0_obj = ref_alt_obj.get("allele0")
+            a1_obj = ref_alt_obj.get("allele1")
+            if chrom_obj is None or pos_obj is None or a0_obj is None or a1_obj is None:
+                raise ValueError(
+                    "FarmCPU dense cache ref_alt dict must contain "
+                    "chrom/pos/allele0/allele1."
+                )
+            chrom = np.asarray(chrom_obj, dtype=object).reshape(-1)
+            pos = np.asarray(pos_obj, dtype=np.int64).reshape(-1)
+            allele0 = [str(x) for x in np.asarray(a0_obj, dtype=object).reshape(-1)]
+            allele1 = [str(x) for x in np.asarray(a1_obj, dtype=object).reshape(-1)]
+            if (
+                int(chrom.shape[0]) != int(n_markers)
+                or int(pos.shape[0]) != int(n_markers)
+                or len(allele0) != int(n_markers)
+                or len(allele1) != int(n_markers)
+            ):
+                raise ValueError(
+                    "FarmCPU dense cache ref_alt length mismatch with genotype markers."
+                )
+            return chrom, pos, allele0, allele1
+
+        raise ValueError("Unsupported FarmCPU dense cache ref_alt payload type.")
+
+    def _heter_keep_mask(geno_add: np.ndarray, het_threshold: float) -> np.ndarray:
+        geno = np.asarray(geno_add, dtype=np.float32)
+        m = int(geno.shape[0])
+        if m == 0:
+            return np.zeros((0,), dtype=bool)
+        valid = np.isfinite(geno) & (geno >= 0.0)
+        non_missing = np.sum(valid, axis=1)
+        keep = non_missing > 0
+        if not np.any(keep):
+            return keep
+        het_count = np.sum(np.isclose(geno, 1.0, atol=1e-6) & valid, axis=1)
+        het_rate = np.zeros((m,), dtype=np.float32)
+        idx = non_missing > 0
+        het_rate[idx] = het_count[idx] / non_missing[idx]
+        keep &= (het_rate >= float(het_threshold)) & (
+            het_rate <= (1.0 - float(het_threshold))
+        )
+        return keep
+
+    def _apply_genetic_model(geno_add: np.ndarray, model: str) -> np.ndarray:
+        m = str(model).lower()
+        g = np.asarray(geno_add, dtype=np.float32)
+        if m == "add":
+            return g
+        if m == "dom":
+            return (
+                np.isclose(g, 1.0, atol=1e-6) | np.isclose(g, 2.0, atol=1e-6)
+            ).astype(np.float32, copy=False)
+        if m == "rec":
+            return np.isclose(g, 2.0, atol=1e-6).astype(np.float32, copy=False)
+        if m == "het":
+            return np.isclose(g, 1.0, atol=1e-6).astype(np.float32, copy=False)
+        raise ValueError(f"Unsupported genetic model for dense FILE fast route: {model}")
+
+    def _transform_alleles(
+        allele0_list: list[str],
+        allele1_list: list[str],
+        model: str,
+    ) -> tuple[list[str], list[str]]:
+        m = str(model).lower()
+        if m == "add":
+            return allele0_list, allele1_list
+        out0: list[str] = []
+        out1: list[str] = []
+        for a0, a1 in zip(allele0_list, allele1_list):
+            hom0 = f"{a0}{a0}"
+            het = f"{a0}{a1}"
+            hom1 = f"{a1}{a1}"
+            if m == "dom":
+                out0.append(hom0)
+                out1.append(f"{het}/{hom1}")
+            elif m == "rec":
+                out0.append(f"{het}/{hom0}")
+                out1.append(hom1)
+            elif m == "het":
+                out0.append(f"{hom0}/{hom1}")
+                out1.append(het)
+            else:
+                raise ValueError(f"Unsupported genetic model for dense FILE fast route: {model}")
+        return out0, out1
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+
+    _section(logger, "GWAS task")
+    _log_file_only(
+        logger,
+        logging.INFO,
+        "FILE fast mode: preparing shared dense genotype cache once for LM/LMM/FastLMM/FarmCPU.",
+    )
+    farmcpu_cache_runtime = run_farmcpu_fullmem(
+        args=args,
+        gfile=str(gfile),
+        prefix=str(prefix),
+        logger=logger,
+        pheno_preloaded=None,
+        ids_preloaded=None,
+        n_snps_preloaded=None,
+        qmatrix_preloaded=None,
+        cov_preloaded=None,
+        use_spinner=use_spinner,
+        context_prepared=False,
+        summary_rows=summary_rows,
+        saved_paths=saved_paths,
+        trait_names=None,
+        farmcpu_cache=None,
+        prepare_only=True,
+        emit_trait_header=False,
+        preloaded_packed=None,
+        emit_file_dense_warning=bool(has_farmcpu),
+    )
+    if not isinstance(farmcpu_cache_runtime, dict):
+        raise RuntimeError("FarmCPU prepare_only did not return a reusable cache dict.")
+
+    pheno_obj = farmcpu_cache_runtime.get("pheno")
+    if not isinstance(pheno_obj, pd.DataFrame):
+        raise RuntimeError("FarmCPU cache missing phenotype dataframe in FILE fast mode.")
+    pheno = pheno_obj
+    ids = np.asarray(farmcpu_cache_runtime.get("famid"), dtype=str).reshape(-1)
+    if int(ids.shape[0]) == 0:
+        raise RuntimeError("FarmCPU cache has zero genotype samples in FILE fast mode.")
+
+    geno_obj = farmcpu_cache_runtime.get("geno")
+    if geno_obj is None:
+        raise RuntimeError(
+            "FILE fast mode expects dense genotype matrix in FarmCPU cache, got None."
+        )
+    geno = np.ascontiguousarray(np.asarray(geno_obj, dtype=np.float32))
+    if geno.ndim != 2:
+        raise RuntimeError(
+            f"Dense FILE fast genotype must be 2D, got ndim={geno.ndim}."
+        )
+    if int(geno.shape[1]) != int(ids.shape[0]):
+        raise RuntimeError(
+            "Dense FILE fast genotype sample count mismatch: "
+            f"geno_n={geno.shape[1]}, ids_n={ids.shape[0]}."
+        )
+    n_snps = int(geno.shape[0])
+
+    q_obj = farmcpu_cache_runtime.get("qmatrix")
+    if q_obj is None:
+        qmatrix = np.zeros((int(ids.shape[0]), 0), dtype=np.float32)
+    else:
+        qmatrix = np.ascontiguousarray(np.asarray(q_obj, dtype=np.float32))
+    if qmatrix.ndim != 2 or int(qmatrix.shape[0]) != int(ids.shape[0]):
+        raise RuntimeError(
+            "Dense FILE fast Q matrix shape mismatch: "
+            f"q={qmatrix.shape}, ids_n={ids.shape[0]}."
+        )
+
+    ref_alt_obj = farmcpu_cache_runtime.get("ref_alt")
+    chrom_all, pos_all, allele0_all, allele1_all = _extract_ref_alt(ref_alt_obj, n_snps)
+    _phase_split(logger)
+
+    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "fastlmm"}]
+    gm_tag = str(args.model).lower()
+    pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
+    trait_iter = list(pheno_aligned.columns)
+    multi_trait_mode = len(trait_iter) > 1
+
+    if len(model_sequence) == 0 and has_farmcpu:
+        farmcpu_cache_runtime = run_farmcpu_fullmem(
+            args=args,
+            gfile=str(gfile),
+            prefix=str(prefix),
+            logger=logger,
+            pheno_preloaded=pheno_aligned,
+            ids_preloaded=ids,
+            n_snps_preloaded=n_snps,
+            qmatrix_preloaded=qmatrix,
+            cov_preloaded=None,
+            use_spinner=use_spinner,
+            context_prepared=True,
+            summary_rows=summary_rows,
+            saved_paths=saved_paths,
+            trait_names=[str(t) for t in trait_iter],
+            farmcpu_cache=farmcpu_cache_runtime,
+            prepare_only=False,
+            emit_trait_header=True,
+            preloaded_packed=None,
+        )
+        _ = farmcpu_cache_runtime
+        return pheno_aligned, ids, n_snps
+
+    for trait_idx, pname in enumerate(trait_iter):
+        y_full, sameidx = _trait_values_and_mask(pheno_aligned, str(pname))
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        n_idv = int(keep_idx.shape[0])
+        if n_idv == 0:
+            logger.warning(f"{pname}: no overlapping samples, skipped.")
+            if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
+                logger.info("")
+            continue
+
+        if len(model_sequence) > 0:
+            _emit_trait_header(
+                logger,
+                str(pname),
+                n_idv,
+                pve=None,
+                use_spinner=bool(use_spinner),
+                width=60,
+            )
+
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = np.ascontiguousarray(qmatrix[keep_idx], dtype=np.float64)
+        x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
+
+        geno_add_sub = np.ascontiguousarray(geno[:, keep_idx], dtype=np.float32)
+        if gm_tag == "add":
+            keep_site = np.ones((int(geno_add_sub.shape[0]),), dtype=bool)
+        else:
+            keep_site = _heter_keep_mask(geno_add_sub, float(args.het))
+
+        if not np.any(keep_site):
+            for mkey in model_sequence:
+                model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()
+                summary_rows.append(
+                    {
+                        "phenotype": str(pname),
+                        "model": model_label,
+                        "nidv": int(n_idv),
+                        "eff_snp": 0,
+                        "pve": None,
+                        "avg_cpu": 0.0,
+                        "peak_rss_gb": float(process.memory_info().rss / 1024**3),
+                        "gwas_time_s": 0.0,
+                        "viz_time_s": 0.0,
+                        "result_file": "",
+                    }
+                )
+                logger.info(f"{model_label}: no SNPs passed filters for trait {pname}.")
+            if has_farmcpu:
+                farmcpu_cache_runtime = run_farmcpu_fullmem(
+                    args=args,
+                    gfile=str(gfile),
+                    prefix=str(prefix),
+                    logger=logger,
+                    pheno_preloaded=pheno_aligned,
+                    ids_preloaded=ids,
+                    n_snps_preloaded=n_snps,
+                    qmatrix_preloaded=qmatrix,
+                    cov_preloaded=None,
+                    use_spinner=use_spinner,
+                    context_prepared=True,
+                    summary_rows=summary_rows,
+                    saved_paths=saved_paths,
+                    trait_names=[str(pname)],
+                    farmcpu_cache=farmcpu_cache_runtime,
+                    prepare_only=False,
+                    emit_trait_header=False,
+                    preloaded_packed=None,
+                )
+            if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
+                logger.info("")
+            continue
+
+        geno_add_use = np.ascontiguousarray(geno_add_sub[keep_site], dtype=np.float32)
+        geno_model = np.ascontiguousarray(
+            _apply_genetic_model(geno_add_use, gm_tag),
+            dtype=np.float32,
+        )
+        p = np.asarray(np.mean(geno_add_use, axis=1, dtype=np.float64) / 2.0, dtype=np.float64)
+        p = np.clip(p, 0.0, 1.0)
+        maf = np.ascontiguousarray(np.minimum(p, 1.0 - p), dtype=np.float32)
+
+        chrom_keep = np.asarray(chrom_all[keep_site], dtype=object)
+        pos_keep = np.asarray(pos_all[keep_site], dtype=np.int64)
+        idx_keep = np.flatnonzero(keep_site).astype(np.int64, copy=False)
+        allele0_keep = [allele0_all[int(i)] for i in idx_keep]
+        allele1_keep = [allele1_all[int(i)] for i in idx_keep]
+        allele0_use, allele1_use = _transform_alleles(allele0_keep, allele1_keep, gm_tag)
+
+        kinship_sub: Union[np.ndarray, None] = None
+        lmm_model_obj: Union[LMM, None] = None
+        fastlmm_model_obj: Union[FastLMM, None] = None
+
+        for mkey in model_sequence:
+            model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()
+            model_tag = str(mkey).lower()
+            if gm_tag == "add":
+                out_tsv = f"{outprefix}.{pname}.{model_tag}.tsv"
+                out_svg = f"{outprefix}.{pname}.{model_tag}.svg"
+            else:
+                out_tsv = f"{outprefix}.{pname}.{gm_tag}.{model_tag}.tsv"
+                out_svg = f"{outprefix}.{pname}.{gm_tag}.{model_tag}.svg"
+
+            cpu_t0 = process.cpu_times()
+            wall_t0 = time.monotonic()
+            peak_rss = int(process.memory_info().rss)
+            pve_now: Union[float, None] = None
+            init_secs = 0.0
+
+            if mkey == "lm":
+                init_t0 = time.monotonic()
+                mod = LM(y=y_vec, X=x_arg)
+                init_secs = max(time.monotonic() - init_t0, 0.0)
+                scan_t0 = time.monotonic()
+                res_raw = mod.gwas(geno_model, threads=int(max(1, args.thread)))
+                scan_secs = max(time.monotonic() - scan_t0, 0.0)
+            else:
+                if kinship_sub is None:
+                    kin_t0 = time.monotonic()
+                    with CliStatus(
+                        "Calculating GRM from dense FILE genotype...",
+                        enabled=bool(use_spinner),
+                        use_process=True,
+                    ) as task:
+                        try:
+                            kinship_sub = np.asarray(
+                                _calc_grm(
+                                    geno_model,
+                                    log=False,
+                                    chunksize=max(1, int(args.chunksize)),
+                                ),
+                                dtype=np.float64,
+                            )
+                        except Exception:
+                            task.fail("Calculating GRM from dense FILE genotype ...Failed")
+                            raise
+                    kin_secs = max(time.monotonic() - kin_t0, 0.0)
+                    _log_model_line(
+                        logger,
+                        model_label,
+                        f"trait GRM prepared [{format_elapsed(kin_secs)}]",
+                        use_spinner=bool(use_spinner),
+                    )
+
+                if mkey == "lmm":
+                    if lmm_model_obj is None:
+                        init_t0 = time.monotonic()
+                        lmm_model_obj = LMM(
+                            y=y_vec,
+                            X=x_arg,
+                            kinship=np.array(kinship_sub, copy=True),
+                        )
+                        init_secs = max(time.monotonic() - init_t0, 0.0)
+                    mod = lmm_model_obj
+                else:
+                    if fastlmm_model_obj is None:
+                        if lmm_model_obj is not None:
+                            fastlmm_model_obj = FastLMM.from_lmm(lmm_model_obj)
+                            init_secs = 0.0
+                        else:
+                            init_t0 = time.monotonic()
+                            fastlmm_model_obj = FastLMM(
+                                y=y_vec,
+                                X=x_arg,
+                                kinship=np.array(kinship_sub, copy=True),
+                            )
+                            init_secs = max(time.monotonic() - init_t0, 0.0)
+                    mod = fastlmm_model_obj
+
+                scan_t0 = time.monotonic()
+                res_raw = mod.gwas(geno_model, threads=int(max(1, args.thread)))
+                scan_secs = max(time.monotonic() - scan_t0, 0.0)
+                try:
+                    pve_tmp = float(getattr(mod, "pve"))
+                    if np.isfinite(pve_tmp):
+                        pve_now = pve_tmp
+                except Exception:
+                    pve_now = None
+
+            peak_rss = max(peak_rss, int(process.memory_info().rss))
+            cpu_t1 = process.cpu_times()
+            wall_total = max(time.monotonic() - wall_t0, 1e-12)
+            cpu_used = float(
+                (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+            )
+            avg_cpu = 100.0 * cpu_used / (wall_total * max(1, int(n_cores)))
+            peak_rss_gb = float(peak_rss / 1024**3)
+
+            res = np.ascontiguousarray(np.asarray(res_raw, dtype=np.float64))
+            if res.ndim != 2 or res.shape[0] != int(geno_model.shape[0]) or res.shape[1] < 3:
+                raise RuntimeError(
+                    f"Dense FILE fast {model_label} returned invalid shape {res.shape}."
+                )
+            res_df = pd.DataFrame(
+                {
+                    "chrom": chrom_keep.astype(str),
+                    "pos": pos_keep.astype(np.int64),
+                    "allele0": allele0_use,
+                    "allele1": allele1_use,
+                    "maf": np.asarray(maf, dtype=np.float32),
+                    "beta": np.asarray(res[:, 0], dtype=np.float64),
+                    "se": np.asarray(res[:, 1], dtype=np.float64),
+                    "pwald": np.asarray(res[:, 2], dtype=np.float64),
+                }
+            )
+            if res.shape[1] > 3:
+                res_df["plrt"] = np.asarray(res[:, 3], dtype=np.float64)
+
+            viz_secs = 0.0
+
+            def _write_dense_result() -> None:
+                cast_map: dict[str, object] = {"pos": int, "pwald": "object"}
+                if "plrt" in res_df.columns:
+                    cast_map["plrt"] = "object"
+                out_df = res_df.astype(cast_map)
+                out_df.loc[:, "pwald"] = out_df["pwald"].map(lambda x: f"{x:.4e}")
+                if "plrt" in out_df.columns:
+                    out_df.loc[:, "plrt"] = out_df["plrt"].map(lambda x: f"{x:.4e}")
+                out_df.to_csv(out_tsv, sep="\t", float_format="%.4f", index=False)
+
+            _run_result_write_with_status(
+                _write_dense_result,
+                use_spinner=bool(use_spinner),
+                emit_done_line=False,
+            )
+            saved_paths.append(str(out_tsv))
+            _log_model_line(
+                logger,
+                model_label,
+                f"Results saved to {_display_path(str(out_tsv))}",
+                use_spinner=bool(use_spinner),
+            )
+
+            if bool(args.plot):
+                viz_secs = _run_fastplot_with_status(
+                    res_df[["chrom", "pos", "pwald"]],
+                    y_vec,
+                    xlabel=str(pname),
+                    outpdf=out_svg,
+                    use_spinner=bool(use_spinner),
+                    emit_done_line=False,
+                )
+
+            summary_rows.append(
+                {
+                    "phenotype": str(pname),
+                    "model": model_label,
+                    "nidv": int(n_idv),
+                    "eff_snp": int(geno_model.shape[0]),
+                    "pve": (float(pve_now) if pve_now is not None else None),
+                    "avg_cpu": float(avg_cpu),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(init_secs + scan_secs),
+                    "viz_time_s": float(viz_secs),
+                    "result_file": str(out_tsv),
+                }
+            )
+
+            _log_model_line(
+                logger,
+                model_label,
+                f"avg CPU ~ {avg_cpu:.1f}% of {n_cores} c, peak RSS ~ {peak_rss_gb:.2f} G",
+                use_spinner=bool(use_spinner),
+            )
+            done_times: list[str] = []
+            if init_secs > 0.0:
+                done_times.append(format_elapsed(init_secs))
+            done_times.append(format_elapsed(scan_secs))
+            if bool(args.plot):
+                done_times.append(format_elapsed(viz_secs))
+            if (
+                pve_now is not None
+                and np.isfinite(float(pve_now))
+                and str(model_label).lower() in {"lmm", "fastlmm"}
+            ):
+                done_msg = (
+                    f"{model_label} ...pve {float(pve_now):.3f} "
+                    f"[{'/'.join(done_times)}]"
+                )
+            else:
+                done_msg = f"{model_label} ...Finished [{'/'.join(done_times)}]"
+            _rich_success(
+                logger,
+                done_msg,
+                use_spinner=bool(use_spinner),
+            )
+
+        if has_farmcpu:
+            farmcpu_cache_runtime = run_farmcpu_fullmem(
+                args=args,
+                gfile=str(gfile),
+                prefix=str(prefix),
+                logger=logger,
+                pheno_preloaded=pheno_aligned,
+                ids_preloaded=ids,
+                n_snps_preloaded=n_snps,
+                qmatrix_preloaded=qmatrix,
+                cov_preloaded=None,
+                use_spinner=use_spinner,
+                context_prepared=True,
+                summary_rows=summary_rows,
+                saved_paths=saved_paths,
+                trait_names=[str(pname)],
+                farmcpu_cache=farmcpu_cache_runtime,
+                prepare_only=False,
+                emit_trait_header=False,
+                preloaded_packed=None,
+            )
+        if multi_trait_mode and trait_idx != (len(trait_iter) - 1):
+            logger.info("")
+
+    return pheno_aligned, ids, n_snps
+
+
 def _parse_float_csv(raw: str, *, label: str) -> list[float]:
     vals: list[float] = []
     for part in str(raw).split(","):
@@ -3828,6 +4434,15 @@ def _run_gwas_pipeline(
     saved_result_paths: list[str] = []
     ordered_result_paths: list[str] = []
     trait_order: list[str] = []
+    _, _file_matrix_path_cli = _resolve_file_input_matrix(gfile)
+    input_is_file_matrix = bool(_file_matrix_path_cli is not None)
+    explicit_fast_mode = bool(getattr(args, "fast", False))
+    farmcpu_auto_fast = bool(args.farmcpu)
+    fast_mode = bool(explicit_fast_mode or farmcpu_auto_fast)
+    # FILE-input fast policy (2026-05): prefer Rust routes by materializing
+    # PLINK cache then using packed/stream scans, instead of dense Python path.
+    file_fast_rust_mode = bool(input_is_file_matrix and fast_mode)
+    file_fast_dense_mode = False
 
     if log:
         model_tokens: list[str] = []
@@ -3839,8 +4454,11 @@ def _run_gwas_pipeline(
             model_tokens.append("LMM")
         if args.farmcpu:
             model_tokens.append("FarmCPU")
-        cli_fast_mode = bool(getattr(args, "fast", False) or bool(args.farmcpu))
-        bed_backend_policy = "packed (-fast/-farmcpu)" if cli_fast_mode else "memmap (default)"
+        cli_fast_mode = bool(fast_mode)
+        if file_fast_rust_mode:
+            bed_backend_policy = "packed (-fast/-farmcpu; FILE->BED cache)"
+        else:
+            bed_backend_policy = "packed (-fast/-farmcpu)" if cli_fast_mode else "memmap (default)"
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
@@ -3921,16 +4539,19 @@ def _run_gwas_pipeline(
     het_threshold_scan = float(args.het)
 
     input_is_bed = _as_plink_prefix(gfile) is not None
-    fast_mode = bool(getattr(args, "fast", False) or bool(args.farmcpu))
     memmap_mode = not bool(fast_mode)
     mmap_limit_effective = bool(args.mmap_limit or memmap_mode)
     _log_file_only(
         logger,
         logging.INFO,
         (
-            "BED backend policy: packed (-fast/-farmcpu)."
-            if fast_mode
-            else "BED backend policy: memmap (default)."
+            "FILE fast backend policy: Rust packed/stream via PLINK cache."
+            if file_fast_rust_mode
+            else (
+                "BED backend policy: packed (-fast/-farmcpu)."
+                if fast_mode
+                else "BED backend policy: memmap (default)."
+            )
         ),
     )
     if memmap_mode and (not bool(args.mmap_limit)):
@@ -3954,18 +4575,40 @@ def _run_gwas_pipeline(
         fast_mode
         and (args.lmm or args.fastlmm or qcov_needs_grm)
     )
+    force_bed_stream_scan = bool(
+        (args.lm or args.lmm or args.fastlmm)
+        and input_is_file_matrix
+        and (not bool(fast_mode))
+    )
+    allow_packed_grm_effective = bool(
+        (not bool(file_fast_dense_mode))
+        and (prefer_packed_grm or force_bed_stream_scan)
+    )
+    if force_bed_stream_scan and (not bool(fast_mode)):
+        _log_file_only(
+            logger,
+            logging.INFO,
+            "FILE matrix input for LM/LMM/FaSTLMM: materializing PLINK BED cache for Rust streaming scan.",
+        )
     if (not bool(fast_mode)) and bool(args.lmm or args.fastlmm or qcov_needs_grm):
         _log_file_only(
             logger,
             logging.INFO,
             "Non-fast GWAS: GRM uses memmap path by default (packed single-entry disabled).",
         )
-    if bool(args.farmcpu) and (not bool(getattr(args, "fast", False))):
-        _log_file_only(
-            logger,
-            logging.INFO,
-            "FarmCPU selected: enabling fast mode automatically.",
-        )
+    if bool(args.farmcpu) and (not bool(explicit_fast_mode)):
+        if bool(farmcpu_auto_fast):
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "FarmCPU selected: enabling fast mode automatically.",
+            )
+        else:
+            _log_file_only(
+                logger,
+                logging.INFO,
+                "FarmCPU selected on FILE matrix input: packed fast mode disabled; using dense float32 path.",
+            )
     try:
 
         # --- prepare streaming context once if needed ---
@@ -3979,70 +4622,6 @@ def _run_gwas_pipeline(
         genofile_stream = gfile
         eff_snp_by_trait: dict[str, int] = {}
 
-        stream_selected = bool(args.lmm or args.lm or args.fastlmm)
-        shared_context_needed = bool(stream_selected or fast_mode)
-        preloaded_packed: Union[dict[str, object], None] = None
-        if shared_context_needed:
-            _section(logger, "GWAS task")
-            _log_file_only(
-                logger,
-                logging.INFO,
-                "Prepare shared context (phenotype/genotype meta/GRM/Q/cov)",
-            )
-            pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
-                genofile=genofile_stream,
-                phenofile=args.pheno,
-                pheno_cols=args.ncol,
-                maf_threshold=maf_threshold_scan,
-                max_missing_rate=max_missing_rate_scan,
-                genetic_model=args.model,
-                het_threshold=het_threshold_scan,
-                chunk_size=args.chunksize,
-                mgrm=args.grm,
-                pcdim=args.qcov,
-                cov_inputs=args.cov,
-                threads=args.thread,
-                mmap_limit=mmap_limit_effective,
-                require_kinship=(args.lmm or args.fastlmm),
-                logger=logger,
-                use_spinner=use_spinner,
-                snps_only=bool(args.snps_only),
-                allow_packed_grm=bool(prefer_packed_grm),
-                preload_packed_context=bool(fast_mode),
-            )
-            if bool(fast_mode) and (not isinstance(preloaded_packed, dict)):
-                try:
-                    prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
-                        genofile=genofile_stream,
-                        maf_threshold=float(maf_threshold_scan),
-                        max_missing_rate=float(max_missing_rate_scan),
-                        het_threshold=float(het_threshold_scan),
-                        snps_only=bool(args.snps_only),
-                        use_spinner=bool(use_spinner),
-                        preloaded_packed=None,
-                    )
-                    preloaded_packed = {
-                        "prefix": str(prefix0),
-                        "full_ids": np.asarray(full_ids0, dtype=str),
-                        "packed_ctx": packed_ctx0,
-                        "sites_all": sites0,
-                    }
-                except Exception as ex:
-                    logger.warning(
-                        f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
-                    )
-                    preloaded_packed = None
-            _phase_split(logger)
-        else:
-            if args.farmcpu:
-                pheno = _load_phenotype_with_status(
-                    args.pheno,
-                    args.ncol,
-                    logger,
-                    id_col=0,
-                    use_spinner=use_spinner,
-                )
-
         stream_models: list[str] = []
         if args.lm:
             stream_models.append("lm")
@@ -4052,6 +4631,88 @@ def _run_gwas_pipeline(
             stream_models.append("fastlmm")
         has_farmcpu = bool(args.farmcpu)
         farmcpu_handled_in_trait_loop = False
+        preloaded_packed: Union[dict[str, object], None] = None
+
+        if file_fast_dense_mode:
+            pheno, ids, n_snps = _run_file_dense_fast_once(
+                args=args,
+                gfile=str(gfile),
+                prefix=str(prefix),
+                outprefix=str(outprefix),
+                logger=logger,
+                use_spinner=bool(use_spinner),
+                stream_models=list(stream_models),
+                has_farmcpu=bool(has_farmcpu),
+                summary_rows=gwas_summary_rows,
+                saved_paths=saved_result_paths,
+            )
+            # Dense FILE-fast route has already run requested models.
+            stream_models = []
+            has_farmcpu = False
+            farmcpu_handled_in_trait_loop = True
+        else:
+            stream_selected = bool(len(stream_models) > 0)
+            shared_context_needed = bool(stream_selected or fast_mode)
+            if shared_context_needed:
+                _section(logger, "GWAS task")
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    "Prepare shared context (phenotype/genotype meta/GRM/Q/cov)",
+                )
+                pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
+                    genofile=genofile_stream,
+                    phenofile=args.pheno,
+                    pheno_cols=args.ncol,
+                    maf_threshold=maf_threshold_scan,
+                    max_missing_rate=max_missing_rate_scan,
+                    genetic_model=args.model,
+                    het_threshold=het_threshold_scan,
+                    chunk_size=args.chunksize,
+                    mgrm=args.grm,
+                    pcdim=args.qcov,
+                    cov_inputs=args.cov,
+                    threads=args.thread,
+                    mmap_limit=mmap_limit_effective,
+                    require_kinship=(args.lmm or args.fastlmm),
+                    logger=logger,
+                    use_spinner=use_spinner,
+                    snps_only=bool(args.snps_only),
+                    allow_packed_grm=bool(allow_packed_grm_effective),
+                    preload_packed_context=bool(fast_mode),
+                )
+                if bool(fast_mode) and (not isinstance(preloaded_packed, dict)):
+                    try:
+                        prefix0, full_ids0, packed_ctx0, sites0 = _prepare_packed_bed_once_for_gwas(
+                            genofile=genofile_stream,
+                            maf_threshold=float(maf_threshold_scan),
+                            max_missing_rate=float(max_missing_rate_scan),
+                            het_threshold=float(het_threshold_scan),
+                            snps_only=bool(args.snps_only),
+                            use_spinner=bool(use_spinner),
+                            preloaded_packed=None,
+                        )
+                        preloaded_packed = {
+                            "prefix": str(prefix0),
+                            "full_ids": np.asarray(full_ids0, dtype=str),
+                            "packed_ctx": packed_ctx0,
+                            "sites_all": sites0,
+                        }
+                    except Exception as ex:
+                        logger.warning(
+                            f"Fast mode packed preload unavailable; falling back to on-demand packed load. reason={ex}"
+                        )
+                        preloaded_packed = None
+                _phase_split(logger)
+            else:
+                if args.farmcpu:
+                    pheno = _load_phenotype_with_status(
+                        args.pheno,
+                        args.ncol,
+                        logger,
+                        id_col=0,
+                        use_spinner=use_spinner,
+                    )
 
         trait_order = list(pheno.columns) if pheno is not None else []
         trait_col_map: dict[str, int] = {}
@@ -4618,8 +5279,8 @@ def _run_gwas_pipeline(
                     "farmcpu": bool(args.farmcpu),
                 },
                 "model": str(args.model),
-                "bed_backend": ("packed" if bool(args.fast or args.farmcpu) else "memmap"),
-                "bed_loader": ("packed" if bool(args.fast or args.farmcpu) else "memmap"),
+                "bed_backend": ("packed" if bool(fast_mode) else "memmap"),
+                "bed_loader": ("packed" if bool(fast_mode) else "memmap"),
                 "snps_only": bool(args.snps_only),
                 "maf": float(args.maf),
                 "geno": float(args.geno),

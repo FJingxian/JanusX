@@ -8,21 +8,20 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::bedmath::{
-    adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut,
-    decode_row_centered_full_lut_f64, decode_subset_row_from_full_scratch, is_identity_indices,
-    packed_byte_lut,
+    adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut_f64,
+    decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
-    cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch, cblas_ssyrk_dispatch,
-    rust_blas_get_num_threads, rust_sgemm_backend, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
-    CBLAS_NO_TRANS, CBLAS_TRANS, CBLAS_UPPER,
+    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
+    CBLAS_TRANS,
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::grm;
 use crate::packed::{
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
 };
@@ -34,121 +33,6 @@ use crate::stats_common::{
 #[path = "../math/FaST.rs"]
 mod fast_math;
 use fast_math::gblup_marker_fast_packed;
-
-#[allow(clippy::too_many_arguments)]
-fn decode_grm_block(
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples: usize,
-    row_flip_vec: &[bool],
-    row_maf_vec: &[f32],
-    sample_idx: &[usize],
-    full_sample_fast: bool,
-    method: usize,
-    eps: f32,
-    code4_lut: &[[u8; 4]; 256],
-    row_start: usize,
-    row_end: usize,
-    n: usize,
-    out_block: &mut [f32],
-    out_varsum: &mut [f64],
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(), String> {
-    let cur_rows = row_end.saturating_sub(row_start);
-    if cur_rows == 0 {
-        return Ok(());
-    }
-    if out_block.len() < cur_rows.saturating_mul(n) {
-        return Err("decode_grm_block: out_block too small".to_string());
-    }
-    if out_varsum.len() < cur_rows {
-        return Err("decode_grm_block: out_varsum too small".to_string());
-    }
-    let block = &mut out_block[..cur_rows * n];
-    let varsum = &mut out_varsum[..cur_rows];
-
-    let mut decode_run = || {
-        if full_sample_fast {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each(|(off, (out_row, row_varsum_dst))| {
-                    let idx = row_start + off;
-                    let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                    let flip = row_flip_vec[idx];
-                    let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                    let mean_g = 2.0_f32 * p;
-                    let var = 2.0_f32 * p * (1.0_f32 - p);
-                    let std_scale = if method == 2 {
-                        if var > eps {
-                            1.0_f32 / var.sqrt()
-                        } else {
-                            0.0_f32
-                        }
-                    } else {
-                        1.0_f32
-                    };
-                    let value_lut: [f32; 4] = if flip {
-                        [
-                            (2.0_f32 - mean_g) * std_scale,
-                            0.0_f32, // missing -> mean imputation => centered 0
-                            (1.0_f32 - mean_g) * std_scale,
-                            (0.0_f32 - mean_g) * std_scale,
-                        ]
-                    } else {
-                        [
-                            (0.0_f32 - mean_g) * std_scale,
-                            0.0_f32, // missing -> mean imputation => centered 0
-                            (1.0_f32 - mean_g) * std_scale,
-                            (2.0_f32 - mean_g) * std_scale,
-                        ]
-                    };
-                    decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
-                    if method == 1 {
-                        *row_varsum_dst = var as f64;
-                    }
-                });
-        } else {
-            block
-                .par_chunks_mut(n)
-                .zip(varsum.par_iter_mut())
-                .enumerate()
-                .for_each_init(
-                    || vec![0.0_f32; n_samples],
-                    |full_row, (off, (out_row, row_varsum_dst))| {
-                        let idx = row_start + off;
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
-                        let flip = row_flip_vec[idx];
-                        let p = row_maf_vec[idx].clamp(0.0, 0.5);
-                        let default_mean_g = 2.0_f32 * p;
-                        let (var_centered, _row_sum) = decode_subset_row_from_full_scratch(
-                            row,
-                            n_samples,
-                            sample_idx,
-                            flip,
-                            default_mean_g,
-                            method,
-                            eps,
-                            code4_lut,
-                            full_row.as_mut_slice(),
-                            out_row,
-                        );
-                        if method == 1 {
-                            *row_varsum_dst = var_centered;
-                        }
-                    },
-                );
-        }
-    };
-
-    if let Some(tp) = pool {
-        tp.install(&mut decode_run);
-    } else {
-        decode_run();
-    }
-    Ok(())
-}
 
 #[allow(clippy::too_many_arguments)]
 fn decode_raw_block_f64(
@@ -227,612 +111,6 @@ fn decode_raw_block_f64(
         decode_run();
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrmRankkKernel {
-    Sgemm,
-    Syrk,
-}
-
-#[inline]
-fn grm_rankk_kernel() -> GrmRankkKernel {
-    static KERNEL: OnceLock<GrmRankkKernel> = OnceLock::new();
-    *KERNEL.get_or_init(|| {
-        let raw = std::env::var("JX_GRM_RANKK_KERNEL")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        match raw.as_str() {
-            "sgemm" => GrmRankkKernel::Sgemm,
-            "syrk" => GrmRankkKernel::Syrk,
-            "auto" | "" => {
-                let backend = rust_sgemm_backend();
-                if backend.eq_ignore_ascii_case("openblas") {
-                    GrmRankkKernel::Sgemm
-                } else {
-                    GrmRankkKernel::Syrk
-                }
-            }
-            _ => {
-                let backend = rust_sgemm_backend();
-                if backend.eq_ignore_ascii_case("openblas") {
-                    GrmRankkKernel::Sgemm
-                } else {
-                    GrmRankkKernel::Syrk
-                }
-            }
-        }
-    })
-}
-
-#[inline]
-fn grm_rankk_tile_cols(n: usize) -> usize {
-    static TILE_COLS_ENV: OnceLock<Option<usize>> = OnceLock::new();
-    let env_cfg = TILE_COLS_ENV.get_or_init(|| {
-        let raw = std::env::var("JX_GRM_RANKK_TILE_COLS")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if raw.is_empty() {
-            return None;
-        }
-        match raw.parse::<usize>() {
-            Ok(v) => Some(v),
-            Err(_) => Some(0),
-        }
-    });
-    match env_cfg {
-        Some(0) => 0,
-        Some(v) => (*v).min(n).max(1),
-        None => {
-            if n >= 3072 {
-                1024.min(n)
-            } else {
-                0
-            }
-        }
-    }
-}
-
-#[inline]
-fn grm_rankk_tile_parallel_enabled() -> bool {
-    static TILE_PAR: OnceLock<bool> = OnceLock::new();
-    *TILE_PAR.get_or_init(|| {
-        let raw = std::env::var("JX_GRM_RANKK_TILE_PAR")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if raw.is_empty() {
-            true
-        } else {
-            matches!(raw.as_str(), "1" | "true" | "yes" | "on")
-        }
-    })
-}
-
-#[inline]
-fn grm_rankk_tile_force_parallel() -> bool {
-    static TILE_PAR_FORCE: OnceLock<bool> = OnceLock::new();
-    *TILE_PAR_FORCE.get_or_init(|| {
-        let raw = std::env::var("JX_GRM_RANKK_TILE_PAR_FORCE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        matches!(raw.as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-#[inline]
-fn grm_rankk_update_cblas(
-    grm: &mut [f32],
-    block: &[f32],
-    cur_rows: usize,
-    n: usize,
-    copy_rhs: bool,
-    beta_zero_accum: bool,
-) {
-    match grm_rankk_kernel() {
-        GrmRankkKernel::Sgemm => {
-            let rhs_owned = if copy_rhs { Some(block.to_vec()) } else { None };
-            let rhs_slice: &[f32] = match rhs_owned.as_ref() {
-                Some(v) => v.as_slice(),
-                None => block,
-            };
-            let tile_cols = grm_rankk_tile_cols(n);
-            let use_tiling = tile_cols > 0 && tile_cols < n;
-            if use_tiling {
-                let can_parallel = grm_rankk_tile_parallel_enabled()
-                    && (grm_rankk_tile_force_parallel() || rust_blas_get_num_threads() == 1);
-                if can_parallel {
-                    let chunk_len = n * tile_cols;
-                    grm.par_chunks_mut(chunk_len)
-                        .enumerate()
-                        .for_each(|(tile_idx, c_chunk)| {
-                            let j0 = tile_idx * tile_cols;
-                            let nj = c_chunk.len() / n;
-                            let b_ptr = unsafe { rhs_slice.as_ptr().add(j0) };
-                            if beta_zero_accum {
-                                let mut tmp = vec![0.0_f32; n * nj];
-                                unsafe {
-                                    cblas_sgemm_dispatch(
-                                        CBLAS_COL_MAJOR,
-                                        CBLAS_NO_TRANS,
-                                        CBLAS_TRANS,
-                                        n as CblasInt,
-                                        nj as CblasInt,
-                                        cur_rows as CblasInt,
-                                        1.0,
-                                        block.as_ptr(),
-                                        n as CblasInt,
-                                        b_ptr,
-                                        n as CblasInt,
-                                        0.0,
-                                        tmp.as_mut_ptr(),
-                                        n as CblasInt,
-                                    );
-                                }
-                                for (dst, src) in c_chunk.iter_mut().zip(tmp.iter()) {
-                                    *dst += *src;
-                                }
-                            } else {
-                                unsafe {
-                                    cblas_sgemm_dispatch(
-                                        CBLAS_COL_MAJOR,
-                                        CBLAS_NO_TRANS,
-                                        CBLAS_TRANS,
-                                        n as CblasInt,
-                                        nj as CblasInt,
-                                        cur_rows as CblasInt,
-                                        1.0,
-                                        block.as_ptr(),
-                                        n as CblasInt,
-                                        b_ptr,
-                                        n as CblasInt,
-                                        1.0,
-                                        c_chunk.as_mut_ptr(),
-                                        n as CblasInt,
-                                    );
-                                }
-                            }
-                        });
-                } else {
-                    let mut j0 = 0usize;
-                    while j0 < n {
-                        let nj = (n - j0).min(tile_cols);
-                        let c_chunk = &mut grm[j0 * n..(j0 + nj) * n];
-                        let b_ptr = unsafe { rhs_slice.as_ptr().add(j0) };
-                        if beta_zero_accum {
-                            let mut tmp = vec![0.0_f32; n * nj];
-                            unsafe {
-                                cblas_sgemm_dispatch(
-                                    CBLAS_COL_MAJOR,
-                                    CBLAS_NO_TRANS,
-                                    CBLAS_TRANS,
-                                    n as CblasInt,
-                                    nj as CblasInt,
-                                    cur_rows as CblasInt,
-                                    1.0,
-                                    block.as_ptr(),
-                                    n as CblasInt,
-                                    b_ptr,
-                                    n as CblasInt,
-                                    0.0,
-                                    tmp.as_mut_ptr(),
-                                    n as CblasInt,
-                                );
-                            }
-                            for (dst, src) in c_chunk.iter_mut().zip(tmp.iter()) {
-                                *dst += *src;
-                            }
-                        } else {
-                            unsafe {
-                                cblas_sgemm_dispatch(
-                                    CBLAS_COL_MAJOR,
-                                    CBLAS_NO_TRANS,
-                                    CBLAS_TRANS,
-                                    n as CblasInt,
-                                    nj as CblasInt,
-                                    cur_rows as CblasInt,
-                                    1.0,
-                                    block.as_ptr(),
-                                    n as CblasInt,
-                                    b_ptr,
-                                    n as CblasInt,
-                                    1.0,
-                                    c_chunk.as_mut_ptr(),
-                                    n as CblasInt,
-                                );
-                            }
-                        }
-                        j0 += nj;
-                    }
-                }
-            } else if beta_zero_accum {
-                let mut tmp = vec![0.0_f32; n * n];
-                unsafe {
-                    // `block` row-major (cur_rows, n) is layout-equivalent to
-                    // col-major A(n, cur_rows): C = A * A^T.
-                    cblas_sgemm_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_TRANS,
-                        n as CblasInt,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        rhs_slice.as_ptr(),
-                        n as CblasInt,
-                        0.0,
-                        tmp.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-                for (g, t) in grm.iter_mut().zip(tmp.iter()) {
-                    *g += *t;
-                }
-            } else {
-                unsafe {
-                    cblas_sgemm_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_TRANS,
-                        n as CblasInt,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        rhs_slice.as_ptr(),
-                        n as CblasInt,
-                        1.0,
-                        grm.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-            }
-        }
-        GrmRankkKernel::Syrk => {
-            let _ = copy_rhs;
-            if beta_zero_accum {
-                let mut tmp = vec![0.0_f32; n * n];
-                unsafe {
-                    // `block` is row-major (cur_rows, n), layout-equivalent to
-                    // col-major A with shape (n, cur_rows). Use SYRK upper update.
-                    cblas_ssyrk_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_UPPER,
-                        CBLAS_NO_TRANS,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        0.0,
-                        tmp.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-                for col in 0..n {
-                    for row in 0..=col {
-                        let idx = row + col * n;
-                        grm[idx] += tmp[idx];
-                    }
-                }
-            } else {
-                unsafe {
-                    cblas_ssyrk_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_UPPER,
-                        CBLAS_NO_TRANS,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        1.0,
-                        grm.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn grm_rankk_update(
-    grm: &mut [f32],
-    block: &[f32],
-    cur_rows: usize,
-    n: usize,
-    cblas_copy_rhs: bool,
-    cblas_beta_zero_accum: bool,
-) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        grm_rankk_update_cblas(
-            grm,
-            block,
-            cur_rows,
-            n,
-            cblas_copy_rhs,
-            cblas_beta_zero_accum,
-        );
-        return Ok(());
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = (
-            grm,
-            block,
-            cur_rows,
-            n,
-            cblas_copy_rhs,
-            cblas_beta_zero_accum,
-        );
-        Err(
-            "Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM."
-                .to_string(),
-        )
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-#[inline]
-fn grm_rankk_update_cblas_f64(
-    grm: &mut [f64],
-    block: &[f64],
-    cur_rows: usize,
-    n: usize,
-    copy_rhs: bool,
-    beta_zero_accum: bool,
-) {
-    match grm_rankk_kernel() {
-        GrmRankkKernel::Sgemm => {
-            let rhs_owned = if copy_rhs { Some(block.to_vec()) } else { None };
-            let rhs_slice: &[f64] = match rhs_owned.as_ref() {
-                Some(v) => v.as_slice(),
-                None => block,
-            };
-            let tile_cols = grm_rankk_tile_cols(n);
-            let use_tiling = tile_cols > 0 && tile_cols < n;
-            if use_tiling {
-                let can_parallel = grm_rankk_tile_parallel_enabled()
-                    && (grm_rankk_tile_force_parallel() || rust_blas_get_num_threads() == 1);
-                if can_parallel {
-                    let chunk_len = n * tile_cols;
-                    grm.par_chunks_mut(chunk_len)
-                        .enumerate()
-                        .for_each(|(tile_idx, c_chunk)| {
-                            let j0 = tile_idx * tile_cols;
-                            let nj = c_chunk.len() / n;
-                            let b_ptr = unsafe { rhs_slice.as_ptr().add(j0) };
-                            if beta_zero_accum {
-                                let mut tmp = vec![0.0_f64; n * nj];
-                                unsafe {
-                                    cblas_dgemm_dispatch(
-                                        CBLAS_COL_MAJOR,
-                                        CBLAS_NO_TRANS,
-                                        CBLAS_TRANS,
-                                        n as CblasInt,
-                                        nj as CblasInt,
-                                        cur_rows as CblasInt,
-                                        1.0,
-                                        block.as_ptr(),
-                                        n as CblasInt,
-                                        b_ptr,
-                                        n as CblasInt,
-                                        0.0,
-                                        tmp.as_mut_ptr(),
-                                        n as CblasInt,
-                                    );
-                                }
-                                for (dst, src) in c_chunk.iter_mut().zip(tmp.iter()) {
-                                    *dst += *src;
-                                }
-                            } else {
-                                unsafe {
-                                    cblas_dgemm_dispatch(
-                                        CBLAS_COL_MAJOR,
-                                        CBLAS_NO_TRANS,
-                                        CBLAS_TRANS,
-                                        n as CblasInt,
-                                        nj as CblasInt,
-                                        cur_rows as CblasInt,
-                                        1.0,
-                                        block.as_ptr(),
-                                        n as CblasInt,
-                                        b_ptr,
-                                        n as CblasInt,
-                                        1.0,
-                                        c_chunk.as_mut_ptr(),
-                                        n as CblasInt,
-                                    );
-                                }
-                            }
-                        });
-                } else {
-                    let mut j0 = 0usize;
-                    while j0 < n {
-                        let nj = (n - j0).min(tile_cols);
-                        let c_chunk = &mut grm[j0 * n..(j0 + nj) * n];
-                        let b_ptr = unsafe { rhs_slice.as_ptr().add(j0) };
-                        if beta_zero_accum {
-                            let mut tmp = vec![0.0_f64; n * nj];
-                            unsafe {
-                                cblas_dgemm_dispatch(
-                                    CBLAS_COL_MAJOR,
-                                    CBLAS_NO_TRANS,
-                                    CBLAS_TRANS,
-                                    n as CblasInt,
-                                    nj as CblasInt,
-                                    cur_rows as CblasInt,
-                                    1.0,
-                                    block.as_ptr(),
-                                    n as CblasInt,
-                                    b_ptr,
-                                    n as CblasInt,
-                                    0.0,
-                                    tmp.as_mut_ptr(),
-                                    n as CblasInt,
-                                );
-                            }
-                            for (dst, src) in c_chunk.iter_mut().zip(tmp.iter()) {
-                                *dst += *src;
-                            }
-                        } else {
-                            unsafe {
-                                cblas_dgemm_dispatch(
-                                    CBLAS_COL_MAJOR,
-                                    CBLAS_NO_TRANS,
-                                    CBLAS_TRANS,
-                                    n as CblasInt,
-                                    nj as CblasInt,
-                                    cur_rows as CblasInt,
-                                    1.0,
-                                    block.as_ptr(),
-                                    n as CblasInt,
-                                    b_ptr,
-                                    n as CblasInt,
-                                    1.0,
-                                    c_chunk.as_mut_ptr(),
-                                    n as CblasInt,
-                                );
-                            }
-                        }
-                        j0 += nj;
-                    }
-                }
-            } else if beta_zero_accum {
-                let mut tmp = vec![0.0_f64; n * n];
-                unsafe {
-                    cblas_dgemm_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_TRANS,
-                        n as CblasInt,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        rhs_slice.as_ptr(),
-                        n as CblasInt,
-                        0.0,
-                        tmp.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-                for (g, t) in grm.iter_mut().zip(tmp.iter()) {
-                    *g += *t;
-                }
-            } else {
-                unsafe {
-                    cblas_dgemm_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_NO_TRANS,
-                        CBLAS_TRANS,
-                        n as CblasInt,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        rhs_slice.as_ptr(),
-                        n as CblasInt,
-                        1.0,
-                        grm.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-            }
-        }
-        GrmRankkKernel::Syrk => {
-            let _ = copy_rhs;
-            if beta_zero_accum {
-                let mut tmp = vec![0.0_f64; n * n];
-                unsafe {
-                    cblas_dsyrk_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_UPPER,
-                        CBLAS_NO_TRANS,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        0.0,
-                        tmp.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-                for col in 0..n {
-                    for row in 0..=col {
-                        let idx = row + col * n;
-                        grm[idx] += tmp[idx];
-                    }
-                }
-            } else {
-                unsafe {
-                    cblas_dsyrk_dispatch(
-                        CBLAS_COL_MAJOR,
-                        CBLAS_UPPER,
-                        CBLAS_NO_TRANS,
-                        n as CblasInt,
-                        cur_rows as CblasInt,
-                        1.0,
-                        block.as_ptr(),
-                        n as CblasInt,
-                        1.0,
-                        grm.as_mut_ptr(),
-                        n as CblasInt,
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn grm_rankk_update_f64(
-    grm: &mut [f64],
-    block: &[f64],
-    cur_rows: usize,
-    n: usize,
-    cblas_copy_rhs: bool,
-    cblas_beta_zero_accum: bool,
-) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        grm_rankk_update_cblas_f64(
-            grm,
-            block,
-            cur_rows,
-            n,
-            cblas_copy_rhs,
-            cblas_beta_zero_accum,
-        );
-        return Ok(());
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = (
-            grm,
-            block,
-            cur_rows,
-            n,
-            cblas_copy_rhs,
-            cblas_beta_zero_accum,
-        );
-        Err(
-            "Packed GRM requires CBLAS backend on this platform; fallback to streaming GRM."
-                .to_string(),
-        )
-    }
 }
 
 // packed decode/hash/prediction kernels were migrated to `stats/packed.rs`
@@ -923,6 +201,20 @@ fn row_major_block_t_mul_vec_accum_f32(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PcgMatvecTiming {
+    decode_secs: f64,
+    mul_secs: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PcgStageTimingAccum {
+    decode_secs: f64,
+    xmul_secs: f64,
+    xtmul_secs: f64,
+    callback_secs: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_standardized_block_f32(
     packed_flat: &[u8],
@@ -938,72 +230,20 @@ fn decode_standardized_block_f32(
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(), String> {
-    let n_out = sample_idx.len();
-    if n_out == 0 {
-        return Ok(());
-    }
-    if out.len() % n_out != 0 {
-        return Err("decode_standardized_block_f32: output length mismatch".to_string());
-    }
-    let cur_rows = out.len() / n_out;
-    if cur_rows == 0 {
-        return Ok(());
-    }
-
-    let decode_one = |local_row: usize, out_row: &mut [f32]| {
-        let row_idx = row_start + local_row;
-        let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-        let mean_g = row_mean[row_idx];
-        let inv_sd = row_inv_sd[row_idx];
-        if full_sample_fast {
-            let value_lut: [f32; 4] = if row_flip[row_idx] {
-                [
-                    (2.0_f32 - mean_g) * inv_sd,
-                    0.0_f32,
-                    (1.0_f32 - mean_g) * inv_sd,
-                    (0.0_f32 - mean_g) * inv_sd,
-                ]
-            } else {
-                [
-                    (0.0_f32 - mean_g) * inv_sd,
-                    0.0_f32,
-                    (1.0_f32 - mean_g) * inv_sd,
-                    (2.0_f32 - mean_g) * inv_sd,
-                ]
-            };
-            decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, out_row);
-            return;
-        }
-
-        let flip = row_flip[row_idx];
-        for (j, &sid) in sample_idx.iter().enumerate() {
-            let b = row[sid >> 2];
-            let code = (b >> ((sid & 3) * 2)) & 0b11;
-            let mut gv = match code {
-                0b00 => 0.0_f32,
-                0b10 => 1.0_f32,
-                0b11 => 2.0_f32,
-                _ => mean_g,
-            };
-            if flip && code != 0b01 {
-                gv = 2.0_f32 - gv;
-            }
-            out_row[j] = (gv - mean_g) * inv_sd;
-        }
-    };
-
-    if let Some(tp) = pool {
-        tp.install(|| {
-            out.par_chunks_mut(n_out)
-                .enumerate()
-                .for_each(|(local_row, out_row)| decode_one(local_row, out_row));
-        });
-    } else {
-        for (local_row, out_row) in out.chunks_mut(n_out).enumerate() {
-            decode_one(local_row, out_row);
-        }
-    }
-    Ok(())
+    decode_standardized_packed_block_f32(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        sample_idx,
+        full_sample_fast,
+        row_start,
+        out,
+        code4_lut,
+        pool,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1020,6 +260,7 @@ fn pcg_x_mul_samples(
     weights: &[f32],
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: Option<&mut PcgMatvecTiming>,
 ) -> Result<Vec<f32>, String> {
     let m = weights.len();
     let n_out = sample_idx.len();
@@ -1030,11 +271,14 @@ fn pcg_x_mul_samples(
     let row_step = block_rows.max(1).min(m.max(1));
     let mut block = vec![0.0_f32; row_step * n_out];
     let mut tick = 0usize;
+    let mut decode_acc = 0.0_f64;
+    let mut mul_acc = 0.0_f64;
 
     for st in (0..m).step_by(row_step) {
         let ed = (st + row_step).min(m);
         let cur_rows = ed - st;
         let blk_slice = &mut block[..cur_rows * n_out];
+        let t_decode = Instant::now();
         decode_standardized_block_f32(
             packed_flat,
             bytes_per_snp,
@@ -1049,12 +293,19 @@ fn pcg_x_mul_samples(
             code4_lut,
             pool,
         )?;
+        decode_acc += t_decode.elapsed().as_secs_f64();
+        let t_mul = Instant::now();
         row_major_block_t_mul_vec_accum_f32(blk_slice, cur_rows, n_out, &weights[st..ed], &mut out);
+        mul_acc += t_mul.elapsed().as_secs_f64();
         tick += cur_rows;
         if tick >= row_step.saturating_mul(64).max(1) {
             check_ctrlc()?;
             tick = 0;
         }
+    }
+    if let Some(t) = timing {
+        t.decode_secs += decode_acc;
+        t.mul_secs += mul_acc;
     }
     Ok(out)
 }
@@ -1073,6 +324,7 @@ fn pcg_xt_mul_rows(
     u: &[f32],
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: Option<&mut PcgMatvecTiming>,
 ) -> Result<Vec<f32>, String> {
     let m = row_flip.len();
     let n_out = sample_idx.len();
@@ -1090,11 +342,14 @@ fn pcg_xt_mul_rows(
     let mut block = vec![0.0_f32; row_step * n_out];
     let mut tmp = vec![0.0_f32; row_step];
     let mut tick = 0usize;
+    let mut decode_acc = 0.0_f64;
+    let mut mul_acc = 0.0_f64;
 
     for st in (0..m).step_by(row_step) {
         let ed = (st + row_step).min(m);
         let cur_rows = ed - st;
         let blk_slice = &mut block[..cur_rows * n_out];
+        let t_decode = Instant::now();
         decode_standardized_block_f32(
             packed_flat,
             bytes_per_snp,
@@ -1109,14 +364,21 @@ fn pcg_xt_mul_rows(
             code4_lut,
             pool,
         )?;
+        decode_acc += t_decode.elapsed().as_secs_f64();
         let out_blk = &mut tmp[..cur_rows];
+        let t_mul = Instant::now();
         row_major_block_mul_vec_f32(blk_slice, cur_rows, n_out, u, out_blk);
+        mul_acc += t_mul.elapsed().as_secs_f64();
         out[st..ed].copy_from_slice(out_blk);
         tick += cur_rows;
         if tick >= row_step.saturating_mul(64).max(1) {
             check_ctrlc()?;
             tick = 0;
         }
+    }
+    if let Some(t) = timing {
+        t.decode_secs += decode_acc;
+        t.mul_secs += mul_acc;
     }
     Ok(out)
 }
@@ -1150,7 +412,9 @@ fn sample_var_f64(v: &[f64]) -> f64 {
     max_iter=50,
     tol=1e-4_f64,
     block_rows=4096,
-    threads=0
+    threads=0,
+    return_variance_components=false,
+    estimate_only=false
 ))]
 pub fn gblup_reml_packed_bed<'py>(
     py: Python<'py>,
@@ -1167,6 +431,8 @@ pub fn gblup_reml_packed_bed<'py>(
     tol: f64,
     block_rows: usize,
     threads: usize,
+    return_variance_components: bool,
+    estimate_only: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
@@ -1177,6 +443,8 @@ pub fn gblup_reml_packed_bed<'py>(
     String,
     f64,
     usize,
+    f64,
+    f64,
 )> {
     if !(g_eps.is_finite() && g_eps >= 0.0) {
         return Err(PyRuntimeError::new_err("g_eps must be finite and >= 0"));
@@ -1360,9 +628,34 @@ pub fn gblup_reml_packed_bed<'py>(
             .unwrap_or(1024)
             .max(1);
 
-        let (pred_train, pred_test, pve, lambda_opt, ml, reml, evd_backend, evd_elapsed) = py
+        let (
+            pred_train,
+            pred_test,
+            pve,
+            lambda_opt,
+            ml,
+            reml,
+            evd_backend,
+            evd_elapsed,
+            sigma_g2,
+            sigma_e2,
+        ) = py
             .detach(
-                move || -> Result<(Vec<f64>, Vec<f64>, f64, f64, f64, f64, String, f64), String> {
+                move || -> Result<
+                    (
+                        Vec<f64>,
+                        Vec<f64>,
+                        f64,
+                        f64,
+                        f64,
+                        f64,
+                        String,
+                        f64,
+                        f64,
+                        f64,
+                    ),
+                    String,
+                > {
                     gblup_marker_fast_packed(
                         threads,
                         eff_m,
@@ -1381,11 +674,22 @@ pub fn gblup_reml_packed_bed<'py>(
                         high,
                         tol,
                         max_iter,
+                        estimate_only,
                         pool_ref,
                     )
                 },
             )
             .map_err(map_err_string_to_py)?;
+        let sigma_g2_out = if return_variance_components {
+            sigma_g2
+        } else {
+            f64::NAN
+        };
+        let sigma_e2_out = if return_variance_components {
+            sigma_e2
+        } else {
+            f64::NAN
+        };
 
         let train_arr = PyArray2::from_owned_array(
             py,
@@ -1410,6 +714,8 @@ pub fn gblup_reml_packed_bed<'py>(
             evd_backend,
             evd_elapsed,
             eff_m,
+            sigma_g2_out,
+            sigma_e2_out,
         ));
     }
 
@@ -1482,9 +788,34 @@ pub fn gblup_reml_packed_bed<'py>(
     }
     let m_mean: Vec<f64> = row_sum_vec.iter().map(|v| *v / (n_train as f64)).collect();
 
-    let (alpha_vec, beta0, lambda_opt, pve, ml, reml, evd_backend, evd_elapsed) = py
+    let (
+        alpha_vec,
+        beta0,
+        lambda_opt,
+        pve,
+        ml,
+        reml,
+        evd_backend,
+        evd_elapsed,
+        sigma_g2,
+        sigma_e2,
+    ) = py
         .detach(
-            move || -> Result<(Vec<f64>, f64, f64, f64, f64, f64, String, f64), String> {
+            move || -> Result<
+                (
+                    Vec<f64>,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    String,
+                    f64,
+                    f64,
+                    f64,
+                ),
+                String,
+            > {
                 // Keep eig stage pinned to requested OpenBLAS threads.
                 let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
                 let n = n_train;
@@ -1603,10 +934,49 @@ pub fn gblup_reml_packed_bed<'py>(
                     reml_best,
                     evd_backend.to_string(),
                     evd_elapsed,
+                    sigma_g2,
+                    sigma_e2,
                 ))
             },
         )
         .map_err(map_err_string_to_py)?;
+    let sigma_g2_out = if return_variance_components {
+        sigma_g2
+    } else {
+        f64::NAN
+    };
+    let sigma_e2_out = if return_variance_components {
+        sigma_e2
+    } else {
+        f64::NAN
+    };
+    if estimate_only {
+        let train_arr = PyArray2::from_owned_array(
+            py,
+            Array2::from_shape_vec((0, 1), Vec::<f64>::new())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        )
+        .into_bound();
+        let test_arr = PyArray2::from_owned_array(
+            py,
+            Array2::from_shape_vec((0, 1), Vec::<f64>::new())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        )
+        .into_bound();
+        return Ok((
+            train_arr,
+            test_arr,
+            pve,
+            lambda_opt,
+            ml,
+            reml,
+            evd_backend,
+            evd_elapsed,
+            eff_m,
+            sigma_g2_out,
+            sigma_e2_out,
+        ));
+    }
 
     let alpha_arr =
         PyArray1::from_owned_array(py, Array1::from_vec(alpha_vec.clone())).into_bound();
@@ -1717,7 +1087,6 @@ pub fn gblup_reml_packed_bed<'py>(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .into_bound();
-
     Ok((
         train_arr,
         test_arr,
@@ -1728,6 +1097,8 @@ pub fn gblup_reml_packed_bed<'py>(
         evd_backend,
         evd_elapsed,
         eff_m,
+        sigma_g2_out,
+        sigma_e2_out,
     ))
 }
 
@@ -2037,6 +1408,12 @@ pub fn rrblup_pcg_bed<'py>(
     } else {
         progress_every.max(1)
     };
+    let stage_timing = env_truthy("JX_GS_PCG_STAGE_TIMING");
+    let stage_log_every = std::env::var("JX_GS_PCG_STAGE_LOG_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(100usize);
 
     let mut row_mean = vec![0.0_f32; m];
     let mut row_inv_sd = vec![0.0_f32; m];
@@ -2070,6 +1447,10 @@ pub fn rrblup_pcg_bed<'py>(
     ) = py
         .detach(
             move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64, Vec<f32>), String> {
+                // rrBLUP-PCG uses Rayon for outer/block parallelism; keep BLAS
+                // single-threaded to avoid nested oversubscription.
+                let _pcg_blas_guard = OpenBlasThreadGuard::enter(1);
+                let stage_accum = Arc::new(Mutex::new(PcgStageTimingAccum::default()));
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];
                 let mut block = vec![0.0_f32; row_step * n_train];
@@ -2117,12 +1498,14 @@ pub fn rrblup_pcg_bed<'py>(
                 }
 
                 let mut last_notified = 0usize;
+                let pcg_t0 = Instant::now();
                 let pcg_res = pcg_solve_f32(
                     &b,
                     max_iter,
                     tol_use,
                     1e-20_f64,
                     |p| {
+                        let mut xmul_t = PcgMatvecTiming::default();
                         let xp = pcg_x_mul_samples(
                             packed_keep.as_ref(),
                             bytes_per_snp,
@@ -2136,7 +1519,9 @@ pub fn rrblup_pcg_bed<'py>(
                             p,
                             &code4_lut,
                             pool_ref,
+                            if stage_timing { Some(&mut xmul_t) } else { None },
                         )?;
+                        let mut xtmul_t = PcgMatvecTiming::default();
                         let mut ap = pcg_xt_mul_rows(
                             packed_keep.as_ref(),
                             bytes_per_snp,
@@ -2150,18 +1535,44 @@ pub fn rrblup_pcg_bed<'py>(
                             &xp,
                             &code4_lut,
                             pool_ref,
+                            if stage_timing { Some(&mut xtmul_t) } else { None },
                         )?;
-                        for j in 0..m {
-                            ap[j] += lambda_use * p[j];
+                        if let Some(tp) = pool_ref {
+                            tp.install(|| {
+                                ap.par_iter_mut()
+                                    .zip(p.par_iter())
+                                    .for_each(|(apj, pj)| *apj += lambda_use * *pj);
+                            });
+                        } else {
+                            for j in 0..m {
+                                ap[j] += lambda_use * p[j];
+                            }
+                        }
+                        if stage_timing {
+                            if let Ok(mut acc) = stage_accum.lock() {
+                                acc.decode_secs += xmul_t.decode_secs + xtmul_t.decode_secs;
+                                acc.xmul_secs += xmul_t.mul_secs;
+                                acc.xtmul_secs += xtmul_t.mul_secs;
+                            }
                         }
                         Ok(ap)
                     },
                     |r, z| {
-                        for j in 0..m {
-                            z[j] = diag_inv[j] * r[j];
+                        if let Some(tp) = pool_ref {
+                            tp.install(|| {
+                                z.par_iter_mut()
+                                    .zip(r.par_iter())
+                                    .zip(diag_inv.par_iter())
+                                    .for_each(|((zj, rj), dj)| *zj = *dj * *rj);
+                            });
+                        } else {
+                            for j in 0..m {
+                                z[j] = diag_inv[j] * r[j];
+                            }
                         }
                     },
                     |iters_now, iters_max, _rel_res| {
+                        let cb_t0 = Instant::now();
                         if (iters_now >= last_notified.saturating_add(notify_step))
                             || (iters_now == iters_max)
                         {
@@ -2178,6 +1589,35 @@ pub fn rrblup_pcg_bed<'py>(
                         if (iters_now & 7) == 0 {
                             check_ctrlc()?;
                         }
+                        let cb_elapsed = cb_t0.elapsed().as_secs_f64();
+                        if stage_timing {
+                            if let Ok(mut acc) = stage_accum.lock() {
+                                acc.callback_secs += cb_elapsed;
+                            }
+                            if (iters_now % stage_log_every) == 0 || iters_now == iters_max {
+                                if let Ok(acc) = stage_accum.lock() {
+                                    let elapsed = pcg_t0.elapsed().as_secs_f64().max(1e-12_f64);
+                                    let decode_s = acc.decode_secs.max(0.0);
+                                    let xmul_s = acc.xmul_secs.max(0.0);
+                                    let xtmul_s = acc.xtmul_secs.max(0.0);
+                                    let cb_s = acc.callback_secs.max(0.0);
+                                    let known = decode_s + xmul_s + xtmul_s + cb_s;
+                                    let update_s = (elapsed - known).max(0.0_f64);
+                                    let pct = |x: f64| -> f64 { (x * 100.0) / elapsed };
+                                    eprintln!(
+                                        "rrBLUP-PCG stage timing iter={}/{} decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) update={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) total={:.3}s",
+                                        iters_now,
+                                        iters_max,
+                                        decode_s, pct(decode_s),
+                                        xmul_s, pct(xmul_s),
+                                        xtmul_s, pct(xtmul_s),
+                                        update_s, pct(update_s),
+                                        cb_s, pct(cb_s),
+                                        elapsed
+                                    );
+                                }
+                            }
+                        }
                         Ok(())
                     },
                 )?;
@@ -2185,6 +1625,29 @@ pub fn rrblup_pcg_bed<'py>(
                 let converged = pcg_res.converged;
                 let iters_done = pcg_res.iters;
                 let rel_res = pcg_res.rel_res;
+                if stage_timing {
+                    if let Ok(acc) = stage_accum.lock() {
+                        let elapsed = pcg_t0.elapsed().as_secs_f64().max(1e-12_f64);
+                        let decode_s = acc.decode_secs.max(0.0);
+                        let xmul_s = acc.xmul_secs.max(0.0);
+                        let xtmul_s = acc.xtmul_secs.max(0.0);
+                        let cb_s = acc.callback_secs.max(0.0);
+                        let known = decode_s + xmul_s + xtmul_s + cb_s;
+                        let update_s = (elapsed - known).max(0.0_f64);
+                        let pct = |x: f64| -> f64 { (x * 100.0) / elapsed };
+                        eprintln!(
+                            "rrBLUP-PCG stage timing final iter={}/{} decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) update={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) total={:.3}s",
+                            iters_done,
+                            max_iter,
+                            decode_s, pct(decode_s),
+                            xmul_s, pct(xmul_s),
+                            xtmul_s, pct(xtmul_s),
+                            update_s, pct(update_s),
+                            cb_s, pct(cb_s),
+                            elapsed
+                        );
+                    }
+                }
 
                 let need_train_pred_all = train_pred_pick.is_none();
                 let need_train_pred_subset = train_pred_pick
@@ -2209,6 +1672,7 @@ pub fn rrblup_pcg_bed<'py>(
                         &beta,
                         &code4_lut,
                         pool_ref,
+                        None,
                     )?;
                     for v in pred_train_full.iter_mut() {
                         *v += y_mean as f32;
@@ -2260,6 +1724,7 @@ pub fn rrblup_pcg_bed<'py>(
                                 &beta,
                                 &code4_lut,
                                 pool_ref,
+                                None,
                             )?;
                             for v in pred_train_sub.iter_mut() {
                                 *v += y_mean as f32;
@@ -2302,6 +1767,7 @@ pub fn rrblup_pcg_bed<'py>(
                         &beta,
                         &code4_lut,
                         pool_ref,
+                        None,
                     )?;
                     pred_test_ret = test_pred_f32.iter().map(|v| (*v as f64) + y_mean).collect();
                 }
@@ -2375,448 +1841,20 @@ pub fn grm_packed_f32<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    if n_samples == 0 {
-        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
-    }
-    if method != 1 && method != 2 {
-        return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered) or 2 (standardized)"
-        )));
-    }
-
-    let packed_arr = packed.as_array();
-    if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "packed must be 2D (m, bytes_per_snp)",
-        ));
-    }
-    let m = packed_arr.shape()[0];
-    if m == 0 {
-        return Err(PyRuntimeError::new_err(
-            "packed must contain at least one SNP row",
-        ));
-    }
-    let bytes_per_snp = packed_arr.shape()[1];
-    let expected_bps = (n_samples + 3) / 4;
-    if bytes_per_snp != expected_bps {
-        return Err(PyRuntimeError::new_err(format!(
-            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
-        )));
-    }
-
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
-    };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
-    };
-    if row_flip_vec.len() != m {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_flip length mismatch: got {}, expected {m}",
-            row_flip_vec.len()
-        )));
-    }
-    if row_maf_vec.len() != m {
-        return Err(PyRuntimeError::new_err(format!(
-            "row_maf length mismatch: got {}, expected {m}",
-            row_maf_vec.len()
-        )));
-    }
-
-    let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
-        parse_index_vec_i64(sidx.as_slice()?, n_samples, "sample_indices")?
-    } else {
-        (0..n_samples).collect()
-    };
-    let n = sample_idx.len();
-    if n == 0 {
-        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
-    }
-    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
-
-    let varsum_full = if method == 1 && full_sample_fast {
-        let mut acc = 0.0_f64;
-        for &maf in row_maf_vec.iter() {
-            let p = maf as f64;
-            let v = 2.0_f64 * p * (1.0_f64 - p);
-            if v.is_finite() && v > 0.0 {
-                acc += v;
-            }
-        }
-        if !(acc.is_finite() && acc > 0.0) {
-            return Err(PyRuntimeError::new_err(
-                "invalid centered GRM denominator: sum(2p(1-p)) <= 0",
-            ));
-        }
-        acc
-    } else {
-        0.0_f64
-    };
-
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
-    };
-    let pool = get_cached_pool(threads)?;
-    let row_step = adaptive_grm_block_rows(
-        block_cols.max(1),
-        m.max(1),
-        n,
-        if full_sample_fast { 0 } else { n_samples },
-        threads,
-    );
-    let block_target_mb = std::env::var("JX_GRM_PACKED_BLOCK_TARGET_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(64.0_f64);
-    let stage_timing = env_truthy("JX_GRM_PACKED_STAGE_TIMING");
-    let notify_step = if progress_every == 0 {
-        row_step
-    } else {
-        progress_every.max(1)
-    };
-    let cblas_copy_rhs = std::env::var("JX_GRM_PACKED_CBLAS_COPY_RHS")
-        .ok()
-        .map(|s| s.trim().eq_ignore_ascii_case("1") || s.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let cblas_beta_zero_accum = std::env::var("JX_GRM_PACKED_CBLAS_BETA0")
-        .ok()
-        .map(|s| {
-            let t = s.trim().to_ascii_lowercase();
-            matches!(t.as_str(), "1" | "true" | "yes" | "on")
-        })
-        // Default ON: avoids observed diagonal drift for very large SNP blocks.
-        .unwrap_or(true);
-
-    let grm_vec = py
-        .detach(move || -> Result<Vec<f32>, String> {
-            let _blas_guard = OpenBlasThreadGuard::enter(threads.max(1));
-            let total_t0 = Instant::now();
-            let mut decode_secs = 0.0_f64;
-            let mut gemm_secs = 0.0_f64;
-            let mut grm = vec![0.0_f32; n * n];
-            let mut varsum_acc = varsum_full;
-            let eps = 1e-12_f32;
-            let byte_lut = packed_byte_lut();
-
-            let mut block_a = vec![0.0_f32; row_step * n];
-            let mut block_b = vec![0.0_f32; row_step * n];
-            let mut varsum_a = vec![0.0_f64; row_step];
-            let mut varsum_b = vec![0.0_f64; row_step];
-            // Default strategy: always use dual-buffer overlap when there is
-            // enough work and more than one thread.
-            let pipeline_overlap = (threads != 1) && (m > row_step);
-
-            let mut cur_start = 0usize;
-            let mut cur_end = row_step.min(m);
-            let mut use_a = true;
-            let mut last_notified = 0usize;
-
-            let decode_t0 = Instant::now();
-            decode_grm_block(
-                packed_flat.as_ref(),
-                bytes_per_snp,
-                n_samples,
-                row_flip_vec.as_ref(),
-                row_maf_vec.as_ref(),
-                &sample_idx,
-                full_sample_fast,
-                method,
-                eps,
-                &byte_lut.code4,
-                cur_start,
-                cur_end,
-                n,
-                &mut block_a,
-                &mut varsum_a,
-                pool.as_ref(),
-            )?;
-            decode_secs += decode_t0.elapsed().as_secs_f64();
-
-            loop {
-                let cur_rows = cur_end.saturating_sub(cur_start);
-                if cur_rows == 0 {
-                    break;
-                }
-                let next_start = cur_end;
-                let next_end = (next_start + row_step).min(m);
-                let has_next = next_start < m;
-
-                if pipeline_overlap && has_next {
-                    if use_a {
-                        let (gemm_dt, decode_dt) =
-                            std::thread::scope(|scope| -> Result<(f64, f64), String> {
-                                let decode_handle = scope.spawn(|| {
-                                    let dt0 = Instant::now();
-                                    let r = decode_grm_block(
-                                        packed_flat.as_ref(),
-                                        bytes_per_snp,
-                                        n_samples,
-                                        row_flip_vec.as_ref(),
-                                        row_maf_vec.as_ref(),
-                                        &sample_idx,
-                                        full_sample_fast,
-                                        method,
-                                        eps,
-                                        &byte_lut.code4,
-                                        next_start,
-                                        next_end,
-                                        n,
-                                        &mut block_b,
-                                        &mut varsum_b,
-                                        pool.as_ref(),
-                                    );
-                                    (r, dt0.elapsed().as_secs_f64())
-                                });
-
-                                let gt0 = Instant::now();
-                                let gemm_res = grm_rankk_update(
-                                    &mut grm,
-                                    &block_a[..cur_rows * n],
-                                    cur_rows,
-                                    n,
-                                    cblas_copy_rhs,
-                                    cblas_beta_zero_accum,
-                                );
-                                let gemm_dt = gt0.elapsed().as_secs_f64();
-
-                                let (decode_res, decode_dt) = decode_handle
-                                    .join()
-                                    .map_err(|_| "decode worker thread panicked".to_string())?;
-                                gemm_res?;
-                                decode_res?;
-                                Ok((gemm_dt, decode_dt))
-                            })?;
-                        gemm_secs += gemm_dt;
-                        decode_secs += decode_dt;
-                        if method == 1 && !full_sample_fast {
-                            varsum_acc += varsum_a[..cur_rows].iter().sum::<f64>();
-                        }
-                    } else {
-                        let (gemm_dt, decode_dt) =
-                            std::thread::scope(|scope| -> Result<(f64, f64), String> {
-                                let decode_handle = scope.spawn(|| {
-                                    let dt0 = Instant::now();
-                                    let r = decode_grm_block(
-                                        packed_flat.as_ref(),
-                                        bytes_per_snp,
-                                        n_samples,
-                                        row_flip_vec.as_ref(),
-                                        row_maf_vec.as_ref(),
-                                        &sample_idx,
-                                        full_sample_fast,
-                                        method,
-                                        eps,
-                                        &byte_lut.code4,
-                                        next_start,
-                                        next_end,
-                                        n,
-                                        &mut block_a,
-                                        &mut varsum_a,
-                                        pool.as_ref(),
-                                    );
-                                    (r, dt0.elapsed().as_secs_f64())
-                                });
-
-                                let gt0 = Instant::now();
-                                let gemm_res = grm_rankk_update(
-                                    &mut grm,
-                                    &block_b[..cur_rows * n],
-                                    cur_rows,
-                                    n,
-                                    cblas_copy_rhs,
-                                    cblas_beta_zero_accum,
-                                );
-                                let gemm_dt = gt0.elapsed().as_secs_f64();
-
-                                let (decode_res, decode_dt) = decode_handle
-                                    .join()
-                                    .map_err(|_| "decode worker thread panicked".to_string())?;
-                                gemm_res?;
-                                decode_res?;
-                                Ok((gemm_dt, decode_dt))
-                            })?;
-                        gemm_secs += gemm_dt;
-                        decode_secs += decode_dt;
-                        if method == 1 && !full_sample_fast {
-                            varsum_acc += varsum_b[..cur_rows].iter().sum::<f64>();
-                        }
-                    }
-                } else {
-                    if use_a {
-                        let gemm_t0 = Instant::now();
-                        grm_rankk_update(
-                            &mut grm,
-                            &block_a[..cur_rows * n],
-                            cur_rows,
-                            n,
-                            cblas_copy_rhs,
-                            cblas_beta_zero_accum,
-                        )?;
-                        gemm_secs += gemm_t0.elapsed().as_secs_f64();
-                        if method == 1 && !full_sample_fast {
-                            varsum_acc += varsum_a[..cur_rows].iter().sum::<f64>();
-                        }
-                        if has_next {
-                            let decode_t0 = Instant::now();
-                            decode_grm_block(
-                                packed_flat.as_ref(),
-                                bytes_per_snp,
-                                n_samples,
-                                row_flip_vec.as_ref(),
-                                row_maf_vec.as_ref(),
-                                &sample_idx,
-                                full_sample_fast,
-                                method,
-                                eps,
-                                &byte_lut.code4,
-                                next_start,
-                                next_end,
-                                n,
-                                &mut block_b,
-                                &mut varsum_b,
-                                pool.as_ref(),
-                            )?;
-                            decode_secs += decode_t0.elapsed().as_secs_f64();
-                        }
-                    } else {
-                        let gemm_t0 = Instant::now();
-                        grm_rankk_update(
-                            &mut grm,
-                            &block_b[..cur_rows * n],
-                            cur_rows,
-                            n,
-                            cblas_copy_rhs,
-                            cblas_beta_zero_accum,
-                        )?;
-                        gemm_secs += gemm_t0.elapsed().as_secs_f64();
-                        if method == 1 && !full_sample_fast {
-                            varsum_acc += varsum_b[..cur_rows].iter().sum::<f64>();
-                        }
-                        if has_next {
-                            let decode_t0 = Instant::now();
-                            decode_grm_block(
-                                packed_flat.as_ref(),
-                                bytes_per_snp,
-                                n_samples,
-                                row_flip_vec.as_ref(),
-                                row_maf_vec.as_ref(),
-                                &sample_idx,
-                                full_sample_fast,
-                                method,
-                                eps,
-                                &byte_lut.code4,
-                                next_start,
-                                next_end,
-                                n,
-                                &mut block_a,
-                                &mut varsum_a,
-                                pool.as_ref(),
-                            )?;
-                            decode_secs += decode_t0.elapsed().as_secs_f64();
-                        }
-                    }
-                }
-
-                let done = cur_end;
-                if (done >= last_notified.saturating_add(notify_step)) || (done == m) {
-                    last_notified = done;
-                    if let Some(cb) = progress_callback.as_ref() {
-                        Python::attach(|py2| -> PyResult<()> {
-                            py2.check_signals()?;
-                            cb.call1(py2, (done, m))?;
-                            Ok(())
-                        })
-                        .map_err(|e| e.to_string())?;
-                    } else {
-                        Python::attach(|py2| py2.check_signals()).map_err(|e| e.to_string())?;
-                    }
-                }
-
-                if !has_next {
-                    break;
-                }
-                cur_start = next_start;
-                cur_end = next_end;
-                use_a = !use_a;
-            }
-
-            let scale = if method == 1 {
-                if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
-                    return Err("invalid centered GRM denominator in subset path".to_string());
-                }
-                varsum_acc as f32
-            } else {
-                m as f32
-            };
-            if !(scale.is_finite() && scale > 0.0) {
-                return Err("invalid GRM scale factor".to_string());
-            }
-            let inv_scale = 1.0_f32 / scale;
-            for i in 0..n {
-                let ii = i * n + i;
-                grm[ii] *= inv_scale;
-                for j in 0..i {
-                    let idx_lo = i * n + j;
-                    let idx_up = j * n + i;
-                    let v = grm[idx_lo] * inv_scale;
-                    grm[idx_lo] = v;
-                    grm[idx_up] = v;
-                }
-            }
-            if stage_timing {
-                let total_secs = total_t0.elapsed().as_secs_f64();
-                let stage_sum = decode_secs + gemm_secs;
-                let overlap_secs = (stage_sum - total_secs).max(0.0_f64);
-                let other_secs = if stage_sum <= total_secs {
-                    total_secs - stage_sum
-                } else {
-                    0.0_f64
-                };
-                let to_pct = |x: f64| -> f64 {
-                    if total_secs > 0.0 {
-                        x * 100.0 / total_secs
-                    } else {
-                        0.0
-                    }
-                };
-                eprintln!(
-                    "GRM stage timing: decode={:.3}s ({:.1}%), gemm={:.3}s ({:.1}%), \
-other={:.3}s ({:.1}%), overlap={:.3}s ({:.1}%), total={:.3}s, row_step={}, \
-block_target_mb={:.1}, n_samples={}, full_sample={}, threads={}",
-                    decode_secs,
-                    to_pct(decode_secs),
-                    gemm_secs,
-                    to_pct(gemm_secs),
-                    other_secs,
-                    to_pct(other_secs),
-                    overlap_secs,
-                    to_pct(overlap_secs),
-                    total_secs,
-                    row_step,
-                    block_target_mb,
-                    n,
-                    if full_sample_fast { "yes" } else { "no" },
-                    if threads > 0 {
-                        threads
-                    } else {
-                        rayon::current_num_threads()
-                    }
-                );
-            }
-            Ok(grm)
-        })
-        .map_err(map_err_string_to_py)?;
-
-    let grm_arr = PyArray2::from_owned_array(
+    // Reuse optimized shared GRM backend in `src/stats/grm.rs`.
+    grm::grm_packed_f32(
         py,
-        Array2::from_shape_vec((n, n), grm_vec)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        packed,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_indices,
+        method,
+        block_cols,
+        threads,
+        progress_callback,
+        progress_every,
     )
-    .into_bound();
-    Ok(grm_arr)
 }
 
 #[pyfunction]
@@ -2968,12 +2006,13 @@ pub fn packed_mtm_f64<'py>(
                 decode_secs += decode_t0.elapsed().as_secs_f64();
 
                 let gemm_t0 = Instant::now();
-                grm_rankk_update_f64(
+                grm::grm_rankk_update_f64(
                     &mut gram,
                     &block[..cur_rows * n],
                     cur_rows,
                     n,
                     cblas_copy_rhs,
+                    cur_start == 0,
                     cblas_beta_zero_accum,
                 )?;
                 gemm_secs += gemm_t0.elapsed().as_secs_f64();

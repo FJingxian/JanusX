@@ -57,6 +57,7 @@ import logging
 import typing
 import os
 import time
+import json
 import socket
 import argparse
 import sys
@@ -87,6 +88,7 @@ import matplotlib as mpl
 mpl.use("Agg")
 mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
+mpl.rcParams["svg.fonttype"] = "none"
 
 logging.getLogger("fontTools.subset").setLevel(logging.ERROR)
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
@@ -397,13 +399,19 @@ def _is_jxmodel_export_supported(method: str) -> bool:
     )
 
 
+def _known_jxmodel_methods() -> set[str]:
+    return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())
+
+
 def _parse_jxmodel_method_from_name(path_like: str) -> str | None:
     base = os.path.basename(str(path_like))
-    m = re.search(r"\.gs\.([A-Za-z0-9_]+)\.jxmodel$", base)
-    if m is None:
+    if not base.endswith(".jxmodel"):
         return None
-    token = str(m.group(1))
-    if token in (_GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())):
+    stem = base[: -len(".jxmodel")]
+    if stem == "":
+        return None
+    token = str(stem.split(".")[-1]).strip()
+    if token in _known_jxmodel_methods():
         return token
     return None
 
@@ -480,6 +488,12 @@ def _resolve_jxmodel_file(
     trait_token = str(trait_name)
     method_token = str(method)
     candidates: list[str] = []
+    # New naming: {trait}.{method}.jxmodel
+    new_exact = os.path.join(p, f"{trait_token}.{method_token}.jxmodel")
+    if os.path.isfile(new_exact):
+        candidates.append(new_exact)
+    candidates.extend(sorted(glob.glob(os.path.join(p, f"*.{trait_token}.{method_token}.jxmodel"))))
+    # Legacy naming: {prefix}.{trait}.gs.{method}.jxmodel
     if prefix_hint is not None and str(prefix_hint).strip() != "":
         exact = os.path.join(
             p,
@@ -488,6 +502,9 @@ def _resolve_jxmodel_file(
         if os.path.isfile(exact):
             candidates.append(exact)
     candidates.extend(sorted(glob.glob(os.path.join(p, f"*.{trait_token}.gs.{method_token}.jxmodel"))))
+    if len(candidates) == 0:
+        # Accept generic fallback files inside model directory, e.g. *.rrBLUP.jxmodel
+        candidates.extend(sorted(glob.glob(os.path.join(p, f"*.{method_token}.jxmodel"))))
     if len(candidates) == 0:
         candidates.extend(sorted(glob.glob(os.path.join(p, f"*.gs.{method_token}.jxmodel"))))
     uniq = list(dict.fromkeys(candidates))
@@ -521,6 +538,596 @@ def _load_jxmodel(path: str) -> dict[str, typing.Any]:
             f"Unsupported jxmodel format: {fmt!r}. Expected {_JXMODEL_FORMAT!r}."
         )
     return typing.cast(dict[str, typing.Any], obj)
+
+
+def _strip_plink_suffix(path_or_prefix: str) -> str:
+    p = str(path_or_prefix).strip()
+    low = p.lower()
+    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
+        return p[:-4]
+    return p
+
+
+def _read_plink_bim_effect_meta(
+    prefix_or_bim: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    prefix = _strip_plink_suffix(str(prefix_or_bim))
+    bim_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
+    if not os.path.isfile(bim_path):
+        raise FileNotFoundError(f"Cannot find BIM file: {bim_path}")
+
+    chrom: list[str] = []
+    pos: list[int] = []
+    allele0: list[str] = []
+    allele1: list[str] = []
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            s = str(line).strip()
+            if s == "" or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) < 6:
+                raise ValueError(
+                    f"Invalid BIM row at {bim_path}:{line_no} (expected >= 6 columns)."
+                )
+            chrom.append(str(parts[0]))
+            try:
+                p = int(parts[3])
+            except Exception:
+                p = int(float(parts[3]))
+            pos.append(int(p))
+            allele0.append(str(parts[4]))
+            allele1.append(str(parts[5]))
+    return (
+        np.asarray(chrom, dtype=object),
+        np.asarray(pos, dtype=np.int64),
+        np.asarray(allele0, dtype=object),
+        np.asarray(allele1, dtype=object),
+    )
+
+
+def _extract_ml_effect_vector_from_estimator(
+    estimator: typing.Any,
+) -> tuple[np.ndarray | None, str]:
+    if estimator is None:
+        return None, "missing_estimator"
+    base_est = estimator
+    scaler = None
+    named_steps = getattr(estimator, "named_steps", None)
+    if isinstance(named_steps, dict) and len(named_steps) > 0:
+        scaler = named_steps.get("scale", None)
+        try:
+            base_est = list(named_steps.values())[-1]
+        except Exception:
+            base_est = estimator
+
+    if hasattr(base_est, "feature_importances_"):
+        arr = np.asarray(getattr(base_est, "feature_importances_"), dtype=np.float64).reshape(-1)
+        if int(arr.size) > 0:
+            return np.ascontiguousarray(arr, dtype=np.float64), "feature_importances_"
+
+    if hasattr(base_est, "coef_"):
+        arr = np.asarray(getattr(base_est, "coef_"), dtype=np.float64).reshape(-1)
+        src = "coef_"
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = np.asarray(getattr(scaler, "scale_"), dtype=np.float64).reshape(-1)
+            if int(scale.size) == int(arr.size):
+                safe_scale = np.where(np.abs(scale) > 1e-12, scale, 1.0)
+                arr = arr / safe_scale
+                src = "coef_/scaled_back"
+        if int(arr.size) > 0:
+            return np.ascontiguousarray(arr, dtype=np.float64), src
+    return None, "no_ml_feature_score"
+
+
+def _as_opt_f64_vector(value: typing.Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _prepare_model_state_for_export_raw_012(
+    *,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+) -> tuple[dict[str, typing.Any], dict[str, typing.Any]]:
+    state_export = dict(model_state)
+    kind = str(state_export.get("kind", "")).strip().lower()
+    is_std = bool(state_export.get("standardized", True))
+    notes: list[str] = []
+
+    meta: dict[str, typing.Any] = {
+        "model_kind": str(kind),
+        "converted": False,
+        "scale": ("standardized" if is_std else "raw_012"),
+        "notes": notes,
+    }
+
+    beta_vec = _as_opt_f64_vector(state_export.get("beta", None))
+    if beta_vec is None:
+        notes.append("beta_missing_or_unreadable")
+        return state_export, meta
+    if int(beta_vec.shape[0]) == 0:
+        notes.append("beta_empty")
+        state_export["export_scale"] = "raw_012"
+        meta["converted"] = True
+        meta["scale"] = "raw_012"
+        return state_export, meta
+
+    alpha_val = float(state_export.get("alpha", 0.0))
+    alpha_raw = float(alpha_val)
+    beta_raw = np.ascontiguousarray(beta_vec, dtype=np.float64)
+    cov_beta_raw: np.ndarray | None = None
+    cov_beta_source = "none"
+    can_apply_raw_affine = not bool(is_std)
+
+    linear_kind = kind in {"rrblup_linear", "bayes_linear"}
+    if linear_kind and is_std:
+        row_mean_vec = _as_opt_f64_vector(state_export.get("row_mean", None))
+        row_inv_vec = _as_opt_f64_vector(state_export.get("row_inv_sd", None))
+        row_stats_source = "model_state"
+        if row_mean_vec is None or row_inv_vec is None:
+            if _looks_like_packed_payload(packed_ctx):
+                try:
+                    mean_auto, inv_auto = _ensure_packed_standard_stats_cached(
+                        typing.cast(dict[str, typing.Any], packed_ctx)
+                    )
+                    row_mean_vec = np.ascontiguousarray(
+                        np.asarray(mean_auto, dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                    row_inv_vec = np.ascontiguousarray(
+                        np.asarray(inv_auto, dtype=np.float64).reshape(-1),
+                        dtype=np.float64,
+                    )
+                    row_stats_source = "packed_ctx"
+                except Exception as ex:
+                    notes.append(f"row_stats_from_packed_failed:{ex}")
+        m = int(beta_vec.shape[0])
+        if (
+            row_mean_vec is not None
+            and row_inv_vec is not None
+            and int(row_mean_vec.shape[0]) == m
+            and int(row_inv_vec.shape[0]) == m
+        ):
+            inv_safe = np.where(np.isfinite(row_inv_vec), row_inv_vec, 0.0)
+            beta_raw = np.ascontiguousarray(beta_vec * inv_safe, dtype=np.float64)
+            alpha_raw = float(alpha_val - float(np.dot(row_mean_vec, beta_raw)))
+            state_export["standardized"] = False
+            state_export["alpha_standardized"] = float(alpha_val)
+            state_export["alpha"] = float(alpha_raw)
+            state_export["beta"] = np.ascontiguousarray(
+                np.asarray(beta_raw, dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+            state_export["export_scale"] = "raw_012"
+            state_export["export_marker_transform"] = "converted_from_standardized"
+            state_export["export_marker_stats_source"] = str(row_stats_source)
+            meta["converted"] = True
+            meta["scale"] = "raw_012"
+            meta["marker_stats_source"] = str(row_stats_source)
+            can_apply_raw_affine = True
+        else:
+            notes.append(
+                "missing_or_mismatched_row_stats_for_standardized_marker_conversion"
+            )
+    elif linear_kind:
+        state_export["export_scale"] = "raw_012"
+        meta["converted"] = True
+        meta["scale"] = "raw_012"
+        can_apply_raw_affine = True
+    else:
+        notes.append("non_linear_or_non_marker_effect_model")
+
+    cov_beta_key = None
+    for key in ("cov_beta", "cov_coef", "cov_coeff", "covariate_beta", "gamma"):
+        if key in state_export:
+            cov_beta_key = key
+            break
+    cov_beta_vec = (
+        _as_opt_f64_vector(state_export.get(cov_beta_key, None))
+        if cov_beta_key is not None
+        else None
+    )
+    cov_mean_vec = _as_opt_f64_vector(
+        state_export.get("cov_means", state_export.get("cov_mean", None))
+    )
+    cov_inv_vec = _as_opt_f64_vector(
+        state_export.get("cov_inv_sd", state_export.get("cov_inv_std", None))
+    )
+
+    if cov_beta_vec is not None and int(cov_beta_vec.shape[0]) > 0:
+        cov_beta_raw = np.ascontiguousarray(cov_beta_vec, dtype=np.float64)
+        cov_beta_source = str(cov_beta_key or "cov_beta")
+        if bool(can_apply_raw_affine):
+            if is_std and cov_inv_vec is not None and int(cov_inv_vec.shape[0]) == int(
+                cov_beta_vec.shape[0]
+            ):
+                cov_beta_raw = np.ascontiguousarray(
+                    cov_beta_vec * np.where(np.isfinite(cov_inv_vec), cov_inv_vec, 0.0),
+                    dtype=np.float64,
+                )
+                if cov_mean_vec is not None and int(cov_mean_vec.shape[0]) == int(
+                    cov_beta_raw.shape[0]
+                ):
+                    alpha_raw = float(alpha_raw - float(np.dot(cov_mean_vec, cov_beta_raw)))
+                    state_export["alpha"] = float(alpha_raw)
+                cov_beta_source = f"{cov_beta_source}:converted_from_standardized"
+        elif bool(is_std):
+            notes.append(
+                "skip_covariate_conversion_due_to_unconverted_marker_scale"
+            )
+        state_export["export_cov_beta_raw_012"] = np.ascontiguousarray(
+            np.asarray(cov_beta_raw, dtype=np.float64).reshape(-1),
+            dtype=np.float64,
+        )
+    else:
+        if cov_beta_key is not None:
+            notes.append("covariate_beta_unreadable")
+
+    scale_now = str(
+        state_export.get("export_scale", "raw_012" if (not is_std) else "standardized")
+    ).strip().lower()
+    alpha_export_val: float | None = None
+    if scale_now == "raw_012":
+        try:
+            alpha_export_val = float(state_export.get("alpha", alpha_raw))
+        except Exception:
+            alpha_export_val = None
+    state_export["export_alpha_raw_012"] = alpha_export_val
+    state_export["export_cov_beta_source"] = str(cov_beta_source)
+    state_export["export_conversion_notes"] = list(notes)
+    meta["alpha_raw_012"] = alpha_export_val
+    meta["cov_beta_source"] = str(cov_beta_source)
+    return state_export, meta
+
+
+def _extract_effect_beta_from_model_state(
+    model_state: dict[str, typing.Any],
+) -> tuple[np.ndarray | None, str]:
+    beta_raw = model_state.get("beta", None)
+    if beta_raw is not None:
+        beta_arr = np.asarray(beta_raw, dtype=np.float64).reshape(-1)
+        if int(beta_arr.size) > 0:
+            return np.ascontiguousarray(beta_arr, dtype=np.float64), "model_state.beta"
+
+    kind = str(model_state.get("kind", "")).strip().lower()
+    if kind == "mlsk_model":
+        arr, src = _extract_ml_effect_vector_from_estimator(model_state.get("estimator", None))
+        if arr is None:
+            return None, src
+        marker_means = np.asarray(
+            model_state.get("marker_means", np.zeros((0,), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        m_marker = int(marker_means.shape[0])
+        if m_marker > 0:
+            if int(arr.size) < m_marker:
+                return None, f"{src}:short_feature_vector({arr.size}<{m_marker})"
+            return np.ascontiguousarray(arr[:m_marker], dtype=np.float64), f"{src}:marker_slice"
+        return np.ascontiguousarray(arr, dtype=np.float64), src
+    return None, "no_beta_in_model_state"
+
+
+def _build_method_effect_table(
+    *,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+    genotype_prefix_hint: str | None,
+    fallback_marker_count: int | None,
+) -> tuple[pd.DataFrame, dict[str, typing.Any]]:
+    notes: list[str] = []
+    beta_vec, beta_source = _extract_effect_beta_from_model_state(model_state)
+    beta_len = 0 if beta_vec is None else int(beta_vec.shape[0])
+
+    metadata_source = "placeholder"
+    chrom_meta = np.zeros((0,), dtype=object)
+    pos_meta = np.zeros((0,), dtype=np.int64)
+    allele0_meta = np.zeros((0,), dtype=object)
+    allele1_meta = np.zeros((0,), dtype=object)
+    maf_vec = np.zeros((0,), dtype=np.float64)
+    row_flip = np.zeros((0,), dtype=np.bool_)
+
+    packed_local = (
+        typing.cast(dict[str, typing.Any], packed_ctx)
+        if _looks_like_packed_payload(packed_ctx)
+        else None
+    )
+
+    if packed_local is not None:
+        try:
+            maf_vec = np.ascontiguousarray(
+                np.asarray(packed_local.get("maf", np.zeros((0,), dtype=np.float32)), dtype=np.float64).reshape(-1),
+                dtype=np.float64,
+            )
+        except Exception:
+            maf_vec = np.zeros((0,), dtype=np.float64)
+        try:
+            row_flip = np.ascontiguousarray(
+                np.asarray(packed_local.get("row_flip", np.zeros((0,), dtype=np.bool_)), dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+        except Exception:
+            row_flip = np.zeros((0,), dtype=np.bool_)
+
+    prefix_candidates: list[str] = []
+    if packed_local is not None:
+        src_prefix = str(packed_local.get("source_prefix", "") or "").strip()
+        if src_prefix != "":
+            prefix_candidates.append(_strip_plink_suffix(src_prefix))
+    if genotype_prefix_hint is not None and str(genotype_prefix_hint).strip() != "":
+        prefix_candidates.append(_strip_plink_suffix(str(genotype_prefix_hint)))
+
+    prefix_candidates = list(dict.fromkeys(prefix_candidates))
+    for cand in prefix_candidates:
+        if not _is_plink_prefix(cand):
+            continue
+        try:
+            chrom_meta, pos_meta, allele0_meta, allele1_meta = _read_plink_bim_effect_meta(cand)
+            metadata_source = str(cand)
+            if packed_local is not None:
+                site_keep_raw = packed_local.get("site_keep", None)
+                if site_keep_raw is not None:
+                    site_keep = np.ascontiguousarray(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    if int(site_keep.shape[0]) == int(chrom_meta.shape[0]):
+                        chrom_meta = np.asarray(chrom_meta[site_keep], dtype=object)
+                        pos_meta = np.asarray(pos_meta[site_keep], dtype=np.int64)
+                        allele0_meta = np.asarray(allele0_meta[site_keep], dtype=object)
+                        allele1_meta = np.asarray(allele1_meta[site_keep], dtype=object)
+                    else:
+                        notes.append("site_keep length mismatch with BIM rows; skipped site_keep alignment")
+                if int(row_flip.shape[0]) == int(chrom_meta.shape[0]) and int(row_flip.shape[0]) > 0:
+                    swap = np.asarray(row_flip, dtype=np.bool_)
+                    if np.any(swap):
+                        a0_tmp = allele0_meta.copy()
+                        allele0_meta[swap] = allele1_meta[swap]
+                        allele1_meta[swap] = a0_tmp[swap]
+            break
+        except Exception as ex:
+            notes.append(f"failed to read BIM metadata from {cand}: {ex}")
+
+    n_rows = 0
+    if beta_len > 0:
+        n_rows = int(beta_len)
+    elif int(maf_vec.shape[0]) > 0:
+        n_rows = int(maf_vec.shape[0])
+    elif int(chrom_meta.shape[0]) > 0:
+        n_rows = int(chrom_meta.shape[0])
+    elif fallback_marker_count is not None and int(fallback_marker_count) > 0:
+        n_rows = int(fallback_marker_count)
+
+    chrom = np.full((n_rows,), ".", dtype=object)
+    pos = np.full((n_rows,), -1, dtype=np.int64)
+    allele0 = np.full((n_rows,), "N", dtype=object)
+    allele1 = np.full((n_rows,), "N", dtype=object)
+    maf = np.full((n_rows,), np.nan, dtype=np.float64)
+    beta = np.full((n_rows,), np.nan, dtype=np.float64)
+
+    if int(chrom_meta.shape[0]) > 0 and n_rows > 0:
+        use_n = min(n_rows, int(chrom_meta.shape[0]))
+        chrom[:use_n] = chrom_meta[:use_n]
+        pos[:use_n] = pos_meta[:use_n]
+        allele0[:use_n] = allele0_meta[:use_n]
+        allele1[:use_n] = allele1_meta[:use_n]
+        if int(chrom_meta.shape[0]) != n_rows:
+            notes.append(f"metadata rows={int(chrom_meta.shape[0])}, effect rows={int(n_rows)}")
+    if int(maf_vec.shape[0]) > 0 and n_rows > 0:
+        use_n = min(n_rows, int(maf_vec.shape[0]))
+        maf[:use_n] = np.asarray(maf_vec[:use_n], dtype=np.float64)
+        if int(maf_vec.shape[0]) != n_rows:
+            notes.append(f"maf rows={int(maf_vec.shape[0])}, effect rows={int(n_rows)}")
+    if beta_vec is not None and n_rows > 0:
+        use_n = min(n_rows, int(beta_vec.shape[0]))
+        beta[:use_n] = np.asarray(beta_vec[:use_n], dtype=np.float64)
+        if int(beta_vec.shape[0]) != n_rows:
+            notes.append(f"beta rows={int(beta_vec.shape[0])}, effect rows={int(n_rows)}")
+    for note in list(model_state.get("export_conversion_notes", []) or []):
+        n = str(note).strip()
+        if n != "":
+            notes.append(f"model_export:{n}")
+
+    table = pd.DataFrame(
+        {
+            "chrom": chrom,
+            "pos": pos,
+            "allele0": allele0,
+            "allele1": allele1,
+            "maf": maf,
+            "beta": beta,
+        }
+    )
+    alpha_meta: float | None = None
+    try:
+        alpha_val = float(model_state.get("export_alpha_raw_012", np.nan))
+        if np.isfinite(alpha_val):
+            alpha_meta = float(alpha_val)
+    except Exception:
+        alpha_meta = None
+    meta: dict[str, typing.Any] = {
+        "rows": int(n_rows),
+        "beta_source": str(beta_source),
+        "beta_available": bool(beta_vec is not None),
+        "beta_non_nan_rows": int(np.sum(np.isfinite(beta))),
+        "beta_scale": (
+            str(model_state.get("export_scale", "raw_012")).strip()
+            if (not bool(model_state.get("standardized", True)))
+            else str(model_state.get("export_scale", "standardized")).strip()
+        ),
+        "alpha_raw_012": alpha_meta,
+        "cov_beta_source": str(model_state.get("export_cov_beta_source", "none")),
+        "metadata_source": str(metadata_source),
+        "notes": list(notes),
+    }
+    return table, meta
+
+
+def _write_method_effect_tsv(
+    *,
+    out_path: str,
+    model_state: dict[str, typing.Any],
+    packed_ctx: dict[str, typing.Any] | None,
+    genotype_prefix_hint: str | None,
+    fallback_marker_count: int | None,
+) -> dict[str, typing.Any]:
+    table, meta = _build_method_effect_table(
+        model_state=model_state,
+        packed_ctx=packed_ctx,
+        genotype_prefix_hint=genotype_prefix_hint,
+        fallback_marker_count=fallback_marker_count,
+    )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    table.to_csv(str(out_path), sep="\t", index=False, float_format="%.6g")
+    out = dict(meta)
+    out["effect_file"] = str(out_path)
+    return out
+
+
+def _sanitize_artifact_token(token: str) -> str:
+    s = str(token).strip()
+    if s == "":
+        return "NA"
+    s = re.sub(r"[\\/:*?\"<>|\s]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("._")
+    return s or "NA"
+
+
+def _reindex_effect_table(
+    table: pd.DataFrame | None,
+    n_rows: int,
+) -> pd.DataFrame:
+    if n_rows <= 0:
+        return pd.DataFrame(
+            {
+                "chrom": np.zeros((0,), dtype=object),
+                "pos": np.zeros((0,), dtype=np.int64),
+                "allele0": np.zeros((0,), dtype=object),
+                "allele1": np.zeros((0,), dtype=object),
+                "maf": np.zeros((0,), dtype=np.float64),
+            }
+        )
+
+    chrom = np.full((n_rows,), ".", dtype=object)
+    pos = np.full((n_rows,), -1, dtype=np.int64)
+    allele0 = np.full((n_rows,), "N", dtype=object)
+    allele1 = np.full((n_rows,), "N", dtype=object)
+    maf = np.full((n_rows,), np.nan, dtype=np.float64)
+    if table is not None and int(table.shape[0]) > 0:
+        t = table
+        use_n = min(n_rows, int(t.shape[0]))
+        if "chrom" in t.columns:
+            chrom[:use_n] = np.asarray(t["chrom"], dtype=object).reshape(-1)[:use_n]
+        if "pos" in t.columns:
+            pos[:use_n] = np.asarray(t["pos"], dtype=np.int64).reshape(-1)[:use_n]
+        if "allele0" in t.columns:
+            allele0[:use_n] = np.asarray(t["allele0"], dtype=object).reshape(-1)[:use_n]
+        if "allele1" in t.columns:
+            allele1[:use_n] = np.asarray(t["allele1"], dtype=object).reshape(-1)[:use_n]
+        if "maf" in t.columns:
+            maf[:use_n] = np.asarray(t["maf"], dtype=np.float64).reshape(-1)[:use_n]
+    return pd.DataFrame(
+        {
+            "chrom": chrom,
+            "pos": pos,
+            "allele0": allele0,
+            "allele1": allele1,
+            "maf": maf,
+        }
+    )
+
+
+def _build_trait_merged_effect_table(
+    *,
+    method_tables: dict[str, pd.DataFrame],
+    method_order: list[str],
+    method_display_map: dict[str, str],
+) -> pd.DataFrame:
+    n_rows = 0
+    for _k, _tb in method_tables.items():
+        n_rows = max(n_rows, int(_tb.shape[0]))
+    if n_rows <= 0:
+        n_rows = 1
+
+    best_key = ""
+    best_score = -1
+    for k, tb in method_tables.items():
+        if int(tb.shape[0]) <= 0:
+            continue
+        score = 0
+        if "chrom" in tb.columns:
+            chrom_v = np.asarray(tb["chrom"], dtype=object).reshape(-1)
+            score += int(np.sum(chrom_v != "."))
+        if "pos" in tb.columns:
+            pos_v = np.asarray(tb["pos"], dtype=np.int64).reshape(-1)
+            score += int(np.sum(pos_v >= 0))
+        if "maf" in tb.columns:
+            maf_v = np.asarray(tb["maf"], dtype=np.float64).reshape(-1)
+            score += int(np.sum(np.isfinite(maf_v)))
+        if score > best_score:
+            best_key = str(k)
+            best_score = int(score)
+
+    base_table = _reindex_effect_table(method_tables.get(best_key, None), n_rows)
+    used_cols: set[str] = set(base_table.columns.tolist())
+    for method in list(method_order):
+        m_key = str(method)
+        disp_raw = str(method_display_map.get(m_key, m_key))
+        col = disp_raw if disp_raw != "" else m_key
+        if col in used_cols:
+            i = 2
+            while f"{col}_{i}" in used_cols:
+                i += 1
+            col = f"{col}_{i}"
+        used_cols.add(col)
+
+        beta_full = np.full((n_rows,), np.nan, dtype=np.float64)
+        tb = method_tables.get(m_key, None)
+        if tb is not None and "beta" in tb.columns:
+            beta_vec = np.asarray(tb["beta"], dtype=np.float64).reshape(-1)
+            use_n = min(n_rows, int(beta_vec.shape[0]))
+            beta_full[:use_n] = beta_vec[:use_n]
+        base_table[col] = beta_full
+    return base_table
+
+
+def _json_safe(value: typing.Any) -> typing.Any:
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.ndarray):
+        return [_json_safe(x) for x in value.tolist()]
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(x) for x in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return str(value)
+
+
+def _order_gs_saved_result_paths(paths: typing.Sequence[str]) -> list[str]:
+    dedup = list(dict.fromkeys([str(p) for p in paths if str(p).strip() != ""]))
+    primary: list[str] = []
+    model_effect: list[str] = []
+    summary: list[str] = []
+    for p in dedup:
+        low = str(p).lower()
+        if low.endswith("summary.json"):
+            summary.append(str(p))
+        elif low.endswith(".jxmodel") or low.endswith(".effect.tsv") or low.endswith(".gs.effect"):
+            model_effect.append(str(p))
+        else:
+            primary.append(str(p))
+    return primary + model_effect + summary
 
 
 def _resolve_top_bundle_model_file(
@@ -1784,18 +2391,6 @@ def _estimate_rrblup_lambda_subsample_reml(
     seed = int(cfg_use.get("lambda_subsample_seed", 42))
     rng = np.random.default_rng(seed)
     std_eps = float(max(np.finfo(np.float32).eps, float(cfg_use.get("pcg_std_eps", 1e-12))))
-    exact_reml_max_n = int(
-        max(
-            2,
-            int(
-                cfg_use.get(
-                    "lambda_exact_reml_max_n",
-                    cfg_use.get("auto_pcg_min_n", _RRBLUP_AUTO_PCG_MIN_N),
-                )
-            ),
-        )
-    )
-
     maf_all = np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
     site_keep_raw = packed_ctx.get("site_keep", None)
     if site_keep_raw is not None and int(maf_all.size) > 0:
@@ -1814,6 +2409,234 @@ def _estimate_rrblup_lambda_subsample_reml(
         m_effective = 0
     m_scale = float(max(1, int(m_effective)))
 
+    he_diag: dict[str, typing.Any] = {
+        "sigma_g2": float("nan"),
+        "sigma_e2": float("nan"),
+        "h2": float("nan"),
+        "he_converged": None,
+        "he_iters": None,
+        "he_rel_res": float("nan"),
+        "lambda_he_raw_k": float("nan"),
+        "lambda_he_raw_equation": float("nan"),
+        "lambda_he_lambda_k": float("nan"),
+        "lambda_he_lambda_equation": float("nan"),
+        "trace_samples_used": 0,
+        "he_tr_k2": float("nan"),
+        "he_tr_k2_solve": float("nan"),
+        "he_y_ky": float("nan"),
+        "he_y_y": float("nan"),
+        "he_tr_k": float("nan"),
+        "he_tr_p": float("nan"),
+        "he_nnls_projected": None,
+        "he_boundary_status": "",
+        "he_accepted": None,
+        "he_reject_reason": "",
+        "he_error": "",
+    }
+    lambda_auto_strategy = str(
+        cfg_use.get("lambda_auto_strategy", "he_first")
+    ).strip().lower()
+    if lambda_auto_strategy not in {"he_first", "he_only", "reml_first"}:
+        lambda_auto_strategy = "he_first"
+
+    def _merge_he_diag(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        out = dict(payload)
+        out.update(dict(he_diag))
+        return out
+
+    he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
+    can_try_he = bool(
+        he_enable
+        and
+        (_jxrs is not None)
+        and hasattr(_jxrs, "he_pcg_bed")
+        and _looks_like_packed_payload(packed_ctx)
+    )
+    if can_try_he:
+        try:
+            packed_arg = np.ascontiguousarray(
+                np.asarray(packed_ctx["packed"], dtype=np.uint8),
+                dtype=np.uint8,
+            )
+            maf_arg = np.ascontiguousarray(
+                np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+                dtype=np.float32,
+            )
+            n_samples_full = int(packed_ctx["n_samples"])
+            if packed_arg.ndim != 2:
+                raise ValueError("HE lambda-auto requires packed matrix with ndim=2.")
+            if int(maf_arg.shape[0]) != int(packed_arg.shape[0]):
+                raise ValueError("HE lambda-auto packed payload mismatch: maf length != packed SNP rows.")
+            exp_bps = (n_samples_full + 3) // 4
+            if int(packed_arg.shape[1]) != int(exp_bps):
+                raise ValueError(
+                    "HE lambda-auto packed payload mismatch: "
+                    f"bytes_per_snp={packed_arg.shape[1]} expected={exp_bps}."
+                )
+
+            row_flip_raw = packed_ctx.get("row_flip", None)
+            if row_flip_raw is None:
+                row_flip_arg = np.ascontiguousarray(
+                    np.asarray(
+                        _jxrs.bed_packed_row_flip_mask(packed_arg, int(n_samples_full)),  # type: ignore[union-attr]
+                        dtype=np.bool_,
+                    ).reshape(-1),
+                    dtype=np.bool_,
+                )
+                packed_ctx["row_flip"] = row_flip_arg
+            else:
+                row_flip_arg = np.ascontiguousarray(
+                    np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+            if int(row_flip_arg.shape[0]) != int(packed_arg.shape[0]):
+                raise ValueError("HE lambda-auto packed payload mismatch: row_flip length != packed SNP rows.")
+
+            site_keep_arg: np.ndarray | None = None
+            site_keep_raw = packed_ctx.get("site_keep", None)
+            if site_keep_raw is not None:
+                site_keep_arg = np.ascontiguousarray(
+                    np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+                    dtype=np.bool_,
+                )
+                if int(site_keep_arg.shape[0]) != int(maf_arg.shape[0]):
+                    site_keep_arg = None
+
+            source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+            he_trace_samples = int(
+                max(
+                    8,
+                    int(
+                        cfg_use.get(
+                            "he_trace_samples",
+                            cfg_use.get("pcg_he_trace_samples", 64),
+                        )
+                    ),
+                )
+            )
+            he_block_rows = int(
+                max(
+                    1,
+                    int(
+                        cfg_use.get(
+                            "he_block_rows",
+                            cfg_use.get("pcg_block_rows", cfg_use.get("snp_block_size", 4096)),
+                        )
+                    ),
+                )
+            )
+            he_tol = float(
+                max(
+                    np.finfo(np.float64).eps,
+                    float(cfg_use.get("he_tol", cfg_use.get("pcg_tol", 1e-6))),
+                )
+            )
+            he_max_iter = int(max(1, int(cfg_use.get("he_max_iter", cfg_use.get("pcg_max_iter", 32)))))
+            he_seed = int(cfg_use.get("he_seed", seed))
+            he_use_train_maf = _cfg_truthy(cfg_use.get("he_use_train_maf", "on"), default=True)
+
+            try:
+                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                    source_prefix,
+                    train_abs,
+                    y_vec,
+                    site_keep=site_keep_arg,
+                    trace_samples=int(he_trace_samples),
+                    tol=float(he_tol),
+                    max_iter=int(he_max_iter),
+                    block_rows=int(he_block_rows),
+                    std_eps=float(std_eps),
+                    use_train_maf=bool(he_use_train_maf),
+                    threads=int(max(1, int(n_jobs))),
+                    seed=int(he_seed),
+                    packed=packed_arg,
+                    packed_n_samples=int(n_samples_full),
+                    maf=maf_arg,
+                    row_flip=row_flip_arg,
+                )
+            except TypeError:
+                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                    source_prefix,
+                    train_abs,
+                    y_vec,
+                    site_keep_arg,
+                    int(he_trace_samples),
+                    float(he_tol),
+                    int(he_max_iter),
+                    int(he_block_rows),
+                    float(std_eps),
+                    bool(he_use_train_maf),
+                    int(max(1, int(n_jobs))),
+                    int(he_seed),
+                )
+
+            he_t = tuple(he_out)
+            if len(he_t) >= 2:
+                sigma_g2 = float(he_t[0])
+                sigma_e2 = float(he_t[1])
+                h2 = float(he_t[2]) if len(he_t) >= 3 else float("nan")
+                he_converged = bool(he_t[3]) if len(he_t) >= 4 else None
+                he_iters = int(he_t[4]) if len(he_t) >= 5 else None
+                he_rel_res = float(he_t[5]) if len(he_t) >= 6 else float("nan")
+                he_m_eff = int(he_t[6]) if len(he_t) >= 7 else int(max(1, int(m_effective)))
+                he_tr_k2 = float(he_t[7]) if len(he_t) >= 8 else float("nan")
+                he_y_ky = float(he_t[8]) if len(he_t) >= 9 else float("nan")
+                he_y_y = float(he_t[9]) if len(he_t) >= 10 else float("nan")
+                he_lambda_k = float(he_t[10]) if len(he_t) >= 11 else float("nan")
+                he_tr_k2_solve = float(he_t[11]) if len(he_t) >= 12 else float("nan")
+                he_tr_k = float(he_t[12]) if len(he_t) >= 13 else float("nan")
+                he_tr_p = float(he_t[13]) if len(he_t) >= 14 else float("nan")
+                he_boundary_status = str(he_t[14]).strip() if len(he_t) >= 15 else ""
+
+                if (not np.isfinite(he_lambda_k)) and np.isfinite(sigma_g2) and np.isfinite(sigma_e2) and sigma_g2 > 0.0:
+                    he_lambda_k = float(sigma_e2 / sigma_g2)
+                he_m_for_eq = int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective)))
+                he_lambda_eq = (
+                    float(he_lambda_k * float(he_m_for_eq))
+                    if np.isfinite(he_lambda_k) and he_lambda_k >= 0.0
+                    else float("nan")
+                )
+                he_lambda_eq_sel = (
+                    float(max(1e-8, he_lambda_eq))
+                    if np.isfinite(he_lambda_eq) and he_lambda_eq >= 0.0
+                    else float("nan")
+                )
+                he_lambda_k_sel = (
+                    float(he_lambda_eq_sel / float(max(1, he_m_for_eq)))
+                    if np.isfinite(he_lambda_eq_sel)
+                    else float("nan")
+                )
+                he_nnls_projected = None
+                if np.isfinite(sigma_g2) and np.isfinite(sigma_e2):
+                    he_nnls_projected = bool((sigma_g2 <= 0.0) or (sigma_e2 <= 0.0))
+
+                he_diag.update(
+                    {
+                        "sigma_g2": float(sigma_g2),
+                        "sigma_e2": float(sigma_e2),
+                        "h2": float(h2),
+                        "he_converged": he_converged,
+                        "he_iters": he_iters,
+                        "he_rel_res": float(he_rel_res),
+                        "lambda_he_raw_k": float(he_lambda_k),
+                        "lambda_he_raw_equation": float(he_lambda_eq),
+                        "lambda_he_lambda_k": float(he_lambda_k_sel),
+                        "lambda_he_lambda_equation": float(he_lambda_eq_sel),
+                        "trace_samples_used": int(he_trace_samples),
+                        "he_tr_k2": float(he_tr_k2),
+                        "he_tr_k2_solve": float(he_tr_k2_solve),
+                        "he_y_ky": float(he_y_ky),
+                        "he_y_y": float(he_y_y),
+                        "he_tr_k": float(he_tr_k),
+                        "he_tr_p": float(he_tr_p),
+                        "he_nnls_projected": he_nnls_projected,
+                        "he_boundary_status": str(he_boundary_status),
+                        "he_error": "",
+                    }
+                )
+        except Exception as he_ex:
+            he_diag["he_error"] = str(he_ex)
+
     def _emit(event: str, **payload: typing.Any) -> None:
         if progress_hook is None:
             return
@@ -1822,7 +2645,268 @@ def _estimate_rrblup_lambda_subsample_reml(
         except Exception:
             return
 
-    def _fit_once(local_idx: np.ndarray) -> tuple[float, float]:
+    he_lam_eq_raw = float(he_diag.get("lambda_he_raw_equation", np.nan))
+    he_lam_k_raw = float(he_diag.get("lambda_he_raw_k", np.nan))
+    he_lam_eq = float(he_diag.get("lambda_he_lambda_equation", np.nan))
+    he_lam_k = float(he_diag.get("lambda_he_lambda_k", np.nan))
+    he_sigma_g2 = float(he_diag.get("sigma_g2", np.nan))
+    he_sigma_e2 = float(he_diag.get("sigma_e2", np.nan))
+    he_rel_res = float(he_diag.get("he_rel_res", np.nan))
+    he_converged = he_diag.get("he_converged", None)
+    he_nnls_projected = he_diag.get("he_nnls_projected", None)
+    he_accept_rel_res_max = float(
+        max(
+            1e-6,
+            float(cfg_use.get("he_accept_rel_res_max", 1e-2)),
+        )
+    )
+    he_is_clamped = bool(
+        np.isfinite(he_lam_eq_raw)
+        and np.isfinite(he_lam_eq)
+        and (he_lam_eq > (he_lam_eq_raw + 1e-12))
+    )
+    he_rel_ok = bool(np.isfinite(he_rel_res) and (he_rel_res <= he_accept_rel_res_max))
+    if (not he_rel_ok) and (not np.isfinite(he_rel_res)) and (he_converged is not None):
+        he_rel_ok = bool(he_converged)
+    he_reject_reasons: list[str] = []
+    if not (np.isfinite(he_lam_eq_raw) and he_lam_eq_raw > 0.0):
+        he_reject_reasons.append("lambda_raw_nonpositive")
+    if not (np.isfinite(he_sigma_g2) and he_sigma_g2 > 0.0):
+        he_reject_reasons.append("sigma_g2_nonpositive")
+    if not (np.isfinite(he_sigma_e2) and he_sigma_e2 > 0.0):
+        he_reject_reasons.append("sigma_e2_nonpositive")
+    if bool(he_nnls_projected):
+        he_reject_reasons.append("nnls_projected")
+    if not he_rel_ok:
+        he_reject_reasons.append("rel_res_too_large")
+    if he_is_clamped:
+        he_reject_reasons.append("lambda_clamped_to_floor")
+    he_ok = len(he_reject_reasons) == 0
+    he_diag["he_accepted"] = bool(he_ok)
+    he_diag["he_reject_reason"] = ",".join(he_reject_reasons)
+    if lambda_auto_strategy in {"he_first", "he_only"}:
+        if he_ok:
+            return _merge_he_diag(
+                {
+                    "lambda_equation": float(he_lam_eq_raw),
+                    "lambda_k": float(he_lam_k_raw) if np.isfinite(he_lam_k_raw) else float("nan"),
+                    "n_sub": int(n_sub),
+                    "repeats": 0,
+                    "ok_repeats": 0,
+                    "m_effective": int(m_effective),
+                    "strategy": "he_primary",
+                    "vc_method": "HE",
+                    "vc_sigma_g2": float(he_sigma_g2),
+                    "vc_sigma_e2": float(he_sigma_e2),
+                    "vc_pve": float(he_diag.get("h2", np.nan)),
+                }
+            )
+        if lambda_auto_strategy == "he_only":
+            return _merge_he_diag(
+                {
+                    "lambda_equation": float("nan"),
+                    "lambda_k": float("nan"),
+                    "n_sub": int(n_sub),
+                    "repeats": 0,
+                    "ok_repeats": 0,
+                    "m_effective": int(m_effective),
+                    "strategy": "he_only_rejected",
+                    "vc_method": "HE",
+                    "vc_sigma_g2": float(he_sigma_g2),
+                    "vc_sigma_e2": float(he_sigma_e2),
+                    "vc_pve": float(he_diag.get("h2", np.nan)),
+                }
+            )
+
+    def _method_payload(
+        *,
+        lambda_equation: float,
+        lambda_k: float,
+        n_sub_used: int,
+        repeats_used: int,
+        ok_repeats_used: int,
+        strategy: str,
+        vc_method: str,
+        vc_sigma_g2: float,
+        vc_sigma_e2: float,
+        vc_pve: float,
+    ) -> dict[str, typing.Any]:
+        return _merge_he_diag(
+            {
+                "lambda_equation": float(lambda_equation),
+                "lambda_k": float(lambda_k),
+                "n_sub": int(n_sub_used),
+                "repeats": int(repeats_used),
+                "ok_repeats": int(ok_repeats_used),
+                "m_effective": int(m_effective),
+                "strategy": str(strategy),
+                "vc_method": str(vc_method),
+                "vc_sigma_g2": float(vc_sigma_g2),
+                "vc_sigma_e2": float(vc_sigma_e2),
+                "vc_pve": float(vc_pve),
+            }
+        )
+
+    source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
+    site_keep_arg: np.ndarray | None = None
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep_arr = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        maf_len = int(np.asarray(packed_ctx.get("maf", np.asarray([], dtype=np.float32))).reshape(-1).shape[0])
+        if (maf_len <= 0) or (int(site_keep_arr.shape[0]) == int(maf_len)):
+            site_keep_arg = site_keep_arr
+
+    gblup_g_eps = float(max(0.0, float(np.finfo(np.float64).eps)))
+    gblup_reml_low = float(cfg_use.get("gblup_reml_low", -6.0))
+    gblup_reml_high = float(cfg_use.get("gblup_reml_high", 6.0))
+    if (not np.isfinite(gblup_reml_low)) or (not np.isfinite(gblup_reml_high)) or (gblup_reml_low >= gblup_reml_high):
+        gblup_reml_low, gblup_reml_high = -6.0, 6.0
+    gblup_reml_max_iter = int(max(1, int(cfg_use.get("gblup_reml_max_iter", 50))))
+    gblup_reml_tol = float(
+        max(
+            np.finfo(np.float64).eps,
+            float(cfg_use.get("gblup_reml_tol", 1e-4)),
+        )
+    )
+    gblup_block_rows = int(
+        max(
+            1,
+            int(
+                cfg_use.get(
+                    "gblup_block_rows",
+                    cfg_use.get("pcg_block_rows", cfg_use.get("snp_block_size", 4096)),
+                )
+            ),
+        )
+    )
+    can_use_rust_gblup = bool(
+        (_jxrs is not None)
+        and hasattr(_jxrs, "gblup_reml_packed_bed")
+        and (source_prefix != "")
+    )
+
+    def _run_rust_reml(
+        local_idx: np.ndarray | None,
+        *,
+        force_grm_eig: bool,
+    ) -> tuple[dict[str, float], str]:
+        if not can_use_rust_gblup:
+            raise RuntimeError(
+                "Rust GBLUP packed REML path is unavailable for lambda-auto "
+                "(missing source_prefix or gblup_reml_packed_bed binding)."
+            )
+        if local_idx is None:
+            sub_abs = np.ascontiguousarray(train_abs, dtype=np.int64)
+            y_sub = np.ascontiguousarray(y_vec, dtype=np.float64)
+        else:
+            sub_abs = np.ascontiguousarray(train_abs[local_idx], dtype=np.int64)
+            y_sub = np.ascontiguousarray(y_vec[local_idx], dtype=np.float64)
+        train_pred_local_empty = np.zeros((0,), dtype=np.int64)
+
+        old_force = os.environ.get("JX_GBLUP_PACKED_FORCE_GRM_EIG", None)
+        try:
+            if force_grm_eig:
+                os.environ["JX_GBLUP_PACKED_FORCE_GRM_EIG"] = "1"
+            elif old_force is None:
+                os.environ.pop("JX_GBLUP_PACKED_FORCE_GRM_EIG", None)
+
+            try:
+                g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                    source_prefix,
+                    sub_abs,
+                    y_sub,
+                    None,
+                    train_pred_local_empty,
+                    site_keep_arg,
+                    float(gblup_g_eps),
+                    float(gblup_reml_low),
+                    float(gblup_reml_high),
+                    int(gblup_reml_max_iter),
+                    float(gblup_reml_tol),
+                    int(gblup_block_rows),
+                    int(max(1, int(n_jobs))),
+                    True,
+                    True,
+                )
+            except TypeError:
+                try:
+                    g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                        source_prefix,
+                        sub_abs,
+                        y_sub,
+                        None,
+                        train_pred_local_empty,
+                        site_keep_arg,
+                        float(gblup_g_eps),
+                        float(gblup_reml_low),
+                        float(gblup_reml_high),
+                        int(gblup_reml_max_iter),
+                        float(gblup_reml_tol),
+                        int(gblup_block_rows),
+                        int(max(1, int(n_jobs))),
+                        True,
+                    )
+                except TypeError:
+                    g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                        source_prefix,
+                        sub_abs,
+                        y_sub,
+                        None,
+                        train_pred_local_empty,
+                        site_keep_arg,
+                        float(gblup_g_eps),
+                        float(gblup_reml_low),
+                        float(gblup_reml_high),
+                        int(gblup_reml_max_iter),
+                        float(gblup_reml_tol),
+                        int(gblup_block_rows),
+                        int(max(1, int(n_jobs))),
+                    )
+        finally:
+            if old_force is None:
+                os.environ.pop("JX_GBLUP_PACKED_FORCE_GRM_EIG", None)
+            else:
+                os.environ["JX_GBLUP_PACKED_FORCE_GRM_EIG"] = str(old_force)
+
+        g_t = tuple(g_out)
+        if len(g_t) >= 11:
+            _pred_train, _pred_test, pve, lam_k, _ml, _reml, evd_backend, _evd_elapsed, _m_eff, sigma_g2, sigma_e2 = g_t[:11]
+        elif len(g_t) >= 9:
+            _pred_train, _pred_test, pve, lam_k, _ml, _reml, evd_backend, _evd_elapsed, _m_eff = g_t[:9]
+            sigma_g2 = float("nan")
+            sigma_e2 = float("nan")
+        else:
+            raise RuntimeError(
+                "gblup_reml_packed_bed returned unexpected payload size "
+                f"for lambda-auto: {len(g_t)}"
+            )
+
+        lam_sub_k = float(lam_k)
+        lam_sub_eq = (
+            float(lam_sub_k * m_scale)
+            if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0)
+            else float("nan")
+        )
+        fit = {
+            "lambda_k": float(lam_sub_k),
+            "lambda_eq": float(lam_sub_eq),
+            "sigma_g2": float(sigma_g2),
+            "sigma_e2": float(sigma_e2),
+            "pve": float(pve),
+        }
+        return fit, str(evd_backend)
+
+    def _fit_once_grm(local_idx: np.ndarray) -> dict[str, float]:
+        if can_use_rust_gblup:
+            fit_sub, _evd_backend = _run_rust_reml(
+                local_idx,
+                force_grm_eig=True,
+            )
+            return fit_sub
+
         sub_abs = np.ascontiguousarray(train_abs[local_idx], dtype=np.int64)
         y_sub = np.ascontiguousarray(y_vec[local_idx], dtype=np.float64)
         grm_sub = _build_gblup_cv_grm_once(
@@ -1840,53 +2924,165 @@ def _estimate_rrblup_lambda_subsample_reml(
             if (np.isfinite(lam_sub_k) and lam_sub_k > 0.0)
             else float("nan")
         )
-        return lam_sub_k, lam_sub_eq
+        return {
+            "lambda_k": float(lam_sub_k),
+            "lambda_eq": float(lam_sub_eq),
+            "sigma_g2": float(fit_sub.get("sigma_g2", np.nan)),
+            "sigma_e2": float(fit_sub.get("sigma_e2", np.nan)),
+            "pve": float(fit_sub.get("pve", np.nan)),
+        }
 
-    # Small/medium sample: exact REML on full training GRM.
-    if n_train <= exact_reml_max_n:
+    def _recover_lambda_from_model(model: typing.Any) -> tuple[float, float, float]:
+        sigma_g2 = float("nan")
+        sigma_e2 = float("nan")
+        lambda_k = float("nan")
+        try:
+            rtv_invr = float(getattr(model, "rTV_invr", np.nan))
+            n_model = int(getattr(model, "n", n_train))
+            p_model = int(getattr(model, "p", 1))
+            n_eff_model = int(max(1, n_model - p_model))
+            svals = np.asarray(getattr(model, "S", []), dtype=float).reshape(-1)
+            v_inv = np.asarray(getattr(model, "V_inv", []), dtype=float).reshape(-1)
+            if svals.size > 0 and v_inv.size == svals.size:
+                eps_v = float(np.finfo(np.float64).eps)
+                valid = np.isfinite(svals) & np.isfinite(v_inv) & (v_inv > eps_v)
+                if np.any(valid):
+                    lam_cand = (1.0 / v_inv[valid]) - svals[valid]
+                    lam_cand = lam_cand[np.isfinite(lam_cand) & (lam_cand >= 0.0)]
+                    if lam_cand.size > 0:
+                        lambda_k = float(np.median(lam_cand))
+            if np.isfinite(rtv_invr) and rtv_invr > 0.0:
+                sigma_g2 = float(rtv_invr / float(max(1, n_eff_model)))
+                if np.isfinite(lambda_k) and lambda_k >= 0.0:
+                    sigma_e2 = float(lambda_k * sigma_g2)
+            if (
+                (not np.isfinite(lambda_k))
+                and np.isfinite(sigma_g2)
+                and np.isfinite(sigma_e2)
+                and sigma_g2 > 0.0
+            ):
+                lambda_k = float(sigma_e2 / sigma_g2)
+        except Exception:
+            pass
+        return float(lambda_k), float(sigma_g2), float(sigma_e2)
+
+    def _fit_full_fast_reml() -> dict[str, float]:
+        if can_use_rust_gblup:
+            fit_fast, _evd_backend = _run_rust_reml(
+                None,
+                force_grm_eig=False,
+            )
+            return fit_fast
+
+        y_fit = np.ascontiguousarray(y_vec.reshape(-1, 1), dtype=np.float64)
+        model = MLMBLUP(
+            y_fit,
+            packed_ctx,
+            kinship=1,
+            sample_indices=np.ascontiguousarray(train_abs, dtype=np.int64),
+            force_fast=True,
+        )
+        lam_k, sigma_g2, sigma_e2 = _recover_lambda_from_model(model)
+        lam_eq = (
+            float(lam_k * m_scale)
+            if (np.isfinite(lam_k) and lam_k > 0.0)
+            else float("nan")
+        )
+        return {
+            "lambda_k": float(lam_k),
+            "lambda_eq": float(lam_eq),
+            "sigma_g2": float(sigma_g2),
+            "sigma_e2": float(sigma_e2),
+            "pve": float(getattr(model, "pve", np.nan)),
+        }
+
+    large_cutoff = int(max(2, int(cfg_use.get("lambda_large_cutoff", 15_000))))
+    many_samples = bool(int(n_train) >= int(large_cutoff))
+    many_snps = bool(int(m_effective) >= int(large_cutoff))
+    prefer_subsample = bool(many_samples and many_snps)
+    prefer_fast = bool(many_samples and (not many_snps))
+
+    # 1) GRM+REML (small-sample bucket under 15k threshold)
+    if not prefer_subsample and not prefer_fast:
         _emit(
             "pcg_lambda_subsample_start",
             total=1,
             n_sub=int(n_train),
             n_train=int(n_train),
-            strategy="reml_exact",
+            strategy="grm_reml",
         )
-        lam_k = float("nan")
-        lam_eq = float("nan")
+        fit_one = {
+            "lambda_k": float("nan"),
+            "lambda_eq": float("nan"),
+            "sigma_g2": float("nan"),
+            "sigma_e2": float("nan"),
+            "pve": float("nan"),
+        }
         try:
-            full_idx = np.arange(n_train, dtype=np.int64)
-            lam_k, lam_eq = _fit_once(full_idx)
+            fit_one = _fit_once_grm(np.arange(n_train, dtype=np.int64))
         except Exception:
             pass
-        lam_ok = bool(np.isfinite(lam_eq) and lam_eq > 0.0)
+        lam_ok = bool(np.isfinite(float(fit_one["lambda_eq"])) and float(fit_one["lambda_eq"]) > 0.0)
         _emit(
             "pcg_lambda_subsample_iter",
             iter=1,
             total=1,
-            lambda_equation=float(lam_eq),
-            lambda_k=float(lam_k),
+            lambda_equation=float(fit_one["lambda_eq"]),
+            lambda_k=float(fit_one["lambda_k"]),
             m_effective=int(m_effective),
-            strategy="reml_exact",
+            strategy="grm_reml",
         )
         _emit(
             "pcg_lambda_subsample_end",
             repeats=1,
             ok_repeats=int(1 if lam_ok else 0),
-            lambda_equation=float(lam_eq),
+            lambda_equation=float(fit_one["lambda_eq"]),
             m_effective=int(m_effective),
-            strategy="reml_exact",
+            strategy="grm_reml",
         )
-        return {
-            "lambda_equation": float(lam_eq),
-            "lambda_k": float(lam_k),
-            "n_sub": int(n_train),
-            "repeats": 1,
-            "ok_repeats": int(1 if lam_ok else 0),
-            "m_effective": int(m_effective),
-            "strategy": ("reml_exact" if lam_ok else "reml_exact_failed"),
-        }
+        if lam_ok:
+            return _method_payload(
+                lambda_equation=float(fit_one["lambda_eq"]),
+                lambda_k=float(fit_one["lambda_k"]),
+                n_sub_used=int(n_train),
+                repeats_used=1,
+                ok_repeats_used=1,
+                strategy="grm_reml",
+                vc_method="GRM/REML",
+                vc_sigma_g2=float(fit_one["sigma_g2"]),
+                vc_sigma_e2=float(fit_one["sigma_e2"]),
+                vc_pve=float(fit_one["pve"]),
+            )
 
-    # Large sample: estimate lambda from repeated subsample REML.
+    # 2) FaST+REML (many-sample + few-SNP bucket under 15k threshold)
+    if prefer_fast:
+        fit_fast = {
+            "lambda_k": float("nan"),
+            "lambda_eq": float("nan"),
+            "sigma_g2": float("nan"),
+            "sigma_e2": float("nan"),
+            "pve": float("nan"),
+        }
+        try:
+            fit_fast = _fit_full_fast_reml()
+        except Exception:
+            pass
+        lam_ok = bool(np.isfinite(float(fit_fast["lambda_eq"])) and float(fit_fast["lambda_eq"]) > 0.0)
+        if lam_ok:
+            return _method_payload(
+                lambda_equation=float(fit_fast["lambda_eq"]),
+                lambda_k=float(fit_fast["lambda_k"]),
+                n_sub_used=int(n_train),
+                repeats_used=1,
+                ok_repeats_used=1,
+                strategy="fast_reml",
+                vc_method="FaST/REML",
+                vc_sigma_g2=float(fit_fast["sigma_g2"]),
+                vc_sigma_e2=float(fit_fast["sigma_e2"]),
+                vc_pve=float(fit_fast["pve"]),
+            )
+
+    # 3) Subsample REML (many-sample + many-SNP)
     _emit(
         "pcg_lambda_subsample_start",
         total=int(repeats),
@@ -1895,6 +3091,10 @@ def _estimate_rrblup_lambda_subsample_reml(
         strategy="subsample_reml",
     )
     log10_vals: list[float] = []
+    sigma_g2_vals: list[float] = []
+    sigma_e2_vals: list[float] = []
+    pve_vals: list[float] = []
+    lam_k_vals: list[float] = []
     for rep in range(repeats):
         if n_sub >= n_train:
             local_idx = np.arange(n_train, dtype=np.int64)
@@ -1904,13 +3104,29 @@ def _estimate_rrblup_lambda_subsample_reml(
                 dtype=np.int64,
             )
             local_idx.sort()
+        fit_one = {
+            "lambda_k": float("nan"),
+            "lambda_eq": float("nan"),
+            "sigma_g2": float("nan"),
+            "sigma_e2": float("nan"),
+            "pve": float("nan"),
+        }
         try:
-            lam_sub_k, lam_sub_eq = _fit_once(local_idx)
+            fit_one = _fit_once_grm(local_idx)
         except Exception:
-            lam_sub_k = float("nan")
-            lam_sub_eq = float("nan")
+            pass
+        lam_sub_k = float(fit_one["lambda_k"])
+        lam_sub_eq = float(fit_one["lambda_eq"])
         if np.isfinite(lam_sub_eq) and lam_sub_eq > 0.0:
             log10_vals.append(float(np.log10(lam_sub_eq)))
+        if np.isfinite(lam_sub_k) and lam_sub_k > 0.0:
+            lam_k_vals.append(float(lam_sub_k))
+        if np.isfinite(float(fit_one["sigma_g2"])):
+            sigma_g2_vals.append(float(fit_one["sigma_g2"]))
+        if np.isfinite(float(fit_one["sigma_e2"])):
+            sigma_e2_vals.append(float(fit_one["sigma_e2"]))
+        if np.isfinite(float(fit_one["pve"])):
+            pve_vals.append(float(fit_one["pve"]))
         _emit(
             "pcg_lambda_subsample_iter",
             iter=int(rep + 1),
@@ -1930,18 +3146,51 @@ def _estimate_rrblup_lambda_subsample_reml(
             m_effective=int(m_effective),
             strategy="subsample_reml",
         )
-        return {
-            "lambda_equation": float("nan"),
-            "lambda_k": float("nan"),
-            "n_sub": int(n_sub),
-            "repeats": int(repeats),
-            "ok_repeats": 0,
-            "m_effective": int(m_effective),
-            "strategy": "subsample_reml_failed",
-        }
+        he_lam_eq = float(he_diag.get("lambda_he_raw_equation", np.nan))
+        he_lam_k = float(he_diag.get("lambda_he_raw_k", np.nan))
+        if np.isfinite(he_lam_eq) and he_lam_eq > 0.0:
+            return _method_payload(
+                lambda_equation=float(he_lam_eq),
+                lambda_k=float(he_lam_k) if np.isfinite(he_lam_k) else float("nan"),
+                n_sub_used=int(n_sub),
+                repeats_used=int(repeats),
+                ok_repeats_used=0,
+                strategy="he_fallback_subsample_reml_failed",
+                vc_method="HE",
+                vc_sigma_g2=float(he_diag.get("sigma_g2", np.nan)),
+                vc_sigma_e2=float(he_diag.get("sigma_e2", np.nan)),
+                vc_pve=float(he_diag.get("h2", np.nan)),
+            )
+        return _method_payload(
+            lambda_equation=float("nan"),
+            lambda_k=float("nan"),
+            n_sub_used=int(n_sub),
+            repeats_used=int(repeats),
+            ok_repeats_used=0,
+            strategy="subsample_reml_failed",
+            vc_method="Sub/REML",
+            vc_sigma_g2=float("nan"),
+            vc_sigma_e2=float("nan"),
+            vc_pve=float("nan"),
+        )
 
     lam_eq = float(10.0 ** float(np.median(np.asarray(log10_vals, dtype=np.float64))))
     lam_k = float(lam_eq / m_scale) if m_scale > 0.0 else float("nan")
+    vc_sigma_g2 = (
+        float(np.median(np.asarray(sigma_g2_vals, dtype=np.float64)))
+        if len(sigma_g2_vals) > 0
+        else float("nan")
+    )
+    vc_sigma_e2 = (
+        float(np.median(np.asarray(sigma_e2_vals, dtype=np.float64)))
+        if len(sigma_e2_vals) > 0
+        else float("nan")
+    )
+    vc_pve = (
+        float(np.median(np.asarray(pve_vals, dtype=np.float64)))
+        if len(pve_vals) > 0
+        else float("nan")
+    )
     _emit(
         "pcg_lambda_subsample_end",
         repeats=int(repeats),
@@ -1950,15 +3199,18 @@ def _estimate_rrblup_lambda_subsample_reml(
         m_effective=int(m_effective),
         strategy="subsample_reml",
     )
-    return {
-        "lambda_equation": float(lam_eq),
-        "lambda_k": float(lam_k),
-        "n_sub": int(n_sub),
-        "repeats": int(repeats),
-        "ok_repeats": int(len(log10_vals)),
-        "m_effective": int(m_effective),
-        "strategy": "subsample_reml",
-    }
+    return _method_payload(
+        lambda_equation=float(lam_eq),
+        lambda_k=float(lam_k),
+        n_sub_used=int(n_sub),
+        repeats_used=int(repeats),
+        ok_repeats_used=int(len(log10_vals)),
+        strategy="subsample_reml",
+        vc_method="Sub/REML",
+        vc_sigma_g2=float(vc_sigma_g2),
+        vc_sigma_e2=float(vc_sigma_e2),
+        vc_pve=float(vc_pve),
+    )
 
 
 def _cfg_truthy(value: typing.Any, *, default: bool = False) -> bool:
@@ -2532,6 +3784,58 @@ def _predict_bayes_packed_from_effects(
             )
             x64 = np.ascontiguousarray(np.asarray(x, dtype=np.float64), dtype=np.float64)
             pred += np.asarray(x64.T @ b[st:ed], dtype=np.float64).reshape(-1)
+        out[cst:ced] = pred
+    return np.asarray(out, dtype=np.float64).reshape(-1, 1)
+
+
+def _predict_bayes_packed_raw_from_effects(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    alpha0: float,
+    beta: np.ndarray,
+    row_block_size: int,
+    sample_chunk_size: int,
+) -> np.ndarray:
+    if _jxrs is None or (not hasattr(_jxrs, "bed_packed_decode_rows_f32")):
+        raise RuntimeError(
+            "Rust packed BED decode helper is unavailable. Rebuild/install JanusX extension."
+        )
+    sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+    n_out = int(sidx.shape[0])
+    if n_out == 0:
+        return np.zeros((0, 1), dtype=np.float64)
+
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
+    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
+    n_samples = int(packed_ctx["n_samples"])
+    row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+    m = int(packed.shape[0])
+    b = np.ascontiguousarray(np.asarray(beta, dtype=np.float64).reshape(-1), dtype=np.float64)
+    if int(b.shape[0]) != m:
+        raise ValueError(f"Bayes beta length mismatch: got {b.shape[0]}, expected {m}.")
+
+    out = np.zeros((n_out,), dtype=np.float64)
+    row_step = int(max(1, int(row_block_size)))
+    sample_step = int(max(1, int(sample_chunk_size)))
+    alpha = float(alpha0)
+    for cst in range(0, n_out, sample_step):
+        ced = min(cst + sample_step, n_out)
+        blk_idx = np.ascontiguousarray(sidx[cst:ced], dtype=np.int64)
+        pred = np.full((int(blk_idx.shape[0]),), alpha, dtype=np.float64)
+        for st in range(0, m, row_step):
+            ed = min(st + row_step, m)
+            ridx = np.ascontiguousarray(np.arange(st, ed, dtype=np.int64), dtype=np.int64)
+            x_blk = _jxrs.bed_packed_decode_rows_f32(  # type: ignore[union-attr]
+                packed,
+                int(n_samples),
+                ridx,
+                row_flip,
+                maf,
+                blk_idx,
+            )
+            x = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float64), dtype=np.float64)
+            pred += np.asarray(x.T @ b[st:ed], dtype=np.float64).reshape(-1)
         out[cst:ced] = pred
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
@@ -3356,14 +4660,51 @@ def GSapi(
             yhat_test = np.zeros((0, 1), dtype=float)
 
         pve = float("nan")
+        sigma_g2 = float("nan")
+        sigma_e2 = float("nan")
+        sigma_a2 = float("nan")
+        sigma_d2 = float("nan")
+        lambda_reml = float("nan")
         try:
             var = np.asarray(getattr(model, "var", []), dtype=float).reshape(-1)
             if var.size >= 2 and np.all(np.isfinite(var)):
                 den = float(np.sum(var))
                 if den > 0:
                     pve = float(np.sum(var[:-1]) / den)
+                    sigma_e2 = float(var[-1])
+                    if mode == "d":
+                        sigma_d2 = float(var[0])
+                        sigma_g2 = float(sigma_d2)
+                    else:
+                        sigma_a2 = float(var[0]) if int(var.size) >= 3 else float("nan")
+                        sigma_d2 = float(var[1]) if int(var.size) >= 3 else float("nan")
+                        sigma_g2 = float(np.sum(var[:-1]))
+                    if np.isfinite(sigma_g2) and sigma_g2 > 0.0 and np.isfinite(sigma_e2):
+                        lambda_reml = float(sigma_e2 / sigma_g2)
         except Exception:
             pve = float("nan")
+            sigma_g2 = float("nan")
+            sigma_e2 = float("nan")
+            sigma_a2 = float("nan")
+            sigma_d2 = float("nan")
+            lambda_reml = float("nan")
+        if gblup_runtime_state is not None:
+            gblup_runtime_state["variance_component_path"] = "grm"
+            gblup_runtime_state["variance_component"] = "REML/GRM"
+            gblup_runtime_state["backend"] = "pyBLUP/JAX"
+            gblup_runtime_state["kernel_mode"] = str(mode)
+            if np.isfinite(sigma_g2):
+                gblup_runtime_state["sigma_g2"] = float(sigma_g2)
+            if np.isfinite(sigma_e2):
+                gblup_runtime_state["sigma_e2"] = float(sigma_e2)
+            if np.isfinite(sigma_a2):
+                gblup_runtime_state["sigma_a2"] = float(sigma_a2)
+            if np.isfinite(sigma_d2):
+                gblup_runtime_state["sigma_d2"] = float(sigma_d2)
+            if np.isfinite(lambda_reml):
+                gblup_runtime_state["lambda_reml"] = float(lambda_reml)
+            if np.isfinite(pve):
+                gblup_runtime_state["h2"] = float(pve)
         return np.asarray(yhat_train, dtype=float), np.asarray(yhat_test, dtype=float), pve
 
     # Linear mixed models
@@ -3415,6 +4756,113 @@ def GSapi(
                 rrblup_progress_hook(str(event), dict(payload))
             except Exception:
                 return
+
+        def _sync_rrblup_he_state(
+            runtime_state: dict[str, typing.Any],
+            lambda_info: dict[str, typing.Any] | None,
+        ) -> None:
+            he_keys = (
+                "lambda_he_sigma_g2",
+                "lambda_he_sigma_e2",
+                "lambda_he_h2",
+                "lambda_he_converged",
+                "lambda_he_iters",
+                "lambda_he_rel_res",
+                "lambda_he_lambda_k",
+                "lambda_he_lambda_equation",
+                "lambda_he_raw_k",
+                "lambda_he_raw_equation",
+                "lambda_he_trace_samples_used",
+                "lambda_he_tr_k2",
+                "lambda_he_tr_k2_solve",
+                "lambda_he_y_ky",
+                "lambda_he_y_y",
+                "lambda_he_tr_k",
+                "lambda_he_tr_p",
+                "lambda_he_nnls_projected",
+                "lambda_he_boundary_status",
+                "lambda_he_accepted",
+                "lambda_he_reject_reason",
+                "lambda_he_error",
+                "lambda_vc_method",
+                "lambda_vc_sigma_g2",
+                "lambda_vc_sigma_e2",
+                "lambda_vc_pve",
+            )
+            if lambda_info is None:
+                for k in he_keys:
+                    runtime_state.pop(str(k), None)
+                return
+
+            def _set_float(dst: str, src: str) -> None:
+                raw = lambda_info.get(src, None)
+                if raw is None:
+                    runtime_state.pop(dst, None)
+                    return
+                try:
+                    val = float(raw)
+                except Exception:
+                    runtime_state.pop(dst, None)
+                    return
+                if np.isfinite(val):
+                    runtime_state[dst] = float(val)
+                else:
+                    runtime_state.pop(dst, None)
+
+            def _set_int(dst: str, src: str) -> None:
+                raw = lambda_info.get(src, None)
+                if raw is None:
+                    runtime_state.pop(dst, None)
+                    return
+                try:
+                    runtime_state[dst] = int(raw)
+                except Exception:
+                    runtime_state.pop(dst, None)
+
+            def _set_bool(dst: str, src: str) -> None:
+                raw = lambda_info.get(src, None)
+                if raw is None:
+                    runtime_state.pop(dst, None)
+                    return
+                runtime_state[dst] = bool(raw)
+
+            def _set_str(dst: str, src: str) -> None:
+                raw = lambda_info.get(src, None)
+                if raw is None:
+                    runtime_state.pop(dst, None)
+                    return
+                txt = str(raw).strip()
+                if txt == "":
+                    runtime_state.pop(dst, None)
+                else:
+                    runtime_state[dst] = txt
+
+            _set_float("lambda_he_sigma_g2", "sigma_g2")
+            _set_float("lambda_he_sigma_e2", "sigma_e2")
+            _set_float("lambda_he_h2", "h2")
+            _set_bool("lambda_he_converged", "he_converged")
+            _set_int("lambda_he_iters", "he_iters")
+            _set_float("lambda_he_rel_res", "he_rel_res")
+            _set_float("lambda_he_lambda_k", "lambda_he_lambda_k")
+            _set_float("lambda_he_lambda_equation", "lambda_he_lambda_equation")
+            _set_float("lambda_he_raw_k", "lambda_he_raw_k")
+            _set_float("lambda_he_raw_equation", "lambda_he_raw_equation")
+            _set_int("lambda_he_trace_samples_used", "trace_samples_used")
+            _set_float("lambda_he_tr_k2", "he_tr_k2")
+            _set_float("lambda_he_tr_k2_solve", "he_tr_k2_solve")
+            _set_float("lambda_he_y_ky", "he_y_ky")
+            _set_float("lambda_he_y_y", "he_y_y")
+            _set_float("lambda_he_tr_k", "he_tr_k")
+            _set_float("lambda_he_tr_p", "he_tr_p")
+            _set_bool("lambda_he_nnls_projected", "he_nnls_projected")
+            _set_str("lambda_he_boundary_status", "he_boundary_status")
+            _set_bool("lambda_he_accepted", "he_accepted")
+            _set_str("lambda_he_reject_reason", "he_reject_reason")
+            _set_str("lambda_he_error", "he_error")
+            _set_str("lambda_vc_method", "vc_method")
+            _set_float("lambda_vc_sigma_g2", "vc_sigma_g2")
+            _set_float("lambda_vc_sigma_e2", "vc_sigma_e2")
+            _set_float("lambda_vc_pve", "vc_pve")
 
         if _GS_DEBUG_STAGE:
             t_fit = time.time()
@@ -3523,6 +4971,10 @@ def GSapi(
                     os.getenv("JX_GBLUP_PACKED_BLOCK_ROWS", "4096")
                 )
                 gblup_block_rows = int(max(1, int(4096 if gblup_block_rows is None else gblup_block_rows)))
+                gblup_return_variance_components = bool(
+                    (gblup_runtime_state is not None)
+                    or _env_truthy("JX_GBLUP_PACKED_RETURN_VC", "0")
+                )
 
                 if _GS_DEBUG_STAGE:
                     rust_blas_before = get_rust_blas_threads()
@@ -3539,33 +4991,67 @@ def GSapi(
                     rayon_threads=1,
                 ):
                     rust_blas_in_stage = get_rust_blas_threads()
-                    (
-                        pred_train_raw,
-                        pred_test_raw,
-                        pve,
-                        _lambda_opt,
-                        _ml,
-                        _reml,
-                        _eigh_backend,
-                        _eigh_elapsed,
-                        _m_eff,
-                    ) = (
-                        _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
-                            source_prefix,
-                            train_abs,
-                            y_train_vec,
-                            test_abs,
-                            train_pred_local_arg,
-                            site_keep_arg,
-                            float(gblup_g_eps),
-                            float(gblup_reml_low),
-                            float(gblup_reml_high),
-                            int(gblup_reml_max_iter),
-                            float(gblup_reml_tol),
-                            int(gblup_block_rows),
-                            int(max(1, int(n_jobs))),
+                    try:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                            _sigma_g2,
+                            _sigma_e2,
+                        ) = (
+                            _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_train_vec,
+                                test_abs,
+                                train_pred_local_arg,
+                                site_keep_arg,
+                                float(gblup_g_eps),
+                                float(gblup_reml_low),
+                                float(gblup_reml_high),
+                                int(gblup_reml_max_iter),
+                                float(gblup_reml_tol),
+                                int(gblup_block_rows),
+                                int(max(1, int(n_jobs))),
+                                bool(gblup_return_variance_components),
+                            )
                         )
-                    )
+                    except TypeError:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                        ) = (
+                            _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_train_vec,
+                                test_abs,
+                                train_pred_local_arg,
+                                site_keep_arg,
+                                float(gblup_g_eps),
+                                float(gblup_reml_low),
+                                float(gblup_reml_high),
+                                int(gblup_reml_max_iter),
+                                float(gblup_reml_tol),
+                                int(gblup_block_rows),
+                                int(max(1, int(n_jobs))),
+                            )
+                        )
+                        _sigma_g2 = float("nan")
+                        _sigma_e2 = float("nan")
                 if gblup_runtime_state is not None:
                     _evd_backend_l = str(_eigh_backend).strip().lower()
                     _vc_path = (
@@ -3584,6 +5070,10 @@ def GSapi(
                     gblup_runtime_state["variance_component"] = (
                         "REML/FaST" if _vc_path == "fast" else "REML/GRM"
                     )
+                    if np.isfinite(float(_sigma_g2)):
+                        gblup_runtime_state["sigma_g2"] = float(_sigma_g2)
+                    if np.isfinite(float(_sigma_e2)):
+                        gblup_runtime_state["sigma_e2"] = float(_sigma_e2)
                 pred_train = (
                     np.zeros((0, 1), dtype=float)
                     if (not need_train_pred)
@@ -3702,6 +5192,7 @@ def GSapi(
                 rr_cfg = dict(rrblup_adamw_cfg or {})
                 lambda_raw = float(rr_cfg.get("lambda_value", 1.0))
                 lambda_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
+                stage_rayon_threads = int(max(1, int(n_jobs)))
                 if (not np.isfinite(lambda_raw)) or (lambda_raw < 0.0):
                     raise ValueError(f"rrBLUP lambda must be finite and >= 0, got {lambda_raw!r}.")
                 if lambda_scale not in {"equation", "mean-loss"}:
@@ -3802,29 +5293,37 @@ def GSapi(
                     except Exception:
                         return
                 pcg_progress_cb = _on_pcg_progress if rrblup_progress_hook is not None else None
-                pcg_progress_every = 1 if pcg_progress_cb is not None else 0
+                pcg_progress_every = (
+                    int(max(1, int(rr_cfg.get("pcg_progress_every", 8))))
+                    if pcg_progress_cb is not None
+                    else 0
+                )
                 try:
-                    rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
-                        source_prefix,
-                        train_abs,
-                        y_train_vec,
-                        test_abs,
-                        train_pred_local_arg,
-                        site_keep_arg,
-                        float(lambda_equation),
-                        float(pcg_tol),
-                        int(pcg_max_iter),
-                        int(pcg_block_rows),
-                        float(pcg_std_eps),
-                        int(max(1, int(n_jobs))),
-                        progress_callback=pcg_progress_cb,
-                        progress_every=int(pcg_progress_every),
-                        compute_trainvar=bool(pcg_compute_trainvar),
-                        packed=packed_arg,
-                        packed_n_samples=int(packed_n_samples),
-                        maf=maf_arg,
-                        row_flip=row_flip_arg,
-                    )
+                    with runtime_thread_stage(
+                        blas_threads=1,
+                        rayon_threads=int(stage_rayon_threads),
+                    ):
+                        rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            site_keep_arg,
+                            float(lambda_equation),
+                            float(pcg_tol),
+                            int(pcg_max_iter),
+                            int(pcg_block_rows),
+                            float(pcg_std_eps),
+                            int(max(1, int(n_jobs))),
+                            progress_callback=pcg_progress_cb,
+                            progress_every=int(pcg_progress_every),
+                            compute_trainvar=bool(pcg_compute_trainvar),
+                            packed=packed_arg,
+                            packed_n_samples=int(packed_n_samples),
+                            maf=maf_arg,
+                            row_flip=row_flip_arg,
+                        )
                 except TypeError:
                     _emit_rrblup_progress(
                         "pcg_callback_unavailable",
@@ -3835,20 +5334,24 @@ def GSapi(
                             "Current JanusX extension does not support direct packed rrBLUP-PCG "
                             "arguments, and packed context has no source_prefix for legacy fallback."
                         )
-                    rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
-                        source_prefix,
-                        train_abs,
-                        y_train_vec,
-                        test_abs,
-                        train_pred_local_arg,
-                        site_keep_arg_legacy,
-                        float(lambda_equation),
-                        float(pcg_tol),
-                        int(pcg_max_iter),
-                        int(pcg_block_rows),
-                        float(pcg_std_eps),
-                        int(max(1, int(n_jobs))),
-                    )
+                    with runtime_thread_stage(
+                        blas_threads=1,
+                        rayon_threads=int(stage_rayon_threads),
+                    ):
+                        rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            site_keep_arg_legacy,
+                            float(lambda_equation),
+                            float(pcg_tol),
+                            int(pcg_max_iter),
+                            int(pcg_block_rows),
+                            float(pcg_std_eps),
+                            int(max(1, int(n_jobs))),
+                        )
                 rr_out_t = tuple(rr_out)
                 beta_export = None
                 if len(rr_out_t) >= 10:
@@ -3923,6 +5426,9 @@ def GSapi(
                     rrblup_runtime_state["pcg_iters"] = int(pcg_iters)
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
                     rrblup_runtime_state["m_effective"] = int(m_eff)
+                    rrblup_runtime_state["thread_policy"] = "rayon_parallel_blas_serial"
+                    rrblup_runtime_state["stage_blas_threads"] = 1
+                    rrblup_runtime_state["stage_rayon_threads"] = int(stage_rayon_threads)
                     rrblup_runtime_state["lambda_equation"] = float(lambda_equation)
                     rrblup_runtime_state["selected_lambda"] = float(lambda_raw)
                     rrblup_runtime_state["lambda_source"] = str(lambda_source)
@@ -3937,56 +5443,7 @@ def GSapi(
                         rrblup_runtime_state["lambda_subsample_ok_repeats"] = int(
                             lambda_auto_info.get("ok_repeats", 0)
                         )
-                        auto_strategy = str(lambda_auto_info.get("strategy", "")).strip().lower()
-                        if auto_strategy.startswith("he"):
-                            rrblup_runtime_state["lambda_he_sigma_g2"] = float(
-                                lambda_auto_info.get("sigma_g2", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_sigma_e2"] = float(
-                                lambda_auto_info.get("sigma_e2", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_h2"] = float(
-                                lambda_auto_info.get("h2", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_converged"] = bool(
-                                lambda_auto_info.get("he_converged", False)
-                            )
-                            rrblup_runtime_state["lambda_he_iters"] = int(
-                                lambda_auto_info.get("he_iters", 0)
-                            )
-                            rrblup_runtime_state["lambda_he_rel_res"] = float(
-                                lambda_auto_info.get("he_rel_res", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_lambda_k"] = float(
-                                lambda_auto_info.get("lambda_k", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_lambda_equation"] = float(
-                                lambda_auto_info.get("lambda_equation", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_raw_k"] = float(
-                                lambda_auto_info.get("lambda_he_raw_k", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_raw_equation"] = float(
-                                lambda_auto_info.get("lambda_he_raw_equation", np.nan)
-                            )
-                            rrblup_runtime_state["lambda_he_trace_samples_used"] = int(
-                                lambda_auto_info.get("trace_samples_used", 0)
-                            )
-                        else:
-                            for k in (
-                                "lambda_he_sigma_g2",
-                                "lambda_he_sigma_e2",
-                                "lambda_he_h2",
-                                "lambda_he_converged",
-                                "lambda_he_iters",
-                                "lambda_he_rel_res",
-                                "lambda_he_lambda_k",
-                                "lambda_he_lambda_equation",
-                                "lambda_he_raw_k",
-                                "lambda_he_raw_equation",
-                                "lambda_he_trace_samples_used",
-                            ):
-                                rrblup_runtime_state.pop(str(k), None)
+                    _sync_rrblup_he_state(rrblup_runtime_state, lambda_auto_info)
                     rrblup_runtime_state["pve_mode_used"] = str(pve_mode)
                     rrblup_runtime_state["pve_used"] = float(pve)
                     rrblup_runtime_state["pve_lambda"] = float(pve_lambda)
@@ -4242,42 +5699,7 @@ def GSapi(
                 rrblup_runtime_state["epochs_ran"] = int(max(1, int(fit.get("epochs_ran", fit.get("best_epoch", 1)))))
                 rrblup_runtime_state["stopped_early"] = bool(fit.get("stopped_early", False))
                 rrblup_runtime_state["best_val_loss"] = float(fit.get("best_val_loss", np.nan))
-                if adamw_lambda_auto_info is not None:
-                    auto_strategy = str(adamw_lambda_auto_info.get("strategy", "")).strip().lower()
-                    if auto_strategy.startswith("he"):
-                        rrblup_runtime_state["lambda_he_sigma_g2"] = float(
-                            adamw_lambda_auto_info.get("sigma_g2", np.nan)
-                        )
-                        rrblup_runtime_state["lambda_he_sigma_e2"] = float(
-                            adamw_lambda_auto_info.get("sigma_e2", np.nan)
-                        )
-                        rrblup_runtime_state["lambda_he_h2"] = float(
-                            adamw_lambda_auto_info.get("h2", np.nan)
-                        )
-                        rrblup_runtime_state["lambda_he_converged"] = bool(
-                            adamw_lambda_auto_info.get("he_converged", False)
-                        )
-                        rrblup_runtime_state["lambda_he_iters"] = int(
-                            adamw_lambda_auto_info.get("he_iters", 0)
-                        )
-                        rrblup_runtime_state["lambda_he_rel_res"] = float(
-                            adamw_lambda_auto_info.get("he_rel_res", np.nan)
-                        )
-                    else:
-                        for k in (
-                            "lambda_he_sigma_g2",
-                            "lambda_he_sigma_e2",
-                            "lambda_he_h2",
-                            "lambda_he_converged",
-                            "lambda_he_iters",
-                            "lambda_he_rel_res",
-                            "lambda_he_lambda_k",
-                            "lambda_he_lambda_equation",
-                            "lambda_he_raw_k",
-                            "lambda_he_raw_equation",
-                            "lambda_he_trace_samples_used",
-                        ):
-                            rrblup_runtime_state.pop(str(k), None)
+                _sync_rrblup_he_state(rrblup_runtime_state, adamw_lambda_auto_info)
                 if len(trial_rows) > 0:
                     rrblup_runtime_state["auto_grid_trials"] = trial_rows
             if _GS_DEBUG_STAGE:
@@ -4484,6 +5906,62 @@ def GSapi(
             gblup_runtime_state["variance_component"] = (
                 "REML/FaST" if vc_path == "fast" else "REML/GRM"
             )
+            sigma_g2 = float("nan")
+            sigma_e2 = float("nan")
+            h2 = float("nan")
+            lambda_reml = float("nan")
+            try:
+                var = np.asarray(getattr(model, "var", []), dtype=float).reshape(-1)
+                if var.size >= 2 and np.all(np.isfinite(var)):
+                    sigma_g2 = float(np.sum(var[:-1]))
+                    sigma_e2 = float(var[-1])
+                    den = sigma_g2 + sigma_e2
+                    if np.isfinite(den) and den > 0.0:
+                        h2 = float(sigma_g2 / den)
+                    if np.isfinite(sigma_g2) and sigma_g2 > 0.0 and np.isfinite(sigma_e2):
+                        lambda_reml = float(sigma_e2 / sigma_g2)
+            except Exception:
+                sigma_g2 = float("nan")
+                sigma_e2 = float("nan")
+                h2 = float("nan")
+                lambda_reml = float("nan")
+            if (not np.isfinite(sigma_g2)) or (not np.isfinite(sigma_e2)):
+                # Packed/FaST paths in MLMBLUP may not populate `model.var`.
+                # Recover lambda from spectral V_inv and derive (sigma_g2, sigma_e2).
+                try:
+                    rtv_invr = float(getattr(model, "rTV_invr", np.nan))
+                    n_model = int(getattr(model, "n", int(Y.reshape(-1).shape[0])))
+                    p_model = int(getattr(model, "p", 1))
+                    n_eff_model = int(max(1, n_model - p_model))
+                    svals = np.asarray(getattr(model, "S", []), dtype=float).reshape(-1)
+                    v_inv = np.asarray(getattr(model, "V_inv", []), dtype=float).reshape(-1)
+                    lam = float("nan")
+                    if svals.size > 0 and v_inv.size == svals.size:
+                        eps_v = float(np.finfo(np.float64).eps)
+                        valid = np.isfinite(svals) & np.isfinite(v_inv) & (v_inv > eps_v)
+                        if np.any(valid):
+                            lam_cand = (1.0 / v_inv[valid]) - svals[valid]
+                            lam_cand = lam_cand[np.isfinite(lam_cand) & (lam_cand >= 0.0)]
+                            if lam_cand.size > 0:
+                                lam = float(np.median(lam_cand))
+                    if np.isfinite(rtv_invr) and rtv_invr > 0.0 and np.isfinite(lam) and lam >= 0.0:
+                        sigma_g2 = float(rtv_invr / float(max(1, n_eff_model)))
+                        sigma_e2 = float(lam * sigma_g2)
+                        den = sigma_g2 + sigma_e2
+                        if np.isfinite(den) and den > 0.0:
+                            h2 = float(sigma_g2 / den)
+                        if np.isfinite(sigma_g2) and sigma_g2 > 0.0 and np.isfinite(sigma_e2):
+                            lambda_reml = float(sigma_e2 / sigma_g2)
+                except Exception:
+                    pass
+            if np.isfinite(sigma_g2):
+                gblup_runtime_state["sigma_g2"] = float(sigma_g2)
+            if np.isfinite(sigma_e2):
+                gblup_runtime_state["sigma_e2"] = float(sigma_e2)
+            if np.isfinite(h2):
+                gblup_runtime_state["h2"] = float(h2)
+            if np.isfinite(lambda_reml):
+                gblup_runtime_state["lambda_reml"] = float(lambda_reml)
         if method == "rrBLUP":
             _set_rrblup_solver_state(str(resolved_rr_solver))
         if method == "rrBLUP" and rrblup_runtime_state is not None:
@@ -5466,6 +6944,14 @@ def _run_method_task(
                 rr_state_call: dict[str, typing.Any] | None = None
                 if method == "rrBLUP":
                     rr_cfg_call = dict(rrblup_cfg_base)
+                    rr_lambda_auto_strategy = str(
+                        rr_cfg_call.get("lambda_auto_strategy", "he_first")
+                    ).strip().lower()
+                    if rr_lambda_auto_strategy in {"he_first", "he_only"}:
+                        rr_cfg_call["he_enable"] = "on"
+                    else:
+                        # REML-first mode can keep fold-level HE disabled.
+                        rr_cfg_call["he_enable"] = "off"
                     if (
                         rrblup_cv_reuse_enabled
                         and rrblup_cv_selected is not None
@@ -5483,7 +6969,7 @@ def _run_method_task(
                 bayes_r2_call: float | None = None
                 bayes_state_call: dict[str, typing.Any] | None = None
                 bayes_r2_cache_key: str | None = None
-                if method == "GBLUP":
+                if _is_gblup_method(str(method)):
                     gblup_state_call = {}
                 if method == "rrBLUP" and rrblup_progress_hook is not None:
                     def _fold_rr_progress(event: str, payload: dict[str, typing.Any], *, _fold_id: int = int(fold_id), _cv_total: int = int(cv_total)) -> None:
@@ -5918,6 +7404,18 @@ def _run_method_task(
             "variance_component": "REML/GRM",
             "backend": ("packed active" if packed_payload is not None else "dense"),
         }
+        sigma_g2_fit = float(fit.get("sigma_g2", np.nan))
+        sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
+        lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
+        h2_fit = float(fit.get("pve", np.nan))
+        if np.isfinite(sigma_g2_fit):
+            gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
+        if np.isfinite(sigma_e2_fit):
+            gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+        if np.isfinite(lambda_reml_fit):
+            gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
+        if np.isfinite(h2_fit):
+            gblup_final_state["h2"] = float(h2_fit)
         _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_adamw_cfg
@@ -5960,7 +7458,7 @@ def _run_method_task(
                     if np.isfinite(cached_r2):
                         bayes_r2_final_call = float(cached_r2)
             bayes_state_final = {}
-        if method == "GBLUP":
+        if _is_gblup_method(str(method)):
             gblup_state_final = {}
         if bool(export_model) and _is_jxmodel_export_supported(method):
             model_state_call = {}
@@ -5993,7 +7491,7 @@ def _run_method_task(
         _emit_stage("predict_end", method=str(method), elapsed=0.0)
         if model_state_call is not None and len(model_state_call) > 0:
             model_state_final = dict(model_state_call)
-        if method == "GBLUP" and gblup_state_final is not None:
+        if _is_gblup_method(str(method)) and gblup_state_final is not None:
             gblup_final_state = dict(gblup_state_final)
         if method in {"BayesA", "BayesB", "BayesCpi"} and bayes_state_final is not None:
             r2_used_final = float(bayes_state_final.get("r2_used", np.nan))
@@ -6197,21 +7695,36 @@ def _predict_from_loaded_model_state(
         beta = np.asarray(model_state.get("beta", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1)
         block_rows = int(max(1, int(model_state.get("snp_block_size", 2048))))
         sample_chunk = int(max(1, int(model_state.get("sample_chunk_size", 4096))))
+        is_std = bool(model_state.get("standardized", True))
         if packed_ctx is not None and packed_sample_indices is not None:
-            row_mean = model_state.get("row_mean", None)
-            row_inv = model_state.get("row_inv_sd", None)
-            if row_mean is None or row_inv is None:
-                row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(packed_ctx)
-            else:
-                row_mean_arr = np.ascontiguousarray(
-                    np.asarray(row_mean, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
+            if is_std:
+                row_mean = model_state.get("row_mean", None)
+                row_inv = model_state.get("row_inv_sd", None)
+                if row_mean is None or row_inv is None:
+                    row_mean_arr, row_inv_arr = _ensure_packed_standard_stats_cached(packed_ctx)
+                else:
+                    row_mean_arr = np.ascontiguousarray(
+                        np.asarray(row_mean, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    row_inv_arr = np.ascontiguousarray(
+                        np.asarray(row_inv, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                return _predict_bayes_packed_from_effects(
+                    packed_ctx=packed_ctx,
+                    sample_indices=np.ascontiguousarray(
+                        np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    ),
+                    alpha0=alpha0,
+                    beta=beta,
+                    row_mean=row_mean_arr,
+                    row_inv_sd=row_inv_arr,
+                    snp_block_size=block_rows,
+                    sample_chunk_size=sample_chunk,
                 )
-                row_inv_arr = np.ascontiguousarray(
-                    np.asarray(row_inv, dtype=np.float32).reshape(-1),
-                    dtype=np.float32,
-                )
-            return _predict_bayes_packed_from_effects(
+            return _predict_bayes_packed_raw_from_effects(
                 packed_ctx=packed_ctx,
                 sample_indices=np.ascontiguousarray(
                     np.asarray(packed_sample_indices, dtype=np.int64).reshape(-1),
@@ -6219,9 +7732,7 @@ def _predict_from_loaded_model_state(
                 ),
                 alpha0=alpha0,
                 beta=beta,
-                row_mean=row_mean_arr,
-                row_inv_sd=row_inv_arr,
-                snp_block_size=block_rows,
+                row_block_size=block_rows,
                 sample_chunk_size=sample_chunk,
             )
         if dense_matrix is None:
@@ -6507,7 +8018,7 @@ def _run_methods_parallel(
                     vc_label = "REML/GRM"
                 else:
                     vc_label = "REML/FaST"
-            rows.append(("variance component", vc_label))
+            rows.append(("method", vc_label))
             if mode in {"d", "ad"}:
                 rows.append(("backend", "pyBLUP/JAX"))
             else:
@@ -6517,22 +8028,19 @@ def _run_methods_parallel(
                         ("packed active" if _looks_like_packed_payload(packed_ctx) else "dense"),
                     )
                 )
-                gblup_state = dict(
-                    typing.cast(
-                        dict[str, typing.Any] | None,
-                        result.get("gblup_final_state"),
-                    )
-                    or {}
-                )
-                eigh_backend = str(gblup_state.get("eigh_backend", "")).strip()
-                if eigh_backend != "":
-                    rows.append(("eigh backend", eigh_backend))
-                try:
-                    eigh_sec = float(gblup_state.get("eigh_sec", np.nan))
-                except Exception:
-                    eigh_sec = float("nan")
-                if np.isfinite(eigh_sec):
-                    rows.append(("eigh time", f"{eigh_sec:.3f}s"))
+            sigma_g2 = float(gblup_state.get("sigma_g2", np.nan))
+            sigma_e2 = float(gblup_state.get("sigma_e2", np.nan))
+            sigma_a2 = float(gblup_state.get("sigma_a2", np.nan))
+            sigma_d2 = float(gblup_state.get("sigma_d2", np.nan))
+            va = sigma_a2 if np.isfinite(sigma_a2) else sigma_g2
+            vd = sigma_d2 if np.isfinite(sigma_d2) else sigma_g2
+            def _fmt_var_or_na(x: float) -> str:
+                return f"{x:.6g}" if np.isfinite(x) else "NA"
+            if mode in {"a", "ad"}:
+                rows.append(("Va", _fmt_var_or_na(va)))
+            if mode in {"d", "ad"}:
+                rows.append(("Vd", _fmt_var_or_na(vd)))
+            rows.append(("Ve", _fmt_var_or_na(sigma_e2)))
             try:
                 pve_final = float(result.get("pve_final", np.nan))
             except Exception:
@@ -6564,22 +8072,8 @@ def _run_methods_parallel(
                     rr_state.get("solver", solver_req),
                 )
             ).strip().lower()
-            if solver_req != solver_used:
-                rows.append(("solver", f"{solver_req} -> {solver_used.upper()}"))
-            else:
-                rows.append(("solver", solver_used.upper()))
-            solver_fallback_reason = str(rr_state.get("solver_fallback_reason", "")).strip()
-            if solver_fallback_reason != "":
-                rows.append(("solver note", solver_fallback_reason))
-            lambda_source = str(rr_state.get("lambda_source", "")).strip()
-            if lambda_source != "":
-                rows.append(("lambda source", lambda_source))
 
             if solver_used == "pcg":
-                lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
-                if np.isfinite(lam_raw):
-                    lam_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
-                    rows.append(("lambda", f"{lam_raw:.6g} ({lam_scale})"))
                 rows.append(
                     (
                         "PCG",
@@ -6589,7 +8083,39 @@ def _run_methods_parallel(
                         ),
                     )
                 )
+                vc_method = str(rr_state.get("lambda_vc_method", "")).strip()
+                if vc_method == "":
+                    lam_src = str(rr_state.get("lambda_source", "")).strip().lower()
+                    if lam_src.startswith("he"):
+                        vc_method = "HE"
+                    elif "fast_reml" in lam_src:
+                        vc_method = "FaST/REML"
+                    elif "subsample" in lam_src:
+                        vc_method = "Sub/REML"
+                    elif lam_src != "":
+                        vc_method = "GRM/REML"
+                if vc_method != "":
+                    rows.append(("method", vc_method))
+                va = float(rr_state.get("lambda_vc_sigma_g2", np.nan))
+                ve = float(rr_state.get("lambda_vc_sigma_e2", np.nan))
+                pve_vc = float(rr_state.get("lambda_vc_pve", np.nan))
+                if not np.isfinite(pve_vc):
+                    pve_vc = float(rr_state.get("pve_used", np.nan))
+                rows.append(("Va", f"{va:.6g}" if np.isfinite(va) else "NA"))
+                rows.append(("Ve", f"{ve:.6g}" if np.isfinite(ve) else "NA"))
+                rows.append(("PVE", f"{pve_vc:.3f}" if np.isfinite(pve_vc) else "NA"))
+                return rows
             elif solver_used == "adamw":
+                if solver_req != solver_used:
+                    rows.append(("solver", f"{solver_req} -> {solver_used.upper()}"))
+                else:
+                    rows.append(("solver", solver_used.upper()))
+                solver_fallback_reason = str(rr_state.get("solver_fallback_reason", "")).strip()
+                if solver_fallback_reason != "":
+                    rows.append(("solver note", solver_fallback_reason))
+                lambda_source = str(rr_state.get("lambda_source", "")).strip()
+                if lambda_source != "":
+                    rows.append(("lambda source", lambda_source))
                 lam_raw = float(rr_state.get("selected_lambda", rr_cfg.get("lambda_value", np.nan)))
                 if np.isfinite(lam_raw):
                     lam_scale = str(rr_cfg.get("lambda_scale", "equation")).strip().lower()
@@ -6604,74 +8130,6 @@ def _run_methods_parallel(
                         ),
                     )
                 )
-
-            he_sigma_g2 = float(rr_state.get("lambda_he_sigma_g2", np.nan))
-            he_sigma_e2 = float(rr_state.get("lambda_he_sigma_e2", np.nan))
-            he_h2 = float(rr_state.get("lambda_he_h2", np.nan))
-            he_lambda_k = float(rr_state.get("lambda_he_raw_k", np.nan))
-            if (
-                (not np.isfinite(he_lambda_k))
-                and np.isfinite(he_sigma_g2)
-                and np.isfinite(he_sigma_e2)
-                and he_sigma_g2 > 0.0
-            ):
-                he_lambda_k = float(he_sigma_e2 / he_sigma_g2)
-            he_lambda_eq = float(rr_state.get("lambda_he_raw_equation", np.nan))
-            he_lambda_k_selected = float(rr_state.get("lambda_he_lambda_k", np.nan))
-            he_lambda_eq_selected = float(rr_state.get("lambda_he_lambda_equation", np.nan))
-            if np.isfinite(he_sigma_g2):
-                rows.append(("HE sigma_g2", f"{he_sigma_g2:.6g}"))
-            if np.isfinite(he_sigma_e2):
-                rows.append(("HE sigma_e2", f"{he_sigma_e2:.6g}"))
-            if np.isfinite(he_h2):
-                rows.append(("HE h2", f"{he_h2:.6g}"))
-            if np.isfinite(he_lambda_k):
-                rows.append(("HE lambda_k", f"{he_lambda_k:.6g}"))
-            if np.isfinite(he_lambda_eq):
-                rows.append(("HE lambda_eq", f"{he_lambda_eq:.6g}"))
-            if (
-                np.isfinite(he_lambda_eq_selected)
-                and np.isfinite(he_lambda_eq)
-                and abs(he_lambda_eq_selected - he_lambda_eq) > 1e-12
-            ):
-                rows.append(("HE selected lambda_k", f"{he_lambda_k_selected:.6g}"))
-                rows.append(("HE selected lambda_eq", f"{he_lambda_eq_selected:.6g}"))
-            if (
-                (not np.isfinite(he_sigma_g2))
-                and (not np.isfinite(he_sigma_e2))
-                and (not np.isfinite(he_h2))
-                and lambda_source != ""
-                and str(lambda_source).strip().lower().startswith("he")
-            ):
-                rows.append(("HE", f"NA (lambda_source={lambda_source})"))
-            he_converged_raw = rr_state.get("lambda_he_converged", None)
-            he_iters_raw = rr_state.get("lambda_he_iters", None)
-            he_rel_res = float(rr_state.get("lambda_he_rel_res", np.nan))
-            has_he_diag = (
-                (he_converged_raw is not None)
-                or (he_iters_raw is not None)
-                or np.isfinite(he_rel_res)
-            )
-            if has_he_diag:
-                he_diag_parts: list[str] = []
-                if he_converged_raw is not None:
-                    he_diag_parts.append(f"converged={int(bool(he_converged_raw))}")
-                if he_iters_raw is not None:
-                    try:
-                        he_diag_parts.append(f"iters={int(he_iters_raw)}")
-                    except Exception:
-                        pass
-                if np.isfinite(he_rel_res):
-                    he_diag_parts.append(f"rel_res={he_rel_res:.3e}")
-                he_trace_used = int(rr_state.get("lambda_he_trace_samples_used", 0))
-                if he_trace_used > 0:
-                    he_diag_parts.append(f"trace_samples={he_trace_used}")
-                if len(he_diag_parts) > 0:
-                    rows.append(("HE diag", ", ".join(he_diag_parts)))
-
-            pve_mode = str(rr_state.get("pve_mode_used", rr_cfg.get("pve_mode", "lambda"))).strip().lower()
-            if pve_mode != "":
-                rows.append(("PVE mode", pve_mode))
             return rows
 
         if m in {"BayesA", "BayesB", "BayesCpi"}:
@@ -10855,36 +12313,21 @@ def _run_gs_pipeline(
         except Exception:
             pass
     gblup_methods = [_gblup_mode_to_method(m) for m in gblup_modes]
-    # Policy: if user selected only GBLUP (without rrBLUP or other models),
-    # run rrBLUP path directly.
-    gblup_only_requested = bool(
-        (len(gblup_methods) > 0)
-        and (not bool(args.rrBLUP))
-        and (not bool(args.BayesA))
-        and (not bool(args.BayesB))
-        and (not bool(args.BayesCpi))
-        and (not bool(args.RF))
-        and (not bool(args.ET))
-        and (not bool(args.GBDT))
-        and (not bool(args.XGB))
-        and (not bool(args.SVM))
-        and (not bool(args.ENET))
-    )
-    if gblup_only_requested:
-        gblup_methods = []
-        args.rrBLUP = True
 
     rrblup_solver = str(args.rrblup_solver).strip().lower()
     rrblup_adamw_cfg: dict[str, typing.Any] = {
         "lambda_value": float(args.rrblup_lambda),
         "lambda_scale": str(args.rrblup_lambda_scale),
         "lambda_auto": str(args.rrblup_lambda_auto),
+        "lambda_auto_strategy": "he_first",
+        "he_enable": "on",
         "auto_pcg_min_n": int(args.rrblup_auto_pcg_min_n),
         "lambda_subsample_n": int(args.rrblup_lambda_subsample_n),
         "lambda_subsample_min_n": int(_RRBLUP_LAMBDA_SUBSAMPLE_MIN_N),
         "lambda_subsample_max_n": int(_RRBLUP_LAMBDA_SUBSAMPLE_MAX_N),
         "lambda_subsample_repeats": int(args.rrblup_lambda_subsample_repeats),
         "lambda_subsample_seed": int(args.rrblup_lambda_subsample_seed),
+        "lambda_large_cutoff": 15_000,
         "lr": float(args.rrblup_lr),
         "epochs": int(args.rrblup_epochs),
         "batch_size": int(args.rrblup_batch_size),
@@ -10914,6 +12357,7 @@ def _run_gs_pipeline(
         "pcg_tol": float(args.rrblup_pcg_tol),
         "pcg_max_iter": int(args.rrblup_pcg_max_iter),
         "pcg_std_eps": float(args.rrblup_pcg_std_eps),
+        "pcg_progress_every": 8,
         "pcg_block_rows": int(args.rrblup_snp_block_size),
     }
     bayes_auto_r2_cfg: dict[str, typing.Any] = {
@@ -10961,6 +12405,7 @@ def _run_gs_pipeline(
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, args.prefix)
+    gs_model_dir = os.path.join(args.out, f"{args.prefix}.gs.model")
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
     thread_capped = False
@@ -10977,6 +12422,7 @@ def _run_gs_pipeline(
     # Logger
     # ------------------------------------------------------------------
     os.makedirs(args.out, 0o755, exist_ok=True)
+    os.makedirs(gs_model_dir, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.gs.log"
     logger = setup_logging(log_path)
@@ -11000,6 +12446,7 @@ def _run_gs_pipeline(
             and _is_vcf_or_hmp_like_input(str(gfile))
         )
     )
+    input_cacheable_requested = bool(input_vcf_hmp_requested or file_input_requested)
     file_memmap_preferred = bool(
         file_input_requested
         and (
@@ -11008,13 +12455,6 @@ def _run_gs_pipeline(
             or str(gfile).strip().lower().endswith(".bin")
         )
     )
-    if file_memmap_preferred and rr_solver_mode == "pcg":
-        rrblup_solver = "auto"
-        rr_solver_mode = "auto"
-        logger.warning(
-            "rrBLUP solver=pcg is unavailable for FILE memmap inputs; "
-            "falling back to solver=auto (non-packed backend)."
-        )
     pcg_requested = bool(
         bool(args.rrBLUP) and (rr_solver_mode == "pcg")
     )
@@ -11023,6 +12463,14 @@ def _run_gs_pipeline(
     gblup_nonadd_requested = bool(any(m in {"d", "ad"} for m in gblup_modes))
     bayes_requested = bool(bool(args.BayesA) or bool(args.BayesB) or bool(args.BayesCpi))
     packed_model_requested = bool(gblup_add_requested or bool(args.rrBLUP) or bayes_requested)
+    if file_memmap_preferred and rr_solver_mode == "pcg" and (not packed_model_requested):
+        rrblup_solver = "auto"
+        rr_solver_mode = "auto"
+        logger.warning(
+            "rrBLUP solver=pcg is unavailable for FILE memmap inputs without packed Rust models; "
+            "falling back to solver=auto."
+        )
+        pcg_requested = False
     packed_only_requested = bool(
         packed_model_requested
         and (not gblup_nonadd_requested)
@@ -11041,7 +12489,7 @@ def _run_gs_pipeline(
         (not gfile_is_plink)
         and _cfg_truthy(getattr(args, "packed_lmm_auto", "on"), default=True)
         and packed_only_requested
-        and input_vcf_hmp_requested
+        and input_cacheable_requested
     ):
         # For Bayes on VCF/HMP inputs, prefer packed path by default to avoid
         # dense genotype peak memory. Keep legacy size-threshold probing for
@@ -11072,7 +12520,7 @@ def _run_gs_pipeline(
         and bool(args.rrBLUP)
         and (rr_solver_mode == "auto")
         and (not gfile_is_plink)
-        and input_vcf_hmp_requested
+        and input_cacheable_requested
     ):
         if probe_n_samples is None:
             try:
@@ -11093,14 +12541,14 @@ def _run_gs_pipeline(
     pcg_packed_preprocess_requested = bool(
         (not gfile_is_plink)
         and pcg_requested
-        and input_vcf_hmp_requested
+        and input_cacheable_requested
     )
     hard_packed_preprocess_requested = bool(
         manual_packed_preprocess_requested or pcg_packed_preprocess_requested
     )
-    always_packed_for_vcf_hmp = bool(input_vcf_hmp_requested)
+    always_packed_for_cacheable = bool(input_cacheable_requested and packed_model_requested)
     packed_preprocess_requested = bool(
-        hard_packed_preprocess_requested or auto_packed_lmm_requested or always_packed_for_vcf_hmp
+        hard_packed_preprocess_requested or auto_packed_lmm_requested or always_packed_for_cacheable
     )
 
     checks: list[bool] = []
@@ -11368,9 +12816,8 @@ def _run_gs_pipeline(
                         str(gfile),
                         snps_only=False,
                         delimiter=None,
-                        # GS FILE-input policy keeps TXT/TSV/CSV on NPY+memmap path.
-                        # VCF/HMP still resolve to PLINK BED cache in prepare_cli_input_cache.
-                        prefer_plink_for_txt=False,
+                        # Prefer PLINK cache for GS packed Rust routes, including FILE inputs.
+                        prefer_plink_for_txt=True,
                     )
                 except Exception as ex:
                     if hard_packed_preprocess_requested:
@@ -11401,9 +12848,8 @@ def _run_gs_pipeline(
                         logger.error(
                             "--hash/--ldprune require PLINK BED input. "
                             "Auto-cache to PLINK is supported for -vcf/-hmp and for -file "
-                            "when source resolves to VCF/HMP/TXT. "
-                            f"Current input could not be converted to BED: {cached_prefix}. "
-                            "For -file inputs backed by .npy/.bin, please convert to -bfile first."
+                            "when source resolves to VCF/HMP/TXT/NPY/BIN. "
+                            f"Current input could not be converted to BED: {cached_prefix}."
                         )
                         raise SystemExit(1)
                     task.complete("Preparing PLINK cache for packed GS ...Skipped (fallback dense)")
@@ -12189,6 +13635,9 @@ def _run_gs_pipeline(
     trait_order = [str(x) for x in list(pheno.columns)]
     gs_summary_rows: list[dict[str, typing.Any]] = []
     saved_result_paths: list[str] = []
+    exported_model_artifacts: list[dict[str, typing.Any]] = []
+    trait_method_summary: dict[str, dict[str, dict[str, typing.Any]]] = {}
+    run_started_unix = float(time.time())
     top_trait_selected_method: dict[str, str] = {}
     top_trait_metric_scores: dict[str, dict[str, dict[str, float]]] = {}
     top_train_ids_by_trait: dict[str, np.ndarray] = {}
@@ -12829,6 +14278,7 @@ def _run_gs_pipeline(
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
         expected_test_n = int(np.sum(testmask))
         pred_by_method: dict[str, np.ndarray] = {}
+        trait_method_summary[str(trait_name)] = {}
 
         def _emit_method_header(method_key: str) -> None:
             m_key = str(method_key)
@@ -12927,9 +14377,22 @@ def _run_gs_pipeline(
                 gblup_pve=float(res_obj.get("pve_final", np.nan)),
             )
 
+            model_out_export: str | None = None
+            effect_out_export: str | None = None
+            effect_meta: dict[str, typing.Any] | None = None
+            model_export_meta: dict[str, typing.Any] | None = None
             if (args.model is None) and (not top_enabled) and _is_jxmodel_export_supported(m_key):
                 state_raw = res_obj.get("model_state", None)
                 if isinstance(state_raw, dict) and len(state_raw) > 0:
+                    packed_ctx_for_export = (
+                        typing.cast(dict[str, typing.Any], trait_packed_ctx)
+                        if _looks_like_packed_payload(trait_packed_ctx)
+                        else None
+                    )
+                    state_export, model_export_meta = _prepare_model_state_for_export_raw_012(
+                        model_state=dict(state_raw),
+                        packed_ctx=packed_ctx_for_export,
+                    )
                     payload = {
                         "format": _JXMODEL_FORMAT,
                         "method": str(m_key),
@@ -12937,14 +14400,56 @@ def _run_gs_pipeline(
                         "trait": str(trait_name),
                         "created_at_unix": float(time.time()),
                         "pve_final": float(res_obj.get("pve_final", np.nan)),
-                        "model_state": dict(state_raw),
+                        "model_state": dict(state_export),
+                        "export_scale_meta": dict(model_export_meta or {}),
                     }
-                    model_out = f"{outprefix}.{trait_name}.gs.{m_key}.jxmodel"
+                    model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
                     _save_jxmodel(model_out, payload)
                     saved_result_paths.append(str(model_out))
-                    log_success(
-                        logger,
-                        f"Saved model to {format_path_for_display(model_out)}\n",
+                    model_out_export = str(model_out)
+                    effect_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.effect.tsv")
+                    try:
+                        fallback_marker_count = None
+                        if _looks_like_packed_payload(trait_packed_ctx):
+                            fallback_marker_count = int(
+                                np.asarray(
+                                    typing.cast(dict[str, typing.Any], trait_packed_ctx)["packed"]
+                                ).shape[0]
+                            )
+                        elif train_snp is not None:
+                            fallback_marker_count = int(np.asarray(train_snp).shape[0])
+                        effect_meta = _write_method_effect_tsv(
+                            out_path=effect_out,
+                            model_state=dict(state_export),
+                            packed_ctx=packed_ctx_for_export,
+                            genotype_prefix_hint=(str(gfile) if _is_plink_prefix(_strip_plink_suffix(str(gfile))) else None),
+                            fallback_marker_count=fallback_marker_count,
+                        )
+                        saved_result_paths.append(str(effect_out))
+                        effect_out_export = str(effect_out)
+                    except Exception as ex:
+                        logger.warning(
+                            f"Effect export failed for trait={trait_name}, method={m_key}: {ex}"
+                        )
+                        effect_meta = {
+                            "effect_file": str(effect_out),
+                            "rows": 0,
+                            "beta_available": False,
+                            "beta_source": "export_failed",
+                            "beta_non_nan_rows": 0,
+                            "beta_scale": "unknown",
+                            "metadata_source": "unknown",
+                            "notes": [f"export_failed: {ex}"],
+                        }
+                    exported_model_artifacts.append(
+                        {
+                            "trait": str(trait_name),
+                            "method": str(m_key),
+                            "model_file": str(model_out_export or ""),
+                            "effect_file": str(effect_out_export or ""),
+                            "model_export_meta": dict(model_export_meta or {}),
+                            "effect_meta": dict(effect_meta or {}),
+                        }
                     )
                 else:
                     logger.warning(
@@ -12973,6 +14478,54 @@ def _run_gs_pipeline(
                 index=samples[testmask],
             )
             outpred_partial.to_csv(out_tsv, sep="\t", float_format="%.4f")
+
+            detail_rows_safe: list[dict[str, str]] = []
+            for row in list(
+                typing.cast(
+                    list[tuple[str, str]] | None,
+                    res_obj.get("method_detail_rows"),
+                )
+                or []
+            ):
+                if len(row) >= 2:
+                    detail_rows_safe.append(
+                        {"name": str(row[0]), "value": str(row[1])}
+                    )
+            fold_rows_safe: list[dict[str, typing.Any]] = []
+            for row in list(res_obj.get("fold_rows", []) or []):
+                if len(row) < 7:
+                    continue
+                fold_rows_safe.append(
+                    {
+                        "method": str(row[0]),
+                        "fold": int(row[1]),
+                        "pearson": float(row[2]),
+                        "spearman": float(row[3]),
+                        "r2": float(row[4]),
+                        "pve": float(row[5]),
+                        "elapsed_sec": float(row[6]),
+                    }
+                )
+            trait_method_summary[str(trait_name)][str(m_key)] = {
+                "method_display": str(m_disp),
+                "cv_mode": str(res_obj.get("cv_mode", "train_cv")),
+                "elapsed_total_sec": float(res_obj.get("elapsed_total_sec", np.nan)),
+                "elapsed_cv_sec": float(res_obj.get("elapsed_cv_sec", np.nan)),
+                "elapsed_fit_sec": float(res_obj.get("elapsed_fit_sec", np.nan)),
+                "elapsed_predict_sec": float(res_obj.get("elapsed_predict_sec", np.nan)),
+                "pve_final": float(res_obj.get("pve_final", np.nan)),
+                "gblup_final_state": dict(
+                    typing.cast(dict[str, typing.Any] | None, res_obj.get("gblup_final_state")) or {}
+                ),
+                "rrblup_pve_final": dict(
+                    typing.cast(dict[str, typing.Any] | None, res_obj.get("rrblup_pve_final")) or {}
+                ),
+                "method_details": detail_rows_safe,
+                "fold_rows": fold_rows_safe,
+                "model_file": (str(model_out_export) if model_out_export is not None else None),
+                "effect_file": (str(effect_out_export) if effect_out_export is not None else None),
+                "effect_meta": (dict(effect_meta) if isinstance(effect_meta, dict) else None),
+            }
 
         method_train_sample_idx = np.ascontiguousarray(train_sample_idx, dtype=np.int64)
         method_test_sample_idx = np.ascontiguousarray(test_sample_idx, dtype=np.int64)
@@ -13553,7 +15106,7 @@ def _run_gs_pipeline(
                     "model_state": dict(top_trait_model_state.get(str(trait), {})),
                 }
 
-            top_weights_out = f"{outprefix}.gs.TOP.weights.tsv"
+            top_weights_out = os.path.join(gs_model_dir, f"{args.prefix}.gs.TOP.weights.tsv")
             pd.DataFrame(top_metrics_rows).to_csv(
                 top_weights_out,
                 sep="\t",
@@ -13564,7 +15117,7 @@ def _run_gs_pipeline(
             log_success(logger, f"Saved TOP weights to {format_path_for_display(top_weights_out)}")
 
             if not model_mode:
-                top_model_out = f"{outprefix}.gs.TOP.jxmodel"
+                top_model_out = os.path.join(gs_model_dir, f"{args.prefix}.gs.TOP.jxmodel")
                 _save_jxmodel(
                     top_model_out,
                     {
@@ -13651,6 +15204,67 @@ def _run_gs_pipeline(
                     saved_result_paths.append(str(top_rank_out))
                     log_success(logger, f"Saved TOP rank to {format_path_for_display(top_rank_out)}")
 
+    run_finished_unix = float(time.time())
+    summary_out = os.path.join(gs_model_dir, "summary.json")
+    ordered_saved_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
+    result_files_for_summary = _order_gs_saved_result_paths(
+        ordered_saved_paths + [str(summary_out)]
+    )
+    method_display_requested = [str(_method_display_name(str(x))) for x in methods]
+    summary_payload: dict[str, typing.Any] = {
+        "format": "janusx.gs.summary.v1",
+        "created_at_unix": run_finished_unix,
+        "created_at_local": time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(run_finished_unix)),
+        "started_at_unix": float(run_started_unix),
+        "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(run_started_unix)),
+        "elapsed_sec": float(max(run_finished_unix - t_start, 0.0)),
+        "prefix": str(args.prefix),
+        "output_dir": str(args.out),
+        "outprefix": str(outprefix),
+        "model_dir": str(gs_model_dir),
+        "genotype_input": str(gfile),
+        "phenotype_input": str(args.pheno),
+        "log_file": str(log_path),
+        "traits": [str(x) for x in trait_order],
+        "methods_requested": [str(x) for x in methods],
+        "methods_display": method_display_requested,
+        "summary_rows": [dict(x) for x in gs_summary_rows],
+        "trait_method_details": dict(trait_method_summary),
+        "top_enabled": bool(top_enabled),
+        "top_selected_by_trait": dict(top_trait_selected_method),
+        "model_artifacts": list(exported_model_artifacts),
+        "result_files": result_files_for_summary,
+        "resource": {
+            "memory_peak_rss": None,
+            "memory_note": "Not collected yet in GS workflow.",
+        },
+        "usage": {
+            "model_directory": str(gs_model_dir),
+            "single_trait_model_file_pattern": "{trait}.{method}.jxmodel",
+            "effect_file_pattern": "{trait}.{method}.effect.tsv",
+            "summary_file": "summary.json",
+            "loaded_model_hint": (
+                "Use --model <model_dir> with the target trait and method. "
+                "Both new ({trait}.{method}.jxmodel) and legacy (*.gs.{method}.jxmodel) names are supported."
+            ),
+        },
+    }
+    try:
+        os.makedirs(gs_model_dir, exist_ok=True)
+        with open(summary_out, "w", encoding="utf-8") as sfh:
+            json.dump(_json_safe(summary_payload), sfh, indent=2, ensure_ascii=False)
+        saved_result_paths = list(result_files_for_summary)
+        log_success(logger, f"Saved GS summary to {format_path_for_display(summary_out)}")
+    except Exception as ex:
+        logger.warning(f"Failed to write GS summary.json: {ex}")
+    saved_result_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
+    if len(saved_result_paths) > 0:
+        logger.info("")
+        saved_body = "\n".join(
+            [f"  {format_path_for_display(str(p))}" for p in saved_result_paths]
+        )
+        log_success(logger, f"Results saved:\n{saved_body}")
+
     # ----------------------------------------------------------------------
     # Final summary
     # ----------------------------------------------------------------------
@@ -13667,6 +15281,8 @@ def _run_gs_pipeline(
             "error": "",
             "genofile": str(gfile),
             "outprefix": str(outprefix),
+            "model_dir": str(gs_model_dir),
+            "summary_json": str(summary_out),
             "log_file": str(log_path),
             "summary_rows": [dict(x) for x in gs_summary_rows],
             "result_files": [str(x) for x in saved_result_paths],

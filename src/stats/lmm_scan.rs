@@ -566,17 +566,8 @@ pub fn ai_reml_null_f64<'py>(
         Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
     };
 
-    let out = ai_reml_null_from_spectral(
-        s,
-        &xcov_flat,
-        y,
-        n,
-        p_cov,
-        max_iter,
-        tol,
-        min_var,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let out = ai_reml_null_from_spectral(s, &xcov_flat, y, n, p_cov, max_iter, tol, min_var)
+        .map_err(PyRuntimeError::new_err)?;
 
     Ok((
         out.lbd,

@@ -228,10 +228,16 @@ pub fn ai_reml_null_from_spectral(
     min_var: f64,
 ) -> Result<AiRemlNullResult, String> {
     if y.len() != n {
-        return Err(format!("ai_reml_null_from_spectral: y length mismatch: got {}, expected {n}", y.len()));
+        return Err(format!(
+            "ai_reml_null_from_spectral: y length mismatch: got {}, expected {n}",
+            y.len()
+        ));
     }
     if s.len() != n {
-        return Err(format!("ai_reml_null_from_spectral: s length mismatch: got {}, expected {n}", s.len()));
+        return Err(format!(
+            "ai_reml_null_from_spectral: s length mismatch: got {}, expected {n}",
+            s.len()
+        ));
     }
     if xcov.len() != n.saturating_mul(p_cov) {
         return Err(format!(
@@ -258,7 +264,11 @@ pub fn ai_reml_null_from_spectral(
     } else {
         1e-12
     };
-    let tol = if tol.is_finite() && tol > 0.0 { tol } else { 1e-6 };
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-6
+    };
 
     let mean_y = y.iter().copied().sum::<f64>() / (n as f64);
     let mut var_y = 0.0_f64;

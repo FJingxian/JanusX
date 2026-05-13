@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 pub(crate) struct PcgResultF32 {
     pub(crate) x: Vec<f32>,
     pub(crate) converged: bool,
@@ -5,12 +7,21 @@ pub(crate) struct PcgResultF32 {
     pub(crate) rel_res: f64,
 }
 
+const PCG_PAR_THRESHOLD: usize = 16_384;
+
 #[inline]
 fn dot_f32_f64(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (*x as f64) * (*y as f64))
-        .sum()
+    if a.len() >= PCG_PAR_THRESHOLD {
+        a.par_iter()
+            .zip(b.par_iter())
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum()
+    } else {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum()
+    }
 }
 
 pub(crate) fn pcg_solve_f32<FA, FM, FO>(
@@ -70,9 +81,19 @@ where
         }
         let alpha = rz_old / denom;
         let alpha32 = alpha as f32;
-        for j in 0..m {
-            x[j] += alpha32 * p[j];
-            r[j] -= alpha32 * ap[j];
+        if m >= PCG_PAR_THRESHOLD {
+            x.par_iter_mut()
+                .zip(r.par_iter_mut())
+                .zip(p.par_iter().zip(ap.par_iter()))
+                .for_each(|((xj, rj), (pj, apj))| {
+                    *xj += alpha32 * *pj;
+                    *rj -= alpha32 * *apj;
+                });
+        } else {
+            for j in 0..m {
+                x[j] += alpha32 * p[j];
+                r[j] -= alpha32 * ap[j];
+            }
         }
         rel_res = (dot_f32_f64(&r, &r).sqrt() / denom_b).max(0.0_f64);
         iters_done = it + 1;
@@ -89,8 +110,14 @@ where
         }
         let beta_cg = rz_new / rz_old.max(tiny_use);
         let beta32 = beta_cg as f32;
-        for j in 0..m {
-            p[j] = z[j] + beta32 * p[j];
+        if m >= PCG_PAR_THRESHOLD {
+            p.par_iter_mut()
+                .zip(z.par_iter())
+                .for_each(|(pj, zj)| *pj = *zj + beta32 * *pj);
+        } else {
+            for j in 0..m {
+                p[j] = z[j] + beta32 * p[j];
+            }
         }
         rz_old = rz_new;
     }

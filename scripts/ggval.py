@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -453,6 +454,177 @@ def full_flow(outdir: Path, postgs_enabled: bool) -> None:
     sep()
 
 
+def _parse_grm_kernel_backend(log_path: Path) -> str:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(
+        r"GRM \(Effective SNPs:\s*\d+,\s*([^)]+)\)\s*\.\.\.Finished",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return str(m.group(1)).strip()
+    if re.search(r"memmap.*fallback.*packed", text, flags=re.IGNORECASE):
+        return "packed-bed kernel (fallback)"
+    if re.search(r"memmap", text, flags=re.IGNORECASE):
+        return "rust-memmap kernel"
+    if re.search(r"packed", text, flags=re.IGNORECASE):
+        return "packed-bed kernel"
+    return "unknown"
+
+
+def backend_thread_checks(outdir: Path) -> None:
+    nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
+    step(
+        "STEP 4. Backend report and 1-core/all-core timing checks "
+        f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
+    )
+    sim_prefix = outdir / "__ggval_tmp_large_sim"
+    full_cores = max(1, int(os.cpu_count() or 1))
+
+    use_local_py = env_str("JX_GGVAL_USE_LOCAL_PYTHON", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if use_local_py:
+        py_root = ROOT_DIR / "python"
+        if str(py_root) not in sys.path:
+            sys.path.insert(0, str(py_root))
+    else:
+        root_resolved = str(ROOT_DIR.resolve())
+        py_root_resolved = str((ROOT_DIR / "python").resolve())
+        cleaned: list[str] = []
+        for p in sys.path:
+            p_norm = p if p != "" else os.getcwd()
+            try:
+                p_resolved = str(Path(p_norm).resolve())
+            except Exception:
+                p_resolved = str(p_norm)
+            if p_resolved in {root_resolved, py_root_resolved}:
+                continue
+            cleaned.append(p)
+        sys.path[:] = cleaned
+    try:
+        import janusx  # type: ignore
+        from janusx import janusx as jxrs  # type: ignore
+    except Exception as ex:  # pragma: no cover - runtime environment dependent
+        if not use_local_py:
+            py_root = ROOT_DIR / "python"
+            if str(py_root) not in sys.path:
+                sys.path.insert(0, str(py_root))
+            try:
+                import janusx  # type: ignore
+                from janusx import janusx as jxrs  # type: ignore
+                print("NOTE: janusx site-packages import failed; fallback to local python/janusx.")
+            except Exception as ex2:
+                fail(f"Unable to import janusx Rust module for backend checks: {ex2} (initial error: {ex})")
+        else:
+            fail(f"Unable to import janusx Rust module for backend checks: {ex}")
+    print(f"JANUSX module path       : {str(getattr(jxrs, '__file__', '?'))}")
+    print(f"JANUSX package path      : {str(getattr(janusx, '__file__', '?'))}")
+
+    def _find_grm_for_prefix(prefix_path: Path) -> Path:
+        base = str(prefix_path)
+        candidates = [
+            Path(f"{base}.cGRM.npy"),
+            Path(f"{base}.grm.npy"),
+            Path(f"{base}.cGRM.txt"),
+            Path(f"{base}.grm.txt"),
+        ]
+        return require_any_file("GRM benchmark output missing", candidates)
+
+    def _cleanup_tmp_outputs() -> None:
+        pattern = f"{sim_prefix.name}*"
+        for p in outdir.glob(pattern):
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink()
+            except FileNotFoundError:
+                pass
+
+    _cleanup_tmp_outputs()
+    try:
+        run(["jx", "sim", str(nsnp_k), str(n_individuals), str(sim_prefix)])
+        bfile_prefix = sim_prefix
+        require_file(bfile_prefix.with_suffix(".bed"), "Simulated BED output missing")
+        require_file(bfile_prefix.with_suffix(".bim"), "Simulated BIM output missing")
+        require_file(bfile_prefix.with_suffix(".fam"), "Simulated FAM output missing")
+
+        def run_grm_once(threads: int) -> tuple[float, str, Path]:
+            prefix = f"{sim_prefix.name}.grmbench.t{int(threads)}"
+            t0 = time.perf_counter()
+            run(
+                [
+                    "jx",
+                    "grm",
+                    "-bfile",
+                    str(bfile_prefix),
+                    "-t",
+                    str(int(threads)),
+                    "-o",
+                    str(outdir),
+                    "-prefix",
+                    prefix,
+                    "-npy",
+                ]
+            )
+            elapsed = time.perf_counter() - t0
+            log_path = outdir / f"{prefix}.grm.log"
+            require_file(log_path, "GRM benchmark log missing")
+            backend = _parse_grm_kernel_backend(log_path)
+            grm_file = _find_grm_for_prefix(outdir / prefix)
+            return elapsed, backend, grm_file
+
+        grm_t1, grm_backend_1, grm_file = run_grm_once(1)
+        grm_tn, grm_backend_n, _ = run_grm_once(full_cores)
+        if grm_backend_1 == grm_backend_n:
+            print(f"GRM build backend        : {grm_backend_n}")
+        else:
+            print(
+                "GRM build backend        : "
+                f"1-core={grm_backend_1}, {full_cores}-core={grm_backend_n}"
+            )
+
+        eigh_backend = str(jxrs.rust_eigh_lapack_backend()).strip()
+        print(f"EIGH backend             : {eigh_backend}")
+
+        def run_eigh_once(threads: int) -> tuple[float, str]:
+            t0 = time.perf_counter()
+            ret = jxrs.rust_eigh_from_matrix_file_f64(
+                str(grm_file),
+                threads=int(threads),
+                driver="auto",
+                jobz="N",
+                require_lapack=False,
+            )
+            elapsed = time.perf_counter() - t0
+            evd_backend = str(ret[3]).strip()
+            return elapsed, evd_backend
+
+        eigh_t1, eigh_run_backend_1 = run_eigh_once(1)
+        eigh_tn, eigh_run_backend_n = run_eigh_once(full_cores)
+        if eigh_run_backend_1 == eigh_run_backend_n:
+            print(f"EIGH solve backend       : {eigh_run_backend_1}")
+        else:
+            print(
+                "EIGH solve backend       : "
+                f"1-core={eigh_run_backend_1}, {full_cores}-core={eigh_run_backend_n}"
+            )
+
+        print(f"EIGH runtime  (1 core)   : {eigh_t1:.3f}s")
+        print(f"EIGH runtime  ({full_cores} cores): {eigh_tn:.3f}s")
+        print(f"GRM runtime   (1 core)   : {grm_t1:.3f}s")
+        print(f"GRM runtime   ({full_cores} cores): {grm_tn:.3f}s")
+    finally:
+        _cleanup_tmp_outputs()
+    sep()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cross-platform JanusX validation runner.",
@@ -511,6 +683,7 @@ def main() -> int:
         smoke_flow(outdir, logdir, args.threads, args.cv)
     else:
         full_flow(outdir, postgs_enabled=not args.no_postgs)
+    backend_thread_checks(outdir)
 
     step("Validation completed")
     print(f"Mode      : {args.mode}")

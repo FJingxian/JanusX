@@ -76,6 +76,7 @@ try:
 except Exception:
     _sp_erfc = None
 import psutil
+import janusx as jx_pkg
 from janusx.gfreader import (
     load_genotype_chunks,
     inspect_genotype_file,
@@ -2791,21 +2792,54 @@ def _gwas_eigh_from_grm(
     -------
     eigvals, eigvecs, backend_label, elapsed_seconds
     """
-    g0 = np.asarray(grm, dtype=np.float64)
-    if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
-        raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g0.shape}")
-    g = np.ascontiguousarray(g0)
-    t = max(1, int(threads))
-
     if not hasattr(jxrs, "rust_eigh_from_array_f64"):
         raise RuntimeError(
             f"{stage_label} requires rust_eigh_from_array_f64, but the symbol is unavailable."
         )
     impl_req = _resolve_gwas_eigh_impl(require_rust=bool(require_rust))
-    driver_req = _resolve_gwas_eigh_driver(int(g.shape[0]))
+    t = max(1, int(threads))
 
-    def _run_eigh_rust(driver_name: str, mat: np.ndarray):
+    matrix_file_hint: Optional[str] = None
+    if impl_req == "rust" and hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
+        try:
+            _fn = getattr(grm, "filename", None)
+            if _fn is not None:
+                cand = os.fspath(_fn)
+                if isinstance(cand, bytes):
+                    cand = cand.decode("utf-8", errors="ignore")
+                cand = str(cand).strip()
+                low = cand.lower()
+                if cand and os.path.isfile(cand) and low.endswith((".npy", ".txt", ".tsv", ".csv")):
+                    matrix_file_hint = cand
+        except Exception:
+            matrix_file_hint = None
+
+    g_shape = np.shape(grm)
+    if len(g_shape) != 2 or int(g_shape[0]) != int(g_shape[1]) or int(g_shape[0]) == 0:
+        raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g_shape}")
+    n = int(g_shape[0])
+    driver_req = _resolve_gwas_eigh_driver(n)
+
+    g0: Optional[np.ndarray] = None
+    g: Optional[np.ndarray] = None
+    if impl_req == "scipy" or matrix_file_hint is None:
+        g0 = np.asarray(grm, dtype=np.float64)
+        if g0.ndim != 2 or g0.shape[0] != g0.shape[1] or g0.shape[0] == 0:
+            raise RuntimeError(f"{stage_label} expects non-empty square GRM, got shape={g0.shape}")
+        g = np.ascontiguousarray(g0)
+
+    def _run_eigh_rust(driver_name: str, mat: Optional[np.ndarray], matrix_path: Optional[str] = None):
         with _gwas_evd_stage_ctx(t):
+            if matrix_path is not None and hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
+                return jxrs.rust_eigh_from_matrix_file_f64(
+                    str(matrix_path),
+                    threads=int(t),
+                    driver=str(driver_name),
+                    jobz="V",
+                    require_lapack=False,
+                )
+            if mat is None:
+                raise RuntimeError("Rust eigh requires either matrix array or matrix file path.")
             if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
                 return jxrs.rust_eigh_from_array_f64_inplace(
                     mat,
@@ -2851,8 +2885,10 @@ def _gwas_eigh_from_grm(
             float(elapsed),
         )
 
-    def _run_eigh(driver_name: str, mat: np.ndarray):
+    def _run_eigh(driver_name: str, mat: Optional[np.ndarray], matrix_path: Optional[str] = None):
         if impl_req == "scipy":
+            if mat is None:
+                raise RuntimeError("SciPy eigh requires an in-memory GRM array.")
             return _run_eigh_scipy(driver_name, mat)
         (
             eval_raw,
@@ -2865,7 +2901,7 @@ def _gwas_eigh_from_grm(
             _ta,
             _lapack_used,
             elapsed,
-        ) = _run_eigh_rust(driver_name, mat)
+        ) = _run_eigh_rust(driver_name, mat, matrix_path=matrix_path)
         return (
             np.asarray(eval_raw, dtype=np.float64),
             np.asarray(evec_raw, dtype=np.float64) if evec_raw is not None else None,
@@ -2874,12 +2910,28 @@ def _gwas_eigh_from_grm(
         )
 
     try:
-        eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
+        if impl_req == "rust" and matrix_file_hint is not None:
+            eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(
+                driver_req,
+                None,
+                matrix_path=matrix_file_hint,
+            )
+        else:
+            eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(driver_req, g)
     except Exception as ex:
         if str(driver_req).lower() == "dsyevr":
             try:
-                g_retry = np.ascontiguousarray(np.asarray(g0, dtype=np.float64))
-                eval_raw, evec_raw, evd_backend, elapsed = _run_eigh("dsyevd", g_retry)
+                if impl_req == "rust" and matrix_file_hint is not None:
+                    eval_raw, evec_raw, evd_backend, elapsed = _run_eigh(
+                        "dsyevd",
+                        None,
+                        matrix_path=matrix_file_hint,
+                    )
+                else:
+                    if g0 is None:
+                        raise RuntimeError("missing GRM array for dsyevd fallback")
+                    g_retry = np.ascontiguousarray(np.asarray(g0, dtype=np.float64))
+                    eval_raw, evec_raw, evd_backend, elapsed = _run_eigh("dsyevd", g_retry)
                 driver_req = "dsyevd(fallback)"
             except Exception as ex2:
                 raise RuntimeError(
@@ -2895,6 +2947,10 @@ def _gwas_eigh_from_grm(
     eigvals = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
     eigvecs = np.asarray(evec_raw, dtype=np.float64)
     backend = str(evd_backend)
+    jx_pkg.maybe_emit_macos_eigh_fallback_hint(
+        evd_backend=backend,
+        logger=logger,
+    )
     if logger is not None:
         _log_file_only(
             logger,

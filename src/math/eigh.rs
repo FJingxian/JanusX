@@ -1,4 +1,5 @@
 use nalgebra::DMatrix;
+use memmap2::MmapOptions;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyRuntimeError;
@@ -6,6 +7,9 @@ use pyo3::prelude::*;
 use pyo3::BoundObject;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::time::Instant;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -21,6 +25,12 @@ enum EighDriver {
 enum EighJobz {
     ValuesOnly,
     ValuesAndVectors,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum NpyFloatDtype {
+    F32Le,
+    F64Le,
 }
 
 #[inline]
@@ -113,6 +123,255 @@ fn resolve_eigh_driver_from_env() -> EighDriver {
         EighDriver::Dsyevd
     } else {
         parsed
+    }
+}
+
+#[inline]
+fn parse_npy_shape_local(header: &str) -> Result<(usize, usize), String> {
+    let shape_key_pos = header
+        .find("'shape'")
+        .or_else(|| header.find("\"shape\""))
+        .ok_or_else(|| "NPY header missing shape field".to_string())?;
+    let after = &header[shape_key_pos..];
+    let open = after
+        .find('(')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let close = after[open + 1..]
+        .find(')')
+        .ok_or_else(|| "NPY header has malformed shape tuple".to_string())?;
+    let inside = &after[open + 1..open + 1 + close];
+
+    let dims: Vec<usize> = inside
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| format!("invalid NPY shape dimension: {s}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match dims.as_slice() {
+        [rows] => Ok((*rows, 1)),
+        [rows, cols] => Ok((*rows, *cols)),
+        _ => Err(format!("unsupported NPY shape rank: {:?}", dims)),
+    }
+}
+
+#[inline]
+fn parse_npy_descr_local(header: &str) -> Result<NpyFloatDtype, String> {
+    let descr_key_pos = header
+        .find("'descr'")
+        .or_else(|| header.find("\"descr\""))
+        .ok_or_else(|| "NPY header missing descr field".to_string())?;
+    let after = &header[descr_key_pos..];
+    let colon = after
+        .find(':')
+        .ok_or_else(|| "NPY header has malformed descr field".to_string())?;
+    let mut tail = after[colon + 1..].trim_start();
+    let q = tail
+        .chars()
+        .next()
+        .ok_or_else(|| "NPY header has empty descr field".to_string())?;
+    if q != '\'' && q != '"' {
+        return Err("NPY header has malformed descr quote".to_string());
+    }
+    tail = &tail[1..];
+    let end = tail
+        .find(q)
+        .ok_or_else(|| "NPY header has unterminated descr field".to_string())?;
+    let descr = tail[..end].trim().to_ascii_lowercase();
+    match descr.as_str() {
+        "<f4" | "|f4" | "=f4" => Ok(NpyFloatDtype::F32Le),
+        "<f8" | "|f8" | "=f8" => Ok(NpyFloatDtype::F64Le),
+        d if d.starts_with(">f4") || d.starts_with(">f8") => {
+            Err("big-endian NPY float dtype is not supported".to_string())
+        }
+        _ => Err(format!("NPY dtype is not supported for eigh: {descr}")),
+    }
+}
+
+#[inline]
+fn parse_npy_header_for_float_matrix(bytes: &[u8]) -> Result<(usize, usize, usize, NpyFloatDtype), String> {
+    if bytes.len() < 10 {
+        return Err("NPY file too small".to_string());
+    }
+    if &bytes[0..6] != b"\x93NUMPY" {
+        return Err("invalid NPY magic".to_string());
+    }
+
+    let major = bytes[6];
+    let minor = bytes[7];
+    let (header_len, header_start) = match major {
+        1 => {
+            let len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+            (len, 10usize)
+        }
+        2 | 3 => {
+            if bytes.len() < 12 {
+                return Err("NPY file too small for v2/v3 header".to_string());
+            }
+            let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+            (len, 12usize)
+        }
+        _ => return Err(format!("unsupported NPY version: {major}.{minor}")),
+    };
+    let header_end = header_start
+        .checked_add(header_len)
+        .ok_or_else(|| "NPY header overflow".to_string())?;
+    if header_end > bytes.len() {
+        return Err("NPY header exceeds file size".to_string());
+    }
+    let header =
+        std::str::from_utf8(&bytes[header_start..header_end]).map_err(|e| e.to_string())?;
+    if header.contains("fortran_order': True") || header.contains("fortran_order\": true") {
+        return Err("fortran_order=True NPY is not supported".to_string());
+    }
+    let (rows, cols) = parse_npy_shape_local(header)?;
+    let dtype = parse_npy_descr_local(header)?;
+    Ok((rows, cols, header_end, dtype))
+}
+
+fn load_square_matrix_from_npy_f64(path: &str) -> Result<(Vec<f64>, usize), String> {
+    let file = File::open(path).map_err(|e| format!("open NPY failed: {e}"))?;
+    let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
+    let (rows, cols, data_offset, dtype) = parse_npy_header_for_float_matrix(&mmap[..])?;
+    if rows == 0 || cols == 0 || rows != cols {
+        return Err(format!("GRM/kinship matrix must be non-empty square, got ({rows}, {cols})"));
+    }
+    let n = rows;
+    let n_elem = n
+        .checked_mul(n)
+        .ok_or_else(|| "matrix element count overflow".to_string())?;
+    let bytes_per = match dtype {
+        NpyFloatDtype::F32Le => 4usize,
+        NpyFloatDtype::F64Le => 8usize,
+    };
+    let payload_bytes = n_elem
+        .checked_mul(bytes_per)
+        .ok_or_else(|| "matrix payload size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(payload_bytes)
+        .ok_or_else(|| "matrix payload end overflow".to_string())?;
+    if data_end > mmap.len() {
+        return Err("NPY data truncated".to_string());
+    }
+    let payload = &mmap[data_offset..data_end];
+
+    let mut out = Vec::<f64>::with_capacity(n_elem);
+    match dtype {
+        NpyFloatDtype::F64Le => {
+            for chunk in payload.chunks_exact(8) {
+                let v = f64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]);
+                out.push(v);
+            }
+        }
+        NpyFloatDtype::F32Le => {
+            for chunk in payload.chunks_exact(4) {
+                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64;
+                out.push(v);
+            }
+        }
+    }
+    if out.len() != n_elem {
+        return Err(format!(
+            "decoded matrix length mismatch: got {}, expected {}",
+            out.len(),
+            n_elem
+        ));
+    }
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err("matrix contains non-finite values".to_string());
+    }
+    Ok((out, n))
+}
+
+fn parse_text_matrix_row(line: &str) -> Vec<&str> {
+    if line.contains('\t') {
+        line.split('\t').map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else if line.contains(',') {
+        line.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else {
+        line.split_whitespace().collect()
+    }
+}
+
+fn load_square_matrix_from_text_f64(path: &str) -> Result<(Vec<f64>, usize), String> {
+    let file = File::open(path).map_err(|e| format!("open text matrix failed: {e}"))?;
+    let reader = BufReader::new(file);
+
+    let mut ncols: Option<usize> = None;
+    let mut nrows: usize = 0;
+    let mut out = Vec::<f64>::new();
+
+    for (ln_idx, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| format!("read line {} failed: {e}", ln_idx + 1))?;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let toks = parse_text_matrix_row(t);
+        if toks.is_empty() {
+            continue;
+        }
+        let row_cols = toks.len();
+        if let Some(prev) = ncols {
+            if row_cols != prev {
+                return Err(format!(
+                    "text matrix row width mismatch at line {}: got {}, expected {}",
+                    ln_idx + 1,
+                    row_cols,
+                    prev
+                ));
+            }
+        } else {
+            ncols = Some(row_cols);
+        }
+        for tok in toks {
+            let v = tok
+                .parse::<f64>()
+                .map_err(|_| format!("invalid float at line {}: {tok}", ln_idx + 1))?;
+            if !v.is_finite() {
+                return Err(format!("non-finite value at line {}: {tok}", ln_idx + 1));
+            }
+            out.push(v);
+        }
+        nrows = nrows.saturating_add(1);
+    }
+
+    let cols = ncols.ok_or_else(|| "text matrix is empty".to_string())?;
+    if cols == 0 || nrows == 0 || nrows != cols {
+        return Err(format!(
+            "GRM/kinship matrix must be non-empty square, got ({nrows}, {cols})"
+        ));
+    }
+    let n = nrows;
+    let expect = n
+        .checked_mul(n)
+        .ok_or_else(|| "text matrix size overflow".to_string())?;
+    if out.len() != expect {
+        return Err(format!(
+            "text matrix payload mismatch: got {}, expected {}",
+            out.len(),
+            expect
+        ));
+    }
+    Ok((out, n))
+}
+
+fn load_square_matrix_f64_from_file(path: &str) -> Result<(Vec<f64>, usize), String> {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "npy" => load_square_matrix_from_npy_f64(path),
+        "txt" | "tsv" | "csv" => load_square_matrix_from_text_f64(path),
+        _ => load_square_matrix_from_text_f64(path),
     }
 }
 
@@ -644,6 +903,86 @@ pub fn rust_eigh_from_array_f64<'py>(
     if require_lapack && !lapack_used {
         return Err(PyRuntimeError::new_err(format!(
             "rust_eigh_from_array_f64 expected LAPACK backend, got {evd_backend}"
+        )));
+    }
+
+    let evals_arr = PyArray1::from_owned_array(py, Array1::from_vec(evals)).into_bound();
+    let evecs_arr = match evecs_opt {
+        Some(v) => Some(
+            PyArray2::from_owned_array(
+                py,
+                Array2::from_shape_vec((n, n), v)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            )
+            .into_bound(),
+        ),
+        None => None,
+    };
+
+    Ok((
+        evals_arr,
+        evecs_arr,
+        backend,
+        evd_backend.to_string(),
+        n,
+        threads_before,
+        threads_in_stage,
+        threads_after,
+        lapack_used,
+        elapsed,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, threads=0, driver=None, jobz="V", require_lapack=false))]
+pub fn rust_eigh_from_matrix_file_f64<'py>(
+    py: Python<'py>,
+    path: String,
+    threads: usize,
+    driver: Option<String>,
+    jobz: &str,
+    require_lapack: bool,
+) -> PyResult<(
+    Bound<'py, PyArray1<f64>>,
+    Option<Bound<'py, PyArray2<f64>>>,
+    String,
+    String,
+    usize,
+    isize,
+    isize,
+    isize,
+    bool,
+    f64,
+)> {
+    let path_trimmed = path.trim();
+    if path_trimmed.is_empty() {
+        return Err(PyRuntimeError::new_err("path must not be empty"));
+    }
+    let (a_row_major, n) =
+        load_square_matrix_f64_from_file(path_trimmed).map_err(PyRuntimeError::new_err)?;
+    let driver_sel = parse_eigh_driver_token(driver.unwrap_or_else(|| "auto".to_string()).as_str());
+    let jobz_sel = parse_eigh_jobz_token(jobz);
+
+    let backend = crate::blas::rust_sgemm_backend();
+    let threads_before = crate::blas::rust_blas_get_num_threads();
+    if threads > 0 {
+        let _ = crate::blas::rust_blas_set_num_threads(threads);
+    }
+    let threads_in_stage = crate::blas::rust_blas_get_num_threads();
+
+    let t0 = Instant::now();
+    let run = symmetric_eigh_f64_row_major_with_driver(&a_row_major, n, driver_sel, jobz_sel);
+    if threads > 0 && threads_before > 0 {
+        let _ = crate::blas::rust_blas_set_num_threads(threads_before as usize);
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let threads_after = crate::blas::rust_blas_get_num_threads();
+
+    let (evals, evecs_opt, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
+    let lapack_used = is_lapack_backend(evd_backend);
+    if require_lapack && !lapack_used {
+        return Err(PyRuntimeError::new_err(format!(
+            "rust_eigh_from_matrix_file_f64 expected LAPACK backend, got {evd_backend}"
         )));
     }
 

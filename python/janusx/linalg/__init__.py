@@ -123,6 +123,15 @@ def eigh(
 
     if ret is None:
         ret = _jx.rust_eigh_from_array_f64(arr, **kw)
+    try:
+        import janusx as _jx_pkg
+
+        _ = _jx_pkg.maybe_emit_macos_eigh_fallback_hint(
+            evd_backend=(ret[3] if len(ret) > 3 else None),
+            logger=None,
+        )
+    except Exception:
+        pass
     if bool(return_meta):
         return ret
     return ret[0], ret[1]

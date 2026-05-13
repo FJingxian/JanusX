@@ -23,6 +23,7 @@ Modules:
     Genomic Selection (GS):
     gs            Genomic prediction and model-based selection
     reml          Estimate heritability/effect components by REML-BLUP
+    postgs        Summarize and visualize GS results
 
     Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):
     garfield      Random-forest based marker-trait association
@@ -111,7 +112,7 @@ __version__ = (
 
 _MODULE_NAMES = [
     "gwas", "postgwas", "postgarfield", "postbsa",
-    "garfield", "grm", "pca", "gs", "reml",
+    "garfield", "grm", "pca", "gs", "reml", "postgs",
     "sim", "simulation", "benchmark", "gblupbench", "bayesbench", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "view", "treeplot",
 ]
@@ -316,6 +317,7 @@ def _print_cli_help() -> None:
     print(f"  {_style_blue('Genomic Selection (GS):')}")
     _print_help_entry(4, "gs", "Genomic prediction and model-based selection", 12, width)
     _print_help_entry(4, "reml", "Estimate heritability/effect components by REML-BLUP", 12, width)
+    _print_help_entry(4, "postgs", "Summarize and visualize GS results", 12, width)
     print()
 
     print(

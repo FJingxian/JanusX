@@ -56,6 +56,7 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import psutil
+import janusx as jx_pkg
 from janusx import janusx as jxrs
 
 mpl.use("Agg")
@@ -428,7 +429,20 @@ def _run_with_algo_progress(
     t0 = time.monotonic()
     suffix = _algo_metrics_suffix(n_samples=n_samples, n_snps=n_snps)
     # CliStatus animates only for loading/computing-like prefixes.
-    status_desc = f"Computing {algo_name}{suffix} ..."
+    status_desc_raw = f"Computing {algo_name}{suffix} ..."
+    status_desc = status_desc_raw
+    if stdout_is_tty():
+        try:
+            cols = int(shutil.get_terminal_size((80, 20)).columns)
+        except Exception:
+            cols = 80
+        # Keep room for spinner frame + elapsed suffix to avoid hard wraps.
+        max_desc = max(24, int(cols) - 18)
+        if len(status_desc_raw) > max_desc:
+            if max_desc <= 3:
+                status_desc = status_desc_raw[:max_desc]
+            else:
+                status_desc = status_desc_raw[: max_desc - 3] + "..."
 
     if stdout_is_tty():
         with CliStatus(status_desc, enabled=True, use_process=True) as task:
@@ -573,7 +587,7 @@ def build_grm_streaming_for_pca(
     return grm, sample_ids, int(eff_m)
 
 
-def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.ndarray]:
+def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.ndarray, str]:
     """
     Perform eigen decomposition of a symmetric GRM with Rust LAPACK backend:
       GRM = V Λ V^T
@@ -597,7 +611,17 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     g = np.ascontiguousarray(g0)
     n = int(g.shape[0])
     threads = max(1, int(os.cpu_count() or 1))
-    driver = "dsyevr" if n >= 512 else "dsyevd"
+
+    # Keep PCA aligned with GWAS default strategy:
+    # default to Rust "auto" (which resolves to dsyevd in current backend),
+    # while allowing explicit override via env.
+    raw_driver = str(
+        os.environ.get(
+            "JX_PCA_EIGH_DRIVER",
+            os.environ.get("JX_GWAS_EIGH_DRIVER", "auto"),
+        )
+    ).strip().lower()
+    driver = raw_driver if raw_driver in {"auto", "dsyevd", "dsyevr"} else "auto"
 
     def _run(driver_name: str, mat: np.ndarray):
         if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
@@ -633,10 +657,69 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
     eigval = eigval[idx]
     eigvec = eigvec[:, idx]
 
+    backend = str(_evd_backend).strip()
     if logger is not None:
-        logger.info("Eigen decomposition finished.")
+        logger.info(f"Eigen decomposition finished (backend={backend}).")
 
-    return eigvec, eigval
+    return eigvec, eigval, backend
+
+
+def eigendecompose_grm_file(grm_file: str, logger=None) -> tuple[np.ndarray, np.ndarray, str, int]:
+    """
+    Rust-native file-path eigendecomposition for precomputed GRM:
+      - .npy: parsed directly in Rust
+      - .txt/.tsv/.csv: parsed directly in Rust
+    Returns:
+      eigenvec, eigenval, backend, n
+    """
+    if logger is not None:
+        logger.info("* Performing eigen decomposition of GRM (Rust file-path backend)...")
+    if not hasattr(jxrs, "rust_eigh_from_matrix_file_f64"):
+        raise RuntimeError(
+            "Rust extension is missing rust_eigh_from_matrix_file_f64. "
+            "Rebuild/install JanusX extension first."
+        )
+    threads = max(1, int(os.cpu_count() or 1))
+    raw_driver = str(
+        os.environ.get(
+            "JX_PCA_EIGH_DRIVER",
+            os.environ.get("JX_GWAS_EIGH_DRIVER", "auto"),
+        )
+    ).strip().lower()
+    driver = raw_driver if raw_driver in {"auto", "dsyevd", "dsyevr"} else "auto"
+
+    try:
+        ret = jxrs.rust_eigh_from_matrix_file_f64(
+            str(grm_file),
+            threads=int(threads),
+            driver=str(driver),
+            jobz="V",
+            require_lapack=False,
+        )
+    except Exception as ex:
+        if str(driver).lower() == "dsyevr":
+            ret = jxrs.rust_eigh_from_matrix_file_f64(
+                str(grm_file),
+                threads=int(threads),
+                driver="dsyevd",
+                jobz="V",
+                require_lapack=False,
+            )
+        else:
+            raise RuntimeError(f"Rust file-path eigh failed (driver={driver}): {ex}") from ex
+
+    eval_raw, evec_raw, _blas_backend, _evd_backend, n, _tb, _ti, _ta, _lapack_used, _elapsed = ret
+    if evec_raw is None:
+        raise RuntimeError("Rust file-path eigh returned no eigenvectors for jobz=V.")
+    eigval = np.asarray(eval_raw, dtype=np.float64).reshape(-1)
+    eigvec = np.asarray(evec_raw, dtype=np.float64)
+    idx = np.argsort(eigval)[::-1]
+    eigval = eigval[idx]
+    eigvec = eigvec[:, idx]
+    backend = str(_evd_backend).strip()
+    if logger is not None:
+        logger.info(f"Eigen decomposition finished (backend={backend}, n={int(n)}).")
+    return eigvec, eigval, backend, int(n)
 
 
 # ======================================================================
@@ -863,8 +946,8 @@ def main(log: bool = True):
     logger = setup_logging(log_path)
     # Keep algorithm status visible immediately.
     use_spinner = True
-    if genotype_input_mode and (not bool(args.mmap_limit)):
-        logger.info("PCA backend policy: memmap (default).")
+    # if genotype_input_mode and (not bool(args.mmap_limit)):
+    #     logger.info("PCA backend policy: memmap (default).")
 
     if palette_idx == -1:
         args.color = None
@@ -1050,15 +1133,19 @@ def main(log: bool = True):
                     )
 
                 def _run_txt_force_eig_only():
-                    eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
-                    return eigenvec_local, eigenval_local
+                    eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(grm, logger=None)
+                    return eigenvec_local, eigenval_local, evd_backend_local
 
-                (eigenvec, eigenval), algo_elapsed_s = _run_with_algo_progress(
+                (eigenvec, eigenval, evd_backend), algo_elapsed_s = _run_with_algo_progress(
                     algo_name,
                     _run_txt_force_eig_only,
                     logger=logger,
                     n_samples=algo_n,
                     n_snps=int(algo_snp),
+                )
+                jx_pkg.maybe_emit_macos_eigh_fallback_hint(
+                    evd_backend=str(evd_backend),
+                    logger=logger,
                 )
             else:
                 if not hasattr(jxrs, "admx_rsvd_stream_sample"):
@@ -1149,15 +1236,19 @@ def main(log: bool = True):
                 )
 
             def _run_memmap_eig_only():
-                eigenvec_local, eigenval_local = eigendecompose_grm(grm, logger=None)
-                return eigenvec_local, eigenval_local
+                eigenvec_local, eigenval_local, evd_backend_local = eigendecompose_grm(grm, logger=None)
+                return eigenvec_local, eigenval_local, evd_backend_local
 
-            (eigenvec, eigenval), algo_elapsed_s = _run_with_algo_progress(
+            (eigenvec, eigenval, evd_backend), algo_elapsed_s = _run_with_algo_progress(
                 "Eigen-Decomposition",
                 _run_memmap_eig_only,
                 logger=logger,
                 n_samples=algo_n,
                 n_snps=int(algo_snp),
+            )
+            jx_pkg.maybe_emit_macos_eigh_fallback_hint(
+                evd_backend=str(evd_backend),
+                logger=logger,
             )
             log_success(
                 logger,
@@ -1210,26 +1301,27 @@ def main(log: bool = True):
             )
 
         grm_src = os.path.basename(str(grm_file).rstrip("/\\")) or str(grm_file)
+        use_rust_file_eigh = bool(hasattr(jxrs, "rust_eigh_from_matrix_file_f64"))
+        grm = None
         with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:
             try:
-                if grm_file.endswith(".npy"):
-                    grm = np.load(grm_file)
-                else:
-                    grm = np.genfromtxt(grm_file)
-
                 id_path = f"{grm_file}.id"
                 samples = _read_id_file(id_path, logger, "GRM", show_status=False)
                 if samples is None:
                     raise ValueError(f"GRM ID file not found: {id_path}")
-
-                if grm.shape[0] != len(samples):
-                    raise ValueError(
-                        f"GRM size mismatch: {grm.shape[0]} != {len(samples)} (ID count)."
-                    )
+                if not use_rust_file_eigh:
+                    if grm_file.endswith(".npy"):
+                        grm = np.load(grm_file)
+                    else:
+                        grm = np.genfromtxt(grm_file)
+                    if grm.shape[0] != len(samples):
+                        raise ValueError(
+                            f"GRM size mismatch: {grm.shape[0]} != {len(samples)} (ID count)."
+                        )
             except Exception:
                 task.fail(f"Loading GRM from {grm_src} ...Failed")
                 raise
-            task.complete(f"Loading GRM from {grm_src} (n={grm.shape[0]})")
+            task.complete(f"Loading GRM from {grm_src} (n={len(samples)})")
 
         # Eigen decomposition: keep one dynamic progress line only.
         with CliStatus(
@@ -1238,11 +1330,27 @@ def main(log: bool = True):
             use_process=True,
         ) as task:
             try:
-                eigenvec, eigenval = eigendecompose_grm(grm, logger=None)
+                if use_rust_file_eigh:
+                    eigenvec, eigenval, evd_backend, n_rust = eigendecompose_grm_file(
+                        grm_file,
+                        logger=None,
+                    )
+                    if int(n_rust) != int(len(samples)):
+                        raise ValueError(
+                            f"GRM size mismatch: Rust n={int(n_rust)} != {len(samples)} (ID count)."
+                        )
+                else:
+                    if grm is None:
+                        raise RuntimeError("GRM matrix is not loaded for PCA eigendecomposition.")
+                    eigenvec, eigenval, evd_backend = eigendecompose_grm(grm, logger=None)
             except Exception:
                 task.fail("Computing Eigen-Decomposition ...Failed")
                 raise
             task.complete("Computing Eigen-Decomposition ...Finished")
+        jx_pkg.maybe_emit_macos_eigh_fallback_hint(
+            evd_backend=str(evd_backend),
+            logger=logger,
+        )
 
         # Save core PCA results
         df_vec = pd.DataFrame(

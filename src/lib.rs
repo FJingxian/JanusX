@@ -111,7 +111,10 @@ use blas::{
     rust_sgemm_backend,
 };
 use bsa::preprocess_bsa;
-use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace};
+use eigh::{
+    rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
+    rust_eigh_from_matrix_file_f64,
+};
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, gfd_packbits_from_dosage_block, load_bed_2bit_packed,
@@ -268,6 +271,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;

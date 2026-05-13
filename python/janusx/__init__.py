@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
-import warnings
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -121,53 +122,155 @@ def _attach_native_linalg_alias() -> None:
 _attach_native_linalg_alias()
 
 
-def _warn_macos_eigh_lapack_fallback() -> None:
-    if sys.platform != "darwin":
+_EIGH_WARN_ONCE_ENV = "JANUSX_EIGH_FALLBACK_WARNED"
+_EIGH_WARN_SENTINEL_TTL_SEC = 300.0
+
+
+def _env_truthy(name: str) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def _stderr_is_interactive() -> bool:
+    try:
+        return bool(getattr(sys.stderr, "isatty", lambda: False)())
+    except Exception:
+        return False
+
+
+def _clear_current_stdout_line() -> None:
+    try:
+        if not bool(getattr(sys.stdout, "isatty", lambda: False)()):
+            return
+    except Exception:
         return
-    # Explicit user choice: do not warn on requested Accelerate LAPACK.
+    try:
+        cols = int(getattr(os, "get_terminal_size", lambda *_: os.terminal_size((80, 20)))().columns)
+    except Exception:
+        cols = 80
+    cols = max(1, int(cols))
+    try:
+        sys.stdout.write("\r" + (" " * cols) + "\r")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _eigh_warn_sentinel_file() -> str:
+    try:
+        uid = str(int(os.getuid()))
+    except Exception:
+        uid = "nouid"
+    return os.path.join(tempfile.gettempdir(), f".janusx_eigh_fallback_warned_{uid}")
+
+
+def _is_macos_eigh_fallback_backend(backend_label: str) -> bool:
+    b = str(backend_label).strip().lower()
+    if b == "accelerate":
+        return True
+    return "accelerate" in b and b.startswith("lapack_")
+
+
+def _should_check_macos_eigh_hint() -> bool:
+    if sys.platform != "darwin":
+        return False
     raw_pref = str(
         os.environ.get(
             "JX_RUST_EIGH_LAPACK_BACKEND",
             os.environ.get("JX_RUST_LAPACK_BACKEND", "auto"),
         )
     ).strip().lower()
+    # Explicit Accelerate LAPACK request is intentional.
     if raw_pref in ("accelerate", "veclib"):
-        return
+        return False
+    return True
+
+
+def _probe_macos_eigh_backend() -> str:
     try:
         from . import janusx as _jx
     except Exception:
-        return
+        return ""
     try:
         probe_sgemm = getattr(_jx, "rust_sgemm_backend", None)
         probe_eigh = getattr(_jx, "rust_eigh_lapack_backend", None)
         if not callable(probe_sgemm):
-            return
+            return ""
         sgemm_backend = str(probe_sgemm()).strip().lower()
-        # Only inspect eigh LAPACK fallback on BLAS=Accelerate builds.
-        # OpenBLAS BLAS builds do not need this probe, and skipping it avoids
-        # unnecessary dynamic OpenBLAS LAPACK loading during import.
+        # OpenBLAS BLAS builds should not trigger fallback hints.
         if sgemm_backend != "accelerate":
-            return
+            return ""
         if not callable(probe_eigh):
-            return
-        lapack_backend = str(probe_eigh()).strip().lower()
+            return ""
+        return str(probe_eigh()).strip().lower()
     except Exception:
-        return
-
-    # Auto/openblas mode expects dynamic OpenBLAS LAPACK on macOS.
-    # If we land on Accelerate instead, this is a fallback path and may
-    # re-introduce the known "eigh slow on Accelerate" behavior.
-    if lapack_backend == "accelerate":
-        warnings.warn(
-            "JanusX macOS LAPACK fallback: rust_eigh is using Accelerate "
-            "(expected openblas_dyn in auto/openblas mode). "
-            "This may make eigen decomposition slower. "
-            "Check bundled OpenBLAS dylib loading and JX_OPENBLAS_LIB_PATH.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        return ""
 
 
-_warn_macos_eigh_lapack_fallback()
+def maybe_emit_macos_eigh_fallback_hint(
+    *,
+    evd_backend: str | None = None,
+    logger=None,
+) -> bool:
+    """
+    Emit a gentle one-time hint when macOS eigendecomposition falls back to
+    Accelerate LAPACK in auto/openblas mode.
 
-__all__ = ["linalg"]
+    Returns True when the hint was emitted in this call.
+    """
+    if not _should_check_macos_eigh_hint():
+        return False
+    if sys.platform != "darwin":
+        return False
+    # Process-tree once-only sentinel.
+    if _env_truthy(_EIGH_WARN_ONCE_ENV):
+        return False
+    # Cross-process once-only sentinel (pipeline/subprocess chains) is only
+    # applied in non-interactive mode. Interactive CLI invocations should still
+    # surface the warning once per run.
+    use_cross_process_sentinel = not _stderr_is_interactive()
+    sentinel_path = _eigh_warn_sentinel_file() if use_cross_process_sentinel else ""
+    if use_cross_process_sentinel and os.path.exists(sentinel_path):
+        try:
+            age = max(0.0, float(time.time()) - float(os.path.getmtime(sentinel_path)))
+            if age <= float(_EIGH_WARN_SENTINEL_TTL_SEC):
+                return False
+        except Exception:
+            return False
+
+    backend = (
+        str(evd_backend).strip().lower()
+        if evd_backend is not None and str(evd_backend).strip() != ""
+        else _probe_macos_eigh_backend()
+    )
+    if not _is_macos_eigh_fallback_backend(backend):
+        return False
+
+    os.environ[_EIGH_WARN_ONCE_ENV] = "1"
+    if use_cross_process_sentinel:
+        try:
+            with open(sentinel_path, "w", encoding="utf-8") as fh:
+                fh.write("1\n")
+        except Exception:
+            pass
+
+    backend_line = "  backend: Accelerate LAPACK"
+    warning_body = (
+        "OpenBLAS LAPACK was requested but unavailable; JanusX used Accelerate instead.\n"
+        "  Set JX_OPENBLAS_LIB_PATH to use OpenBLAS for faster eigendecomposition."
+    )
+    _clear_current_stdout_line()
+    if logger is not None and hasattr(logger, "info"):
+        logger.info(backend_line)
+        if hasattr(logger, "warning"):
+            logger.warning(warning_body)
+        else:
+            logger.info(f"Warning: {warning_body}")
+    else:
+        sys.stderr.write(backend_line + "\n")
+        sys.stderr.write("Warning: " + warning_body + "\n")
+        sys.stderr.flush()
+    return True
+
+
+__all__ = ["linalg", "maybe_emit_macos_eigh_fallback_hint"]

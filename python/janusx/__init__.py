@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -118,5 +119,46 @@ def _attach_native_linalg_alias() -> None:
 
 
 _attach_native_linalg_alias()
+
+
+def _warn_macos_eigh_lapack_fallback() -> None:
+    if sys.platform != "darwin":
+        return
+    # Explicit user choice: do not warn on requested Accelerate LAPACK.
+    raw_pref = str(
+        os.environ.get(
+            "JX_RUST_EIGH_LAPACK_BACKEND",
+            os.environ.get("JX_RUST_LAPACK_BACKEND", "auto"),
+        )
+    ).strip().lower()
+    if raw_pref in ("accelerate", "veclib"):
+        return
+    try:
+        from . import janusx as _jx
+    except Exception:
+        return
+    try:
+        probe_eigh = getattr(_jx, "rust_eigh_lapack_backend", None)
+        if not callable(probe_eigh):
+            return
+        lapack_backend = str(probe_eigh()).strip().lower()
+    except Exception:
+        return
+
+    # Auto/openblas mode expects dynamic OpenBLAS LAPACK on macOS.
+    # If we land on Accelerate instead, this is a fallback path and may
+    # re-introduce the known "eigh slow on Accelerate" behavior.
+    if lapack_backend == "accelerate":
+        warnings.warn(
+            "JanusX macOS LAPACK fallback: rust_eigh is using Accelerate "
+            "(expected openblas_dyn in auto/openblas mode). "
+            "This may make eigen decomposition slower. "
+            "Check bundled OpenBLAS dylib loading and JX_OPENBLAS_LIB_PATH.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+_warn_macos_eigh_lapack_fallback()
 
 __all__ = ["linalg"]

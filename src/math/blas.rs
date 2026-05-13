@@ -45,10 +45,18 @@ const HAS_BLAS_BACKEND: bool = cfg!(all(
 fn default_sgemm_backend() -> SgemmBackend {
     #[cfg(target_os = "macos")]
     {
-        // macOS policy: prefer Accelerate by default.
-        // OpenBLAS remains available only via explicit env override:
-        //   JX_RUST_BLAS_BACKEND=openblas
-        return SgemmBackend::Accelerate;
+        // macOS policy:
+        // - If Accelerate backend is compiled in, use it by default for BLAS
+        //   (GRM/GEMM/SYRK-heavy paths).
+        // - Otherwise, fall back to OpenBLAS when this wheel/build is
+        //   OpenBLAS-only.
+        if HAS_ACCELERATE_BACKEND {
+            return SgemmBackend::Accelerate;
+        }
+        if HAS_OPENBLAS_BACKEND {
+            return SgemmBackend::OpenBlas;
+        }
+        return SgemmBackend::Rust;
     }
     #[cfg(target_os = "windows")]
     {
@@ -135,6 +143,7 @@ unsafe extern "C" {
         ldc: CblasInt,
     );
     #[link_name = "cblas_dgemm"]
+    #[allow(dead_code)]
     fn cblas_dgemm_accelerate(
         order: CblasInt,
         transa: CblasInt,
@@ -1142,6 +1151,7 @@ pub(crate) unsafe fn cblas_sgemm_dispatch(
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
+#[allow(dead_code)]
 unsafe fn cblas_dgemm_rust(
     order: CblasInt,
     transa: CblasInt,
@@ -1195,6 +1205,7 @@ unsafe fn cblas_dgemm_rust(
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
+#[allow(dead_code)]
 pub(crate) unsafe fn cblas_dgemm_dispatch(
     order: CblasInt,
     transa: CblasInt,

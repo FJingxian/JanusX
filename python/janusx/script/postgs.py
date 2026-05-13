@@ -36,7 +36,6 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
 )
 from janusx.script._common.log import setup_logging
-from janusx.script._common.status import format_elapsed
 
 
 class _SilentLogger:
@@ -139,6 +138,33 @@ class _PostGsCliUI:
         self._write("\n")
         if n > 0:
             self._write(f"\033[{n}E")
+
+
+class _PostGsNoopPhase:
+    def ok(self, label: str, sec: float) -> None:
+        _ = (label, sec)
+
+    def note(self, text: str) -> None:
+        _ = text
+
+    def complete(self) -> None:
+        return
+
+
+class _PostGsNoopUI:
+    def plain(self, text: str = "") -> None:
+        _ = text
+
+    def green(self, text: str) -> None:
+        _ = text
+
+    def start_phase(self, title: str) -> _PostGsNoopPhase:
+        _ = title
+        return _PostGsNoopPhase()
+
+    def complete_parent(self, title: str, child_lines: int) -> None:
+        _ = (title, child_lines)
+        return
 
 
 def _sanitize_token(text: str) -> str:
@@ -250,6 +276,21 @@ def _save_fig(fig: plt.Figure, out_path: str, fmt: str) -> None:
         )
 
 
+def _max_abs_scale(values: pd.Series) -> tuple[np.ndarray, float]:
+    arr = np.asarray(pd.to_numeric(values, errors="coerce"), dtype=float).reshape(-1)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return arr, float("nan")
+    max_abs = float(np.nanmax(np.abs(arr[finite])))
+    if (not np.isfinite(max_abs)) or (max_abs <= 0.0):
+        out = arr.copy()
+        out[finite] = 0.0
+        return out, max_abs
+    out = arr.copy()
+    out[finite] = out[finite] / max_abs
+    return out, max_abs
+
+
 def _resolve_existing_path(path_like: str, *, base_dir: str) -> Optional[str]:
     if path_like is None:
         return None
@@ -351,13 +392,20 @@ def _cv_accuracy_long_frame(summary: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _model_cv_error_frame(summary: dict[str, Any]) -> pd.DataFrame:
+def _model_cv_error_frame(
+    summary: dict[str, Any],
+    *,
+    trait: Optional[str] = None,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     tmd = summary.get("trait_method_details", {})
     if not isinstance(tmd, dict):
         return pd.DataFrame(columns=["model", "pearsonr_cv_sd", "time_cv_sd"])
 
+    trait_filter = str(trait) if trait is not None else None
     for _trait, trait_rec in tmd.items():
+        if trait_filter is not None and str(_trait) != trait_filter:
+            continue
         if not isinstance(trait_rec, dict):
             continue
         for mk, mv in trait_rec.items():
@@ -806,7 +854,7 @@ def _plot_and_save_trait_effect_panels(
 
     trait_tag = _sanitize_token(trait)
     for fmt in fmts:
-        out_path = f"{out_prefix}.{trait_tag}.effects_panel.{fmt}"
+        out_path = f"{out_prefix}.{trait_tag}.effects.{fmt}"
         _save_fig(fig, out_path, fmt)
         saved_paths.append(str(out_path))
     plt.close(fig)
@@ -840,7 +888,6 @@ def _log_results_overview(
 
 
 def main() -> None:
-    t0 = time.time()
     parser = CliArgumentParser(
         prog="jx postgs",
         formatter_class=cli_help_formatter(),
@@ -973,10 +1020,10 @@ def main() -> None:
     effect_specs_by_trait = _collect_trait_effect_specs(summary, summary_dir=summary_dir)
     effect_table_cache: dict[str, pd.DataFrame] = {}
 
-    has_selector = any(x is not None for x in (args.manh, args.violin, args.pcctime))
-    do_manh = (not has_selector) or (args.manh is not None)
-    do_violin = (not has_selector) or (args.violin is not None)
-    do_pcctime = (not has_selector) or (args.pcctime is not None)
+    # Keep only effect plotting for now: disable global runtime/violin outputs.
+    do_manh = True
+    do_violin = False
+    do_pcctime = False
     manh_ratio, manh_palette = _parse_ratio_palette_spec(args.manh, default_ratio=2.0)
     violin_ratio, violin_palette = _parse_ratio_palette_spec(args.violin, default_ratio=1.0)
     pcctime_ratio, pcctime_palette = _parse_ratio_palette_spec(args.pcctime, default_ratio=1.0)
@@ -995,61 +1042,75 @@ def main() -> None:
     pcctime_fig_size = _figsize_from_ratio(pcctime_ratio, base_height=6.2)
 
     df = _summary_rows_frame(summary)
-    ranked_trait = _rank_by_trait(df)
-    model_rank = _aggregate_model_ranking(df)
-    model_cv_err = _model_cv_error_frame(summary)
-    if model_cv_err.shape[0] > 0:
-        model_rank = model_rank.merge(model_cv_err, on="model", how="left")
-    key_results = _best_models_by_trait(ranked_trait)
     cv_long = _cv_accuracy_long_frame(summary)
-    ui = _PostGsCliUI(stream=sys.stdout)
+    trait_eval_items = sorted(df["trait"].astype(str).unique().tolist(), key=str)
+    ui = _PostGsNoopUI()
 
-    phase1 = ui.start_phase("[1/2] Generating global evaluation plots...")
+    if do_pcctime or do_violin:
+        phase1 = ui.start_phase("[1/2] Generating trait-wise evaluation plots...")
+        for trait in trait_eval_items:
+            trait_s = str(trait)
+            trait_df = df[df["trait"].astype(str) == trait_s].copy()
+            if trait_df.shape[0] == 0:
+                continue
+            trait_model_rank = _aggregate_model_ranking(trait_df)
+            trait_cv_err = _model_cv_error_frame(summary, trait=trait_s)
+            if trait_cv_err.shape[0] > 0:
+                trait_model_rank = trait_model_rank.merge(trait_cv_err, on="model", how="left")
 
-    # Accuracy-runtime
-    if do_pcctime:
-        step_t0 = time.time()
-        fig = plt.figure(figsize=pcctime_fig_size, dpi=300)
-        ax = fig.add_subplot(111)
-        gsplot.plot_accuracy_runtime_scatter(
-            model_rank,
-            ax=ax,
-            palette=pcctime_palette,
-            x_col="time_cv_mean_sec",
-            y_col="pearsonr_cv_mean",
-            label_col="model",
-            point_size=runtime_point_size,
-        )
-        ax.set_title("")
-        for fmt in fmts:
-            p = f"{outprefix}.accuracy_runtime.{fmt}"
-            _save_fig(fig, p, fmt)
-            saved_paths.append(str(p))
-        plt.close(fig)
-        phase1.ok("Accuracy-runtime scatter", time.time() - step_t0)
+            if cv_long.shape[0] > 0:
+                trait_cv_long = cv_long[cv_long["Trait"].astype(str) == trait_s].copy()
+            else:
+                trait_cv_long = cv_long
 
-    # Split violin
-    if do_violin and cv_long.shape[0] > 0:
-        step_t0 = time.time()
-        fig = plt.figure(figsize=violin_fig_size, dpi=300)
-        ax = fig.add_subplot(111)
-        gsplot.plot_accuracy_split_violin(
-            cv_long,
-            ax=ax,
-            palette=violin_palette,
-            model_order=model_rank["model"].astype(str).tolist(),
-            model_col="Model",
-            metric_col="Metric",
-            value_col="Accuracy",
-        )
-        ax.set_title("")
-        for fmt in fmts:
-            p = f"{outprefix}.accuracy_violin.{fmt}"
-            _save_fig(fig, p, fmt)
-            saved_paths.append(str(p))
-        plt.close(fig)
-        phase1.ok("Split violin (Pearson/Spearman)", time.time() - step_t0)
-    phase1.complete()
+            trait_out_dir = os.path.join(args.out, _sanitize_token(trait_s))
+            os.makedirs(trait_out_dir, mode=0o755, exist_ok=True)
+            trait_outprefix = os.path.join(trait_out_dir, prefix)
+
+            # Accuracy-runtime
+            if do_pcctime:
+                step_t0 = time.time()
+                fig = plt.figure(figsize=pcctime_fig_size, dpi=300)
+                ax = fig.add_subplot(111)
+                gsplot.plot_accuracy_runtime_scatter(
+                    trait_model_rank,
+                    ax=ax,
+                    palette=pcctime_palette,
+                    x_col="time_cv_mean_sec",
+                    y_col="pearsonr_cv_mean",
+                    label_col="model",
+                    point_size=runtime_point_size,
+                )
+                ax.set_title("")
+                for fmt in fmts:
+                    p = f"{trait_outprefix}.accuracy_runtime.{fmt}"
+                    _save_fig(fig, p, fmt)
+                    saved_paths.append(str(p))
+                plt.close(fig)
+                phase1.ok(f"{trait_s} accuracy-runtime scatter", time.time() - step_t0)
+
+            # Split violin
+            if do_violin and trait_cv_long.shape[0] > 0:
+                step_t0 = time.time()
+                fig = plt.figure(figsize=violin_fig_size, dpi=300)
+                ax = fig.add_subplot(111)
+                gsplot.plot_accuracy_split_violin(
+                    trait_cv_long,
+                    ax=ax,
+                    palette=violin_palette,
+                    model_order=trait_model_rank["model"].astype(str).tolist(),
+                    model_col="Model",
+                    metric_col="Metric",
+                    value_col="Accuracy",
+                )
+                ax.set_title("")
+                for fmt in fmts:
+                    p = f"{trait_outprefix}.accuracy_violin.{fmt}"
+                    _save_fig(fig, p, fmt)
+                    saved_paths.append(str(p))
+                plt.close(fig)
+                phase1.ok(f"{trait_s} split violin (Pearson/Spearman)", time.time() - step_t0)
+        phase1.complete()
 
     trait_items = sorted(effect_specs_by_trait.keys(), key=str) if do_manh else []
     if len(trait_items) == 0:
@@ -1113,6 +1174,10 @@ def main() -> None:
                     & np.isfinite(part["Effect"].to_numpy(dtype=float))
                 ]
                 if part.shape[0] > 0:
+                    scaled_eff, max_abs = _max_abs_scale(part["Effect"])
+                    part["Effect"] = scaled_eff
+                    if np.isfinite(max_abs):
+                        part["ScaleMaxAbs"] = float(max_abs)
                     merged_parts.append(part)
             phase2.ok(label, time.time() - step_t0)
 
@@ -1169,26 +1234,12 @@ def main() -> None:
         _log_step_skip(logger, "Standalone signed effect", "disabled by plot selector")
 
     logger.info("")
-    logger.info(f"PostGS completed successfully! (Total: {float(time.time() - t0):.1f}s)")
-
-    for _, r in key_results.iterrows():
-        logger.info("")
-        logger.info(f"Key Results [{r['trait']}]:")
-        logger.info(f"  Best Model : {r['model']}")
-        logger.info(
-            f"  Metrics    : Pearson={float(r['pearsonr_cv_mean']):.4f} | "
-            f"Spearman={float(r['spearmanr_cv_mean']):.4f} | R²={float(r['r2_cv_mean']):.4f}"
-        )
-        logger.info(f"  Time       : {float(r['time_cv_mean_sec']):.3f}s")
-
-    logger.info("")
     _log_results_overview(
         logger,
         out_dir=args.out,
         prefix=prefix,
         saved_paths=saved_paths,
     )
-    logger.info(f"\nFinished PostGS. Total wall time: {format_elapsed(time.time() - t0)}")
 
 
 if __name__ == "__main__":

@@ -1231,12 +1231,18 @@ def main(log: bool = True):
                 raise
             task.complete(f"Loading GRM from {grm_src} (n={grm.shape[0]})")
 
-        # Eigen decomposition
-        eigenvec, eigenval = eigendecompose_grm(grm, logger=logger)
-        log_success(
-            logger,
-            f"Completed PCA from GRM in {round(time.time() - t_loading, 3)} seconds",
-        )
+        # Eigen decomposition: keep one dynamic progress line only.
+        with CliStatus(
+            "Computing Eigen-Decomposition...",
+            enabled=use_spinner,
+            use_process=True,
+        ) as task:
+            try:
+                eigenvec, eigenval = eigendecompose_grm(grm, logger=None)
+            except Exception:
+                task.fail("Computing Eigen-Decomposition ...Failed")
+                raise
+            task.complete("Computing Eigen-Decomposition ...Finished")
 
         # Save core PCA results
         df_vec = pd.DataFrame(

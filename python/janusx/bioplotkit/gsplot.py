@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 def mse(tparray:np.ndarray):
     se = tparray[:,0]-tparray[:,1]
     return se.T@se/se.shape[0]
@@ -9,7 +10,13 @@ def r2(tparray:np.ndarray):
     sse2 = tparray[:,0] - np.mean(tparray[:,0])
     return 1-sse1.T@sse1/(sse2.T@sse2)
 
-def scatterh(ttest:np.ndarray,ttrain:np.ndarray=None,color_set:list=['black','grey'],fig:plt.Figure=None):
+def scatterh(
+    ttest: np.ndarray,
+    ttrain: np.ndarray = None,
+    color_set: list = ['black', 'grey'],
+    fig: plt.Figure = None,
+    rasterized: bool | None = None,
+):
     if not fig:
         fig = plt.figure(figsize=(5,4),dpi=300)
     layout = np.array([['A']*4+['.']+(['C']*4+['D'])*4]).reshape(5,5)
@@ -17,22 +24,40 @@ def scatterh(ttest:np.ndarray,ttrain:np.ndarray=None,color_set:list=['black','gr
     ax1:plt.Axes = axe['A']
     ax2:plt.Axes = axe['C']
     ax3:plt.Axes = axe['D']
-    rasterized = True if ttrain.shape[0] > 2000 else False # Reduce storage of PDF file
+    if rasterized is None:
+        n_train = int(ttrain.shape[0]) if (ttrain is not None) else 0
+        rasterized_flag = True if n_train > 2000 else False  # reduce vector size on very large plots
+    else:
+        rasterized_flag = bool(rasterized)
     # scatterplot
     ax2.plot([np.min(ttest),np.max(ttest)],[np.min(ttest),np.max(ttest)],linestyle='--',color=color_set[0],alpha=.8,label='y = x (Ideal)')
     if ttrain is not None:
-        ax2.scatter(ttrain[:,0],ttrain[:,1],color=color_set[1],alpha=.4,marker='+',label='Train data',rasterized=rasterized)
-    ax2.scatter(ttest[:,0],ttest[:,1],color=color_set[0],alpha=.8,marker='*',label='Test data',rasterized=rasterized)
+        ax2.scatter(ttrain[:,0],ttrain[:,1],color=color_set[1],alpha=.4,marker='+',label='Train data',rasterized=rasterized_flag)
+    ax2.scatter(ttest[:,0],ttest[:,1],color=color_set[0],alpha=.8,marker='*',label='Test data',rasterized=rasterized_flag)
     ax2.set_xlabel('Observed Value')
     ax2.set_ylabel('Predicted Value')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3, axis='both')
-    plt.gca().text(-0.2, 0.04, 
-        f'Train MSE: {mse(ttrain):.2f}\nTest MSE: {mse(ttest):.2f}\nTrain R2: {r2(ttrain):.2f}\nTest R2: {r2(ttest):.2f}',
-        transform=plt.gca().transAxes,
-        ha='right', va='bottom',
-        color='gray',alpha=.8,
-        multialignment='left')
+    if ttrain is not None:
+        stat_txt = (
+            f'Train MSE: {mse(ttrain):.2f}\n'
+            f'Test MSE: {mse(ttest):.2f}\n'
+            f'Train R2: {r2(ttrain):.2f}\n'
+            f'Test R2: {r2(ttest):.2f}'
+        )
+    else:
+        stat_txt = f'Test MSE: {mse(ttest):.2f}\nTest R2: {r2(ttest):.2f}'
+    ax2.text(
+        -0.2,
+        0.04,
+        stat_txt,
+        transform=ax2.transAxes,
+        ha='right',
+        va='bottom',
+        color='gray',
+        alpha=.8,
+        multialignment='left',
+    )
     # histplot
     if ttrain is not None:
         ax1.hist(ttrain[:,0],color=color_set[1],density=True,alpha=.4,bins=20)

@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 #[cfg(target_os = "macos")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -45,9 +45,9 @@ const HAS_BLAS_BACKEND: bool = cfg!(all(
 fn default_sgemm_backend() -> SgemmBackend {
     #[cfg(target_os = "macos")]
     {
-        if HAS_OPENBLAS_BACKEND {
-            return SgemmBackend::OpenBlas;
-        }
+        // macOS policy: prefer Accelerate by default.
+        // OpenBLAS remains available only via explicit env override:
+        //   JX_RUST_BLAS_BACKEND=openblas
         return SgemmBackend::Accelerate;
     }
     #[cfg(target_os = "windows")]
@@ -1795,6 +1795,18 @@ pub fn rust_sgemm_backend() -> String {
     }
 }
 
+#[pyfunction]
+pub fn rust_eigh_lapack_backend() -> String {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        rust_eigh_lapack_backend_tag().to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unsupported".to_string()
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
 pub(crate) fn rust_eigh_lapack_backend_tag() -> &'static str {
@@ -2004,7 +2016,12 @@ fn should_try_openblas_lapack_on_macos() -> bool {
     match mac_eigh_lapack_pref() {
         MacEighLapackPref::OpenBlas => true,
         MacEighLapackPref::Accelerate => false,
-        MacEighLapackPref::Auto => matches!(selected_sgemm_backend(), SgemmBackend::Accelerate),
+        // Auto policy on macOS:
+        // - BLAS kernels (GEMM/SYRK) still follow rust_sgemm_backend() and default
+        //   to Accelerate for GRM-heavy paths.
+        // - LAPACK eigensolver (dsyevd/dsyevr) probes dynamic OpenBLAS first and
+        //   falls back to Accelerate if unavailable.
+        MacEighLapackPref::Auto => true,
     }
 }
 
@@ -2042,46 +2059,125 @@ fn push_unique_candidate(out: &mut Vec<String>, path: String) {
 }
 
 #[cfg(target_os = "macos")]
-fn openblas_lapack_candidates() -> Vec<String> {
+#[inline]
+fn push_openblas_candidates_in_dir(out: &mut Vec<String>, dir: &Path) {
+    if !(dir.exists() && dir.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut preferred = Vec::<String>::new();
+    let mut others = Vec::<String>::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !(path.exists() && path.is_file()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        let lname = name.to_ascii_lowercase();
+        if !lname.starts_with("libopenblas") || !lname.ends_with(".dylib") {
+            continue;
+        }
+        let path_s = path.to_string_lossy().to_string();
+        if lname == "libopenblas.0.dylib" || lname == "libopenblas.dylib" {
+            preferred.push(path_s);
+        } else {
+            others.push(path_s);
+        }
+    }
+    preferred.sort_unstable();
+    others.sort_unstable();
+    for p in preferred.into_iter().chain(others.into_iter()) {
+        push_unique_candidate(out, p);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn extension_module_dir() -> Option<PathBuf> {
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        let sym = rust_sgemm_backend as *const () as *const libc::c_void;
+        if libc::dladdr(sym, &mut info as *mut libc::Dl_info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        let c_path = std::ffi::CStr::from_ptr(info.dli_fname);
+        let path = PathBuf::from(c_path.to_string_lossy().to_string());
+        path.parent().map(|p| p.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
     let mut out = Vec::<String>::new();
+
+    // 1) Explicit user-provided locations (file or directory).
     for key in ["JX_OPENBLAS_LIB_PATH", "OPENBLAS_LIB_PATH"] {
         if let Ok(v) = std::env::var(key) {
             let s = v.trim();
             if !s.is_empty() {
-                push_unique_candidate(&mut out, s.to_string());
+                let p = Path::new(s);
+                if p.exists() && p.is_dir() {
+                    push_openblas_candidates_in_dir(&mut out, p);
+                } else {
+                    push_unique_candidate(&mut out, s.to_string());
+                }
             }
         }
     }
-    if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
-        let base = Path::new(&prefix).join("lib");
-        for leaf in [
+
+    // 2) Wheel-local candidates (preferred in auto mode):
+    //    janusx/.dylibs, janusx/.libs, and sibling janusx.libs.
+    if let Some(mod_dir) = extension_module_dir() {
+        for rel in [".dylibs", ".libs", ""] {
+            let probe_dir = if rel.is_empty() {
+                mod_dir.clone()
+            } else {
+                mod_dir.join(rel)
+            };
+            push_openblas_candidates_in_dir(&mut out, &probe_dir);
+        }
+        if let Some(parent) = mod_dir.parent() {
+            push_openblas_candidates_in_dir(&mut out, &parent.join("janusx.libs"));
+        }
+    }
+
+    // 3) System-wide/provisioned OpenBLAS fallbacks (explicit openblas mode).
+    if matches!(pref, MacEighLapackPref::OpenBlas) {
+        if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
+            let base = Path::new(&prefix).join("lib");
+            for leaf in [
+                "libopenblas.dylib",
+                "libopenblas.0.dylib",
+                "libopenblasp-r0.3.32.dylib",
+                "libopenblas_armv8p-r0.3.32.dylib",
+                "libopenblas_vortexp-r0.3.32.dylib",
+            ] {
+                let p = base.join(leaf);
+                if p.exists() {
+                    push_unique_candidate(&mut out, p.to_string_lossy().to_string());
+                }
+            }
+        }
+        for p in [
+            "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
+            "/usr/local/opt/openblas/lib/libopenblas.dylib",
             "libopenblas.dylib",
             "libopenblas.0.dylib",
-            "libopenblasp-r0.3.32.dylib",
-            "libopenblas_armv8p-r0.3.32.dylib",
-            "libopenblas_vortexp-r0.3.32.dylib",
         ] {
-            let p = base.join(leaf);
-            if p.exists() {
-                push_unique_candidate(&mut out, p.to_string_lossy().to_string());
-            }
+            push_unique_candidate(&mut out, p.to_string());
         }
-    }
-    for p in [
-        "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
-        "/usr/local/opt/openblas/lib/libopenblas.dylib",
-        "libopenblas.dylib",
-        "libopenblas.0.dylib",
-    ] {
-        push_unique_candidate(&mut out, p.to_string());
     }
     out
 }
 
 #[cfg(target_os = "macos")]
 unsafe fn openblas_lapack_dyn_load_once() -> Option<OpenBlasLapackDyn> {
+    let pref = mac_eigh_lapack_pref();
     let mut handle: *mut libc::c_void = std::ptr::null_mut();
-    for cand in openblas_lapack_candidates().into_iter() {
+    for cand in openblas_lapack_candidates(pref).into_iter() {
         let Ok(cpath) = std::ffi::CString::new(cand.as_bytes()) else {
             continue;
         };

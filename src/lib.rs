@@ -106,7 +106,10 @@ use beam::{
     beam_search_and_continuous_corr_bin_indices_py, beam_search_and_continuous_corr_bin_py,
 };
 use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
-use blas::{rust_blas_get_num_threads, rust_blas_set_num_threads, rust_sgemm_backend};
+use blas::{
+    rust_blas_get_num_threads, rust_blas_set_num_threads, rust_eigh_lapack_backend,
+    rust_sgemm_backend,
+};
 use bsa::preprocess_bsa;
 use eigh::{rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace};
 use gfreader::{
@@ -260,6 +263,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
+    m.add_function(wrap_pyfunction!(rust_eigh_lapack_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;

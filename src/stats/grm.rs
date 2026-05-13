@@ -8,9 +8,10 @@ use pyo3::Bound;
 use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::bedmath::{
@@ -666,7 +667,9 @@ fn grm_accum_mode_from_env(preferred_var: &str) -> Result<GrmAccumMode, String> 
     if let Ok(raw) = std::env::var("JX_GRM_ACCUM") {
         return parse_grm_accum_mode(&raw);
     }
-    Ok(GrmAccumMode::Auto)
+    // Default to SYRK to avoid auto-probe overhead in repeated GRM builds.
+    // Use JX_GRM_*_ACCUM=auto/gemm to override when needed.
+    Ok(GrmAccumMode::Syrk)
 }
 
 #[inline]
@@ -1091,6 +1094,13 @@ fn grm_overlap_enabled_default() -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[inline]
+fn grm_accum_probe_cache() -> &'static Mutex<HashMap<(usize, usize), GrmAccumMode>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), GrmAccumMode>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
 fn grm_probe_accum_mode_f32(block: &[f32], rows: usize, n: usize) -> GrmAccumMode {
     if rows == 0 || n == 0 {
         return GrmAccumMode::Syrk;
@@ -1102,6 +1112,11 @@ fn grm_probe_accum_mode_f32(block: &[f32], rows: usize, n: usize) -> GrmAccumMod
         .unwrap_or(1024usize);
     if n < gemm_min_n {
         return GrmAccumMode::Syrk;
+    }
+    if let Ok(cache) = grm_accum_probe_cache().lock() {
+        if let Some(mode) = cache.get(&(n, rows)).copied() {
+            return mode;
+        }
     }
 
     let probe_n = std::env::var("JX_GRM_ACCUM_PROBE_N")
@@ -1185,11 +1200,15 @@ fn grm_probe_accum_mode_f32(block: &[f32], rows: usize, n: usize) -> GrmAccumMod
 
     let syrk_secs = bench(GrmAccumMode::Syrk);
     let gemm_secs = bench(GrmAccumMode::Gemm);
-    if gemm_secs > 0.0 && gemm_secs < (syrk_secs * 0.90) {
+    let mode = if gemm_secs > 0.0 && gemm_secs < (syrk_secs * 0.90) {
         GrmAccumMode::Gemm
     } else {
         GrmAccumMode::Syrk
+    };
+    if let Ok(mut cache) = grm_accum_probe_cache().lock() {
+        cache.insert((n, rows), mode);
     }
+    mode
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

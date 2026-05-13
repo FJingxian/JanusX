@@ -1130,6 +1130,89 @@ def _order_gs_saved_result_paths(paths: typing.Sequence[str]) -> list[str]:
     return primary + model_effect + summary
 
 
+def _format_gs_saved_result_report(
+    paths: typing.Sequence[str],
+    *,
+    trait_order: typing.Sequence[str] | None = None,
+) -> str:
+    dedup = list(dict.fromkeys([str(p) for p in paths if str(p).strip() != ""]))
+    trait_blocks: "OrderedDict[str, dict[str, list[str]]]" = OrderedDict()
+    summary_path: str | None = None
+    extras: list[str] = []
+
+    if trait_order is not None:
+        for t in list(trait_order):
+            tt = str(t).strip()
+            if tt != "" and tt not in trait_blocks:
+                trait_blocks[tt] = {"pred": [], "effect": [], "model": []}
+
+    def _ensure_trait(trait_name: str) -> dict[str, list[str]]:
+        t = str(trait_name).strip()
+        if t == "":
+            t = "unknown"
+        if t not in trait_blocks:
+            trait_blocks[t] = {"pred": [], "effect": [], "model": []}
+        return trait_blocks[t]
+
+    for p in dedup:
+        low = str(p).lower()
+        if low.endswith(".svg"):
+            continue
+        if low.endswith("summary.json"):
+            summary_path = str(p)
+            continue
+
+        base = os.path.basename(str(p))
+        parts = base.split(".")
+        # Prediction table: {prefix}.{trait}.gs.tsv
+        if len(parts) >= 4 and parts[-2] == "gs" and parts[-1] == "tsv":
+            bucket = _ensure_trait(parts[-3])
+            if str(p) not in bucket["pred"]:
+                bucket["pred"].append(str(p))
+            continue
+        # Effect table: {prefix}.{trait}.gs.effect (or legacy *.effect.tsv)
+        if len(parts) >= 4 and parts[-2] == "gs" and parts[-1] == "effect":
+            bucket = _ensure_trait(parts[-3])
+            if str(p) not in bucket["effect"]:
+                bucket["effect"].append(str(p))
+            continue
+        if len(parts) >= 3 and parts[-2] == "effect" and parts[-1] == "tsv":
+            bucket = _ensure_trait(parts[-3])
+            if str(p) not in bucket["effect"]:
+                bucket["effect"].append(str(p))
+            continue
+        # Model: {trait}.{method}.jxmodel (exclude TOP bundle)
+        if low.endswith(".jxmodel") and (not low.endswith(".gs.top.jxmodel")):
+            stem = base[: -len(".jxmodel")]
+            if "." in stem:
+                trait_token = stem.rsplit(".", 1)[0]
+                bucket = _ensure_trait(trait_token)
+                if str(p) not in bucket["model"]:
+                    bucket["model"].append(str(p))
+                continue
+
+        extras.append(str(p))
+
+    lines: list[str] = []
+    for trait_name, bucket in trait_blocks.items():
+        rows: list[str] = []
+        for key in ("pred", "effect", "model"):
+            for fp in list(bucket.get(key, [])):
+                rows.append(f"  {key:<10}{format_path_for_display(str(fp))}")
+        if len(rows) <= 0:
+            continue
+        lines.append(str(trait_name))
+        lines.extend(rows)
+
+    for p in extras:
+        lines.append(f"extra    {format_path_for_display(str(p))}")
+
+    if summary_path is not None:
+        lines.append(f"summary  {format_path_for_display(str(summary_path))}")
+
+    return "\n".join(lines).strip()
+
+
 def _resolve_top_bundle_model_file(
     *,
     model_arg: str,
@@ -12426,6 +12509,19 @@ def _run_gs_pipeline(
     configure_genotype_cache_from_out(args.out)
     log_path = f"{outprefix}.gs.log"
     logger = setup_logging(log_path)
+    _file_only_logger = logging.getLogger("janusx.gs.file_only")
+    _file_only_logger.handlers.clear()
+    _file_only_logger.setLevel(logging.INFO)
+    _file_only_logger.propagate = False
+    for _h in list(logger.handlers):
+        if isinstance(_h, logging.FileHandler):
+            _file_only_logger.addHandler(_h)
+
+    def _log_file_only(msg: str) -> None:
+        text = str(msg).strip()
+        if text != "":
+            _file_only_logger.info(text)
+
     if thread_capped:
         logger.warning(
             f"Requested threads={requested_threads} exceeds detected available={detected_threads}; "
@@ -14276,9 +14372,12 @@ def _run_gs_pipeline(
 
         method_display_map = {str(m): _method_display_name(str(m)) for m in trait_methods}
         out_tsv = f"{outprefix}.{trait_name}.gs.tsv"
+        out_effect_merged = f"{outprefix}.{trait_name}.gs.effect"
         expected_test_n = int(np.sum(testmask))
         pred_by_method: dict[str, np.ndarray] = {}
         trait_method_summary[str(trait_name)] = {}
+        trait_effect_tables: dict[str, pd.DataFrame] = {}
+        trait_effect_meta_by_method: dict[str, dict[str, typing.Any]] = {}
 
         def _emit_method_header(method_key: str) -> None:
             m_key = str(method_key)
@@ -14407,7 +14506,6 @@ def _run_gs_pipeline(
                     _save_jxmodel(model_out, payload)
                     saved_result_paths.append(str(model_out))
                     model_out_export = str(model_out)
-                    effect_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.effect.tsv")
                     try:
                         fallback_marker_count = None
                         if _looks_like_packed_payload(trait_packed_ctx):
@@ -14418,21 +14516,21 @@ def _run_gs_pipeline(
                             )
                         elif train_snp is not None:
                             fallback_marker_count = int(np.asarray(train_snp).shape[0])
-                        effect_meta = _write_method_effect_tsv(
-                            out_path=effect_out,
+                        effect_table, effect_meta = _build_method_effect_table(
                             model_state=dict(state_export),
                             packed_ctx=packed_ctx_for_export,
                             genotype_prefix_hint=(str(gfile) if _is_plink_prefix(_strip_plink_suffix(str(gfile))) else None),
                             fallback_marker_count=fallback_marker_count,
                         )
-                        saved_result_paths.append(str(effect_out))
-                        effect_out_export = str(effect_out)
+                        trait_effect_tables[str(m_key)] = pd.DataFrame(effect_table)
+                        trait_effect_meta_by_method[str(m_key)] = dict(effect_meta or {})
+                        effect_out_export = str(out_effect_merged)
                     except Exception as ex:
                         logger.warning(
-                            f"Effect export failed for trait={trait_name}, method={m_key}: {ex}"
+                            f"Effect table build failed for trait={trait_name}, method={m_key}: {ex}"
                         )
                         effect_meta = {
-                            "effect_file": str(effect_out),
+                            "effect_file": str(out_effect_merged),
                             "rows": 0,
                             "beta_available": False,
                             "beta_source": "export_failed",
@@ -14441,6 +14539,8 @@ def _run_gs_pipeline(
                             "metadata_source": "unknown",
                             "notes": [f"export_failed: {ex}"],
                         }
+                        trait_effect_meta_by_method[str(m_key)] = dict(effect_meta)
+                        effect_out_export = str(out_effect_merged)
                     exported_model_artifacts.append(
                         {
                             "trait": str(trait_name),
@@ -14665,6 +14765,106 @@ def _run_gs_pipeline(
                 f"elapsed={time.time() - t_stage:.3f}s"
             )
         method_result_map = {str(x["method"]): x for x in method_results}
+        trait_method_keys = {str(m) for m in trait_methods}
+        merged_effect_written = False
+        merged_effect_method_keys: list[str] = []
+        if (args.model is None) and (not top_enabled) and (len(trait_effect_tables) > 0):
+            try:
+                merge_method_order: list[str] = []
+                for m in trait_methods:
+                    m_key = str(m)
+                    tb = trait_effect_tables.get(m_key, None)
+                    if tb is None:
+                        continue
+                    if _is_gblup_method(m_key):
+                        has_finite_beta = False
+                        if "beta" in tb.columns:
+                            try:
+                                beta_vec = np.asarray(tb["beta"], dtype=np.float64).reshape(-1)
+                                has_finite_beta = bool(np.any(np.isfinite(beta_vec)))
+                            except Exception:
+                                has_finite_beta = False
+                        if not has_finite_beta:
+                            meta_skip = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
+                            notes_skip = list(meta_skip.get("notes", []) or [])
+                            notes_skip.append("excluded_from_merged_effect:beta_unavailable")
+                            meta_skip["notes"] = notes_skip
+                            meta_skip["merged_effect_included"] = False
+                            trait_effect_meta_by_method[m_key] = meta_skip
+                            _log_file_only(
+                                "Merged effect export: skip method "
+                                f"{m_key} for trait={trait_name} (GBLUP-related with unavailable beta)."
+                            )
+                            continue
+                    merge_method_order.append(m_key)
+                    meta_keep = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
+                    meta_keep["merged_effect_included"] = True
+                    trait_effect_meta_by_method[m_key] = meta_keep
+
+                merged_effect_method_keys = list(merge_method_order)
+                if len(merged_effect_method_keys) > 0:
+                    merged_effect_tbl = _build_trait_merged_effect_table(
+                        method_tables=dict(trait_effect_tables),
+                        method_order=list(merge_method_order),
+                        method_display_map=dict(method_display_map),
+                    )
+                    os.makedirs(os.path.dirname(out_effect_merged), exist_ok=True)
+                    merged_effect_tbl.to_csv(
+                        out_effect_merged,
+                        sep="\t",
+                        index=False,
+                        float_format="%.6g",
+                    )
+                    saved_result_paths.append(str(out_effect_merged))
+                    merged_effect_written = True
+            except Exception as ex:
+                logger.warning(
+                    f"Merged effect export failed for trait={trait_name}: {ex}"
+                )
+        if merged_effect_written:
+            merged_effect_method_set = set(merged_effect_method_keys)
+            for m in trait_methods:
+                m_key = str(m)
+                if m_key in trait_method_summary.get(str(trait_name), {}):
+                    if m_key in merged_effect_method_set:
+                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = str(
+                            out_effect_merged
+                        )
+                    else:
+                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = None
+                    if m_key in trait_effect_meta_by_method:
+                        trait_method_summary[str(trait_name)][m_key]["effect_meta"] = dict(
+                            trait_effect_meta_by_method[m_key]
+                        )
+            for art in exported_model_artifacts:
+                trait_art = str(art.get("trait", "")).strip()
+                method_art = str(art.get("method", "")).strip()
+                if (trait_art != str(trait_name)) or (method_art not in trait_method_keys):
+                    continue
+                if method_art in merged_effect_method_set:
+                    art["effect_file"] = str(out_effect_merged)
+                    art["effect_column"] = str(
+                        method_display_map.get(method_art, method_art)
+                    )
+                else:
+                    art["effect_file"] = ""
+                    art["effect_column"] = ""
+                if method_art in trait_effect_meta_by_method:
+                    art["effect_meta"] = dict(trait_effect_meta_by_method[method_art])
+        else:
+            for m in trait_methods:
+                m_key = str(m)
+                if m_key in trait_method_summary.get(str(trait_name), {}):
+                    cur_eff = trait_method_summary[str(trait_name)][m_key].get("effect_file", None)
+                    if str(cur_eff or "").strip() == str(out_effect_merged):
+                        trait_method_summary[str(trait_name)][m_key]["effect_file"] = None
+            for art in exported_model_artifacts:
+                trait_art = str(art.get("trait", "")).strip()
+                method_art = str(art.get("method", "")).strip()
+                if (trait_art != str(trait_name)) or (method_art not in trait_method_keys):
+                    continue
+                if str(art.get("effect_file", "")).strip() == str(out_effect_merged):
+                    art["effect_file"] = ""
         top_selected_method = ""
         top_metric_scores: dict[str, dict[str, float]] = {}
         if top_enabled:
@@ -14799,23 +14999,35 @@ def _run_gs_pipeline(
                 if best_test is None or best_train is None:
                     continue
                 fig = plt.figure(figsize=(5, 4), dpi=300)
-                gsplot.scatterh(best_test, best_train, color_set=color_set[0], fig=fig)
+                gsplot.scatterh(
+                    best_test,
+                    best_train,
+                    color_set=color_set[0],
+                    fig=fig,
+                    rasterized=False,
+                )
                 for ax in fig.axes:
                     if str(ax.get_ylabel()).strip() == "Predicted Value":
                         ax.set_ylabel(
                             f"Predicted Value ({method_display_map.get(str(method), str(method))})"
                         )
                         break
-                out_svg = f"{outprefix}.{trait_name}.gs.{method}.svg"
+                svg_method = _sanitize_artifact_token(
+                    method_display_map.get(str(method), str(method))
+                )
+                out_svg = os.path.join(gs_model_dir, f"{trait_name}.{svg_method}.svg")
                 # Avoid tight_layout warnings on dense decorations.
                 fig.subplots_adjust(left=0.16, right=0.98, bottom=0.14, top=0.98)
-                fig.savefig(
-                    out_svg,
-                    transparent=False,
-                    facecolor="white",
-                    bbox_inches="tight",
-                )
+                with mpl.rc_context({"svg.fonttype": "none"}):
+                    fig.savefig(
+                        out_svg,
+                        format="svg",
+                        transparent=False,
+                        facecolor="white",
+                        bbox_inches="tight",
+                    )
                 plt.close(fig)
+                saved_result_paths.append(str(out_svg))
 
         missing_methods = [m for m in trait_methods if m not in method_result_map]
         if len(missing_methods) > 0:
@@ -14916,7 +15128,7 @@ def _run_gs_pipeline(
                     "Selected model: %s",
                     method_display_map.get(str(selected_cv_model_key), str(selected_cv_model_key)),
                 )
-        log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
+        # log_success(logger, f"Saved predictions to {format_path_for_display(out_tsv)}")
         log_success(logger, f"Trait {trait_name} finished in {(time.time() - t_trait):.2f} secs")
 
     if top_enabled:
@@ -15241,7 +15453,7 @@ def _run_gs_pipeline(
         "usage": {
             "model_directory": str(gs_model_dir),
             "single_trait_model_file_pattern": "{trait}.{method}.jxmodel",
-            "effect_file_pattern": "{trait}.{method}.effect.tsv",
+            "effect_file_pattern": "{prefix}.{trait}.gs.effect",
             "summary_file": "summary.json",
             "loaded_model_hint": (
                 "Use --model <model_dir> with the target trait and method. "
@@ -15254,15 +15466,20 @@ def _run_gs_pipeline(
         with open(summary_out, "w", encoding="utf-8") as sfh:
             json.dump(_json_safe(summary_payload), sfh, indent=2, ensure_ascii=False)
         saved_result_paths = list(result_files_for_summary)
-        log_success(logger, f"Saved GS summary to {format_path_for_display(summary_out)}")
+        # log_success(logger, f"Saved GS summary to {format_path_for_display(summary_out)}")
     except Exception as ex:
         logger.warning(f"Failed to write GS summary.json: {ex}")
     saved_result_paths = _order_gs_saved_result_paths([str(x) for x in saved_result_paths])
     if len(saved_result_paths) > 0:
         logger.info("")
-        saved_body = "\n".join(
-            [f"  {format_path_for_display(str(p))}" for p in saved_result_paths]
+        saved_body = _format_gs_saved_result_report(
+            saved_result_paths,
+            trait_order=[str(x) for x in trait_order],
         )
+        if saved_body.strip() == "":
+            saved_body = "\n".join(
+                [f"  {format_path_for_display(str(p))}" for p in saved_result_paths]
+            )
         log_success(logger, f"Results saved:\n{saved_body}")
 
     # ----------------------------------------------------------------------

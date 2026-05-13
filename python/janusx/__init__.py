@@ -61,6 +61,7 @@ def _init_macos_openblas_path() -> None:
 
     pkg_dir = Path(__file__).resolve().parent
     cands: list[Path] = []
+    cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
     cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
     cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
     if len(cands) == 0:
@@ -68,8 +69,8 @@ def _init_macos_openblas_path() -> None:
 
     # Prefer canonical soname-style names first.
     preferred_order = [
-        "libopenblas.dylib",
         "libopenblas.0.dylib",
+        "libopenblas.dylib",
     ]
     picked: Path | None = None
     by_name = {p.name: p for p in cands}

@@ -160,6 +160,23 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_accelerate(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_accelerate(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
+    );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_accelerate(
         order: CblasInt,
@@ -269,6 +286,23 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_blas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_blas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
+    );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_blas(
         order: CblasInt,
@@ -340,6 +374,23 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
     );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
@@ -457,6 +508,23 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
+    );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
         order: CblasInt,
@@ -573,6 +641,23 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
+    );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
         order: CblasInt,
@@ -686,6 +771,23 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
     );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
@@ -802,6 +904,23 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: CblasInt,
     );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
+    );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
         order: CblasInt,
@@ -916,6 +1035,23 @@ unsafe extern "C" {
         beta: f64,
         c: *mut f64,
         ldc: CblasInt,
+    );
+    #[link_name = "cblas_ddot"]
+    fn cblas_ddot_openblas(
+        n: CblasInt,
+        x: *const f64,
+        incx: CblasInt,
+        y: *const f64,
+        incy: CblasInt,
+    ) -> f64;
+    #[link_name = "cblas_daxpy"]
+    fn cblas_daxpy_openblas(
+        n: CblasInt,
+        alpha: f64,
+        x: *const f64,
+        incx: CblasInt,
+        y: *mut f64,
+        incy: CblasInt,
     );
     #[link_name = "cblas_ssyrk"]
     fn cblas_ssyrk_openblas(
@@ -1308,6 +1444,235 @@ pub(crate) unsafe fn cblas_dgemm_dispatch(
         cblas_dgemm_openblas(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn cblas_ddot_rust(
+    n: CblasInt,
+    x: *const f64,
+    incx: CblasInt,
+    y: *const f64,
+    incy: CblasInt,
+) -> f64 {
+    if n <= 0 {
+        return 0.0_f64;
+    }
+    assert!(incx > 0 && incy > 0, "Rust DDOT fallback expects positive increments");
+    let n_usize = n as usize;
+    let incx_usize = incx as usize;
+    let incy_usize = incy as usize;
+    if incx_usize == 1 && incy_usize == 1 {
+        let xs = std::slice::from_raw_parts(x, n_usize);
+        let ys = std::slice::from_raw_parts(y, n_usize);
+        xs.iter()
+            .zip(ys.iter())
+            .map(|(a, b)| (*a) * (*b))
+            .sum::<f64>()
+    } else {
+        let xs = std::slice::from_raw_parts(x, n_usize.saturating_mul(incx_usize));
+        let ys = std::slice::from_raw_parts(y, n_usize.saturating_mul(incy_usize));
+        let mut acc = 0.0_f64;
+        for i in 0..n_usize {
+            acc += xs[i * incx_usize] * ys[i * incy_usize];
+        }
+        acc
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) unsafe fn cblas_ddot_dispatch(
+    n: CblasInt,
+    x: *const f64,
+    incx: CblasInt,
+    y: *const f64,
+    incy: CblasInt,
+) -> f64 {
+    match selected_sgemm_backend() {
+        SgemmBackend::Accelerate => {
+            #[cfg(all(
+                target_os = "macos",
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                return cblas_ddot_accelerate(n, x, incx, y, incy);
+            }
+        }
+        SgemmBackend::OpenBlas => {
+            #[cfg(any(
+                target_os = "windows",
+                all(feature = "blas-openblas", jx_openblas_available)
+            ))]
+            {
+                return cblas_ddot_openblas(n, x, incx, y, incy);
+            }
+        }
+        SgemmBackend::Blas => {
+            #[cfg(all(
+                target_os = "linux",
+                jx_blas_available,
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                return cblas_ddot_blas(n, x, incx, y, incy);
+            }
+        }
+        SgemmBackend::Rust => {
+            return cblas_ddot_rust(n, x, incx, y, incy);
+        }
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        return cblas_ddot_accelerate(n, x, incx, y, incy);
+    }
+    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    {
+        return cblas_ddot_openblas(n, x, incx, y, incy);
+    }
+    #[cfg(all(
+        target_os = "linux",
+        jx_blas_available,
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        return cblas_ddot_blas(n, x, incx, y, incy);
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(jx_blas_available),
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        return cblas_ddot_rust(n, x, incx, y, incy);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return cblas_ddot_openblas(n, x, incx, y, incy);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+unsafe fn cblas_daxpy_rust(
+    n: CblasInt,
+    alpha: f64,
+    x: *const f64,
+    incx: CblasInt,
+    y: *mut f64,
+    incy: CblasInt,
+) {
+    if n <= 0 || alpha == 0.0_f64 {
+        return;
+    }
+    assert!(incx > 0 && incy > 0, "Rust DAXPY fallback expects positive increments");
+    let n_usize = n as usize;
+    let incx_usize = incx as usize;
+    let incy_usize = incy as usize;
+    if incx_usize == 1 && incy_usize == 1 {
+        let xs = std::slice::from_raw_parts(x, n_usize);
+        let ys = std::slice::from_raw_parts_mut(y, n_usize);
+        for i in 0..n_usize {
+            ys[i] = alpha.mul_add(xs[i], ys[i]);
+        }
+    } else {
+        let xs = std::slice::from_raw_parts(x, n_usize.saturating_mul(incx_usize));
+        let ys = std::slice::from_raw_parts_mut(y, n_usize.saturating_mul(incy_usize));
+        for i in 0..n_usize {
+            let yi = i * incy_usize;
+            ys[yi] = alpha.mul_add(xs[i * incx_usize], ys[yi]);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) unsafe fn cblas_daxpy_dispatch(
+    n: CblasInt,
+    alpha: f64,
+    x: *const f64,
+    incx: CblasInt,
+    y: *mut f64,
+    incy: CblasInt,
+) {
+    match selected_sgemm_backend() {
+        SgemmBackend::Accelerate => {
+            #[cfg(all(
+                target_os = "macos",
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                cblas_daxpy_accelerate(n, alpha, x, incx, y, incy);
+                return;
+            }
+        }
+        SgemmBackend::OpenBlas => {
+            #[cfg(any(
+                target_os = "windows",
+                all(feature = "blas-openblas", jx_openblas_available)
+            ))]
+            {
+                cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
+                return;
+            }
+        }
+        SgemmBackend::Blas => {
+            #[cfg(all(
+                target_os = "linux",
+                jx_blas_available,
+                not(all(feature = "blas-openblas", jx_openblas_available))
+            ))]
+            {
+                cblas_daxpy_blas(n, alpha, x, incx, y, incy);
+                return;
+            }
+        }
+        SgemmBackend::Rust => {
+            cblas_daxpy_rust(n, alpha, x, incx, y, incy);
+            return;
+        }
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_daxpy_accelerate(n, alpha, x, incx, y, incy);
+        return;
+    }
+    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    {
+        cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
+        return;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        jx_blas_available,
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_daxpy_blas(n, alpha, x, incx, y, incy);
+        return;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(jx_blas_available),
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
+    {
+        cblas_daxpy_rust(n, alpha, x, incx, y, incy);
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
+        return;
     }
 }
 

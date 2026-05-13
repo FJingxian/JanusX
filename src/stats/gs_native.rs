@@ -414,7 +414,8 @@ fn sample_var_f64(v: &[f64]) -> f64 {
     block_rows=4096,
     threads=0,
     return_variance_components=false,
-    estimate_only=false
+    estimate_only=false,
+    return_effect=false
 ))]
 pub fn gblup_reml_packed_bed<'py>(
     py: Python<'py>,
@@ -433,6 +434,7 @@ pub fn gblup_reml_packed_bed<'py>(
     threads: usize,
     return_variance_components: bool,
     estimate_only: bool,
+    return_effect: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
@@ -445,6 +447,7 @@ pub fn gblup_reml_packed_bed<'py>(
     usize,
     f64,
     f64,
+    Bound<'py, PyArray1<f64>>,
 )> {
     if !(g_eps.is_finite() && g_eps >= 0.0) {
         return Err(PyRuntimeError::new_err("g_eps must be finite and >= 0"));
@@ -639,6 +642,8 @@ pub fn gblup_reml_packed_bed<'py>(
             evd_elapsed,
             sigma_g2,
             sigma_e2,
+            effect_alpha0,
+            effect_beta,
         ) = py
             .detach(
                 move || -> Result<
@@ -653,6 +658,8 @@ pub fn gblup_reml_packed_bed<'py>(
                         f64,
                         f64,
                         f64,
+                        f64,
+                        Vec<f64>,
                     ),
                     String,
                 > {
@@ -675,6 +682,7 @@ pub fn gblup_reml_packed_bed<'py>(
                         tol,
                         max_iter,
                         estimate_only,
+                        return_effect,
                         pool_ref,
                     )
                 },
@@ -703,6 +711,12 @@ pub fn gblup_reml_packed_bed<'py>(
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         )
         .into_bound();
+        let effect_arr = if return_effect {
+            PyArray1::from_owned_array(py, Array1::from_vec(effect_beta)).into_bound()
+        } else {
+            PyArray1::from_owned_array(py, Array1::from_vec(Vec::<f64>::new())).into_bound()
+        };
+        let _effect_alpha0_out = if return_effect { effect_alpha0 } else { f64::NAN };
 
         return Ok((
             train_arr,
@@ -716,6 +730,7 @@ pub fn gblup_reml_packed_bed<'py>(
             eff_m,
             sigma_g2_out,
             sigma_e2_out,
+            effect_arr,
         ));
     }
 
@@ -950,33 +965,6 @@ pub fn gblup_reml_packed_bed<'py>(
     } else {
         f64::NAN
     };
-    if estimate_only {
-        let train_arr = PyArray2::from_owned_array(
-            py,
-            Array2::from_shape_vec((0, 1), Vec::<f64>::new())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        )
-        .into_bound();
-        let test_arr = PyArray2::from_owned_array(
-            py,
-            Array2::from_shape_vec((0, 1), Vec::<f64>::new())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        )
-        .into_bound();
-        return Ok((
-            train_arr,
-            test_arr,
-            pve,
-            lambda_opt,
-            ml,
-            reml,
-            evd_backend,
-            evd_elapsed,
-            eff_m,
-            sigma_g2_out,
-            sigma_e2_out,
-        ));
-    }
 
     let alpha_arr =
         PyArray1::from_owned_array(py, Array1::from_vec(alpha_vec.clone())).into_bound();
@@ -1011,54 +999,29 @@ pub fn gblup_reml_packed_bed<'py>(
         .zip(m_alpha_slice.iter())
         .map(|(a, b)| (*a) * (*b))
         .sum::<f64>();
-
-    let train_pred_all_arr = cross_grm_times_alpha_packed_f64(
-        py,
-        packed_keep_arr.readonly(),
-        n_samples,
-        row_flip_keep_arr.readonly(),
-        maf_keep_arr.readonly(),
-        train_idx_arr.readonly(),
-        m_alpha_arr.readonly(),
-        m_mean_arr.readonly(),
-        alpha_sum,
-        mean_sq,
-        mean_malpha,
-        var_sum,
-        block_rows.max(1),
-        threads,
-    )?;
-    let train_pred_all_ro = train_pred_all_arr.readonly();
-    let train_pred_all_slice = train_pred_all_ro.as_slice().map_err(|e| {
-        PyRuntimeError::new_err(format!("train prediction buffer is not contiguous: {e}"))
-    })?;
-    if train_pred_all_slice.len() != n_train {
-        return Err(PyRuntimeError::new_err(format!(
-            "train prediction length mismatch: got {}, expected {}",
-            train_pred_all_slice.len(),
-            n_train
-        )));
+    let mut effect_alpha0 = f64::NAN;
+    let mut effect_beta_vec: Vec<f64> = Vec::new();
+    if return_effect {
+        let inv_var = 1.0_f64 / var_sum.max(1e-12_f64);
+        effect_beta_vec = m_alpha_slice
+            .iter()
+            .zip(m_mean.iter())
+            .map(|(ma, mm)| (*ma - (*mm) * alpha_sum) * inv_var)
+            .collect();
+        let const_term = mean_sq * alpha_sum - mean_malpha;
+        effect_alpha0 = beta0 + const_term * inv_var;
     }
-    let mut pred_train_all: Vec<f64> = train_pred_all_slice.iter().map(|v| *v + beta0).collect();
-    let pred_train: Vec<f64> = if let Some(local_idx) = train_pred_pick {
-        local_idx.iter().map(|&i| pred_train_all[i]).collect()
-    } else {
-        std::mem::take(&mut pred_train_all)
-    };
 
-    let pred_test: Vec<f64> = if test_idx.is_empty() {
-        Vec::new()
+    let (pred_train, pred_test): (Vec<f64>, Vec<f64>) = if estimate_only {
+        (Vec::new(), Vec::new())
     } else {
-        let test_idx_i64: Vec<i64> = test_idx.iter().map(|&v| v as i64).collect();
-        let test_idx_arr =
-            PyArray1::from_owned_array(py, Array1::from_vec(test_idx_i64)).into_bound();
-        let test_pred_arr = cross_grm_times_alpha_packed_f64(
+        let train_pred_all_arr = cross_grm_times_alpha_packed_f64(
             py,
             packed_keep_arr.readonly(),
             n_samples,
             row_flip_keep_arr.readonly(),
             maf_keep_arr.readonly(),
-            test_idx_arr.readonly(),
+            train_idx_arr.readonly(),
             m_alpha_arr.readonly(),
             m_mean_arr.readonly(),
             alpha_sum,
@@ -1068,11 +1031,54 @@ pub fn gblup_reml_packed_bed<'py>(
             block_rows.max(1),
             threads,
         )?;
-        let test_pred_ro = test_pred_arr.readonly();
-        let test_pred_slice = test_pred_ro.as_slice().map_err(|e| {
-            PyRuntimeError::new_err(format!("test prediction buffer is not contiguous: {e}"))
+        let train_pred_all_ro = train_pred_all_arr.readonly();
+        let train_pred_all_slice = train_pred_all_ro.as_slice().map_err(|e| {
+            PyRuntimeError::new_err(format!("train prediction buffer is not contiguous: {e}"))
         })?;
-        test_pred_slice.iter().map(|v| *v + beta0).collect()
+        if train_pred_all_slice.len() != n_train {
+            return Err(PyRuntimeError::new_err(format!(
+                "train prediction length mismatch: got {}, expected {}",
+                train_pred_all_slice.len(),
+                n_train
+            )));
+        }
+        let mut pred_train_all: Vec<f64> =
+            train_pred_all_slice.iter().map(|v| *v + beta0).collect();
+        let pred_train_local: Vec<f64> = if let Some(local_idx) = train_pred_pick {
+            local_idx.iter().map(|&i| pred_train_all[i]).collect()
+        } else {
+            std::mem::take(&mut pred_train_all)
+        };
+
+        let pred_test_local: Vec<f64> = if test_idx.is_empty() {
+            Vec::new()
+        } else {
+            let test_idx_i64: Vec<i64> = test_idx.iter().map(|&v| v as i64).collect();
+            let test_idx_arr =
+                PyArray1::from_owned_array(py, Array1::from_vec(test_idx_i64)).into_bound();
+            let test_pred_arr = cross_grm_times_alpha_packed_f64(
+                py,
+                packed_keep_arr.readonly(),
+                n_samples,
+                row_flip_keep_arr.readonly(),
+                maf_keep_arr.readonly(),
+                test_idx_arr.readonly(),
+                m_alpha_arr.readonly(),
+                m_mean_arr.readonly(),
+                alpha_sum,
+                mean_sq,
+                mean_malpha,
+                var_sum,
+                block_rows.max(1),
+                threads,
+            )?;
+            let test_pred_ro = test_pred_arr.readonly();
+            let test_pred_slice = test_pred_ro.as_slice().map_err(|e| {
+                PyRuntimeError::new_err(format!("test prediction buffer is not contiguous: {e}"))
+            })?;
+            test_pred_slice.iter().map(|v| *v + beta0).collect()
+        };
+        (pred_train_local, pred_test_local)
     };
 
     let train_arr = PyArray2::from_owned_array(
@@ -1087,6 +1093,12 @@ pub fn gblup_reml_packed_bed<'py>(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .into_bound();
+    let effect_arr = if return_effect {
+        PyArray1::from_owned_array(py, Array1::from_vec(effect_beta_vec)).into_bound()
+    } else {
+        PyArray1::from_owned_array(py, Array1::from_vec(Vec::<f64>::new())).into_bound()
+    };
+    let _effect_alpha0_out = if return_effect { effect_alpha0 } else { f64::NAN };
     Ok((
         train_arr,
         test_arr,
@@ -1099,6 +1111,7 @@ pub fn gblup_reml_packed_bed<'py>(
         eff_m,
         sigma_g2_out,
         sigma_e2_out,
+        effect_arr,
     ))
 }
 

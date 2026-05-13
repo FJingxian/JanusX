@@ -158,6 +158,7 @@ use packed::{
     bed_packed_decode_rows_f32, bed_packed_decode_stats_f64, bed_packed_row_flip_mask,
     bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
     bed_packed_signed_hash_ztz_stats_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
+    packed_malpha_mode_f64,
 };
 use rsvd::py_rsvd_packed_subset;
 use score::{
@@ -262,6 +263,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_mmap_filter_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;

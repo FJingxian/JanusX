@@ -399,6 +399,11 @@ def _is_jxmodel_export_supported(method: str) -> bool:
     )
 
 
+def _is_effect_export_supported(method: str) -> bool:
+    m = str(method)
+    return bool(_is_gblup_method(m) or _is_jxmodel_export_supported(m))
+
+
 def _known_jxmodel_methods() -> set[str]:
     return _GBLUP_METHOD_SET | {"rrBLUP", "BayesA", "BayesB", "BayesCpi"} | set(_ML_METHOD_MAP.keys())
 
@@ -620,6 +625,54 @@ def _extract_ml_effect_vector_from_estimator(
     return None, "no_ml_feature_score"
 
 
+def _infer_effect_kind_from_state(
+    model_state: dict[str, typing.Any],
+    *,
+    ml_source: str = "",
+) -> str:
+    kind = str(model_state.get("kind", "")).strip().lower()
+    method = str(model_state.get("method", "")).strip()
+    explicit = str(model_state.get("effect_kind", "")).strip().lower()
+    if explicit in {"signed_beta", "importance", "attribution", "kernel_projection"}:
+        return explicit
+    if kind in {"rrblup_linear", "bayes_linear"}:
+        return "signed_beta"
+    if kind in {"gblup_kernel_projection", "gblup_kernel_projection_ad"}:
+        return "kernel_projection"
+    if _is_gblup_method(method):
+        return "kernel_projection"
+    if kind == "mlsk_model":
+        src = str(ml_source).strip().lower()
+        if src.startswith("feature_importances_"):
+            return "importance"
+        if src.startswith("coef_"):
+            return "signed_beta"
+        return "importance"
+    return "signed_beta"
+
+
+_EFFECT_KIND_COLUMNS: dict[str, str] = {
+    "signed_beta": "signed_beta",
+    "importance": "importance",
+    "attribution": "attribution",
+    "kernel_projection": "kernel_projection",
+}
+
+
+def _primary_effect_col_for_kind(effect_kind: str) -> str:
+    k = str(effect_kind).strip().lower()
+    return _EFFECT_KIND_COLUMNS.get(k, "signed_beta")
+
+
+def _candidate_effect_cols_for_kind(effect_kind: str) -> list[str]:
+    primary = _primary_effect_col_for_kind(effect_kind)
+    cols = [primary]
+    # Backward compatibility: older artifacts only contain `beta`.
+    if primary != "beta":
+        cols.append("beta")
+    return cols
+
+
 def _as_opt_f64_vector(value: typing.Any) -> np.ndarray | None:
     if value is None:
         return None
@@ -786,20 +839,33 @@ def _prepare_model_state_for_export_raw_012(
     return state_export, meta
 
 
-def _extract_effect_beta_from_model_state(
+def _extract_effect_vector_from_model_state(
     model_state: dict[str, typing.Any],
-) -> tuple[np.ndarray | None, str]:
-    beta_raw = model_state.get("beta", None)
-    if beta_raw is not None:
-        beta_arr = np.asarray(beta_raw, dtype=np.float64).reshape(-1)
-        if int(beta_arr.size) > 0:
-            return np.ascontiguousarray(beta_arr, dtype=np.float64), "model_state.beta"
+) -> tuple[np.ndarray | None, str, str]:
+    inferred_kind = _infer_effect_kind_from_state(model_state)
+    cand_keys = _candidate_effect_cols_for_kind(inferred_kind)
+    # Try all named semantics first, then `beta` fallback.
+    for k in list(_EFFECT_KIND_COLUMNS.values()) + ["beta"]:
+        if k not in cand_keys:
+            cand_keys.append(k)
+    for key in cand_keys:
+        vec_raw = model_state.get(str(key), None)
+        if vec_raw is None:
+            continue
+        vec = np.asarray(vec_raw, dtype=np.float64).reshape(-1)
+        if int(vec.size) <= 0:
+            continue
+        src = f"model_state.{key}"
+        eff_kind = _infer_effect_kind_from_state(model_state, ml_source=src)
+        if str(key).strip().lower() in _EFFECT_KIND_COLUMNS:
+            eff_kind = str(key).strip().lower()
+        return np.ascontiguousarray(vec, dtype=np.float64), src, eff_kind
 
     kind = str(model_state.get("kind", "")).strip().lower()
     if kind == "mlsk_model":
         arr, src = _extract_ml_effect_vector_from_estimator(model_state.get("estimator", None))
         if arr is None:
-            return None, src
+            return None, src, _infer_effect_kind_from_state(model_state, ml_source=src)
         marker_means = np.asarray(
             model_state.get("marker_means", np.zeros((0,), dtype=np.float32)),
             dtype=np.float32,
@@ -807,10 +873,21 @@ def _extract_effect_beta_from_model_state(
         m_marker = int(marker_means.shape[0])
         if m_marker > 0:
             if int(arr.size) < m_marker:
-                return None, f"{src}:short_feature_vector({arr.size}<{m_marker})"
-            return np.ascontiguousarray(arr[:m_marker], dtype=np.float64), f"{src}:marker_slice"
-        return np.ascontiguousarray(arr, dtype=np.float64), src
-    return None, "no_beta_in_model_state"
+                short_src = f"{src}:short_feature_vector({arr.size}<{m_marker})"
+                return None, short_src, _infer_effect_kind_from_state(model_state, ml_source=short_src)
+            slice_src = f"{src}:marker_slice"
+            return (
+                np.ascontiguousarray(arr[:m_marker], dtype=np.float64),
+                slice_src,
+                _infer_effect_kind_from_state(model_state, ml_source=slice_src),
+            )
+        return (
+            np.ascontiguousarray(arr, dtype=np.float64),
+            src,
+            _infer_effect_kind_from_state(model_state, ml_source=src),
+        )
+    src = "no_beta_in_model_state"
+    return None, src, _infer_effect_kind_from_state(model_state, ml_source=src)
 
 
 def _build_method_effect_table(
@@ -821,7 +898,7 @@ def _build_method_effect_table(
     fallback_marker_count: int | None,
 ) -> tuple[pd.DataFrame, dict[str, typing.Any]]:
     notes: list[str] = []
-    beta_vec, beta_source = _extract_effect_beta_from_model_state(model_state)
+    beta_vec, beta_source, effect_kind = _extract_effect_vector_from_model_state(model_state)
     beta_len = 0 if beta_vec is None else int(beta_vec.shape[0])
 
     metadata_source = "placeholder"
@@ -908,7 +985,8 @@ def _build_method_effect_table(
     allele0 = np.full((n_rows,), "N", dtype=object)
     allele1 = np.full((n_rows,), "N", dtype=object)
     maf = np.full((n_rows,), np.nan, dtype=np.float64)
-    beta = np.full((n_rows,), np.nan, dtype=np.float64)
+    effect_col = _primary_effect_col_for_kind(effect_kind)
+    effect_values = np.full((n_rows,), np.nan, dtype=np.float64)
 
     if int(chrom_meta.shape[0]) > 0 and n_rows > 0:
         use_n = min(n_rows, int(chrom_meta.shape[0]))
@@ -925,7 +1003,7 @@ def _build_method_effect_table(
             notes.append(f"maf rows={int(maf_vec.shape[0])}, effect rows={int(n_rows)}")
     if beta_vec is not None and n_rows > 0:
         use_n = min(n_rows, int(beta_vec.shape[0]))
-        beta[:use_n] = np.asarray(beta_vec[:use_n], dtype=np.float64)
+        effect_values[:use_n] = np.asarray(beta_vec[:use_n], dtype=np.float64)
         if int(beta_vec.shape[0]) != n_rows:
             notes.append(f"beta rows={int(beta_vec.shape[0])}, effect rows={int(n_rows)}")
     for note in list(model_state.get("export_conversion_notes", []) or []):
@@ -940,7 +1018,9 @@ def _build_method_effect_table(
             "allele0": allele0,
             "allele1": allele1,
             "maf": maf,
-            "beta": beta,
+            effect_col: effect_values,
+            # Backward-compatible alias for older downstream code.
+            "beta": effect_values,
         }
     )
     alpha_meta: float | None = None
@@ -952,9 +1032,12 @@ def _build_method_effect_table(
         alpha_meta = None
     meta: dict[str, typing.Any] = {
         "rows": int(n_rows),
+        "effect_kind": str(effect_kind),
+        "effect_source": str(beta_source),
+        "effect_column": str(effect_col),
         "beta_source": str(beta_source),
         "beta_available": bool(beta_vec is not None),
-        "beta_non_nan_rows": int(np.sum(np.isfinite(beta))),
+        "beta_non_nan_rows": int(np.sum(np.isfinite(effect_values))),
         "beta_scale": (
             str(model_state.get("export_scale", "raw_012")).strip()
             if (not bool(model_state.get("standardized", True)))
@@ -1042,6 +1125,15 @@ def _reindex_effect_table(
     )
 
 
+def _resolve_effect_col_from_table(tb: pd.DataFrame | None) -> str | None:
+    if tb is None:
+        return None
+    for c in ("signed_beta", "kernel_projection", "importance", "attribution", "beta"):
+        if c in tb.columns:
+            return str(c)
+    return None
+
+
 def _build_trait_merged_effect_table(
     *,
     method_tables: dict[str, pd.DataFrame],
@@ -1088,8 +1180,9 @@ def _build_trait_merged_effect_table(
 
         beta_full = np.full((n_rows,), np.nan, dtype=np.float64)
         tb = method_tables.get(m_key, None)
-        if tb is not None and "beta" in tb.columns:
-            beta_vec = np.asarray(tb["beta"], dtype=np.float64).reshape(-1)
+        eff_col = _resolve_effect_col_from_table(tb)
+        if tb is not None and eff_col is not None:
+            beta_vec = np.asarray(tb[eff_col], dtype=np.float64).reshape(-1)
             use_n = min(n_rows, int(beta_vec.shape[0]))
             beta_full[:use_n] = beta_vec[:use_n]
         base_table[col] = beta_full
@@ -3828,6 +3921,112 @@ def _predict_rrblup_packed_raw_from_beta(
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
 
+def _kernel_projection_beta_from_dense(
+    *,
+    marker_by_sample: np.ndarray,
+    alpha: np.ndarray,
+    coef: float = 1.0,
+) -> np.ndarray | None:
+    try:
+        m = np.asarray(marker_by_sample, dtype=np.float64)
+        a = np.asarray(alpha, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if m.ndim != 2:
+        return None
+    if int(m.shape[1]) != int(a.shape[0]) or int(m.shape[0]) <= 0:
+        return None
+    row_mean = np.mean(m, axis=1)
+    row_var = np.var(m, axis=1, ddof=0)
+    valid = np.isfinite(row_var) & (row_var > 0.0)
+    var_sum = float(np.sum(row_var[valid], dtype=np.float64))
+    if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
+        var_sum = 1e-12
+    alpha_sum = float(np.sum(a, dtype=np.float64))
+    m_alpha = np.asarray(m @ a, dtype=np.float64).reshape(-1)
+    beta = (m_alpha - row_mean * alpha_sum) / float(var_sum)
+    coef_v = float(coef)
+    if np.isfinite(coef_v) and coef_v != 1.0:
+        beta = beta * coef_v
+    return np.ascontiguousarray(beta, dtype=np.float64)
+
+
+def _kernel_projection_beta_from_packed(
+    *,
+    packed_ctx: dict[str, typing.Any],
+    sample_indices: np.ndarray,
+    alpha: np.ndarray,
+    mode: str,
+    coef: float = 1.0,
+    block_rows: int = 4096,
+    threads: int = 0,
+) -> np.ndarray | None:
+    if _jxrs is None or not hasattr(_jxrs, "packed_malpha_mode_f64"):
+        return None
+    if not _looks_like_packed_payload(packed_ctx):
+        return None
+    try:
+        packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8), dtype=np.uint8)
+        maf = np.ascontiguousarray(
+            np.asarray(packed_ctx.get("maf", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip = _ensure_packed_row_flip_cached(packed_ctx)
+        n_samples = int(packed_ctx["n_samples"])
+        sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1), dtype=np.int64)
+        a = np.ascontiguousarray(np.asarray(alpha, dtype=np.float64).reshape(-1), dtype=np.float64)
+        m = int(packed.shape[0])
+        if int(maf.shape[0]) != m or int(row_flip.shape[0]) != m:
+            return None
+        if int(sidx.shape[0]) == 0 or int(a.shape[0]) != int(sidx.shape[0]):
+            return None
+
+        mode_norm = str(mode).strip().lower()
+        mode_arg = "d" if mode_norm in {"d", "dom", "dominance"} else "a"
+        m_alpha_raw = _jxrs.packed_malpha_mode_f64(  # type: ignore[union-attr]
+            packed,
+            int(n_samples),
+            row_flip,
+            maf,
+            sidx,
+            a,
+            mode=mode_arg,
+            block_rows=int(max(1, int(block_rows))),
+            threads=int(max(0, int(threads))),
+        )
+        m_alpha = np.ascontiguousarray(np.asarray(m_alpha_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
+        if int(m_alpha.shape[0]) != m:
+            return None
+
+        p_raw = np.asarray(maf, dtype=np.float64).reshape(-1)
+        p_raw = np.clip(p_raw, 0.0, 1.0)
+        flip = np.asarray(row_flip, dtype=np.bool_).reshape(-1)
+        p_oriented = np.where(
+            p_raw <= 0.5,
+            p_raw,
+            np.where(flip, 1.0 - p_raw, p_raw),
+        )
+        p_oriented = np.clip(p_oriented, 0.0, 1.0)
+        if mode_arg == "d":
+            row_mean = 2.0 * p_oriented * (1.0 - p_oriented)
+            row_var = row_mean * (1.0 - row_mean)
+        else:
+            row_mean = 2.0 * p_oriented
+            row_var = 2.0 * p_oriented * (1.0 - p_oriented)
+        row_var = np.where(np.isfinite(row_var) & (row_var > 0.0), row_var, 0.0)
+        var_sum = float(np.sum(row_var, dtype=np.float64))
+        if (not np.isfinite(var_sum)) or (var_sum <= 0.0):
+            var_sum = 1e-12
+        alpha_sum = float(np.sum(a, dtype=np.float64))
+        beta = (m_alpha - row_mean * alpha_sum) / float(var_sum)
+        coef_v = float(coef)
+        if np.isfinite(coef_v) and coef_v != 1.0:
+            beta = beta * coef_v
+        return np.ascontiguousarray(beta, dtype=np.float64)
+    except Exception:
+        return None
+
+
 def _predict_bayes_packed_from_effects(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -4648,23 +4847,23 @@ def GSapi(
             enabled=PCAdec,
         )
 
-    # Dominance-kernel and additive+dominance GBLUP variants (pyBLUP/JAX backend)
-    if _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
+    # Additive+dominance GBLUP variant (pyBLUP/JAX backend)
+    if _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) == "ad"):
         mode = _gblup_method_kernel_mode(str(method))
         if (not _HAS_ADBLUP_PY) or KernelBLUP is None or Gmatrix is None:
             raise ImportError(
-                "GBLUP(d/ad) (JAX backend) is unavailable. "
+                "GBLUP(ad) (JAX backend) is unavailable. "
                 f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
             )
         if is_packed_input:
             if not _looks_like_packed_payload(Xtrain):
-                raise ValueError("GBLUP(d/ad) packed route requires packed train payload.")
+                raise ValueError("GBLUP(ad) packed route requires packed train payload.")
             packed_train = typing.cast(dict[str, typing.Any], Xtrain)
             n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
             if packed_train_indices is None:
                 if int(packed_train["n_samples"]) != n_train_expected:
                     raise ValueError(
-                        "Packed GBLUP(d/ad) requires packed_train_indices when "
+                        "Packed GBLUP(ad) requires packed_train_indices when "
                         "n_train differs from packed n_samples."
                     )
                 train_abs = np.ascontiguousarray(
@@ -4678,7 +4877,7 @@ def GSapi(
                 )
             if int(train_abs.shape[0]) != n_train_expected:
                 raise ValueError(
-                    "Packed GBLUP(d/ad) train index mismatch: "
+                    "Packed GBLUP(ad) train index mismatch: "
                     f"indices={train_abs.shape[0]}, y={n_train_expected}."
                 )
             if packed_test_indices is None:
@@ -4705,26 +4904,20 @@ def GSapi(
             gadd_test = np.asarray(Xtest, dtype=np.float32)
         if gadd_train.ndim != 2 or gadd_test.ndim != 2:
             raise ValueError(
-                f"GBLUP(d/ad) expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
+                f"GBLUP(ad) expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
             )
         if gadd_train.shape[0] != gadd_test.shape[0]:
             raise ValueError(
-                f"GBLUP(d/ad) marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
+                f"GBLUP(ad) marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
             )
 
         ghet_train = (gadd_train == 1.0).astype(np.float32, copy=False)
         Ghet_train = Gmatrix(ghet_train)
-        if mode == "d":
-            model = KernelBLUP(Y.reshape(-1, 1), G=[Ghet_train], progress=False)
-        else:
-            Gadd_train = Gmatrix(gadd_train)
-            model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
+        Gadd_train = Gmatrix(gadd_train)
+        model = KernelBLUP(Y.reshape(-1, 1), G=[Gadd_train, Ghet_train], progress=False)
 
         if need_train_pred:
-            if mode == "d":
-                yhat_train = model.predict(G=[Ghet_train])
-            else:
-                yhat_train = model.predict(G=[Gadd_train, Ghet_train])
+            yhat_train = model.predict(G=[Gadd_train, Ghet_train])
         else:
             yhat_train = np.zeros((0, 1), dtype=float)
         n_train = int(gadd_train.shape[1])
@@ -4733,12 +4926,9 @@ def GSapi(
             ghet_all = (gadd_all == 1.0).astype(np.float32, copy=False)
             Ghet_all = Gmatrix(ghet_all)
             Ghet_cross = Ghet_all[n_train:, :n_train]
-            if mode == "d":
-                yhat_test = model.predict(G=[Ghet_cross])
-            else:
-                Gadd_all = Gmatrix(gadd_all)
-                Gadd_cross = Gadd_all[n_train:, :n_train]
-                yhat_test = model.predict(G=[Gadd_cross, Ghet_cross])
+            Gadd_all = Gmatrix(gadd_all)
+            Gadd_cross = Gadd_all[n_train:, :n_train]
+            yhat_test = model.predict(G=[Gadd_cross, Ghet_cross])
         else:
             yhat_test = np.zeros((0, 1), dtype=float)
 
@@ -4755,13 +4945,9 @@ def GSapi(
                 if den > 0:
                     pve = float(np.sum(var[:-1]) / den)
                     sigma_e2 = float(var[-1])
-                    if mode == "d":
-                        sigma_d2 = float(var[0])
-                        sigma_g2 = float(sigma_d2)
-                    else:
-                        sigma_a2 = float(var[0]) if int(var.size) >= 3 else float("nan")
-                        sigma_d2 = float(var[1]) if int(var.size) >= 3 else float("nan")
-                        sigma_g2 = float(np.sum(var[:-1]))
+                    sigma_a2 = float(var[0]) if int(var.size) >= 3 else float("nan")
+                    sigma_d2 = float(var[1]) if int(var.size) >= 3 else float("nan")
+                    sigma_g2 = float(np.sum(var[:-1]))
                     if np.isfinite(sigma_g2) and sigma_g2 > 0.0 and np.isfinite(sigma_e2):
                         lambda_reml = float(sigma_e2 / sigma_g2)
         except Exception:
@@ -4788,6 +4974,235 @@ def GSapi(
                 gblup_runtime_state["lambda_reml"] = float(lambda_reml)
             if np.isfinite(pve):
                 gblup_runtime_state["h2"] = float(pve)
+        if model_state is not None:
+            beta_a = np.zeros((int(gadd_train.shape[0]),), dtype=np.float64)
+            beta_d = np.zeros((int(gadd_train.shape[0]),), dtype=np.float64)
+            used_rust_kernel_projection = False
+            try:
+                vinvr = np.asarray(getattr(model, "_Vinvr", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
+                g_theta = np.asarray(getattr(model, "_g_theta", np.zeros((0,))), dtype=np.float64).reshape(-1)
+                g_scales = np.asarray(getattr(model, "_g_scales", np.ones((0,))), dtype=np.float64).reshape(-1)
+                if int(vinvr.size) == int(gadd_train.shape[1]):
+                    coef_a = (
+                        float(g_theta[0]) / float(max(1e-12, float(g_scales[0])))
+                        if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
+                        else 1.0
+                    )
+                    coef_d = (
+                        float(g_theta[1]) / float(max(1e-12, float(g_scales[1])))
+                        if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
+                        else 1.0
+                    )
+                    if is_packed_input and _looks_like_packed_payload(Xtrain):
+                        beta_a_rust = _kernel_projection_beta_from_packed(
+                            packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                            sample_indices=np.asarray(train_abs, dtype=np.int64),
+                            alpha=vinvr,
+                            mode="a",
+                            coef=float(coef_a),
+                            block_rows=4096,
+                            threads=max(0, int(n_jobs)),
+                        )
+                        beta_d_rust = _kernel_projection_beta_from_packed(
+                            packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                            sample_indices=np.asarray(train_abs, dtype=np.int64),
+                            alpha=vinvr,
+                            mode="d",
+                            coef=float(coef_d),
+                            block_rows=4096,
+                            threads=max(0, int(n_jobs)),
+                        )
+                        if beta_a_rust is not None and beta_d_rust is not None:
+                            beta_a = np.ascontiguousarray(beta_a_rust, dtype=np.float64)
+                            beta_d = np.ascontiguousarray(beta_d_rust, dtype=np.float64)
+                            used_rust_kernel_projection = True
+                    if int(g_theta.size) >= 2 and int(g_scales.size) >= 2:
+                        if not used_rust_kernel_projection:
+                            beta_a_dense = _kernel_projection_beta_from_dense(
+                                marker_by_sample=gadd_train,
+                                alpha=vinvr,
+                                coef=float(coef_a),
+                            )
+                            beta_d_dense = _kernel_projection_beta_from_dense(
+                                marker_by_sample=ghet_train,
+                                alpha=vinvr,
+                                coef=float(coef_d),
+                            )
+                            if beta_a_dense is not None and beta_d_dense is not None:
+                                beta_a = np.ascontiguousarray(beta_a_dense, dtype=np.float64)
+                                beta_d = np.ascontiguousarray(beta_d_dense, dtype=np.float64)
+            except Exception:
+                beta_a = np.zeros((int(gadd_train.shape[0]),), dtype=np.float64)
+                beta_d = np.zeros((int(gadd_train.shape[0]),), dtype=np.float64)
+            model_state["kind"] = "gblup_kernel_projection_ad"
+            model_state["method"] = str(method)
+            model_state["effect_kind"] = "kernel_projection"
+            model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
+            model_state["beta_a"] = np.ascontiguousarray(beta_a, dtype=np.float64)
+            model_state["beta_d"] = np.ascontiguousarray(beta_d, dtype=np.float64)
+            model_state["kernel_projection_a"] = np.ascontiguousarray(beta_a, dtype=np.float64)
+            model_state["kernel_projection_d"] = np.ascontiguousarray(beta_d, dtype=np.float64)
+            model_state["kernel_projection"] = np.ascontiguousarray(beta_a + beta_d, dtype=np.float64)
+            model_state["beta"] = np.ascontiguousarray(beta_a + beta_d, dtype=np.float64)
+            model_state["packed"] = bool(is_packed_input)
+            model_state["standardized"] = False
+            model_state["kernel_mode"] = "ad"
+            model_state["pve"] = float(pve)
+        return np.asarray(yhat_train, dtype=float), np.asarray(yhat_test, dtype=float), pve
+
+    # Dominance-only GBLUP: keep a dedicated fast path (separate from AD kernel stack).
+    if _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) == "d"):
+        if is_packed_input:
+            if not _looks_like_packed_payload(Xtrain):
+                raise ValueError("GBLUP(d) packed route requires packed train payload.")
+            packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+            n_train_expected = int(np.asarray(Y).reshape(-1).shape[0])
+            if packed_train_indices is None:
+                if int(packed_train["n_samples"]) != n_train_expected:
+                    raise ValueError(
+                        "Packed GBLUP(d) requires packed_train_indices when "
+                        "n_train differs from packed n_samples."
+                    )
+                train_abs = np.ascontiguousarray(
+                    np.arange(int(packed_train["n_samples"]), dtype=np.int64),
+                    dtype=np.int64,
+                )
+            else:
+                train_abs = np.ascontiguousarray(
+                    np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            if int(train_abs.shape[0]) != n_train_expected:
+                raise ValueError(
+                    "Packed GBLUP(d) train index mismatch: "
+                    f"indices={train_abs.shape[0]}, y={n_train_expected}."
+                )
+            if packed_test_indices is None:
+                test_abs = np.zeros((0,), dtype=np.int64)
+            else:
+                test_abs = np.ascontiguousarray(
+                    np.asarray(packed_test_indices, dtype=np.int64).reshape(-1),
+                    dtype=np.int64,
+                )
+            gadd_train = _decode_packed_subset_to_dense_raw_f32(
+                packed_train,
+                train_abs,
+            )
+            gadd_test = (
+                np.zeros((int(gadd_train.shape[0]), 0), dtype=np.float32)
+                if int(test_abs.size) == 0
+                else _decode_packed_subset_to_dense_raw_f32(
+                    typing.cast(dict[str, typing.Any], Xtest),
+                    test_abs,
+                )
+            )
+        else:
+            gadd_train = np.asarray(Xtrain, dtype=np.float32)
+            gadd_test = np.asarray(Xtest, dtype=np.float32)
+
+        if gadd_train.ndim != 2 or gadd_test.ndim != 2:
+            raise ValueError(
+                f"GBLUP(d) expects 2D genotype matrices. got train={gadd_train.shape}, test={gadd_test.shape}"
+            )
+        if gadd_train.shape[0] != gadd_test.shape[0]:
+            raise ValueError(
+                f"GBLUP(d) marker mismatch: train={gadd_train.shape[0]}, test={gadd_test.shape[0]}"
+            )
+
+        gdom_train = (gadd_train == 1.0).astype(np.float32, copy=False)
+        gdom_test = (gadd_test == 1.0).astype(np.float32, copy=False)
+        model = MLMBLUP(
+            Y.reshape(-1, 1),
+            gdom_train,
+            kinship=1,
+            force_fast=True,
+        )
+
+        if need_train_pred:
+            if train_pred_idx is None:
+                yhat_train = model.predict(gdom_train)
+            elif int(train_pred_idx.size) == 0:
+                yhat_train = np.zeros((0, 1), dtype=float)
+            else:
+                yhat_train = model.predict(np.asarray(gdom_train)[:, train_pred_idx])
+        else:
+            yhat_train = np.zeros((0, 1), dtype=float)
+        if int(gdom_test.shape[1]) > 0:
+            yhat_test = model.predict(gdom_test)
+        else:
+            yhat_test = np.zeros((0, 1), dtype=float)
+
+        pve = float(getattr(model, "pve", np.nan))
+        sigma_g2 = float("nan")
+        sigma_e2 = float("nan")
+        lambda_reml = float("nan")
+        try:
+            rtv = float(getattr(model, "rTV_invr", np.nan))
+            n_m = int(getattr(model, "n", int(np.asarray(Y).reshape(-1).shape[0])))
+            p_m = int(getattr(model, "p", 1))
+            lambda_reml = float(getattr(model, "lbd", np.nan))
+            if np.isfinite(rtv) and (rtv > 0.0):
+                sigma_g2 = float(rtv / float(max(1, n_m - p_m)))
+                if np.isfinite(lambda_reml) and lambda_reml >= 0.0:
+                    sigma_e2 = float(lambda_reml * sigma_g2)
+        except Exception:
+            sigma_g2 = float("nan")
+            sigma_e2 = float("nan")
+            lambda_reml = float("nan")
+
+        if gblup_runtime_state is not None:
+            gblup_runtime_state["variance_component_path"] = "fast"
+            gblup_runtime_state["variance_component"] = "REML/FaST"
+            gblup_runtime_state["backend"] = "pyBLUP/FaST(d)"
+            gblup_runtime_state["kernel_mode"] = "d"
+            if np.isfinite(sigma_g2):
+                gblup_runtime_state["sigma_g2"] = float(sigma_g2)
+                gblup_runtime_state["sigma_d2"] = float(sigma_g2)
+            if np.isfinite(sigma_e2):
+                gblup_runtime_state["sigma_e2"] = float(sigma_e2)
+            if np.isfinite(lambda_reml):
+                gblup_runtime_state["lambda_reml"] = float(lambda_reml)
+            if np.isfinite(pve):
+                gblup_runtime_state["h2"] = float(pve)
+
+        if model_state is not None:
+            model_state["kind"] = "gblup_kernel_projection"
+            model_state["method"] = str(method)
+            model_state["effect_kind"] = "kernel_projection"
+            model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
+            beta_dom: np.ndarray | None = None
+            alpha_vec = np.asarray(getattr(model, "alpha", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
+            if int(alpha_vec.size) == int(gdom_train.shape[1]):
+                if is_packed_input and _looks_like_packed_payload(Xtrain):
+                    beta_dom = _kernel_projection_beta_from_packed(
+                        packed_ctx=typing.cast(dict[str, typing.Any], Xtrain),
+                        sample_indices=np.asarray(train_abs, dtype=np.int64),
+                        alpha=alpha_vec,
+                        mode="d",
+                        coef=1.0,
+                        block_rows=4096,
+                        threads=max(0, int(n_jobs)),
+                    )
+                if beta_dom is None:
+                    beta_dom = _kernel_projection_beta_from_dense(
+                        marker_by_sample=gdom_train,
+                        alpha=alpha_vec,
+                        coef=1.0,
+                    )
+            if beta_dom is None:
+                beta_u = np.asarray(getattr(model, "u", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
+                if int(beta_u.size) == int(gdom_train.shape[0]):
+                    beta_dom = np.ascontiguousarray(beta_u, dtype=np.float64)
+            model_state["kernel_projection"] = (
+                np.ascontiguousarray(beta_dom, dtype=np.float64)
+                if beta_dom is not None
+                else None
+            )
+            model_state["beta"] = model_state["kernel_projection"]
+            model_state["packed"] = bool(is_packed_input)
+            model_state["standardized"] = False
+            model_state["pve"] = float(pve)
+            model_state["kernel_mode"] = "d"
         return np.asarray(yhat_train, dtype=float), np.asarray(yhat_test, dtype=float), pve
 
     # Linear mixed models
@@ -5058,6 +5473,10 @@ def GSapi(
                     (gblup_runtime_state is not None)
                     or _env_truthy("JX_GBLUP_PACKED_RETURN_VC", "0")
                 )
+                gblup_return_effect = bool(
+                    (model_state is not None)
+                    and _cfg_truthy(os.getenv("JX_GS_GBLUP_RETURN_EFFECT", "1"), default=True)
+                )
 
                 if _GS_DEBUG_STAGE:
                     rust_blas_before = get_rust_blas_threads()
@@ -5069,26 +5488,34 @@ def GSapi(
                         flush=True,
                     )
                 rust_blas_in_stage: int | None = None
+                gblup_effect_vec = None
                 with runtime_thread_stage(
                     blas_threads=int(max(1, int(n_jobs))),
                     rayon_threads=1,
                 ):
                     rust_blas_in_stage = get_rust_blas_threads()
                     try:
-                        (
-                            pred_train_raw,
-                            pred_test_raw,
-                            pve,
-                            _lambda_opt,
-                            _ml,
-                            _reml,
-                            _eigh_backend,
-                            _eigh_elapsed,
-                            _m_eff,
-                            _sigma_g2,
-                            _sigma_e2,
-                        ) = (
-                            _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                        g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_train_vec,
+                            test_abs,
+                            train_pred_local_arg,
+                            site_keep_arg,
+                            float(gblup_g_eps),
+                            float(gblup_reml_low),
+                            float(gblup_reml_high),
+                            int(gblup_reml_max_iter),
+                            float(gblup_reml_tol),
+                            int(gblup_block_rows),
+                            int(max(1, int(n_jobs))),
+                            bool(gblup_return_variance_components),
+                            False,
+                            bool(gblup_return_effect),
+                        )
+                    except TypeError:
+                        try:
+                            g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
                                 source_prefix,
                                 train_abs,
                                 y_train_vec,
@@ -5104,20 +5531,8 @@ def GSapi(
                                 int(max(1, int(n_jobs))),
                                 bool(gblup_return_variance_components),
                             )
-                        )
-                    except TypeError:
-                        (
-                            pred_train_raw,
-                            pred_test_raw,
-                            pve,
-                            _lambda_opt,
-                            _ml,
-                            _reml,
-                            _eigh_backend,
-                            _eigh_elapsed,
-                            _m_eff,
-                        ) = (
-                            _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
+                        except TypeError:
+                            g_out = _jxrs.gblup_reml_packed_bed(  # type: ignore[union-attr]
                                 source_prefix,
                                 train_abs,
                                 y_train_vec,
@@ -5132,9 +5547,57 @@ def GSapi(
                                 int(gblup_block_rows),
                                 int(max(1, int(n_jobs))),
                             )
-                        )
+                    g_t = tuple(g_out)
+                    if len(g_t) >= 12:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                            _sigma_g2,
+                            _sigma_e2,
+                            gblup_effect_vec,
+                        ) = g_t[:12]
+                    elif len(g_t) >= 11:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                            _sigma_g2,
+                            _sigma_e2,
+                        ) = g_t[:11]
+                        gblup_effect_vec = None
+                    elif len(g_t) >= 9:
+                        (
+                            pred_train_raw,
+                            pred_test_raw,
+                            pve,
+                            _lambda_opt,
+                            _ml,
+                            _reml,
+                            _eigh_backend,
+                            _eigh_elapsed,
+                            _m_eff,
+                        ) = g_t[:9]
                         _sigma_g2 = float("nan")
                         _sigma_e2 = float("nan")
+                        gblup_effect_vec = None
+                    else:
+                        raise RuntimeError(
+                            "gblup_reml_packed_bed returned unexpected payload size: "
+                            f"{len(g_t)}"
+                        )
                 if gblup_runtime_state is not None:
                     _evd_backend_l = str(_eigh_backend).strip().lower()
                     _vc_path = (
@@ -5157,6 +5620,23 @@ def GSapi(
                         gblup_runtime_state["sigma_g2"] = float(_sigma_g2)
                     if np.isfinite(float(_sigma_e2)):
                         gblup_runtime_state["sigma_e2"] = float(_sigma_e2)
+                if (model_state is not None) and (gblup_return_effect or (gblup_effect_vec is not None)):
+                    model_state["kind"] = "gblup_kernel_projection"
+                    model_state["method"] = str(method)
+                    model_state["effect_kind"] = "kernel_projection"
+                    model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
+                    model_state["kernel_projection"] = (
+                        np.ascontiguousarray(
+                            np.asarray(gblup_effect_vec, dtype=np.float64).reshape(-1),
+                            dtype=np.float64,
+                        )
+                        if gblup_effect_vec is not None
+                        else None
+                    )
+                    model_state["beta"] = model_state["kernel_projection"]
+                    model_state["packed"] = True
+                    model_state["standardized"] = False
+                    model_state["pve"] = float(pve)
                 pred_train = (
                     np.zeros((0, 1), dtype=float)
                     if (not need_train_pred)
@@ -6075,6 +6555,60 @@ def GSapi(
             model_state["snp_block_size"] = 2048
             model_state["sample_chunk_size"] = 4096
             model_state["pve"] = float(model.pve)
+        if method == "GBLUP" and model_state is not None:
+            n_train_cur = int(np.asarray(Y).reshape(-1).shape[0])
+            alpha_vec = np.asarray(getattr(model, "alpha", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
+            beta_kp: np.ndarray | None = None
+            if int(alpha_vec.size) == n_train_cur:
+                if is_packed_input and _looks_like_packed_payload(Xtrain):
+                    packed_train_local = typing.cast(dict[str, typing.Any], Xtrain)
+                    if packed_train_indices is None:
+                        if int(packed_train_local["n_samples"]) == n_train_cur:
+                            sample_idx_local = np.ascontiguousarray(
+                                np.arange(int(n_train_cur), dtype=np.int64),
+                                dtype=np.int64,
+                            )
+                        else:
+                            sample_idx_local = None
+                    else:
+                        sample_idx_local = np.ascontiguousarray(
+                            np.asarray(packed_train_indices, dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        )
+                    if sample_idx_local is not None and int(sample_idx_local.shape[0]) == n_train_cur:
+                        beta_kp = _kernel_projection_beta_from_packed(
+                            packed_ctx=packed_train_local,
+                            sample_indices=sample_idx_local,
+                            alpha=alpha_vec,
+                            mode="a",
+                            coef=1.0,
+                            block_rows=4096,
+                            threads=max(0, int(n_jobs)),
+                        )
+                if beta_kp is None and (not is_packed_input):
+                    beta_kp = _kernel_projection_beta_from_dense(
+                        marker_by_sample=np.asarray(Xtrain, dtype=np.float64),
+                        alpha=alpha_vec,
+                        coef=1.0,
+                    )
+            if beta_kp is None:
+                u_vec = np.asarray(getattr(model, "u", np.zeros((0, 1))), dtype=np.float64).reshape(-1)
+                if not is_packed_input and int(u_vec.size) == int(np.asarray(Xtrain).shape[0]):
+                    beta_kp = np.ascontiguousarray(u_vec, dtype=np.float64)
+            model_state["kind"] = "gblup_kernel_projection"
+            model_state["method"] = "GBLUP"
+            model_state["effect_kind"] = "kernel_projection"
+            model_state["alpha"] = float(np.mean(np.asarray(Y, dtype=np.float64)))
+            model_state["kernel_projection"] = (
+                np.ascontiguousarray(beta_kp, dtype=np.float64)
+                if beta_kp is not None
+                else None
+            )
+            model_state["beta"] = model_state["kernel_projection"]
+            model_state["packed"] = bool(is_packed_input)
+            model_state["standardized"] = False
+            model_state["kernel_mode"] = "a"
+            model_state["pve"] = float(model.pve)
         if _GS_DEBUG_STAGE:
             print(
                 f"[GS-DEBUG] GSapi predict_done method={method} "
@@ -6181,6 +6715,7 @@ def GSapi(
                     "burnin": 200,
                     "thin": 1,
                     "r2": float(r2_used),
+                    "threads": int(max(0, int(n_jobs))),
                     "seed": None,
                 }
                 if str(method) in {"BayesB", "BayesCpi"}:
@@ -6190,11 +6725,22 @@ def GSapi(
                     packed_kwargs["min_abs_beta"] = 1e-9
 
                 packed_fit_fn = getattr(_jxrs, str(packed_func_name))
-                packed_fit_ret = packed_fit_fn(**packed_kwargs)
+                packed_threads_compat_fallback = False
+                try:
+                    packed_fit_ret = packed_fit_fn(**packed_kwargs)
+                except TypeError as e:
+                    msg = str(e)
+                    if "unexpected keyword argument 'threads'" in msg:
+                        packed_kwargs_retry = dict(packed_kwargs)
+                        packed_kwargs_retry.pop("threads", None)
+                        packed_fit_ret = packed_fit_fn(**packed_kwargs_retry)
+                        packed_threads_compat_fallback = True
+                    else:
+                        raise
                 if str(method) == "BayesCpi":
-                    beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2 = packed_fit_ret
+                    beta_raw, alpha_raw, _varb_mean, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
                 else:
-                    beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2 = packed_fit_ret
+                    beta_raw, alpha_raw, _varb, _vare, h2_mean, _var_h2, *diag_tail = packed_fit_ret
 
                 pve = float(h2_mean)
                 bayes_beta = np.ascontiguousarray(np.asarray(beta_raw, dtype=np.float64).reshape(-1), dtype=np.float64)
@@ -6207,6 +6753,13 @@ def GSapi(
                     bayes_runtime_state["r2_source"] = str(r2_source)
                     bayes_runtime_state["r2_n_used"] = int(r2_n_used)
                     bayes_runtime_state["r2_n_total"] = int(r2_n_total)
+                    bayes_runtime_state["threads_requested"] = int(max(0, int(n_jobs)))
+                    bayes_runtime_state["threads_compat_fallback"] = bool(
+                        packed_threads_compat_fallback
+                    )
+                    if len(diag_tail) >= 2:
+                        bayes_runtime_state["prob_in_mean"] = float(diag_tail[0])
+                        bayes_runtime_state["n_active_mean"] = float(diag_tail[1])
 
                 if need_train_pred:
                     if train_pred_idx is None:
@@ -7385,7 +7938,7 @@ def _run_method_task(
                 and len(getattr(final_test, "shape")) >= 2
                 and int(final_test.shape[1]) == 0
             )
-    if bool(export_model) and _is_jxmodel_export_supported(method):
+    if bool(export_model) and _is_effect_export_supported(method):
         skip_final_fit = False
 
     if skip_final_fit:
@@ -7543,7 +8096,7 @@ def _run_method_task(
             bayes_state_final = {}
         if _is_gblup_method(str(method)):
             gblup_state_final = {}
-        if bool(export_model) and _is_jxmodel_export_supported(method):
+        if bool(export_model) and _is_effect_export_supported(method):
             model_state_call = {}
         _emit_stage("fit_start", method=str(method))
         _t_fit_stage = time.time()
@@ -8093,8 +8646,10 @@ def _run_methods_parallel(
             vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
             eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
             if vc_label == "":
-                if mode in {"d", "ad"}:
+                if mode == "ad":
                     vc_label = "REML/GRM"
+                elif mode == "d":
+                    vc_label = "REML/FaST"
                 elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
                     vc_label = "REML/FaST"
                 elif vc_path == "grm" or eigh_backend != "":
@@ -8102,8 +8657,11 @@ def _run_methods_parallel(
                 else:
                     vc_label = "REML/FaST"
             rows.append(("method", vc_label))
-            if mode in {"d", "ad"}:
+            if mode == "ad":
                 rows.append(("backend", "pyBLUP/JAX"))
+            elif mode == "d":
+                backend_d = str(gblup_state.get("backend", "pyBLUP/FaST(d)")).strip()
+                rows.append(("backend", backend_d if backend_d != "" else "pyBLUP/FaST(d)"))
             else:
                 rows.append(
                     (
@@ -12761,14 +13319,14 @@ def _run_gs_pipeline(
         logger.error("Rust backend missing top_fit_model export. Please rebuild JanusX.")
         raise SystemExit(1)
     ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET"}
-    gblup_d_like_methods = [
+    gblup_ad_methods = [
         m for m in methods
-        if _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
+        if _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) == "ad")
     ]
-    if (len(gblup_d_like_methods) > 0) and (not _HAS_ADBLUP_PY):
-        methods = [m for m in methods if m not in set(gblup_d_like_methods)]
+    if (len(gblup_ad_methods) > 0) and (not _HAS_ADBLUP_PY):
+        methods = [m for m in methods if m not in set(gblup_ad_methods)]
         logger.warning(
-            "Skip GBLUP(d/ad) because JAX backend dependency is unavailable. "
+            "Skip GBLUP(ad) because JAX backend dependency is unavailable. "
             f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
         )
 
@@ -14417,8 +14975,8 @@ def _run_gs_pipeline(
             gblup_variance_component_label: str | None = None
             if _is_gblup_method(m_key):
                 gblup_mode = _gblup_method_kernel_mode(m_key)
-                if gblup_mode in {"d", "ad"}:
-                    # Dominance/add+dom path uses explicit kernel matrices.
+                if gblup_mode == "ad":
+                    # Additive+dominance path uses explicit dual-kernel REML.
                     gblup_variance_component_label = "REML/GRM"
                 else:
                     gblup_state = dict(
@@ -14480,7 +15038,9 @@ def _run_gs_pipeline(
             effect_out_export: str | None = None
             effect_meta: dict[str, typing.Any] | None = None
             model_export_meta: dict[str, typing.Any] | None = None
-            if (args.model is None) and (not top_enabled) and _is_jxmodel_export_supported(m_key):
+            can_model_export = bool(_is_jxmodel_export_supported(m_key))
+            can_effect_export = bool(_is_effect_export_supported(m_key))
+            if (args.model is None) and (not top_enabled) and can_effect_export:
                 state_raw = res_obj.get("model_state", None)
                 if isinstance(state_raw, dict) and len(state_raw) > 0:
                     packed_ctx_for_export = (
@@ -14488,24 +15048,29 @@ def _run_gs_pipeline(
                         if _looks_like_packed_payload(trait_packed_ctx)
                         else None
                     )
-                    state_export, model_export_meta = _prepare_model_state_for_export_raw_012(
-                        model_state=dict(state_raw),
-                        packed_ctx=packed_ctx_for_export,
-                    )
-                    payload = {
-                        "format": _JXMODEL_FORMAT,
-                        "method": str(m_key),
-                        "method_display": str(m_disp),
-                        "trait": str(trait_name),
-                        "created_at_unix": float(time.time()),
-                        "pve_final": float(res_obj.get("pve_final", np.nan)),
-                        "model_state": dict(state_export),
-                        "export_scale_meta": dict(model_export_meta or {}),
-                    }
-                    model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
-                    _save_jxmodel(model_out, payload)
-                    saved_result_paths.append(str(model_out))
-                    model_out_export = str(model_out)
+                    if can_model_export:
+                        state_export, model_export_meta = _prepare_model_state_for_export_raw_012(
+                            model_state=dict(state_raw),
+                            packed_ctx=packed_ctx_for_export,
+                        )
+                    else:
+                        state_export = dict(state_raw)
+                        model_export_meta = {}
+                    if can_model_export:
+                        payload = {
+                            "format": _JXMODEL_FORMAT,
+                            "method": str(m_key),
+                            "method_display": str(m_disp),
+                            "trait": str(trait_name),
+                            "created_at_unix": float(time.time()),
+                            "pve_final": float(res_obj.get("pve_final", np.nan)),
+                            "model_state": dict(state_export),
+                            "export_scale_meta": dict(model_export_meta or {}),
+                        }
+                        model_out = os.path.join(gs_model_dir, f"{trait_name}.{m_key}.jxmodel")
+                        _save_jxmodel(model_out, payload)
+                        saved_result_paths.append(str(model_out))
+                        model_out_export = str(model_out)
                     try:
                         fallback_marker_count = None
                         if _looks_like_packed_payload(trait_packed_ctx):
@@ -14532,6 +15097,9 @@ def _run_gs_pipeline(
                         effect_meta = {
                             "effect_file": str(out_effect_merged),
                             "rows": 0,
+                            "effect_kind": "unknown",
+                            "effect_column": "unknown",
+                            "effect_source": "export_failed",
                             "beta_available": False,
                             "beta_source": "export_failed",
                             "beta_non_nan_rows": 0,
@@ -14553,7 +15121,7 @@ def _run_gs_pipeline(
                     )
                 else:
                     logger.warning(
-                        f"Skip model export for method={m_key}: fitted model state is unavailable."
+                        f"Skip effect/model export for method={m_key}: fitted model state is unavailable."
                     )
 
             pred_arr = np.asarray(res_obj["test_pred"], dtype=float).reshape(-1, 1)
@@ -14776,26 +15344,26 @@ def _run_gs_pipeline(
                     tb = trait_effect_tables.get(m_key, None)
                     if tb is None:
                         continue
-                    if _is_gblup_method(m_key):
-                        has_finite_beta = False
-                        if "beta" in tb.columns:
-                            try:
-                                beta_vec = np.asarray(tb["beta"], dtype=np.float64).reshape(-1)
-                                has_finite_beta = bool(np.any(np.isfinite(beta_vec)))
-                            except Exception:
-                                has_finite_beta = False
-                        if not has_finite_beta:
-                            meta_skip = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
-                            notes_skip = list(meta_skip.get("notes", []) or [])
-                            notes_skip.append("excluded_from_merged_effect:beta_unavailable")
-                            meta_skip["notes"] = notes_skip
-                            meta_skip["merged_effect_included"] = False
-                            trait_effect_meta_by_method[m_key] = meta_skip
-                            _log_file_only(
-                                "Merged effect export: skip method "
-                                f"{m_key} for trait={trait_name} (GBLUP-related with unavailable beta)."
-                            )
-                            continue
+                    has_finite_effect = False
+                    eff_col = _resolve_effect_col_from_table(tb)
+                    if eff_col is not None:
+                        try:
+                            beta_vec = np.asarray(tb[eff_col], dtype=np.float64).reshape(-1)
+                            has_finite_effect = bool(np.any(np.isfinite(beta_vec)))
+                        except Exception:
+                            has_finite_effect = False
+                    if not has_finite_effect:
+                        meta_skip = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
+                        notes_skip = list(meta_skip.get("notes", []) or [])
+                        notes_skip.append("excluded_from_merged_effect:effect_unavailable")
+                        meta_skip["notes"] = notes_skip
+                        meta_skip["merged_effect_included"] = False
+                        trait_effect_meta_by_method[m_key] = meta_skip
+                        _log_file_only(
+                            "Merged effect export: skip method "
+                            f"{m_key} for trait={trait_name} (effect unavailable)."
+                        )
+                        continue
                     merge_method_order.append(m_key)
                     meta_keep = dict(trait_effect_meta_by_method.get(m_key, {}) or {})
                     meta_keep["merged_effect_included"] = True

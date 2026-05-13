@@ -1,10 +1,13 @@
 from __future__ import annotations
 from typing import Optional, Tuple
 import typing
+import warnings
 import numpy as np
 
 from janusx.janusx import bayesa as _bayesa, bayesb as _bayesb, bayescpi as _bayescpi
 from janusx.pyBLUP.mlm import BLUP
+
+_BAYESA_MIN_ABS_BETA_WARNED = False
 
 
 def _as_1d_f64(arr: np.ndarray, name: str) -> np.ndarray:
@@ -69,8 +72,8 @@ def _call_bayesa(
         raise ValueError("n_iter must be > burnin")
     if thin < 1:
         raise ValueError("thin must be >= 1")
-    if min_abs_beta <= 0.0:
-        raise ValueError("min_abs_beta must be > 0")
+    if not np.isfinite(float(min_abs_beta)) or float(min_abs_beta) < 0.0:
+        raise ValueError("min_abs_beta is deprecated/ignored; keep it finite and >= 0")
     if not (0.0 < r2 < 1.0):
         raise ValueError("r2 must be in (0, 1)")
     if df0_b <= 0.0 or df0_e <= 0.0:
@@ -87,6 +90,14 @@ def _call_bayesa(
         seed = int(seed)
         if seed < 0:
             raise ValueError("seed must be >= 0")
+    global _BAYESA_MIN_ABS_BETA_WARNED
+    if not _BAYESA_MIN_ABS_BETA_WARNED:
+        warnings.warn(
+            "BayesA `min_abs_beta` is deprecated and ignored by Rust backend; it will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        _BAYESA_MIN_ABS_BETA_WARNED = True
 
     return _bayesa(
         y=y,
@@ -124,7 +135,7 @@ def _call_bayesb(
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = int(thin)
@@ -188,7 +199,7 @@ def _call_bayescpi(
     df0_e: float,
     s0_e: Optional[float],
     seed: Optional[int],
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float]:
     n_iter = int(n_iter)
     burnin = int(burnin)
     thin = int(thin)
@@ -291,7 +302,7 @@ def BayesA(
     s0_e : float, optional
         Prior scale for residual variance; if None, derived from data.
     min_abs_beta : float, default=1e-9
-        Lower bound on absolute effect size; prevents exact zeros.
+        Deprecated and ignored by Rust backend (kept for API compatibility).
     seed : int, optional
         RNG seed for reproducibility.
 
@@ -310,7 +321,6 @@ def BayesA(
         Posterior mean heritability.
     varh2 : float
         Posterior variance of heritability.
-
     Raises
     ------
     ValueError
@@ -362,7 +372,7 @@ def BayesB(
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, float]:
     """
     Python interface for the Rust BayesB kernel (PyO3).
 
@@ -418,6 +428,10 @@ def BayesB(
         Posterior mean heritability.
     varh2 : float
         Posterior variance of heritability.
+    prob_in_mean : float
+        Posterior mean inclusion probability.
+    n_active_mean : float
+        Posterior mean number of active markers.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -460,7 +474,7 @@ def BayesCpi(
     df0_e: float = 5.0,
     s0_e: Optional[float] = None,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, float, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float, float, float]:
     """
     Python interface for the Rust BayesCpi kernel (PyO3).
 
@@ -512,6 +526,10 @@ def BayesCpi(
         Posterior mean heritability.
     varh2 : float
         Posterior variance of heritability.
+    prob_in_mean : float
+        Posterior mean inclusion probability.
+    n_active_mean : float
+        Posterior mean number of active markers.
     """
     y_arr = _as_1d_f64(y, "y")
     m_arr = _as_2d_f64_mxn(M, "M", y_arr.shape[0])
@@ -622,7 +640,7 @@ class BAYES:
         if method not in method_map:
             raise ValueError(f"Unsupported Bayes method: {method}")
 
-        beta, alpha, varbeta, varep, h2_mean, varh2 = method_map[method](
+        beta, alpha, varbeta, varep, h2_mean, varh2, *_diag = method_map[method](
             y,
             M,
             X,

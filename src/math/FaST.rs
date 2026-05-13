@@ -70,6 +70,7 @@ pub(crate) fn gblup_marker_fast_packed(
     tol: f64,
     max_iter: usize,
     estimate_only: bool,
+    return_effect: bool,
     pool_ref: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<
     (
@@ -83,6 +84,8 @@ pub(crate) fn gblup_marker_fast_packed(
         f64,
         f64,
         f64,
+        f64,
+        Vec<f64>,
     ),
     String,
 > {
@@ -315,7 +318,10 @@ pub(crate) fn gblup_marker_fast_packed(
         rhs[k] = y_proj[k] / (s[k] + lambda).max(v_floor);
     }
 
-    let (pred_train_local, pred_test_local) = if estimate_only {
+    let need_projection = (!estimate_only) || return_effect;
+    let mut effect_alpha0 = f64::NAN;
+    let mut effect_beta = Vec::<f64>::new();
+    let (pred_train_local, pred_test_local) = if !need_projection {
         (Vec::new(), Vec::new())
     } else {
         let mut tmp_u = vec![0.0_f64; r];
@@ -336,42 +342,50 @@ pub(crate) fn gblup_marker_fast_packed(
             .zip(q_u.iter())
             .map(|(a, b)| (*a) * (*b))
             .sum::<f64>();
-        let predict_samples = |sample_abs: &[usize]| -> Result<Vec<f64>, String> {
-            let n_out = sample_abs.len();
-            if n_out == 0 {
-                return Ok(Vec::new());
-            }
-            let mut out = vec![0.0_f64; n_out];
-            let mut run = || {
-                out.par_iter_mut().enumerate().for_each(|(i, dst)| {
-                    let sid = sample_abs[i];
-                    let mut acc = 0.0_f64;
-                    for row_idx in 0..m {
-                        let row =
-                            &packed_keep[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                        let b = row[sid >> 2];
-                        let code = (b >> ((sid & 3) * 2)) & 0b11;
-                        let mean_g = 2.0_f64 * (maf_keep[row_idx] as f64);
-                        let mut gv = match decode_plink_bed_hardcall(code) {
-                            Some(v0) => v0,
-                            None => mean_g,
-                        };
-                        if row_flip_keep[row_idx] && code != 0b01 {
-                            gv = 2.0_f64 - gv;
+        let inv_scale = 1.0_f64 / scale.max(1e-12_f64);
+        effect_alpha0 = y_mean - mu_dot_u * inv_scale;
+        effect_beta = q_u.iter().map(|v| *v * inv_scale).collect();
+
+        if estimate_only {
+            (Vec::new(), Vec::new())
+        } else {
+            let predict_samples = |sample_abs: &[usize]| -> Result<Vec<f64>, String> {
+                let n_out = sample_abs.len();
+                if n_out == 0 {
+                    return Ok(Vec::new());
+                }
+                let mut out = vec![0.0_f64; n_out];
+                let mut run = || {
+                    out.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                        let sid = sample_abs[i];
+                        let mut acc = 0.0_f64;
+                        for row_idx in 0..m {
+                            let row = &packed_keep
+                                [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                            let b = row[sid >> 2];
+                            let code = (b >> ((sid & 3) * 2)) & 0b11;
+                            let mean_g = 2.0_f64 * (maf_keep[row_idx] as f64);
+                            let mut gv = match decode_plink_bed_hardcall(code) {
+                                Some(v0) => v0,
+                                None => mean_g,
+                            };
+                            if row_flip_keep[row_idx] && code != 0b01 {
+                                gv = 2.0_f64 - gv;
+                            }
+                            acc += gv * q_u[row_idx];
                         }
-                        acc += gv * q_u[row_idx];
-                    }
-                    *dst = y_mean + (acc - mu_dot_u) / scale;
-                });
+                        *dst = y_mean + (acc - mu_dot_u) * inv_scale;
+                    });
+                };
+                if let Some(tp) = pool_ref {
+                    tp.install(&mut run);
+                } else {
+                    run();
+                }
+                Ok(out)
             };
-            if let Some(tp) = pool_ref {
-                tp.install(&mut run);
-            } else {
-                run();
-            }
-            Ok(out)
-        };
-        (predict_samples(train_pred_abs)?, predict_samples(test_idx)?)
+            (predict_samples(train_pred_abs)?, predict_samples(test_idx)?)
+        }
     };
 
     let sigma_g2 = rtv_invr / n_eff.max(1.0);
@@ -396,5 +410,7 @@ pub(crate) fn gblup_marker_fast_packed(
         evd_elapsed_inner,
         sigma_g2,
         sigma_e2,
+        effect_alpha0,
+        effect_beta,
     ))
 }

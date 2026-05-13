@@ -1989,3 +1989,254 @@ pub fn packed_malpha_f64<'py>(
     let out_arr = PyArray1::from_owned_array(py, Array1::from_vec(out)).into_bound();
     Ok(out_arr)
 }
+
+#[pyfunction]
+#[pyo3(signature = (
+    packed,
+    n_samples,
+    row_flip,
+    row_maf,
+    sample_indices,
+    alpha,
+    mode="a",
+    block_rows=4096,
+    threads=0
+))]
+pub fn packed_malpha_mode_f64<'py>(
+    py: Python<'py>,
+    packed: PyReadonlyArray2<'py, u8>,
+    n_samples: usize,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    alpha: PyReadonlyArray1<'py, f64>,
+    mode: &str,
+    block_rows: usize,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let mode_norm = mode.trim().to_ascii_lowercase();
+    let mode_is_dom = match mode_norm.as_str() {
+        "a" | "add" | "additive" => false,
+        "d" | "dom" | "dominance" => true,
+        _ => {
+            return Err(PyRuntimeError::new_err(
+                "mode must be one of {'a','additive','d','dominance'}",
+            ))
+        }
+    };
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0"));
+    }
+
+    let packed_arr = packed.as_array();
+    if packed_arr.ndim() != 2 {
+        return Err(PyRuntimeError::new_err(
+            "packed must be 2D (m, bytes_per_snp)",
+        ));
+    }
+    let m = packed_arr.shape()[0];
+    if m == 0 {
+        return Err(PyRuntimeError::new_err(
+            "packed must contain at least one SNP row",
+        ));
+    }
+    let bytes_per_snp = packed_arr.shape()[1];
+    let expected_bps = (n_samples + 3) / 4;
+    if bytes_per_snp != expected_bps {
+        return Err(PyRuntimeError::new_err(format!(
+            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
+        )));
+    }
+
+    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+    };
+    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+    };
+    if row_flip_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_flip length mismatch: got {}, expected {m}",
+            row_flip_vec.len()
+        )));
+    }
+    if row_maf_vec.len() != m {
+        return Err(PyRuntimeError::new_err(format!(
+            "row_maf length mismatch: got {}, expected {m}",
+            row_maf_vec.len()
+        )));
+    }
+
+    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    let n_out = sample_idx.len();
+    if n_out == 0 {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
+    }
+    let alpha_vec: Cow<[f64]> = match alpha.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(alpha.as_array().iter().copied().collect()),
+    };
+    if alpha_vec.len() != n_out {
+        return Err(PyRuntimeError::new_err(format!(
+            "alpha length mismatch: got {}, expected {} (len(sample_indices))",
+            alpha_vec.len(),
+            n_out
+        )));
+    }
+    let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
+
+    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+    };
+    let pool = get_cached_pool(threads)?;
+    let row_step = block_rows.max(1).min(m.max(1));
+    let byte_lut = packed_byte_lut();
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    let alpha_f32: Vec<f32> = alpha_vec.iter().map(|&v| v as f32).collect();
+
+    let out = py
+        .detach(|| -> Result<Vec<f64>, String> {
+            let mut out = vec![0.0_f64; m];
+            let mut block = vec![0.0_f32; row_step * n_out];
+            let mut tick = 0usize;
+
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            let mut tmp = vec![0.0_f32; row_step];
+
+            let mut run = || -> Result<(), String> {
+                for st in (0..m).step_by(row_step) {
+                    let ed = (st + row_step).min(m);
+                    let cur_rows = ed - st;
+                    let blk_slice = &mut block[..cur_rows * n_out];
+
+                    if full_sample_fast {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let p = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
+                                let mean_add = 2.0_f32 * p;
+                                let mean_dom = 2.0_f32 * p * (1.0_f32 - p);
+                                let value_lut = if mode_is_dom {
+                                    [0.0_f32, mean_dom, 1.0_f32, 0.0_f32]
+                                } else if row_flip_vec[row_idx] {
+                                    [2.0_f32, mean_add, 1.0_f32, 0.0_f32]
+                                } else {
+                                    [0.0_f32, mean_add, 1.0_f32, 2.0_f32]
+                                };
+                                decode_row_centered_full_lut(
+                                    row,
+                                    n_samples,
+                                    &byte_lut.code4,
+                                    &value_lut,
+                                    out_row,
+                                );
+                            },
+                        );
+                    } else {
+                        blk_slice.par_chunks_mut(n_out).enumerate().for_each(
+                            |(local_row, out_row)| {
+                                let row_idx = st + local_row;
+                                let row = &packed_flat
+                                    [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                                let flip = row_flip_vec[row_idx];
+                                let p = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
+                                let mean_add = 2.0_f32 * p;
+                                let mean_dom = 2.0_f32 * p * (1.0_f32 - p);
+                                for (j, &sid) in sample_idx.iter().enumerate() {
+                                    let b = row[sid >> 2];
+                                    let code = (b >> ((sid & 3) * 2)) & 0b11;
+                                    let gv = if mode_is_dom {
+                                        match code {
+                                            0b10 => 1.0_f32,
+                                            0b00 | 0b11 => 0.0_f32,
+                                            _ => mean_dom,
+                                        }
+                                    } else {
+                                        let mut x = match code {
+                                            0b00 => 0.0_f32,
+                                            0b10 => 1.0_f32,
+                                            0b11 => 2.0_f32,
+                                            _ => mean_add,
+                                        };
+                                        if flip && code != 0b01 {
+                                            x = 2.0_f32 - x;
+                                        }
+                                        x
+                                    };
+                                    out_row[j] = gv;
+                                }
+                            },
+                        );
+                    }
+
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    {
+                        let out_blk = &mut out[st..ed];
+                        let tmp_blk = &mut tmp[..cur_rows];
+                        unsafe {
+                            cblas_sgemm_dispatch(
+                                CBLAS_COL_MAJOR,
+                                CBLAS_TRANS,
+                                CBLAS_NO_TRANS,
+                                cur_rows as CblasInt,
+                                1 as CblasInt,
+                                n_out as CblasInt,
+                                1.0,
+                                blk_slice.as_ptr(),
+                                n_out as CblasInt,
+                                alpha_f32.as_ptr(),
+                                n_out as CblasInt,
+                                0.0,
+                                tmp_blk.as_mut_ptr(),
+                                cur_rows as CblasInt,
+                            );
+                        }
+                        for i in 0..cur_rows {
+                            out_blk[i] = tmp_blk[i] as f64;
+                        }
+                    }
+
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "linux",
+                        target_os = "windows"
+                    )))]
+                    {
+                        let out_blk = &mut out[st..ed];
+                        for r in 0..cur_rows {
+                            let mut acc = 0.0_f64;
+                            let row = &blk_slice[r * n_out..(r + 1) * n_out];
+                            for j in 0..n_out {
+                                acc += row[j] as f64 * alpha_vec[j];
+                            }
+                            out_blk[r] = acc;
+                        }
+                    }
+
+                    tick += cur_rows;
+                    if tick >= row_step.saturating_mul(64).max(1) {
+                        check_ctrlc()?;
+                        tick = 0;
+                    }
+                }
+                Ok(())
+            };
+
+            if let Some(tp) = &pool {
+                tp.install(run)?;
+            } else {
+                run()?;
+            }
+            Ok(out)
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let out_arr = PyArray1::from_owned_array(py, Array1::from_vec(out)).into_bound();
+    Ok(out_arr)
+}

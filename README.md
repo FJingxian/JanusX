@@ -49,7 +49,14 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ## Installation
 
-### Option A: launcher install (recommended for end users)
+### Option A: Python package install (API-first / development)
+
+```bash
+pip install janusx
+# command entry: jxpy (version>=1.0.14) or jx (version<1.0.14)
+```
+
+### Option B: launcher install
 
 Download installer assets from [Releases](https://github.com/FJingxian/JanusX/releases):
 
@@ -65,23 +72,6 @@ Then run installer:
 
 On Windows, double click or run the `.exe` installer.
 
-After install:
-
-```bash
-jx -v
-jx -list module
-```
-
-### Option B: Python package install (API-first / development)
-
-```bash
-pip install janusx
-# command entry: jxpy (version>=1.0.14) or jx (version<1.0.14)
-```
-
-- If you only need a turnkey CLI environment with pipeline tooling, prefer launcher install.
-- Enhanced Rich-styled CLI help is optional: `pip install "janusx[cli]"`.
-
 ### Option C: Conda / Bioconda
 
 Recommended Bioconda channel order:
@@ -90,36 +80,7 @@ Recommended Bioconda channel order:
 conda create -n janusx \
   --channel conda-forge \
   --channel bioconda \
-  --strict-channel-priority \
   janusx
-```
-
-- JanusX keeps `rich-argparse` as an optional CLI enhancement so the core runtime does not require that conda-forge-only package at install time.
-- Even so, Bioconda officially recommends keeping `conda-forge` above `bioconda`, because many Bioconda packages rely on the broader conda-forge ecosystem.
-
----
-
-## BLAS backend and threads
-
-- macOS default: prefer Accelerate backend.
-- Linux/Windows default: prefer OpenBLAS (fallback when unavailable).
-- OpenBLAS is available on macOS/Linux/Windows.
-- JanusX now applies `-t/--thread` to BLAS thread env vars (`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, etc.) in major analysis CLIs.
-- For strongest cross-platform numerical/performance consistency, prefer a conda-forge OpenBLAS environment.
-
-Example (OpenBLAS environment):
-
-```bash
-conda create -n jx_openblas -c conda-forge python=3.14 numpy scipy "libblas=*=*openblas"
-conda activate jx_openblas
-```
-
-macOS users who want OpenBLAS instead of Accelerate can set:
-
-```bash
-export JANUSX_MACOS_PREFER_ACCELERATE=0
-# or force strict OpenBLAS detection
-export JANUSX_REQUIRE_OPENBLAS=1
 ```
 
 ---
@@ -129,7 +90,12 @@ export JANUSX_REQUIRE_OPENBLAS=1
 ### 1) GWAS
 
 ```bash
+# Estimate variance once in NULL model, similar with EMMAX. (Fast, recommand)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fastlmm -o test
+# Estimate variance for every snp, similar with GEMMA. (Exact)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
+# FarmCPU (Fast, and more sites)
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test
 ```
 
 <p align="center">
@@ -149,7 +115,12 @@ jx postgwas -gwasfile test/mouse_hs1940.test0.add.lmm.tsv -manh -qq -thr 1e-6 -o
 ### 3) Genomic selection
 
 ```bash
+# GBLUP is a kernel method for small samples or small sites
+# (n<15,000 or m<15,000>)
 jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -GBLUP -cv 5 -o testgs
+# rrBLUP is a linear model designed for population with huge size
+# (UKB, n~500,000 and m~500,000).
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -rrBLUP -cv 5 -o testgs
 ```
 
 ```text
@@ -182,37 +153,7 @@ Fold Method     Pearsonr Spearmanr     R² h²/PVE time(secs)
 
 **See full usages in [CLI Guide](./doc/JanusXcli.md).**
 
-### 4) Python thin wrappers
-
-```python
-from janusx.assoc import LinearModel
-from janusx.gs import GenomicSelection
-
-# GWAS (file mode; internally reuses janusx.script.gwas)
-lm = LinearModel(
-    genotype="test/bench4k5k",
-    phenotype="test/bench4k5k.pheno.txt",
-    traits=[0],
-    threads=4,
-    out="tmp_assoc",
-    prefix="bench",
-)
-assoc_res = lm.lm(log=False)
-
-# GS (file mode; internally reuses janusx.script.gs)
-gs = GenomicSelection(
-    genotype="test/bench4k5k",
-    phenotype="test/bench4k5k.pheno.txt",
-    traits=[0],
-    cv=2,
-    threads=4,
-    out="tmp_gs",
-    prefix="bench",
-)
-gs_res = gs.gblup(log=False)
-```
-
-### 5) Get module help
+### 4) Get module help
 
 ```bash
 jx <module> -h
@@ -228,10 +169,12 @@ jx <module> -h
 - `pca`
 - `gwas`
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
+- `adamixture` (Optimized admixture based on [ADAMIXTURE](https://github.com/AI-sandbox/ADAMIXTURE.git))
 
 **Genomic Selection (GS)**:
 
 - `gs`
+- `postgs` (Visualization, `manh` `violin` `pcctime`)
 - `reml` (Estimation of broaden heritability and blup values)
 
 **[GARFIELD](https://github.com/heroalone/Garfield)**:
@@ -239,24 +182,11 @@ jx <module> -h
 - `garfield`
 - `postgarfield`
 
-**Bulk Segregation Analysis (BSA)**:
+**Utility**:
 
-- `postbsa` (Visualization, after BSA pipeline)
-
-**Pipeline and utility**:
-
-- `fastq2count` (RNAseq pipeline, launcher-only)
-- `fastq2vcf` (BSA/Reseq pipeline, launcher-only)
-- `adamixture` (Based on [ADAMIXTURE](https://github.com/AI-sandbox/ADAMIXTURE.git))
 - `hybrid` (Generate F1 genotype base on Parents)
 - `gformat` (Conversion between genotype data formats)
 - `gmerge` (Merge genotype between samples)
-- `webui` (Visualization, beta version)
-
-**Benchmark**:
-
-- `sim`
-- `simulation`
 
 ---
 

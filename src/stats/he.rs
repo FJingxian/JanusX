@@ -1,7 +1,6 @@
 use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -316,6 +315,25 @@ fn oriented_minor_freq_from_input(raw_freq: f32, flip: bool) -> Result<f32, Stri
     Ok(p.clamp(0.0_f32, 1.0_f32))
 }
 
+#[inline]
+fn prefer_parallel_small_rhs(
+    rows: usize,
+    cols: usize,
+    n_rhs: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> bool {
+    if n_rhs == 0 {
+        return false;
+    }
+    let Some(tp) = pool else {
+        return false;
+    };
+    if tp.current_num_threads() <= 1 {
+        return false;
+    }
+    n_rhs <= 16 && rows.saturating_mul(cols).saturating_mul(n_rhs) >= 1_048_576
+}
+
 pub fn build_row_standardization_stats(
     packed_flat: &[u8],
     bytes_per_snp: usize,
@@ -324,6 +342,7 @@ pub fn build_row_standardization_stats(
     sample_idx: &[usize],
     std_eps32: f32,
     use_train_maf: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<RowStdStats, String> {
     let m = row_flip.len();
     if row_maf.len() != m {
@@ -334,8 +353,7 @@ pub fn build_row_standardization_stats(
     }
     let mut row_mean = vec![0.0_f32; m];
     let mut row_inv_sd = vec![0.0_f32; m];
-    let mut m_effective = 0usize;
-    for j in 0..m {
+    let compute_row = |j: usize, mean_slot: &mut f32, inv_sd_slot: &mut f32| -> Result<usize, String> {
         let flip = row_flip[j];
         let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
         if use_train_maf {
@@ -372,14 +390,31 @@ pub fn build_row_standardization_stats(
         let p = p.clamp(0.0_f32, 1.0_f32);
         let mean = 2.0_f32 * p;
         let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
-        row_mean[j] = mean;
+        *mean_slot = mean;
         if var > std_eps32 {
-            row_inv_sd[j] = 1.0_f32 / var.sqrt();
-            m_effective += 1;
+            *inv_sd_slot = 1.0_f32 / var.sqrt();
+            Ok(1usize)
         } else {
-            row_inv_sd[j] = 0.0_f32;
+            *inv_sd_slot = 0.0_f32;
+            Ok(0usize)
         }
-    }
+    };
+    let m_effective = if let Some(tp) = pool {
+        tp.install(|| {
+            row_mean
+                .par_iter_mut()
+                .zip(row_inv_sd.par_iter_mut())
+                .enumerate()
+                .map(|(j, (mean_slot, inv_sd_slot))| compute_row(j, mean_slot, inv_sd_slot))
+                .try_reduce(|| 0usize, |acc, v| Ok(acc + v))
+        })?
+    } else {
+        let mut acc = 0usize;
+        for j in 0..m {
+            acc += compute_row(j, &mut row_mean[j], &mut row_inv_sd[j])?;
+        }
+        acc
+    };
     Ok(RowStdStats {
         row_mean,
         row_inv_sd,
@@ -496,11 +531,38 @@ fn row_major_block_mul_mat_f32(
     rhs: &[f32], // row-major (cols, n_rhs)
     n_rhs: usize,
     out: &mut [f32], // row-major (rows, n_rhs)
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(rhs.len(), cols.saturating_mul(n_rhs));
     debug_assert_eq!(out.len(), rows.saturating_mul(n_rhs));
     if n_rhs == 0 {
+        return;
+    }
+    if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
+        let mut run = || {
+            out.par_chunks_mut(n_rhs)
+                .enumerate()
+                .for_each(|(r, out_row)| {
+                    out_row.fill(0.0_f32);
+                    let row = &block[r * cols..(r + 1) * cols];
+                    for c in 0..cols {
+                        let a = row[c];
+                        if a == 0.0_f32 {
+                            continue;
+                        }
+                        let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
+                        for t in 0..n_rhs {
+                            out_row[t] += a * rhs_row[t];
+                        }
+                    }
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
         return;
     }
 
@@ -554,11 +616,36 @@ fn row_major_block_t_mul_mat_accum_f32(
     rhs: &[f32], // row-major (rows, n_rhs)
     n_rhs: usize,
     out: &mut [f32], // row-major (cols, n_rhs)
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(rhs.len(), rows.saturating_mul(n_rhs));
     debug_assert_eq!(out.len(), cols.saturating_mul(n_rhs));
     if n_rhs == 0 {
+        return;
+    }
+    if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
+        let mut run = || {
+            out.par_chunks_mut(n_rhs)
+                .enumerate()
+                .for_each(|(c, out_row)| {
+                    for r in 0..rows {
+                        let a = block[r * cols + c];
+                        if a == 0.0_f32 {
+                            continue;
+                        }
+                        let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
+                        for t in 0..n_rhs {
+                            out_row[t] += a * rhs_row[t];
+                        }
+                    }
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
         return;
     }
 
@@ -703,8 +790,8 @@ fn apply_grm_to_mat_f32_with_workspace(
         decode_acc += t_decode.elapsed().as_secs_f64();
         let tmp_slice = &mut workspace.tmp[..cur_rows * n_rhs];
         let t_gemm = Instant::now();
-        row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice);
-        row_major_block_t_mul_mat_accum_f32(blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out);
+        row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice, pool);
+        row_major_block_t_mul_mat_accum_f32(blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out, pool);
         gemm_acc += t_gemm.elapsed().as_secs_f64();
     }
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
@@ -901,6 +988,7 @@ pub fn he_variance_components_packed_with_covariates(
         sample_idx,
         std_eps32,
         use_train_maf,
+        pool,
     )?;
     let train_maf_secs = train_maf_t0.elapsed().as_secs_f64();
     if stage_timing {

@@ -117,16 +117,47 @@ fn decode_raw_block_f64(
 // to keep this file focused on association/model routines.
 
 #[inline]
+fn prefer_parallel_block_vec(
+    rows: usize,
+    cols: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> bool {
+    let Some(tp) = pool else {
+        return false;
+    };
+    tp.current_num_threads() > 1 && rows.saturating_mul(cols) >= 1_048_576
+}
+
+#[inline]
 fn row_major_block_mul_vec_f32(
     block: &[f32],
     rows: usize,
     cols: usize,
     vec: &[f32],
     out: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), cols);
     debug_assert_eq!(out.len(), rows);
+    if prefer_parallel_block_vec(rows, cols, pool) {
+        let mut run = || {
+            out.par_iter_mut().enumerate().for_each(|(r, out_cell)| {
+                let row = &block[r * cols..(r + 1) * cols];
+                let mut acc = 0.0_f32;
+                for c in 0..cols {
+                    acc += row[c] * vec[c];
+                }
+                *out_cell = acc;
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
         cblas_sgemm_dispatch(
@@ -166,10 +197,28 @@ fn row_major_block_t_mul_vec_accum_f32(
     cols: usize,
     vec: &[f32],
     out: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
+    if prefer_parallel_block_vec(rows, cols, pool) {
+        let mut run = || {
+            out.par_iter_mut().enumerate().for_each(|(c, out_cell)| {
+                let mut acc = 0.0_f32;
+                for r in 0..rows {
+                    acc += block[r * cols + c] * vec[r];
+                }
+                *out_cell += acc;
+            });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
         cblas_sgemm_dispatch(
@@ -295,7 +344,14 @@ fn pcg_x_mul_samples(
         )?;
         decode_acc += t_decode.elapsed().as_secs_f64();
         let t_mul = Instant::now();
-        row_major_block_t_mul_vec_accum_f32(blk_slice, cur_rows, n_out, &weights[st..ed], &mut out);
+        row_major_block_t_mul_vec_accum_f32(
+            blk_slice,
+            cur_rows,
+            n_out,
+            &weights[st..ed],
+            &mut out,
+            pool,
+        );
         mul_acc += t_mul.elapsed().as_secs_f64();
         tick += cur_rows;
         if tick >= row_step.saturating_mul(64).max(1) {
@@ -367,7 +423,7 @@ fn pcg_xt_mul_rows(
         decode_acc += t_decode.elapsed().as_secs_f64();
         let out_blk = &mut tmp[..cur_rows];
         let t_mul = Instant::now();
-        row_major_block_mul_vec_f32(blk_slice, cur_rows, n_out, u, out_blk);
+        row_major_block_mul_vec_f32(blk_slice, cur_rows, n_out, u, out_blk, pool);
         mul_acc += t_mul.elapsed().as_secs_f64();
         out[st..ed].copy_from_slice(out_blk);
         tick += cur_rows;
@@ -1494,6 +1550,7 @@ pub fn rrblup_pcg_bed<'py>(
                         n_train,
                         &y_center_f32,
                         &mut dot_blk[..cur_rows],
+                        pool_ref,
                     );
                     for r in 0..cur_rows {
                         let row = &blk_slice[r * n_train..(r + 1) * n_train];

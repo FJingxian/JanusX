@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import shutil
@@ -50,6 +51,123 @@ def env_float(name: str, default: float, min_value: float | None = None) -> floa
 def env_truthy(name: str, default: bool = False) -> bool:
     raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_positive_int(raw: object) -> int | None:
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+def _parse_positive_env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return _parse_positive_int(raw)
+
+
+def _detect_cgroup_cpu_quota() -> int | None:
+    try:
+        quota_path = "/sys/fs/cgroup/cpu.max"
+        if os.path.isfile(quota_path):
+            raw = Path(quota_path).read_text(encoding="utf-8").strip().split()
+            if len(raw) >= 2 and raw[0] != "max":
+                quota = int(raw[0])
+                period = int(raw[1])
+                if quota > 0 and period > 0:
+                    return max(1, int(math.ceil(float(quota) / float(period))))
+    except Exception:
+        pass
+
+    try:
+        quota_path = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+        period_path = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+        if os.path.isfile(quota_path) and os.path.isfile(period_path):
+            quota = int(Path(quota_path).read_text(encoding="utf-8").strip())
+            period = int(Path(period_path).read_text(encoding="utf-8").strip())
+            if quota > 0 and period > 0:
+                return max(1, int(math.ceil(float(quota) / float(period))))
+    except Exception:
+        pass
+    return None
+
+
+def _detect_joblib_cpu_count() -> int | None:
+    try:
+        from joblib import cpu_count as joblib_cpu_count
+
+        return _parse_positive_int(joblib_cpu_count())
+    except Exception:
+        return None
+
+
+def detect_effective_threads(override_threads: int = 0) -> tuple[int, str]:
+    if override_threads > 0:
+        return int(override_threads), "override (--bench-threads / JX_GGVAL_BENCH_THREADS)"
+
+    scheduler_envs = [
+        "SLURM_CPUS_PER_TASK",
+        "PBS_NP",
+        "LSB_DJOB_NUMPROC",
+        "NSLOTS",
+        "NCPUS",
+    ]
+    detected: int | None = None
+    source = ""
+    for name in scheduler_envs:
+        value = _parse_positive_env_int(name)
+        if value is not None:
+            detected = value
+            source = f"scheduler:{name}"
+            break
+
+    if detected is None:
+        try:
+            if hasattr(os, "sched_getaffinity"):
+                affinity = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+                if affinity is not None and len(affinity) > 0:
+                    detected = int(len(affinity))
+                    source = "sched_getaffinity"
+        except Exception:
+            pass
+
+    if detected is None:
+        quota_threads = _detect_cgroup_cpu_quota()
+        if quota_threads is not None:
+            detected = quota_threads
+            source = "cgroup"
+
+    if detected is None:
+        joblib_threads = _detect_joblib_cpu_count()
+        if joblib_threads is not None:
+            detected = joblib_threads
+            source = "joblib.cpu_count"
+
+    if detected is None:
+        detected = int(os.cpu_count() or 1)
+        source = "os.cpu_count"
+
+    cap_envs = [
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ]
+    caps: list[tuple[str, int]] = []
+    for name in cap_envs:
+        value = _parse_positive_env_int(name)
+        if value is not None:
+            caps.append((name, value))
+    if caps:
+        cap_name, cap_value = min(caps, key=lambda item: item[1])
+        if cap_value < detected:
+            detected = cap_value
+            source = f"{source}, capped:{cap_name}"
+
+    return max(1, int(detected)), source
 
 
 def fail(message: str) -> None:
@@ -646,7 +764,7 @@ def _parse_grm_kernel_backend(log_path: Path) -> str:
     return "unknown"
 
 
-def backend_thread_checks(outdir: Path) -> None:
+def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
     nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
     n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
     step(
@@ -654,10 +772,14 @@ def backend_thread_checks(outdir: Path) -> None:
         f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
     )
     sim_prefix = outdir / "__ggval_tmp_large_sim"
-    full_cores = max(1, int(os.cpu_count() or 1))
+    full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
     report_janusx_runtime(janusx, jxrs)
+    print(
+        "Benchmark thread target  : "
+        f"1 vs {full_cores} ({full_cores_source})"
+    )
 
     def _find_grm_for_prefix(prefix_path: Path) -> Path:
         base = str(prefix_path)
@@ -750,6 +872,7 @@ def backend_thread_checks(outdir: Path) -> None:
 def he_thread_checks(
     outdir: Path,
     *,
+    bench_threads: int = 0,
     stage_timing: bool = False,
     stage_log_every: int = 8,
 ) -> None:
@@ -772,10 +895,14 @@ def he_thread_checks(
         f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
     )
     sim_prefix = outdir / "__ggval_tmp_he_sim"
-    full_cores = max(1, int(os.cpu_count() or 1))
+    full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
     report_janusx_runtime(janusx, jxrs)
+    print(
+        "HE benchmark threads     : "
+        f"1 vs {full_cores} ({full_cores_source})"
+    )
     print(f"HE BLAS backend          : {str(jxrs.rust_sgemm_backend()).strip()}")
     if stage_timing:
         print(
@@ -875,6 +1002,7 @@ def he_thread_checks(
 def pcg_thread_checks(
     outdir: Path,
     *,
+    bench_threads: int = 0,
     stage_timing: bool = False,
     stage_log_every: int = 100,
 ) -> None:
@@ -893,10 +1021,14 @@ def pcg_thread_checks(
         f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
     )
     sim_prefix = outdir / "__ggval_tmp_pcg_sim"
-    full_cores = max(1, int(os.cpu_count() or 1))
+    full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
     report_janusx_runtime(janusx, jxrs)
+    print(
+        "PCG benchmark threads    : "
+        f"1 vs {full_cores} ({full_cores_source})"
+    )
     print(f"PCG BLAS backend         : {str(jxrs.rust_sgemm_backend()).strip()}")
     if stage_timing:
         print(
@@ -1024,6 +1156,15 @@ def parse_args() -> argparse.Namespace:
         help="Thread count for selected commands. Can also be set by JX_GGVAL_THREADS.",
     )
     parser.add_argument(
+        "--bench-threads",
+        type=int,
+        default=env_int("JX_GGVAL_BENCH_THREADS", 0, min_value=0),
+        help=(
+            "Thread count for the multi-core side of benchmark checks "
+            "(GRM/EIGH/HE/PCG). Use 0 to auto-detect scheduler/affinity limits."
+        ),
+    )
+    parser.add_argument(
         "--cv",
         type=int,
         default=env_int("JX_GGVAL_CV", 2, min_value=2),
@@ -1092,6 +1233,7 @@ def main() -> int:
     if args.test_he:
         he_thread_checks(
             outdir,
+            bench_threads=int(args.bench_threads),
             stage_timing=bool(args.he_stage_timing),
             stage_log_every=int(args.he_stage_log_every),
         )
@@ -1099,16 +1241,17 @@ def main() -> int:
     if args.test_pcg:
         pcg_thread_checks(
             outdir,
+            bench_threads=int(args.bench_threads),
             stage_timing=bool(args.pcg_stage_timing),
             stage_log_every=int(args.pcg_stage_log_every),
         )
         ran_special = True
     if not ran_special and args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)
-        backend_thread_checks(outdir)
+        backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
     elif not ran_special:
         full_flow(outdir, postgs_enabled=not args.no_postgs)
-        backend_thread_checks(outdir)
+        backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
 
     step("Validation completed")
     if args.test_he or args.test_pcg:

@@ -31,20 +31,18 @@ from janusx.script._common.threads import apply_blas_thread_env, detect_effectiv
 
 try:
     from janusx.janusx import (
-        beam_scan_windows_binary_mcc_bin,
-        beam_scan_windows_continuous_corr_bin,
         garfield_eval_rule_bin,
         garfield_prepare_input_bin,
         garfield_scan_groups_bin,
+        garfield_scan_windows_bin,
         garfield_subset_bin_samples,
         load_site_info,
     )
 except Exception as _exc:  # pragma: no cover
-    beam_scan_windows_binary_mcc_bin = None  # type: ignore[assignment]
-    beam_scan_windows_continuous_corr_bin = None  # type: ignore[assignment]
     garfield_eval_rule_bin = None  # type: ignore[assignment]
     garfield_prepare_input_bin = None  # type: ignore[assignment]
     garfield_scan_groups_bin = None  # type: ignore[assignment]
+    garfield_scan_windows_bin = None  # type: ignore[assignment]
     garfield_subset_bin_samples = None  # type: ignore[assignment]
     load_site_info = None  # type: ignore[assignment]
     _RUST_IMPORT_ERROR = _exc
@@ -78,11 +76,10 @@ class _GarfieldPhenoLogger:
 
 def _require_rust_backend() -> None:
     missing = (
-        beam_scan_windows_binary_mcc_bin is None
-        or beam_scan_windows_continuous_corr_bin is None
-        or garfield_eval_rule_bin is None
+        garfield_eval_rule_bin is None
         or garfield_prepare_input_bin is None
         or garfield_scan_groups_bin is None
+        or garfield_scan_windows_bin is None
         or garfield_subset_bin_samples is None
         or load_site_info is None
     )
@@ -551,6 +548,13 @@ def main() -> None:
     optional_group.add_argument("-ext", "--extension", type=int, default=50_000, help="Window extension in bp.")
     optional_group.add_argument("-nsnp", "--nsnp", type=int, default=5, help="Beam width / top SNP candidates.")
     optional_group.add_argument("-m", "--max-pick", type=int, default=3, help="Maximum literals in beam rule.")
+    optional_group.add_argument(
+        "--feature-source",
+        type=str,
+        choices=["bin", "mbin"],
+        default="mbin",
+        help="Feature cache for beam search (default: mbin).",
+    )
     optional_group.add_argument("--top-k-validate", type=int, default=10, help="Top train candidates for validation.")
     optional_group.add_argument("--val-frac", type=float, default=0.2, help="Validation fraction (default: 0.2).")
     optional_group.add_argument("--seed", type=int, default=42, help="Random seed for split.")
@@ -634,6 +638,18 @@ def main() -> None:
         logger=logger,
         use_spinner=use_spinner,
     )
+    scan_bin_path = bin_path
+    if str(args.feature_source).lower() == "mbin":
+        if mbin_path is not None:
+            scan_bin_path = mbin_path
+        else:
+            logger.warning(
+                "feature-source=mbin requested, but current input is already BIN; fallback to bin."
+            )
+    elif str(args.feature_source).lower() == "bin":
+        scan_bin_path = bin_path
+    else:
+        raise ValueError(f"Unsupported feature-source: {args.feature_source}")
 
     emit_cli_configuration(
         logger,
@@ -648,6 +664,8 @@ def main() -> None:
                     ("Input kind", input_kind),
                     ("BIN path", bin_path),
                     ("MBIN path", mbin_path if mbin_path else "(skip; input already BIN)"),
+                    ("Feature source", str(args.feature_source).lower()),
+                    ("Scan BIN path", scan_bin_path),
                     ("Phenotype", args.pheno),
                     ("Scan mode", args.scan_mode),
                     ("Gene file", args.genefile),
@@ -666,7 +684,7 @@ def main() -> None:
         line_max_chars=60,
     )
 
-    sample_ids, n_rows = inspect_genotype_file(bin_path)
+    sample_ids, n_rows = inspect_genotype_file(scan_bin_path)
     sample_ids = np.asarray(sample_ids, dtype=str)
     if len(sample_ids) == 0:
         raise ValueError("No sample IDs found in BIN input.")
@@ -705,7 +723,7 @@ def main() -> None:
             raise ValueError(f"No valid groups built for scan-mode={args.scan_mode}.")
         logger.info(f"Prepared {len(group_intervals)} interval groups for {args.scan_mode} scan.")
 
-    lut = _literal_lookup(bin_path, int(n_rows))
+    lut = _literal_lookup(scan_bin_path, int(n_rows))
 
     used_trait_labels: dict[str, int] = {}
     saved = 0
@@ -740,7 +758,7 @@ def main() -> None:
 
         with CliStatus(f"Preparing BIN subsets for '{trait_name}'...", enabled=use_spinner) as task:
             try:
-                garfield_subset_bin_samples(bin_path, common_bin, common_global_idx)
+                garfield_subset_bin_samples(scan_bin_path, common_bin, common_global_idx)
                 garfield_subset_bin_samples(common_bin, train_bin, train_idx.astype(np.int64).tolist())
                 garfield_subset_bin_samples(common_bin, val_bin, val_idx.astype(np.int64).tolist())
             except Exception:
@@ -756,45 +774,16 @@ def main() -> None:
         with CliStatus(f"Train beam search for '{trait_name}'...", enabled=use_spinner, timeout=0.1) as task:
             try:
                 if args.scan_mode == "window":
-                    if response_mode == "binary":
-                        (
-                            _sel,
-                            _best_score,
-                            _w_chrom,
-                            _w_start,
-                            _w_end,
-                            _w_n_candidates,
-                            _w_n_windows,
-                            w_results,
-                        ) = beam_scan_windows_binary_mcc_bin(
-                            train_bin,
-                            y_train,
-                            max_pick=int(args.max_pick),
-                            beam_width=int(args.nsnp),
-                            extension=int(args.extension),
-                            step=int(args.step),
-                            return_window_results=True,
-                        )
-                    else:
-                        (
-                            _sel,
-                            _best_score,
-                            _w_chrom,
-                            _w_start,
-                            _w_end,
-                            _w_n_candidates,
-                            _w_n_windows,
-                            w_results,
-                        ) = beam_scan_windows_continuous_corr_bin(
-                            train_bin,
-                            y_train,
-                            max_pick=int(args.max_pick),
-                            beam_width=int(args.nsnp),
-                            extension=int(args.extension),
-                            step=int(args.step),
-                            return_window_results=True,
-                        )
-
+                    w_results = garfield_scan_windows_bin(
+                        train_bin,
+                        y_train,
+                        response=response_mode,
+                        max_pick=int(args.max_pick),
+                        beam_width=int(args.nsnp),
+                        extension=int(args.extension),
+                        step=int(args.step),
+                        enforce_feature_exclusion=True,
+                    )
                     for wi, chrom, bp_start, bp_end, n_cand, sc, sel_idx in w_results:
                         candidates.append(
                             {
@@ -814,6 +803,7 @@ def main() -> None:
                         response=response_mode,
                         max_pick=int(args.max_pick),
                         beam_width=int(args.nsnp),
+                        enforce_feature_exclusion=True,
                     )
                     for gi, n_cand, sc, sel_idx in g_results:
                         label = group_labels[int(gi)] if int(gi) < len(group_labels) else f"group_{int(gi)}"

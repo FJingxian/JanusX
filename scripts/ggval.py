@@ -189,7 +189,18 @@ _HE_THREAD_POLICY_SWEEP_DEFAULT = [
     "split_half",
 ]
 _ROWMAJOR_KERNEL_DEFAULT = "blas"
-_ROWMAJOR_KERNEL_COMPARE_DEFAULT = ["blas", "rayon"]
+
+
+def _default_rowmajor_kernel_compare_policies() -> list[str]:
+    # Windows OpenBLAS wheels/builds still need a conservative default here:
+    # explicit Rayon comparison remains available via CLI/env, but the default
+    # benchmark path should stay runnable.
+    if os.name == "nt":
+        return ["blas"]
+    return ["blas", "rayon"]
+
+
+_ROWMAJOR_KERNEL_COMPARE_DEFAULT = _default_rowmajor_kernel_compare_policies()
 
 
 def _normalize_he_thread_policy_name(
@@ -351,6 +362,26 @@ def step(message: str) -> None:
 
 def sep() -> None:
     print("=" * 44)
+
+
+def report_special_progress(done: int, total: int, label: str) -> None:
+    total_n = max(1, int(total))
+    done_n = max(0, min(int(done), total_n))
+    print(
+        "Benchmark progress      : "
+        f"{done_n}/{total_n} ({str(label)} done)"
+    )
+
+
+def report_benchmark_phase(label: str, phase: str, elapsed: float, extra: str = "") -> None:
+    line = (
+        f"{str(label)} benchmark progress: "
+        f"{str(phase)} done [{float(max(0.0, elapsed)):.3f}s]"
+    )
+    extra_txt = str(extra).strip()
+    if extra_txt != "":
+        line += f" {extra_txt}"
+    print(line)
 
 
 def cmd_to_text(cmd: list[str]) -> str:
@@ -1308,6 +1339,7 @@ def he_thread_checks(
             he_base_kernel,
             enable_stage_timing=False,
         )
+        report_benchmark_phase("HE", "1-core baseline", he_t1)
         he_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
         for kernel_name in kernel_names:
             for policy_name in policy_names:
@@ -1319,6 +1351,19 @@ def he_thread_checks(
                 )
                 assert_he_outputs_close(he_out_1, he_out_n, full_cores)
                 he_results.append((kernel_name, policy_spec, he_tn, he_out_n))
+        if len(he_results) > 0:
+            best_multi_t = min(float(item[2]) for item in he_results)
+            phase_text = (
+                f"{full_cores}-core run"
+                if len(he_results) == 1
+                else f"{full_cores}-core strategy sweep"
+            )
+            report_benchmark_phase(
+                "HE",
+                phase_text,
+                best_multi_t,
+                extra=f"(completed {len(he_results)} run{'s' if len(he_results) != 1 else ''})",
+            )
 
         best_kernel, best_spec, best_time, best_out = min(he_results, key=lambda item: item[2])
         print(f"HE runtime    (1 core)   : {he_t1:.3f}s")
@@ -1517,11 +1562,25 @@ def pcg_thread_checks(
 
         pcg_base_kernel = kernel_names[0]
         pcg_t1, pcg_out_1 = run_pcg_once(1, pcg_base_kernel)
+        report_benchmark_phase("PCG", "1-core baseline", pcg_t1)
         pcg_results: list[tuple[str, float, tuple[object, ...]]] = []
         for kernel_name in kernel_names:
             pcg_tn, pcg_out_n = run_pcg_once(full_cores, kernel_name)
             assert_pcg_outputs_close(pcg_out_1, pcg_out_n, full_cores)
             pcg_results.append((kernel_name, pcg_tn, pcg_out_n))
+        if len(pcg_results) > 0:
+            best_multi_t = min(float(item[1]) for item in pcg_results)
+            phase_text = (
+                f"{full_cores}-core run"
+                if len(pcg_results) == 1
+                else f"{full_cores}-core strategy sweep"
+            )
+            report_benchmark_phase(
+                "PCG",
+                phase_text,
+                best_multi_t,
+                extra=f"(completed {len(pcg_results)} run{'s' if len(pcg_results) != 1 else ''})",
+            )
 
         print(f"PCG runtime   (1 core)   : {pcg_t1:.3f}s")
         if len(pcg_results) == 1:
@@ -1667,7 +1726,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rowmajor-kernel-policies",
         type=str,
-        default=env_str("JX_GGVAL_ROWMAJOR_F32_KERNEL_POLICIES", "blas,rayon"),
+        default=env_str(
+            "JX_GGVAL_ROWMAJOR_F32_KERNEL_POLICIES",
+            ",".join(_ROWMAJOR_KERNEL_COMPARE_DEFAULT),
+        ),
         help=(
             "Comma-separated row-major f32 kernel strategies to compare in HE/PCG benchmarks. "
             "Use empty string to disable comparison."
@@ -1713,6 +1775,8 @@ def main() -> int:
     check_jx_available()
 
     ran_special = False
+    special_total = int(bool(args.test_he)) + int(bool(args.test_pcg))
+    special_done = 0
     if args.test_he:
         he_thread_checks(
             outdir,
@@ -1724,6 +1788,8 @@ def main() -> int:
             stage_timing=bool(args.he_stage_timing),
             stage_log_every=int(args.he_stage_log_every),
         )
+        special_done += 1
+        report_special_progress(special_done, special_total, "HE")
         ran_special = True
     if args.test_pcg:
         pcg_thread_checks(
@@ -1734,6 +1800,8 @@ def main() -> int:
             stage_timing=bool(args.pcg_stage_timing),
             stage_log_every=int(args.pcg_stage_log_every),
         )
+        special_done += 1
+        report_special_progress(special_done, special_total, "PCG")
         ran_special = True
     if not ran_special and args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)

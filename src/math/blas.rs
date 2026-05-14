@@ -2206,16 +2206,31 @@ pub(crate) fn rust_sgemm_prefers_rayon_rowmajor_f32_kernel() -> bool {
             _ => {}
         }
     }
-    match selected_sgemm_backend() {
-        // Accelerate-backed dense BLAS is still the safer default on macOS
-        // until HE/PCG kernels are tuned more aggressively there.
-        SgemmBackend::Accelerate => false,
-        // OpenBLAS builds on Linux/Windows (and OpenBLAS-only macOS wheels)
-        // benchmark better with the custom Rayon row-major kernel for the
-        // current HE/PCG matvec access pattern.
-        SgemmBackend::OpenBlas => true,
-        SgemmBackend::Blas => false,
-        SgemmBackend::Rust => true,
+    #[cfg(target_os = "windows")]
+    {
+        return match selected_sgemm_backend() {
+            // Keep Windows conservative for now: benchmark experiments showed
+            // throughput gains in some environments, but the Rayon row-major
+            // path is not yet stable enough to be the unconditional default.
+            SgemmBackend::OpenBlas => false,
+            SgemmBackend::Accelerate => false,
+            SgemmBackend::Blas => false,
+            SgemmBackend::Rust => true,
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return match selected_sgemm_backend() {
+            // Accelerate-backed dense BLAS is still the safer default on macOS
+            // until HE/PCG kernels are tuned more aggressively there.
+            SgemmBackend::Accelerate => false,
+            // Linux/OpenBLAS HE/PCG benchmarks consistently favor the custom
+            // Rayon row-major kernel for the current access pattern.
+            SgemmBackend::OpenBlas => true,
+            SgemmBackend::Blas => false,
+            SgemmBackend::Rust => true,
+        };
     }
 }
 

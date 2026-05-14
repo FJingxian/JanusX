@@ -134,6 +134,205 @@ fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
     }
 }
 
+#[inline]
+fn row_prefix<'a>(
+    bits_flat: &'a [u64],
+    row_words: usize,
+    row_idx: usize,
+    needed_words: usize,
+) -> &'a [u64] {
+    let st = row_idx * row_words;
+    &bits_flat[st..st + needed_words]
+}
+
+#[inline]
+fn score_key(s: f64) -> f64 {
+    if s.is_nan() {
+        f64::NEG_INFINITY
+    } else {
+        s
+    }
+}
+
+#[inline]
+fn constrained_node_better(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> bool {
+    let sa = score_key(a.score);
+    let sb = score_key(b.score);
+    if sa > sb {
+        return true;
+    }
+    if sa < sb {
+        return false;
+    }
+    if a.selected.len() < b.selected.len() {
+        return true;
+    }
+    if a.selected.len() > b.selected.len() {
+        return false;
+    }
+    a.selected < b.selected
+}
+
+#[inline]
+fn sort_truncate_nodes(mut nodes: Vec<ConstrainedBeamNode>, k: usize) -> Vec<ConstrainedBeamNode> {
+    nodes.sort_by(|a, b| {
+        let sa = score_key(a.score);
+        let sb = score_key(b.score);
+        match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
+            std::cmp::Ordering::Equal => match a.selected.len().cmp(&b.selected.len()) {
+                std::cmp::Ordering::Equal => a.selected.cmp(&b.selected),
+                other => other,
+            },
+            other => other,
+        }
+    });
+    if nodes.len() > k {
+        nodes.truncate(k);
+    }
+    nodes
+}
+
+#[inline]
+fn validate_constrained_inputs(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    max_pick: usize,
+    beam_width: usize,
+    group_ids: &[usize],
+    ctx: &str,
+) -> Result<usize, String> {
+    if n_rows == 0 {
+        return Err(format!("{ctx}: n_rows must be > 0"));
+    }
+    if row_words == 0 {
+        return Err(format!("{ctx}: row_words must be > 0"));
+    }
+    if n_samples == 0 {
+        return Err(format!("{ctx}: n_samples must be > 0"));
+    }
+    if max_pick == 0 {
+        return Err(format!("{ctx}: max_pick must be > 0"));
+    }
+    if beam_width == 0 {
+        return Err(format!("{ctx}: beam_width must be > 0"));
+    }
+    if group_ids.len() != n_rows {
+        return Err(format!(
+            "{ctx}: group_ids length mismatch: {} vs n_rows={}",
+            group_ids.len(),
+            n_rows
+        ));
+    }
+    let needed_words = words_for_samples(n_samples);
+    if row_words < needed_words {
+        return Err(format!(
+            "{ctx}: row_words={} smaller than required {}",
+            row_words, needed_words
+        ));
+    }
+    let total_words = n_rows
+        .checked_mul(row_words)
+        .ok_or_else(|| format!("{ctx}: n_rows*row_words overflow"))?;
+    if bits_flat.len() < total_words {
+        return Err(format!(
+            "{ctx}: bits length={} smaller than required {}",
+            bits_flat.len(),
+            total_words
+        ));
+    }
+    Ok(needed_words)
+}
+
+fn beam_search_and_with_group_exclusion<F>(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    max_pick: usize,
+    beam_width: usize,
+    group_ids: &[usize],
+    score_fn: F,
+) -> Result<BeamAndResult, String>
+where
+    F: Fn(&[u64]) -> f64 + Sync,
+{
+    let ctx = "garfield::beam_search_and_with_group_exclusion";
+    let needed_words = validate_constrained_inputs(
+        bits_flat,
+        row_words,
+        n_rows,
+        n_samples,
+        max_pick,
+        beam_width,
+        group_ids,
+        ctx,
+    )?;
+
+    let mask = tail_mask(n_samples);
+    let max_depth = max_pick.min(n_rows);
+    let layer_cap = beam_width.min(n_rows);
+
+    let mut beam: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+    for i in 0..n_rows {
+        let mut combined = row_prefix(bits_flat, row_words, i, needed_words).to_vec();
+        apply_tail_mask(&mut combined, mask);
+        let score = score_fn(&combined);
+        beam.push(ConstrainedBeamNode {
+            selected: vec![i],
+            combined,
+            score,
+            last_index: i,
+        });
+    }
+    beam = sort_truncate_nodes(beam, layer_cap);
+    if beam.is_empty() {
+        return Err(format!("{ctx}: no candidates"));
+    }
+
+    let mut best = beam[0].clone();
+    for _depth in 2..=max_depth {
+        let mut next: Vec<ConstrainedBeamNode> = Vec::new();
+        for node in beam.iter() {
+            for cand in (node.last_index + 1)..n_rows {
+                let cg = group_ids[cand];
+                if node.selected.iter().any(|&s| group_ids[s] == cg) {
+                    continue;
+                }
+                let row = row_prefix(bits_flat, row_words, cand, needed_words);
+                let mut combined = node.combined.clone();
+                for (a, &b) in combined.iter_mut().zip(row.iter()) {
+                    *a &= b;
+                }
+                apply_tail_mask(&mut combined, mask);
+                let score = score_fn(&combined);
+                let mut selected = node.selected.clone();
+                selected.push(cand);
+                next.push(ConstrainedBeamNode {
+                    selected,
+                    combined,
+                    score,
+                    last_index: cand,
+                });
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        beam = sort_truncate_nodes(next, layer_cap);
+        if constrained_node_better(&beam[0], &best) {
+            best = beam[0].clone();
+        }
+    }
+
+    Ok(BeamAndResult {
+        selected_indices: best.selected,
+        score: best.score,
+        combined_bits: best.combined,
+    })
+}
+
 fn parse_bin01_header(bytes: &[u8], ctx: &str) -> Result<(usize, usize, usize, usize), String> {
     if bytes.len() < BIN01_HEADER_LEN {
         return Err(format!("{ctx}: BIN file too small"));
@@ -326,6 +525,21 @@ fn discover_site_sidecar(path: &str) -> Option<PathBuf> {
     None
 }
 
+fn discover_id_sidecar(path: &str) -> Option<PathBuf> {
+    let prefix = bin_prefix(path);
+    let candidates = [
+        append_suffix(&prefix, ".bin.id"),
+        append_suffix(&prefix, ".id"),
+        append_suffix(&prefix, ".fam"),
+    ];
+    for cand in candidates {
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn copy_site_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
     let Some(src) = discover_site_sidecar(src_bin) else {
         return Ok(());
@@ -334,6 +548,34 @@ fn copy_site_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
         .file_name()
         .and_then(|x| x.to_str())
         .ok_or_else(|| "invalid sidecar filename".to_string())?;
+    let src_prefix = bin_prefix(src_bin);
+    let dst_prefix = bin_prefix(dst_bin);
+    let src_prefix_name = src_prefix
+        .file_name()
+        .and_then(|x| x.to_str())
+        .ok_or_else(|| "invalid src prefix".to_string())?;
+
+    let suffix = src_name
+        .strip_prefix(src_prefix_name)
+        .unwrap_or("")
+        .to_string();
+    if suffix.is_empty() {
+        return Ok(());
+    }
+    let dst = append_suffix(&dst_prefix, &suffix);
+    fs::copy(&src, &dst)
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+fn copy_id_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
+    let Some(src) = discover_id_sidecar(src_bin) else {
+        return Ok(());
+    };
+    let src_name = src
+        .file_name()
+        .and_then(|x| x.to_str())
+        .ok_or_else(|| "invalid id-sidecar filename".to_string())?;
     let src_prefix = bin_prefix(src_bin);
     let dst_prefix = bin_prefix(dst_bin);
     let src_prefix_name = src_prefix
@@ -776,6 +1018,233 @@ fn interval_indices(
         out.push(*idx);
     }
     out
+}
+
+fn gather_rows_by_indices(
+    bits_flat: &[u64],
+    row_words: usize,
+    row_indices: &[usize],
+) -> Result<Vec<u64>, String> {
+    let ctx = "garfield::gather_rows_by_indices";
+    if row_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n_rows_all = bits_flat.len() / row_words;
+    let mut out = vec![0u64; row_indices.len() * row_words];
+    for (dst_r, &src_r) in row_indices.iter().enumerate() {
+        if src_r >= n_rows_all {
+            return Err(format!(
+                "{ctx}: row index out of range: {} >= {}",
+                src_r, n_rows_all
+            ));
+        }
+        let src_st = src_r * row_words;
+        let dst_st = dst_r * row_words;
+        out[dst_st..dst_st + row_words]
+            .copy_from_slice(&bits_flat[src_st..src_st + row_words]);
+    }
+    Ok(out)
+}
+
+fn build_feature_group_ids(sites: &[SiteInfo], n_rows: usize) -> Vec<usize> {
+    let mut map: HashMap<(String, i32), usize> = HashMap::new();
+    let mut out = vec![0usize; n_rows];
+    for (i, site) in sites.iter().take(n_rows).enumerate() {
+        let key = (normalize_chrom(&site.chrom), site.pos);
+        let gid = if let Some(g) = map.get(&key) {
+            *g
+        } else {
+            let g = map.len();
+            map.insert(key, g);
+            g
+        };
+        out[i] = gid;
+    }
+    out
+}
+
+fn run_beam_with_feature_exclusion(
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    response: GarfieldResponse,
+    y_train_f64: &[f64],
+    y_train_bin: Option<&[u8]>,
+    max_pick: usize,
+    beam_width: usize,
+    local_group_ids: Option<&[usize]>,
+) -> Result<BeamAndResult, String> {
+    if let Some(groups) = local_group_ids {
+        return match response {
+            GarfieldResponse::Binary => {
+                let yb = y_train_bin.ok_or_else(|| "binary y is not prepared".to_string())?;
+                beam_search_and_with_group_exclusion(
+                    bits_flat,
+                    row_words,
+                    n_rows,
+                    n_samples,
+                    max_pick,
+                    beam_width,
+                    groups,
+                    |combined| score_binary_mcc_packed(yb, combined, n_samples),
+                )
+            }
+            GarfieldResponse::Continuous => beam_search_and_with_group_exclusion(
+                bits_flat,
+                row_words,
+                n_rows,
+                n_samples,
+                max_pick,
+                beam_width,
+                groups,
+                |combined| score_cont_corr_packed(y_train_f64, combined, n_samples).abs(),
+            ),
+        };
+    }
+
+    match response {
+        GarfieldResponse::Binary => {
+            let yb = y_train_bin.ok_or_else(|| "binary y is not prepared".to_string())?;
+            beam_search_and_binary_mcc(
+                yb,
+                bits_flat,
+                row_words,
+                n_rows,
+                n_samples,
+                max_pick,
+                beam_width,
+            )
+        }
+        GarfieldResponse::Continuous => beam_search_and_continuous_abs_corr(
+            y_train_f64,
+            bits_flat,
+            row_words,
+            n_rows,
+            n_samples,
+            max_pick,
+            beam_width,
+        ),
+    }
+}
+
+fn build_windows_from_sites(
+    sites: &[SiteInfo],
+    n_rows: usize,
+    extension: usize,
+    step: usize,
+) -> Vec<GarfieldWindow> {
+    if n_rows == 0 || sites.is_empty() || extension == 0 || step == 0 {
+        return vec![GarfieldWindow {
+            chrom: "ALL".to_string(),
+            bp_start: 0,
+            bp_end: 0,
+            indices: (0..n_rows).collect(),
+        }];
+    }
+
+    let mut groups: HashMap<String, Vec<(i32, usize)>> = HashMap::new();
+    let mut chrom_order: Vec<String> = Vec::new();
+    for (idx, site) in sites.iter().enumerate().take(n_rows) {
+        let chrom = normalize_chrom(&site.chrom);
+        if !groups.contains_key(&chrom) {
+            groups.insert(chrom.clone(), Vec::new());
+            chrom_order.push(chrom.clone());
+        }
+        if let Some(v) = groups.get_mut(&chrom) {
+            v.push((site.pos, idx));
+        }
+    }
+    if groups.is_empty() {
+        return vec![GarfieldWindow {
+            chrom: "ALL".to_string(),
+            bp_start: 0,
+            bp_end: 0,
+            indices: (0..n_rows).collect(),
+        }];
+    }
+
+    let mut windows: Vec<GarfieldWindow> = Vec::new();
+    for chrom in chrom_order {
+        let Some(mut pairs) = groups.remove(&chrom) else {
+            continue;
+        };
+        if pairs.is_empty() {
+            continue;
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let n = pairs.len();
+        let bps: Vec<i32> = pairs.iter().map(|(bp, _)| *bp).collect();
+        let idxs: Vec<usize> = pairs.iter().map(|(_, i)| *i).collect();
+        let min_bp = bps[0];
+        let max_bp = bps[n - 1];
+        let mut l = 0usize;
+        let mut r = 0usize;
+        let mut center = min_bp;
+        let mut prev_sig: Option<(usize, usize, usize)> = None;
+
+        loop {
+            let left_i64 = (center as i64)
+                .saturating_sub(extension as i64)
+                .max(min_bp as i64);
+            let right_i64 = (center as i64)
+                .saturating_add(extension as i64)
+                .min(max_bp as i64);
+
+            while l < n && (bps[l] as i64) < left_i64 {
+                l += 1;
+            }
+            if r < l {
+                r = l;
+            }
+            while r < n && (bps[r] as i64) <= right_i64 {
+                r += 1;
+            }
+
+            if r > l {
+                let chunk = idxs[l..r].to_vec();
+                let sig = (chunk[0], chunk[chunk.len() - 1], chunk.len());
+                if prev_sig.map_or(true, |s| s != sig) {
+                    windows.push(GarfieldWindow {
+                        chrom: chrom.clone(),
+                        bp_start: left_i64 as i32,
+                        bp_end: right_i64 as i32,
+                        indices: chunk,
+                    });
+                    prev_sig = Some(sig);
+                }
+            }
+
+            if center >= max_bp {
+                break;
+            }
+            center = (center as i64).saturating_add(step as i64) as i32;
+            if center <= min_bp && step > 0 {
+                break;
+            }
+        }
+
+        let has_chrom_window = windows.last().map(|w| w.chrom == chrom).unwrap_or(false);
+        if !has_chrom_window {
+            windows.push(GarfieldWindow {
+                chrom: chrom.clone(),
+                bp_start: min_bp,
+                bp_end: max_bp.saturating_add(1),
+                indices: idxs,
+            });
+        }
+    }
+
+    if windows.is_empty() {
+        vec![GarfieldWindow {
+            chrom: "ALL".to_string(),
+            bp_start: 0,
+            bp_end: 0,
+            indices: (0..n_rows).collect(),
+        }]
+    } else {
+        windows
+    }
 }
 
 fn read_y_f64(arr: &PyReadonlyArray1<'_, f64>) -> Vec<f64> {
@@ -1233,6 +1702,7 @@ pub fn garfield_subset_bin_samples_py(
         .map_err(|e| PyRuntimeError::new_err(format!("{ctx}: flush {out_bin_path}: {e}")))?;
 
     copy_site_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
+    copy_id_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
     Ok(())
 }
 
@@ -1243,7 +1713,8 @@ pub fn garfield_subset_bin_samples_py(
     groups,
     response="continuous",
     max_pick=3,
-    beam_width=5
+    beam_width=5,
+    enforce_feature_exclusion=true
 ))]
 pub fn garfield_scan_groups_bin_py(
     bin_path: String,
@@ -1252,18 +1723,20 @@ pub fn garfield_scan_groups_bin_py(
     response: &str,
     max_pick: usize,
     beam_width: usize,
+    enforce_feature_exclusion: bool,
 ) -> PyResult<Vec<(usize, usize, f64, Vec<usize>)>> {
     if groups.is_empty() {
         return Ok(Vec::new());
     }
     let resp = parse_response(response).map_err(PyValueError::new_err)?;
     let y_vec = read_y_f64(&y_train);
-    let y_bin = if resp == GarfieldResponse::Binary {
+    let y_bin_owned = if resp == GarfieldResponse::Binary {
         Some(validate_binary_y(&y_vec).map_err(PyValueError::new_err)?)
     } else {
         validate_continuous_y(&y_vec).map_err(PyValueError::new_err)?;
         None
     };
+    let y_bin = y_bin_owned.as_deref();
 
     let (bits_flat_all, row_words, n_rows_all, n_samples) =
         load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
@@ -1279,6 +1752,11 @@ pub fn garfield_scan_groups_bin_py(
         .map_err(PyRuntimeError::new_err)?
         .sites;
     let chrom_idx = build_chrom_index(&sites, n_rows_all);
+    let feature_group_ids_all = if enforce_feature_exclusion {
+        Some(build_feature_group_ids(&sites, n_rows_all))
+    } else {
+        None
+    };
 
     let mut out: Vec<(usize, usize, f64, Vec<usize>)> = Vec::with_capacity(groups.len());
     for (gi, group) in groups.iter().enumerate() {
@@ -1303,37 +1781,158 @@ pub fn garfield_scan_groups_bin_py(
                 .copy_from_slice(&bits_flat_all[src_start..src_start + row_words]);
         }
 
-        let res = match resp {
-            GarfieldResponse::Binary => {
-                let yb = y_bin.as_ref().expect("binary y prepared");
-                beam_search_and_binary_mcc(
-                    yb.as_slice(),
-                    &bits_flat,
-                    row_words,
-                    n_rows,
-                    n_samples,
-                    max_pick,
-                    beam_width,
-                )
-                .map_err(PyRuntimeError::new_err)?
-            }
-            GarfieldResponse::Continuous => beam_search_and_continuous_abs_corr(
-                y_vec.as_slice(),
-                &bits_flat,
-                row_words,
-                n_rows,
-                n_samples,
-                max_pick,
-                beam_width,
+        let local_group_ids = if let Some(global_ids) = feature_group_ids_all.as_ref() {
+            Some(
+                idx_all
+                    .iter()
+                    .map(|&gi| global_ids[gi])
+                    .collect::<Vec<usize>>(),
             )
-            .map_err(PyRuntimeError::new_err)?,
+        } else {
+            None
         };
+        let res = run_beam_with_feature_exclusion(
+            &bits_flat,
+            row_words,
+            n_rows,
+            n_samples,
+            resp,
+            y_vec.as_slice(),
+            y_bin,
+            max_pick,
+            beam_width,
+            local_group_ids.as_deref(),
+        )
+        .map_err(PyRuntimeError::new_err)?;
         let selected_global = res
             .selected_indices
             .iter()
             .map(|&local_idx| idx_all[local_idx])
             .collect::<Vec<_>>();
         out.push((gi, idx_all.len(), res.score, selected_global));
+    }
+    Ok(out)
+}
+
+#[pyfunction(name = "garfield_scan_windows_bin")]
+#[pyo3(signature = (
+    bin_path,
+    y_train,
+    response="continuous",
+    max_pick=3,
+    beam_width=5,
+    extension=50000,
+    step=None,
+    enforce_feature_exclusion=true
+))]
+pub fn garfield_scan_windows_bin_py(
+    bin_path: String,
+    y_train: PyReadonlyArray1<'_, f64>,
+    response: &str,
+    max_pick: usize,
+    beam_width: usize,
+    extension: usize,
+    step: Option<usize>,
+    enforce_feature_exclusion: bool,
+) -> PyResult<Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)>> {
+    let resp = parse_response(response).map_err(PyValueError::new_err)?;
+    if extension == 0 {
+        return Err(PyValueError::new_err(
+            "garfield_scan_windows_bin: extension must be > 0",
+        ));
+    }
+    let step_v = step.unwrap_or((extension / 2).max(1));
+    if step_v == 0 {
+        return Err(PyValueError::new_err(
+            "garfield_scan_windows_bin: step must be > 0",
+        ));
+    }
+
+    let y_vec = read_y_f64(&y_train);
+    let y_bin_owned = if resp == GarfieldResponse::Binary {
+        Some(validate_binary_y(&y_vec).map_err(PyValueError::new_err)?)
+    } else {
+        validate_continuous_y(&y_vec).map_err(PyValueError::new_err)?;
+        None
+    };
+    let y_bin = y_bin_owned.as_deref();
+
+    let (bits_flat_all, row_words, n_rows_all, n_samples) =
+        load_bin01_as_u64_words(&bin_path).map_err(PyRuntimeError::new_err)?;
+    if y_vec.len() < n_samples {
+        return Err(PyValueError::new_err(format!(
+            "garfield_scan_windows_bin: y length={} smaller than n_samples={}",
+            y_vec.len(),
+            n_samples
+        )));
+    }
+
+    let sites = TxtSnpIter::new(&bin_path, None)
+        .map_err(PyRuntimeError::new_err)?
+        .sites;
+    let windows = build_windows_from_sites(&sites, n_rows_all, extension, step_v);
+    if windows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let feature_group_ids_all = if enforce_feature_exclusion {
+        Some(build_feature_group_ids(&sites, n_rows_all))
+    } else {
+        None
+    };
+
+    let mut out: Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)> =
+        Vec::with_capacity(windows.len());
+    for (wi0, win) in windows.iter().enumerate() {
+        if win.indices.is_empty() {
+            continue;
+        }
+        let n_rows = win.indices.len();
+        let sub = if n_rows == n_rows_all {
+            bits_flat_all.clone()
+        } else {
+            gather_rows_by_indices(&bits_flat_all, row_words, &win.indices)
+                .map_err(PyRuntimeError::new_err)?
+        };
+
+        let local_group_ids = if let Some(global_ids) = feature_group_ids_all.as_ref() {
+            Some(
+                win.indices
+                    .iter()
+                    .map(|&gi| global_ids[gi])
+                    .collect::<Vec<usize>>(),
+            )
+        } else {
+            None
+        };
+
+        let res = run_beam_with_feature_exclusion(
+            &sub,
+            row_words,
+            n_rows,
+            n_samples,
+            resp,
+            y_vec.as_slice(),
+            y_bin,
+            max_pick,
+            beam_width,
+            local_group_ids.as_deref(),
+        )
+        .map_err(PyRuntimeError::new_err)?;
+
+        let selected_global = res
+            .selected_indices
+            .iter()
+            .map(|&local_idx| win.indices[local_idx])
+            .collect::<Vec<_>>();
+        out.push((
+            wi0 + 1,
+            win.chrom.clone(),
+            win.bp_start,
+            win.bp_end,
+            n_rows,
+            res.score,
+            selected_global,
+        ));
     }
     Ok(out)
 }

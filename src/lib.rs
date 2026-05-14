@@ -119,7 +119,7 @@ use eigh::{
 };
 use garfield::{
     garfield_eval_rule_bin_py, garfield_prepare_input_bin_py, garfield_scan_groups_bin_py,
-    garfield_subset_bin_samples_py,
+    garfield_scan_windows_bin_py, garfield_subset_bin_samples_py,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
@@ -356,6 +356,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garfield_ml_select_topk_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_subset_bin_samples_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_scan_groups_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_scan_windows_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_eval_rule_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_prepare_input_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;

@@ -10,7 +10,7 @@ use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
@@ -594,6 +594,76 @@ fn copy_id_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
     fs::copy(&src, &dst)
         .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
     Ok(())
+}
+
+fn read_sample_ids_from_sidecar(path: &Path) -> Result<Vec<String>, String> {
+    let fr = BufReader::new(File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?);
+    let is_fam = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(|x| x.eq_ignore_ascii_case("fam"))
+        .unwrap_or(false);
+    let mut out: Vec<String> = Vec::new();
+    for (ln, line) in fr.lines().enumerate() {
+        let raw = line.map_err(|e| format!("read {}:{}: {e}", path.display(), ln + 1))?;
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if is_fam {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            if toks.len() < 2 {
+                return Err(format!(
+                    "{}:{} malformed FAM row (need >=2 columns)",
+                    path.display(),
+                    ln + 1
+                ));
+            }
+            out.push(toks[1].to_string());
+        } else {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            if toks.is_empty() {
+                continue;
+            }
+            out.push(toks[0].to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn write_subset_id_sidecar(
+    src_bin: &str,
+    dst_bin: &str,
+    sample_indices: &[usize],
+) -> Result<bool, String> {
+    let Some(src_id_path) = discover_id_sidecar(src_bin) else {
+        return Ok(false);
+    };
+    let src_ids = read_sample_ids_from_sidecar(&src_id_path)?;
+    let dst_id_path = out_bin_id_path(dst_bin);
+    if let Some(parent) = dst_id_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let mut fw = BufWriter::new(
+        File::create(&dst_id_path).map_err(|e| format!("create {}: {e}", dst_id_path.display()))?,
+    );
+    for &si in sample_indices.iter() {
+        if si >= src_ids.len() {
+            return Err(format!(
+                "sample index out of range while subsetting IDs: {} >= {}",
+                si,
+                src_ids.len()
+            ));
+        }
+        fw.write_all(src_ids[si].as_bytes())
+            .map_err(|e| format!("write {}: {e}", dst_id_path.display()))?;
+        fw.write_all(b"\n")
+            .map_err(|e| format!("write {}: {e}", dst_id_path.display()))?;
+    }
+    fw.flush()
+        .map_err(|e| format!("flush {}: {e}", dst_id_path.display()))?;
+    Ok(true)
 }
 
 #[inline]
@@ -1702,7 +1772,11 @@ pub fn garfield_subset_bin_samples_py(
         .map_err(|e| PyRuntimeError::new_err(format!("{ctx}: flush {out_bin_path}: {e}")))?;
 
     copy_site_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
-    copy_id_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
+    let wrote_subset_ids =
+        write_subset_id_sidecar(&bin_path, &out_bin_path, &sample_indices).map_err(PyRuntimeError::new_err)?;
+    if !wrote_subset_ids {
+        copy_id_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
+    }
     Ok(())
 }
 

@@ -7,7 +7,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut};
-use crate::blas::{cblas_sgemm_dispatch, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS};
+use crate::blas::{
+    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
+    CBLAS_TRANS,
+};
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
 use crate::stats_common::{get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
@@ -1371,6 +1374,13 @@ pub fn he_pcg_bed<'py>(
     let pool_ref = pool_owned.as_ref();
     let he_res = py
         .detach(move || {
+            // Keep HE's BLAS kernels aligned with the requested outer thread count so
+            // `threads=1` is truly single-core and benchmark comparisons stay meaningful.
+            let _blas_guard = if threads > 0 {
+                Some(OpenBlasThreadGuard::enter(threads.max(1)))
+            } else {
+                None
+            };
             he_variance_components_packed_with_covariates(
                 packed_keep.as_ref(),
                 bytes_per_snp,

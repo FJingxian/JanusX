@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -32,6 +34,11 @@ def env_int(name: str, default: int, min_value: int | None = None) -> int:
     if min_value is not None and value < min_value:
         fail(f"{name} must be >= {min_value}, got {value}")
     return value
+
+
+def env_truthy(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
 
 
 def fail(message: str) -> None:
@@ -212,6 +219,107 @@ def check_jx_available() -> None:
     if shutil.which("jx") is None:
         fail("jx command not found in PATH")
     run(["jx", "--version"])
+
+
+def import_janusx_runtime() -> tuple[object, object]:
+    use_local_py = env_truthy("JX_GGVAL_USE_LOCAL_PYTHON", False)
+    if use_local_py:
+        py_root = ROOT_DIR / "python"
+        if str(py_root) not in sys.path:
+            sys.path.insert(0, str(py_root))
+    else:
+        root_resolved = str(ROOT_DIR.resolve())
+        py_root_resolved = str((ROOT_DIR / "python").resolve())
+        cleaned: list[str] = []
+        for p in sys.path:
+            p_norm = p if p != "" else os.getcwd()
+            try:
+                p_resolved = str(Path(p_norm).resolve())
+            except Exception:
+                p_resolved = str(p_norm)
+            if p_resolved in {root_resolved, py_root_resolved}:
+                continue
+            cleaned.append(p)
+        sys.path[:] = cleaned
+
+    try:
+        import janusx  # type: ignore
+        from janusx import janusx as jxrs  # type: ignore
+        return janusx, jxrs
+    except Exception as ex:  # pragma: no cover - runtime environment dependent
+        if not use_local_py:
+            py_root = ROOT_DIR / "python"
+            if str(py_root) not in sys.path:
+                sys.path.insert(0, str(py_root))
+            try:
+                import janusx  # type: ignore
+                from janusx import janusx as jxrs  # type: ignore
+                print("NOTE: janusx site-packages import failed; fallback to local python/janusx.")
+                return janusx, jxrs
+            except Exception as ex2:
+                fail(f"Unable to import janusx Rust module for backend checks: {ex2} (initial error: {ex})")
+        fail(f"Unable to import janusx Rust module for backend checks: {ex}")
+
+
+def report_janusx_runtime(janusx_module: object, jxrs_module: object) -> None:
+    print(f"JANUSX module path       : {str(getattr(jxrs_module, '__file__', '?'))}")
+    print(f"JANUSX package path      : {str(getattr(janusx_module, '__file__', '?'))}")
+
+
+def cleanup_tmp_outputs(outdir: Path, prefix_name: str) -> None:
+    pattern = f"{prefix_name}*"
+    for p in outdir.glob(pattern):
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def assert_he_outputs_close(ref: tuple[object, ...], cur: tuple[object, ...], full_cores: int) -> None:
+    if len(ref) != len(cur):
+        fail(
+            "HE return length mismatch between 1-core and "
+            f"{full_cores}-core runs: {len(ref)} vs {len(cur)}"
+        )
+
+    exact_fields = {
+        3: "converged",
+        4: "iters",
+        6: "m_effective",
+    }
+    for idx, name in exact_fields.items():
+        if idx >= len(ref):
+            continue
+        if ref[idx] != cur[idx]:
+            fail(
+                f"HE output mismatch for {name}: "
+                f"1-core={ref[idx]!r}, {full_cores}-core={cur[idx]!r}"
+            )
+
+    float_fields = {
+        0: "sigma_g2",
+        1: "sigma_e2",
+        2: "h2",
+        5: "rel_res",
+        7: "tr_k2",
+        8: "y_ky",
+        9: "y_y",
+        10: "lambda",
+        11: "tr_k2_solve",
+    }
+    for idx, name in float_fields.items():
+        if idx >= len(ref):
+            continue
+        a = float(ref[idx])
+        b = float(cur[idx])
+        if not np.allclose([a], [b], rtol=5e-4, atol=1e-8, equal_nan=True):
+            fail(
+                f"HE output drifted across thread counts for {name}: "
+                f"1-core={a}, {full_cores}-core={b}"
+            )
 
 
 def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
@@ -485,49 +593,8 @@ def backend_thread_checks(outdir: Path) -> None:
     sim_prefix = outdir / "__ggval_tmp_large_sim"
     full_cores = max(1, int(os.cpu_count() or 1))
 
-    use_local_py = env_str("JX_GGVAL_USE_LOCAL_PYTHON", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    }
-    if use_local_py:
-        py_root = ROOT_DIR / "python"
-        if str(py_root) not in sys.path:
-            sys.path.insert(0, str(py_root))
-    else:
-        root_resolved = str(ROOT_DIR.resolve())
-        py_root_resolved = str((ROOT_DIR / "python").resolve())
-        cleaned: list[str] = []
-        for p in sys.path:
-            p_norm = p if p != "" else os.getcwd()
-            try:
-                p_resolved = str(Path(p_norm).resolve())
-            except Exception:
-                p_resolved = str(p_norm)
-            if p_resolved in {root_resolved, py_root_resolved}:
-                continue
-            cleaned.append(p)
-        sys.path[:] = cleaned
-    try:
-        import janusx  # type: ignore
-        from janusx import janusx as jxrs  # type: ignore
-    except Exception as ex:  # pragma: no cover - runtime environment dependent
-        if not use_local_py:
-            py_root = ROOT_DIR / "python"
-            if str(py_root) not in sys.path:
-                sys.path.insert(0, str(py_root))
-            try:
-                import janusx  # type: ignore
-                from janusx import janusx as jxrs  # type: ignore
-                print("NOTE: janusx site-packages import failed; fallback to local python/janusx.")
-            except Exception as ex2:
-                fail(f"Unable to import janusx Rust module for backend checks: {ex2} (initial error: {ex})")
-        else:
-            fail(f"Unable to import janusx Rust module for backend checks: {ex}")
-    print(f"JANUSX module path       : {str(getattr(jxrs, '__file__', '?'))}")
-    print(f"JANUSX package path      : {str(getattr(janusx, '__file__', '?'))}")
+    janusx, jxrs = import_janusx_runtime()
+    report_janusx_runtime(janusx, jxrs)
 
     def _find_grm_for_prefix(prefix_path: Path) -> Path:
         base = str(prefix_path)
@@ -539,18 +606,7 @@ def backend_thread_checks(outdir: Path) -> None:
         ]
         return require_any_file("GRM benchmark output missing", candidates)
 
-    def _cleanup_tmp_outputs() -> None:
-        pattern = f"{sim_prefix.name}*"
-        for p in outdir.glob(pattern):
-            try:
-                if p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink()
-            except FileNotFoundError:
-                pass
-
-    _cleanup_tmp_outputs()
+    cleanup_tmp_outputs(outdir, sim_prefix.name)
     try:
         run(["jx", "sim", str(nsnp_k), str(n_individuals), str(sim_prefix)])
         bfile_prefix = sim_prefix
@@ -624,7 +680,106 @@ def backend_thread_checks(outdir: Path) -> None:
         print(f"GRM runtime   (1 core)   : {grm_t1:.3f}s")
         print(f"GRM runtime   ({full_cores} cores): {grm_tn:.3f}s")
     finally:
-        _cleanup_tmp_outputs()
+        cleanup_tmp_outputs(outdir, sim_prefix.name)
+    sep()
+
+
+def he_thread_checks(outdir: Path) -> None:
+    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
+    nsnp_k = env_int("JX_GGVAL_HE_BENCH_NSNP_K", default_nsnp_k, min_value=1)
+    n_individuals = env_int("JX_GGVAL_HE_BENCH_NIND", default_n_individuals, min_value=2)
+    trace_samples = env_int("JX_GGVAL_HE_TRACE_SAMPLES", 64, min_value=8)
+    trace_probe_batch = env_int(
+        "JX_GGVAL_HE_TRACE_PROBE_BATCH",
+        min(8, trace_samples),
+        min_value=1,
+    )
+    block_rows = env_int("JX_GGVAL_HE_BLOCK_ROWS", 4096, min_value=1)
+    max_iter = env_int("JX_GGVAL_HE_MAX_ITER", 32, min_value=1)
+    seed = env_int("JX_GGVAL_HE_SEED", 20260514, min_value=0)
+
+    step(
+        "STEP HE. HE equation 1-core/all-core timing check "
+        f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
+    )
+    sim_prefix = outdir / "__ggval_tmp_he_sim"
+    full_cores = max(1, int(os.cpu_count() or 1))
+
+    janusx, jxrs = import_janusx_runtime()
+    report_janusx_runtime(janusx, jxrs)
+    print(f"HE BLAS backend          : {str(jxrs.rust_sgemm_backend()).strip()}")
+
+    cleanup_tmp_outputs(outdir, sim_prefix.name)
+    try:
+        run(["jx", "sim", str(nsnp_k), str(n_individuals), str(sim_prefix)])
+        bfile_prefix = sim_prefix
+        require_file(bfile_prefix.with_suffix(".bed"), "Simulated BED output missing")
+        require_file(bfile_prefix.with_suffix(".bim"), "Simulated BIM output missing")
+        require_file(bfile_prefix.with_suffix(".fam"), "Simulated FAM output missing")
+
+        packed_arr, _miss_arr, maf_arr, _std_arr, n_samples = jxrs.load_bed_2bit_packed(str(bfile_prefix))
+        packed = np.ascontiguousarray(np.asarray(packed_arr, dtype=np.uint8), dtype=np.uint8)
+        maf = np.ascontiguousarray(np.asarray(maf_arr, dtype=np.float32).reshape(-1), dtype=np.float32)
+        row_flip = np.ascontiguousarray(
+            np.asarray(
+                jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+                dtype=np.bool_,
+            ).reshape(-1),
+            dtype=np.bool_,
+        )
+        train_idx = np.arange(int(n_samples), dtype=np.int64)
+        y = np.asarray(np.random.default_rng(int(seed)).standard_normal(int(n_samples)), dtype=np.float64)
+        y -= float(y.mean())
+
+        print(
+            "HE benchmark payload     : "
+            f"{int(packed.shape[0])} SNP x {int(n_samples)} samples"
+        )
+
+        def run_he_once(threads: int) -> tuple[float, tuple[object, ...]]:
+            t0 = time.perf_counter()
+            ret = jxrs.he_pcg_bed(
+                str(bfile_prefix),
+                train_idx,
+                y,
+                trace_samples=int(trace_samples),
+                trace_probe_batch=int(trace_probe_batch),
+                tol=1e-6,
+                max_iter=int(max_iter),
+                block_rows=int(block_rows),
+                std_eps=1e-12,
+                use_train_maf=True,
+                exact_trace_debug=False,
+                exact_trace_max_n=256,
+                threads=int(threads),
+                seed=int(seed),
+                packed=packed,
+                packed_n_samples=int(n_samples),
+                maf=maf,
+                row_flip=row_flip,
+            )
+            elapsed = time.perf_counter() - t0
+            return elapsed, tuple(ret)
+
+        he_t1, he_out_1 = run_he_once(1)
+        he_tn, he_out_n = run_he_once(full_cores)
+        assert_he_outputs_close(he_out_1, he_out_n, full_cores)
+
+        print(f"HE runtime    (1 core)   : {he_t1:.3f}s")
+        print(f"HE runtime    ({full_cores} cores): {he_tn:.3f}s")
+        if he_tn > 0.0:
+            print(f"HE speedup               : {he_t1 / he_tn:.2f}x")
+        if len(he_out_n) >= 11:
+            print(
+                "HE estimate              : "
+                f"h2={float(he_out_n[2]):.6f}, "
+                f"lambda={float(he_out_n[10]):.6f}, "
+                f"converged={bool(he_out_n[3])}, "
+                f"m_eff={int(he_out_n[6])}"
+            )
+    finally:
+        cleanup_tmp_outputs(outdir, sim_prefix.name)
     sep()
 
 
@@ -667,6 +822,13 @@ def parse_args() -> argparse.Namespace:
         default=env_str("JX_GGVAL_POSTGS", "1") != "1",
         help="Skip postGS validation in full mode.",
     )
+    parser.add_argument(
+        "--testHE",
+        "--test-he",
+        dest="test_he",
+        action="store_true",
+        help="Run only the HE thread benchmark branch (1 core vs all cores).",
+    )
     return parser.parse_args()
 
 
@@ -682,14 +844,17 @@ def main() -> int:
 
     check_jx_available()
 
-    if args.mode == "smoke":
+    if args.test_he:
+        he_thread_checks(outdir)
+    elif args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)
+        backend_thread_checks(outdir)
     else:
         full_flow(outdir, postgs_enabled=not args.no_postgs)
-    backend_thread_checks(outdir)
+        backend_thread_checks(outdir)
 
     step("Validation completed")
-    print(f"Mode      : {args.mode}")
+    print(f"Mode      : {'testHE' if args.test_he else args.mode}")
     print(f"Output dir: {outdir}")
     print(f"Log dir   : {logdir}")
     return 0

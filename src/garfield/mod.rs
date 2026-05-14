@@ -1,22 +1,80 @@
-use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr};
-use crate::gfcore::{SiteInfo, TxtSnpIter};
+use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
+use crate::gfcore::{process_snp_row, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter};
+use crate::gfreader::build_sample_selection;
 use crate::score::{score_binary_mcc_packed, score_cont_corr_packed};
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
 const BIN01_HEADER_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GarfieldInputKind {
+    Auto,
+    Bfile,
+    Vcf,
+    Hmp,
+    File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GarfieldBinMode {
+    Bin,
+    Mbin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldResponse {
     Binary,
     Continuous,
+}
+
+#[derive(Clone)]
+struct EncodedRow {
+    site: SiteInfo,
+    bits: Vec<u8>,
+}
+
+enum GarfieldInputReader {
+    Bed(BedSnpIter),
+    Vcf(VcfSnpIter),
+    Hmp(HmpSnpIter),
+    Txt(TxtSnpIter),
+}
+
+impl GarfieldInputReader {
+    fn sample_ids(&self) -> &[String] {
+        match self {
+            GarfieldInputReader::Bed(it) => &it.samples,
+            GarfieldInputReader::Vcf(it) => &it.samples,
+            GarfieldInputReader::Hmp(it) => &it.samples,
+            GarfieldInputReader::Txt(it) => &it.samples,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GarfieldWindow {
+    chrom: String,
+    bp_start: i32,
+    bp_end: i32,
+    indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstrainedBeamNode {
+    selected: Vec<usize>,
+    combined: Vec<u64>,
+    score: f64,
+    last_index: usize,
 }
 
 #[inline]
@@ -26,6 +84,29 @@ fn parse_response(response: &str) -> Result<GarfieldResponse, String> {
         "binary" | "bin" | "b" => Ok(GarfieldResponse::Binary),
         "continuous" | "cont" | "c" => Ok(GarfieldResponse::Continuous),
         _ => Err("response must be 'binary' or 'continuous'".to_string()),
+    }
+}
+
+#[inline]
+fn parse_input_kind(input_kind: &str) -> Result<GarfieldInputKind, String> {
+    let t = input_kind.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "" | "auto" => Ok(GarfieldInputKind::Auto),
+        "bfile" | "plink" | "bed" => Ok(GarfieldInputKind::Bfile),
+        "vcf" => Ok(GarfieldInputKind::Vcf),
+        "hmp" | "hapmap" => Ok(GarfieldInputKind::Hmp),
+        "file" | "txt" | "npy" | "bin" => Ok(GarfieldInputKind::File),
+        _ => Err("input_kind must be one of: auto, bfile, vcf, hmp, file".to_string()),
+    }
+}
+
+#[inline]
+fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
+    let t = mode.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "bin" | "bin02" => Ok(GarfieldBinMode::Bin),
+        "mbin" => Ok(GarfieldBinMode::Mbin),
+        _ => Err("mode must be one of: bin, mbin".to_string()),
     }
 }
 
@@ -274,6 +355,374 @@ fn copy_site_sidecar(src_bin: &str, dst_bin: &str) -> Result<(), String> {
 }
 
 #[inline]
+fn normalize_plink_prefix(path_or_prefix: &str) -> String {
+    let s = path_or_prefix.trim();
+    let low = s.to_ascii_lowercase();
+    if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
+        s[..s.len() - 4].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn make_input_reader(input_path: &str, input_kind: GarfieldInputKind) -> Result<GarfieldInputReader, String> {
+    let p = input_path.trim();
+    if p.is_empty() {
+        return Err("input_path must not be empty".to_string());
+    }
+    let low = p.to_ascii_lowercase();
+    match input_kind {
+        GarfieldInputKind::Bfile => {
+            let prefix = normalize_plink_prefix(p);
+            let it = BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, 0.02)?;
+            Ok(GarfieldInputReader::Bed(it))
+        }
+        GarfieldInputKind::Vcf => {
+            let it = VcfSnpIter::new_with_fill(p, 0.0, 1.0, false, false, 0.02)?;
+            Ok(GarfieldInputReader::Vcf(it))
+        }
+        GarfieldInputKind::Hmp => {
+            let it = HmpSnpIter::new_with_fill(p, 0.0, 1.0, false, false, 0.02)?;
+            Ok(GarfieldInputReader::Hmp(it))
+        }
+        GarfieldInputKind::File => {
+            let it = TxtSnpIter::new(p, None)?;
+            Ok(GarfieldInputReader::Txt(it))
+        }
+        GarfieldInputKind::Auto => {
+            if low.ends_with(".vcf") || low.ends_with(".vcf.gz") {
+                let it = VcfSnpIter::new_with_fill(p, 0.0, 1.0, false, false, 0.02)?;
+                return Ok(GarfieldInputReader::Vcf(it));
+            }
+            if low.ends_with(".hmp") || low.ends_with(".hmp.gz") {
+                let it = HmpSnpIter::new_with_fill(p, 0.0, 1.0, false, false, 0.02)?;
+                return Ok(GarfieldInputReader::Hmp(it));
+            }
+            let prefix = normalize_plink_prefix(p);
+            let bed = format!("{prefix}.bed");
+            let bim = format!("{prefix}.bim");
+            let fam = format!("{prefix}.fam");
+            if Path::new(&bed).exists() && Path::new(&bim).exists() && Path::new(&fam).exists() {
+                let it = BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, 0.02)?;
+                return Ok(GarfieldInputReader::Bed(it));
+            }
+            let it = TxtSnpIter::new(p, None)?;
+            Ok(GarfieldInputReader::Txt(it))
+        }
+    }
+}
+
+#[inline]
+fn row_bytes_for_samples(n_samples: usize) -> usize {
+    n_samples.div_ceil(8).max(1)
+}
+
+#[inline]
+fn normalize_genotype3(v: f32) -> Option<u8> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let r = v.round();
+    if r <= 0.0 {
+        Some(0)
+    } else if r >= 2.0 {
+        Some(2)
+    } else {
+        Some(1)
+    }
+}
+
+fn write_bin01_header(file: &mut File, n_rows: u64, n_samples: usize) -> Result<(), String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek BIN header: {e}"))?;
+    file.write_all(BIN01_MAGIC)
+        .map_err(|e| format!("write BIN magic: {e}"))?;
+    file.write_all(&n_rows.to_le_bytes())
+        .map_err(|e| format!("write BIN n_rows: {e}"))?;
+    file.write_all(&(n_samples as u64).to_le_bytes())
+        .map_err(|e| format!("write BIN n_samples: {e}"))?;
+    file.write_all(&(0u64).to_le_bytes())
+        .map_err(|e| format!("write BIN reserved: {e}"))?;
+    Ok(())
+}
+
+#[inline]
+fn bin_output_prefix(out_bin_path: &str) -> PathBuf {
+    let p = Path::new(out_bin_path);
+    let mut out = p.to_path_buf();
+    let is_bin = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("bin"))
+        .unwrap_or(false);
+    if is_bin {
+        out.set_extension("");
+    }
+    out
+}
+
+#[inline]
+fn out_bin_id_path(out_bin_path: &str) -> PathBuf {
+    append_suffix(&bin_output_prefix(out_bin_path), ".bin.id")
+}
+
+#[inline]
+fn out_bin_site_path(out_bin_path: &str) -> PathBuf {
+    append_suffix(&bin_output_prefix(out_bin_path), ".bin.site")
+}
+
+fn write_sample_id_sidecar(out_bin_path: &str, sample_ids: &[String]) -> Result<(), String> {
+    let id_path = out_bin_id_path(out_bin_path);
+    if let Some(parent) = id_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
+    }
+    let mut fw = BufWriter::new(
+        File::create(&id_path).map_err(|e| format!("create {}: {e}", id_path.display()))?,
+    );
+    for sid in sample_ids.iter() {
+        fw.write_all(sid.as_bytes())
+            .map_err(|e| format!("write {}: {e}", id_path.display()))?;
+        fw.write_all(b"\n")
+            .map_err(|e| format!("write {}: {e}", id_path.display()))?;
+    }
+    fw.flush()
+        .map_err(|e| format!("flush {}: {e}", id_path.display()))?;
+    Ok(())
+}
+
+fn row_select_by_indices(row: Vec<f32>, sample_indices: &[usize]) -> Result<Vec<f32>, String> {
+    let mut out = Vec::with_capacity(sample_indices.len());
+    for &idx in sample_indices.iter() {
+        if idx >= row.len() {
+            return Err(format!(
+                "sample index out of range while slicing row: {} >= {}",
+                idx,
+                row.len()
+            ));
+        }
+        out.push(row[idx]);
+    }
+    Ok(out)
+}
+
+fn mbin_site_variants(site: &SiteInfo) -> [SiteInfo; 3] {
+    let dom = SiteInfo {
+        chrom: site.chrom.clone(),
+        pos: site.pos,
+        ref_allele: site.ref_allele.clone(),
+        alt_allele: format!("{}|DOM", site.alt_allele),
+    };
+    let rec = SiteInfo {
+        chrom: site.chrom.clone(),
+        pos: site.pos,
+        ref_allele: site.ref_allele.clone(),
+        alt_allele: format!("{}|REC", site.alt_allele),
+    };
+    let het = SiteInfo {
+        chrom: site.chrom.clone(),
+        pos: site.pos,
+        ref_allele: site.ref_allele.clone(),
+        alt_allele: format!("{}|HET", site.alt_allele),
+    };
+    [dom, rec, het]
+}
+
+fn encode_row_to_bits(
+    mut row: Vec<f32>,
+    mut site: SiteInfo,
+    mode: GarfieldBinMode,
+    row_bytes: usize,
+    maf: f32,
+    geno: f32,
+    impute: bool,
+    het: f32,
+) -> Option<Vec<EncodedRow>> {
+    let keep = process_snp_row(
+        &mut row,
+        &mut site.ref_allele,
+        &mut site.alt_allele,
+        maf,
+        geno,
+        impute,
+        false,
+        het,
+    );
+    if !keep {
+        return None;
+    }
+
+    match mode {
+        GarfieldBinMode::Bin => {
+            let mut c0 = 0usize;
+            let mut c2 = 0usize;
+            for &v in row.iter() {
+                match normalize_genotype3(v) {
+                    Some(0) => c0 += 1,
+                    Some(2) => c2 += 1,
+                    _ => {}
+                }
+            }
+            let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
+            let mut bits = vec![0u8; row_bytes];
+            for (i, &v) in row.iter().enumerate() {
+                let g = normalize_genotype3(v).unwrap_or(mode02);
+                let is_one = if g == 0 {
+                    false
+                } else if g == 2 {
+                    true
+                } else {
+                    mode02 == 2
+                };
+                if is_one {
+                    bits[i >> 3] |= 1u8 << (i & 7);
+                }
+            }
+            site.alt_allele = format!("{}|BIN", site.alt_allele);
+            Some(vec![EncodedRow { site, bits }])
+        }
+        GarfieldBinMode::Mbin => {
+            let mut dom = vec![0u8; row_bytes];
+            let mut rec = vec![0u8; row_bytes];
+            let mut het_bits = vec![0u8; row_bytes];
+            for (i, &v) in row.iter().enumerate() {
+                let Some(g) = normalize_genotype3(v) else {
+                    continue;
+                };
+                let mask = 1u8 << (i & 7);
+                if g > 0 {
+                    dom[i >> 3] |= mask;
+                }
+                if g == 2 {
+                    rec[i >> 3] |= mask;
+                }
+                if g == 1 {
+                    het_bits[i >> 3] |= mask;
+                }
+            }
+            let [s_dom, s_rec, s_het] = mbin_site_variants(&site);
+            Some(vec![
+                EncodedRow {
+                    site: s_dom,
+                    bits: dom,
+                },
+                EncodedRow {
+                    site: s_rec,
+                    bits: rec,
+                },
+                EncodedRow {
+                    site: s_het,
+                    bits: het_bits,
+                },
+            ])
+        }
+    }
+}
+
+fn encode_batch_rows(
+    batch: Vec<(Vec<f32>, SiteInfo)>,
+    mode: GarfieldBinMode,
+    row_bytes: usize,
+    maf: f32,
+    geno: f32,
+    impute: bool,
+    het: f32,
+    pool: Option<&rayon::ThreadPool>,
+) -> Vec<Option<Vec<EncodedRow>>> {
+    if let Some(p) = pool {
+        p.install(|| {
+            batch
+                .into_par_iter()
+                .map(|(row, site)| {
+                    encode_row_to_bits(row, site, mode, row_bytes, maf, geno, impute, het)
+                })
+                .collect::<Vec<_>>()
+        })
+    } else {
+        batch
+            .into_iter()
+            .map(|(row, site)| {
+                encode_row_to_bits(row, site, mode, row_bytes, maf, geno, impute, het)
+            })
+            .collect::<Vec<_>>()
+    }
+}
+
+struct GarfieldBinWriter {
+    file: File,
+    site_fw: BufWriter<File>,
+    row_bytes: usize,
+    n_rows_written: usize,
+}
+
+impl GarfieldBinWriter {
+    fn new(out_bin_path: &str, n_samples: usize) -> Result<Self, String> {
+        let out_path = Path::new(out_bin_path);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
+        }
+        let mut file =
+            File::create(out_path).map_err(|e| format!("create {}: {e}", out_path.display()))?;
+        write_bin01_header(&mut file, 0, n_samples)?;
+
+        let site_path = out_bin_site_path(out_bin_path);
+        if let Some(parent) = site_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
+        }
+        let site_fw = BufWriter::new(
+            File::create(&site_path).map_err(|e| format!("create {}: {e}", site_path.display()))?,
+        );
+        Ok(Self {
+            file,
+            site_fw,
+            row_bytes: row_bytes_for_samples(n_samples),
+            n_rows_written: 0,
+        })
+    }
+
+    fn write_rows(&mut self, rows: &[EncodedRow]) -> Result<(), String> {
+        for row in rows.iter() {
+            if row.bits.len() != self.row_bytes {
+                return Err(format!(
+                    "encoded row byte mismatch: got {}, expected {}",
+                    row.bits.len(),
+                    self.row_bytes
+                ));
+            }
+            self.file
+                .write_all(&row.bits)
+                .map_err(|e| format!("write BIN row: {e}"))?;
+            writeln!(
+                self.site_fw,
+                "{}\t{}\t{}\t{}",
+                row.site.chrom, row.site.pos, row.site.ref_allele, row.site.alt_allele
+            )
+            .map_err(|e| format!("write BIN site row: {e}"))?;
+            self.n_rows_written = self.n_rows_written.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, n_samples: usize) -> Result<usize, String> {
+        self.site_fw
+            .flush()
+            .map_err(|e| format!("flush BIN site sidecar: {e}"))?;
+        self.file
+            .flush()
+            .map_err(|e| format!("flush BIN file: {e}"))?;
+        let n_rows_u64 =
+            u64::try_from(self.n_rows_written).map_err(|_| "n_rows overflows u64".to_string())?;
+        write_bin01_header(&mut self.file, n_rows_u64, n_samples)?;
+        self.file
+            .flush()
+            .map_err(|e| format!("flush BIN header rewrite: {e}"))?;
+        Ok(self.n_rows_written)
+    }
+}
+
+#[inline]
 fn normalize_chrom(chrom: &str) -> String {
     let s = chrom.trim();
     if s.len() > 2 && (s.ends_with("_1") || s.ends_with("_2")) {
@@ -366,6 +815,356 @@ fn validate_continuous_y(y: &[f64]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[pyfunction(name = "garfield_prepare_input_bin")]
+#[pyo3(signature = (
+    input_path,
+    out_bin_path,
+    input_kind="auto",
+    mode="bin",
+    threads=0,
+    maf=0.0,
+    geno=1.0,
+    impute=false,
+    het=0.02,
+    sample_ids=None,
+    sample_indices=None
+))]
+pub fn garfield_prepare_input_bin_py(
+    input_path: String,
+    out_bin_path: String,
+    input_kind: &str,
+    mode: &str,
+    threads: usize,
+    maf: f64,
+    geno: f64,
+    impute: bool,
+    het: f64,
+    sample_ids: Option<Vec<String>>,
+    sample_indices: Option<Vec<usize>>,
+) -> PyResult<(usize, usize, usize, usize)> {
+    if !(0.0..=0.5).contains(&maf) {
+        return Err(PyValueError::new_err("maf must be within [0, 0.5]"));
+    }
+    if !(0.0..=1.0).contains(&geno) {
+        return Err(PyValueError::new_err("geno must be within [0, 1]"));
+    }
+    if !(0.0..=0.5).contains(&het) {
+        return Err(PyValueError::new_err("het must be within [0, 0.5]"));
+    }
+
+    let input_kind = parse_input_kind(input_kind).map_err(PyValueError::new_err)?;
+    let mode = parse_bin_mode(mode).map_err(PyValueError::new_err)?;
+    let mut reader = make_input_reader(&input_path, input_kind).map_err(PyRuntimeError::new_err)?;
+
+    let (selected_indices, selected_ids) = build_sample_selection(
+        reader.sample_ids(),
+        sample_ids,
+        sample_indices,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    if selected_indices.is_empty() {
+        return Err(PyValueError::new_err("selected sample set is empty"));
+    }
+    write_sample_id_sidecar(&out_bin_path, &selected_ids).map_err(PyRuntimeError::new_err)?;
+
+    let n_samples = selected_indices.len();
+    let identity_selection = selected_indices
+        .iter()
+        .enumerate()
+        .all(|(i, &idx)| i == idx);
+    let row_bytes = row_bytes_for_samples(n_samples);
+    let mut writer = GarfieldBinWriter::new(&out_bin_path, n_samples).map_err(PyRuntimeError::new_err)?;
+
+    let available_threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1usize);
+    let n_threads = if threads == 0 {
+        available_threads
+    } else {
+        threads.min(available_threads).max(1)
+    };
+    let pool = if n_threads > 1 {
+        Some(
+            ThreadPoolBuilder::new()
+                .num_threads(n_threads)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("build thread pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let pool_ref = pool.as_ref();
+
+    let maf_f32 = maf as f32;
+    let geno_f32 = geno as f32;
+    let het_f32 = het as f32;
+
+    let mut n_sites_seen = 0usize;
+    let mut n_sites_written = 0usize;
+    let mut n_rows_written = 0usize;
+
+    match &mut reader {
+        GarfieldInputReader::Bed(bed) => {
+            if n_threads > 1 {
+                let n_sites = bed.sites.len();
+                let target_bytes = 16usize * 1024 * 1024;
+                let mut chunk_size = target_bytes / n_samples.max(1);
+                if chunk_size == 0 {
+                    chunk_size = 1;
+                }
+                if chunk_size > 4096 {
+                    chunk_size = 4096;
+                }
+                for start in (0..n_sites).step_by(chunk_size) {
+                    let end = (start + chunk_size).min(n_sites);
+                    let rows_res: Vec<Result<Option<Vec<EncodedRow>>, String>> = pool_ref
+                        .expect("thread pool exists when n_threads>1")
+                        .install(|| {
+                            (start..end)
+                                .into_par_iter()
+                                .map(|idx| {
+                                    let (row, site) = if identity_selection {
+                                        bed.get_snp_row_raw(idx).ok_or_else(|| {
+                                            format!("BED decode failed at row {}", idx)
+                                        })?
+                                    } else {
+                                        bed.get_snp_row_selected_raw(idx, &selected_indices)
+                                            .ok_or_else(|| {
+                                                format!("BED decode with sample selection failed at row {}", idx)
+                                            })?
+                                    };
+                                    Ok(encode_row_to_bits(
+                                        row,
+                                        site,
+                                        mode,
+                                        row_bytes,
+                                        maf_f32,
+                                        geno_f32,
+                                        impute,
+                                        het_f32,
+                                    ))
+                                })
+                                .collect()
+                        });
+
+                    for item in rows_res.into_iter() {
+                        n_sites_seen = n_sites_seen.saturating_add(1);
+                        let maybe_rows = item.map_err(PyRuntimeError::new_err)?;
+                        if let Some(rows) = maybe_rows {
+                            n_sites_written = n_sites_written.saturating_add(1);
+                            n_rows_written = n_rows_written.saturating_add(rows.len());
+                            writer.write_rows(&rows).map_err(PyRuntimeError::new_err)?;
+                        }
+                    }
+                }
+            } else {
+                while let Some((row, site)) = if identity_selection {
+                    bed.next_snp_raw()
+                } else {
+                    bed.next_snp_selected_raw(&selected_indices)
+                } {
+                    n_sites_seen = n_sites_seen.saturating_add(1);
+                    if let Some(rows) = encode_row_to_bits(
+                        row,
+                        site,
+                        mode,
+                        row_bytes,
+                        maf_f32,
+                        geno_f32,
+                        impute,
+                        het_f32,
+                    ) {
+                        n_sites_written = n_sites_written.saturating_add(1);
+                        n_rows_written = n_rows_written.saturating_add(rows.len());
+                        writer.write_rows(&rows).map_err(PyRuntimeError::new_err)?;
+                    }
+                }
+            }
+        }
+        GarfieldInputReader::Vcf(vcf) => {
+            let mut batch: Vec<(Vec<f32>, SiteInfo)> = Vec::with_capacity(1024);
+            loop {
+                let Some((row_raw, site)) = vcf.next_snp_raw() else {
+                    break;
+                };
+                let row = if identity_selection {
+                    row_raw
+                } else {
+                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                };
+                batch.push((row, site));
+                if batch.len() >= 1024 {
+                    let results = encode_batch_rows(
+                        std::mem::take(&mut batch),
+                        mode,
+                        row_bytes,
+                        maf_f32,
+                        geno_f32,
+                        impute,
+                        het_f32,
+                        pool_ref,
+                    );
+                    for rows in results.into_iter() {
+                        n_sites_seen = n_sites_seen.saturating_add(1);
+                        if let Some(rows_kept) = rows {
+                            n_sites_written = n_sites_written.saturating_add(1);
+                            n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                            writer
+                                .write_rows(&rows_kept)
+                                .map_err(PyRuntimeError::new_err)?;
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let results = encode_batch_rows(
+                    std::mem::take(&mut batch),
+                    mode,
+                    row_bytes,
+                    maf_f32,
+                    geno_f32,
+                    impute,
+                    het_f32,
+                    pool_ref,
+                );
+                for rows in results.into_iter() {
+                    n_sites_seen = n_sites_seen.saturating_add(1);
+                    if let Some(rows_kept) = rows {
+                        n_sites_written = n_sites_written.saturating_add(1);
+                        n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                        writer
+                            .write_rows(&rows_kept)
+                            .map_err(PyRuntimeError::new_err)?;
+                    }
+                }
+            }
+        }
+        GarfieldInputReader::Hmp(hmp) => {
+            let mut batch: Vec<(Vec<f32>, SiteInfo)> = Vec::with_capacity(1024);
+            loop {
+                let Some((row_raw, site)) = hmp.next_snp_raw() else {
+                    break;
+                };
+                let row = if identity_selection {
+                    row_raw
+                } else {
+                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                };
+                batch.push((row, site));
+                if batch.len() >= 1024 {
+                    let results = encode_batch_rows(
+                        std::mem::take(&mut batch),
+                        mode,
+                        row_bytes,
+                        maf_f32,
+                        geno_f32,
+                        impute,
+                        het_f32,
+                        pool_ref,
+                    );
+                    for rows in results.into_iter() {
+                        n_sites_seen = n_sites_seen.saturating_add(1);
+                        if let Some(rows_kept) = rows {
+                            n_sites_written = n_sites_written.saturating_add(1);
+                            n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                            writer
+                                .write_rows(&rows_kept)
+                                .map_err(PyRuntimeError::new_err)?;
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let results = encode_batch_rows(
+                    std::mem::take(&mut batch),
+                    mode,
+                    row_bytes,
+                    maf_f32,
+                    geno_f32,
+                    impute,
+                    het_f32,
+                    pool_ref,
+                );
+                for rows in results.into_iter() {
+                    n_sites_seen = n_sites_seen.saturating_add(1);
+                    if let Some(rows_kept) = rows {
+                        n_sites_written = n_sites_written.saturating_add(1);
+                        n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                        writer
+                            .write_rows(&rows_kept)
+                            .map_err(PyRuntimeError::new_err)?;
+                    }
+                }
+            }
+        }
+        GarfieldInputReader::Txt(txt) => {
+            let mut batch: Vec<(Vec<f32>, SiteInfo)> = Vec::with_capacity(1024);
+            while let Some((row_raw, site)) = txt.next_snp() {
+                let row = if identity_selection {
+                    row_raw
+                } else {
+                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                };
+                batch.push((row, site));
+                if batch.len() >= 1024 {
+                    let results = encode_batch_rows(
+                        std::mem::take(&mut batch),
+                        mode,
+                        row_bytes,
+                        maf_f32,
+                        geno_f32,
+                        impute,
+                        het_f32,
+                        pool_ref,
+                    );
+                    for rows in results.into_iter() {
+                        n_sites_seen = n_sites_seen.saturating_add(1);
+                        if let Some(rows_kept) = rows {
+                            n_sites_written = n_sites_written.saturating_add(1);
+                            n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                            writer
+                                .write_rows(&rows_kept)
+                                .map_err(PyRuntimeError::new_err)?;
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let results = encode_batch_rows(
+                    std::mem::take(&mut batch),
+                    mode,
+                    row_bytes,
+                    maf_f32,
+                    geno_f32,
+                    impute,
+                    het_f32,
+                    pool_ref,
+                );
+                for rows in results.into_iter() {
+                    n_sites_seen = n_sites_seen.saturating_add(1);
+                    if let Some(rows_kept) = rows {
+                        n_sites_written = n_sites_written.saturating_add(1);
+                        n_rows_written = n_rows_written.saturating_add(rows_kept.len());
+                        writer
+                            .write_rows(&rows_kept)
+                            .map_err(PyRuntimeError::new_err)?;
+                    }
+                }
+            }
+        }
+    }
+
+    let header_rows = writer.finish(n_samples).map_err(PyRuntimeError::new_err)?;
+    if header_rows != n_rows_written {
+        return Err(PyRuntimeError::new_err(format!(
+            "internal row count mismatch: header_rows={}, tracked_rows={}",
+            header_rows, n_rows_written
+        )));
+    }
+
+    Ok((n_sites_seen, n_sites_written, n_rows_written, n_samples))
 }
 
 #[pyfunction(name = "garfield_subset_bin_samples")]

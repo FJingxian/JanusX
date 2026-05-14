@@ -118,7 +118,8 @@ use eigh::{
     rust_eigh_from_matrix_file_f64,
 };
 use garfield::{
-    garfield_eval_rule_bin_py, garfield_scan_groups_bin_py, garfield_subset_bin_samples_py,
+    garfield_eval_rule_bin_py, garfield_prepare_input_bin_py, garfield_scan_groups_bin_py,
+    garfield_subset_bin_samples_py,
 };
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
@@ -356,6 +357,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(garfield_subset_bin_samples_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_scan_groups_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_eval_rule_bin_py, m)?)?;
+    m.add_function(wrap_pyfunction!(garfield_prepare_input_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;

@@ -117,6 +117,23 @@ except Exception:
     _HAS_RICH_CONSOLE = False
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _allow_windows_postgwas_process_pool() -> bool:
+    """
+    Windows matplotlib multi-process plotting has proven unstable in some
+    environments (observed fail-fast 0xC0000409 crashes during ggval/postgwas).
+    Keep a conservative serial default and allow explicit opt-in for further
+    diagnostics.
+    """
+    if os.name != "nt":
+        return True
+    return _env_truthy("JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL", False)
+
+
 def _sanitize_plot_text(text: object) -> str:
     s = str(text)
     if not _contains_cjk(s):
@@ -4455,6 +4472,36 @@ def _run_postgwas_tasks(args, logger: logging.Logger) -> None:
     done_count = 0
     req_threads = int(args.thread)
     logical_workers = max(1, min(req_threads, len(files)))
+
+    if (len(files) > 1) and (os.name == "nt") and (not _allow_windows_postgwas_process_pool()):
+        logger.warning(
+            "Warning: Windows multi-process postgwas plotting is unstable in this "
+            "environment; falling back to serial execution. "
+            "Set JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL=1 to force experimental "
+            "process-pool mode."
+        )
+        setattr(args, "_postgwas_job_workers", 1)
+        setattr(args, "_postgwas_worker_mute_stream", False)
+        n_total = len(files)
+        for idx, file_path in enumerate(files, start=1):
+            task_start_ts = time.monotonic()
+            try:
+                GWASplot(file_path, args, logger)
+            except Exception:
+                elapsed = format_elapsed(time.monotonic() - task_start_ts)
+                print_failure(
+                    f"Task {idx}/{n_total}: "
+                    f"{os.path.basename(file_path)} ...Failed [{elapsed}]"
+                )
+                raise
+            done_count += 1
+        total_elapsed = format_elapsed(time.monotonic() - total_start_ts)
+        print_success(
+            f"Task {done_count}/{n_total} ...Finished [{total_elapsed}]",
+            force_color=True,
+        )
+        return
+
     # In parallel mode, keep worker logs in file only to avoid spinner/pbar corruption.
     setattr(args, "_postgwas_worker_mute_stream", True)
 

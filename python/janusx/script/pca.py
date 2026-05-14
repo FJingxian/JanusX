@@ -466,6 +466,16 @@ def _log_saved_eigen_results(logger, outprefix: str) -> None:
     )
 
 
+def _log_pca_eigh_backend(logger, evd_backend: str | None) -> None:
+    backend = str(evd_backend).strip()
+    if backend == "":
+        return
+    try:
+        logger.info(f"EIGH backend: {backend}")
+    except Exception:
+        pass
+
+
 def _count_effective_snps_from_input(
     genofile: str,
     *,
@@ -1164,6 +1174,7 @@ def main(log: bool = True):
                     evd_backend=str(evd_backend),
                     logger=logger,
                 )
+                _log_pca_eigh_backend(logger, str(evd_backend))
             else:
                 if not hasattr(jxrs, "admx_rsvd_stream_sample"):
                     raise RuntimeError(
@@ -1267,6 +1278,7 @@ def main(log: bool = True):
                 evd_backend=str(evd_backend),
                 logger=logger,
             )
+            _log_pca_eigh_backend(logger, str(evd_backend))
             log_success(
                 logger,
                 f"Eigen-Decomposition (n={algo_n}, snp={int(algo_snp)}) "
@@ -1368,6 +1380,7 @@ def main(log: bool = True):
             evd_backend=str(evd_backend),
             logger=logger,
         )
+        _log_pca_eigh_backend(logger, str(evd_backend))
 
         # Save core PCA results
         df_vec = pd.DataFrame(

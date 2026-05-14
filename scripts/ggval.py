@@ -976,6 +976,7 @@ def _parse_grm_kernel_backend(log_path: Path) -> str:
 def _parse_pca_eigh_backend(log_path: Path) -> str:
     text = log_path.read_text(encoding="utf-8", errors="replace")
     patterns = [
+        r"EIGH backend:\s*([A-Za-z0-9_:+.-]+)",
         r"Eigen decomposition finished \(backend=([^),\s]+)",
         r"Rust eigh did not use LAPACK backend \(backend=([^)\s]+)\)",
         r"backend=([A-Za-z0-9_:+.-]+)",

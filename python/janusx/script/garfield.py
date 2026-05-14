@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import socket
 import time
@@ -33,6 +34,7 @@ try:
         beam_scan_windows_binary_mcc_bin,
         beam_scan_windows_continuous_corr_bin,
         garfield_eval_rule_bin,
+        garfield_prepare_input_bin,
         garfield_scan_groups_bin,
         garfield_subset_bin_samples,
         load_site_info,
@@ -41,6 +43,7 @@ except Exception as _exc:  # pragma: no cover
     beam_scan_windows_binary_mcc_bin = None  # type: ignore[assignment]
     beam_scan_windows_continuous_corr_bin = None  # type: ignore[assignment]
     garfield_eval_rule_bin = None  # type: ignore[assignment]
+    garfield_prepare_input_bin = None  # type: ignore[assignment]
     garfield_scan_groups_bin = None  # type: ignore[assignment]
     garfield_subset_bin_samples = None  # type: ignore[assignment]
     load_site_info = None  # type: ignore[assignment]
@@ -78,6 +81,7 @@ def _require_rust_backend() -> None:
         beam_scan_windows_binary_mcc_bin is None
         or beam_scan_windows_continuous_corr_bin is None
         or garfield_eval_rule_bin is None
+        or garfield_prepare_input_bin is None
         or garfield_scan_groups_bin is None
         or garfield_subset_bin_samples is None
         or load_site_info is None
@@ -99,16 +103,159 @@ def _resolve_bin_path(path_or_prefix: str) -> Optional[str]:
     return None
 
 
-def _resolve_input_bin(args) -> tuple[str, str, str]:
-    gfile, prefix = determine_genotype_source(args)
-    bin_path = _resolve_bin_path(gfile)
-    if bin_path is None:
-        raise ValueError(
-            "Current new GARFIELD scheduler requires JXBIN001 input (.bin). "
-            "Please convert first, e.g. `jx gformat -bfile <prefix> -fmt gfd` "
-            "or `jx gformat -vcf <vcf> -fmt gfd` and then run GARFIELD with `-file <gfd_prefix>`."
-        )
-    return gfile, prefix, bin_path
+def _infer_input_kind(args) -> str:
+    if args.bfile:
+        return "bfile"
+    if args.vcf:
+        return "vcf"
+    if args.hmp:
+        return "hmp"
+    return "file"
+
+
+def _safe_cache_stem(text: str) -> str:
+    stem = str(text).replace("/", "_").replace("\\", "_").replace(" ", "_")
+    while "__" in stem:
+        stem = stem.replace("__", "_")
+    return stem.strip("._") or "geno"
+
+
+def _input_signature_paths(input_kind: str, gfile: str) -> list[Path]:
+    if input_kind == "bfile":
+        p = str(gfile).rstrip("/")
+        prefix = p[:-4] if p.lower().endswith((".bed", ".bim", ".fam")) else p
+        return [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam")]
+
+    p = Path(str(gfile))
+    if p.exists():
+        return [p]
+
+    # FILE prefix style: try known sidecars
+    known = [
+        Path(f"{gfile}.txt"),
+        Path(f"{gfile}.tsv"),
+        Path(f"{gfile}.csv"),
+        Path(f"{gfile}.npy"),
+        Path(f"{gfile}.bin"),
+        Path(f"{gfile}.id"),
+        Path(f"{gfile}.fam"),
+        Path(f"{gfile}.site"),
+        Path(f"{gfile}.site.tsv"),
+        Path(f"{gfile}.site.txt"),
+        Path(f"{gfile}.site.csv"),
+        Path(f"{gfile}.bim"),
+    ]
+    return [x for x in known if x.exists()]
+
+
+def _build_conversion_cache_key(
+    input_kind: str,
+    gfile: str,
+    *,
+    threads: int,
+    maf: float,
+    geno: float,
+    impute: bool,
+    het: float,
+) -> str:
+    h = hashlib.sha1()
+    h.update(f"kind={input_kind}\n".encode("utf-8"))
+    h.update(f"src={Path(str(gfile)).expanduser().resolve() if Path(str(gfile)).exists() else str(gfile)}\n".encode("utf-8"))
+    h.update(f"threads={int(threads)}\nmaf={float(maf):.8g}\ngeno={float(geno):.8g}\nimpute={int(bool(impute))}\nhet={float(het):.8g}\n".encode("utf-8"))
+    for p in _input_signature_paths(input_kind, gfile):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        h.update(f"{str(p)}|{int(st.st_size)}|{int(st.st_mtime_ns)}\n".encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _prepare_input_bins(
+    *,
+    input_kind: str,
+    gfile: str,
+    prefix: str,
+    out_dir: str,
+    threads: int,
+    logger,
+    use_spinner: bool,
+    maf: float = 0.0,
+    geno: float = 1.0,
+    impute: bool = False,
+    het: float = 0.02,
+) -> tuple[str, Optional[str]]:
+    # Explicit .bin input: reuse as primary BIN, skip MBIN synthesis from binary input.
+    gfile_norm = str(Path(str(gfile)).expanduser())
+    existing_bin = _resolve_bin_path(gfile_norm)
+    explicit_bin_input = gfile_norm.lower().endswith(".bin") and Path(gfile_norm).is_file()
+    if explicit_bin_input and existing_bin is not None and input_kind == "file":
+        logger.info(f"Input already BIN: {existing_bin}")
+        return existing_bin, None
+
+    cache_dir = Path(out_dir) / ".garfield_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = _build_conversion_cache_key(
+        input_kind,
+        gfile,
+        threads=int(threads),
+        maf=float(maf),
+        geno=float(geno),
+        impute=bool(impute),
+        het=float(het),
+    )
+    stem = _safe_cache_stem(prefix)
+    cache_base = cache_dir / f"{stem}.{cache_key}"
+    bin_path = str(cache_base) + ".bin02.bin"
+    mbin_path = str(cache_base) + ".mbin.bin"
+
+    def _sidecars_ready(path: str) -> bool:
+        p = Path(path)
+        pre = p.with_suffix("") if p.suffix.lower() == ".bin" else p
+        return Path(str(pre) + ".bin.id").is_file() and Path(str(pre) + ".bin.site").is_file()
+
+    need_bin = not (Path(bin_path).is_file() and _sidecars_ready(bin_path))
+    need_mbin = not (Path(mbin_path).is_file() and _sidecars_ready(mbin_path))
+
+    if need_bin:
+        with CliStatus("Preparing BIN cache (bin02)...", enabled=use_spinner) as task:
+            try:
+                garfield_prepare_input_bin(
+                    gfile,
+                    bin_path,
+                    input_kind=input_kind,
+                    mode="bin",
+                    threads=int(threads),
+                    maf=float(maf),
+                    geno=float(geno),
+                    impute=bool(impute),
+                    het=float(het),
+                )
+            except Exception:
+                task.fail("Preparing BIN cache (bin02) ...Failed")
+                raise
+            task.complete("Preparing BIN cache (bin02) ...Finished")
+
+    if need_mbin:
+        with CliStatus("Preparing MBIN cache (dom/rec/het)...", enabled=use_spinner) as task:
+            try:
+                garfield_prepare_input_bin(
+                    gfile,
+                    mbin_path,
+                    input_kind=input_kind,
+                    mode="mbin",
+                    threads=int(threads),
+                    maf=float(maf),
+                    geno=float(geno),
+                    impute=bool(impute),
+                    het=float(het),
+                )
+            except Exception:
+                task.fail("Preparing MBIN cache (dom/rec/het) ...Failed")
+                raise
+            task.complete("Preparing MBIN cache (dom/rec/het) ...Finished")
+
+    return bin_path, mbin_path
 
 
 def _looks_numeric_token(token: object) -> bool:
@@ -331,7 +478,11 @@ def _literal_lookup(bin_path: str, n_rows: int) -> dict[int, str]:
     sites = list(load_site_info(str(bin_path), None))
     out: dict[int, str] = {}
     for i, s in enumerate(sites[:n_rows]):
-        out[i] = f"{str(getattr(s, 'chrom', 'N'))}_{int(getattr(s, 'pos', i + 1))}"
+        chrom = str(getattr(s, "chrom", "N"))
+        pos = int(getattr(s, "pos", i + 1))
+        ref = str(getattr(s, "ref_allele", "N"))
+        alt = str(getattr(s, "alt_allele", "N"))
+        out[i] = f"{chrom}_{pos}[{ref}>{alt}]"
     return out
 
 
@@ -447,7 +598,8 @@ def main() -> None:
     if int(args.thread) > int(detected_threads):
         args.thread = int(detected_threads)
 
-    gfile, prefix, bin_path = _resolve_input_bin(args)
+    gfile, prefix = determine_genotype_source(args)
+    input_kind = _infer_input_kind(args)
 
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, prefix)
@@ -473,6 +625,16 @@ def main() -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
+    bin_path, mbin_path = _prepare_input_bins(
+        input_kind=input_kind,
+        gfile=gfile,
+        prefix=prefix,
+        out_dir=args.out,
+        threads=int(args.thread),
+        logger=logger,
+        use_spinner=use_spinner,
+    )
+
     emit_cli_configuration(
         logger,
         app_title="JanusX - GARFIELD (Rust-first)",
@@ -483,7 +645,9 @@ def main() -> None:
                 "General",
                 [
                     ("Genotype input", gfile),
+                    ("Input kind", input_kind),
                     ("BIN path", bin_path),
+                    ("MBIN path", mbin_path if mbin_path else "(skip; input already BIN)"),
                     ("Phenotype", args.pheno),
                     ("Scan mode", args.scan_mode),
                     ("Gene file", args.genefile),

@@ -826,12 +826,36 @@ jobs:
           print("[windows-arm64] runtime probe skipped on x64 host; static wheel sanity check passed.")
           PY
 
-      - name: Upload wheel artifact
+      - name: Stage final wheel artifact
+        if: ${{ matrix.upload_wheel == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf wheelhouse
+          mkdir -p wheelhouse
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+          "$PY" - <<'PY'
+          import glob
+          import os
+          import shutil
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one final wheel in dist/, got {len(wheels)}")
+          wheel = wheels[0]
+          dst = os.path.join("wheelhouse", os.path.basename(wheel))
+          shutil.copy2(wheel, dst)
+          print(f"[release] staged final wheel: {dst}")
+          PY
+
+      - name: Upload final wheel artifact
         if: ${{ matrix.upload_wheel == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.label }}
-          path: dist/*.whl
+          path: wheelhouse/*.whl
 
   build-sdist:
     name: Build sdist
@@ -892,7 +916,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
-          path: dist
+          path: wheelhouse
           merge-multiple: true
 
       - name: Download sdist artifact
@@ -923,7 +947,7 @@ jobs:
             --repository-url https://test.pypi.org/legacy/ \
             --non-interactive \
             --skip-existing \
-            dist/*.whl dist/*.tar.gz
+            wheelhouse/*.whl dist/*.tar.gz
 
   publish-pypi:
     name: Publish to PyPI
@@ -939,7 +963,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
-          path: dist
+          path: wheelhouse
           merge-multiple: true
 
       - name: Download sdist artifact
@@ -969,7 +993,7 @@ jobs:
           maturin upload \
             --non-interactive \
             --skip-existing \
-            dist/*.whl dist/*.tar.gz
+            wheelhouse/*.whl dist/*.tar.gz
 
   update-bioconda-pr:
     name: Update Bioconda PR

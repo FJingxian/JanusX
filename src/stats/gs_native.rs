@@ -1,7 +1,7 @@
 use numpy::ndarray::{Array1, Array2};
 use numpy::PyArray1;
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
@@ -17,7 +17,7 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_TRANS,
+    CBLAS_TRANS, rust_sgemm_backend_tag,
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
@@ -140,7 +140,10 @@ fn row_major_block_mul_vec_f32(
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), cols);
     debug_assert_eq!(out.len(), rows);
-    if prefer_parallel_block_vec(rows, cols, pool) {
+    let prefer_parallel = prefer_parallel_block_vec(rows, cols, pool);
+    #[cfg(target_os = "macos")]
+    let prefer_parallel = prefer_parallel && (rust_sgemm_backend_tag() != "accelerate");
+    if prefer_parallel {
         let mut run = || {
             out.par_iter_mut().enumerate().for_each(|(r, out_cell)| {
                 let row = &block[r * cols..(r + 1) * cols];
@@ -203,14 +206,37 @@ fn row_major_block_t_mul_vec_accum_f32(
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
     if prefer_parallel_block_vec(rows, cols, pool) {
+        let row_chunk = 256usize.min(rows.max(1));
         let mut run = || {
-            out.par_iter_mut().enumerate().for_each(|(c, out_cell)| {
-                let mut acc = 0.0_f32;
-                for r in 0..rows {
-                    acc += block[r * cols + c] * vec[r];
-                }
-                *out_cell += acc;
-            });
+            let partial = block
+                .par_chunks(row_chunk * cols)
+                .zip(vec.par_chunks(row_chunk))
+                .fold(
+                    || vec![0.0_f32; cols],
+                    |mut acc, (block_chunk, vec_chunk)| {
+                        let rows_here = vec_chunk.len();
+                        for r in 0..rows_here {
+                            let vr = vec_chunk[r];
+                            let row = &block_chunk[r * cols..(r + 1) * cols];
+                            for c in 0..cols {
+                                acc[c] += row[c] * vr;
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![0.0_f32; cols],
+                    |mut left, right| {
+                        for c in 0..cols {
+                            left[c] += right[c];
+                        }
+                        left
+                    },
+                );
+            for c in 0..cols {
+                out[c] += partial[c];
+            }
         };
         if let Some(tp) = pool {
             tp.install(run);
@@ -1641,16 +1667,26 @@ pub fn rrblup_pcg_bed<'py>(
                             }
                         }
                     },
-                    |iters_now, iters_max, _rel_res| {
+                    |iters_now, iters_max, rel_res_now| {
                         let cb_t0 = Instant::now();
-                        if (iters_now >= last_notified.saturating_add(notify_step))
+                        if ((iters_now == 0usize) && (last_notified == 0usize))
+                            || (iters_now >= last_notified.saturating_add(notify_step))
                             || (iters_now == iters_max)
                         {
                             last_notified = iters_now;
                             if let Some(cb) = progress_callback.as_ref() {
                                 Python::attach(|py2| -> PyResult<()> {
                                     py2.check_signals()?;
-                                    cb.call1(py2, (iters_now, iters_max))?;
+                                    match cb.call1(py2, (iters_now, iters_max, rel_res_now)) {
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            if err.is_instance_of::<PyTypeError>(py2) {
+                                                cb.call1(py2, (iters_now, iters_max))?;
+                                            } else {
+                                                return Err(err);
+                                            }
+                                        }
+                                    }
                                     Ok(())
                                 })
                                 .map_err(|e| e.to_string())?;

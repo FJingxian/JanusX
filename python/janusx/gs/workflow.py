@@ -204,6 +204,20 @@ _GBLUP_METHOD_AD = "GBLUP_AD"
 _GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
 
 
+def _rrblup_vc_method_display(name: object) -> str:
+    txt = str(name).strip()
+    if txt == "":
+        return ""
+    norm = re.sub(r"[^a-z0-9]+", "", txt.lower())
+    if norm == "he":
+        return "HE"
+    if norm == "grmreml":
+        return "GRMreml"
+    if norm == "fastreml":
+        return "FaSTreml"
+    return txt
+
+
 def _warn_rust_gblup_backend_fallback_once(backend: str, allowed: set[str]) -> None:
     b = str(backend).strip().lower() or "unknown"
     with _RUST_GBLUP_BACKEND_WARN_LOCK:
@@ -2620,6 +2634,14 @@ def _estimate_rrblup_lambda_subsample_reml(
         out.update(dict(he_diag))
         return out
 
+    def _emit(event: str, **payload: typing.Any) -> None:
+        if progress_hook is None:
+            return
+        try:
+            progress_hook(str(event), dict(payload))
+        except Exception:
+            return
+
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
     can_try_he = bool(
         he_enable
@@ -2690,6 +2712,26 @@ def _estimate_rrblup_lambda_subsample_reml(
                     ),
                 )
             )
+            he_trace_probe_batch = int(
+                max(
+                    1,
+                    int(
+                        cfg_use.get(
+                            "he_trace_probe_batch",
+                            cfg_use.get(
+                                "pcg_he_trace_probe_batch",
+                                min(64, int(he_trace_samples)),
+                            ),
+                        )
+                    ),
+                )
+            )
+            he_trace_probe_batch = int(
+                min(
+                    max(1, int(he_trace_probe_batch)),
+                    max(1, int(he_trace_samples)),
+                )
+            )
             he_block_rows = int(
                 max(
                     1,
@@ -2711,39 +2753,57 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_seed = int(cfg_use.get("he_seed", seed))
             he_use_train_maf = _cfg_truthy(cfg_use.get("he_use_train_maf", "on"), default=True)
 
+            _emit(
+                "pcg_lambda_vc_start",
+                vc_method="HE",
+                strategy="he",
+                trace_samples=int(he_trace_samples),
+            )
             try:
-                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
-                    source_prefix,
-                    train_abs,
-                    y_vec,
-                    site_keep=site_keep_arg,
-                    trace_samples=int(he_trace_samples),
-                    tol=float(he_tol),
-                    max_iter=int(he_max_iter),
-                    block_rows=int(he_block_rows),
-                    std_eps=float(std_eps),
-                    use_train_maf=bool(he_use_train_maf),
-                    threads=int(max(1, int(n_jobs))),
-                    seed=int(he_seed),
-                    packed=packed_arg,
-                    packed_n_samples=int(n_samples_full),
-                    maf=maf_arg,
-                    row_flip=row_flip_arg,
-                )
-            except TypeError:
-                he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
-                    source_prefix,
-                    train_abs,
-                    y_vec,
-                    site_keep_arg,
-                    int(he_trace_samples),
-                    float(he_tol),
-                    int(he_max_iter),
-                    int(he_block_rows),
-                    float(std_eps),
-                    bool(he_use_train_maf),
-                    int(max(1, int(n_jobs))),
-                    int(he_seed),
+                with runtime_thread_stage(
+                    blas_threads=1,
+                    rayon_threads=int(max(1, int(n_jobs))),
+                ):
+                    try:
+                        he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_vec,
+                            site_keep=site_keep_arg,
+                            trace_samples=int(he_trace_samples),
+                            trace_probe_batch=int(he_trace_probe_batch),
+                            tol=float(he_tol),
+                            max_iter=int(he_max_iter),
+                            block_rows=int(he_block_rows),
+                            std_eps=float(std_eps),
+                            use_train_maf=bool(he_use_train_maf),
+                            threads=int(max(1, int(n_jobs))),
+                            seed=int(he_seed),
+                            packed=packed_arg,
+                            packed_n_samples=int(n_samples_full),
+                            maf=maf_arg,
+                            row_flip=row_flip_arg,
+                        )
+                    except TypeError:
+                        he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                            source_prefix,
+                            train_abs,
+                            y_vec,
+                            site_keep_arg,
+                            int(he_trace_samples),
+                            float(he_tol),
+                            int(he_max_iter),
+                            int(he_block_rows),
+                            float(std_eps),
+                            bool(he_use_train_maf),
+                            int(max(1, int(n_jobs))),
+                            int(he_seed),
+                        )
+            finally:
+                _emit(
+                    "pcg_lambda_vc_end",
+                    vc_method="HE",
+                    strategy="he",
                 )
 
             he_t = tuple(he_out)
@@ -2812,14 +2872,6 @@ def _estimate_rrblup_lambda_subsample_reml(
                 )
         except Exception as he_ex:
             he_diag["he_error"] = str(he_ex)
-
-    def _emit(event: str, **payload: typing.Any) -> None:
-        if progress_hook is None:
-            return
-        try:
-            progress_hook(str(event), dict(payload))
-        except Exception:
-            return
 
     he_lam_eq_raw = float(he_diag.get("lambda_he_raw_equation", np.nan))
     he_lam_k_raw = float(he_diag.get("lambda_he_raw_k", np.nan))
@@ -3180,13 +3232,6 @@ def _estimate_rrblup_lambda_subsample_reml(
 
     # 1) GRM+REML (small-sample bucket under 15k threshold)
     if not prefer_subsample and not prefer_fast:
-        _emit(
-            "pcg_lambda_subsample_start",
-            total=1,
-            n_sub=int(n_train),
-            n_train=int(n_train),
-            strategy="grm_reml",
-        )
         fit_one = {
             "lambda_k": float("nan"),
             "lambda_eq": float("nan"),
@@ -3195,27 +3240,21 @@ def _estimate_rrblup_lambda_subsample_reml(
             "pve": float("nan"),
         }
         try:
+            _emit(
+                "pcg_lambda_vc_start",
+                vc_method="GRMreml",
+                strategy="grm_reml",
+            )
             fit_one = _fit_once_grm(np.arange(n_train, dtype=np.int64))
         except Exception:
             pass
+        finally:
+            _emit(
+                "pcg_lambda_vc_end",
+                vc_method="GRMreml",
+                strategy="grm_reml",
+            )
         lam_ok = bool(np.isfinite(float(fit_one["lambda_eq"])) and float(fit_one["lambda_eq"]) > 0.0)
-        _emit(
-            "pcg_lambda_subsample_iter",
-            iter=1,
-            total=1,
-            lambda_equation=float(fit_one["lambda_eq"]),
-            lambda_k=float(fit_one["lambda_k"]),
-            m_effective=int(m_effective),
-            strategy="grm_reml",
-        )
-        _emit(
-            "pcg_lambda_subsample_end",
-            repeats=1,
-            ok_repeats=int(1 if lam_ok else 0),
-            lambda_equation=float(fit_one["lambda_eq"]),
-            m_effective=int(m_effective),
-            strategy="grm_reml",
-        )
         if lam_ok:
             return _method_payload(
                 lambda_equation=float(fit_one["lambda_eq"]),
@@ -3224,7 +3263,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 repeats_used=1,
                 ok_repeats_used=1,
                 strategy="grm_reml",
-                vc_method="GRM/REML",
+                vc_method="GRMreml",
                 vc_sigma_g2=float(fit_one["sigma_g2"]),
                 vc_sigma_e2=float(fit_one["sigma_e2"]),
                 vc_pve=float(fit_one["pve"]),
@@ -3240,9 +3279,20 @@ def _estimate_rrblup_lambda_subsample_reml(
             "pve": float("nan"),
         }
         try:
+            _emit(
+                "pcg_lambda_vc_start",
+                vc_method="FaSTreml",
+                strategy="fast_reml",
+            )
             fit_fast = _fit_full_fast_reml()
         except Exception:
             pass
+        finally:
+            _emit(
+                "pcg_lambda_vc_end",
+                vc_method="FaSTreml",
+                strategy="fast_reml",
+            )
         lam_ok = bool(np.isfinite(float(fit_fast["lambda_eq"])) and float(fit_fast["lambda_eq"]) > 0.0)
         if lam_ok:
             return _method_payload(
@@ -3252,7 +3302,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 repeats_used=1,
                 ok_repeats_used=1,
                 strategy="fast_reml",
-                vc_method="FaST/REML",
+                vc_method="FaSTreml",
                 vc_sigma_g2=float(fit_fast["sigma_g2"]),
                 vc_sigma_e2=float(fit_fast["sigma_e2"]),
                 vc_pve=float(fit_fast["pve"]),
@@ -5840,24 +5890,50 @@ def GSapi(
                     np.asarray(Y, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
                 )
+                pcg_rel_res_trace: list[dict[str, typing.Any]] = []
                 _emit_rrblup_progress(
                     "pcg_start",
+                    stage="pcg",
                     total=int(pcg_max_iter),
                     tol=float(pcg_tol),
                     lambda_equation=float(lambda_equation),
                 )
-                def _on_pcg_progress(done: int, total_from_backend: int) -> None:
+                def _on_pcg_progress(
+                    done: int,
+                    total_from_backend: int,
+                    rel_res_now: float = float("nan"),
+                ) -> None:
+                    iter_now = int(max(0, int(done)))
+                    total_now = int(max(1, int(total_from_backend)))
+                    rel_res_f = float(rel_res_now)
+                    if (
+                        len(pcg_rel_res_trace) == 0
+                        or int(pcg_rel_res_trace[-1].get("iter", -1)) != iter_now
+                    ):
+                        pcg_rel_res_trace.append(
+                            {
+                                "iter": int(iter_now),
+                                "total": int(total_now),
+                                "rel_res": float(rel_res_f),
+                            }
+                        )
                     try:
                         _emit_rrblup_progress(
                             "pcg_iter",
-                            iter=int(max(0, int(done))),
-                            total=int(max(1, int(total_from_backend))),
+                            stage="pcg",
+                            iter=int(iter_now),
+                            total=int(total_now),
+                            rel_res=float(rel_res_f),
                         )
                     except Exception:
                         return
-                pcg_progress_cb = _on_pcg_progress if rrblup_progress_hook is not None else None
+                pcg_progress_cb = (
+                    _on_pcg_progress
+                    if ((rrblup_progress_hook is not None) or (rrblup_runtime_state is not None))
+                    else None
+                )
                 pcg_progress_every = (
-                    int(max(1, int(rr_cfg.get("pcg_progress_every", 8))))
+                    int(max(1, int(rr_cfg.get("pcg_progress_every", 1))))
                     if pcg_progress_cb is not None
                     else 0
                 )
@@ -5890,6 +5966,7 @@ def GSapi(
                 except TypeError:
                     _emit_rrblup_progress(
                         "pcg_callback_unavailable",
+                        stage="pcg",
                         reason="legacy_rrblup_pcg_bed_signature",
                     )
                     if source_prefix == "":
@@ -5961,11 +6038,28 @@ def GSapi(
                     )
                 _emit_rrblup_progress(
                     "pcg_end",
+                    stage="pcg",
                     iters=int(pcg_iters),
                     converged=bool(pcg_converged),
                     rel_res=float(pcg_rel_res),
                     total=int(pcg_max_iter),
                 )
+                if len(pcg_rel_res_trace) == 0:
+                    pcg_rel_res_trace.append(
+                        {
+                            "iter": int(max(0, int(pcg_iters))),
+                            "total": int(max(1, int(pcg_max_iter))),
+                            "rel_res": float(pcg_rel_res),
+                        }
+                    )
+                elif int(pcg_rel_res_trace[-1].get("iter", -1)) != int(max(0, int(pcg_iters))):
+                    pcg_rel_res_trace.append(
+                        {
+                            "iter": int(max(0, int(pcg_iters))),
+                            "total": int(max(1, int(pcg_max_iter))),
+                            "rel_res": float(pcg_rel_res),
+                        }
+                    )
 
                 pred_train = (
                     np.zeros((0, 1), dtype=float)
@@ -5988,6 +6082,7 @@ def GSapi(
                     rrblup_runtime_state["pcg_converged"] = bool(pcg_converged)
                     rrblup_runtime_state["pcg_iters"] = int(pcg_iters)
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
+                    rrblup_runtime_state["pcg_rel_res_trace"] = [dict(x) for x in pcg_rel_res_trace]
                     rrblup_runtime_state["m_effective"] = int(m_eff)
                     rrblup_runtime_state["thread_policy"] = "rayon_parallel_blas_serial"
                     rrblup_runtime_state["stage_blas_threads"] = 1
@@ -7116,6 +7211,7 @@ def _run_method_task(
     oof_pred: np.ndarray | None = None
     oof_truth: np.ndarray | None = None
     rrblup_pve_rows: list[dict[str, typing.Any]] = []
+    rrblup_pcg_trace_rows: list[dict[str, typing.Any]] = []
     rrblup_pve_final: dict[str, typing.Any] | None = None
     rrblup_final_state: dict[str, typing.Any] | None = None
     rrblup_final_cfg: dict[str, typing.Any] | None = None
@@ -7739,6 +7835,43 @@ def _run_method_task(
                             "iter_like": iter_like,
                         }
                     )
+                    trace_items_raw = list(
+                        typing.cast(
+                            list[dict[str, typing.Any]] | None,
+                            rr_state_call.get("pcg_rel_res_trace"),
+                        )
+                        or []
+                    )
+                    if len(trace_items_raw) > 0:
+                        rrblup_pcg_trace_rows.append(
+                            {
+                                "phase": "cv",
+                                "phase_label": f"fold {int(fold_id)}/{int(cv_total)}",
+                                "fold": int(fold_id),
+                                "solver": str(solver_eff_fold),
+                                "converged": bool(rr_state_call.get("pcg_converged", False)),
+                                "iters": int(max(0, int(rr_state_call.get("pcg_iters", 0) or 0))),
+                                "max_iter": int(
+                                    max(
+                                        1,
+                                        int(
+                                            (rr_cfg_call or {}).get(
+                                                "pcg_max_iter",
+                                                rrblup_cfg_base.get("pcg_max_iter", 100),
+                                            )
+                                        ),
+                                    )
+                                ),
+                                "trace": [
+                                    {
+                                        "iter": int(max(0, int(rec.get("iter", 0) or 0))),
+                                        "total": int(max(1, int(rec.get("total", 1) or 1))),
+                                        "rel_res": float(rec.get("rel_res", np.nan)),
+                                    }
+                                    for rec in trace_items_raw
+                                ],
+                            }
+                        )
             if oof_pred is not None:
                 try:
                     yhat_oof = np.asarray(yhat_test, dtype=np.float64).reshape(-1)
@@ -8194,6 +8327,43 @@ def _run_method_task(
                 ),
             }
             rrblup_final_state = dict(rr_state_final)
+            trace_items_final = list(
+                typing.cast(
+                    list[dict[str, typing.Any]] | None,
+                    rr_state_final.get("pcg_rel_res_trace"),
+                )
+                or []
+            )
+            if len(trace_items_final) > 0:
+                rrblup_pcg_trace_rows.append(
+                    {
+                        "phase": "final",
+                        "phase_label": "final",
+                        "fold": None,
+                        "solver": str(solver_eff_final),
+                        "converged": bool(rr_state_final.get("pcg_converged", False)),
+                        "iters": int(max(0, int(rr_state_final.get("pcg_iters", 0) or 0))),
+                        "max_iter": int(
+                            max(
+                                1,
+                                int(
+                                    (rr_cfg_final or {}).get(
+                                        "pcg_max_iter",
+                                        rrblup_cfg_base.get("pcg_max_iter", 100),
+                                    )
+                                ),
+                            )
+                        ),
+                        "trace": [
+                            {
+                                "iter": int(max(0, int(rec.get("iter", 0) or 0))),
+                                "total": int(max(1, int(rec.get("total", 1) or 1))),
+                                "rel_res": float(rec.get("rel_res", np.nan)),
+                            }
+                            for rec in trace_items_final
+                        ],
+                    }
+                )
         if ml_tuning_cache is not None:
             pve_final = float(ml_tuning_cache.get("pve", np.nan))
     if (
@@ -8224,6 +8394,7 @@ def _run_method_task(
         "method_display": _method_display_name(method),
         "fold_rows": fold_rows,
         "rrblup_pve_rows": rrblup_pve_rows,
+        "rrblup_pcg_trace_rows": rrblup_pcg_trace_rows,
         "rrblup_pve_final": rrblup_pve_final,
         "best_test": best_test,
         "best_train": best_train,
@@ -8730,11 +8901,12 @@ def _run_methods_parallel(
                     if lam_src.startswith("he"):
                         vc_method = "HE"
                     elif "fast_reml" in lam_src:
-                        vc_method = "FaST/REML"
+                        vc_method = "FaSTreml"
                     elif "subsample" in lam_src:
                         vc_method = "Sub/REML"
                     elif lam_src != "":
-                        vc_method = "GRM/REML"
+                        vc_method = "GRMreml"
+                vc_method = _rrblup_vc_method_display(vc_method)
                 if vc_method != "":
                     rows.append(("method", vc_method))
                 va = float(rr_state.get("lambda_vc_sigma_g2", np.nan))
@@ -9044,9 +9216,11 @@ def _run_methods_parallel(
                 adam_grid_trial_epochs = 0
                 adam_grid_completed_epochs = 0
                 adam_grid_active_trial = 0
+                adam_task_indeterminate = False
                 lambda_task_id: int | None = None
                 lambda_done = 0
                 lambda_total = 0
+                lambda_task_indeterminate = False
                 cv_line_emitted = False
                 stage_lines_emitted = False
                 cv_stage_closed = False
@@ -9210,6 +9384,31 @@ def _run_methods_parallel(
                     pred_status.__exit__(None, None, None)
                     pred_status = None
 
+                def _rr_phase_title(name: str, payload: dict[str, typing.Any]) -> str:
+                    _ = payload
+                    return str(name).strip()
+
+                def _rr_lambda_label(payload: dict[str, typing.Any]) -> str:
+                    vc_method = _rrblup_vc_method_display(payload.get("vc_method", ""))
+                    strategy = str(payload.get("strategy", "")).strip().lower()
+                    if vc_method != "":
+                        return _rr_phase_title(f"Estimate lambda ({vc_method})", payload)
+                    if strategy == "subsample_reml":
+                        return _rr_phase_title("Estimate lambda (subsample REML)", payload)
+                    return _rr_phase_title("Estimate lambda", payload)
+
+                def _mark_rr_subprogress() -> None:
+                    nonlocal fit_status, rr_subprogress_seen
+                    rr_subprogress_seen = True
+                    if fit_status is not None:
+                        fit_status.__exit__(None, None, None)
+                        fit_status = None
+
+                def _close_rr_phase(*, fail: bool = False) -> None:
+                    _ = fail
+                    _close_adam_task()
+                    _close_lambda_task()
+
                 def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
                     nonlocal progress_live_stopped
                     ev = str(event)
@@ -9239,12 +9438,12 @@ def _run_methods_parallel(
                         return "pcg"
                     return "grid" if stage == "grid" else "fit"
 
-                def _adam_label(stage: str, done: int, total: int) -> str:
+                def _adam_label(stage: str, payload: dict[str, typing.Any]) -> str:
                     if str(stage) == "grid":
-                        return f"{m_disp} adam search"
+                        return _rr_phase_title("AdamW search", payload)
                     if str(stage) == "pcg":
-                        return f"{m_disp} pcg"
-                    return f"{m_disp} adam"
+                        return _rr_phase_title("PCG iteration", payload)
+                    return _rr_phase_title("AdamW iteration", payload)
 
                 def _adam_counter(done: int, total: int) -> str:
                     return f"{int(done)}/{int(total)}"
@@ -9330,13 +9529,48 @@ def _run_methods_parallel(
                     payload: dict[str, typing.Any],
                     *,
                     event: str = "start",
+                    indeterminate: bool = False,
                 ) -> None:
                     nonlocal adam_task_id, adam_done, adam_total, adam_stage
+                    nonlocal adam_task_indeterminate
                     stage, target_done, target_total = _adam_progress_values(str(event), payload)
                     adam_stage = str(stage)
+                    label = _adam_label(adam_stage, payload)
+                    if indeterminate:
+                        adam_done = 0
+                        adam_total = 0
+                        if (adam_task_id is not None) and (not adam_task_indeterminate):
+                            try:
+                                progress.remove_task(adam_task_id)
+                            except Exception:
+                                pass
+                            adam_task_id = None
+                        adam_task_indeterminate = True
+                        if adam_task_id is None:
+                            adam_task_id = progress.add_task(
+                                description="",
+                                total=None,
+                                label=label,
+                                counter="",
+                            )
+                        else:
+                            progress.update(
+                                adam_task_id,
+                                total=None,
+                                completed=0,
+                                label=label,
+                                counter="",
+                            )
+                        return
+                    if (adam_task_id is not None) and adam_task_indeterminate:
+                        try:
+                            progress.remove_task(adam_task_id)
+                        except Exception:
+                            pass
+                        adam_task_id = None
+                    adam_task_indeterminate = False
                     adam_done = int(target_done)
                     adam_total = int(max(1, int(target_total)))
-                    label = _adam_label(adam_stage, adam_done, adam_total)
                     if adam_task_id is None:
                         adam_task_id = progress.add_task(
                             description="",
@@ -9365,12 +9599,12 @@ def _run_methods_parallel(
                     nonlocal adam_task_id, adam_done, adam_total, adam_stage
                     nonlocal adam_grid_trial_total, adam_grid_trial_epochs
                     nonlocal adam_grid_completed_epochs, adam_grid_active_trial
-                    if adam_task_id is None:
-                        return
-                    try:
-                        progress.remove_task(adam_task_id)
-                    except Exception:
-                        pass
+                    nonlocal adam_task_indeterminate
+                    if adam_task_id is not None:
+                        try:
+                            progress.remove_task(adam_task_id)
+                        except Exception:
+                            pass
                     adam_task_id = None
                     adam_done = 0
                     adam_total = 0
@@ -9379,40 +9613,87 @@ def _run_methods_parallel(
                     adam_grid_trial_epochs = 0
                     adam_grid_completed_epochs = 0
                     adam_grid_active_trial = 0
+                    adam_task_indeterminate = False
 
                 def _ensure_lambda_task(
                     *,
-                    done: int,
-                    total: int,
+                    label: str,
+                    done: int | None = None,
+                    total: int | None = None,
+                    indeterminate: bool = False,
                 ) -> None:
                     nonlocal lambda_task_id, lambda_done, lambda_total
+                    nonlocal lambda_task_indeterminate
+                    if indeterminate:
+                        lambda_done = 0
+                        lambda_total = 0
+                        if (lambda_task_id is not None) and (not lambda_task_indeterminate):
+                            try:
+                                progress.remove_task(lambda_task_id)
+                            except Exception:
+                                pass
+                            lambda_task_id = None
+                        lambda_task_indeterminate = True
+                        if lambda_task_id is None:
+                            lambda_task_id = progress.add_task(
+                                description="",
+                                total=None,
+                                label=label,
+                                counter="",
+                                hide_bar=True,
+                            )
+                        else:
+                            progress.update(
+                                lambda_task_id,
+                                total=None,
+                                completed=0,
+                                label=label,
+                                counter="",
+                                hide_bar=True,
+                            )
+                        return
+                    if done is None:
+                        done = 0
+                    if total is None:
+                        total = 1
+                    if (lambda_task_id is not None) and lambda_task_indeterminate:
+                        try:
+                            progress.remove_task(lambda_task_id)
+                        except Exception:
+                            pass
+                        lambda_task_id = None
+                    lambda_task_indeterminate = False
                     lambda_done = int(max(0, int(done)))
                     lambda_total = int(max(1, int(total)))
                     if lambda_task_id is None:
                         lambda_task_id = progress.add_task(
                             description="",
                             total=lambda_total,
-                            label=f"{m_disp} lambda search",
-                            counter=f"{lambda_done}/{lambda_total}",
+                            label=label,
+                            counter="",
+                            hide_bar=True,
                         )
                     progress.update(
                         lambda_task_id,
                         total=lambda_total,
                         completed=min(lambda_done, lambda_total),
-                        label=f"{m_disp} lambda search",
-                        counter=f"{lambda_done}/{lambda_total}",
+                        label=label,
+                        counter="",
+                        hide_bar=True,
                     )
 
                 def _close_lambda_task(*, complete: bool = False) -> None:
                     nonlocal lambda_task_id, lambda_done, lambda_total
+                    nonlocal lambda_task_indeterminate
                     if lambda_task_id is not None:
-                        if complete:
+                        if complete and (not lambda_task_indeterminate):
                             progress.update(
                                 lambda_task_id,
                                 total=max(1, int(lambda_total)),
                                 completed=max(0, int(lambda_total)),
-                                label=f"{m_disp} lambda search",
-                                counter=f"{int(max(0, lambda_total))}/{int(max(1, lambda_total))}",
+                                label=_rr_phase_title("Estimate lambda", {}),
+                                counter="",
+                                hide_bar=True,
                             )
                         try:
                             progress.remove_task(lambda_task_id)
@@ -9421,6 +9702,7 @@ def _run_methods_parallel(
                     lambda_task_id = None
                     lambda_done = 0
                     lambda_total = 0
+                    lambda_task_indeterminate = False
 
                 def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
                     nonlocal search_task_id, search_done, search_total, search_total_fixed
@@ -9494,82 +9776,69 @@ def _run_methods_parallel(
                 def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
                     nonlocal adam_done, adam_total, adam_task_id, adam_stage
                     nonlocal lambda_done, lambda_total
-                    nonlocal rr_subprogress_seen, fit_status
+                    nonlocal adam_task_indeterminate
                     if not has_rrblup_iter_progress:
                         return
-                    rr_subprogress_seen = True
-                    # If rrBLUP sub-progress is active, hide generic fitting spinner
-                    # to avoid two live indicators competing on the same terminal rows.
-                    if fit_status is not None:
-                        fit_status.__exit__(None, None, None)
-                        fit_status = None
                     ev = str(event)
+                    _mark_rr_subprogress()
+                    if ev == "pcg_lambda_vc_start":
+                        _close_adam_task()
+                        _close_lambda_task()
+                        _ensure_lambda_task(
+                            label=_rr_lambda_label(payload),
+                            indeterminate=True,
+                        )
+                        return
+                    if ev == "pcg_lambda_vc_end":
+                        _close_lambda_task()
+                        return
                     if ev == "pcg_lambda_subsample_start":
+                        _close_adam_task()
+                        _close_lambda_task()
                         total = int(max(1, int(payload.get("total", payload.get("repeats", 1)))))
-                        _ensure_lambda_task(done=0, total=total)
+                        _ensure_lambda_task(
+                            label=_rr_lambda_label(payload),
+                            done=0,
+                            total=total,
+                        )
                         return
                     if ev == "pcg_callback_unavailable":
-                        progress.console.print(
-                            "[yellow]Warning: rrBLUP-PCG backend has no iter callback; "
-                            "showing spinner instead of sub-progress bar.[/yellow]"
+                        _close_adam_task()
+                        _ensure_adam_task(
+                            payload,
+                            event="start",
+                            indeterminate=True,
                         )
                         return
                     if ev == "pcg_lambda_subsample_iter":
                         total = int(max(1, int(payload.get("total", max(1, int(lambda_total or 1))))))
                         done = int(max(0, int(payload.get("iter", lambda_done))))
-                        _ensure_lambda_task(done=min(done, total), total=total)
+                        _ensure_lambda_task(
+                            label=_rr_lambda_label(payload),
+                            done=min(done, total),
+                            total=total,
+                        )
                         return
                     if ev == "pcg_lambda_subsample_end":
                         total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
                         done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
-                        _ensure_lambda_task(done=min(done, total), total=total)
+                        _ensure_lambda_task(
+                            label=_rr_lambda_label(payload),
+                            done=min(done, total),
+                            total=total,
+                        )
                         _close_lambda_task(complete=True)
                         return
                     if ev == "pcg_start":
                         _close_lambda_task()
-                        pp = dict(payload)
-                        pp["stage"] = "pcg"
-                        _ensure_adam_task(pp, event="start")
+                        _ensure_adam_task(payload, event="start")
                         return
                     if ev == "pcg_iter":
-                        pp = dict(payload)
-                        pp["stage"] = "pcg"
-                        if adam_task_id is None:
-                            _ensure_adam_task(pp, event="epoch")
-                        if adam_task_id is None:
-                            return
-                        stage, target, total = _adam_progress_values("epoch", pp)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        progress.update(
-                            adam_task_id,
-                            total=adam_total,
-                            completed=adam_done,
-                            label=_adam_label(adam_stage, adam_done, adam_total),
-                            counter=_adam_counter(adam_done, adam_total),
-                        )
+                        _ensure_adam_task(payload, event="epoch")
                         return
                     if ev == "pcg_end":
-                        pp = dict(payload)
-                        pp["stage"] = "pcg"
-                        if "iter" not in pp and ("iters" in pp):
-                            pp["iter"] = pp.get("iters")
-                        if adam_task_id is None:
-                            _ensure_adam_task(pp, event="end")
-                        if adam_task_id is None:
-                            return
-                        stage, target, total = _adam_progress_values("end", pp)
-                        adam_stage = str(stage)
-                        adam_done = int(target)
-                        adam_total = int(max(1, int(total)))
-                        progress.update(
-                            adam_task_id,
-                            total=adam_total,
-                            completed=adam_done,
-                            label=_adam_label(adam_stage, adam_done, adam_total),
-                            counter=_adam_counter(adam_done, adam_total),
-                        )
+                        if not adam_task_indeterminate:
+                            _ensure_adam_task(payload, event="end")
                         _close_adam_task()
                         return
                     if ev == "adam_start":
@@ -9588,7 +9857,7 @@ def _run_methods_parallel(
                             adam_task_id,
                             total=adam_total,
                             completed=adam_done,
-                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            label=_adam_label(adam_stage, payload),
                             counter=_adam_counter(adam_done, adam_total),
                         )
                         return
@@ -9603,7 +9872,7 @@ def _run_methods_parallel(
                             adam_task_id,
                             total=adam_total,
                             completed=adam_done,
-                            label=_adam_label(adam_stage, adam_done, adam_total),
+                            label=_adam_label(adam_stage, payload),
                             counter=_adam_counter(adam_done, adam_total),
                         )
 
@@ -9682,6 +9951,7 @@ def _run_methods_parallel(
                         _close_search_task()
                         _close_adam_task()
                         _close_lambda_task()
+                        _close_rr_phase(fail=True)
                         _fail_fit_stage()
                         _fail_predict_stage()
                         if cv_task_id is not None:
@@ -9696,6 +9966,7 @@ def _run_methods_parallel(
                         raise
                     _close_search_task()
                     _close_lambda_task()
+                    _close_rr_phase()
                     if show_method_progress:
                         _ensure_cv_task()
                         _finish_cv_stage()
@@ -9771,12 +10042,15 @@ def _run_methods_parallel(
             adam_grid_trial_epochs = 0
             adam_grid_completed_epochs = 0
             adam_grid_active_trial = 0
+            adam_bar_indeterminate = False
             lambda_done = 0
             lambda_total = 0
+            lambda_bar_indeterminate = False
             fit_status: CliStatus | None = None
             pred_status: CliStatus | None = None
             stage_lines_emitted = False
             cv_line_emitted = bool(enable_tqdm_progress and show_method_progress)
+            rr_subprogress_seen = False
 
             def _close_search_bar() -> None:
                 nonlocal search_bar
@@ -9814,12 +10088,12 @@ def _run_methods_parallel(
                     return "pcg"
                 return "grid" if stage == "grid" else "fit"
 
-            def _adam_desc(stage: str, done: int, total: int) -> str:
+            def _adam_desc(stage: str, payload: dict[str, typing.Any]) -> str:
                 if str(stage) == "grid":
-                    return f"{m_disp} adam search"
+                    return _rr_phase_title("AdamW search", payload)
                 if str(stage) == "pcg":
-                    return f"{m_disp} pcg"
-                return f"{m_disp} adam"
+                    return _rr_phase_title("PCG iteration", payload)
+                return _rr_phase_title("AdamW iteration", payload)
 
             def _adam_progress_values(
                 event: str,
@@ -9902,15 +10176,42 @@ def _run_methods_parallel(
                 payload: dict[str, typing.Any],
                 *,
                 event: str = "start",
+                indeterminate: bool = False,
             ) -> None:
                 nonlocal adam_bar, adam_done, adam_total, adam_stage
+                nonlocal adam_bar_indeterminate
                 if not enable_tqdm_progress:
                     return
                 stage, target_done, target_total = _adam_progress_values(str(event), payload)
                 adam_stage = str(stage)
+                desc = _adam_desc(adam_stage, payload)
+                if indeterminate:
+                    adam_done = 0
+                    adam_total = 0
+                    if (adam_bar is not None) and (not adam_bar_indeterminate):
+                        adam_bar.close()
+                        adam_bar = None
+                    adam_bar_indeterminate = True
+                    if adam_bar is None:
+                        assert tqdm is not None
+                        adam_bar = tqdm(
+                            total=None,
+                            desc=desc,
+                            leave=False,
+                            dynamic_ncols=True,
+                            position=(1 if show_method_progress else 0),
+                            bar_format="{desc} [{elapsed}]",
+                        )
+                    else:
+                        adam_bar.set_description_str(desc, refresh=False)
+                    adam_bar.refresh()
+                    return
+                if (adam_bar is not None) and adam_bar_indeterminate:
+                    adam_bar.close()
+                    adam_bar = None
+                adam_bar_indeterminate = False
                 adam_done = int(target_done)
                 adam_total = int(max(1, int(target_total)))
-                desc = _adam_desc(adam_stage, adam_done, adam_total)
                 if adam_bar is None:
                     assert tqdm is not None
                     unit = "iter" if str(adam_stage) == "pcg" else "ep"
@@ -9924,12 +10225,9 @@ def _run_methods_parallel(
                         bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt} "
                         "[{elapsed}, {rate_fmt}{postfix}]",
                     )
-                    if adam_done > 0:
-                        adam_bar.n = int(min(adam_done, adam_total))
-                else:
-                    adam_bar.total = int(max(1, adam_total))
-                    adam_bar.n = int(min(max(0, adam_done), max(1, adam_total)))
-                    adam_bar.set_description_str(desc, refresh=False)
+                adam_bar.total = int(max(1, adam_total))
+                adam_bar.n = int(min(max(0, adam_done), max(1, adam_total)))
+                adam_bar.set_description_str(desc, refresh=False)
                 adam_bar.set_postfix_str("", refresh=False)
                 adam_bar.refresh()
 
@@ -9937,6 +10235,7 @@ def _run_methods_parallel(
                 nonlocal adam_bar, adam_done, adam_total, adam_stage
                 nonlocal adam_grid_trial_total, adam_grid_trial_epochs
                 nonlocal adam_grid_completed_epochs, adam_grid_active_trial
+                nonlocal adam_bar_indeterminate
                 if adam_bar is not None:
                     adam_bar.close()
                     adam_bar = None
@@ -9947,53 +10246,52 @@ def _run_methods_parallel(
                 adam_grid_trial_epochs = 0
                 adam_grid_completed_epochs = 0
                 adam_grid_active_trial = 0
+                adam_bar_indeterminate = False
 
             def _ensure_lambda_bar(
-                payload: dict[str, typing.Any],
+                desc: str,
                 *,
                 event: str = "start",
+                payload: dict[str, typing.Any] | None = None,
+                indeterminate: bool = False,
             ) -> None:
                 nonlocal lambda_bar, lambda_done, lambda_total
+                nonlocal lambda_bar_indeterminate
                 if not enable_tqdm_progress:
                     return
-                total = int(max(1, int(payload.get("total", payload.get("repeats", max(1, int(lambda_total or 1)))))))
-                if str(event) == "start":
-                    done = 0
-                elif str(event) == "end":
-                    done = int(max(0, int(payload.get("iter", payload.get("ok_repeats", total)))))
-                else:
-                    done = int(max(0, int(payload.get("iter", lambda_done))))
-                done = int(min(done, total))
-                lambda_done = int(done)
-                lambda_total = int(total)
+                _ = event
+                _ = payload
+                _ = indeterminate
+                was_indeterminate = bool(lambda_bar_indeterminate)
+                lambda_done = 0
+                lambda_total = 0
+                if (lambda_bar is not None) and (not was_indeterminate):
+                    lambda_bar.close()
+                    lambda_bar = None
+                lambda_bar_indeterminate = True
                 if lambda_bar is None:
                     assert tqdm is not None
                     lambda_bar = tqdm(
-                        total=lambda_total,
-                        desc=f"{m_disp} lambda search",
-                        unit="cfg",
+                        total=None,
+                        desc=desc,
                         leave=False,
                         dynamic_ncols=True,
-                        position=(2 if show_method_progress else 1),
-                        bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt} "
-                        "[{elapsed}, {rate_fmt}{postfix}]",
+                        position=(1 if show_method_progress else 0),
+                        bar_format="{desc} [{elapsed}]",
                     )
-                lambda_bar.total = int(max(1, lambda_total))
-                lambda_bar.n = int(min(max(0, lambda_done), max(1, lambda_total)))
-                lambda_bar.set_description_str(
-                    f"{m_disp} lambda search",
-                    refresh=False,
-                )
-                lambda_bar.set_postfix_str("", refresh=False)
+                else:
+                    lambda_bar.set_description_str(desc, refresh=False)
                 lambda_bar.refresh()
 
             def _close_lambda_bar() -> None:
                 nonlocal lambda_bar, lambda_done, lambda_total
+                nonlocal lambda_bar_indeterminate
                 if lambda_bar is not None:
                     lambda_bar.close()
                     lambda_bar = None
                 lambda_done = 0
                 lambda_total = 0
+                lambda_bar_indeterminate = False
 
             def _start_fit_status() -> None:
                 nonlocal fit_status
@@ -10011,6 +10309,13 @@ def _run_methods_parallel(
 
             def _complete_fit_status(elapsed: float | None = None) -> None:
                 nonlocal fit_status, stage_lines_emitted
+                if fit_status is None and rr_subprogress_seen:
+                    msg = "Fitting ...Finished"
+                    if elapsed is not None and np.isfinite(float(elapsed)):
+                        msg = f"Fitting ...Finished [{float(elapsed):.1f}s]"
+                    print_success(msg, force_color=True)
+                    stage_lines_emitted = True
+                    return
                 if fit_status is None:
                     return
                 msg = "Fitting ...Finished"
@@ -10062,6 +10367,31 @@ def _run_methods_parallel(
                 pred_status.fail("Predicting ...Failed")
                 pred_status.__exit__(None, None, None)
                 pred_status = None
+
+            def _rr_phase_title(name: str, payload: dict[str, typing.Any]) -> str:
+                _ = payload
+                return str(name).strip()
+
+            def _rr_lambda_desc(payload: dict[str, typing.Any]) -> str:
+                vc_method = _rrblup_vc_method_display(payload.get("vc_method", ""))
+                strategy = str(payload.get("strategy", "")).strip().lower()
+                if vc_method != "":
+                    return _rr_phase_title(f"Estimate lambda ({vc_method})", payload)
+                if strategy == "subsample_reml":
+                    return _rr_phase_title("Estimate lambda (subsample REML)", payload)
+                return _rr_phase_title("Estimate lambda", payload)
+
+            def _mark_rr_subprogress() -> None:
+                nonlocal fit_status, rr_subprogress_seen
+                rr_subprogress_seen = True
+                if fit_status is not None:
+                    fit_status.__exit__(None, None, None)
+                    fit_status = None
+
+            def _close_rr_phase(*, fail: bool = False) -> None:
+                _ = fail
+                _close_adam_bar()
+                _close_lambda_bar()
 
             def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
                 ev = str(event)
@@ -10157,68 +10487,64 @@ def _run_methods_parallel(
 
             def _adam_hook(event: str, payload: dict[str, typing.Any]) -> None:
                 nonlocal adam_done, adam_total, adam_stage
+                nonlocal adam_bar_indeterminate
                 if not has_rrblup_iter_progress:
                     return
                 ev = str(event)
+                _mark_rr_subprogress()
+                if ev == "pcg_lambda_vc_start":
+                    _close_adam_bar()
+                    _close_lambda_bar()
+                    _ensure_lambda_bar(
+                        _rr_lambda_desc(payload),
+                        indeterminate=True,
+                    )
+                    return
+                if ev == "pcg_lambda_vc_end":
+                    _close_lambda_bar()
+                    return
                 if ev == "pcg_lambda_subsample_start":
-                    _ensure_lambda_bar(payload, event="start")
+                    _close_adam_bar()
+                    _close_lambda_bar()
+                    _ensure_lambda_bar(
+                        _rr_lambda_desc(payload),
+                        event="start",
+                        payload=payload,
+                    )
                     return
                 if ev == "pcg_lambda_subsample_iter":
-                    _ensure_lambda_bar(payload, event="iter")
+                    _ensure_lambda_bar(
+                        _rr_lambda_desc(payload),
+                        event="iter",
+                        payload=payload,
+                    )
                     return
                 if ev == "pcg_lambda_subsample_end":
-                    _ensure_lambda_bar(payload, event="end")
+                    _ensure_lambda_bar(
+                        _rr_lambda_desc(payload),
+                        event="end",
+                        payload=payload,
+                    )
                     _close_lambda_bar()
+                    return
+                if ev == "pcg_callback_unavailable":
+                    _close_adam_bar()
+                    _ensure_adam_bar(
+                        payload,
+                        event="start",
+                        indeterminate=True,
+                    )
                     return
                 if ev == "pcg_start":
                     _close_lambda_bar()
-                    pp = dict(payload)
-                    pp["stage"] = "pcg"
-                    _ensure_adam_bar(pp, event="start")
+                    _ensure_adam_bar(payload, event="start")
                     return
                 if ev == "pcg_iter":
-                    pp = dict(payload)
-                    pp["stage"] = "pcg"
-                    if adam_bar is None:
-                        _ensure_adam_bar(pp, event="epoch")
-                    if adam_bar is None:
-                        return
-                    stage, target, total = _adam_progress_values("epoch", pp)
-                    adam_stage = str(stage)
-                    adam_done = int(target)
-                    adam_total = int(max(1, int(total)))
-                    adam_bar.total = adam_total
-                    adam_bar.n = int(min(max(0, adam_done), adam_total))
-                    adam_bar.set_description_str(
-                        _adam_desc(adam_stage, adam_done, adam_total),
-                        refresh=False,
-                    )
-                    adam_bar.set_postfix_str("", refresh=False)
-                    adam_bar.refresh()
+                    _ensure_adam_bar(payload, event="epoch")
                     return
                 if ev == "pcg_end":
-                    pp = dict(payload)
-                    pp["stage"] = "pcg"
-                    if "iter" not in pp and ("iters" in pp):
-                        pp["iter"] = pp.get("iters")
-                    if adam_bar is None:
-                        _ensure_adam_bar(pp, event="end")
-                    if adam_bar is None:
-                        return
-                    stage, target, total = _adam_progress_values("end", pp)
-                    adam_stage = str(stage)
-                    adam_done = int(target)
-                    adam_total = int(max(1, int(total)))
-                    adam_bar.total = adam_total
-                    adam_bar.n = int(min(max(0, adam_done), adam_total))
-                    adam_bar.set_description_str(
-                        _adam_desc(adam_stage, adam_done, adam_total),
-                        refresh=False,
-                    )
-                    adam_bar.set_postfix_str("", refresh=False)
-                    adam_bar.refresh()
-                    # Reset per-round PCG sub-progress elapsed timer by closing
-                    # this bar at the end of each PCG round.
+                    if not adam_bar_indeterminate:
+                        _ensure_adam_bar(payload, event="end")
                     _close_adam_bar()
                     return
                 if ev == "adam_start":
@@ -10236,7 +10562,7 @@ def _run_methods_parallel(
                     adam_bar.total = adam_total
                     adam_bar.n = int(min(max(0, adam_done), adam_total))
                     adam_bar.set_description_str(
-                        _adam_desc(adam_stage, adam_done, adam_total),
+                        _adam_desc(adam_stage, payload),
                         refresh=False,
                     )
                     adam_bar.set_postfix_str("", refresh=False)
@@ -10252,7 +10578,7 @@ def _run_methods_parallel(
                     adam_bar.total = adam_total
                     adam_bar.n = int(min(max(0, adam_done), adam_total))
                     adam_bar.set_description_str(
-                        _adam_desc(adam_stage, adam_done, adam_total),
+                        _adam_desc(adam_stage, payload),
                         refresh=False,
                     )
                     adam_bar.set_postfix_str("", refresh=False)
@@ -10334,6 +10660,7 @@ def _run_methods_parallel(
                     _close_search_bar()
                     _close_adam_bar()
                     _close_lambda_bar()
+                    _close_rr_phase(fail=True)
                     _close_cv_bar()
                     _fail_fit_status()
                     _fail_predict_status()
@@ -10346,6 +10673,7 @@ def _run_methods_parallel(
 
                 _close_search_bar()
                 _close_lambda_bar()
+                _close_rr_phase()
                 if enable_tqdm_progress and show_method_progress:
                     _ensure_cv_bar()
                     if cv_bar is not None:
@@ -12998,7 +13326,7 @@ def _run_gs_pipeline(
         "pcg_tol": float(args.rrblup_pcg_tol),
         "pcg_max_iter": int(args.rrblup_pcg_max_iter),
         "pcg_std_eps": float(args.rrblup_pcg_std_eps),
-        "pcg_progress_every": 8,
+        "pcg_progress_every": 1,
         "pcg_block_rows": int(args.rrblup_snp_block_size),
     }
     bayes_auto_r2_cfg: dict[str, typing.Any] = {
@@ -15174,6 +15502,47 @@ def _run_gs_pipeline(
                         "elapsed_sec": float(row[6]),
                     }
                 )
+            rrblup_pcg_traces_safe: list[dict[str, typing.Any]] = []
+            for trace_row in list(res_obj.get("rrblup_pcg_trace_rows", []) or []):
+                trace_items_safe: list[dict[str, typing.Any]] = []
+                for rec in list(trace_row.get("trace", []) or []):
+                    trace_items_safe.append(
+                        {
+                            "iter": int(max(0, int(rec.get("iter", 0) or 0))),
+                            "total": int(max(1, int(rec.get("total", 1) or 1))),
+                            "rel_res": float(rec.get("rel_res", np.nan)),
+                        }
+                    )
+                rrblup_pcg_traces_safe.append(
+                    {
+                        "phase": str(trace_row.get("phase", "")),
+                        "phase_label": str(trace_row.get("phase_label", "")),
+                        "fold": (
+                            None
+                            if trace_row.get("fold", None) is None
+                            else int(trace_row.get("fold"))
+                        ),
+                        "solver": str(trace_row.get("solver", "")),
+                        "converged": bool(trace_row.get("converged", False)),
+                        "iters": int(max(0, int(trace_row.get("iters", 0) or 0))),
+                        "max_iter": int(max(1, int(trace_row.get("max_iter", 1) or 1))),
+                        "trace": trace_items_safe,
+                    }
+                )
+            if str(m_key) == "rrBLUP" and len(rrblup_pcg_traces_safe) > 0:
+                _log_file_only(f"[rrBLUP-PCG][trait={trait_name}][method={m_key}] residual_trace_begin")
+                for trace_row in rrblup_pcg_traces_safe:
+                    phase_label = str(trace_row.get("phase_label", "")).strip() or str(
+                        trace_row.get("phase", "")
+                    ).strip()
+                    for rec in list(trace_row.get("trace", []) or []):
+                        _log_file_only(
+                            "[rrBLUP-PCG] "
+                            f"trait={trait_name} method={m_key} phase={phase_label} "
+                            f"iter={int(rec.get('iter', 0))}/{int(rec.get('total', 1))} "
+                            f"rel_res={float(rec.get('rel_res', np.nan)):.12g}"
+                        )
+                _log_file_only(f"[rrBLUP-PCG][trait={trait_name}][method={m_key}] residual_trace_end")
             trait_method_summary[str(trait_name)][str(m_key)] = {
                 "method_display": str(m_disp),
                 "cv_mode": str(res_obj.get("cv_mode", "train_cv")),
@@ -15188,6 +15557,7 @@ def _run_gs_pipeline(
                 "rrblup_pve_final": dict(
                     typing.cast(dict[str, typing.Any] | None, res_obj.get("rrblup_pve_final")) or {}
                 ),
+                "rrblup_pcg_traces": rrblup_pcg_traces_safe,
                 "method_details": detail_rows_safe,
                 "fold_rows": fold_rows_safe,
                 "model_file": (str(model_out_export) if model_out_export is not None else None),

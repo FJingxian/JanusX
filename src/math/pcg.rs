@@ -66,6 +66,17 @@ where
     let tiny_use = tiny.max(1e-30_f64);
     let tol_use = tol.max(0.0_f64);
 
+    on_iteration(0usize, max_iter, rel_res)?;
+    if rel_res.is_finite() && rel_res <= tol_use {
+        converged = true;
+        return Ok(PcgResultF32 {
+            x,
+            converged,
+            iters: 0usize,
+            rel_res,
+        });
+    }
+
     for it in 0..max_iter {
         let ap = apply_a(&p)?;
         if ap.len() != m {

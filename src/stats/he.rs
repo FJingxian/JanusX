@@ -100,8 +100,18 @@ impl GrmApplyWorkspace {
 #[derive(Clone, Copy, Debug, Default)]
 struct HeApplyTiming {
     decode_secs: f64,
-    gemm_secs: f64,
+    xmul_secs: f64,
+    xtmul_secs: f64,
 }
+
+impl HeApplyTiming {
+    #[inline]
+    fn gemm_secs(&self) -> f64 {
+        self.xmul_secs + self.xtmul_secs
+    }
+}
+
+const SMALL_RHS_PAR_ROW_BLOCK: usize = 64;
 
 fn emit_he_stage_timing(
     label: &str,
@@ -109,15 +119,18 @@ fn emit_he_stage_timing(
     batch_total: usize,
     train_maf_secs: f64,
     decode_secs: f64,
-    gemm_secs: f64,
+    xmul_secs: f64,
+    xtmul_secs: f64,
     trace_secs: f64,
     total_secs: f64,
 ) {
     let total = total_secs.max(1e-12_f64);
-    let other_secs = (total_secs - train_maf_secs - decode_secs - gemm_secs - trace_secs).max(0.0);
+    let other_secs =
+        (total_secs - train_maf_secs - decode_secs - xmul_secs - xtmul_secs - trace_secs)
+            .max(0.0);
     let pct = |x: f64| -> f64 { (x * 100.0) / total };
     eprintln!(
-        "HE stage timing {} batch={}/{} train_maf={:.3}s ({:.1}%) decode={:.3}s ({:.1}%) gemm={:.3}s ({:.1}%) trace={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
+        "HE stage timing {} batch={}/{} train_maf={:.3}s ({:.1}%) decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) trace={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
         label,
         batch_done,
         batch_total,
@@ -125,8 +138,10 @@ fn emit_he_stage_timing(
         pct(train_maf_secs),
         decode_secs,
         pct(decode_secs),
-        gemm_secs,
-        pct(gemm_secs),
+        xmul_secs,
+        pct(xmul_secs),
+        xtmul_secs,
+        pct(xtmul_secs),
         trace_secs,
         pct(trace_secs),
         other_secs,
@@ -540,22 +555,29 @@ fn row_major_block_mul_mat_f32(
         return;
     }
     if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
+        let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
         let mut run = || {
-            out.par_chunks_mut(n_rhs)
+            out.par_chunks_mut(n_rhs * row_block)
                 .enumerate()
-                .for_each(|(r, out_row)| {
-                    out_row.fill(0.0_f32);
-                    let row = &block[r * cols..(r + 1) * cols];
-                    for c in 0..cols {
-                        let a = row[c];
-                        if a == 0.0_f32 {
-                            continue;
+                .for_each(|(chunk_id, out_chunk)| {
+                    out_chunk.fill(0.0_f32);
+                    let row_start = chunk_id * row_block;
+                    let rows_here = out_chunk.len() / n_rhs;
+                    for local_r in 0..rows_here {
+                        let r = row_start + local_r;
+                        let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
+                        let row = &block[r * cols..(r + 1) * cols];
+                        for c in 0..cols {
+                            let a = row[c];
+                            if a == 0.0_f32 {
+                                continue;
+                            }
+                            let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
+                            for t in 0..n_rhs {
+                                out_row[t] += a * rhs_row[t];
+                            }
                         }
-                        let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
-                        for t in 0..n_rhs {
-                            out_row[t] += a * rhs_row[t];
-                        }
-                    }
+                    }                    
                 });
         };
         if let Some(tp) = pool {
@@ -589,19 +611,26 @@ fn row_major_block_mul_mat_f32(
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        out.par_chunks_mut(n_rhs)
+        let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+        out.par_chunks_mut(n_rhs * row_block)
             .enumerate()
-            .for_each(|(r, out_row)| {
-                out_row.fill(0.0_f32);
-                let row = &block[r * cols..(r + 1) * cols];
-                for c in 0..cols {
-                    let a = row[c];
-                    if a == 0.0_f32 {
-                        continue;
-                    }
-                    let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
-                    for t in 0..n_rhs {
-                        out_row[t] += a * rhs_row[t];
+            .for_each(|(chunk_id, out_chunk)| {
+                out_chunk.fill(0.0_f32);
+                let row_start = chunk_id * row_block;
+                let rows_here = out_chunk.len() / n_rhs;
+                for local_r in 0..rows_here {
+                    let r = row_start + local_r;
+                    let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
+                    let row = &block[r * cols..(r + 1) * cols];
+                    for c in 0..cols {
+                        let a = row[c];
+                        if a == 0.0_f32 {
+                            continue;
+                        }
+                        let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
+                        for t in 0..n_rhs {
+                            out_row[t] += a * rhs_row[t];
+                        }
                     }
                 }
             });
@@ -625,18 +654,25 @@ fn row_major_block_t_mul_mat_accum_f32(
         return;
     }
     if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
+        let col_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
         let mut run = || {
-            out.par_chunks_mut(n_rhs)
+            out.par_chunks_mut(n_rhs * col_block)
                 .enumerate()
-                .for_each(|(c, out_row)| {
-                    for r in 0..rows {
-                        let a = block[r * cols + c];
-                        if a == 0.0_f32 {
-                            continue;
-                        }
-                        let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
-                        for t in 0..n_rhs {
-                            out_row[t] += a * rhs_row[t];
+                .for_each(|(chunk_id, out_chunk)| {
+                    let col_start = chunk_id * col_block;
+                    let cols_here = out_chunk.len() / n_rhs;
+                    for local_c in 0..cols_here {
+                        let c = col_start + local_c;
+                        let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+                        for r in 0..rows {
+                            let a = block[r * cols + c];
+                            if a == 0.0_f32 {
+                                continue;
+                            }
+                            let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
+                            for t in 0..n_rhs {
+                                out_row[t] += a * rhs_row[t];
+                            }
                         }
                     }
                 });
@@ -672,17 +708,24 @@ fn row_major_block_t_mul_mat_accum_f32(
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        out.par_chunks_mut(n_rhs)
+        let col_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+        out.par_chunks_mut(n_rhs * col_block)
             .enumerate()
-            .for_each(|(c, out_row)| {
-                for r in 0..rows {
-                    let a = block[r * cols + c];
-                    if a == 0.0_f32 {
-                        continue;
-                    }
-                    let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
-                    for t in 0..n_rhs {
-                        out_row[t] += a * rhs_row[t];
+            .for_each(|(chunk_id, out_chunk)| {
+                let col_start = chunk_id * col_block;
+                let cols_here = out_chunk.len() / n_rhs;
+                for local_c in 0..cols_here {
+                    let c = col_start + local_c;
+                    let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+                    for r in 0..rows {
+                        let a = block[r * cols + c];
+                        if a == 0.0_f32 {
+                            continue;
+                        }
+                        let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
+                        for t in 0..n_rhs {
+                            out_row[t] += a * rhs_row[t];
+                        }
                     }
                 }
             });
@@ -766,7 +809,8 @@ fn apply_grm_to_mat_f32_with_workspace(
     let row_step = block_rows.max(1).min(m.max(1));
     workspace.ensure(row_step, n_out, n_rhs);
     let mut decode_acc = 0.0_f64;
-    let mut gemm_acc = 0.0_f64;
+    let mut xmul_acc = 0.0_f64;
+    let mut xtmul_acc = 0.0_f64;
 
     for st in (0..m).step_by(row_step) {
         let ed = (st + row_step).min(m);
@@ -789,16 +833,19 @@ fn apply_grm_to_mat_f32_with_workspace(
         )?;
         decode_acc += t_decode.elapsed().as_secs_f64();
         let tmp_slice = &mut workspace.tmp[..cur_rows * n_rhs];
-        let t_gemm = Instant::now();
+        let t_xmul = Instant::now();
         row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice, pool);
+        xmul_acc += t_xmul.elapsed().as_secs_f64();
+        let t_xtmul = Instant::now();
         row_major_block_t_mul_mat_accum_f32(blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out, pool);
-        gemm_acc += t_gemm.elapsed().as_secs_f64();
+        xtmul_acc += t_xtmul.elapsed().as_secs_f64();
     }
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
     out.iter_mut().for_each(|v| *v *= inv_m);
     if let Some(t) = timing {
         t.decode_secs += decode_acc;
-        t.gemm_secs += gemm_acc;
+        t.xmul_secs += xmul_acc;
+        t.xtmul_secs += xtmul_acc;
     }
     Ok(())
 }
@@ -1000,6 +1047,7 @@ pub fn he_variance_components_packed_with_covariates(
             0.0,
             0.0,
             0.0,
+            0.0,
             total_t0.elapsed().as_secs_f64(),
         );
     }
@@ -1113,7 +1161,7 @@ pub fn he_variance_components_packed_with_covariates(
             {
                 let trace_secs = (trace_t0.elapsed().as_secs_f64()
                     - trace_apply_t.decode_secs
-                    - trace_apply_t.gemm_secs)
+                    - trace_apply_t.gemm_secs())
                     .max(0.0_f64);
                 emit_he_stage_timing(
                     "stage=trace",
@@ -1121,7 +1169,8 @@ pub fn he_variance_components_packed_with_covariates(
                     total_trace_batches,
                     train_maf_secs,
                     ky_apply_t.decode_secs + trace_apply_t.decode_secs,
-                    ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+                    ky_apply_t.xmul_secs + trace_apply_t.xmul_secs,
+                    ky_apply_t.xtmul_secs + trace_apply_t.xtmul_secs,
                     trace_secs,
                     total_t0.elapsed().as_secs_f64(),
                 );
@@ -1189,7 +1238,7 @@ pub fn he_variance_components_packed_with_covariates(
             {
                 let trace_secs = (trace_t0.elapsed().as_secs_f64()
                     - trace_apply_t.decode_secs
-                    - trace_apply_t.gemm_secs)
+                    - trace_apply_t.gemm_secs())
                     .max(0.0_f64);
                 emit_he_stage_timing(
                     "stage=trace",
@@ -1197,7 +1246,8 @@ pub fn he_variance_components_packed_with_covariates(
                     total_trace_batches,
                     train_maf_secs,
                     ky_apply_t.decode_secs + trace_apply_t.decode_secs,
-                    ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+                    ky_apply_t.xmul_secs + trace_apply_t.xmul_secs,
+                    ky_apply_t.xtmul_secs + trace_apply_t.xtmul_secs,
                     trace_secs,
                     total_t0.elapsed().as_secs_f64(),
                 );
@@ -1211,7 +1261,8 @@ pub fn he_variance_components_packed_with_covariates(
             0,
             train_maf_secs,
             ky_apply_t.decode_secs,
-            ky_apply_t.gemm_secs,
+            ky_apply_t.xmul_secs,
+            ky_apply_t.xtmul_secs,
             0.0,
             total_t0.elapsed().as_secs_f64(),
         );
@@ -1285,7 +1336,7 @@ pub fn he_variance_components_packed_with_covariates(
     if stage_timing {
         let trace_secs = (trace_t0.elapsed().as_secs_f64()
             - trace_apply_t.decode_secs
-            - trace_apply_t.gemm_secs)
+            - trace_apply_t.gemm_secs())
             .max(0.0_f64);
         emit_he_stage_timing(
             "final",
@@ -1293,7 +1344,8 @@ pub fn he_variance_components_packed_with_covariates(
             total_trace_batches,
             train_maf_secs,
             ky_apply_t.decode_secs + trace_apply_t.decode_secs,
-            ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+            ky_apply_t.xmul_secs + trace_apply_t.xmul_secs,
+            ky_apply_t.xtmul_secs + trace_apply_t.xtmul_secs,
             trace_secs,
             total_t0.elapsed().as_secs_f64(),
         );
@@ -1327,7 +1379,7 @@ pub fn he_variance_components_packed_with_covariates(
     y_train,
     site_keep=None,
     trace_samples=32,
-    trace_probe_batch=8,
+    trace_probe_batch=64,
     tol=1e-6_f64,
     max_iter=32,
     block_rows=4096,

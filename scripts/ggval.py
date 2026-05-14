@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable
 
@@ -388,6 +389,24 @@ def import_janusx_runtime() -> tuple[object, object]:
             except Exception as ex2:
                 fail(f"Unable to import janusx Rust module for backend checks: {ex2} (initial error: {ex})")
         fail(f"Unable to import janusx Rust module for backend checks: {ex}")
+
+
+def resolve_runtime_thread_stage():
+    try:
+        from janusx.script._common.threads import runtime_thread_stage as _runtime_thread_stage
+
+        return _runtime_thread_stage
+    except Exception:
+        def _fallback_runtime_thread_stage(
+            *,
+            blas_threads: int | None = None,
+            rayon_threads: int | None = None,
+        ):
+            _ = blas_threads
+            _ = rayon_threads
+            return nullcontext()
+
+        return _fallback_runtime_thread_stage
 
 
 def report_janusx_runtime(janusx_module: object, jxrs_module: object) -> None:
@@ -775,6 +794,7 @@ def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
     full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
+    runtime_thread_stage = resolve_runtime_thread_stage()
     report_janusx_runtime(janusx, jxrs)
     print(
         "Benchmark thread target  : "
@@ -883,7 +903,7 @@ def he_thread_checks(
     trace_samples = env_int("JX_GGVAL_HE_TRACE_SAMPLES", 64, min_value=8)
     trace_probe_batch = env_int(
         "JX_GGVAL_HE_TRACE_PROBE_BATCH",
-        min(8, trace_samples),
+        min(64, trace_samples),
         min_value=1,
     )
     block_rows = env_int("JX_GGVAL_HE_BLOCK_ROWS", 4096, min_value=1)
@@ -898,16 +918,22 @@ def he_thread_checks(
     full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
+    runtime_thread_stage = resolve_runtime_thread_stage()
     report_janusx_runtime(janusx, jxrs)
     print(
         "HE benchmark threads     : "
         f"1 vs {full_cores} ({full_cores_source})"
     )
     print(f"HE BLAS backend          : {str(jxrs.rust_sgemm_backend()).strip()}")
+    print(
+        "HE trace config         : "
+        f"samples={int(trace_samples)}, probe_batch={int(trace_probe_batch)}"
+    )
     if stage_timing:
         print(
             "HE stage timing         : "
-            f"enabled (JX_GS_HE_STAGE_LOG_EVERY={int(max(1, stage_log_every))})"
+            "enabled for a separate diagnostic run "
+            f"(JX_GS_HE_STAGE_LOG_EVERY={int(max(1, stage_log_every))})"
         )
 
     cleanup_tmp_outputs(outdir, sim_prefix.name)
@@ -937,35 +963,43 @@ def he_thread_checks(
             f"{int(packed.shape[0])} SNP x {int(n_samples)} samples"
         )
 
-        def run_he_once(threads: int) -> tuple[float, tuple[object, ...]]:
+        def run_he_once(
+            threads: int,
+            *,
+            enable_stage_timing: bool = False,
+        ) -> tuple[float, tuple[object, ...]]:
             prev_stage_timing = os.environ.get("JX_GS_HE_STAGE_TIMING")
             prev_stage_log_every = os.environ.get("JX_GS_HE_STAGE_LOG_EVERY")
-            if stage_timing:
+            if enable_stage_timing:
                 print(f"HE timing run            : threads={int(threads)}")
                 os.environ["JX_GS_HE_STAGE_TIMING"] = "1"
                 os.environ["JX_GS_HE_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
             t0 = time.perf_counter()
             try:
-                ret = jxrs.he_pcg_bed(
-                    str(bfile_prefix),
-                    train_idx,
-                    y,
-                    trace_samples=int(trace_samples),
-                    trace_probe_batch=int(trace_probe_batch),
-                    tol=1e-6,
-                    max_iter=int(max_iter),
-                    block_rows=int(block_rows),
-                    std_eps=1e-12,
-                    use_train_maf=True,
-                    exact_trace_debug=False,
-                    exact_trace_max_n=256,
-                    threads=int(threads),
-                    seed=int(seed),
-                    packed=packed,
-                    packed_n_samples=int(n_samples),
-                    maf=maf,
-                    row_flip=row_flip,
-                )
+                with runtime_thread_stage(
+                    blas_threads=1,
+                    rayon_threads=int(max(1, int(threads))),
+                ):
+                    ret = jxrs.he_pcg_bed(
+                        str(bfile_prefix),
+                        train_idx,
+                        y,
+                        trace_samples=int(trace_samples),
+                        trace_probe_batch=int(trace_probe_batch),
+                        tol=1e-6,
+                        max_iter=int(max_iter),
+                        block_rows=int(block_rows),
+                        std_eps=1e-12,
+                        use_train_maf=True,
+                        exact_trace_debug=False,
+                        exact_trace_max_n=256,
+                        threads=int(threads),
+                        seed=int(seed),
+                        packed=packed,
+                        packed_n_samples=int(n_samples),
+                        maf=maf,
+                        row_flip=row_flip,
+                    )
                 elapsed = time.perf_counter() - t0
                 return elapsed, tuple(ret)
             finally:
@@ -978,8 +1012,8 @@ def he_thread_checks(
                 else:
                     os.environ["JX_GS_HE_STAGE_LOG_EVERY"] = prev_stage_log_every
 
-        he_t1, he_out_1 = run_he_once(1)
-        he_tn, he_out_n = run_he_once(full_cores)
+        he_t1, he_out_1 = run_he_once(1, enable_stage_timing=False)
+        he_tn, he_out_n = run_he_once(full_cores, enable_stage_timing=False)
         assert_he_outputs_close(he_out_1, he_out_n, full_cores)
 
         print(f"HE runtime    (1 core)   : {he_t1:.3f}s")
@@ -994,6 +1028,16 @@ def he_thread_checks(
                 f"converged={bool(he_out_n[3])}, "
                 f"m_eff={int(he_out_n[6])}"
             )
+        if stage_timing:
+            print(
+                "HE stage timing note     : "
+                "benchmark timings above exclude diagnostic logging overhead"
+            )
+            he_diag_t, _he_diag_out = run_he_once(
+                full_cores,
+                enable_stage_timing=True,
+            )
+            print(f"HE stage diag runtime    : {he_diag_t:.3f}s")
     finally:
         cleanup_tmp_outputs(outdir, sim_prefix.name)
     sep()
@@ -1024,6 +1068,7 @@ def pcg_thread_checks(
     full_cores, full_cores_source = detect_effective_threads(bench_threads)
 
     janusx, jxrs = import_janusx_runtime()
+    runtime_thread_stage = resolve_runtime_thread_stage()
     report_janusx_runtime(janusx, jxrs)
     print(
         "PCG benchmark threads    : "
@@ -1073,27 +1118,31 @@ def pcg_thread_checks(
                 os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
             t0 = time.perf_counter()
             try:
-                ret = jxrs.rrblup_pcg_bed(
-                    str(bfile_prefix),
-                    train_idx,
-                    y,
-                    test_sample_indices=empty_idx,
-                    train_pred_local_indices=empty_idx,
-                    site_keep=None,
-                    lambda_value=float(lambda_value),
-                    tol=float(tol),
-                    max_iter=int(max_iter),
-                    block_rows=int(block_rows),
-                    std_eps=1e-12,
-                    threads=int(threads),
-                    progress_callback=None,
-                    progress_every=0,
-                    compute_trainvar=False,
-                    packed=packed,
-                    packed_n_samples=int(n_samples),
-                    maf=maf,
-                    row_flip=row_flip,
-                )
+                with runtime_thread_stage(
+                    blas_threads=1,
+                    rayon_threads=int(max(1, int(threads))),
+                ):
+                    ret = jxrs.rrblup_pcg_bed(
+                        str(bfile_prefix),
+                        train_idx,
+                        y,
+                        test_sample_indices=empty_idx,
+                        train_pred_local_indices=empty_idx,
+                        site_keep=None,
+                        lambda_value=float(lambda_value),
+                        tol=float(tol),
+                        max_iter=int(max_iter),
+                        block_rows=int(block_rows),
+                        std_eps=1e-12,
+                        threads=int(threads),
+                        progress_callback=None,
+                        progress_every=0,
+                        compute_trainvar=False,
+                        packed=packed,
+                        packed_n_samples=int(n_samples),
+                        maf=maf,
+                        row_flip=row_flip,
+                    )
                 elapsed = time.perf_counter() - t0
                 return elapsed, tuple(ret)
             finally:

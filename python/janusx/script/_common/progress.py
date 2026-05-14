@@ -16,19 +16,23 @@ try:
         BarColumn,
         Progress,
         SpinnerColumn,
+        Task,
         TextColumn,
         TimeElapsedColumn,
         TimeRemainingColumn,
     )
+    from rich.text import Text
 
     _HAS_RICH_PROGRESS = True
 except Exception:
     Progress = None  # type: ignore[assignment]
     SpinnerColumn = None  # type: ignore[assignment]
     BarColumn = None  # type: ignore[assignment]
+    Task = None  # type: ignore[assignment]
     TextColumn = None  # type: ignore[assignment]
     TimeElapsedColumn = None  # type: ignore[assignment]
     TimeRemainingColumn = None  # type: ignore[assignment]
+    Text = None  # type: ignore[assignment]
     _HAS_RICH_PROGRESS = False
 
 try:
@@ -42,6 +46,16 @@ except Exception:
 
 def rich_progress_available() -> bool:
     return bool(_HAS_RICH_PROGRESS and stdout_is_tty())
+
+
+class MaybeHiddenBarColumn(BarColumn):
+    """Rich bar column that can be hidden per-task via `hide_bar=True`."""
+
+    def render(self, task: "Task"):  # type: ignore[override]
+        if bool(getattr(task, "fields", {}).get("hide_bar", False)):
+            assert Text is not None
+            return Text("")
+        return super().render(task)
 
 
 def build_rich_progress(
@@ -84,7 +98,11 @@ def build_rich_progress(
     columns.append(TextColumn(str(description_template)))
     if show_bar:
         assert BarColumn is not None
-        columns.append(BarColumn(bar_width=bar_width) if bar_width is not None else BarColumn())
+        columns.append(
+            MaybeHiddenBarColumn(bar_width=bar_width)
+            if bar_width is not None
+            else MaybeHiddenBarColumn()
+        )
     if show_percentage:
         columns.append(TextColumn("{task.percentage:>6.1f}%"))
     for template in (field_templates_before_elapsed or []):

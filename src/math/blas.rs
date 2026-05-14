@@ -2168,16 +2168,22 @@ pub(crate) unsafe fn lapack_dsyevr_dispatch(
 pub fn rust_sgemm_backend() -> String {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
-        match selected_sgemm_backend() {
-            SgemmBackend::Accelerate => "accelerate".to_string(),
-            SgemmBackend::OpenBlas => "openblas".to_string(),
-            SgemmBackend::Blas => "blas".to_string(),
-            SgemmBackend::Rust => "rust".to_string(),
-        }
+        rust_sgemm_backend_tag().to_string()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unsupported".to_string()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) fn rust_sgemm_backend_tag() -> &'static str {
+    match selected_sgemm_backend() {
+        SgemmBackend::Accelerate => "accelerate",
+        SgemmBackend::OpenBlas => "openblas",
+        SgemmBackend::Blas => "blas",
+        SgemmBackend::Rust => "rust",
     }
 }
 

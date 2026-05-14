@@ -851,6 +851,10 @@ def main() -> None:
                 selected,
                 response=response_mode,
             )
+            if isinstance(xcombine, (bytes, bytearray, memoryview)):
+                xcombine_arr = np.frombuffer(xcombine, dtype=np.uint8).astype(np.int8, copy=False)
+            else:
+                xcombine_arr = np.asarray(xcombine, dtype=np.int8)
 
             expr = _expression_from_indices(selected, lut)
             final_rows.append(
@@ -864,7 +868,7 @@ def main() -> None:
                     "val_score": float(va_score),
                     "train_support": int(tr_support),
                     "val_support": int(va_support),
-                    "xcombine": np.asarray(xcombine, dtype=np.int8),
+                    "xcombine": xcombine_arr,
                 }
             )
 

@@ -188,15 +188,26 @@ _HE_THREAD_POLICY_SWEEP_DEFAULT = [
     "blas_parallel_rayon_serial",
     "split_half",
 ]
+
+
+def _default_pcg_thread_policy() -> str:
+    # Preserve the current rrBLUP-PCG default: BLAS serial, Rayon owns the
+    # outer loop. Benchmark sweeps can still compare split_half explicitly.
+    return "rayon_parallel_blas_serial"
+
+
+_PCG_THREAD_POLICY_DEFAULT = _default_pcg_thread_policy()
+_PCG_THREAD_POLICY_SWEEP_DEFAULT = [
+    "rayon_parallel_blas_serial",
+    "blas_parallel_rayon_serial",
+    "split_half",
+]
 _ROWMAJOR_KERNEL_DEFAULT = "blas"
 
 
 def _default_rowmajor_kernel_compare_policies() -> list[str]:
-    # Windows OpenBLAS wheels/builds still need a conservative default here:
-    # explicit Rayon comparison remains available via CLI/env, but the default
-    # benchmark path should stay runnable.
-    if os.name == "nt":
-        return ["blas"]
+    # Benchmarks should compare both kernels on every platform so Windows runs
+    # can surface whether the slowdown/hang is kernel-specific or more general.
     return ["blas", "rayon"]
 
 
@@ -346,6 +357,97 @@ def _resolve_he_thread_policy(policy_name: object, total_threads: int) -> dict[s
         "label": (
             f"{policy} "
             f"(blas={int(blas_threads)}, rayon={int(rayon_threads)}, he={int(he_threads)})"
+        ),
+    }
+
+
+def _normalize_pcg_thread_policy_name(
+    raw: object,
+    *,
+    default: str = _PCG_THREAD_POLICY_DEFAULT,
+) -> str:
+    txt = str(raw).strip().lower()
+    if txt == "":
+        txt = str(default).strip().lower()
+    norm = re.sub(r"[^a-z0-9]+", "", txt)
+    if norm in {
+        "",
+        "default",
+        "auto",
+        "rayon",
+        "rayonparallelblasserial",
+        "rayononly",
+    }:
+        return "rayon_parallel_blas_serial"
+    if norm in {"blas", "blasparallelrayonserial", "blasonly"}:
+        return "blas_parallel_rayon_serial"
+    if norm in {"split", "splithalf", "halfhalf", "balanced"}:
+        return "split_half"
+    if norm in {"serial", "single", "singlethread", "one"}:
+        return "serial"
+    if norm in {"compare", "all", "sweep"}:
+        return "compare"
+    raise ValueError(
+        "Unsupported PCG thread policy "
+        f"{raw!r}. Use one of: rayon_parallel_blas_serial, "
+        "blas_parallel_rayon_serial, split_half."
+    )
+
+
+def _expand_pcg_thread_policy_names(raw: object) -> list[str]:
+    txt = str(raw).strip()
+    if txt == "":
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[\s,;:+|]+", txt):
+        token = str(token).strip()
+        if token == "":
+            continue
+        policy = _normalize_pcg_thread_policy_name(token)
+        names = (
+            list(_PCG_THREAD_POLICY_SWEEP_DEFAULT)
+            if policy == "compare"
+            else [policy]
+        )
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _resolve_pcg_thread_policy(policy_name: object, total_threads: int) -> dict[str, object]:
+    total = max(1, int(total_threads))
+    policy = _normalize_pcg_thread_policy_name(policy_name)
+    if (policy == "serial") or (total <= 1):
+        blas_threads = 1
+        rayon_threads = 1
+        pcg_threads = 1
+    elif policy == "rayon_parallel_blas_serial":
+        blas_threads = 1
+        rayon_threads = total
+        pcg_threads = total
+    elif policy == "blas_parallel_rayon_serial":
+        blas_threads = total
+        rayon_threads = 1
+        pcg_threads = 1
+    elif policy == "split_half":
+        blas_threads = max(1, total // 2)
+        rayon_threads = max(1, total - blas_threads)
+        pcg_threads = rayon_threads
+    else:
+        raise ValueError(f"Unsupported PCG thread policy {policy_name!r}")
+    return {
+        "policy": str(policy),
+        "target_threads": int(total),
+        "blas_threads": int(blas_threads),
+        "rayon_threads": int(rayon_threads),
+        "pcg_threads": int(pcg_threads),
+        "label": (
+            f"{policy} "
+            f"(blas={int(blas_threads)}, rayon={int(rayon_threads)}, pcg={int(pcg_threads)})"
         ),
     }
 
@@ -1429,6 +1531,8 @@ def pcg_thread_checks(
     outdir: Path,
     *,
     bench_threads: int = 0,
+    thread_policy: str = _PCG_THREAD_POLICY_DEFAULT,
+    thread_policies: str = "",
     rowmajor_kernel_policy: str = _ROWMAJOR_KERNEL_DEFAULT,
     rowmajor_kernel_policies: str = "blas,rayon",
     stage_timing: bool = False,
@@ -1453,6 +1557,14 @@ def pcg_thread_checks(
 
     janusx, jxrs = import_janusx_runtime()
     runtime_thread_stage = resolve_runtime_thread_stage()
+    policy_names = _expand_pcg_thread_policy_names(thread_policies)
+    if len(policy_names) == 0:
+        if _normalize_pcg_thread_policy_name(thread_policy) == _PCG_THREAD_POLICY_DEFAULT:
+            policy_names = list(_PCG_THREAD_POLICY_SWEEP_DEFAULT)
+        else:
+            policy_names = _expand_pcg_thread_policy_names(thread_policy)
+    if len(policy_names) == 0:
+        policy_names = [_normalize_pcg_thread_policy_name(thread_policy)]
     kernel_names = _expand_rowmajor_kernel_names(rowmajor_kernel_policies)
     if len(kernel_names) == 0:
         kernel_names = _expand_rowmajor_kernel_names(rowmajor_kernel_policy)
@@ -1475,6 +1587,14 @@ def pcg_thread_checks(
             + " vs ".join(
                 f"{_rowmajor_kernel_label(name)} ({name})" for name in kernel_names
             )
+        )
+    if len(policy_names) == 1:
+        policy_preview = _resolve_pcg_thread_policy(policy_names[0], full_cores)
+        print(f"PCG thread policy       : {str(policy_preview['label'])}")
+    else:
+        print(
+            "PCG thread sweep        : "
+            + ", ".join(str(name) for name in policy_names)
         )
     if stage_timing:
         print(
@@ -1510,13 +1630,20 @@ def pcg_thread_checks(
             f"{int(packed.shape[0])} SNP x {int(n_samples)} samples"
         )
 
-        def run_pcg_once(threads: int, kernel_name: str) -> tuple[float, tuple[object, ...]]:
+        def run_pcg_once(
+            policy_spec: dict[str, object],
+            kernel_name: str,
+        ) -> tuple[float, tuple[object, ...]]:
+            threads = int(policy_spec["pcg_threads"])
+            blas_threads = int(policy_spec["blas_threads"])
+            rayon_threads = int(policy_spec["rayon_threads"])
             prev_stage_timing = os.environ.get("JX_GS_PCG_STAGE_TIMING")
             prev_stage_log_every = os.environ.get("JX_GS_PCG_STAGE_LOG_EVERY")
             if stage_timing:
                 print(
                     "PCG timing run           : "
-                    f"threads={int(threads)}, kernel={_rowmajor_kernel_label(kernel_name)} ({kernel_name})"
+                    f"{str(policy_spec['label'])}, "
+                    f"kernel={_rowmajor_kernel_label(kernel_name)} ({kernel_name})"
                 )
                 os.environ["JX_GS_PCG_STAGE_TIMING"] = "1"
                 os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
@@ -1524,13 +1651,10 @@ def pcg_thread_checks(
             try:
                 with temporary_env_value("JX_ROWMAJOR_F32_KERNEL", str(kernel_name)):
                     with runtime_thread_stage(
-                        blas_threads=1,
-                        rayon_threads=int(max(1, int(threads))),
+                        blas_threads=int(blas_threads),
+                        rayon_threads=int(rayon_threads),
                     ):
-                        ret = jxrs.rrblup_pcg_bed(
-                            str(bfile_prefix),
-                            train_idx,
-                            y,
+                        call_kwargs = dict(
                             test_sample_indices=empty_idx,
                             train_pred_local_indices=empty_idx,
                             site_keep=None,
@@ -1547,7 +1671,23 @@ def pcg_thread_checks(
                             packed_n_samples=int(n_samples),
                             maf=maf,
                             row_flip=row_flip,
+                            blas_threads=int(blas_threads),
                         )
+                        try:
+                            ret = jxrs.rrblup_pcg_bed(
+                                str(bfile_prefix),
+                                train_idx,
+                                y,
+                                **call_kwargs,
+                            )
+                        except TypeError:
+                            call_kwargs.pop("blas_threads", None)
+                            ret = jxrs.rrblup_pcg_bed(
+                                str(bfile_prefix),
+                                train_idx,
+                                y,
+                                **call_kwargs,
+                            )
                 elapsed = time.perf_counter() - t0
                 return elapsed, tuple(ret)
             finally:
@@ -1560,16 +1700,19 @@ def pcg_thread_checks(
                 else:
                     os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = prev_stage_log_every
 
+        pcg_base_spec = _resolve_pcg_thread_policy("serial", 1)
         pcg_base_kernel = kernel_names[0]
-        pcg_t1, pcg_out_1 = run_pcg_once(1, pcg_base_kernel)
+        pcg_t1, pcg_out_1 = run_pcg_once(pcg_base_spec, pcg_base_kernel)
         report_benchmark_phase("PCG", "1-core baseline", pcg_t1)
-        pcg_results: list[tuple[str, float, tuple[object, ...]]] = []
+        pcg_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
         for kernel_name in kernel_names:
-            pcg_tn, pcg_out_n = run_pcg_once(full_cores, kernel_name)
-            assert_pcg_outputs_close(pcg_out_1, pcg_out_n, full_cores)
-            pcg_results.append((kernel_name, pcg_tn, pcg_out_n))
+            for policy_name in policy_names:
+                policy_spec = _resolve_pcg_thread_policy(policy_name, full_cores)
+                pcg_tn, pcg_out_n = run_pcg_once(policy_spec, kernel_name)
+                assert_pcg_outputs_close(pcg_out_1, pcg_out_n, full_cores)
+                pcg_results.append((kernel_name, policy_spec, pcg_tn, pcg_out_n))
         if len(pcg_results) > 0:
-            best_multi_t = min(float(item[1]) for item in pcg_results)
+            best_multi_t = min(float(item[2]) for item in pcg_results)
             phase_text = (
                 f"{full_cores}-core run"
                 if len(pcg_results) == 1
@@ -1584,28 +1727,35 @@ def pcg_thread_checks(
 
         print(f"PCG runtime   (1 core)   : {pcg_t1:.3f}s")
         if len(pcg_results) == 1:
-            only_kernel, only_time, only_out = pcg_results[0]
+            only_kernel, only_spec, only_time, only_out = pcg_results[0]
             print(f"PCG runtime   ({full_cores} cores): {only_time:.3f}s")
             if only_time > 0.0:
                 print(f"PCG speedup              : {pcg_t1 / only_time:.2f}x")
             pcg_out_to_report = only_out
             diag_kernel = only_kernel
+            diag_spec = only_spec
         else:
-            for kernel_name, elapsed, _pcg_out in pcg_results:
+            for kernel_name, policy_spec, elapsed, _pcg_out in pcg_results:
                 speedup = (pcg_t1 / elapsed) if elapsed > 0.0 else float("nan")
                 print(
                     "PCG strategy result      : "
-                    f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}) -> "
+                    f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}), "
+                    f"{str(policy_spec['label'])} -> "
                     f"{elapsed:.3f}s ({speedup:.2f}x)"
                 )
-            best_kernel, best_time, best_out = min(pcg_results, key=lambda item: item[1])
+            best_kernel, best_spec, best_time, best_out = min(
+                pcg_results,
+                key=lambda item: item[2],
+            )
             print(
                 "PCG best strategy        : "
-                f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}) -> "
+                f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}), "
+                f"{str(best_spec['label'])} -> "
                 f"{best_time:.3f}s ({(pcg_t1 / best_time):.2f}x)"
             )
             pcg_out_to_report = best_out
             diag_kernel = best_kernel
+            diag_spec = best_spec
         if len(pcg_out_to_report) >= 9:
             print(
                 "PCG estimate             : "
@@ -1624,7 +1774,11 @@ def pcg_thread_checks(
                 "PCG stage timing kernel  : "
                 f"{_rowmajor_kernel_label(diag_kernel)} ({diag_kernel})"
             )
-            pcg_diag_t, _pcg_diag_out = run_pcg_once(full_cores, diag_kernel)
+            print(
+                "PCG stage timing policy  : "
+                f"{str(diag_spec['label'])}"
+            )
+            pcg_diag_t, _pcg_diag_out = run_pcg_once(diag_spec, diag_kernel)
             print(f"PCG stage diag runtime   : {pcg_diag_t:.3f}s")
     finally:
         cleanup_tmp_outputs(outdir, sim_prefix.name)
@@ -1715,6 +1869,29 @@ def parse_args() -> argparse.Namespace:
         help="Run the rrBLUP-PCG thread benchmark branch (1 core vs all cores).",
     )
     parser.add_argument(
+        "--pcg-thread-policy",
+        type=str,
+        default=env_str(
+            "JX_GGVAL_PCG_THREAD_POLICY",
+            _PCG_THREAD_POLICY_DEFAULT,
+        ),
+        help=(
+            "PCG benchmark multi-core thread policy. "
+            "Aliases: rayon, blas, split."
+        ),
+    )
+    parser.add_argument(
+        "--pcg-thread-policies",
+        type=str,
+        default=env_str("JX_GGVAL_PCG_THREAD_POLICIES", ""),
+        help=(
+            "Comma-separated PCG policies to compare on the same payload. "
+            "Special token compare expands to rayon,blas,split. "
+            "When omitted, the benchmark auto-sweeps all three if the single-policy "
+            "setting stays at its default."
+        ),
+    )
+    parser.add_argument(
         "--rowmajor-kernel-policy",
         type=str,
         default=env_str("JX_GGVAL_ROWMAJOR_F32_KERNEL", env_str("JX_ROWMAJOR_F32_KERNEL", _ROWMAJOR_KERNEL_DEFAULT)),
@@ -1795,6 +1972,8 @@ def main() -> int:
         pcg_thread_checks(
             outdir,
             bench_threads=int(args.bench_threads),
+            thread_policy=str(args.pcg_thread_policy),
+            thread_policies=str(args.pcg_thread_policies),
             rowmajor_kernel_policy=str(args.rowmajor_kernel_policy),
             rowmajor_kernel_policies=str(args.rowmajor_kernel_policies),
             stage_timing=bool(args.pcg_stage_timing),

@@ -217,6 +217,13 @@ def _default_rrblup_he_thread_policy() -> str:
 _RRBLUP_HE_THREAD_POLICY_DEFAULT = _default_rrblup_he_thread_policy()
 
 
+def _default_rrblup_pcg_thread_policy() -> str:
+    return "rayon_parallel_blas_serial"
+
+
+_RRBLUP_PCG_THREAD_POLICY_DEFAULT = _default_rrblup_pcg_thread_policy()
+
+
 def _rrblup_vc_method_display(name: object) -> str:
     txt = str(name).strip()
     if txt == "":
@@ -297,6 +304,19 @@ def _resolve_he_thread_policy_spec(policy_name: object, total_threads: int) -> d
             f"(blas={int(blas_threads)}, rayon={int(rayon_threads)}, he={int(he_threads)})"
         ),
     }
+
+
+def _resolve_pcg_thread_policy_spec(policy_name: object, total_threads: int) -> dict[str, typing.Any]:
+    spec = dict(_resolve_he_thread_policy_spec(policy_name, total_threads))
+    pcg_threads = int(spec.get("he_threads", 1))
+    spec["pcg_threads"] = pcg_threads
+    spec["label"] = (
+        f"{str(spec.get('policy', '')).strip()} "
+        f"(blas={int(spec.get('blas_threads', 1))}, "
+        f"rayon={int(spec.get('rayon_threads', 1))}, "
+        f"pcg={pcg_threads})"
+    )
+    return spec
 
 
 def _warn_rust_gblup_backend_fallback_once(backend: str, allowed: set[str]) -> None:
@@ -6000,6 +6020,20 @@ def GSapi(
                     max(1, int(rr_cfg.get("pcg_block_rows", rr_cfg.get("snp_block_size", 4096))))
                 )
                 pcg_std_eps = float(max(np.finfo(np.float32).eps, float(rr_cfg.get("pcg_std_eps", 1e-12))))
+                pcg_thread_policy_raw = rr_cfg.get(
+                    "pcg_thread_policy",
+                    os.getenv(
+                        "JX_GS_PCG_THREAD_POLICY",
+                        os.getenv(
+                            "JX_RRBLUP_PCG_THREAD_POLICY",
+                            _RRBLUP_PCG_THREAD_POLICY_DEFAULT,
+                        ),
+                    ),
+                )
+                pcg_thread_spec = _resolve_pcg_thread_policy_spec(
+                    pcg_thread_policy_raw,
+                    int(max(1, int(n_jobs))),
+                )
 
                 if not (np.isfinite(pcg_tol) and pcg_tol > 0.0):
                     raise ValueError(f"rrBLUP PCG tol must be finite and > 0, got {pcg_tol!r}.")
@@ -6036,6 +6070,10 @@ def GSapi(
                     total=int(pcg_max_iter),
                     tol=float(pcg_tol),
                     lambda_equation=float(lambda_equation),
+                    thread_policy=str(pcg_thread_spec["policy"]),
+                    stage_blas_threads=int(pcg_thread_spec["blas_threads"]),
+                    stage_rayon_threads=int(pcg_thread_spec["rayon_threads"]),
+                    pcg_threads=int(pcg_thread_spec["pcg_threads"]),
                 )
                 def _on_pcg_progress(
                     done: int,
@@ -6078,22 +6116,10 @@ def GSapi(
                 )
                 try:
                     with runtime_thread_stage(
-                        blas_threads=1,
-                        rayon_threads=int(stage_rayon_threads),
+                        blas_threads=int(pcg_thread_spec["blas_threads"]),
+                        rayon_threads=int(pcg_thread_spec["rayon_threads"]),
                     ):
-                        rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
-                            source_prefix,
-                            train_abs,
-                            y_train_vec,
-                            test_abs,
-                            train_pred_local_arg,
-                            site_keep_arg,
-                            float(lambda_equation),
-                            float(pcg_tol),
-                            int(pcg_max_iter),
-                            int(pcg_block_rows),
-                            float(pcg_std_eps),
-                            int(max(1, int(n_jobs))),
+                        pcg_call_kwargs = dict(
                             progress_callback=pcg_progress_cb,
                             progress_every=int(pcg_progress_every),
                             compute_trainvar=bool(pcg_compute_trainvar),
@@ -6101,7 +6127,41 @@ def GSapi(
                             packed_n_samples=int(packed_n_samples),
                             maf=maf_arg,
                             row_flip=row_flip_arg,
+                            blas_threads=int(pcg_thread_spec["blas_threads"]),
                         )
+                        try:
+                            rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_train_vec,
+                                test_abs,
+                                train_pred_local_arg,
+                                site_keep_arg,
+                                float(lambda_equation),
+                                float(pcg_tol),
+                                int(pcg_max_iter),
+                                int(pcg_block_rows),
+                                float(pcg_std_eps),
+                                int(pcg_thread_spec["pcg_threads"]),
+                                **pcg_call_kwargs,
+                            )
+                        except TypeError:
+                            pcg_call_kwargs.pop("blas_threads", None)
+                            rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_train_vec,
+                                test_abs,
+                                train_pred_local_arg,
+                                site_keep_arg,
+                                float(lambda_equation),
+                                float(pcg_tol),
+                                int(pcg_max_iter),
+                                int(pcg_block_rows),
+                                float(pcg_std_eps),
+                                int(pcg_thread_spec["pcg_threads"]),
+                                **pcg_call_kwargs,
+                            )
                 except TypeError:
                     _emit_rrblup_progress(
                         "pcg_callback_unavailable",
@@ -6114,8 +6174,8 @@ def GSapi(
                             "arguments, and packed context has no source_prefix for legacy fallback."
                         )
                     with runtime_thread_stage(
-                        blas_threads=1,
-                        rayon_threads=int(stage_rayon_threads),
+                        blas_threads=int(pcg_thread_spec["blas_threads"]),
+                        rayon_threads=int(pcg_thread_spec["rayon_threads"]),
                     ):
                         rr_out = _jxrs.rrblup_pcg_bed(  # type: ignore[union-attr]
                             source_prefix,
@@ -6129,7 +6189,7 @@ def GSapi(
                             int(pcg_max_iter),
                             int(pcg_block_rows),
                             float(pcg_std_eps),
-                            int(max(1, int(n_jobs))),
+                            int(pcg_thread_spec["pcg_threads"]),
                         )
                 rr_out_t = tuple(rr_out)
                 beta_export = None
@@ -6223,9 +6283,10 @@ def GSapi(
                     rrblup_runtime_state["pcg_rel_res"] = float(pcg_rel_res)
                     rrblup_runtime_state["pcg_rel_res_trace"] = [dict(x) for x in pcg_rel_res_trace]
                     rrblup_runtime_state["m_effective"] = int(m_eff)
-                    rrblup_runtime_state["thread_policy"] = "rayon_parallel_blas_serial"
-                    rrblup_runtime_state["stage_blas_threads"] = 1
-                    rrblup_runtime_state["stage_rayon_threads"] = int(stage_rayon_threads)
+                    rrblup_runtime_state["thread_policy"] = str(pcg_thread_spec["policy"])
+                    rrblup_runtime_state["stage_blas_threads"] = int(pcg_thread_spec["blas_threads"])
+                    rrblup_runtime_state["stage_rayon_threads"] = int(pcg_thread_spec["rayon_threads"])
+                    rrblup_runtime_state["pcg_threads_arg"] = int(pcg_thread_spec["pcg_threads"])
                     rrblup_runtime_state["lambda_equation"] = float(lambda_equation)
                     rrblup_runtime_state["selected_lambda"] = float(lambda_raw)
                     rrblup_runtime_state["lambda_source"] = str(lambda_source)

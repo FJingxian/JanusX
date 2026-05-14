@@ -1225,7 +1225,8 @@ pub fn gblup_reml_packed_bed<'py>(
     packed=None,
     packed_n_samples=0,
     maf=None,
-    row_flip=None
+    row_flip=None,
+    blas_threads=0
 ))]
 pub fn rrblup_pcg_bed<'py>(
     py: Python<'py>,
@@ -1248,6 +1249,7 @@ pub fn rrblup_pcg_bed<'py>(
     packed_n_samples: usize,
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
+    blas_threads: usize,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
@@ -1550,9 +1552,14 @@ pub fn rrblup_pcg_bed<'py>(
     ) = py
         .detach(
             move || -> Result<(Vec<f64>, Vec<f64>, f64, bool, usize, f64, f64, f64, Vec<f32>), String> {
-                // rrBLUP-PCG uses Rayon for outer/block parallelism; keep BLAS
-                // single-threaded to avoid nested oversubscription.
-                let _pcg_blas_guard = OpenBlasThreadGuard::enter(1);
+                // Default remains BLAS=1 to preserve the current behavior, but
+                // benchmarks can override this to compare split thread plans.
+                let blas_threads_effective = if blas_threads > 0 {
+                    blas_threads.max(1)
+                } else {
+                    1usize
+                };
+                let _pcg_blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
                 let stage_accum = Arc::new(Mutex::new(PcgStageTimingAccum::default()));
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];

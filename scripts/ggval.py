@@ -684,7 +684,12 @@ def backend_thread_checks(outdir: Path) -> None:
     sep()
 
 
-def he_thread_checks(outdir: Path) -> None:
+def he_thread_checks(
+    outdir: Path,
+    *,
+    stage_timing: bool = False,
+    stage_log_every: int = 8,
+) -> None:
     default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
     default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
     nsnp_k = env_int("JX_GGVAL_HE_BENCH_NSNP_K", default_nsnp_k, min_value=1)
@@ -709,6 +714,11 @@ def he_thread_checks(outdir: Path) -> None:
     janusx, jxrs = import_janusx_runtime()
     report_janusx_runtime(janusx, jxrs)
     print(f"HE BLAS backend          : {str(jxrs.rust_sgemm_backend()).strip()}")
+    if stage_timing:
+        print(
+            "HE stage timing         : "
+            f"enabled (JX_GS_HE_STAGE_LOG_EVERY={int(max(1, stage_log_every))})"
+        )
 
     cleanup_tmp_outputs(outdir, sim_prefix.name)
     try:
@@ -738,29 +748,45 @@ def he_thread_checks(outdir: Path) -> None:
         )
 
         def run_he_once(threads: int) -> tuple[float, tuple[object, ...]]:
+            prev_stage_timing = os.environ.get("JX_GS_HE_STAGE_TIMING")
+            prev_stage_log_every = os.environ.get("JX_GS_HE_STAGE_LOG_EVERY")
+            if stage_timing:
+                print(f"HE timing run            : threads={int(threads)}")
+                os.environ["JX_GS_HE_STAGE_TIMING"] = "1"
+                os.environ["JX_GS_HE_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
             t0 = time.perf_counter()
-            ret = jxrs.he_pcg_bed(
-                str(bfile_prefix),
-                train_idx,
-                y,
-                trace_samples=int(trace_samples),
-                trace_probe_batch=int(trace_probe_batch),
-                tol=1e-6,
-                max_iter=int(max_iter),
-                block_rows=int(block_rows),
-                std_eps=1e-12,
-                use_train_maf=True,
-                exact_trace_debug=False,
-                exact_trace_max_n=256,
-                threads=int(threads),
-                seed=int(seed),
-                packed=packed,
-                packed_n_samples=int(n_samples),
-                maf=maf,
-                row_flip=row_flip,
-            )
-            elapsed = time.perf_counter() - t0
-            return elapsed, tuple(ret)
+            try:
+                ret = jxrs.he_pcg_bed(
+                    str(bfile_prefix),
+                    train_idx,
+                    y,
+                    trace_samples=int(trace_samples),
+                    trace_probe_batch=int(trace_probe_batch),
+                    tol=1e-6,
+                    max_iter=int(max_iter),
+                    block_rows=int(block_rows),
+                    std_eps=1e-12,
+                    use_train_maf=True,
+                    exact_trace_debug=False,
+                    exact_trace_max_n=256,
+                    threads=int(threads),
+                    seed=int(seed),
+                    packed=packed,
+                    packed_n_samples=int(n_samples),
+                    maf=maf,
+                    row_flip=row_flip,
+                )
+                elapsed = time.perf_counter() - t0
+                return elapsed, tuple(ret)
+            finally:
+                if prev_stage_timing is None:
+                    os.environ.pop("JX_GS_HE_STAGE_TIMING", None)
+                else:
+                    os.environ["JX_GS_HE_STAGE_TIMING"] = prev_stage_timing
+                if prev_stage_log_every is None:
+                    os.environ.pop("JX_GS_HE_STAGE_LOG_EVERY", None)
+                else:
+                    os.environ["JX_GS_HE_STAGE_LOG_EVERY"] = prev_stage_log_every
 
         he_t1, he_out_1 = run_he_once(1)
         he_tn, he_out_n = run_he_once(full_cores)
@@ -829,6 +855,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run only the HE thread benchmark branch (1 core vs all cores).",
     )
+    parser.add_argument(
+        "--he-stage-timing",
+        action="store_true",
+        default=env_truthy("JX_GGVAL_HE_STAGE_TIMING", False),
+        help="Enable Rust HE stage timing logs during --testHE runs.",
+    )
+    parser.add_argument(
+        "--he-stage-log-every",
+        type=int,
+        default=env_int("JX_GGVAL_HE_STAGE_LOG_EVERY", 8, min_value=1),
+        help="Emit HE trace timing log every N trace batches during --testHE.",
+    )
     return parser.parse_args()
 
 
@@ -845,7 +883,11 @@ def main() -> int:
     check_jx_available()
 
     if args.test_he:
-        he_thread_checks(outdir)
+        he_thread_checks(
+            outdir,
+            stage_timing=bool(args.he_stage_timing),
+            stage_log_every=int(args.he_stage_log_every),
+        )
     elif args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)
         backend_thread_checks(outdir)

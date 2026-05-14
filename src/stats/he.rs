@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut};
 use crate::blas::{
@@ -13,7 +14,7 @@ use crate::blas::{
 };
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
-use crate::stats_common::{get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
+use crate::stats_common::{env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
 
 pub const HE_BOUNDARY_INTERIOR: u8 = 0;
 pub const HE_BOUNDARY_SIGMA_G_ZERO: u8 = 1;
@@ -95,6 +96,44 @@ impl GrmApplyWorkspace {
             self.tmp.resize(need_tmp, 0.0_f32);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HeApplyTiming {
+    decode_secs: f64,
+    gemm_secs: f64,
+}
+
+fn emit_he_stage_timing(
+    label: &str,
+    batch_done: usize,
+    batch_total: usize,
+    train_maf_secs: f64,
+    decode_secs: f64,
+    gemm_secs: f64,
+    trace_secs: f64,
+    total_secs: f64,
+) {
+    let total = total_secs.max(1e-12_f64);
+    let other_secs = (total_secs - train_maf_secs - decode_secs - gemm_secs - trace_secs).max(0.0);
+    let pct = |x: f64| -> f64 { (x * 100.0) / total };
+    eprintln!(
+        "HE stage timing {} batch={}/{} train_maf={:.3}s ({:.1}%) decode={:.3}s ({:.1}%) gemm={:.3}s ({:.1}%) trace={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
+        label,
+        batch_done,
+        batch_total,
+        train_maf_secs,
+        pct(train_maf_secs),
+        decode_secs,
+        pct(decode_secs),
+        gemm_secs,
+        pct(gemm_secs),
+        trace_secs,
+        pct(trace_secs),
+        other_secs,
+        pct(other_secs),
+        total_secs,
+    );
 }
 
 impl CovariateProjector {
@@ -611,6 +650,7 @@ fn apply_grm_to_mat_f32_with_workspace(
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
     workspace: &mut GrmApplyWorkspace,
+    timing: Option<&mut HeApplyTiming>,
     out: &mut [f32], // row-major (n_out, n_rhs)
 ) -> Result<(), String> {
     let m = row_flip.len();
@@ -638,11 +678,14 @@ fn apply_grm_to_mat_f32_with_workspace(
     }
     let row_step = block_rows.max(1).min(m.max(1));
     workspace.ensure(row_step, n_out, n_rhs);
+    let mut decode_acc = 0.0_f64;
+    let mut gemm_acc = 0.0_f64;
 
     for st in (0..m).step_by(row_step) {
         let ed = (st + row_step).min(m);
         let cur_rows = ed - st;
         let blk_slice = &mut workspace.block[..cur_rows * n_out];
+        let t_decode = Instant::now();
         decode_standardized_block_f32(
             packed_flat,
             bytes_per_snp,
@@ -657,12 +700,19 @@ fn apply_grm_to_mat_f32_with_workspace(
             code4_lut,
             pool,
         )?;
+        decode_acc += t_decode.elapsed().as_secs_f64();
         let tmp_slice = &mut workspace.tmp[..cur_rows * n_rhs];
+        let t_gemm = Instant::now();
         row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice);
         row_major_block_t_mul_mat_accum_f32(blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out);
+        gemm_acc += t_gemm.elapsed().as_secs_f64();
     }
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
     out.iter_mut().for_each(|v| *v *= inv_m);
+    if let Some(t) = timing {
+        t.decode_secs += decode_acc;
+        t.gemm_secs += gemm_acc;
+    }
     Ok(())
 }
 
@@ -682,6 +732,7 @@ fn apply_grm_to_vec_f32_with_workspace(
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
     workspace: &mut GrmApplyWorkspace,
+    timing: Option<&mut HeApplyTiming>,
 ) -> Result<Vec<f32>, String> {
     let n_out = sample_idx.len();
     if vec_in.len() != n_out {
@@ -707,6 +758,7 @@ fn apply_grm_to_vec_f32_with_workspace(
         code4_lut,
         pool,
         workspace,
+        timing,
         &mut out,
     )?;
     Ok(out)
@@ -777,6 +829,13 @@ pub fn he_variance_components_packed_with_covariates(
     exact_trace_max_n: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<HePcgResult, String> {
+    let stage_timing = env_truthy("JX_GS_HE_STAGE_TIMING");
+    let stage_log_every = std::env::var("JX_GS_HE_STAGE_LOG_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(8usize);
+    let total_t0 = Instant::now();
     if n_samples == 0 {
         return Err("n_samples must be > 0".to_string());
     }
@@ -833,6 +892,7 @@ pub fn he_variance_components_packed_with_covariates(
     }
 
     let std_eps32 = std_eps.max(1e-12_f64) as f32;
+    let train_maf_t0 = Instant::now();
     let row_stats = build_row_standardization_stats(
         packed_flat,
         bytes_per_snp,
@@ -842,6 +902,19 @@ pub fn he_variance_components_packed_with_covariates(
         std_eps32,
         use_train_maf,
     )?;
+    let train_maf_secs = train_maf_t0.elapsed().as_secs_f64();
+    if stage_timing {
+        emit_he_stage_timing(
+            "stage=train_maf",
+            0,
+            0,
+            train_maf_secs,
+            0.0,
+            0.0,
+            0.0,
+            total_t0.elapsed().as_secs_f64(),
+        );
+    }
     let m_effective = row_stats.m_effective;
     if m_effective == 0 {
         return Err("No effective SNPs after std_eps filtering".to_string());
@@ -857,6 +930,7 @@ pub fn he_variance_components_packed_with_covariates(
     let y_f32: Vec<f32> = y_proj.iter().map(|v| *v as f32).collect();
     let code4_lut = &packed_byte_lut().code4;
     let mut grm_ws = GrmApplyWorkspace::new();
+    let mut ky_apply_t = HeApplyTiming::default();
 
     let k_y = apply_grm_to_vec_f32_with_workspace(
         packed_flat,
@@ -873,6 +947,11 @@ pub fn he_variance_components_packed_with_covariates(
         code4_lut,
         pool,
         &mut grm_ws,
+        if stage_timing {
+            Some(&mut ky_apply_t)
+        } else {
+            None
+        },
     )?;
     let y_ky = dot_f32_f64(&y_f32, &k_y);
     let y_y = dot_f32_f64(&y_f32, &y_f32);
@@ -883,6 +962,14 @@ pub fn he_variance_components_packed_with_covariates(
     let mut tr_k_acc = 0.0_f64;
     let mut tr_k2_acc = 0.0_f64;
     let exact_trace_used = exact_trace_debug && n <= exact_trace_max_n.max(1);
+    let total_trace_batches = if exact_trace_used {
+        n.div_ceil(batch_cols)
+    } else {
+        trace_samples.div_ceil(batch_cols)
+    };
+    let trace_t0 = Instant::now();
+    let mut trace_apply_t = HeApplyTiming::default();
+    let mut trace_batches_done = 0usize;
 
     if exact_trace_used {
         let mut col_start = 0usize;
@@ -911,6 +998,11 @@ pub fn he_variance_components_packed_with_covariates(
                 code4_lut,
                 pool,
                 &mut grm_ws,
+                if stage_timing {
+                    Some(&mut trace_apply_t)
+                } else {
+                    None
+                },
                 &mut kv_batch,
             )?;
             projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
@@ -926,6 +1018,26 @@ pub fn he_variance_components_packed_with_covariates(
                 tr_k2_acc += col_norm2;
             }
             col_start += cur;
+            trace_batches_done += 1;
+            if stage_timing
+                && ((trace_batches_done % stage_log_every) == 0
+                    || trace_batches_done == total_trace_batches)
+            {
+                let trace_secs = (trace_t0.elapsed().as_secs_f64()
+                    - trace_apply_t.decode_secs
+                    - trace_apply_t.gemm_secs)
+                    .max(0.0_f64);
+                emit_he_stage_timing(
+                    "stage=trace",
+                    trace_batches_done,
+                    total_trace_batches,
+                    train_maf_secs,
+                    ky_apply_t.decode_secs + trace_apply_t.decode_secs,
+                    ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+                    trace_secs,
+                    total_t0.elapsed().as_secs_f64(),
+                );
+            }
         }
     } else {
         let mut b_start = 0usize;
@@ -960,6 +1072,11 @@ pub fn he_variance_components_packed_with_covariates(
                 code4_lut,
                 pool,
                 &mut grm_ws,
+                if stage_timing {
+                    Some(&mut trace_apply_t)
+                } else {
+                    None
+                },
                 &mut kv_batch,
             )?;
             projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
@@ -977,7 +1094,39 @@ pub fn he_variance_components_packed_with_covariates(
                 tr_k2_acc += trk2_one;
             }
             b_start += cur;
+            trace_batches_done += 1;
+            if stage_timing
+                && ((trace_batches_done % stage_log_every) == 0
+                    || trace_batches_done == total_trace_batches)
+            {
+                let trace_secs = (trace_t0.elapsed().as_secs_f64()
+                    - trace_apply_t.decode_secs
+                    - trace_apply_t.gemm_secs)
+                    .max(0.0_f64);
+                emit_he_stage_timing(
+                    "stage=trace",
+                    trace_batches_done,
+                    total_trace_batches,
+                    train_maf_secs,
+                    ky_apply_t.decode_secs + trace_apply_t.decode_secs,
+                    ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+                    trace_secs,
+                    total_t0.elapsed().as_secs_f64(),
+                );
+            }
         }
+    }
+    if stage_timing && total_trace_batches == 0 {
+        emit_he_stage_timing(
+            "stage=trace",
+            0,
+            0,
+            train_maf_secs,
+            ky_apply_t.decode_secs,
+            ky_apply_t.gemm_secs,
+            0.0,
+            total_t0.elapsed().as_secs_f64(),
+        );
     }
     let tr_k = if exact_trace_used {
         tr_k_acc
@@ -1045,6 +1194,22 @@ pub fn he_variance_components_packed_with_covariates(
     } else {
         f64::INFINITY
     };
+    if stage_timing {
+        let trace_secs = (trace_t0.elapsed().as_secs_f64()
+            - trace_apply_t.decode_secs
+            - trace_apply_t.gemm_secs)
+            .max(0.0_f64);
+        emit_he_stage_timing(
+            "final",
+            trace_batches_done,
+            total_trace_batches,
+            train_maf_secs,
+            ky_apply_t.decode_secs + trace_apply_t.decode_secs,
+            ky_apply_t.gemm_secs + trace_apply_t.gemm_secs,
+            trace_secs,
+            total_t0.elapsed().as_secs_f64(),
+        );
+    }
 
     Ok(HePcgResult {
         sigma_g2,

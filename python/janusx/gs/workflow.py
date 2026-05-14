@@ -2715,6 +2715,7 @@ def _estimate_rrblup_lambda_subsample_reml(
         "he_error": "",
         "he_call_path": "",
         "he_call_api": "",
+        "he_site_keep_mode": "",
         "thread_policy": "",
         "stage_blas_threads": 0,
         "stage_rayon_threads": 0,
@@ -2767,6 +2768,33 @@ def _estimate_rrblup_lambda_subsample_reml(
             if note_txt != "":
                 msg += f" note={note_txt}"
             print(msg, flush=True)
+
+    def _describe_he_site_keep_mode(
+        site_keep_raw_obj: typing.Any,
+        site_keep_arr: np.ndarray | None,
+        packed_rows: int,
+    ) -> tuple[str, str]:
+        if site_keep_arr is None:
+            if site_keep_raw_obj is None:
+                return "none", "site_keep not provided"
+            try:
+                raw_len = int(np.asarray(site_keep_raw_obj).reshape(-1).shape[0])
+            except Exception:
+                raw_len = -1
+            if raw_len > 0 and raw_len != int(packed_rows):
+                return (
+                    "suppressed_len_mismatch",
+                    f"site_keep len={raw_len} != packed_rows={int(packed_rows)}",
+                )
+            return "none", "site_keep unavailable after normalization"
+        keep_len = int(site_keep_arr.shape[0])
+        keep_true = int(np.count_nonzero(site_keep_arr))
+        if keep_true == keep_len and bool(np.all(site_keep_arr)):
+            return "identity", f"site_keep len={keep_len}, all_true=1"
+        return (
+            "subset_copy_candidate",
+            f"site_keep len={keep_len}, keep_true={keep_true}, packed_rows={int(packed_rows)}",
+        )
 
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
     can_try_he = bool(
@@ -2825,6 +2853,12 @@ def _estimate_rrblup_lambda_subsample_reml(
                 )
                 if int(site_keep_arg.shape[0]) != int(maf_arg.shape[0]):
                     site_keep_arg = None
+            he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
+                site_keep_raw,
+                site_keep_arg,
+                int(maf_arg.shape[0]),
+            )
+            he_diag["he_site_keep_mode"] = str(he_site_keep_mode)
 
             source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
             he_trace_samples = int(
@@ -2899,6 +2933,27 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_diag["stage_blas_threads"] = int(he_thread_spec["blas_threads"])
             he_diag["stage_rayon_threads"] = int(he_thread_spec["rayon_threads"])
             he_diag["he_threads_arg"] = int(he_thread_spec["he_threads"])
+            if he_debug_mode:
+                he_block_bytes = int(int(he_block_rows) * int(n_train) * np.dtype(np.float32).itemsize)
+                he_probe_bytes = int(
+                    int(n_train) * int(he_trace_probe_batch) * np.dtype(np.float32).itemsize
+                )
+                print(
+                    (
+                        "[rrBLUP-DEBUG] HE site_keep mode="
+                        f"{he_site_keep_mode} ({he_site_keep_note})"
+                    ),
+                    flush=True,
+                )
+                print(
+                    (
+                        "[rrBLUP-DEBUG] HE workspace estimate "
+                        f"packed={packed_arg.nbytes / (1024 ** 3):.2f} GiB "
+                        f"block={he_block_bytes / (1024 ** 3):.2f} GiB "
+                        f"probe={he_probe_bytes / (1024 ** 3):.2f} GiB x2"
+                    ),
+                    flush=True,
+                )
 
             _emit(
                 "pcg_lambda_vc_start",

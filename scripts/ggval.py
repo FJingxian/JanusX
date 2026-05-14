@@ -36,6 +36,17 @@ def env_int(name: str, default: int, min_value: int | None = None) -> int:
     return value
 
 
+def env_float(name: str, default: float, min_value: float | None = None) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError:
+        fail(f"{name} must be a float, got {raw!r}")
+    if min_value is not None and value < min_value:
+        fail(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
 def env_truthy(name: str, default: bool = False) -> bool:
     raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
@@ -319,6 +330,58 @@ def assert_he_outputs_close(ref: tuple[object, ...], cur: tuple[object, ...], fu
             fail(
                 f"HE output drifted across thread counts for {name}: "
                 f"1-core={a}, {full_cores}-core={b}"
+            )
+
+
+def assert_pcg_outputs_close(ref: tuple[object, ...], cur: tuple[object, ...], full_cores: int) -> None:
+    if len(ref) != len(cur):
+        fail(
+            "PCG return length mismatch between 1-core and "
+            f"{full_cores}-core runs: {len(ref)} vs {len(cur)}"
+        )
+
+    scalar_fields = {
+        2: ("pve_trainvar", 5e-4, 1e-8),
+        5: ("rel_res", 5e-4, 1e-8),
+        7: ("pve_lambda_vc", 5e-4, 1e-8),
+        8: ("k_trace_mean", 5e-4, 1e-8),
+    }
+    for idx, (name, rtol, atol) in scalar_fields.items():
+        if idx >= len(ref):
+            continue
+        a = float(ref[idx])
+        b = float(cur[idx])
+        if not np.allclose([a], [b], rtol=rtol, atol=atol, equal_nan=True):
+            fail(
+                f"PCG output drifted across thread counts for {name}: "
+                f"1-core={a}, {full_cores}-core={b}"
+            )
+
+    exact_fields = {
+        3: "converged",
+        6: "m_effective",
+    }
+    for idx, name in exact_fields.items():
+        if idx >= len(ref):
+            continue
+        if ref[idx] != cur[idx]:
+            fail(
+                f"PCG output mismatch for {name}: "
+                f"1-core={ref[idx]!r}, {full_cores}-core={cur[idx]!r}"
+            )
+
+    if len(ref) >= 10:
+        beta_ref = np.asarray(ref[9], dtype=np.float32).reshape(-1)
+        beta_cur = np.asarray(cur[9], dtype=np.float32).reshape(-1)
+        if beta_ref.shape != beta_cur.shape:
+            fail(
+                f"PCG beta shape mismatch: 1-core={beta_ref.shape}, {full_cores}-core={beta_cur.shape}"
+            )
+        if not np.allclose(beta_ref, beta_cur, rtol=5e-4, atol=1e-6, equal_nan=True):
+            diff = float(np.max(np.abs(beta_ref - beta_cur))) if beta_ref.size > 0 else 0.0
+            fail(
+                "PCG beta drifted across thread counts: "
+                f"max_abs_diff={diff}, size={beta_ref.size}"
             )
 
 
@@ -809,6 +872,130 @@ def he_thread_checks(
     sep()
 
 
+def pcg_thread_checks(
+    outdir: Path,
+    *,
+    stage_timing: bool = False,
+    stage_log_every: int = 100,
+) -> None:
+    default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
+    default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
+    nsnp_k = env_int("JX_GGVAL_PCG_BENCH_NSNP_K", default_nsnp_k, min_value=1)
+    n_individuals = env_int("JX_GGVAL_PCG_BENCH_NIND", default_n_individuals, min_value=2)
+    lambda_value = env_float("JX_GGVAL_PCG_LAMBDA", 1.0, min_value=0.0)
+    tol = env_float("JX_GGVAL_PCG_TOL", 1e-4, min_value=0.0)
+    max_iter = env_int("JX_GGVAL_PCG_MAX_ITER", 100, min_value=1)
+    block_rows = env_int("JX_GGVAL_PCG_BLOCK_ROWS", 4096, min_value=1)
+    seed = env_int("JX_GGVAL_PCG_SEED", 20260514, min_value=0)
+
+    step(
+        "STEP PCG. rrBLUP-PCG 1-core/all-core timing check "
+        f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
+    )
+    sim_prefix = outdir / "__ggval_tmp_pcg_sim"
+    full_cores = max(1, int(os.cpu_count() or 1))
+
+    janusx, jxrs = import_janusx_runtime()
+    report_janusx_runtime(janusx, jxrs)
+    print(f"PCG BLAS backend         : {str(jxrs.rust_sgemm_backend()).strip()}")
+    if stage_timing:
+        print(
+            "PCG stage timing        : "
+            f"enabled (JX_GS_PCG_STAGE_LOG_EVERY={int(max(1, stage_log_every))})"
+        )
+
+    cleanup_tmp_outputs(outdir, sim_prefix.name)
+    try:
+        run(["jx", "sim", str(nsnp_k), str(n_individuals), str(sim_prefix)])
+        bfile_prefix = sim_prefix
+        require_file(bfile_prefix.with_suffix(".bed"), "Simulated BED output missing")
+        require_file(bfile_prefix.with_suffix(".bim"), "Simulated BIM output missing")
+        require_file(bfile_prefix.with_suffix(".fam"), "Simulated FAM output missing")
+
+        packed_arr, _miss_arr, maf_arr, _std_arr, n_samples = jxrs.load_bed_2bit_packed(str(bfile_prefix))
+        packed = np.ascontiguousarray(np.asarray(packed_arr, dtype=np.uint8), dtype=np.uint8)
+        maf = np.ascontiguousarray(np.asarray(maf_arr, dtype=np.float32).reshape(-1), dtype=np.float32)
+        row_flip = np.ascontiguousarray(
+            np.asarray(
+                jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
+                dtype=np.bool_,
+            ).reshape(-1),
+            dtype=np.bool_,
+        )
+        train_idx = np.arange(int(n_samples), dtype=np.int64)
+        y = np.asarray(np.random.default_rng(int(seed)).standard_normal(int(n_samples)), dtype=np.float64)
+        y -= float(y.mean())
+        empty_idx = np.zeros((0,), dtype=np.int64)
+
+        print(
+            "PCG benchmark payload    : "
+            f"{int(packed.shape[0])} SNP x {int(n_samples)} samples"
+        )
+
+        def run_pcg_once(threads: int) -> tuple[float, tuple[object, ...]]:
+            prev_stage_timing = os.environ.get("JX_GS_PCG_STAGE_TIMING")
+            prev_stage_log_every = os.environ.get("JX_GS_PCG_STAGE_LOG_EVERY")
+            if stage_timing:
+                print(f"PCG timing run           : threads={int(threads)}")
+                os.environ["JX_GS_PCG_STAGE_TIMING"] = "1"
+                os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
+            t0 = time.perf_counter()
+            try:
+                ret = jxrs.rrblup_pcg_bed(
+                    str(bfile_prefix),
+                    train_idx,
+                    y,
+                    test_sample_indices=empty_idx,
+                    train_pred_local_indices=empty_idx,
+                    site_keep=None,
+                    lambda_value=float(lambda_value),
+                    tol=float(tol),
+                    max_iter=int(max_iter),
+                    block_rows=int(block_rows),
+                    std_eps=1e-12,
+                    threads=int(threads),
+                    progress_callback=None,
+                    progress_every=0,
+                    compute_trainvar=False,
+                    packed=packed,
+                    packed_n_samples=int(n_samples),
+                    maf=maf,
+                    row_flip=row_flip,
+                )
+                elapsed = time.perf_counter() - t0
+                return elapsed, tuple(ret)
+            finally:
+                if prev_stage_timing is None:
+                    os.environ.pop("JX_GS_PCG_STAGE_TIMING", None)
+                else:
+                    os.environ["JX_GS_PCG_STAGE_TIMING"] = prev_stage_timing
+                if prev_stage_log_every is None:
+                    os.environ.pop("JX_GS_PCG_STAGE_LOG_EVERY", None)
+                else:
+                    os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = prev_stage_log_every
+
+        pcg_t1, pcg_out_1 = run_pcg_once(1)
+        pcg_tn, pcg_out_n = run_pcg_once(full_cores)
+        assert_pcg_outputs_close(pcg_out_1, pcg_out_n, full_cores)
+
+        print(f"PCG runtime   (1 core)   : {pcg_t1:.3f}s")
+        print(f"PCG runtime   ({full_cores} cores): {pcg_tn:.3f}s")
+        if pcg_tn > 0.0:
+            print(f"PCG speedup              : {pcg_t1 / pcg_tn:.2f}x")
+        if len(pcg_out_n) >= 9:
+            print(
+                "PCG estimate             : "
+                f"converged={bool(pcg_out_n[3])}, "
+                f"iters={int(pcg_out_n[4])}, "
+                f"rel_res={float(pcg_out_n[5]):.6g}, "
+                f"m_eff={int(pcg_out_n[6])}, "
+                f"k_trace={float(pcg_out_n[8]):.6g}"
+            )
+    finally:
+        cleanup_tmp_outputs(outdir, sim_prefix.name)
+    sep()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cross-platform JanusX validation runner.",
@@ -853,7 +1040,14 @@ def parse_args() -> argparse.Namespace:
         "--test-he",
         dest="test_he",
         action="store_true",
-        help="Run only the HE thread benchmark branch (1 core vs all cores).",
+        help="Run the HE thread benchmark branch (1 core vs all cores).",
+    )
+    parser.add_argument(
+        "--testPCG",
+        "--test-pcg",
+        dest="test_pcg",
+        action="store_true",
+        help="Run the rrBLUP-PCG thread benchmark branch (1 core vs all cores).",
     )
     parser.add_argument(
         "--he-stage-timing",
@@ -866,6 +1060,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=env_int("JX_GGVAL_HE_STAGE_LOG_EVERY", 8, min_value=1),
         help="Emit HE trace timing log every N trace batches during --testHE.",
+    )
+    parser.add_argument(
+        "--pcg-stage-timing",
+        action="store_true",
+        default=env_truthy("JX_GGVAL_PCG_STAGE_TIMING", False),
+        help="Enable Rust rrBLUP-PCG stage timing logs during --testPCG runs.",
+    )
+    parser.add_argument(
+        "--pcg-stage-log-every",
+        type=int,
+        default=env_int("JX_GGVAL_PCG_STAGE_LOG_EVERY", 100, min_value=1),
+        help="Emit rrBLUP-PCG timing log every N PCG iterations during --testPCG.",
     )
     return parser.parse_args()
 
@@ -882,21 +1088,39 @@ def main() -> int:
 
     check_jx_available()
 
+    ran_special = False
     if args.test_he:
         he_thread_checks(
             outdir,
             stage_timing=bool(args.he_stage_timing),
             stage_log_every=int(args.he_stage_log_every),
         )
-    elif args.mode == "smoke":
+        ran_special = True
+    if args.test_pcg:
+        pcg_thread_checks(
+            outdir,
+            stage_timing=bool(args.pcg_stage_timing),
+            stage_log_every=int(args.pcg_stage_log_every),
+        )
+        ran_special = True
+    if not ran_special and args.mode == "smoke":
         smoke_flow(outdir, logdir, args.threads, args.cv)
         backend_thread_checks(outdir)
-    else:
+    elif not ran_special:
         full_flow(outdir, postgs_enabled=not args.no_postgs)
         backend_thread_checks(outdir)
 
     step("Validation completed")
-    print(f"Mode      : {'testHE' if args.test_he else args.mode}")
+    if args.test_he or args.test_pcg:
+        parts: list[str] = []
+        if args.test_he:
+            parts.append("testHE")
+        if args.test_pcg:
+            parts.append("testPCG")
+        mode_text = ",".join(parts)
+    else:
+        mode_text = args.mode
+    print(f"Mode      : {mode_text}")
     print(f"Output dir: {outdir}")
     print(f"Log dir   : {logdir}")
     return 0

@@ -112,6 +112,7 @@ impl HeApplyTiming {
 }
 
 const SMALL_RHS_PAR_ROW_BLOCK: usize = 64;
+const SMALL_RHS_PAR_COL_BLOCK: usize = 256;
 
 fn emit_he_stage_timing(
     label: &str,
@@ -345,9 +346,58 @@ fn prefer_parallel_small_rhs(
     if tp.current_num_threads() <= 1 {
         return false;
     }
-    n_rhs <= 16
+    n_rhs <= 64
         && rows.saturating_mul(cols).saturating_mul(n_rhs) >= 1_048_576
         && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[inline(always)]
+fn accum_scaled_rhs_f32(out_row: &mut [f32], rhs_row: &[f32], a: f32) {
+    debug_assert_eq!(out_row.len(), rhs_row.len());
+    let len = out_row.len();
+    let mut t = 0usize;
+    while t + 16 <= len {
+        out_row[t] += a * rhs_row[t];
+        out_row[t + 1] += a * rhs_row[t + 1];
+        out_row[t + 2] += a * rhs_row[t + 2];
+        out_row[t + 3] += a * rhs_row[t + 3];
+        out_row[t + 4] += a * rhs_row[t + 4];
+        out_row[t + 5] += a * rhs_row[t + 5];
+        out_row[t + 6] += a * rhs_row[t + 6];
+        out_row[t + 7] += a * rhs_row[t + 7];
+        out_row[t + 8] += a * rhs_row[t + 8];
+        out_row[t + 9] += a * rhs_row[t + 9];
+        out_row[t + 10] += a * rhs_row[t + 10];
+        out_row[t + 11] += a * rhs_row[t + 11];
+        out_row[t + 12] += a * rhs_row[t + 12];
+        out_row[t + 13] += a * rhs_row[t + 13];
+        out_row[t + 14] += a * rhs_row[t + 14];
+        out_row[t + 15] += a * rhs_row[t + 15];
+        t += 16;
+    }
+    while t + 8 <= len {
+        out_row[t] += a * rhs_row[t];
+        out_row[t + 1] += a * rhs_row[t + 1];
+        out_row[t + 2] += a * rhs_row[t + 2];
+        out_row[t + 3] += a * rhs_row[t + 3];
+        out_row[t + 4] += a * rhs_row[t + 4];
+        out_row[t + 5] += a * rhs_row[t + 5];
+        out_row[t + 6] += a * rhs_row[t + 6];
+        out_row[t + 7] += a * rhs_row[t + 7];
+        t += 8;
+    }
+    while t + 4 <= len {
+        out_row[t] += a * rhs_row[t];
+        out_row[t + 1] += a * rhs_row[t + 1];
+        out_row[t + 2] += a * rhs_row[t + 2];
+        out_row[t + 3] += a * rhs_row[t + 3];
+        t += 4;
+    }
+    while t < len {
+        out_row[t] += a * rhs_row[t];
+        t += 1;
+    }
 }
 
 pub fn build_row_standardization_stats(
@@ -557,37 +607,78 @@ fn row_major_block_mul_mat_f32(
         return;
     }
     if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
-        let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
-        let mut run = || {
-            out.par_chunks_mut(n_rhs * row_block)
-                .enumerate()
-                .for_each(|(chunk_id, out_chunk)| {
-                    out_chunk.fill(0.0_f32);
-                    let row_start = chunk_id * row_block;
-                    let rows_here = out_chunk.len() / n_rhs;
-                    for local_r in 0..rows_here {
-                        let r = row_start + local_r;
-                        let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
-                        let row = &block[r * cols..(r + 1) * cols];
-                        for c in 0..cols {
-                            let a = row[c];
-                            if a == 0.0_f32 {
-                                continue;
-                            }
-                            let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
-                            for t in 0..n_rhs {
-                                out_row[t] += a * rhs_row[t];
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+            let mut run = || {
+                out.par_chunks_mut(n_rhs * row_block)
+                    .enumerate()
+                    .for_each(|(chunk_id, out_chunk)| {
+                        let row_start = chunk_id * row_block;
+                        let rows_here = out_chunk.len() / n_rhs;
+                        if rows_here == 0 {
+                            return;
+                        }
+                        unsafe {
+                            cblas_sgemm_dispatch(
+                                CBLAS_ROW_MAJOR,
+                                CBLAS_NO_TRANS,
+                                CBLAS_NO_TRANS,
+                                rows_here as CblasInt,
+                                n_rhs as CblasInt,
+                                cols as CblasInt,
+                                1.0,
+                                block.as_ptr().add(row_start * cols),
+                                cols as CblasInt,
+                                rhs.as_ptr(),
+                                n_rhs as CblasInt,
+                                0.0,
+                                out_chunk.as_mut_ptr(),
+                                n_rhs as CblasInt,
+                            );
+                        }
+                    });
+            };
+            if let Some(tp) = pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+            return;
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+            let mut run = || {
+                out.par_chunks_mut(n_rhs * row_block)
+                    .enumerate()
+                    .for_each(|(chunk_id, out_chunk)| {
+                        out_chunk.fill(0.0_f32);
+                        let row_start = chunk_id * row_block;
+                        let rows_here = out_chunk.len() / n_rhs;
+                        for local_r in 0..rows_here {
+                            let r = row_start + local_r;
+                            let out_row = &mut out_chunk[local_r * n_rhs..(local_r + 1) * n_rhs];
+                            let row = &block[r * cols..(r + 1) * cols];
+                            for c in 0..cols {
+                                let a = row[c];
+                                if a == 0.0_f32 {
+                                    continue;
+                                }
+                                let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
+                                accum_scaled_rhs_f32(out_row, rhs_row, a);
                             }
                         }
-                    }
-                });
-        };
-        if let Some(tp) = pool {
-            tp.install(run);
-        } else {
-            run();
+                    });
+            };
+            if let Some(tp) = pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+            return;
         }
-        return;
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -631,9 +722,7 @@ fn row_major_block_mul_mat_f32(
                             continue;
                         }
                         let rhs_row = &rhs[c * n_rhs..(c + 1) * n_rhs];
-                        for t in 0..n_rhs {
-                            out_row[t] += a * rhs_row[t];
-                        }
+                        accum_scaled_rhs_f32(out_row, rhs_row, a);
                     }
                 }
             });
@@ -657,35 +746,76 @@ fn row_major_block_t_mul_mat_accum_f32(
         return;
     }
     if prefer_parallel_small_rhs(rows, cols, n_rhs, pool) {
-        let col_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
-        let mut run = || {
-            out.par_chunks_mut(n_rhs * col_block)
-                .enumerate()
-                .for_each(|(chunk_id, out_chunk)| {
-                    let col_start = chunk_id * col_block;
-                    let cols_here = out_chunk.len() / n_rhs;
-                    for local_c in 0..cols_here {
-                        let c = col_start + local_c;
-                        let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            let col_block = SMALL_RHS_PAR_COL_BLOCK.max(1);
+            let mut run = || {
+                out.par_chunks_mut(n_rhs * col_block)
+                    .enumerate()
+                    .for_each(|(chunk_id, out_chunk)| {
+                        let col_start = chunk_id * col_block;
+                        let cols_here = out_chunk.len() / n_rhs;
+                        if cols_here == 0 {
+                            return;
+                        }
+                        unsafe {
+                            cblas_sgemm_dispatch(
+                                CBLAS_ROW_MAJOR,
+                                CBLAS_TRANS,
+                                CBLAS_NO_TRANS,
+                                cols_here as CblasInt,
+                                n_rhs as CblasInt,
+                                rows as CblasInt,
+                                1.0,
+                                block.as_ptr().add(col_start),
+                                cols as CblasInt,
+                                rhs.as_ptr(),
+                                n_rhs as CblasInt,
+                                1.0,
+                                out_chunk.as_mut_ptr(),
+                                n_rhs as CblasInt,
+                            );
+                        }
+                    });
+            };
+            if let Some(tp) = pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+            return;
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let col_block = SMALL_RHS_PAR_COL_BLOCK.max(1);
+            let mut run = || {
+                out.par_chunks_mut(n_rhs * col_block)
+                    .enumerate()
+                    .for_each(|(chunk_id, out_chunk)| {
+                        let col_start = chunk_id * col_block;
+                        let cols_here = out_chunk.len() / n_rhs;
                         for r in 0..rows {
-                            let a = block[r * cols + c];
-                            if a == 0.0_f32 {
-                                continue;
-                            }
                             let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
-                            for t in 0..n_rhs {
-                                out_row[t] += a * rhs_row[t];
+                            let row = &block[r * cols + col_start..r * cols + col_start + cols_here];
+                            for local_c in 0..cols_here {
+                                let a = row[local_c];
+                                if a == 0.0_f32 {
+                                    continue;
+                                }
+                                let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+                                accum_scaled_rhs_f32(out_row, rhs_row, a);
                             }
                         }
-                    }
-                });
-        };
-        if let Some(tp) = pool {
-            tp.install(run);
-        } else {
-            run();
+                    });
+            };
+            if let Some(tp) = pool {
+                tp.install(run);
+            } else {
+                run();
+            }
+            return;
         }
-        return;
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -711,24 +841,22 @@ fn row_major_block_t_mul_mat_accum_f32(
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let col_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+        let col_block = SMALL_RHS_PAR_COL_BLOCK.max(1);
         out.par_chunks_mut(n_rhs * col_block)
             .enumerate()
             .for_each(|(chunk_id, out_chunk)| {
                 let col_start = chunk_id * col_block;
                 let cols_here = out_chunk.len() / n_rhs;
-                for local_c in 0..cols_here {
-                    let c = col_start + local_c;
-                    let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
-                    for r in 0..rows {
-                        let a = block[r * cols + c];
+                for r in 0..rows {
+                    let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
+                    let row = &block[r * cols + col_start..r * cols + col_start + cols_here];
+                    for local_c in 0..cols_here {
+                        let a = row[local_c];
                         if a == 0.0_f32 {
                             continue;
                         }
-                        let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
-                        for t in 0..n_rhs {
-                            out_row[t] += a * rhs_row[t];
-                        }
+                        let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+                        accum_scaled_rhs_f32(out_row, rhs_row, a);
                     }
                 }
             });

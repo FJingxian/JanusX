@@ -52,7 +52,7 @@ import multiprocessing as mp
 import concurrent.futures as cf
 import textwrap
 from datetime import datetime
-from typing import Union, Optional
+from typing import Any, Union, Optional
 import uuid
 from contextlib import contextmanager
 
@@ -84,7 +84,6 @@ from janusx.gfreader import (
     prepare_cli_input_cache,
 )
 from janusx.pyBLUP.QK2 import QK
-from janusx.pyBLUP.assoc import LMM, LM, FastLMM, farmcpu
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
@@ -121,6 +120,35 @@ from janusx.script._common.genoio import (
     determine_genotype_source_from_args as determine_genotype_source,
     read_id_file as _read_id_file,
 )
+
+
+def _resolve_pyblup_assoc_symbol(name: str):
+    from janusx.pyBLUP import assoc as _assoc
+
+    return getattr(_assoc, str(name))
+
+
+class _LazyPyBlupAssocSymbol:
+    def __init__(self, name: str):
+        self._name = str(name)
+
+    def _resolve(self):
+        return _resolve_pyblup_assoc_symbol(self._name)
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
+
+    def __getattr__(self, attr: str):
+        return getattr(self._resolve(), attr)
+
+    def __repr__(self) -> str:
+        return f"<LazyPyBlupAssocSymbol {self._name}>"
+
+
+LM = _LazyPyBlupAssocSymbol("LM")
+LMM = _LazyPyBlupAssocSymbol("LMM")
+FastLMM = _LazyPyBlupAssocSymbol("FastLMM")
+farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
 from janusx.script._common.packedctx import prepare_packed_ctx_from_plink
 
 from janusx.script._common.colspec import parse_zero_based_index_specs
@@ -3946,8 +3974,8 @@ def _run_file_dense_fast_once(
         allele0_use, allele1_use = _transform_alleles(allele0_keep, allele1_keep, gm_tag)
 
         kinship_sub: Union[np.ndarray, None] = None
-        lmm_model_obj: Union[LMM, None] = None
-        fastlmm_model_obj: Union[FastLMM, None] = None
+        lmm_model_obj: Optional[Any] = None
+        fastlmm_model_obj: Optional[Any] = None
 
         for mkey in model_sequence:
             model_label = "FastLMM" if mkey == "fastlmm" else str(mkey).upper()

@@ -85,17 +85,6 @@ def _init_macos_openblas_path() -> None:
 
     os.environ.setdefault("JX_OPENBLAS_LIB_PATH", str(picked))
 
-    # Help dependent dylib resolution for @rpath/@loader_path fallbacks.
-    libs_dir = str(picked.parent)
-    fallback_key = "DYLD_FALLBACK_LIBRARY_PATH"
-    current = str(os.environ.get(fallback_key, "")).strip()
-    if current == "":
-        os.environ[fallback_key] = libs_dir
-    else:
-        parts = current.split(":")
-        if libs_dir not in parts:
-            os.environ[fallback_key] = f"{libs_dir}:{current}"
-
 
 _init_macos_openblas_path()
 
@@ -256,8 +245,9 @@ def maybe_emit_macos_eigh_fallback_hint(
 
     backend_line = "  backend: Accelerate LAPACK"
     warning_body = (
-        "OpenBLAS LAPACK was requested but unavailable; JanusX used Accelerate instead.\n"
-        "  Set JX_OPENBLAS_LIB_PATH to use OpenBLAS for faster eigendecomposition."
+        "Bundled OpenBLAS LAPACK was unavailable or skipped due to a runtime conflict; "
+        "JanusX used Accelerate instead.\n"
+        "  Set JX_RUST_EIGH_LAPACK_BACKEND=accelerate to silence this fallback."
     )
     _clear_current_stdout_line()
     if logger is not None and hasattr(logger, "info"):

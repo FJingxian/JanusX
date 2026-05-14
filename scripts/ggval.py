@@ -68,6 +68,8 @@ def run(
     stderr_to_stdout: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     print(f"+ {cmd_to_text(cmd)}")
+    proc_env = os.environ.copy()
+
     if stdout_path is not None:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         with stdout_path.open("w", encoding="utf-8") as out:
@@ -75,12 +77,13 @@ def run(
                 cmd,
                 cwd=str(cwd),
                 text=True,
+                env=proc_env,
                 stdout=out,
                 stderr=subprocess.STDOUT if stderr_to_stdout else None,
                 check=True,
             )
 
-    return subprocess.run(cmd, cwd=str(cwd), text=True, check=True)
+    return subprocess.run(cmd, cwd=str(cwd), text=True, env=proc_env, check=True)
 
 
 def require_file(path: Path, message: str = "required file not found") -> None:

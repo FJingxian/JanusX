@@ -2373,6 +2373,12 @@ struct OpenBlasLapackDyn {
 static OPENBLAS_LAPACK_DYN: OnceLock<Option<OpenBlasLapackDyn>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_name(image_index: u32) -> *const std::os::raw::c_char;
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MacEighLapackPref {
     Auto,
@@ -2403,11 +2409,18 @@ fn should_try_openblas_lapack_on_macos() -> bool {
         MacEighLapackPref::OpenBlas => true,
         MacEighLapackPref::Accelerate => false,
         // Auto policy on macOS:
-        // - BLAS kernels (GEMM/SYRK) still follow rust_sgemm_backend() and default
-        //   to Accelerate for GRM-heavy paths.
-        // - LAPACK eigensolver (dsyevd/dsyevr) probes dynamic OpenBLAS first and
-        //   falls back to Accelerate if unavailable.
-        MacEighLapackPref::Auto => true,
+        // - Reuse an already-loaded OpenBLAS runtime when one is present
+        //   (for example NumPy/Conda already loaded it for this process).
+        // - Otherwise prefer bundled wheel-local OpenBLAS LAPACK when safe.
+        // - If a foreign OpenMP runtime is already loaded but no OpenBLAS is
+        //   available to reuse, fall back to Accelerate to avoid mixed-
+        //   runtime crashes.
+        MacEighLapackPref::Auto => {
+            if macos_has_loaded_openblas_runtime() {
+                return true;
+            }
+            !macos_has_foreign_openmp_runtime_loaded()
+        }
     }
 }
 
@@ -2496,8 +2509,118 @@ fn extension_module_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_openblas_bundle_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::<PathBuf>::new();
+    if let Some(mod_dir) = extension_module_dir() {
+        for rel in [".dylibs", ".libs", ""] {
+            let probe = if rel.is_empty() {
+                mod_dir.clone()
+            } else {
+                mod_dir.join(rel)
+            };
+            if probe.exists() && probe.is_dir() && !out.iter().any(|p| p == &probe) {
+                out.push(probe);
+            }
+        }
+        if let Some(parent) = mod_dir.parent() {
+            let sib = parent.join("janusx.libs");
+            if sib.exists() && sib.is_dir() && !out.iter().any(|p| p == &sib) {
+                out.push(sib);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn macos_is_openmp_runtime_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.starts_with("libomp") || low.starts_with("libgomp") || low.starts_with("libiomp")
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn macos_is_openblas_runtime_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low.ends_with(".dylib") && low.contains("openblas")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_loaded_image_paths() -> Vec<PathBuf> {
+    let mut out = Vec::<PathBuf>::new();
+    let nimg = unsafe { _dyld_image_count() };
+    for i in 0..nimg {
+        let p = unsafe { _dyld_get_image_name(i) };
+        if p.is_null() {
+            continue;
+        }
+        let raw = unsafe { std::ffi::CStr::from_ptr(p) };
+        let path = PathBuf::from(raw.to_string_lossy().to_string());
+        if !out.iter().any(|v| v == &path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn macos_loaded_openblas_candidates() -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    for path in macos_loaded_image_paths().into_iter() {
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if !macos_is_openblas_runtime_name(name) {
+            continue;
+        }
+        let path_s = path.to_string_lossy().to_string();
+        if !out.iter().any(|v| v == &path_s) {
+            out.push(path_s);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn macos_has_loaded_openblas_runtime() -> bool {
+    !macos_loaded_openblas_candidates().is_empty()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_has_foreign_openmp_runtime_loaded() -> bool {
+    let bundle_dirs = macos_openblas_bundle_dirs();
+    if bundle_dirs.is_empty() {
+        return false;
+    }
+
+    for path in macos_loaded_image_paths().into_iter() {
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if !macos_is_openmp_runtime_name(name) {
+            continue;
+        }
+        if !bundle_dirs.iter().any(|root| path.starts_with(root)) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
 fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
     let mut out = Vec::<String>::new();
+
+    // 0) Prefer already-loaded OpenBLAS first in auto mode. This reuses the
+    //    process-local runtime and avoids dlopen() introducing a second
+    //    OpenMP runtime when NumPy/Conda has already loaded one.
+    if matches!(pref, MacEighLapackPref::Auto) {
+        for cand in macos_loaded_openblas_candidates() {
+            push_unique_candidate(&mut out, cand);
+        }
+    }
 
     // 1) Explicit user-provided locations (file or directory).
     for key in ["JX_OPENBLAS_LIB_PATH", "OPENBLAS_LIB_PATH"] {
@@ -2511,6 +2634,14 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
                     push_unique_candidate(&mut out, s.to_string());
                 }
             }
+        }
+    }
+
+    // Explicit OpenBLAS mode should still consider already-loaded runtimes
+    // after honoring user-provided paths.
+    if matches!(pref, MacEighLapackPref::OpenBlas) {
+        for cand in macos_loaded_openblas_candidates() {
+            push_unique_candidate(&mut out, cand);
         }
     }
 

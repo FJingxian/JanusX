@@ -6,6 +6,7 @@ import ctypes
 import glob
 import importlib.util
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -54,6 +55,7 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
     dylibs = sorted(glob.glob(os.path.join(libs_dir, "*.dylib")))
     if not dylibs:
         raise RuntimeError(f"no bundled dylibs found under {libs_dir}")
+    dylib_names = {os.path.basename(p) for p in dylibs}
 
     codesign_bin = "/usr/bin/codesign" if os.path.isfile("/usr/bin/codesign") else "codesign"
     for dylib in dylibs:
@@ -71,6 +73,60 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
             raise RuntimeError(
                 f"codesign verification failed for {dylib}: {detail}"
             )
+
+    def _otool_deps(path: str) -> list[str]:
+        proc = subprocess.run(
+            ["otool", "-L", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+        lines = [ln.strip() for ln in (proc.stdout or "").splitlines()[1:]]
+        out: list[str] = []
+        for ln in lines:
+            if not ln:
+                continue
+            out.append(ln.split(" (", 1)[0].strip())
+        return out
+
+    libopenblas_path = _find_bundled_openblas()
+    if os.path.basename(libopenblas_path) not in dylib_names:
+        raise RuntimeError(
+            f"bundled OpenBLAS path is not present under janusx.libs: {libopenblas_path}"
+        )
+
+    # Require a self-contained wheel-local dependency graph. If bundled
+    # OpenBLAS still references host-specific @rpath libs, runtime may silently
+    # pick up Homebrew/Conda copies and reintroduce mixed-BLAS crashes.
+    openblas_deps = _otool_deps(libopenblas_path)
+    expected_bundle_dep_names = {
+        Path(dep).name
+        for dep in openblas_deps
+        if not dep.startswith("/usr/lib/") and not dep.startswith("/System/Library/")
+    }
+    missing = sorted(name for name in expected_bundle_dep_names if name not in dylib_names)
+    if missing:
+        raise RuntimeError(
+            "bundled macOS OpenBLAS closure is incomplete; missing "
+            + ", ".join(missing)
+        )
+
+    for dylib in dylibs:
+        deps = _otool_deps(dylib)
+        for dep in deps:
+            if dep.startswith("/usr/lib/") or dep.startswith("/System/Library/"):
+                continue
+            dep_name = Path(dep).name
+            if dep_name not in dylib_names:
+                raise RuntimeError(
+                    f"bundled dylib {os.path.basename(dylib)} references non-bundled dependency {dep}"
+                )
+            expected = f"@loader_path/{dep_name}"
+            if dep != expected:
+                raise RuntimeError(
+                    f"bundled dylib {os.path.basename(dylib)} should reference {expected}, got {dep}"
+                )
 
     libpath = str(os.environ.get("JX_OPENBLAS_LIB_PATH", "")).strip()
     if not libpath:

@@ -12,9 +12,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import gaussian_kde
 
-from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 from janusx.script._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensure_cjk_font
 from janusx.script._common.progress import build_rich_progress, rich_progress_available
 from janusx.script._common.status import (
@@ -368,6 +366,8 @@ def fastplot(
         layout = [["A", "B", "B", "C"]]
         axes: dict[str, plt.Axes] = fig.subplot_mosaic(mosaic=layout)
 
+        from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
+
         gwasplot = GWASPLOT(results)
         scatter_size = 8.0
 
@@ -388,6 +388,8 @@ def fastplot(
             # Overlay seaborn-like KDE curve, scaled to histogram "Count" axis.
             if counts.size > 1 and np.unique(pheno).size > 1:
                 try:
+                    from scipy.stats import gaussian_kde
+
                     kde = gaussian_kde(pheno)
                     x_grid = np.linspace(float(np.min(pheno)), float(np.max(pheno)), 256)
                     y_density = kde(x_grid)

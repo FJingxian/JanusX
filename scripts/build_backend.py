@@ -351,6 +351,41 @@ def _is_macos_system_lib(dep: str) -> bool:
     return dep.startswith("/usr/lib/") or dep.startswith("/System/Library/")
 
 
+def _resolve_macos_otool_dep(
+    dep: str,
+    *,
+    origin_dir: Path,
+    extra_dirs: list[Path],
+) -> Path | None:
+    s = str(dep).strip()
+    if s == "":
+        return None
+    if _is_macos_system_lib(s):
+        return None
+
+    # Absolute dependency recorded by install name.
+    if s.startswith("/"):
+        p = Path(s)
+        return p if p.is_file() else None
+
+    dep_name = Path(s).name
+    search_dirs: list[Path] = [origin_dir, *extra_dirs]
+    seen: set[str] = set()
+    for d in search_dirs:
+        try:
+            rd = d.resolve()
+        except Exception:
+            rd = d
+        key = str(rd)
+        if key in seen:
+            continue
+        seen.add(key)
+        cand = rd / dep_name
+        if cand.is_file():
+            return cand.resolve()
+    return None
+
+
 def _collect_macos_openblas_dylibs() -> list[Path]:
     if sys.platform != "darwin":
         return []
@@ -407,6 +442,8 @@ def _collect_macos_openblas_dylibs() -> list[Path]:
         seed.append(primary.resolve())
 
     # Recursive dependency closure for non-system absolute dylibs.
+    runtime_dirs = _macos_runtime_dirs()
+    search_dirs: list[Path] = [source_dir, *runtime_dirs]
     picked: dict[str, Path] = {}
     queue: list[Path] = list(seed)
     while len(queue) > 0:
@@ -416,14 +453,19 @@ def _collect_macos_openblas_dylibs() -> list[Path]:
             continue
         picked[key] = cur
         for dep in _otool_libraries(cur):
-            if dep.startswith("@"):
+            dep_path = _resolve_macos_otool_dep(
+                dep,
+                origin_dir=cur.parent,
+                extra_dirs=search_dirs,
+            )
+            if dep_path is None:
+                if strict and (not _is_macos_system_lib(dep)):
+                    raise RuntimeError(
+                        "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but failed to resolve "
+                        f"macOS dylib dependency {dep!r} for {cur.name}."
+                    )
                 continue
-            if not dep.startswith("/"):
-                continue
-            if _is_macos_system_lib(dep):
-                continue
-            dep_path = Path(dep)
-            if dep_path.is_file() and dep_path.name.lower() not in picked:
+            if dep_path.name.lower() not in picked:
                 queue.append(dep_path)
     return sorted(picked.values(), key=lambda p: p.name.lower())
 

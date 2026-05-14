@@ -172,13 +172,52 @@ def detect_effective_threads(override_threads: int = 0) -> tuple[int, str]:
     return max(1, int(detected)), source
 
 
+def _parse_positive_int_list(raw: object) -> list[int]:
+    txt = str(raw).strip()
+    if txt == "":
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for token in re.split(r"[\s,;:+|]+", txt):
+        token = str(token).strip()
+        if token == "":
+            continue
+        value = _parse_positive_int(token)
+        if value is None:
+            fail(
+                "Thread target list must contain positive integers, "
+                f"got {token!r} in {raw!r}"
+            )
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(int(value))
+    return out
+
+
+def resolve_bench_thread_targets(
+    override_threads: int = 0,
+    thread_targets: object = "",
+) -> tuple[list[int], str]:
+    explicit = _parse_positive_int_list(thread_targets)
+    if len(explicit) > 0:
+        return (
+            explicit,
+            "explicit-sweep (--bench-thread-targets / JX_GGVAL_BENCH_THREAD_TARGETS)",
+        )
+    detected, source = detect_effective_threads(override_threads)
+    return [int(detected)], str(source)
+
+
+def _slugify_token(raw: object) -> str:
+    txt = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw).strip())
+    txt = txt.strip("._-")
+    return txt or "default"
+
+
 def _default_he_thread_policy() -> str:
-    # Benchmarks on macOS/Accelerate consistently favored keeping BLAS serial
-    # and letting Rayon own the outer HE parallelism.
-    if sys.platform == "darwin":
-        return "rayon_parallel_blas_serial"
-    # Keep the current default unchanged on other platforms until Linux/Windows
-    # benchmark results settle.
+    # Current HE benchmarks favor keeping BLAS serial and letting Rayon own the
+    # outer parallelism on all supported desktop/server targets.
     return "rayon_parallel_blas_serial"
 
 
@@ -191,8 +230,7 @@ _HE_THREAD_POLICY_SWEEP_DEFAULT = [
 
 
 def _default_pcg_thread_policy() -> str:
-    # Preserve the current rrBLUP-PCG default: BLAS serial, Rayon owns the
-    # outer loop. Benchmark sweeps can still compare split_half explicitly.
+    # Current PCG benchmarks favor BLAS serial + Rayon outer parallelism.
     return "rayon_parallel_blas_serial"
 
 
@@ -202,7 +240,15 @@ _PCG_THREAD_POLICY_SWEEP_DEFAULT = [
     "blas_parallel_rayon_serial",
     "split_half",
 ]
-_ROWMAJOR_KERNEL_DEFAULT = "blas"
+def _default_rowmajor_kernel_policy() -> str:
+    # Keep macOS on the dense BLAS path by default; Linux/Windows now default
+    # to the custom Rayon row-major kernel based on benchmark results.
+    if sys.platform == "darwin":
+        return "blas"
+    return "rayon"
+
+
+_ROWMAJOR_KERNEL_DEFAULT = _default_rowmajor_kernel_policy()
 
 
 def _default_rowmajor_kernel_compare_policies() -> list[str]:
@@ -486,6 +532,42 @@ def report_benchmark_phase(label: str, phase: str, elapsed: float, extra: str = 
     print(line)
 
 
+def report_stage_timing_summary(
+    label: str,
+    thread_target: int,
+    summary: dict[str, object],
+) -> None:
+    metrics = [
+        f"{str(k)}={float(summary.get(k, 0.0)):.3f}s"
+        for k in summary.get("metric_order", [])
+    ]
+    suffix = f" ({', '.join(metrics)})" if len(metrics) > 0 else ""
+    print(
+        f"{str(label)} stage summary      : "
+        f"{int(thread_target)} cores total={float(summary.get('total', 0.0)):.3f}s"
+        f"{suffix}"
+    )
+
+
+def report_stage_timing_compare(label: str, summaries: list[dict[str, object]]) -> None:
+    if len(summaries) < 2:
+        return
+    metric_order = [str(x) for x in summaries[0].get("metric_order", [])]
+    parts: list[str] = []
+    for metric in metric_order:
+        seq = " -> ".join(
+            f"{int(item.get('thread_target', 0))}c:{float(item.get(metric, 0.0)):.3f}s"
+            for item in summaries
+        )
+        parts.append(f"{metric} {seq}")
+    total_seq = " -> ".join(
+        f"{int(item.get('thread_target', 0))}c:{float(item.get('total', 0.0)):.3f}s"
+        for item in summaries
+    )
+    parts.append(f"total {total_seq}")
+    print(f"{str(label)} stage compare      : " + "; ".join(parts))
+
+
 def cmd_to_text(cmd: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(cmd)
@@ -724,6 +806,92 @@ def temporary_env_value(name: str, value: str | None):
             os.environ.pop(name, None)
         else:
             os.environ[name] = prev
+
+
+@contextmanager
+def native_stderr_capture(log_path: Path | None):
+    if log_path is None:
+        yield None
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    try:
+        with log_path.open("w", encoding="utf-8") as handle:
+            os.dup2(handle.fileno(), 2)
+            try:
+                yield log_path
+            finally:
+                sys.stderr.flush()
+                os.dup2(saved_fd, 2)
+    finally:
+        os.close(saved_fd)
+
+
+def _parse_he_stage_timing_summary(log_path: Path) -> dict[str, object] | None:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    matches = list(
+        re.finditer(
+            r"HE stage timing .* batch=(\d+)/(\d+) "
+            r"train_maf=([0-9.]+)s .* "
+            r"decode=([0-9.]+)s .* "
+            r"xmul=([0-9.]+)s .* "
+            r"xtmul=([0-9.]+)s .* "
+            r"trace=([0-9.]+)s .* "
+            r"other=([0-9.]+)s .* "
+            r"total=([0-9.]+)s",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if len(matches) == 0:
+        return None
+    m = matches[-1]
+    return {
+        "batch_done": int(m.group(1)),
+        "batch_total": int(m.group(2)),
+        "train_maf": float(m.group(3)),
+        "decode": float(m.group(4)),
+        "xmul": float(m.group(5)),
+        "xtmul": float(m.group(6)),
+        "trace": float(m.group(7)),
+        "other": float(m.group(8)),
+        "total": float(m.group(9)),
+        "metric_order": ["train_maf", "decode", "xmul", "xtmul", "trace", "other"],
+        "log_path": str(log_path),
+    }
+
+
+def _parse_pcg_stage_timing_summary(log_path: Path) -> dict[str, object] | None:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    matches = list(
+        re.finditer(
+            r"rrBLUP-PCG stage timing final iter=(\d+)/(\d+) "
+            r"decode=([0-9.]+)s .* "
+            r"xmul=([0-9.]+)s .* "
+            r"xtmul=([0-9.]+)s .* "
+            r"update=([0-9.]+)s .* "
+            r"callback=([0-9.]+)s .* "
+            r"total=([0-9.]+)s",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if len(matches) == 0:
+        return None
+    m = matches[-1]
+    return {
+        "iter_done": int(m.group(1)),
+        "iter_total": int(m.group(2)),
+        "decode": float(m.group(3)),
+        "xmul": float(m.group(4)),
+        "xtmul": float(m.group(5)),
+        "update": float(m.group(6)),
+        "callback": float(m.group(7)),
+        "total": float(m.group(8)),
+        "metric_order": ["decode", "xmul", "xtmul", "update", "callback"],
+        "log_path": str(log_path),
+    }
 
 
 def report_janusx_runtime(janusx_module: object, jxrs_module: object) -> None:
@@ -1260,12 +1428,14 @@ def he_thread_checks(
     outdir: Path,
     *,
     bench_threads: int = 0,
+    bench_thread_targets: str = "",
     thread_policy: str = _HE_THREAD_POLICY_DEFAULT,
     thread_policies: str = "",
     rowmajor_kernel_policy: str = _ROWMAJOR_KERNEL_DEFAULT,
     rowmajor_kernel_policies: str = "blas,rayon",
     stage_timing: bool = False,
     stage_log_every: int = 8,
+    logdir: Path | None = None,
 ) -> None:
     default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
     default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
@@ -1286,7 +1456,12 @@ def he_thread_checks(
         f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
     )
     sim_prefix = outdir / "__ggval_tmp_he_sim"
-    full_cores, full_cores_source = detect_effective_threads(bench_threads)
+    thread_targets, thread_target_source = resolve_bench_thread_targets(
+        bench_threads,
+        bench_thread_targets,
+    )
+    full_cores = max(int(x) for x in thread_targets)
+    logdir_use = Path(logdir or (outdir / "logs"))
 
     janusx, jxrs = import_janusx_runtime()
     runtime_thread_stage = resolve_runtime_thread_stage()
@@ -1301,10 +1476,17 @@ def he_thread_checks(
     if len(kernel_names) == 0:
         kernel_names = [_normalize_rowmajor_kernel_name(rowmajor_kernel_policy)]
     report_janusx_runtime(janusx, jxrs)
-    print(
-        "HE benchmark threads     : "
-        f"1 vs {full_cores} ({full_cores_source})"
-    )
+    if len(thread_targets) == 1:
+        print(
+            "HE benchmark threads     : "
+            f"1 vs {full_cores} ({thread_target_source})"
+        )
+    else:
+        print(
+            "HE benchmark threads     : "
+            f"1 vs {', '.join(str(int(x)) for x in thread_targets)} "
+            f"({thread_target_source})"
+        )
     print(f"HE BLAS backend          : {str(jxrs.rust_sgemm_backend()).strip()}")
     if len(kernel_names) == 1:
         print(
@@ -1319,8 +1501,14 @@ def he_thread_checks(
             )
         )
     if len(policy_names) == 1:
-        policy_preview = _resolve_he_thread_policy(policy_names[0], full_cores)
-        print(f"HE thread policy         : {str(policy_preview['label'])}")
+        if len(thread_targets) == 1:
+            policy_preview = _resolve_he_thread_policy(policy_names[0], full_cores)
+            print(f"HE thread policy         : {str(policy_preview['label'])}")
+        else:
+            print(
+                "HE thread policy         : "
+                f"{str(policy_names[0])} (resolved per target)"
+            )
     else:
         print(
             "HE thread sweep          : "
@@ -1333,7 +1521,7 @@ def he_thread_checks(
     if stage_timing:
         print(
             "HE stage timing         : "
-            "enabled for a separate diagnostic run "
+            "enabled for separate per-target diagnostic runs "
             f"(JX_GS_HE_STAGE_LOG_EVERY={int(max(1, stage_log_every))})"
         )
 
@@ -1369,7 +1557,8 @@ def he_thread_checks(
             kernel_name: str,
             *,
             enable_stage_timing: bool = False,
-        ) -> tuple[float, tuple[object, ...]]:
+            stage_log_path: Path | None = None,
+        ) -> tuple[float, tuple[object, ...], dict[str, object] | None]:
             threads = int(policy_spec["he_threads"])
             blas_threads = int(policy_spec["blas_threads"])
             rayon_threads = int(policy_spec["rayon_threads"])
@@ -1384,46 +1573,52 @@ def he_thread_checks(
                 os.environ["JX_GS_HE_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
             t0 = time.perf_counter()
             try:
-                with temporary_env_value("JX_ROWMAJOR_F32_KERNEL", str(kernel_name)):
-                    with runtime_thread_stage(
-                        blas_threads=int(blas_threads),
-                        rayon_threads=int(rayon_threads),
-                    ):
-                        call_kwargs = dict(
-                            trace_samples=int(trace_samples),
-                            trace_probe_batch=int(trace_probe_batch),
-                            tol=1e-6,
-                            max_iter=int(max_iter),
-                            block_rows=int(block_rows),
-                            std_eps=1e-12,
-                            use_train_maf=True,
-                            exact_trace_debug=False,
-                            exact_trace_max_n=256,
-                            threads=int(threads),
+                with native_stderr_capture(stage_log_path if enable_stage_timing else None):
+                    with temporary_env_value("JX_ROWMAJOR_F32_KERNEL", str(kernel_name)):
+                        with runtime_thread_stage(
                             blas_threads=int(blas_threads),
-                            seed=int(seed),
-                            packed=packed,
-                            packed_n_samples=int(n_samples),
-                            maf=maf,
-                            row_flip=row_flip,
-                        )
-                        try:
-                            ret = jxrs.he_pcg_bed(
-                                str(bfile_prefix),
-                                train_idx,
-                                y,
-                                **call_kwargs,
+                            rayon_threads=int(rayon_threads),
+                        ):
+                            call_kwargs = dict(
+                                trace_samples=int(trace_samples),
+                                trace_probe_batch=int(trace_probe_batch),
+                                tol=1e-6,
+                                max_iter=int(max_iter),
+                                block_rows=int(block_rows),
+                                std_eps=1e-12,
+                                use_train_maf=True,
+                                exact_trace_debug=False,
+                                exact_trace_max_n=256,
+                                threads=int(threads),
+                                blas_threads=int(blas_threads),
+                                seed=int(seed),
+                                packed=packed,
+                                packed_n_samples=int(n_samples),
+                                maf=maf,
+                                row_flip=row_flip,
                             )
-                        except TypeError:
-                            call_kwargs.pop("blas_threads", None)
-                            ret = jxrs.he_pcg_bed(
-                                str(bfile_prefix),
-                                train_idx,
-                                y,
-                                **call_kwargs,
-                            )
+                            try:
+                                ret = jxrs.he_pcg_bed(
+                                    str(bfile_prefix),
+                                    train_idx,
+                                    y,
+                                    **call_kwargs,
+                                )
+                            except TypeError:
+                                call_kwargs.pop("blas_threads", None)
+                                ret = jxrs.he_pcg_bed(
+                                    str(bfile_prefix),
+                                    train_idx,
+                                    y,
+                                    **call_kwargs,
+                                )
                 elapsed = time.perf_counter() - t0
-                return elapsed, tuple(ret)
+                stage_summary = (
+                    _parse_he_stage_timing_summary(stage_log_path)
+                    if enable_stage_timing and stage_log_path is not None and stage_log_path.is_file()
+                    else None
+                )
+                return elapsed, tuple(ret), stage_summary
             finally:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GS_HE_STAGE_TIMING", None)
@@ -1436,92 +1631,121 @@ def he_thread_checks(
 
         he_base_spec = _resolve_he_thread_policy("serial", 1)
         he_base_kernel = kernel_names[0]
-        he_t1, he_out_1 = run_he_once(
+        he_t1, he_out_1, _he_stage_base = run_he_once(
             he_base_spec,
             he_base_kernel,
             enable_stage_timing=False,
         )
         report_benchmark_phase("HE", "1-core baseline", he_t1)
-        he_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
-        for kernel_name in kernel_names:
-            for policy_name in policy_names:
-                policy_spec = _resolve_he_thread_policy(policy_name, full_cores)
-                he_tn, he_out_n = run_he_once(
-                    policy_spec,
-                    kernel_name,
-                    enable_stage_timing=False,
-                )
-                assert_he_outputs_close(he_out_1, he_out_n, full_cores)
-                he_results.append((kernel_name, policy_spec, he_tn, he_out_n))
-        if len(he_results) > 0:
-            best_multi_t = min(float(item[2]) for item in he_results)
-            phase_text = (
-                f"{full_cores}-core run"
-                if len(he_results) == 1
-                else f"{full_cores}-core strategy sweep"
-            )
-            report_benchmark_phase(
-                "HE",
-                phase_text,
-                best_multi_t,
-                extra=f"(completed {len(he_results)} run{'s' if len(he_results) != 1 else ''})",
-            )
-
-        best_kernel, best_spec, best_time, best_out = min(he_results, key=lambda item: item[2])
         print(f"HE runtime    (1 core)   : {he_t1:.3f}s")
-        if len(he_results) == 1:
-            only_kernel, only_spec, only_time, only_out = he_results[0]
-            print(f"HE runtime    ({full_cores} cores): {only_time:.3f}s")
-            if only_time > 0.0:
-                print(f"HE speedup               : {he_t1 / only_time:.2f}x")
-            he_out_to_report = only_out
-            diag_kernel = only_kernel
-            diag_spec = only_spec
-        else:
-            for kernel_name, policy_spec, elapsed, _he_out in he_results:
-                speedup = (he_t1 / elapsed) if elapsed > 0.0 else float("nan")
-                print(
-                    "HE strategy result       : "
-                    f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}), "
-                    f"{str(policy_spec['label'])} -> "
-                    f"{elapsed:.3f}s ({speedup:.2f}x)"
+        he_stage_summaries: list[dict[str, object]] = []
+        for thread_target in thread_targets:
+            he_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
+            for kernel_name in kernel_names:
+                for policy_name in policy_names:
+                    policy_spec = _resolve_he_thread_policy(policy_name, int(thread_target))
+                    he_tn, he_out_n, _he_stage = run_he_once(
+                        policy_spec,
+                        kernel_name,
+                        enable_stage_timing=False,
+                    )
+                    assert_he_outputs_close(he_out_1, he_out_n, int(thread_target))
+                    he_results.append((kernel_name, policy_spec, he_tn, he_out_n))
+            if len(he_results) > 0:
+                best_multi_t = min(float(item[2]) for item in he_results)
+                phase_text = (
+                    f"{int(thread_target)}-core run"
+                    if len(he_results) == 1
+                    else f"{int(thread_target)}-core strategy sweep"
                 )
-            print(
-                "HE best strategy         : "
-                f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}), "
-                f"{str(best_spec['label'])} -> "
-                f"{best_time:.3f}s ({(he_t1 / best_time):.2f}x)"
-            )
-            he_out_to_report = best_out
-            diag_kernel = best_kernel
-            diag_spec = best_spec
-        if len(he_out_to_report) >= 11:
-            print(
-                "HE estimate              : "
-                f"h2={float(he_out_to_report[2]):.6f}, "
-                f"lambda={float(he_out_to_report[10]):.6f}, "
-                f"converged={bool(he_out_to_report[3])}, "
-                f"m_eff={int(he_out_to_report[6])}"
-            )
-        if stage_timing:
-            print(
-                "HE stage timing note     : "
-                "benchmark timings above exclude diagnostic logging overhead"
-            )
-            print(
-                "HE stage timing policy   : "
-                f"{str(diag_spec['label'])}"
-            )
-            print(
-                "HE stage timing kernel   : "
-                f"{_rowmajor_kernel_label(diag_kernel)} ({diag_kernel})"
-            )
-            he_diag_t, _he_diag_out = run_he_once(
-                diag_spec,
-                diag_kernel,
-                enable_stage_timing=True,
-            )
-            print(f"HE stage diag runtime    : {he_diag_t:.3f}s")
+                report_benchmark_phase(
+                    "HE",
+                    phase_text,
+                    best_multi_t,
+                    extra=f"(completed {len(he_results)} run{'s' if len(he_results) != 1 else ''})",
+                )
+
+            best_kernel, best_spec, best_time, best_out = min(he_results, key=lambda item: item[2])
+            if len(thread_targets) > 1:
+                print(f"HE target                : {int(thread_target)} cores")
+            if len(he_results) == 1:
+                only_kernel, only_spec, only_time, only_out = he_results[0]
+                print(f"HE runtime    ({int(thread_target)} cores): {only_time:.3f}s")
+                if only_time > 0.0:
+                    print(f"HE speedup               : {he_t1 / only_time:.2f}x")
+                he_out_to_report = only_out
+                diag_kernel = only_kernel
+                diag_spec = only_spec
+            else:
+                for kernel_name, policy_spec, elapsed, _he_out in he_results:
+                    speedup = (he_t1 / elapsed) if elapsed > 0.0 else float("nan")
+                    print(
+                        "HE strategy result       : "
+                        f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}), "
+                        f"{str(policy_spec['label'])} -> "
+                        f"{elapsed:.3f}s ({speedup:.2f}x)"
+                    )
+                print(
+                    "HE best strategy         : "
+                    f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}), "
+                    f"{str(best_spec['label'])} -> "
+                    f"{best_time:.3f}s ({(he_t1 / best_time):.2f}x)"
+                )
+                he_out_to_report = best_out
+                diag_kernel = best_kernel
+                diag_spec = best_spec
+            if len(he_out_to_report) >= 11:
+                if len(thread_targets) == 1:
+                    print(
+                        "HE estimate              : "
+                        f"h2={float(he_out_to_report[2]):.6f}, "
+                        f"lambda={float(he_out_to_report[10]):.6f}, "
+                        f"converged={bool(he_out_to_report[3])}, "
+                        f"m_eff={int(he_out_to_report[6])}"
+                    )
+                else:
+                    print(
+                        f"HE estimate ({int(thread_target)} cores): "
+                        f"h2={float(he_out_to_report[2]):.6f}, "
+                        f"lambda={float(he_out_to_report[10]):.6f}, "
+                        f"converged={bool(he_out_to_report[3])}, "
+                        f"m_eff={int(he_out_to_report[6])}"
+                    )
+            if stage_timing:
+                print(
+                    "HE stage timing note     : "
+                    "benchmark timings above exclude diagnostic logging overhead"
+                )
+                print(
+                    "HE stage timing policy   : "
+                    f"{str(diag_spec['label'])}"
+                )
+                print(
+                    "HE stage timing kernel   : "
+                    f"{_rowmajor_kernel_label(diag_kernel)} ({diag_kernel})"
+                )
+                diag_log = logdir_use / (
+                    "ggval_he_stage_"
+                    f"t{int(thread_target)}_"
+                    f"{_slugify_token(diag_kernel)}_"
+                    f"{_slugify_token(diag_spec['policy'])}.log"
+                )
+                print(f"HE stage timing log      : {diag_log}")
+                he_diag_t, _he_diag_out, he_stage_summary = run_he_once(
+                    diag_spec,
+                    diag_kernel,
+                    enable_stage_timing=True,
+                    stage_log_path=diag_log,
+                )
+                print(f"HE stage diag runtime    : {he_diag_t:.3f}s")
+                if he_stage_summary is not None:
+                    he_stage_summary["thread_target"] = int(thread_target)
+                    report_stage_timing_summary("HE", int(thread_target), he_stage_summary)
+                    he_stage_summaries.append(dict(he_stage_summary))
+                else:
+                    print(f"HE stage summary         : unavailable, see {diag_log}")
+        if len(he_stage_summaries) > 1:
+            report_stage_timing_compare("HE", he_stage_summaries)
     finally:
         cleanup_tmp_outputs(outdir, sim_prefix.name)
     sep()
@@ -1531,12 +1755,14 @@ def pcg_thread_checks(
     outdir: Path,
     *,
     bench_threads: int = 0,
+    bench_thread_targets: str = "",
     thread_policy: str = _PCG_THREAD_POLICY_DEFAULT,
     thread_policies: str = "",
     rowmajor_kernel_policy: str = _ROWMAJOR_KERNEL_DEFAULT,
     rowmajor_kernel_policies: str = "blas,rayon",
     stage_timing: bool = False,
     stage_log_every: int = 100,
+    logdir: Path | None = None,
 ) -> None:
     default_nsnp_k = env_int("JX_GGVAL_BENCH_NSNP_K", 500, min_value=1)
     default_n_individuals = env_int("JX_GGVAL_BENCH_NIND", 5000, min_value=2)
@@ -1553,7 +1779,12 @@ def pcg_thread_checks(
         f"(simulated {n_individuals} x {nsnp_k * 1000} genotype)"
     )
     sim_prefix = outdir / "__ggval_tmp_pcg_sim"
-    full_cores, full_cores_source = detect_effective_threads(bench_threads)
+    thread_targets, thread_target_source = resolve_bench_thread_targets(
+        bench_threads,
+        bench_thread_targets,
+    )
+    full_cores = max(int(x) for x in thread_targets)
+    logdir_use = Path(logdir or (outdir / "logs"))
 
     janusx, jxrs = import_janusx_runtime()
     runtime_thread_stage = resolve_runtime_thread_stage()
@@ -1571,10 +1802,17 @@ def pcg_thread_checks(
     if len(kernel_names) == 0:
         kernel_names = [_normalize_rowmajor_kernel_name(rowmajor_kernel_policy)]
     report_janusx_runtime(janusx, jxrs)
-    print(
-        "PCG benchmark threads    : "
-        f"1 vs {full_cores} ({full_cores_source})"
-    )
+    if len(thread_targets) == 1:
+        print(
+            "PCG benchmark threads    : "
+            f"1 vs {full_cores} ({thread_target_source})"
+        )
+    else:
+        print(
+            "PCG benchmark threads    : "
+            f"1 vs {', '.join(str(int(x)) for x in thread_targets)} "
+            f"({thread_target_source})"
+        )
     print(f"PCG BLAS backend         : {str(jxrs.rust_sgemm_backend()).strip()}")
     if len(kernel_names) == 1:
         print(
@@ -1589,8 +1827,14 @@ def pcg_thread_checks(
             )
         )
     if len(policy_names) == 1:
-        policy_preview = _resolve_pcg_thread_policy(policy_names[0], full_cores)
-        print(f"PCG thread policy       : {str(policy_preview['label'])}")
+        if len(thread_targets) == 1:
+            policy_preview = _resolve_pcg_thread_policy(policy_names[0], full_cores)
+            print(f"PCG thread policy       : {str(policy_preview['label'])}")
+        else:
+            print(
+                "PCG thread policy       : "
+                f"{str(policy_names[0])} (resolved per target)"
+            )
     else:
         print(
             "PCG thread sweep        : "
@@ -1633,13 +1877,16 @@ def pcg_thread_checks(
         def run_pcg_once(
             policy_spec: dict[str, object],
             kernel_name: str,
-        ) -> tuple[float, tuple[object, ...]]:
+            *,
+            enable_stage_timing: bool = False,
+            stage_log_path: Path | None = None,
+        ) -> tuple[float, tuple[object, ...], dict[str, object] | None]:
             threads = int(policy_spec["pcg_threads"])
             blas_threads = int(policy_spec["blas_threads"])
             rayon_threads = int(policy_spec["rayon_threads"])
             prev_stage_timing = os.environ.get("JX_GS_PCG_STAGE_TIMING")
             prev_stage_log_every = os.environ.get("JX_GS_PCG_STAGE_LOG_EVERY")
-            if stage_timing:
+            if enable_stage_timing:
                 print(
                     "PCG timing run           : "
                     f"{str(policy_spec['label'])}, "
@@ -1649,47 +1896,53 @@ def pcg_thread_checks(
                 os.environ["JX_GS_PCG_STAGE_LOG_EVERY"] = str(int(max(1, stage_log_every)))
             t0 = time.perf_counter()
             try:
-                with temporary_env_value("JX_ROWMAJOR_F32_KERNEL", str(kernel_name)):
-                    with runtime_thread_stage(
-                        blas_threads=int(blas_threads),
-                        rayon_threads=int(rayon_threads),
-                    ):
-                        call_kwargs = dict(
-                            test_sample_indices=empty_idx,
-                            train_pred_local_indices=empty_idx,
-                            site_keep=None,
-                            lambda_value=float(lambda_value),
-                            tol=float(tol),
-                            max_iter=int(max_iter),
-                            block_rows=int(block_rows),
-                            std_eps=1e-12,
-                            threads=int(threads),
-                            progress_callback=None,
-                            progress_every=0,
-                            compute_trainvar=False,
-                            packed=packed,
-                            packed_n_samples=int(n_samples),
-                            maf=maf,
-                            row_flip=row_flip,
+                with native_stderr_capture(stage_log_path if enable_stage_timing else None):
+                    with temporary_env_value("JX_ROWMAJOR_F32_KERNEL", str(kernel_name)):
+                        with runtime_thread_stage(
                             blas_threads=int(blas_threads),
-                        )
-                        try:
-                            ret = jxrs.rrblup_pcg_bed(
-                                str(bfile_prefix),
-                                train_idx,
-                                y,
-                                **call_kwargs,
+                            rayon_threads=int(rayon_threads),
+                        ):
+                            call_kwargs = dict(
+                                test_sample_indices=empty_idx,
+                                train_pred_local_indices=empty_idx,
+                                site_keep=None,
+                                lambda_value=float(lambda_value),
+                                tol=float(tol),
+                                max_iter=int(max_iter),
+                                block_rows=int(block_rows),
+                                std_eps=1e-12,
+                                threads=int(threads),
+                                progress_callback=None,
+                                progress_every=0,
+                                compute_trainvar=False,
+                                packed=packed,
+                                packed_n_samples=int(n_samples),
+                                maf=maf,
+                                row_flip=row_flip,
+                                blas_threads=int(blas_threads),
                             )
-                        except TypeError:
-                            call_kwargs.pop("blas_threads", None)
-                            ret = jxrs.rrblup_pcg_bed(
-                                str(bfile_prefix),
-                                train_idx,
-                                y,
-                                **call_kwargs,
-                            )
+                            try:
+                                ret = jxrs.rrblup_pcg_bed(
+                                    str(bfile_prefix),
+                                    train_idx,
+                                    y,
+                                    **call_kwargs,
+                                )
+                            except TypeError:
+                                call_kwargs.pop("blas_threads", None)
+                                ret = jxrs.rrblup_pcg_bed(
+                                    str(bfile_prefix),
+                                    train_idx,
+                                    y,
+                                    **call_kwargs,
+                                )
                 elapsed = time.perf_counter() - t0
-                return elapsed, tuple(ret)
+                stage_summary = (
+                    _parse_pcg_stage_timing_summary(stage_log_path)
+                    if enable_stage_timing and stage_log_path is not None and stage_log_path.is_file()
+                    else None
+                )
+                return elapsed, tuple(ret), stage_summary
             finally:
                 if prev_stage_timing is None:
                     os.environ.pop("JX_GS_PCG_STAGE_TIMING", None)
@@ -1702,84 +1955,118 @@ def pcg_thread_checks(
 
         pcg_base_spec = _resolve_pcg_thread_policy("serial", 1)
         pcg_base_kernel = kernel_names[0]
-        pcg_t1, pcg_out_1 = run_pcg_once(pcg_base_spec, pcg_base_kernel)
+        pcg_t1, pcg_out_1, _pcg_stage_base = run_pcg_once(pcg_base_spec, pcg_base_kernel)
         report_benchmark_phase("PCG", "1-core baseline", pcg_t1)
-        pcg_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
-        for kernel_name in kernel_names:
-            for policy_name in policy_names:
-                policy_spec = _resolve_pcg_thread_policy(policy_name, full_cores)
-                pcg_tn, pcg_out_n = run_pcg_once(policy_spec, kernel_name)
-                assert_pcg_outputs_close(pcg_out_1, pcg_out_n, full_cores)
-                pcg_results.append((kernel_name, policy_spec, pcg_tn, pcg_out_n))
-        if len(pcg_results) > 0:
-            best_multi_t = min(float(item[2]) for item in pcg_results)
-            phase_text = (
-                f"{full_cores}-core run"
-                if len(pcg_results) == 1
-                else f"{full_cores}-core strategy sweep"
-            )
-            report_benchmark_phase(
-                "PCG",
-                phase_text,
-                best_multi_t,
-                extra=f"(completed {len(pcg_results)} run{'s' if len(pcg_results) != 1 else ''})",
-            )
-
         print(f"PCG runtime   (1 core)   : {pcg_t1:.3f}s")
-        if len(pcg_results) == 1:
-            only_kernel, only_spec, only_time, only_out = pcg_results[0]
-            print(f"PCG runtime   ({full_cores} cores): {only_time:.3f}s")
-            if only_time > 0.0:
-                print(f"PCG speedup              : {pcg_t1 / only_time:.2f}x")
-            pcg_out_to_report = only_out
-            diag_kernel = only_kernel
-            diag_spec = only_spec
-        else:
-            for kernel_name, policy_spec, elapsed, _pcg_out in pcg_results:
-                speedup = (pcg_t1 / elapsed) if elapsed > 0.0 else float("nan")
-                print(
-                    "PCG strategy result      : "
-                    f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}), "
-                    f"{str(policy_spec['label'])} -> "
-                    f"{elapsed:.3f}s ({speedup:.2f}x)"
+        pcg_stage_summaries: list[dict[str, object]] = []
+        for thread_target in thread_targets:
+            pcg_results: list[tuple[str, dict[str, object], float, tuple[object, ...]]] = []
+            for kernel_name in kernel_names:
+                for policy_name in policy_names:
+                    policy_spec = _resolve_pcg_thread_policy(policy_name, int(thread_target))
+                    pcg_tn, pcg_out_n, _pcg_stage = run_pcg_once(policy_spec, kernel_name)
+                    assert_pcg_outputs_close(pcg_out_1, pcg_out_n, int(thread_target))
+                    pcg_results.append((kernel_name, policy_spec, pcg_tn, pcg_out_n))
+            if len(pcg_results) > 0:
+                best_multi_t = min(float(item[2]) for item in pcg_results)
+                phase_text = (
+                    f"{int(thread_target)}-core run"
+                    if len(pcg_results) == 1
+                    else f"{int(thread_target)}-core strategy sweep"
                 )
-            best_kernel, best_spec, best_time, best_out = min(
-                pcg_results,
-                key=lambda item: item[2],
-            )
-            print(
-                "PCG best strategy        : "
-                f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}), "
-                f"{str(best_spec['label'])} -> "
-                f"{best_time:.3f}s ({(pcg_t1 / best_time):.2f}x)"
-            )
-            pcg_out_to_report = best_out
-            diag_kernel = best_kernel
-            diag_spec = best_spec
-        if len(pcg_out_to_report) >= 9:
-            print(
-                "PCG estimate             : "
-                f"converged={bool(pcg_out_to_report[3])}, "
-                f"iters={int(pcg_out_to_report[4])}, "
-                f"rel_res={float(pcg_out_to_report[5]):.6g}, "
-                f"m_eff={int(pcg_out_to_report[6])}, "
-                f"k_trace={float(pcg_out_to_report[8]):.6g}"
-            )
-        if stage_timing:
-            print(
-                "PCG stage timing note    : "
-                "benchmark timings above exclude diagnostic logging overhead"
-            )
-            print(
-                "PCG stage timing kernel  : "
-                f"{_rowmajor_kernel_label(diag_kernel)} ({diag_kernel})"
-            )
-            print(
-                "PCG stage timing policy  : "
-                f"{str(diag_spec['label'])}"
-            )
-            pcg_diag_t, _pcg_diag_out = run_pcg_once(diag_spec, diag_kernel)
-            print(f"PCG stage diag runtime   : {pcg_diag_t:.3f}s")
+                report_benchmark_phase(
+                    "PCG",
+                    phase_text,
+                    best_multi_t,
+                    extra=f"(completed {len(pcg_results)} run{'s' if len(pcg_results) != 1 else ''})",
+                )
+
+            if len(thread_targets) > 1:
+                print(f"PCG target               : {int(thread_target)} cores")
+            if len(pcg_results) == 1:
+                only_kernel, only_spec, only_time, only_out = pcg_results[0]
+                print(f"PCG runtime   ({int(thread_target)} cores): {only_time:.3f}s")
+                if only_time > 0.0:
+                    print(f"PCG speedup              : {pcg_t1 / only_time:.2f}x")
+                pcg_out_to_report = only_out
+                diag_kernel = only_kernel
+                diag_spec = only_spec
+            else:
+                for kernel_name, policy_spec, elapsed, _pcg_out in pcg_results:
+                    speedup = (pcg_t1 / elapsed) if elapsed > 0.0 else float("nan")
+                    print(
+                        "PCG strategy result      : "
+                        f"{_rowmajor_kernel_label(kernel_name)} ({kernel_name}), "
+                        f"{str(policy_spec['label'])} -> "
+                        f"{elapsed:.3f}s ({speedup:.2f}x)"
+                    )
+                best_kernel, best_spec, best_time, best_out = min(
+                    pcg_results,
+                    key=lambda item: item[2],
+                )
+                print(
+                    "PCG best strategy        : "
+                    f"{_rowmajor_kernel_label(best_kernel)} ({best_kernel}), "
+                    f"{str(best_spec['label'])} -> "
+                    f"{best_time:.3f}s ({(pcg_t1 / best_time):.2f}x)"
+                )
+                pcg_out_to_report = best_out
+                diag_kernel = best_kernel
+                diag_spec = best_spec
+            if len(pcg_out_to_report) >= 9:
+                if len(thread_targets) == 1:
+                    print(
+                        "PCG estimate             : "
+                        f"converged={bool(pcg_out_to_report[3])}, "
+                        f"iters={int(pcg_out_to_report[4])}, "
+                        f"rel_res={float(pcg_out_to_report[5]):.6g}, "
+                        f"m_eff={int(pcg_out_to_report[6])}, "
+                        f"k_trace={float(pcg_out_to_report[8]):.6g}"
+                    )
+                else:
+                    print(
+                        f"PCG estimate ({int(thread_target)} cores): "
+                        f"converged={bool(pcg_out_to_report[3])}, "
+                        f"iters={int(pcg_out_to_report[4])}, "
+                        f"rel_res={float(pcg_out_to_report[5]):.6g}, "
+                        f"m_eff={int(pcg_out_to_report[6])}, "
+                        f"k_trace={float(pcg_out_to_report[8]):.6g}"
+                    )
+            if stage_timing:
+                print(
+                    "PCG stage timing note    : "
+                    "benchmark timings above exclude diagnostic logging overhead"
+                )
+                print(
+                    "PCG stage timing kernel  : "
+                    f"{_rowmajor_kernel_label(diag_kernel)} ({diag_kernel})"
+                )
+                print(
+                    "PCG stage timing policy  : "
+                    f"{str(diag_spec['label'])}"
+                )
+                diag_log = logdir_use / (
+                    "ggval_pcg_stage_"
+                    f"t{int(thread_target)}_"
+                    f"{_slugify_token(diag_kernel)}_"
+                    f"{_slugify_token(diag_spec['policy'])}.log"
+                )
+                print(f"PCG stage timing log     : {diag_log}")
+                pcg_diag_t, _pcg_diag_out, pcg_stage_summary = run_pcg_once(
+                    diag_spec,
+                    diag_kernel,
+                    enable_stage_timing=True,
+                    stage_log_path=diag_log,
+                )
+                print(f"PCG stage diag runtime   : {pcg_diag_t:.3f}s")
+                if pcg_stage_summary is not None:
+                    pcg_stage_summary["thread_target"] = int(thread_target)
+                    report_stage_timing_summary("PCG", int(thread_target), pcg_stage_summary)
+                    pcg_stage_summaries.append(dict(pcg_stage_summary))
+                else:
+                    print(f"PCG stage summary        : unavailable, see {diag_log}")
+        if len(pcg_stage_summaries) > 1:
+            report_stage_timing_compare("PCG", pcg_stage_summaries)
     finally:
         cleanup_tmp_outputs(outdir, sim_prefix.name)
     sep()
@@ -1819,6 +2106,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Thread count for the multi-core side of benchmark checks "
             "(GRM/EIGH/HE/PCG). Use 0 to auto-detect scheduler/affinity limits."
+        ),
+    )
+    parser.add_argument(
+        "--bench-thread-targets",
+        type=str,
+        default=env_str("JX_GGVAL_BENCH_THREAD_TARGETS", ""),
+        help=(
+            "Comma-separated multi-core thread targets for HE/PCG benchmarks, "
+            "for example 16,32. When set, the same simulated payload is reused "
+            "for each target."
         ),
     )
     parser.add_argument(
@@ -1958,12 +2255,14 @@ def main() -> int:
         he_thread_checks(
             outdir,
             bench_threads=int(args.bench_threads),
+            bench_thread_targets=str(args.bench_thread_targets),
             thread_policy=str(args.he_thread_policy),
             thread_policies=str(args.he_thread_policies),
             rowmajor_kernel_policy=str(args.rowmajor_kernel_policy),
             rowmajor_kernel_policies=str(args.rowmajor_kernel_policies),
             stage_timing=bool(args.he_stage_timing),
             stage_log_every=int(args.he_stage_log_every),
+            logdir=logdir,
         )
         special_done += 1
         report_special_progress(special_done, special_total, "HE")
@@ -1972,12 +2271,14 @@ def main() -> int:
         pcg_thread_checks(
             outdir,
             bench_threads=int(args.bench_threads),
+            bench_thread_targets=str(args.bench_thread_targets),
             thread_policy=str(args.pcg_thread_policy),
             thread_policies=str(args.pcg_thread_policies),
             rowmajor_kernel_policy=str(args.rowmajor_kernel_policy),
             rowmajor_kernel_policies=str(args.rowmajor_kernel_policies),
             stage_timing=bool(args.pcg_stage_timing),
             stage_log_every=int(args.pcg_stage_log_every),
+            logdir=logdir,
         )
         special_done += 1
         report_special_progress(special_done, special_total, "PCG")

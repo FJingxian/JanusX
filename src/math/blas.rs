@@ -2209,12 +2209,11 @@ pub(crate) fn rust_sgemm_prefers_rayon_rowmajor_f32_kernel() -> bool {
     #[cfg(target_os = "windows")]
     {
         return match selected_sgemm_backend() {
-            // Keep Windows conservative for now: benchmark experiments showed
-            // throughput gains in some environments, but the Rayon row-major
-            // path is not yet stable enough to be the unconditional default.
-            SgemmBackend::OpenBlas => false,
+            // Windows benchmarks now favor the custom Rayon row-major kernel
+            // as the default path for the current HE/PCG access pattern.
+            SgemmBackend::OpenBlas => true,
             SgemmBackend::Accelerate => false,
-            SgemmBackend::Blas => false,
+            SgemmBackend::Blas => true,
             SgemmBackend::Rust => true,
         };
     }

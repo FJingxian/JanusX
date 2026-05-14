@@ -205,12 +205,7 @@ _GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
 
 
 def _default_rrblup_he_thread_policy() -> str:
-    # Benchmarks on macOS/Accelerate consistently favored keeping BLAS serial
-    # and letting Rayon own the outer HE parallelism.
-    if sys.platform == "darwin":
-        return "rayon_parallel_blas_serial"
-    # Keep the current default unchanged on other platforms until Linux/Windows
-    # benchmarks are finalized.
+    # Current rrBLUP-HE benchmarks favor BLAS serial + Rayon outer parallelism.
     return "rayon_parallel_blas_serial"
 
 
@@ -218,6 +213,7 @@ _RRBLUP_HE_THREAD_POLICY_DEFAULT = _default_rrblup_he_thread_policy()
 
 
 def _default_rrblup_pcg_thread_policy() -> str:
+    # Current rrBLUP-PCG benchmarks favor BLAS serial + Rayon outer parallelism.
     return "rayon_parallel_blas_serial"
 
 

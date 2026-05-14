@@ -17,7 +17,7 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_TRANS, rust_sgemm_backend_tag,
+    CBLAS_TRANS, rust_sgemm_prefers_rayon_rowmajor_f32_kernel,
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
@@ -140,9 +140,8 @@ fn row_major_block_mul_vec_f32(
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), cols);
     debug_assert_eq!(out.len(), rows);
-    let prefer_parallel = prefer_parallel_block_vec(rows, cols, pool);
-    #[cfg(target_os = "macos")]
-    let prefer_parallel = prefer_parallel && (rust_sgemm_backend_tag() != "accelerate");
+    let prefer_parallel = prefer_parallel_block_vec(rows, cols, pool)
+        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel();
     if prefer_parallel {
         let mut run = || {
             out.par_iter_mut().enumerate().for_each(|(r, out_cell)| {
@@ -205,7 +204,9 @@ fn row_major_block_t_mul_vec_accum_f32(
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
-    if prefer_parallel_block_vec(rows, cols, pool) {
+    if prefer_parallel_block_vec(rows, cols, pool)
+        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+    {
         let row_chunk = 256usize.min(rows.max(1));
         let mut run = || {
             let partial = block

@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut};
 use crate::blas::{
     cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_TRANS,
+    CBLAS_TRANS, rust_sgemm_prefers_rayon_rowmajor_f32_kernel,
 };
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
@@ -346,7 +346,9 @@ fn prefer_parallel_small_rhs(
     if tp.current_num_threads() <= 1 {
         return false;
     }
-    n_rhs <= 16 && rows.saturating_mul(cols).saturating_mul(n_rhs) >= 1_048_576
+    n_rhs <= 16
+        && rows.saturating_mul(cols).saturating_mul(n_rhs) >= 1_048_576
+        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
 }
 
 pub fn build_row_standardization_stats(
@@ -1393,7 +1395,8 @@ pub fn he_variance_components_packed_with_covariates(
     packed_n_samples=0,
     maf=None,
     row_flip=None,
-    x_cov=None
+    x_cov=None,
+    blas_threads=0
 ))]
 pub fn he_pcg_bed<'py>(
     py: Python<'py>,
@@ -1417,6 +1420,7 @@ pub fn he_pcg_bed<'py>(
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
     x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    blas_threads: usize,
 ) -> PyResult<(
     f64,
     f64,
@@ -1679,10 +1683,18 @@ pub fn he_pcg_bed<'py>(
     let pool_ref = pool_owned.as_ref();
     let he_res = py
         .detach(move || {
-            // Keep HE's BLAS kernels aligned with the requested outer thread count so
-            // `threads=1` is truly single-core and benchmark comparisons stay meaningful.
-            let _blas_guard = if threads > 0 {
-                Some(OpenBlasThreadGuard::enter(threads.max(1)))
+            // Keep OpenBLAS stage control independent from Rayon pool sizing when an
+            // explicit BLAS cap is provided, but preserve the legacy behavior of
+            // following `threads` when `blas_threads` is left at its default.
+            let blas_threads_effective = if blas_threads > 0 {
+                blas_threads.max(1)
+            } else if threads > 0 {
+                threads.max(1)
+            } else {
+                0
+            };
+            let _blas_guard = if blas_threads_effective > 0 {
+                Some(OpenBlasThreadGuard::enter(blas_threads_effective))
             } else {
                 None
             };

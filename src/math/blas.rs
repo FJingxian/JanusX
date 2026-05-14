@@ -2187,6 +2187,29 @@ pub(crate) fn rust_sgemm_backend_tag() -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) fn rust_sgemm_prefers_rayon_rowmajor_f32_kernel() -> bool {
+    if let Ok(raw) = std::env::var("JX_ROWMAJOR_F32_KERNEL") {
+        let norm = raw.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "rayon" | "parallel" | "custom" => return true,
+            "blas" | "gemm" | "serial" => return false,
+            _ => {}
+        }
+    }
+    // Default to the current macOS-like policy on all backends: prefer BLAS for
+    // these row-major f32 kernels unless an explicit override requests Rayon.
+    let _ = selected_sgemm_backend();
+    false
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[inline]
+pub(crate) fn rust_sgemm_prefers_rayon_rowmajor_f32_kernel() -> bool {
+    true
+}
+
 #[pyfunction]
 pub fn rust_eigh_lapack_backend() -> String {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

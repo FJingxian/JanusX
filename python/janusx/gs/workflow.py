@@ -202,6 +202,7 @@ _GBLUP_METHOD_ADD = "GBLUP"
 _GBLUP_METHOD_DOM = "GBLUP_D"
 _GBLUP_METHOD_AD = "GBLUP_AD"
 _GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
+_RRBLUP_HE_THREAD_POLICY_DEFAULT = "rayon_parallel_blas_serial"
 
 
 def _rrblup_vc_method_display(name: object) -> str:
@@ -216,6 +217,74 @@ def _rrblup_vc_method_display(name: object) -> str:
     if norm == "fastreml":
         return "FaSTreml"
     return txt
+
+
+def _normalize_he_thread_policy_name(
+    raw: object,
+    *,
+    default: str = _RRBLUP_HE_THREAD_POLICY_DEFAULT,
+    allow_compare: bool = False,
+) -> str:
+    txt = str(raw).strip().lower()
+    if txt == "":
+        txt = str(default).strip().lower()
+    norm = re.sub(r"[^a-z0-9]+", "", txt)
+    if norm in {
+        "",
+        "default",
+        "auto",
+        "rayon",
+        "rayonparallelblasserial",
+        "rayononly",
+    }:
+        return "rayon_parallel_blas_serial"
+    if norm in {"blas", "blasparallelrayonserial", "blasonly"}:
+        return "blas_parallel_rayon_serial"
+    if norm in {"split", "splithalf", "halfhalf", "balanced"}:
+        return "split_half"
+    if norm in {"serial", "single", "singlethread", "one"}:
+        return "serial"
+    if norm in {"compare", "all", "sweep"}:
+        return "compare" if allow_compare else str(default)
+    raise ValueError(
+        "Unsupported HE thread policy "
+        f"{raw!r}. Use one of: rayon_parallel_blas_serial, "
+        "blas_parallel_rayon_serial, split_half."
+    )
+
+
+def _resolve_he_thread_policy_spec(policy_name: object, total_threads: int) -> dict[str, typing.Any]:
+    total = max(1, int(total_threads))
+    policy = _normalize_he_thread_policy_name(policy_name, allow_compare=False)
+    if (policy == "serial") or (total <= 1):
+        blas_threads = 1
+        rayon_threads = 1
+        he_threads = 1
+    elif policy == "rayon_parallel_blas_serial":
+        blas_threads = 1
+        rayon_threads = total
+        he_threads = total
+    elif policy == "blas_parallel_rayon_serial":
+        blas_threads = total
+        rayon_threads = 1
+        he_threads = 1
+    elif policy == "split_half":
+        blas_threads = max(1, total // 2)
+        rayon_threads = max(1, total - blas_threads)
+        he_threads = rayon_threads
+    else:
+        raise ValueError(f"Unsupported HE thread policy {policy_name!r}")
+    return {
+        "policy": str(policy),
+        "target_threads": int(total),
+        "blas_threads": int(blas_threads),
+        "rayon_threads": int(rayon_threads),
+        "he_threads": int(he_threads),
+        "label": (
+            f"{policy} "
+            f"(blas={int(blas_threads)}, rayon={int(rayon_threads)}, he={int(he_threads)})"
+        ),
+    }
 
 
 def _warn_rust_gblup_backend_fallback_once(backend: str, allowed: set[str]) -> None:
@@ -2622,6 +2691,10 @@ def _estimate_rrblup_lambda_subsample_reml(
         "he_accepted": None,
         "he_reject_reason": "",
         "he_error": "",
+        "thread_policy": "",
+        "stage_blas_threads": 0,
+        "stage_rayon_threads": 0,
+        "he_threads_arg": 0,
     }
     lambda_auto_strategy = str(
         cfg_use.get("lambda_auto_strategy", "he_first")
@@ -2752,58 +2825,100 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_max_iter = int(max(1, int(cfg_use.get("he_max_iter", cfg_use.get("pcg_max_iter", 32)))))
             he_seed = int(cfg_use.get("he_seed", seed))
             he_use_train_maf = _cfg_truthy(cfg_use.get("he_use_train_maf", "on"), default=True)
+            he_thread_policy_raw = cfg_use.get(
+                "he_thread_policy",
+                cfg_use.get(
+                    "pcg_he_thread_policy",
+                    os.getenv(
+                        "JX_GS_HE_THREAD_POLICY",
+                        os.getenv(
+                            "JX_RRBLUP_HE_THREAD_POLICY",
+                            _RRBLUP_HE_THREAD_POLICY_DEFAULT,
+                        ),
+                    ),
+                ),
+            )
+            he_thread_spec = _resolve_he_thread_policy_spec(
+                he_thread_policy_raw,
+                int(max(1, int(n_jobs))),
+            )
+            he_diag["thread_policy"] = str(he_thread_spec["policy"])
+            he_diag["stage_blas_threads"] = int(he_thread_spec["blas_threads"])
+            he_diag["stage_rayon_threads"] = int(he_thread_spec["rayon_threads"])
+            he_diag["he_threads_arg"] = int(he_thread_spec["he_threads"])
 
             _emit(
                 "pcg_lambda_vc_start",
                 vc_method="HE",
                 strategy="he",
                 trace_samples=int(he_trace_samples),
+                thread_policy=str(he_thread_spec["policy"]),
+                stage_blas_threads=int(he_thread_spec["blas_threads"]),
+                stage_rayon_threads=int(he_thread_spec["rayon_threads"]),
+                he_threads=int(he_thread_spec["he_threads"]),
             )
             try:
                 with runtime_thread_stage(
-                    blas_threads=1,
-                    rayon_threads=int(max(1, int(n_jobs))),
+                    blas_threads=int(he_thread_spec["blas_threads"]),
+                    rayon_threads=int(he_thread_spec["rayon_threads"]),
                 ):
+                    he_call_kwargs = dict(
+                        site_keep=site_keep_arg,
+                        trace_samples=int(he_trace_samples),
+                        trace_probe_batch=int(he_trace_probe_batch),
+                        tol=float(he_tol),
+                        max_iter=int(he_max_iter),
+                        block_rows=int(he_block_rows),
+                        std_eps=float(std_eps),
+                        use_train_maf=bool(he_use_train_maf),
+                        threads=int(he_thread_spec["he_threads"]),
+                        blas_threads=int(he_thread_spec["blas_threads"]),
+                        seed=int(he_seed),
+                        packed=packed_arg,
+                        packed_n_samples=int(n_samples_full),
+                        maf=maf_arg,
+                        row_flip=row_flip_arg,
+                    )
                     try:
                         he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
                             source_prefix,
                             train_abs,
                             y_vec,
-                            site_keep=site_keep_arg,
-                            trace_samples=int(he_trace_samples),
-                            trace_probe_batch=int(he_trace_probe_batch),
-                            tol=float(he_tol),
-                            max_iter=int(he_max_iter),
-                            block_rows=int(he_block_rows),
-                            std_eps=float(std_eps),
-                            use_train_maf=bool(he_use_train_maf),
-                            threads=int(max(1, int(n_jobs))),
-                            seed=int(he_seed),
-                            packed=packed_arg,
-                            packed_n_samples=int(n_samples_full),
-                            maf=maf_arg,
-                            row_flip=row_flip_arg,
+                            **he_call_kwargs,
                         )
                     except TypeError:
-                        he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
-                            source_prefix,
-                            train_abs,
-                            y_vec,
-                            site_keep_arg,
-                            int(he_trace_samples),
-                            float(he_tol),
-                            int(he_max_iter),
-                            int(he_block_rows),
-                            float(std_eps),
-                            bool(he_use_train_maf),
-                            int(max(1, int(n_jobs))),
-                            int(he_seed),
-                        )
+                        he_call_kwargs.pop("blas_threads", None)
+                        try:
+                            he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_vec,
+                                **he_call_kwargs,
+                            )
+                        except TypeError:
+                            he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
+                                source_prefix,
+                                train_abs,
+                                y_vec,
+                                site_keep_arg,
+                                int(he_trace_samples),
+                                float(he_tol),
+                                int(he_max_iter),
+                                int(he_block_rows),
+                                float(std_eps),
+                                bool(he_use_train_maf),
+                                int(he_thread_spec["he_threads"]),
+                                int(he_seed),
+                            )
             finally:
                 _emit(
                     "pcg_lambda_vc_end",
                     vc_method="HE",
                     strategy="he",
+                    thread_policy=str(he_thread_spec["policy"]),
+                    stage_blas_threads=int(he_thread_spec["blas_threads"]),
+                    stage_rayon_threads=int(he_thread_spec["rayon_threads"]),
+                    he_threads=int(he_thread_spec["he_threads"]),
                 )
 
             he_t = tuple(he_out)
@@ -2859,6 +2974,10 @@ def _estimate_rrblup_lambda_subsample_reml(
                         "lambda_he_lambda_k": float(he_lambda_k_sel),
                         "lambda_he_lambda_equation": float(he_lambda_eq_sel),
                         "trace_samples_used": int(he_trace_samples),
+                        "thread_policy": str(he_thread_spec["policy"]),
+                        "stage_blas_threads": int(he_thread_spec["blas_threads"]),
+                        "stage_rayon_threads": int(he_thread_spec["rayon_threads"]),
+                        "he_threads_arg": int(he_thread_spec["he_threads"]),
                         "he_tr_k2": float(he_tr_k2),
                         "he_tr_k2_solve": float(he_tr_k2_solve),
                         "he_y_ky": float(he_y_ky),
@@ -5332,6 +5451,10 @@ def GSapi(
                 "lambda_he_accepted",
                 "lambda_he_reject_reason",
                 "lambda_he_error",
+                "lambda_he_thread_policy",
+                "lambda_he_stage_blas_threads",
+                "lambda_he_stage_rayon_threads",
+                "lambda_he_threads_arg",
                 "lambda_vc_method",
                 "lambda_vc_sigma_g2",
                 "lambda_vc_sigma_e2",
@@ -5407,6 +5530,10 @@ def GSapi(
             _set_bool("lambda_he_accepted", "he_accepted")
             _set_str("lambda_he_reject_reason", "he_reject_reason")
             _set_str("lambda_he_error", "he_error")
+            _set_str("lambda_he_thread_policy", "thread_policy")
+            _set_int("lambda_he_stage_blas_threads", "stage_blas_threads")
+            _set_int("lambda_he_stage_rayon_threads", "stage_rayon_threads")
+            _set_int("lambda_he_threads_arg", "he_threads_arg")
             _set_str("lambda_vc_method", "vc_method")
             _set_float("lambda_vc_sigma_g2", "vc_sigma_g2")
             _set_float("lambda_vc_sigma_e2", "vc_sigma_e2")
@@ -8909,6 +9036,22 @@ def _run_methods_parallel(
                 vc_method = _rrblup_vc_method_display(vc_method)
                 if vc_method != "":
                     rows.append(("method", vc_method))
+                he_thread_policy = str(rr_state.get("lambda_he_thread_policy", "")).strip()
+                if he_thread_policy != "":
+                    he_blas_threads = int(max(0, int(rr_state.get("lambda_he_stage_blas_threads", 0) or 0)))
+                    he_rayon_threads = int(max(0, int(rr_state.get("lambda_he_stage_rayon_threads", 0) or 0)))
+                    he_threads_arg = int(max(0, int(rr_state.get("lambda_he_threads_arg", 0) or 0)))
+                    rows.append(
+                        (
+                            "HE threads",
+                            (
+                                f"{he_thread_policy} "
+                                f"(blas={he_blas_threads}, "
+                                f"rayon={he_rayon_threads}, "
+                                f"he={he_threads_arg})"
+                            ),
+                        )
+                    )
                 va = float(rr_state.get("lambda_vc_sigma_g2", np.nan))
                 ve = float(rr_state.get("lambda_vc_sigma_e2", np.nan))
                 pve_vc = float(rr_state.get("lambda_vc_pve", np.nan))
@@ -12801,6 +12944,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
+        "--rrblup-he-thread-policy",
+        type=str,
+        default=os.getenv(
+            "JX_RRBLUP_HE_THREAD_POLICY",
+            os.getenv("JX_GS_HE_THREAD_POLICY", _RRBLUP_HE_THREAD_POLICY_DEFAULT),
+        ),
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
         "--rrblup-lr",
         type=float,
         default=1e-2,
@@ -13296,6 +13448,7 @@ def _run_gs_pipeline(
         "lambda_subsample_max_n": int(_RRBLUP_LAMBDA_SUBSAMPLE_MAX_N),
         "lambda_subsample_repeats": int(args.rrblup_lambda_subsample_repeats),
         "lambda_subsample_seed": int(args.rrblup_lambda_subsample_seed),
+        "he_thread_policy": str(args.rrblup_he_thread_policy),
         "lambda_large_cutoff": 15_000,
         "lr": float(args.rrblup_lr),
         "epochs": int(args.rrblup_epochs),

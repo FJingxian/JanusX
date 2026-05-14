@@ -82,6 +82,63 @@ def _lm_precompute_ixx_qr(x_design: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(ixx, dtype=np.float64)
 
 
+def _packed_ctx_active_view_for_gwas(
+    packed_ctx: dict[str, object],
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
+    packed_n = int(packed_ctx["n_samples"])
+    if packed.ndim != 2:
+        raise ValueError("Packed GWAS context requires packed ndim=2.")
+    maf_full = np.ascontiguousarray(
+        np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
+        dtype=np.float32,
+    )
+    if int(maf_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS context mismatch: maf length != packed rows.")
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        if not hasattr(jxrs, "bed_packed_row_flip_mask"):
+            raise RuntimeError(
+                "Rust packed row-flip kernel is unavailable. Rebuild/install JanusX extension."
+            )
+        row_flip_full = np.ascontiguousarray(
+            np.asarray(jxrs.bed_packed_row_flip_mask(packed, int(packed_n)), dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        packed_ctx["row_flip"] = row_flip_full
+    else:
+        row_flip_full = np.ascontiguousarray(
+            np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    if int(row_flip_full.shape[0]) != int(packed.shape[0]):
+        raise ValueError("Packed GWAS context mismatch: row_flip length != packed rows.")
+
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is None:
+        active_row_idx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64), dtype=np.int64)
+    else:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        active_row_idx = np.ascontiguousarray(
+            np.asarray(
+                packed_ctx.get(
+                    "active_row_idx",
+                    np.flatnonzero(site_keep).astype(np.int64, copy=False),
+                ),
+                dtype=np.int64,
+            ).reshape(-1),
+            dtype=np.int64,
+        )
+        if int(site_keep.shape[0]) < int(active_row_idx.shape[0]):
+            raise ValueError("Packed GWAS context mismatch: active_row_idx exceeds site_keep length.")
+    maf_active = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    row_flip_active = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+    return packed, packed_n, active_row_idx, maf_active, row_flip_active
+
+
 def _prepare_packed_bed_once_for_gwas(
     *,
     genofile: str,
@@ -130,6 +187,17 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx_obj.get("site_keep"), dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
             ) if packed_ctx_obj.get("site_keep", None) is not None else None,
+            "active_row_idx": np.ascontiguousarray(
+                np.asarray(
+                    packed_ctx_obj.get(
+                        "active_row_idx",
+                        np.arange(int(np.asarray(packed_ctx_obj["packed"]).shape[0]), dtype=np.int64),
+                    ),
+                    dtype=np.int64,
+                ).reshape(-1),
+                dtype=np.int64,
+            ),
+            "packed_filter_mode": str(packed_ctx_obj.get("packed_filter_mode", "compact")),
             "n_samples": int(packed_ctx_obj["n_samples"]),
             "source_prefix": str(prefix),
         }
@@ -149,6 +217,7 @@ def _prepare_packed_bed_once_for_gwas(
                     missing_rate=float(max_missing_rate),
                     het_threshold=float(het_threshold),
                     snps_only=bool(snps_only),
+                    filter_mode="lazy",
                 )
             except Exception:
                 task.fail("Loading packed BED genotype ...Failed")
@@ -173,6 +242,14 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx.get("site_keep"), dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
             ) if packed_ctx.get("site_keep", None) is not None else None,
+            "active_row_idx": np.ascontiguousarray(
+                np.asarray(
+                    packed_ctx.get("active_row_idx", np.arange(int(np.asarray(packed_ctx["packed"]).shape[0]), dtype=np.int64)),
+                    dtype=np.int64,
+                ).reshape(-1),
+                dtype=np.int64,
+            ),
+            "packed_filter_mode": str(packed_ctx.get("packed_filter_mode", "compact")),
             "n_samples": int(packed_ctx["n_samples"]),
             "source_prefix": str(prefix),
         }
@@ -186,10 +263,17 @@ def _prepare_packed_bed_once_for_gwas(
     if int(site_keep.shape[0]) != int(len(sites_all_full)):
         raise ValueError("Packed site_keep length mismatch with BIM rows.")
     sites_all = [s for s, keep in zip(sites_all_full, site_keep) if bool(keep)]
-    if int(len(sites_all)) != int(np.asarray(packed_ctx["packed"]).shape[0]):
+    active_row_idx = np.ascontiguousarray(
+        np.asarray(
+            packed_ctx.get("active_row_idx", np.flatnonzero(site_keep).astype(np.int64, copy=False)),
+            dtype=np.int64,
+        ).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(len(sites_all)) != int(active_row_idx.shape[0]):
         raise ValueError(
             f"Packed/BIM mismatch after filtering: sites={len(sites_all)} "
-            f"packed_rows={np.asarray(packed_ctx['packed']).shape[0]}"
+            f"active_rows={active_row_idx.shape[0]}"
         )
     return str(prefix), full_ids, packed_ctx, sites_all
 
@@ -324,21 +408,17 @@ def run_fastlmm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    row_flip = np.ascontiguousarray(
-        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
-        dtype=np.bool_,
+    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+        packed_ctx
     )
-    packed_n = int(packed_ctx["n_samples"])
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
-    if int(len(sites_all)) != int(packed.shape[0]):
+    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
         raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
     chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
     pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
@@ -622,6 +702,7 @@ def run_fastlmm_packed_fullrank(
                             int(threads),
                             None,
                             int(max(1, int(chunk_size))),
+                            row_indices=packed_row_idx,
                         )
                         r0 = _res[0]
                         lbd = float(r0.get("lbd", np.nan))
@@ -658,6 +739,7 @@ def run_fastlmm_packed_fullrank(
                         allele0_all,
                         allele1_all,
                         out_tsv,
+                        row_indices=packed_row_idx,
                         fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
                         fixed_ml0=(float(fixed_ml0) if fixed_ml0 is not None else None),
                         **progress_kwargs,
@@ -790,21 +872,17 @@ def run_lm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    row_flip = np.ascontiguousarray(
-        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
-        dtype=np.bool_,
+    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+        packed_ctx
     )
-    packed_n = int(packed_ctx["n_samples"])
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
-    if int(len(sites_all)) != int(packed.shape[0]):
+    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
         raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
     chrom_all = [str(c) for (c, _p, _a0, _a1) in sites_all]
     pos_all = [int(p) for (_c, p, _a0, _a1) in sites_all]
@@ -947,6 +1025,7 @@ def run_lm_packed_fullrank(
                             int(threads),
                             None,
                             int(max(1, int(chunk_size))),
+                            row_indices=packed_row_idx,
                         )
                         try:
                             _written_rows = int(_res[0].get("written_rows", len(chrom_all)))
@@ -977,8 +1056,9 @@ def run_lm_packed_fullrank(
                             allele1_all,
                             out_tsv,
                             sample_idx_trait,
-                            int(max(1, int(chunk_size))),
-                            int(threads),
+                            row_indices=packed_row_idx,
+                            step=int(max(1, int(chunk_size))),
+                            threads=int(threads),
                             **kwargs_assoc,
                         )
                     except TypeError:
@@ -998,8 +1078,9 @@ def run_lm_packed_fullrank(
                             allele1_all,
                             out_tsv,
                             sample_idx_trait,
-                            int(max(1, int(chunk_size))),
-                            int(threads),
+                            row_indices=packed_row_idx,
+                            step=int(max(1, int(chunk_size))),
+                            threads=int(threads),
                             **kwargs_assoc,
                         )
             gwas_ok = True
@@ -1470,21 +1551,17 @@ def run_lmm_packed_fullrank(
     except KeyError as e:
         raise ValueError("Some aligned sample IDs are not present in packed BED sample order.") from e
 
-    packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1), dtype=np.float32)
-    row_flip = np.ascontiguousarray(
-        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
-        dtype=np.bool_,
+    packed, packed_n, packed_row_idx, maf, row_flip = _packed_ctx_active_view_for_gwas(
+        packed_ctx
     )
-    packed_n = int(packed_ctx["n_samples"])
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
-    if packed.shape[0] != maf.shape[0] or packed.shape[0] != row_flip.shape[0]:
+    if int(packed_row_idx.shape[0]) != int(maf.shape[0]) or int(packed_row_idx.shape[0]) != int(row_flip.shape[0]):
         raise ValueError("Packed BED arrays have inconsistent SNP dimensions.")
 
-    if int(len(sites_all)) != int(packed.shape[0]):
+    if int(len(sites_all)) != int(packed_row_idx.shape[0]):
         raise ValueError(
-            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} packed_rows={packed.shape[0]}"
+            f"Packed/BIM mismatch after filtering: sites={len(sites_all)} active_rows={packed_row_idx.shape[0]}"
         )
 
     process = psutil.Process()
@@ -1661,12 +1738,13 @@ def run_lmm_packed_fullrank(
                     allele1_all,
                     out_tsv,
                     sample_idx_trait,
-                    -5.0,
-                    5.0,
-                    50,
-                    1e-2,
-                    int(threads),
-                    "add",
+                    row_indices=packed_row_idx,
+                    low=-5.0,
+                    high=5.0,
+                    max_iter=50,
+                    tol=1e-2,
+                    threads=int(threads),
+                    model="add",
                     nullml=null_ml0,
                     init_log10_lbd=init_log10_lbd,
                     **progress_kwargs,

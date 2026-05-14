@@ -328,6 +328,16 @@ def _emit_packed_load_debug(
             return
         packed_rows = int(packed.shape[0])
         bytes_per_snp = int(packed.shape[1])
+        active_rows = int(
+            packed_ctx.get(
+                "n_active_sites",
+                np.asarray(
+                    packed_ctx.get("active_row_idx", np.arange(packed_rows, dtype=np.int64)),
+                    dtype=np.int64,
+                ).reshape(-1).shape[0],
+            )
+        )
+        filter_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip() or "compact"
         site_keep_raw = packed_ctx.get("site_keep", None)
         source_rows = packed_rows
         if site_keep_raw is not None:
@@ -335,10 +345,10 @@ def _emit_packed_load_debug(
                 source_rows = int(np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1).shape[0])
             except Exception:
                 source_rows = packed_rows
-        source_rows = int(max(packed_rows, source_rows))
+        source_rows = int(max(packed_rows, source_rows, active_rows))
         packed_bytes = int(packed.nbytes)
         source_bed_payload_bytes = int(source_rows * bytes_per_snp)
-        dropped_rows = int(max(0, source_rows - packed_rows))
+        dropped_rows = int(max(0, source_rows - active_rows))
         label_txt = str(label).strip()
         if label_txt != "":
             label_txt = f" {label_txt}"
@@ -346,8 +356,10 @@ def _emit_packed_load_debug(
             (
                 f"[GS-DEBUG] Packed load{label_txt} "
                 f"rows={packed_rows} "
+                f"active_rows={active_rows} "
                 f"source_rows={source_rows} "
                 f"dropped={dropped_rows} "
+                f"mode={filter_mode} "
                 f"bytes_per_snp={bytes_per_snp} "
                 f"packed={_format_debug_bytes(packed_bytes)} "
                 f"source_bed_payload={_format_debug_bytes(source_bed_payload_bytes)} "
@@ -362,6 +374,45 @@ def _emit_packed_load_debug(
             f"[GS-DEBUG] Packed load {label or 'main'} debug_failed={type(ex).__name__}:{ex}",
             flush=True,
         )
+
+
+def _packed_ctx_active_rows(packed_ctx: dict[str, typing.Any]) -> int:
+    try:
+        return int(packed_ctx.get("n_active_sites", 0)) or int(
+            np.asarray(
+                packed_ctx.get(
+                    "active_row_idx",
+                    np.arange(int(np.asarray(packed_ctx["packed"]).shape[0]), dtype=np.int64),
+                ),
+                dtype=np.int64,
+            ).reshape(-1).shape[0]
+        )
+    except Exception:
+        return int(np.asarray(packed_ctx["packed"]).shape[0])
+
+
+def _packed_ctx_active_row_idx(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
+    raw = packed_ctx.get("active_row_idx", None)
+    if raw is not None:
+        arr = np.ascontiguousarray(np.asarray(raw, dtype=np.int64).reshape(-1), dtype=np.int64)
+        if arr.size > 0:
+            return arr
+    site_keep_raw = packed_ctx.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        return np.ascontiguousarray(
+            np.flatnonzero(site_keep).astype(np.int64, copy=False),
+            dtype=np.int64,
+        )
+    m = _packed_ctx_active_rows(packed_ctx)
+    return np.ascontiguousarray(np.arange(m, dtype=np.int64), dtype=np.int64)
+
+
+def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
+    return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
 
 
 def _normalize_he_thread_policy_name(
@@ -2941,6 +2992,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 packed_src_view,
                 dtype=np.uint8,
             )
+            packed_is_lazy = _packed_ctx_is_lazy_full(packed_ctx)
             maf_arg = np.ascontiguousarray(
                 np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
@@ -2982,7 +3034,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                     np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
                     dtype=np.bool_,
                 )
-                if int(site_keep_arg.shape[0]) != int(maf_arg.shape[0]):
+                if (not packed_is_lazy) and (int(site_keep_arg.shape[0]) != int(maf_arg.shape[0])):
                     site_keep_arg = None
             he_site_keep_mode, he_site_keep_note = _describe_he_site_keep_mode(
                 site_keep_raw,
@@ -4129,11 +4181,16 @@ def _decode_packed_block_standardized(
     n_samples = int(packed_ctx["n_samples"])
     row_flip = _ensure_packed_row_flip_cached(packed_ctx)
     ridx = np.ascontiguousarray(np.asarray(row_idx, dtype=np.int64).reshape(-1))
+    if _packed_ctx_is_lazy_full(packed_ctx):
+        active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+        ridx_decode = np.ascontiguousarray(active_row_idx[ridx], dtype=np.int64)
+    else:
+        ridx_decode = ridx
     sidx = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64).reshape(-1))
     blk = _jxrs.bed_packed_decode_rows_f32(
         packed,
         int(n_samples),
-        ridx,
+        ridx_decode,
         row_flip,
         maf,
         sidx,
@@ -4152,23 +4209,34 @@ def _ensure_packed_standard_stats_cached(
     mean_raw = packed_ctx.get("__std_row_mean__", None)
     inv_raw = packed_ctx.get("__std_row_inv_sd__", None)
     packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    m = int(packed.shape[0])
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    m = int(active_row_idx.shape[0])
     if mean_raw is not None and inv_raw is not None:
         mean = np.ascontiguousarray(np.asarray(mean_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         inv = np.ascontiguousarray(np.asarray(inv_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
         if int(mean.shape[0]) == m and int(inv.shape[0]) == m:
             return mean, inv
 
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
-    if int(maf.shape[0]) != m:
-        raise ValueError("Packed context mismatch: maf length != packed rows.")
+    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    if _packed_ctx_is_lazy_full(packed_ctx):
+        if int(maf_full.shape[0]) != int(packed.shape[0]):
+            raise ValueError("Packed context mismatch: maf length != packed rows.")
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    else:
+        maf = maf_full
+        if int(maf.shape[0]) != m:
+            raise ValueError("Packed context mismatch: maf length != packed rows.")
     n_samples = int(packed_ctx["n_samples"])
     if n_samples <= 0:
         raise ValueError("Packed context invalid: n_samples must be > 0.")
 
     mean_f64: np.ndarray
     var_f64: np.ndarray
-    use_rust_stats = bool(_jxrs is not None and hasattr(_jxrs, "bed_packed_decode_stats_f64"))
+    use_rust_stats = bool(
+        (not _packed_ctx_is_lazy_full(packed_ctx))
+        and (_jxrs is not None)
+        and hasattr(_jxrs, "bed_packed_decode_stats_f64")
+    )
     if use_rust_stats:
         row_flip = _ensure_packed_row_flip_cached(packed_ctx)
         sum_rows = np.zeros((m,), dtype=np.float64)
@@ -4302,7 +4370,7 @@ def _predict_rrblup_packed_from_beta(
     if n_out == 0:
         return np.zeros((0, 1), dtype=np.float64)
 
-    m = int(np.asarray(packed_ctx["packed"]).shape[0])
+    m = _packed_ctx_active_rows(packed_ctx)
     b = np.asarray(beta, dtype=np.float32).reshape(-1)
     if int(b.shape[0]) != m:
         raise ValueError(f"beta length mismatch: got {b.shape[0]}, expected {m}.")
@@ -5666,7 +5734,7 @@ def GSapi(
     if method in ("GBLUP", "rrBLUP"):
         n_train_local = int(Y.reshape(-1).shape[0])
         n_snp_local = int(
-            Xtrain["packed"].shape[0]
+            _packed_ctx_active_rows(typing.cast(dict[str, typing.Any], Xtrain))
             if _looks_like_packed_payload(Xtrain)
             else np.asarray(Xtrain).shape[0]
         )
@@ -5844,7 +5912,7 @@ def GSapi(
                 else (Xtest.shape[1] if not is_packed_input else 0)
             )
             n_snp_dbg = int(
-                Xtrain["packed"].shape[0]
+                _packed_ctx_active_rows(typing.cast(dict[str, typing.Any], Xtrain))
                 if _looks_like_packed_payload(Xtrain)
                 else Xtrain.shape[0]
             )
@@ -6153,6 +6221,7 @@ def GSapi(
                     packed_src_view,
                     dtype=np.uint8,
                 )
+                packed_is_lazy = _packed_ctx_is_lazy_full(packed_train)
                 maf_arg = np.ascontiguousarray(
                     np.asarray(packed_train["maf"], dtype=np.float32).reshape(-1),
                     dtype=np.float32,
@@ -6187,11 +6256,10 @@ def GSapi(
                         np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
                         dtype=np.bool_,
                     )
-                # Avoid dimension mismatch when packed payload has already been SNP-filtered.
-                # Keep mask only when it still matches current packed rows.
                 site_keep_arg = None
-                if site_keep_arg_legacy is not None and int(site_keep_arg_legacy.shape[0]) == int(
-                    packed_arg.shape[0]
+                if site_keep_arg_legacy is not None and (
+                    packed_is_lazy
+                    or int(site_keep_arg_legacy.shape[0]) == int(packed_arg.shape[0])
                 ):
                     site_keep_arg = site_keep_arg_legacy
 
@@ -11637,6 +11705,7 @@ def _load_plink_packed_for_lmm(
     *,
     maf: float,
     missing_rate: float,
+    filter_mode: str = "compact",
 ) -> tuple[np.ndarray, dict[str, typing.Any]]:
     """
     Load PLINK BED in packed format for low-memory LMM/GBLUP.
@@ -11652,6 +11721,7 @@ def _load_plink_packed_for_lmm(
         maf=float(maf),
         missing_rate=float(missing_rate),
         snps_only=False,
+        filter_mode=str(filter_mode),
     )
     return sample_ids_arr, packed_ctx
 
@@ -11672,29 +11742,48 @@ def _decode_packed_ctx_to_dense(
         )
 
     packed = np.ascontiguousarray(np.asarray(packed_ctx["packed"], dtype=np.uint8))
-    maf = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
+    maf_full = np.ascontiguousarray(np.asarray(packed_ctx["maf"], dtype=np.float32).reshape(-1))
     n_samples = int(packed_ctx["n_samples"])
     if packed.ndim != 2:
         raise ValueError("Invalid packed payload: packed must be 2D.")
-    if int(packed.shape[0]) != int(maf.shape[0]):
-        raise ValueError("Packed payload shape mismatch between packed rows and maf.")
+    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
+    if _packed_ctx_is_lazy_full(packed_ctx):
+        maf = np.ascontiguousarray(maf_full[active_row_idx], dtype=np.float32)
+    else:
+        maf = maf_full
+    if int(active_row_idx.shape[0]) != int(maf.shape[0]):
+        raise ValueError("Packed payload shape mismatch between active rows and maf.")
 
     row_flip_raw = packed_ctx.get("row_flip", None)
     if row_flip_raw is None:
-        row_flip = np.asarray(
+        row_flip_full = np.asarray(
             _jxrs.bed_packed_row_flip_mask(packed, int(n_samples)),
             dtype=np.bool_,
         )
-        row_flip = np.ascontiguousarray(row_flip.reshape(-1), dtype=np.bool_)
-        packed_ctx["row_flip"] = row_flip
+        row_flip_full = np.ascontiguousarray(row_flip_full.reshape(-1), dtype=np.bool_)
+        packed_ctx["row_flip"] = row_flip_full
+        if _packed_ctx_is_lazy_full(packed_ctx):
+            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        else:
+            row_flip = row_flip_full
     else:
-        row_flip = np.ascontiguousarray(
+        row_flip_full = np.ascontiguousarray(
             np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
         )
-        if int(row_flip.shape[0]) != int(packed.shape[0]):
-            raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+        if _packed_ctx_is_lazy_full(packed_ctx):
+            if int(row_flip_full.shape[0]) != int(packed.shape[0]):
+                raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
+            row_flip = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
+        else:
+            row_flip = row_flip_full
+            if int(row_flip.shape[0]) != int(packed.shape[0]):
+                raise ValueError("Packed payload mismatch: row_flip length does not match packed rows.")
 
-    ridx = np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64))
+    ridx = (
+        active_row_idx
+        if _packed_ctx_is_lazy_full(packed_ctx)
+        else np.ascontiguousarray(np.arange(int(packed.shape[0]), dtype=np.int64))
+    )
     decoded = _jxrs.bed_packed_decode_rows_f32(
         packed,
         int(n_samples),
@@ -11704,10 +11793,11 @@ def _decode_packed_ctx_to_dense(
         None,
     )
     dense = np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
-    if dense.ndim != 2 or dense.shape != (int(packed.shape[0]), int(n_samples)):
+    expected_rows = int(active_row_idx.shape[0])
+    if dense.ndim != 2 or dense.shape != (expected_rows, int(n_samples)):
         raise ValueError(
             "Packed decode shape mismatch: "
-            f"expected ({int(packed.shape[0])},{int(n_samples)}), got {dense.shape}"
+            f"expected ({expected_rows},{int(n_samples)}), got {dense.shape}"
         )
     return dense
 
@@ -14503,6 +14593,13 @@ def _run_gs_pipeline(
         _GsLdPruneSpec | None,
         getattr(args, "ldprune_spec", None),
     )
+    rrblup_only_mode = bool(args.rrBLUP) and all(str(m) == "rrBLUP" for m in methods)
+    packed_lazy_main_requested = bool(
+        rrblup_only_mode
+        and gfile_is_plink
+        and (args.hash_dim is None)
+        and (ldprune_spec is None)
+    )
     preprocess_qc_requested = bool(
         (args.hash_dim is not None) or (ldprune_spec is not None)
     )
@@ -14526,12 +14623,17 @@ def _run_gs_pipeline(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    filter_mode=("lazy" if packed_lazy_main_requested else "compact"),
                 )
             except Exception:
                 task.fail(f"Loading genotype from {gsrc} ...Failed")
                 raise
             n = int(sample_ids.shape[0])
-            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            m = (
+                _packed_ctx_active_rows(packed_lmm_ctx)
+                if packed_lmm_ctx is not None
+                else 0
+            )
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
         _emit_packed_load_debug(
             packed_lmm_ctx,
@@ -14702,12 +14804,17 @@ def _run_gs_pipeline(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    filter_mode="compact",
                 )
             except Exception:
                 task.fail(f"Loading genotype from {gsrc} ...Failed")
                 raise
             n = int(sample_ids.shape[0])
-            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            m = (
+                _packed_ctx_active_rows(packed_lmm_ctx)
+                if packed_lmm_ctx is not None
+                else 0
+            )
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
         _emit_packed_load_debug(
             packed_lmm_ctx,
@@ -14866,12 +14973,17 @@ def _run_gs_pipeline(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    filter_mode="compact",
                 )
             except Exception:
                 task.fail(f"Loading genotype from {gsrc} ...Failed")
                 raise
             n = int(sample_ids.shape[0])
-            m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
+            m = (
+                _packed_ctx_active_rows(packed_lmm_ctx)
+                if packed_lmm_ctx is not None
+                else 0
+            )
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
         _emit_packed_load_debug(
             packed_lmm_ctx,
@@ -15023,6 +15135,7 @@ def _run_gs_pipeline(
                     str(gfile),
                     maf=float(args.maf),
                     missing_rate=float(args.geno),
+                    filter_mode="lazy",
                 )
             except Exception:
                 task.fail("Loading packed rrBLUP helper ...Failed")
@@ -15051,7 +15164,11 @@ def _run_gs_pipeline(
                         f"Missing examples: {preview}"
                     )
                 rrblup_aux_dense_to_packed_idx = np.ascontiguousarray(mapped_idx, dtype=np.int64)
-            m_aux = int(rrblup_aux_packed_ctx["packed"].shape[0]) if rrblup_aux_packed_ctx is not None else 0
+            m_aux = (
+                _packed_ctx_active_rows(rrblup_aux_packed_ctx)
+                if rrblup_aux_packed_ctx is not None
+                else 0
+            )
             task.complete(
                 "Loading packed rrBLUP helper ...Finished "
                 f"(n={int(packed_ids.shape[0])}, nSNP={m_aux})"
@@ -15771,7 +15888,7 @@ def _run_gs_pipeline(
             eff_snp = int(args.hash_dim)
         else:
             eff_snp = (
-                int(trait_packed_ctx["packed"].shape[0])
+                _packed_ctx_active_rows(typing.cast(dict[str, typing.Any], trait_packed_ctx))
                 if (trait_use_packed_lmm and trait_packed_ctx is not None)
                 else int(train_snp.shape[0] if train_snp is not None else 0)
             )

@@ -627,7 +627,7 @@ fn decode_subset_with_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_standardized_packed_block_f32(
+pub(crate) fn decode_standardized_packed_block_rows_f32(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     n_samples: usize,
@@ -636,6 +636,7 @@ pub(crate) fn decode_standardized_packed_block_f32(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     row_start: usize,
     out: &mut [f32],
     code4_lut: &[[u8; 4]; 256],
@@ -659,11 +660,15 @@ pub(crate) fn decode_standardized_packed_block_f32(
     };
 
     let decode_one = |local_row: usize, out_row: &mut [f32]| {
-        let row_idx = row_start + local_row;
-        let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-        let mean_g = row_mean[row_idx];
-        let inv_sd = row_inv_sd[row_idx];
-        let value_lut: [f32; 4] = if row_flip[row_idx] {
+        let row_idx_local = row_start + local_row;
+        let row_idx_packed = packed_row_indices
+            .map(|idx| idx[row_idx_local])
+            .unwrap_or(row_idx_local);
+        let row =
+            &packed_flat[row_idx_packed * bytes_per_snp..(row_idx_packed + 1) * bytes_per_snp];
+        let mean_g = row_mean[row_idx_local];
+        let inv_sd = row_inv_sd[row_idx_local];
+        let value_lut: [f32; 4] = if row_flip[row_idx_local] {
             [
                 (2.0_f32 - mean_g) * inv_sd,
                 0.0_f32,
@@ -699,6 +704,37 @@ pub(crate) fn decode_standardized_packed_block_f32(
         }
     }
     Ok(())
+}
+
+pub(crate) fn decode_standardized_packed_block_f32(
+    packed_flat: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    full_sample_fast: bool,
+    row_start: usize,
+    out: &mut [f32],
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    decode_standardized_packed_block_rows_f32(
+        packed_flat,
+        bytes_per_snp,
+        n_samples,
+        row_flip,
+        row_mean,
+        row_inv_sd,
+        sample_idx,
+        full_sample_fast,
+        None,
+        row_start,
+        out,
+        code4_lut,
+        pool,
+    )
 }
 
 #[inline]

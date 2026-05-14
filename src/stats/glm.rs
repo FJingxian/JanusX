@@ -1250,6 +1250,7 @@ pub fn glmf32_packed_assoc<'py>(
     allele1,
     out_tsv,
     sample_indices=None,
+    row_indices=None,
     step=10000,
     threads=0,
     progress_callback=None,
@@ -1270,6 +1271,7 @@ pub fn glmf32_packed_assoc_to_tsv(
     allele1: Vec<String>,
     out_tsv: &str,
     sample_indices: Option<PyReadonlyArray1<'_, i64>>,
+    row_indices: Option<PyReadonlyArray1<'_, i64>>,
     step: usize,
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
@@ -1287,7 +1289,7 @@ pub fn glmf32_packed_assoc_to_tsv(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
@@ -1298,6 +1300,17 @@ pub fn glmf32_packed_assoc_to_tsv(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
+
     if row_flip.len() != m {
         return Err(PyRuntimeError::new_err(format!(
             "row_flip length mismatch: got {}, expected {m}",
@@ -1433,9 +1446,11 @@ pub fn glmf32_packed_assoc_to_tsv(
                     || GlmScratch::new(q0),
                     |scr, (l, row_out)| {
                         let idx = i_marker + l;
+                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
                         scr.reset_xs();
 
-                        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                        let row =
+                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                         let flip = row_flip[idx];
                         let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
 

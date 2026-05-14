@@ -8,12 +8,12 @@ use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_plink_bed_hardcall, decode_row_centered_full_lut_f64,
-    decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut,
+    decode_standardized_packed_block_rows_f32, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
     cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt,
@@ -128,6 +128,71 @@ fn prefer_parallel_block_vec(
     tp.current_num_threads() > 1 && rows.saturating_mul(cols) >= 1_048_576
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XtMulKernelStrategy {
+    RowReduce,
+    ColChunk,
+    Blas,
+}
+
+#[inline]
+fn xtmul_row_chunk(rows: usize) -> usize {
+    256usize.min(rows.max(1))
+}
+
+#[inline]
+fn xtmul_col_chunk(cols: usize, threads: usize) -> usize {
+    let target_tasks = threads.saturating_mul(2).max(1);
+    let mut chunk = cols.div_ceil(target_tasks).max(8192);
+    let align = 256usize;
+    let rem = chunk % align;
+    if rem != 0 {
+        chunk += align - rem;
+    }
+    chunk.min(cols.max(1))
+}
+
+#[inline]
+fn xtmul_forced_strategy() -> Option<XtMulKernelStrategy> {
+    static OVERRIDE: OnceLock<Option<XtMulKernelStrategy>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("JX_GS_PCG_XTMUL_KERNEL").ok()?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => None,
+            "row_reduce" | "legacy" | "rows" => Some(XtMulKernelStrategy::RowReduce),
+            "col_chunk" | "cols" | "columns" => Some(XtMulKernelStrategy::ColChunk),
+            "blas" | "gemm" => Some(XtMulKernelStrategy::Blas),
+            _ => None,
+        }
+    })
+}
+
+#[inline]
+fn choose_xtmul_kernel_strategy(
+    rows: usize,
+    cols: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> XtMulKernelStrategy {
+    if let Some(force) = xtmul_forced_strategy() {
+        return force;
+    }
+    let prefer_parallel = prefer_parallel_block_vec(rows, cols, pool)
+        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel();
+    if !prefer_parallel {
+        return XtMulKernelStrategy::Blas;
+    }
+    let threads = pool.map(|tp| tp.current_num_threads()).unwrap_or(1).max(1);
+    if cols >= 65_536 && rows <= 4_096 {
+        return XtMulKernelStrategy::ColChunk;
+    }
+    let row_tasks = rows.div_ceil(xtmul_row_chunk(rows));
+    if row_tasks >= threads.saturating_mul(2) {
+        XtMulKernelStrategy::RowReduce
+    } else {
+        XtMulKernelStrategy::Blas
+    }
+}
+
 #[inline]
 fn row_major_block_mul_vec_f32(
     block: &[f32],
@@ -193,7 +258,7 @@ fn row_major_block_mul_vec_f32(
 }
 
 #[inline]
-fn row_major_block_t_mul_vec_accum_f32(
+fn row_major_block_t_mul_vec_accum_f32_row_reduce(
     block: &[f32],
     rows: usize,
     cols: usize,
@@ -204,47 +269,92 @@ fn row_major_block_t_mul_vec_accum_f32(
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
-    if prefer_parallel_block_vec(rows, cols, pool) && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
-    {
-        let row_chunk = 256usize.min(rows.max(1));
-        let mut run = || {
-            let partial = block
-                .par_chunks(row_chunk * cols)
-                .zip(vec.par_chunks(row_chunk))
-                .fold(
-                    || vec![0.0_f32; cols],
-                    |mut acc, (block_chunk, vec_chunk)| {
-                        let rows_here = vec_chunk.len();
-                        for r in 0..rows_here {
-                            let vr = vec_chunk[r];
-                            let row = &block_chunk[r * cols..(r + 1) * cols];
-                            for c in 0..cols {
-                                acc[c] += row[c] * vr;
-                            }
-                        }
-                        acc
-                    },
-                )
-                .reduce(
-                    || vec![0.0_f32; cols],
-                    |mut left, right| {
+    let row_chunk = xtmul_row_chunk(rows);
+    let mut run = || {
+        let partial = block
+            .par_chunks(row_chunk * cols)
+            .zip(vec.par_chunks(row_chunk))
+            .fold(
+                || vec![0.0_f32; cols],
+                |mut acc, (block_chunk, vec_chunk)| {
+                    let rows_here = vec_chunk.len();
+                    for r in 0..rows_here {
+                        let vr = vec_chunk[r];
+                        let row = &block_chunk[r * cols..(r + 1) * cols];
                         for c in 0..cols {
-                            left[c] += right[c];
+                            acc[c] += row[c] * vr;
                         }
-                        left
-                    },
-                );
-            for c in 0..cols {
-                out[c] += partial[c];
-            }
-        };
-        if let Some(tp) = pool {
-            tp.install(run);
-        } else {
-            run();
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f32; cols],
+                |mut left, right| {
+                    for c in 0..cols {
+                        left[c] += right[c];
+                    }
+                    left
+                },
+            );
+        for c in 0..cols {
+            out[c] += partial[c];
         }
-        return;
+    };
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
     }
+}
+
+#[inline]
+fn row_major_block_t_mul_vec_accum_f32_col_chunk(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+    out: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(vec.len(), rows);
+    debug_assert_eq!(out.len(), cols);
+    let threads = pool.map(|tp| tp.current_num_threads()).unwrap_or(1).max(1);
+    let col_chunk = xtmul_col_chunk(cols, threads);
+    let mut run = || {
+        out.par_chunks_mut(col_chunk)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let col_start = chunk_idx * col_chunk;
+                let col_end = col_start + out_chunk.len();
+                for r in 0..rows {
+                    let vr = vec[r];
+                    let row = &block[r * cols + col_start..r * cols + col_end];
+                    for (dst, &a) in out_chunk.iter_mut().zip(row.iter()) {
+                        *dst += a * vr;
+                    }
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
+    }
+}
+
+#[inline]
+fn row_major_block_t_mul_vec_accum_f32_blas_or_serial(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+    out: &mut [f32],
+) {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(vec.len(), rows);
+    debug_assert_eq!(out.len(), cols);
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
         cblas_sgemm_dispatch(
@@ -276,6 +386,28 @@ fn row_major_block_t_mul_vec_accum_f32(
     }
 }
 
+#[inline]
+fn row_major_block_t_mul_vec_accum_f32(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    vec: &[f32],
+    out: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    match choose_xtmul_kernel_strategy(rows, cols, pool) {
+        XtMulKernelStrategy::RowReduce => {
+            row_major_block_t_mul_vec_accum_f32_row_reduce(block, rows, cols, vec, out, pool)
+        }
+        XtMulKernelStrategy::ColChunk => {
+            row_major_block_t_mul_vec_accum_f32_col_chunk(block, rows, cols, vec, out, pool)
+        }
+        XtMulKernelStrategy::Blas => {
+            row_major_block_t_mul_vec_accum_f32_blas_or_serial(block, rows, cols, vec, out)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PcgMatvecTiming {
     decode_secs: f64,
@@ -300,12 +432,13 @@ fn decode_standardized_block_f32(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     row_start: usize,
     out: &mut [f32],
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(), String> {
-    decode_standardized_packed_block_f32(
+    decode_standardized_packed_block_rows_f32(
         packed_flat,
         bytes_per_snp,
         n_samples,
@@ -314,6 +447,7 @@ fn decode_standardized_block_f32(
         row_inv_sd,
         sample_idx,
         full_sample_fast,
+        packed_row_indices,
         row_start,
         out,
         code4_lut,
@@ -331,6 +465,7 @@ fn pcg_x_mul_samples(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     block_rows: usize,
     weights: &[f32],
     code4_lut: &[[u8; 4]; 256],
@@ -363,6 +498,7 @@ fn pcg_x_mul_samples(
             row_inv_sd,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             st,
             blk_slice,
             code4_lut,
@@ -402,6 +538,7 @@ fn pcg_xt_mul_rows(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     block_rows: usize,
     u: &[f32],
     code4_lut: &[[u8; 4]; 256],
@@ -441,6 +578,7 @@ fn pcg_xt_mul_rows(
             row_inv_sd,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             st,
             blk_slice,
             code4_lut,
@@ -1405,9 +1543,10 @@ pub fn rrblup_pcg_bed<'py>(
     }
 
     let mut eff_m = m_total;
-    let mut packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
+    let packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
+    let mut packed_row_indices: Option<Vec<usize>> = None;
     if let Some(mask) = site_keep {
         let mask_vec: Vec<bool> = match mask.as_slice() {
             Ok(s) => s.to_vec(),
@@ -1436,20 +1575,15 @@ pub fn rrblup_pcg_bed<'py>(
                 .all(|(dst_row, &src_row)| dst_row == src_row);
         if !keep_is_identity {
             eff_m = keep_idx.len();
-            let mut packed_subset = vec![0_u8; eff_m * bytes_per_snp];
             let mut maf_subset = vec![0.0_f32; eff_m];
             let mut row_flip_subset = vec![false; eff_m];
             for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-                let src_off = src_row * bytes_per_snp;
-                let dst_off = dst_row * bytes_per_snp;
-                packed_subset[dst_off..dst_off + bytes_per_snp]
-                    .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
                 maf_subset[dst_row] = maf_full[src_row].clamp(0.0, 0.5);
                 row_flip_subset[dst_row] = row_flip_full[src_row];
             }
-            packed_keep = Cow::Owned(packed_subset);
             maf_keep = Cow::Owned(maf_subset);
             row_flip_keep = Cow::Owned(row_flip_subset);
+            packed_row_indices = Some(keep_idx);
         }
     }
 
@@ -1584,6 +1718,7 @@ pub fn rrblup_pcg_bed<'py>(
                             &row_inv_sd,
                             &train_idx,
                             full_train_fast,
+                            packed_row_indices.as_deref(),
                             st,
                             blk_slice,
                             &code4_lut,
@@ -1631,6 +1766,7 @@ pub fn rrblup_pcg_bed<'py>(
                             &row_inv_sd,
                             &train_idx,
                             full_train_fast,
+                            packed_row_indices.as_deref(),
                             row_step,
                             p,
                             &code4_lut,
@@ -1647,6 +1783,7 @@ pub fn rrblup_pcg_bed<'py>(
                             &row_inv_sd,
                             &train_idx,
                             full_train_fast,
+                            packed_row_indices.as_deref(),
                             row_step,
                             &xp,
                             &code4_lut,
@@ -1794,6 +1931,7 @@ pub fn rrblup_pcg_bed<'py>(
                         &row_inv_sd,
                         &train_idx,
                         full_train_fast,
+                        packed_row_indices.as_deref(),
                         row_step,
                         &beta,
                         &code4_lut,
@@ -1846,6 +1984,7 @@ pub fn rrblup_pcg_bed<'py>(
                                 &row_inv_sd,
                                 &train_pred_abs,
                                 train_pred_fast,
+                                packed_row_indices.as_deref(),
                                 row_step,
                                 &beta,
                                 &code4_lut,
@@ -1889,6 +2028,7 @@ pub fn rrblup_pcg_bed<'py>(
                         &row_inv_sd,
                         &test_idx,
                         full_test_fast,
+                        packed_row_indices.as_deref(),
                         row_step,
                         &beta,
                         &code4_lut,
@@ -2326,4 +2466,158 @@ pub fn farmcpu_q_packed_grm_pca_f32<'py>(
     )
     .into_bound();
     Ok((grm_arr, q_arr, evd_backend, evd_elapsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct XtMulBenchCase {
+        name: &'static str,
+        rows: usize,
+        cols: usize,
+        threads: usize,
+        expect: XtMulKernelStrategy,
+    }
+
+    fn make_xtmul_inputs(rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut block = vec![0.0_f32; rows.saturating_mul(cols)];
+        for r in 0..rows {
+            let row_off = r * cols;
+            let row_bias = (((r * 17 + 11) % 97) as f32 - 48.0_f32) * 0.0035_f32;
+            for c in 0..cols {
+                let val = (((c * 13 + r * 7 + 19) % 251) as f32 - 125.0_f32) * 0.002_f32;
+                block[row_off + c] = val + row_bias;
+            }
+        }
+        let mut weights = vec![0.0_f32; rows];
+        for (r, w) in weights.iter_mut().enumerate() {
+            *w = (((r * 29 + 5) % 113) as f32 - 56.0_f32) * 0.015_f32;
+        }
+        (block, weights)
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    fn best_of_n_secs(mut f: impl FnMut()) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            f();
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        best
+    }
+
+    #[test]
+    #[ignore]
+    fn compare_pcg_xtmul_strategies() {
+        std::env::set_var("JX_ROWMAJOR_F32_KERNEL", "rayon");
+
+        let cases = [
+            XtMulBenchCase {
+                name: "front_half_wide",
+                rows: 768,
+                cols: 262_144,
+                threads: 8,
+                expect: XtMulKernelStrategy::ColChunk,
+            },
+            XtMulBenchCase {
+                name: "row_reduce_friendly",
+                rows: 3_072,
+                cols: 16_384,
+                threads: 4,
+                expect: XtMulKernelStrategy::RowReduce,
+            },
+            XtMulBenchCase {
+                name: "blas_fallback_window",
+                rows: 1_024,
+                cols: 32_768,
+                threads: 16,
+                expect: XtMulKernelStrategy::Blas,
+            },
+        ];
+
+        for case in cases {
+            let pool = Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(case.threads)
+                    .build()
+                    .expect("build rayon pool"),
+            ));
+            let pool_ref = pool.as_ref();
+            let picked = choose_xtmul_kernel_strategy(case.rows, case.cols, pool_ref);
+            let row_chunk = xtmul_row_chunk(case.rows);
+            let row_tasks = case.rows.div_ceil(row_chunk);
+            let col_chunk = xtmul_col_chunk(case.cols, case.threads);
+            let col_tasks = case.cols.div_ceil(col_chunk);
+            assert_eq!(picked, case.expect, "unexpected strategy for {}", case.name);
+
+            let (block, weights) = make_xtmul_inputs(case.rows, case.cols);
+            let _blas_guard = OpenBlasThreadGuard::enter(1);
+
+            let mut out_legacy = vec![0.0_f32; case.cols];
+            row_major_block_t_mul_vec_accum_f32_row_reduce(
+                &block,
+                case.rows,
+                case.cols,
+                &weights,
+                &mut out_legacy,
+                pool_ref,
+            );
+
+            let mut out_adaptive = vec![0.0_f32; case.cols];
+            row_major_block_t_mul_vec_accum_f32(
+                &block,
+                case.rows,
+                case.cols,
+                &weights,
+                &mut out_adaptive,
+                pool_ref,
+            );
+
+            let diff = max_abs_diff(&out_legacy, &out_adaptive);
+            assert!(
+                diff <= 5e-3_f32,
+                "strategy output drift too large for {}: diff={diff}",
+                case.name
+            );
+
+            let legacy_secs = best_of_n_secs(|| {
+                let mut out = vec![0.0_f32; case.cols];
+                row_major_block_t_mul_vec_accum_f32_row_reduce(
+                    &block, case.rows, case.cols, &weights, &mut out, pool_ref,
+                );
+            });
+            let adaptive_secs = best_of_n_secs(|| {
+                let mut out = vec![0.0_f32; case.cols];
+                row_major_block_t_mul_vec_accum_f32(
+                    &block, case.rows, case.cols, &weights, &mut out, pool_ref,
+                );
+            });
+            let speedup = legacy_secs / adaptive_secs.max(1e-12_f64);
+
+            eprintln!(
+                "pcg_xtmul case={} rows={} cols={} threads={} strategy={:?} row_chunk={} row_tasks={} col_chunk={} col_tasks={} legacy={:.6}s adaptive={:.6}s speedup={:.2}x",
+                case.name,
+                case.rows,
+                case.cols,
+                case.threads,
+                picked,
+                row_chunk,
+                row_tasks,
+                col_chunk,
+                col_tasks,
+                legacy_secs,
+                adaptive_secs,
+                speedup,
+            );
+        }
+    }
 }

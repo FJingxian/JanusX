@@ -6,7 +6,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut};
+use crate::bedmath::{
+    decode_standardized_packed_block_rows_f32, is_identity_indices, packed_byte_lut,
+};
 use crate::blas::{
     cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt,
     OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
@@ -406,6 +408,7 @@ pub fn build_row_standardization_stats(
     row_flip: &[bool],
     row_maf: &[f32],
     sample_idx: &[usize],
+    packed_row_indices: Option<&[usize]>,
     std_eps32: f32,
     use_train_maf: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
@@ -414,7 +417,18 @@ pub fn build_row_standardization_stats(
     if row_maf.len() != m {
         return Err("build_row_standardization_stats: length mismatch".to_string());
     }
-    if packed_flat.len() != m.saturating_mul(bytes_per_snp) {
+    if bytes_per_snp == 0 || (packed_flat.len() % bytes_per_snp) != 0 {
+        return Err("build_row_standardization_stats: packed length mismatch".to_string());
+    }
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    if let Some(row_idx) = packed_row_indices {
+        if row_idx.len() != m {
+            return Err("build_row_standardization_stats: row index length mismatch".to_string());
+        }
+        if row_idx.iter().any(|&idx| idx >= m_packed) {
+            return Err("build_row_standardization_stats: row index out of bounds".to_string());
+        }
+    } else if m_packed != m {
         return Err("build_row_standardization_stats: packed length mismatch".to_string());
     }
     let mut row_mean = vec![0.0_f32; m];
@@ -424,7 +438,8 @@ pub fn build_row_standardization_stats(
             let flip = row_flip[j];
             let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
             if use_train_maf {
-                let row = &packed_flat[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+                let src_row = packed_row_indices.map(|idx| idx[j]).unwrap_or(j);
+                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 let mut non_missing = 0usize;
                 let mut alt_sum = 0usize;
                 for &sid in sample_idx {
@@ -611,9 +626,8 @@ fn row_major_block_mul_mat_f32(
         {
             let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
             let mut run = || {
-                out.par_chunks_mut(n_rhs * row_block)
-                    .enumerate()
-                    .for_each(|(chunk_id, out_chunk)| {
+                out.par_chunks_mut(n_rhs * row_block).enumerate().for_each(
+                    |(chunk_id, out_chunk)| {
                         let row_start = chunk_id * row_block;
                         let rows_here = out_chunk.len() / n_rhs;
                         if rows_here == 0 {
@@ -637,7 +651,8 @@ fn row_major_block_mul_mat_f32(
                                 n_rhs as CblasInt,
                             );
                         }
-                    });
+                    },
+                );
             };
             if let Some(tp) = pool {
                 tp.install(run);
@@ -651,9 +666,8 @@ fn row_major_block_mul_mat_f32(
         {
             let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
             let mut run = || {
-                out.par_chunks_mut(n_rhs * row_block)
-                    .enumerate()
-                    .for_each(|(chunk_id, out_chunk)| {
+                out.par_chunks_mut(n_rhs * row_block).enumerate().for_each(
+                    |(chunk_id, out_chunk)| {
                         out_chunk.fill(0.0_f32);
                         let row_start = chunk_id * row_block;
                         let rows_here = out_chunk.len() / n_rhs;
@@ -670,7 +684,8 @@ fn row_major_block_mul_mat_f32(
                                 accum_scaled_rhs_f32(out_row, rhs_row, a);
                             }
                         }
-                    });
+                    },
+                );
             };
             if let Some(tp) = pool {
                 tp.install(run);
@@ -750,9 +765,8 @@ fn row_major_block_t_mul_mat_accum_f32(
         {
             let col_block = SMALL_RHS_PAR_COL_BLOCK.max(1);
             let mut run = || {
-                out.par_chunks_mut(n_rhs * col_block)
-                    .enumerate()
-                    .for_each(|(chunk_id, out_chunk)| {
+                out.par_chunks_mut(n_rhs * col_block).enumerate().for_each(
+                    |(chunk_id, out_chunk)| {
                         let col_start = chunk_id * col_block;
                         let cols_here = out_chunk.len() / n_rhs;
                         if cols_here == 0 {
@@ -776,7 +790,8 @@ fn row_major_block_t_mul_mat_accum_f32(
                                 n_rhs as CblasInt,
                             );
                         }
-                    });
+                    },
+                );
             };
             if let Some(tp) = pool {
                 tp.install(run);
@@ -790,24 +805,26 @@ fn row_major_block_t_mul_mat_accum_f32(
         {
             let col_block = SMALL_RHS_PAR_COL_BLOCK.max(1);
             let mut run = || {
-                out.par_chunks_mut(n_rhs * col_block)
-                    .enumerate()
-                    .for_each(|(chunk_id, out_chunk)| {
+                out.par_chunks_mut(n_rhs * col_block).enumerate().for_each(
+                    |(chunk_id, out_chunk)| {
                         let col_start = chunk_id * col_block;
                         let cols_here = out_chunk.len() / n_rhs;
                         for r in 0..rows {
                             let rhs_row = &rhs[r * n_rhs..(r + 1) * n_rhs];
-                            let row = &block[r * cols + col_start..r * cols + col_start + cols_here];
+                            let row =
+                                &block[r * cols + col_start..r * cols + col_start + cols_here];
                             for local_c in 0..cols_here {
                                 let a = row[local_c];
                                 if a == 0.0_f32 {
                                     continue;
                                 }
-                                let out_row = &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
+                                let out_row =
+                                    &mut out_chunk[local_c * n_rhs..(local_c + 1) * n_rhs];
                                 accum_scaled_rhs_f32(out_row, rhs_row, a);
                             }
                         }
-                    });
+                    },
+                );
             };
             if let Some(tp) = pool {
                 tp.install(run);
@@ -873,12 +890,13 @@ fn decode_standardized_block_f32(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     row_start: usize,
     out: &mut [f32],
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(), String> {
-    decode_standardized_packed_block_f32(
+    decode_standardized_packed_block_rows_f32(
         packed_flat,
         bytes_per_snp,
         n_samples,
@@ -887,6 +905,7 @@ fn decode_standardized_block_f32(
         row_inv_sd,
         sample_idx,
         full_sample_fast,
+        packed_row_indices,
         row_start,
         out,
         code4_lut,
@@ -904,6 +923,7 @@ fn apply_grm_to_mat_f32_with_workspace(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     block_rows: usize,
     rhs: &[f32], // row-major (n_out, n_rhs)
     n_rhs: usize,
@@ -957,6 +977,7 @@ fn apply_grm_to_mat_f32_with_workspace(
             row_inv_sd,
             sample_idx,
             full_sample_fast,
+            packed_row_indices,
             st,
             blk_slice,
             code4_lut,
@@ -993,6 +1014,7 @@ fn apply_grm_to_vec_f32_with_workspace(
     row_inv_sd: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    packed_row_indices: Option<&[usize]>,
     block_rows: usize,
     vec_in: &[f32],
     m_scale: f32,
@@ -1018,6 +1040,7 @@ fn apply_grm_to_vec_f32_with_workspace(
         row_inv_sd,
         sample_idx,
         full_sample_fast,
+        packed_row_indices,
         block_rows,
         vec_in,
         1,
@@ -1039,6 +1062,7 @@ pub fn he_variance_components_packed(
     row_flip: &[bool],
     row_maf: &[f32],
     sample_idx: &[usize],
+    packed_row_indices: Option<&[usize]>,
     y: &[f64],
     trace_samples: usize,
     block_rows: usize,
@@ -1056,6 +1080,7 @@ pub fn he_variance_components_packed(
         row_flip,
         row_maf,
         sample_idx,
+        packed_row_indices,
         y,
         None,
         0,
@@ -1081,6 +1106,7 @@ pub fn he_variance_components_packed_with_covariates(
     row_flip: &[bool],
     row_maf: &[f32],
     sample_idx: &[usize],
+    packed_row_indices: Option<&[usize]>,
     y: &[f64],
     x_cov: Option<&[f64]>,
     p_cov: usize,
@@ -1116,7 +1142,21 @@ pub fn he_variance_components_packed_with_covariates(
             row_maf.len()
         ));
     }
-    if packed_flat.len() != m.saturating_mul(bytes_per_snp) {
+    if bytes_per_snp == 0 || (packed_flat.len() % bytes_per_snp) != 0 {
+        return Err("packed payload size mismatch".to_string());
+    }
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    if let Some(row_idx) = packed_row_indices {
+        if row_idx.len() != m {
+            return Err(format!(
+                "packed row index length mismatch: got {}, expected {m}",
+                row_idx.len()
+            ));
+        }
+        if row_idx.iter().any(|&idx| idx >= m_packed) {
+            return Err("packed row index out of bounds".to_string());
+        }
+    } else if m_packed != m {
         return Err(format!(
             "packed payload size mismatch: got {}, expected {}",
             packed_flat.len(),
@@ -1166,6 +1206,7 @@ pub fn he_variance_components_packed_with_covariates(
         row_flip,
         row_maf,
         sample_idx,
+        packed_row_indices,
         std_eps32,
         use_train_maf,
         pool,
@@ -1210,6 +1251,7 @@ pub fn he_variance_components_packed_with_covariates(
         &row_stats.row_inv_sd,
         sample_idx,
         full_sample_fast,
+        packed_row_indices,
         block_rows,
         &y_f32,
         m_scale,
@@ -1260,6 +1302,7 @@ pub fn he_variance_components_packed_with_covariates(
                 &row_stats.row_inv_sd,
                 sample_idx,
                 full_sample_fast,
+                packed_row_indices,
                 block_rows,
                 &probe_batch,
                 batch_cols,
@@ -1335,6 +1378,7 @@ pub fn he_variance_components_packed_with_covariates(
                 &row_stats.row_inv_sd,
                 sample_idx,
                 full_sample_fast,
+                packed_row_indices,
                 block_rows,
                 &probe_batch,
                 batch_cols,
@@ -1700,9 +1744,10 @@ pub fn he_pcg_bed<'py>(
     }
 
     let mut eff_m = m_total;
-    let mut packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
+    let packed_keep: Cow<[u8]> = Cow::Borrowed(packed_flat.as_ref());
     let mut maf_keep: Cow<[f32]> = Cow::Borrowed(maf_full.as_slice());
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
+    let mut packed_row_indices: Option<Vec<usize>> = None;
     if let Some(mask) = site_keep {
         let mask_vec: Vec<bool> = match mask.as_slice() {
             Ok(s) => s.to_vec(),
@@ -1731,20 +1776,15 @@ pub fn he_pcg_bed<'py>(
                 .all(|(dst_row, &src_row)| dst_row == src_row);
         if !keep_is_identity {
             eff_m = keep_idx.len();
-            let mut packed_subset = vec![0_u8; eff_m * bytes_per_snp];
             let mut maf_subset = vec![0.0_f32; eff_m];
             let mut row_flip_subset = vec![false; eff_m];
             for (dst_row, &src_row) in keep_idx.iter().enumerate() {
-                let src_off = src_row * bytes_per_snp;
-                let dst_off = dst_row * bytes_per_snp;
-                packed_subset[dst_off..dst_off + bytes_per_snp]
-                    .copy_from_slice(&packed_flat[src_off..src_off + bytes_per_snp]);
                 maf_subset[dst_row] = maf_full[src_row];
                 row_flip_subset[dst_row] = row_flip_full[src_row];
             }
-            packed_keep = Cow::Owned(packed_subset);
             maf_keep = Cow::Owned(maf_subset);
             row_flip_keep = Cow::Owned(row_flip_subset);
+            packed_row_indices = Some(keep_idx);
         }
     }
 
@@ -1836,6 +1876,7 @@ pub fn he_pcg_bed<'py>(
                 row_flip_keep.as_ref(),
                 maf_keep.as_ref(),
                 &train_idx,
+                packed_row_indices.as_deref(),
                 &y_vec_f64,
                 x_cov_train.as_deref(),
                 p_cov,

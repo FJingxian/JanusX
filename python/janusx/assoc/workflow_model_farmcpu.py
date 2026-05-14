@@ -699,6 +699,7 @@ def run_farmcpu_fullmem(
                             missing_rate=float(args.geno),
                             snps_only=False,
                             expected_n_samples=int(famid.shape[0]),
+                            filter_mode="lazy",
                         )
                     except Exception:
                         task.fail("Loading genotype (Full) ...Failed")
@@ -731,34 +732,32 @@ def run_farmcpu_fullmem(
                 np.asarray(packed_ctx_raw["maf"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             )
-            if np.array_equal(keep_final, keep_numeric):
-                packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
-                miss_arr = np.ascontiguousarray(miss_num, dtype=np.float32)
-                maf_arr = np.ascontiguousarray(maf_num, dtype=np.float32)
-            else:
-                kept_numeric_idx = np.flatnonzero(keep_numeric).astype(np.int64, copy=False)
-                keep_local = np.ascontiguousarray(keep_final[kept_numeric_idx], dtype=np.bool_)
-                packed = np.ascontiguousarray(packed_num[keep_local], dtype=np.uint8)
-                miss_arr = np.ascontiguousarray(miss_num[keep_local], dtype=np.float32)
-                maf_arr = np.ascontiguousarray(maf_num[keep_local], dtype=np.float32)
+            active_row_idx = np.ascontiguousarray(
+                np.flatnonzero(keep_final).astype(np.int64, copy=False),
+                dtype=np.int64,
+            )
+            packed = np.ascontiguousarray(packed_num, dtype=np.uint8)
+            miss_arr = np.ascontiguousarray(miss_num[active_row_idx], dtype=np.float32)
+            maf_arr = np.ascontiguousarray(maf_num[active_row_idx], dtype=np.float32)
 
             row_flip_raw = packed_ctx_raw.get("row_flip")
             if row_flip_raw is None:
                 if hasattr(jxrs, "bed_packed_row_flip_mask"):
                     row_flip_raw = jxrs.bed_packed_row_flip_mask(
-                        packed,
+                        packed_num,
                         int(packed_ctx_raw["n_samples"]),
                     )
                 else:
-                    row_flip_raw = np.zeros(int(packed.shape[0]), dtype=np.bool_)
-            row_flip_arr = np.ascontiguousarray(
+                    row_flip_raw = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
+            row_flip_full = np.ascontiguousarray(
                 np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
                 dtype=np.bool_,
             )
-            if int(row_flip_arr.shape[0]) != int(packed.shape[0]):
+            if int(row_flip_full.shape[0]) != int(packed_num.shape[0]):
                 raise ValueError(
                     "Packed row_flip length mismatch for FarmCPU packed context."
                 )
+            row_flip_arr = np.ascontiguousarray(row_flip_full[active_row_idx], dtype=np.bool_)
 
             loaded_snps = int(ref_alt.shape[0])
             packed_ctx = {
@@ -766,7 +765,9 @@ def run_farmcpu_fullmem(
                 "missing_rate": miss_arr,
                 "maf": maf_arr,
                 "row_flip": row_flip_arr,
+                "row_indices": active_row_idx,
                 "site_keep": np.ascontiguousarray(keep_final, dtype=np.bool_),
+                "packed_filter_mode": "lazy_full",
                 "n_samples": int(packed_ctx_raw["n_samples"]),
                 "source_prefix": str(packed_prefix),
             }
@@ -984,6 +985,16 @@ def run_farmcpu_fullmem(
                     np.asarray(packed_obj["maf"], dtype=np.float32)
                 ),
                 "row_flip": row_flip_arr,
+                "row_indices": np.ascontiguousarray(
+                    np.asarray(
+                        packed_obj.get(
+                            "row_indices",
+                            np.arange(int(np.asarray(packed_obj["maf"]).reshape(-1).shape[0]), dtype=np.int64),
+                        ),
+                        dtype=np.int64,
+                    ).reshape(-1),
+                    dtype=np.int64,
+                ),
                 "n_samples": packed_n,
             }
         packed_sample_idx_obj = farmcpu_cache.get("packed_sample_idx")
@@ -1116,6 +1127,16 @@ def run_farmcpu_fullmem(
                 packed_arr = packed_payload["packed"]
                 row_flip_arr = packed_payload["row_flip"]
                 maf_arr = packed_payload["maf"]
+                row_idx_arr = np.ascontiguousarray(
+                    np.asarray(
+                        packed_payload.get(
+                            "row_indices",
+                            np.arange(int(np.asarray(maf_arr).reshape(-1).shape[0]), dtype=np.int64),
+                        ),
+                        dtype=np.int64,
+                    ).reshape(-1),
+                    dtype=np.int64,
+                )
                 sample_idx_use = (
                     None
                     if sample_idx_arg is None
@@ -1153,6 +1174,7 @@ def run_farmcpu_fullmem(
                         int(args.thread),
                         None,
                         int(max(1, int(getattr(args, "chunksize", 10000)))),
+                        row_indices=row_idx_arr,
                     )
                     r0 = _res[0]
                     n_pseudo_qtn = int(r0.get("pseudo_rows", 0))
@@ -1172,14 +1194,15 @@ def run_farmcpu_fullmem(
                         maf_arr,
                         out_tsv,
                         sample_idx_use,
-                        float(farm_threshold),
-                        int(farm_iter),
-                        farm_qtn_bound,
-                        int(farm_nbin),
-                        [float(x) for x in farm_szbin],
-                        int(args.thread),
-                        _farmcpu_progress,
-                        pseudo_tsv_hint,
+                        row_indices=row_idx_arr,
+                        threshold=float(farm_threshold),
+                        max_iter=int(farm_iter),
+                        qtn_bound=farm_qtn_bound,
+                        nbin=int(farm_nbin),
+                        szbin=[float(x) for x in farm_szbin],
+                        threads=int(args.thread),
+                        progress_callback=_farmcpu_progress,
+                        pseudo_tsv=pseudo_tsv_hint,
                     )
                 farm_pbar.finish()
             finally:

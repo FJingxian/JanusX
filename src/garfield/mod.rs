@@ -260,14 +260,7 @@ where
 {
     let ctx = "garfield::beam_search_and_with_group_exclusion";
     let needed_words = validate_constrained_inputs(
-        bits_flat,
-        row_words,
-        n_rows,
-        n_samples,
-        max_pick,
-        beam_width,
-        group_ids,
-        ctx,
+        bits_flat, row_words, n_rows, n_samples, max_pick, beam_width, group_ids, ctx,
     )?;
 
     let mask = tail_mask(n_samples);
@@ -642,8 +635,7 @@ fn write_subset_id_sidecar(
     let src_ids = read_sample_ids_from_sidecar(&src_id_path)?;
     let dst_id_path = out_bin_id_path(dst_bin);
     if let Some(parent) = dst_id_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let mut fw = BufWriter::new(
         File::create(&dst_id_path).map_err(|e| format!("create {}: {e}", dst_id_path.display()))?,
@@ -677,7 +669,10 @@ fn normalize_plink_prefix(path_or_prefix: &str) -> String {
     }
 }
 
-fn make_input_reader(input_path: &str, input_kind: GarfieldInputKind) -> Result<GarfieldInputReader, String> {
+fn make_input_reader(
+    input_path: &str,
+    input_kind: GarfieldInputKind,
+) -> Result<GarfieldInputReader, String> {
     let p = input_path.trim();
     if p.is_empty() {
         return Err("input_path must not be empty".to_string());
@@ -1129,8 +1124,7 @@ fn gather_rows_by_indices(
         }
         let src_st = src_r * row_words;
         let dst_st = dst_r * row_words;
-        out[dst_st..dst_st + row_words]
-            .copy_from_slice(&bits_flat[src_st..src_st + row_words]);
+        out[dst_st..dst_st + row_words].copy_from_slice(&bits_flat[src_st..src_st + row_words]);
     }
     Ok(out)
 }
@@ -1196,13 +1190,7 @@ fn run_beam_with_feature_exclusion(
         GarfieldResponse::Binary => {
             let yb = y_train_bin.ok_or_else(|| "binary y is not prepared".to_string())?;
             beam_search_and_binary_mcc(
-                yb,
-                bits_flat,
-                row_words,
-                n_rows,
-                n_samples,
-                max_pick,
-                beam_width,
+                yb, bits_flat, row_words, n_rows, n_samples, max_pick, beam_width,
             )
         }
         GarfieldResponse::Continuous => beam_search_and_continuous_abs_corr(
@@ -1416,12 +1404,9 @@ pub fn garfield_prepare_input_bin_py(
     let mode = parse_bin_mode(mode).map_err(PyValueError::new_err)?;
     let mut reader = make_input_reader(&input_path, input_kind).map_err(PyRuntimeError::new_err)?;
 
-    let (selected_indices, selected_ids) = build_sample_selection(
-        reader.sample_ids(),
-        sample_ids,
-        sample_indices,
-    )
-    .map_err(PyRuntimeError::new_err)?;
+    let (selected_indices, selected_ids) =
+        build_sample_selection(reader.sample_ids(), sample_ids, sample_indices)
+            .map_err(PyRuntimeError::new_err)?;
     if selected_indices.is_empty() {
         return Err(PyValueError::new_err("selected sample set is empty"));
     }
@@ -1433,7 +1418,8 @@ pub fn garfield_prepare_input_bin_py(
         .enumerate()
         .all(|(i, &idx)| i == idx);
     let row_bytes = row_bytes_for_samples(n_samples);
-    let mut writer = GarfieldBinWriter::new(&out_bin_path, n_samples).map_err(PyRuntimeError::new_err)?;
+    let mut writer =
+        GarfieldBinWriter::new(&out_bin_path, n_samples).map_err(PyRuntimeError::new_err)?;
 
     let available_threads = std::thread::available_parallelism()
         .map(|x| x.get())
@@ -1525,14 +1511,7 @@ pub fn garfield_prepare_input_bin_py(
                 } {
                     n_sites_seen = n_sites_seen.saturating_add(1);
                     if let Some(rows) = encode_row_to_bits(
-                        row,
-                        site,
-                        mode,
-                        row_bytes,
-                        maf_f32,
-                        geno_f32,
-                        impute,
-                        het_f32,
+                        row, site, mode, row_bytes, maf_f32, geno_f32, impute, het_f32,
                     ) {
                         n_sites_written = n_sites_written.saturating_add(1);
                         n_rows_written = n_rows_written.saturating_add(rows.len());
@@ -1550,7 +1529,8 @@ pub fn garfield_prepare_input_bin_py(
                 let row = if identity_selection {
                     row_raw
                 } else {
-                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                    row_select_by_indices(row_raw, &selected_indices)
+                        .map_err(PyRuntimeError::new_err)?
                 };
                 batch.push((row, site));
                 if batch.len() >= 1024 {
@@ -1608,7 +1588,8 @@ pub fn garfield_prepare_input_bin_py(
                 let row = if identity_selection {
                     row_raw
                 } else {
-                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                    row_select_by_indices(row_raw, &selected_indices)
+                        .map_err(PyRuntimeError::new_err)?
                 };
                 batch.push((row, site));
                 if batch.len() >= 1024 {
@@ -1663,7 +1644,8 @@ pub fn garfield_prepare_input_bin_py(
                 let row = if identity_selection {
                     row_raw
                 } else {
-                    row_select_by_indices(row_raw, &selected_indices).map_err(PyRuntimeError::new_err)?
+                    row_select_by_indices(row_raw, &selected_indices)
+                        .map_err(PyRuntimeError::new_err)?
                 };
                 batch.push((row, site));
                 if batch.len() >= 1024 {
@@ -1791,8 +1773,8 @@ pub fn garfield_subset_bin_samples_py(
         .map_err(|e| PyRuntimeError::new_err(format!("{ctx}: flush {out_bin_path}: {e}")))?;
 
     copy_site_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
-    let wrote_subset_ids =
-        write_subset_id_sidecar(&bin_path, &out_bin_path, &sample_indices).map_err(PyRuntimeError::new_err)?;
+    let wrote_subset_ids = write_subset_id_sidecar(&bin_path, &out_bin_path, &sample_indices)
+        .map_err(PyRuntimeError::new_err)?;
     if !wrote_subset_ids {
         copy_id_sidecar(&bin_path, &out_bin_path).map_err(PyRuntimeError::new_err)?;
     }

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import typing
 
 import numpy as np
@@ -94,6 +95,17 @@ def _packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
     return out
 
 
+def _normalize_filter_mode(mode: str) -> str:
+    key = str(mode or "compact").strip().lower()
+    if key in {"", "compact", "filtered", "subset"}:
+        return "compact"
+    if key in {"lazy", "lazy_full", "full", "mask"}:
+        return "lazy"
+    if key == "auto":
+        return "auto"
+    raise ValueError(f"Unsupported packed filter_mode: {mode!r}")
+
+
 def prepare_packed_ctx_from_plink(
     prefix: str,
     *,
@@ -102,6 +114,7 @@ def prepare_packed_ctx_from_plink(
     het_threshold: float = 0.0,
     snps_only: bool = False,
     expected_n_samples: int | None = None,
+    filter_mode: str = "compact",
 ) -> tuple[np.ndarray, dict[str, typing.Any]]:
     """
     Unified packed BED loading/filtering entry for Python callers.
@@ -109,6 +122,7 @@ def prepare_packed_ctx_from_plink(
     Prefer Rust-side preprocessing when available; fallback to legacy Python
     filtering path for compatibility.
     """
+    filter_mode_key = _normalize_filter_mode(filter_mode)
     plink_prefix = _normalize_plink_prefix(prefix)
     sample_ids, _ = inspect_genotype_file(str(plink_prefix))
     sample_ids_arr = np.asarray(sample_ids, dtype=str)
@@ -119,7 +133,7 @@ def prepare_packed_ctx_from_plink(
             f"got {int(sample_ids_arr.shape[0])} from {plink_prefix}."
         )
 
-    if prepare_bed_2bit_packed is not None:
+    if (filter_mode_key == "compact") and (prepare_bed_2bit_packed is not None):
         try:
             (
                 packed_raw,
@@ -160,6 +174,15 @@ def prepare_packed_ctx_from_plink(
                     np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_
                 ),
                 "n_samples": int(packed_n),
+                "n_total_sites": int(_total_sites),
+                "n_active_sites": int(np.asarray(maf_raw).reshape(-1).shape[0]),
+                "active_row_idx": np.ascontiguousarray(
+                    np.flatnonzero(
+                        np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1)
+                    ).astype(np.int64, copy=False),
+                    dtype=np.int64,
+                ),
+                "packed_filter_mode": "compact",
                 "source_prefix": str(plink_prefix),
             }
             return sample_ids_arr, packed_ctx
@@ -202,19 +225,60 @@ def prepare_packed_ctx_from_plink(
         )
     site_keep = np.ascontiguousarray(np.asarray(keep, dtype=np.bool_).reshape(-1), dtype=np.bool_)
 
+    if _jxrs is not None and hasattr(_jxrs, "bed_packed_row_flip_mask"):
+        row_flip_full = np.ascontiguousarray(
+            np.asarray(_jxrs.bed_packed_row_flip_mask(packed, int(packed_n)), dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+    else:
+        row_flip_full = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
+
+    keep_idx = np.ascontiguousarray(
+        np.flatnonzero(site_keep).astype(np.int64, copy=False),
+        dtype=np.int64,
+    )
+    keep_ratio = (
+        float(keep_idx.shape[0]) / float(site_keep.shape[0])
+        if int(site_keep.shape[0]) > 0
+        else 0.0
+    )
+    use_lazy = False
+    if filter_mode_key == "lazy":
+        use_lazy = True
+    elif filter_mode_key == "auto":
+        lazy_keep_ratio = float(
+            os.environ.get("JX_PACKED_LAZY_KEEP_RATIO", "0.98").strip() or "0.98"
+        )
+        if not np.isfinite(lazy_keep_ratio):
+            lazy_keep_ratio = 0.98
+        lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
+        use_lazy = bool(keep_ratio >= lazy_keep_ratio)
+
+    if use_lazy:
+        packed_ctx = {
+            "packed": packed,
+            "missing_rate": miss_arr,
+            "maf": maf_arr,
+            "std_denom": std_arr,
+            "row_flip": row_flip_full,
+            "site_keep": site_keep,
+            "active_row_idx": keep_idx,
+            "n_samples": int(packed_n),
+            "n_total_sites": int(site_keep.shape[0]),
+            "n_active_sites": int(keep_idx.shape[0]),
+            "packed_filter_mode": "lazy_full",
+            "source_prefix": str(plink_prefix),
+        }
+        return sample_ids_arr, packed_ctx
+
     if not np.all(keep):
         packed = np.ascontiguousarray(packed[keep], dtype=np.uint8)
         miss_arr = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
         maf_arr = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
         std_arr = np.ascontiguousarray(std_arr[keep], dtype=np.float32)
-
-    if _jxrs is not None and hasattr(_jxrs, "bed_packed_row_flip_mask"):
-        row_flip = np.ascontiguousarray(
-            np.asarray(_jxrs.bed_packed_row_flip_mask(packed, int(packed_n)), dtype=np.bool_).reshape(-1),
-            dtype=np.bool_,
-        )
+        row_flip = np.ascontiguousarray(row_flip_full[keep], dtype=np.bool_)
     else:
-        row_flip = np.zeros((int(packed.shape[0]),), dtype=np.bool_)
+        row_flip = row_flip_full
 
     packed_ctx = {
         "packed": packed,
@@ -223,7 +287,11 @@ def prepare_packed_ctx_from_plink(
         "std_denom": std_arr,
         "row_flip": row_flip,
         "site_keep": site_keep,
+        "active_row_idx": keep_idx,
         "n_samples": int(packed_n),
+        "n_total_sites": int(site_keep.shape[0]),
+        "n_active_sites": int(keep_idx.shape[0]),
+        "packed_filter_mode": "compact",
         "source_prefix": str(plink_prefix),
     }
     return sample_ids_arr, packed_ctx

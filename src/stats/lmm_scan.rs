@@ -2474,6 +2474,7 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
     y_rot,
     u_t,
     sample_indices=None,
+    row_indices=None,
     low=-5.0,
     high=5.0,
     max_iter=50,
@@ -2497,6 +2498,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     y_rot: PyReadonlyArray1<'py, f64>,
     u_t: PyReadonlyArray2<'py, f32>,
     sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
     low: f64,
     high: f64,
     max_iter: usize,
@@ -2529,7 +2531,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
@@ -2540,6 +2542,16 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m || row_maf.len() != m {
         return Err(PyRuntimeError::new_err(
             "row_flip/row_maf length mismatch with packed rows",
@@ -2728,6 +2740,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
                     bytes_per_snp,
                     row_flip,
                     row_maf,
+                    row_idx.as_deref(),
                     start,
                     rows,
                     n,
@@ -2840,6 +2853,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
     allele1,
     out_tsv,
     sample_indices=None,
+    row_indices=None,
     low=-5.0,
     high=5.0,
     max_iter=50,
@@ -2868,6 +2882,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     allele1: Vec<String>,
     out_tsv: &str,
     sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
     low: f64,
     high: f64,
     max_iter: usize,
@@ -2900,13 +2915,30 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
         return Err(PyRuntimeError::new_err(format!(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
+    }
+    let row_flip = row_flip.as_slice()?;
+    let row_maf = row_maf.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
+    if row_flip.len() != m || row_maf.len() != m {
+        return Err(PyRuntimeError::new_err(
+            "row_flip/row_maf length mismatch with packed rows",
+        ));
     }
     if chrom.len() != m || pos.len() != m || allele0.len() != m || allele1.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2916,14 +2948,6 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
             allele0.len(),
             allele1.len()
         )));
-    }
-
-    let row_flip = row_flip.as_slice()?;
-    let row_maf = row_maf.as_slice()?;
-    if row_flip.len() != m || row_maf.len() != m {
-        return Err(PyRuntimeError::new_err(
-            "row_flip/row_maf length mismatch with packed rows",
-        ));
     }
 
     let y = y_rot.as_slice()?;
@@ -3135,6 +3159,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                     bytes_per_snp,
                     row_flip,
                     row_maf,
+                    row_idx.as_deref(),
                     start,
                     rows,
                     n,
@@ -3352,6 +3377,7 @@ fn decode_centered_block_packed_f32(
     bytes_per_snp: usize,
     row_flip: &[bool],
     row_maf: &[f32],
+    row_indices: Option<&[usize]>,
     row_start: usize,
     rows: usize,
     n: usize,
@@ -3369,7 +3395,8 @@ fn decode_centered_block_packed_f32(
     if sample_identity {
         out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
             let idx = row_start + off;
-            let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+            let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             let flip = row_flip[idx];
             let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
             let mut sum_g = 0.0_f64;
@@ -3410,7 +3437,8 @@ fn decode_centered_block_packed_f32(
     let bit_shift = sample_bit_shift.expect("sample_bit_shift must exist for non-identity mapping");
     out.par_chunks_mut(n).enumerate().for_each(|(off, dst)| {
         let idx = row_start + off;
-        let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+        let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+        let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
         let flip = row_flip[idx];
         let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
         let mut sum_g = 0.0_f64;
@@ -3620,6 +3648,7 @@ impl PackedFastlmmScratch {
     y,
     x=None,
     sample_indices=None,
+    row_indices=None,
     low=-5.0,
     high=5.0,
     max_iter=50,
@@ -3643,6 +3672,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     y: PyReadonlyArray1<'py, f64>,
     x: Option<PyReadonlyArray2<'py, f64>>,
     sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
     low: f64,
     high: f64,
     max_iter: usize,
@@ -3675,7 +3705,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
@@ -3686,6 +3716,16 @@ pub fn fastlmm_assoc_packed_f32<'py>(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m {
         return Err(PyRuntimeError::new_err(format!(
             "row_flip length mismatch: got {}, expected {m}",
@@ -4020,6 +4060,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                     bytes_per_snp,
                     row_flip,
                     row_maf,
+                    None,
                     start,
                     rows,
                     n,
@@ -4184,33 +4225,7 @@ pub fn fastlmm_assoc_packed_f32<'py>(
     Ok((lbd, ml0, reml0, out))
 }
 
-#[pyfunction(signature=(
-    packed,
-    n_samples,
-    row_flip,
-    row_maf,
-    u,
-    s,
-    y,
-    x,
-    sample_indices,
-    low,
-    high,
-    max_iter,
-    tol,
-    tau,
-    threads,
-    model,
-    chrom,
-    pos,
-    allele0,
-    allele1,
-    out_tsv,
-    progress_callback=None,
-    progress_every=0,
-    fixed_lbd=None,
-    fixed_ml0=None
-))]
+#[pyfunction]
 pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     py: Python<'py>,
     packed: PyReadonlyArray2<'py, u8>,
@@ -4238,6 +4253,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
     progress_every: usize,
     fixed_lbd: Option<f64>,
     fixed_ml0: Option<f64>,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(f64, f64, f64)> {
     if fixed_lbd.is_none() && low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
@@ -4259,7 +4275,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
@@ -4270,6 +4286,16 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
 
     let row_flip = row_flip.as_slice()?;
     let row_maf = row_maf.as_slice()?;
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m {
         return Err(PyRuntimeError::new_err(format!(
             "row_flip length mismatch: got {}, expected {m}",
@@ -4633,6 +4659,7 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                     bytes_per_snp,
                     row_flip,
                     row_maf,
+                    row_idx.as_deref(),
                     start,
                     rows,
                     n,

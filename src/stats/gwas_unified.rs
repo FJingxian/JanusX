@@ -302,7 +302,8 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
     step=10000,
     threads=0,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    row_indices=None
 ))]
 pub fn gwas_packed_unified_to_tsv<'py>(
     py: Python<'py>,
@@ -319,6 +320,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    row_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<Bound<'py, PyList>> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -397,6 +399,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     allele1.clone(),
                     out_tsv.as_str(),
                     sample_indices,
+                    row_indices.clone(),
                     step_use,
                     threads,
                     scan_progress_callback,
@@ -457,6 +460,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     allele1.clone(),
                     out_tsv.as_str(),
                     sample_indices,
+                    row_indices.clone(),
                     low,
                     high,
                     max_iter,
@@ -546,6 +550,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     progress_every_use,
                     fixed_lbd,
                     fixed_ml0,
+                    row_indices.clone(),
                 )?;
                 result_obj.set_item("lbd", lbd)?;
                 result_obj.set_item("ml0", ml0)?;
@@ -595,6 +600,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     row_maf.clone(),
                     out_tsv.as_str(),
                     sample_indices,
+                    row_indices.clone(),
                     threshold,
                     max_iter,
                     qtn_bound,

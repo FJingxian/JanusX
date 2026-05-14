@@ -264,6 +264,7 @@ fn scan_packed_full_matrix(
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
+    row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     threads: usize,
 ) -> Result<(Vec<f64>, usize, usize), String> {
@@ -284,7 +285,8 @@ fn scan_packed_full_matrix(
     if packed_flat.len() % bytes_per_snp != 0 {
         return Err("packed length is not divisible by bytes_per_snp".to_string());
     }
-    let m = packed_flat.len() / bytes_per_snp;
+    let m_packed = packed_flat.len() / bytes_per_snp;
+    let m = row_indices.map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m || row_maf.len() != m {
         return Err("row_flip/row_maf length mismatch".to_string());
     }
@@ -317,7 +319,8 @@ fn scan_packed_full_matrix(
             || GlmScratch::new(q0),
             |scr, (idx, row_out)| {
                 scr.reset_xs();
-                let row = &packed_flat[idx * bytes_per_snp..(idx + 1) * bytes_per_snp];
+                let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
+                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 let flip = row_flip[idx];
                 let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
                 let mut sy = 0.0_f64;
@@ -759,6 +762,7 @@ pub fn farmcpu_super_dense<'py>(
     row_maf,
     out_tsv,
     sample_indices=None,
+    row_indices=None,
     threshold=0.05,
     max_iter=30,
     qtn_bound=None,
@@ -782,6 +786,7 @@ pub fn farmcpu_packed_to_tsv(
     row_maf: PyReadonlyArray1<'_, f32>,
     out_tsv: &str,
     sample_indices: Option<PyReadonlyArray1<'_, i64>>,
+    row_indices: Option<PyReadonlyArray1<'_, i64>>,
     threshold: f64,
     max_iter: usize,
     qtn_bound: Option<usize>,
@@ -834,7 +839,7 @@ pub fn farmcpu_packed_to_tsv(
             "packed must be 2D (m, bytes_per_snp)",
         ));
     }
-    let m = packed_arr.shape()[0];
+    let m_packed = packed_arr.shape()[0];
     let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
     if bytes_per_snp != expected_bps {
@@ -842,6 +847,16 @@ pub fn farmcpu_packed_to_tsv(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
     }
+    let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
+        Some(parse_index_vec_i64(
+            ridx.as_slice()?,
+            m_packed,
+            "row_indices",
+        )?)
+    } else {
+        None
+    };
+    let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
     if m == 0 {
         return Err(PyRuntimeError::new_err("empty packed marker matrix"));
     }
@@ -867,7 +882,7 @@ pub fn farmcpu_packed_to_tsv(
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
-    if packed_flat.len() != m * bytes_per_snp {
+    if packed_flat.len() != m_packed * bytes_per_snp {
         return Err(PyRuntimeError::new_err("invalid packed flattened length"));
     }
 
@@ -933,12 +948,20 @@ pub fn farmcpu_packed_to_tsv(
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
+        let map_local_rows = |local_idx: &[usize]| -> Vec<usize> {
+            if let Some(row_idx_full) = row_idx.as_ref() {
+                local_idx.iter().map(|&j| row_idx_full[j]).collect()
+            } else {
+                local_idx.to_vec()
+            }
+        };
         for it_idx in 0..max_iter_i {
+            let qtn_packed_idx = map_local_rows(&qtn_idx);
             let (x_qtn, q_total) = build_x_with_qtn_packed(
                 &base_x,
                 n,
                 q_base,
-                &qtn_idx,
+                &qtn_packed_idx,
                 &packed_flat,
                 bytes_per_snp,
                 &sample_idx,
@@ -966,6 +989,7 @@ pub fn farmcpu_packed_to_tsv(
                 n_samples,
                 row_flip,
                 row_maf,
+                row_idx.as_deref(),
                 &sample_idx,
                 threads,
             )
@@ -1041,10 +1065,11 @@ pub fn farmcpu_packed_to_tsv(
                     .par_iter()
                     .map(|&(sz, nn)| {
                         let leadidx = select_lead_indices(sz, nn, &femp, &global_pos);
+                        let leadidx_packed = map_local_rows(&leadidx);
                         let sample_major = decode_packed_rows_to_sample_major(
                             &packed_flat,
                             bytes_per_snp,
-                            &leadidx,
+                            &leadidx_packed,
                             &sample_idx,
                             row_flip,
                             row_maf,
@@ -1109,7 +1134,7 @@ pub fn farmcpu_packed_to_tsv(
                 let sample_major = decode_packed_rows_to_sample_major(
                     &packed_flat,
                     bytes_per_snp,
-                    &qtn_union,
+                    &map_local_rows(&qtn_union),
                     &sample_idx,
                     row_flip,
                     row_maf,
@@ -1143,11 +1168,12 @@ pub fn farmcpu_packed_to_tsv(
             qtn_idx = qtn_next;
         }
 
+        let qtn_packed_idx = map_local_rows(&qtn_idx);
         let (x_qtn, q_total) = build_x_with_qtn_packed(
             &base_x,
             n,
             q_base,
-            &qtn_idx,
+            &qtn_packed_idx,
             &packed_flat,
             bytes_per_snp,
             &sample_idx,
@@ -1174,6 +1200,7 @@ pub fn farmcpu_packed_to_tsv(
             n_samples,
             row_flip,
             row_maf,
+            row_idx.as_deref(),
             &sample_idx,
             threads,
         )

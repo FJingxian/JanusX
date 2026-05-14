@@ -1563,48 +1563,53 @@ pub fn rrblup_pcg_bed<'py>(
                 let stage_accum = Arc::new(Mutex::new(PcgStageTimingAccum::default()));
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];
-                let mut block = vec![0.0_f32; row_step * n_train];
-                let mut dot_blk = vec![0.0_f32; row_step];
                 let mut sum_ss_global = 0.0_f64;
-                let mut tick = 0usize;
-                for st in (0..m).step_by(row_step) {
-                    let ed = (st + row_step).min(m);
-                    let cur_rows = ed - st;
-                    let blk_slice = &mut block[..cur_rows * n_train];
-                    decode_standardized_block_f32(
-                        packed_keep.as_ref(),
-                        bytes_per_snp,
-                        n_samples,
-                        row_flip_keep.as_ref(),
-                        &row_mean,
-                        &row_inv_sd,
-                        &train_idx,
-                        full_train_fast,
-                        st,
-                        blk_slice,
-                        &code4_lut,
-                        pool_ref,
-                    )?;
-                    row_major_block_mul_vec_f32(
-                        blk_slice,
-                        cur_rows,
-                        n_train,
-                        &y_center_f32,
-                        &mut dot_blk[..cur_rows],
-                        pool_ref,
-                    );
-                    for r in 0..cur_rows {
-                        let row = &blk_slice[r * n_train..(r + 1) * n_train];
-                        let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
-                        sum_ss_global += ss;
-                        b[st + r] = dot_blk[r];
-                        let d = ((ss as f32) + lambda_use).max(1e-12_f32);
-                        diag_inv[st + r] = 1.0_f32 / d;
-                    }
-                    tick += cur_rows;
-                    if tick >= row_step.saturating_mul(64).max(1) {
-                        check_ctrlc()?;
-                        tick = 0;
+                {
+                    // This decode workspace can reach multiple GiB for large n_train.
+                    // Keep it scoped to the diagonal/preconditioner pass so it is
+                    // released before the PCG matvec loop allocates its own block.
+                    let mut block = vec![0.0_f32; row_step * n_train];
+                    let mut dot_blk = vec![0.0_f32; row_step];
+                    let mut tick = 0usize;
+                    for st in (0..m).step_by(row_step) {
+                        let ed = (st + row_step).min(m);
+                        let cur_rows = ed - st;
+                        let blk_slice = &mut block[..cur_rows * n_train];
+                        decode_standardized_block_f32(
+                            packed_keep.as_ref(),
+                            bytes_per_snp,
+                            n_samples,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            full_train_fast,
+                            st,
+                            blk_slice,
+                            &code4_lut,
+                            pool_ref,
+                        )?;
+                        row_major_block_mul_vec_f32(
+                            blk_slice,
+                            cur_rows,
+                            n_train,
+                            &y_center_f32,
+                            &mut dot_blk[..cur_rows],
+                            pool_ref,
+                        );
+                        for r in 0..cur_rows {
+                            let row = &blk_slice[r * n_train..(r + 1) * n_train];
+                            let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
+                            sum_ss_global += ss;
+                            b[st + r] = dot_blk[r];
+                            let d = ((ss as f32) + lambda_use).max(1e-12_f32);
+                            diag_inv[st + r] = 1.0_f32 / d;
+                        }
+                        tick += cur_rows;
+                        if tick >= row_step.saturating_mul(64).max(1) {
+                            check_ctrlc()?;
+                            tick = 0;
+                        }
                     }
                 }
 

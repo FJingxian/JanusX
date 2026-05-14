@@ -2713,6 +2713,8 @@ def _estimate_rrblup_lambda_subsample_reml(
         "he_accepted": None,
         "he_reject_reason": "",
         "he_error": "",
+        "he_call_path": "",
+        "he_call_api": "",
         "thread_policy": "",
         "stage_blas_threads": 0,
         "stage_rayon_threads": 0,
@@ -2736,6 +2738,35 @@ def _estimate_rrblup_lambda_subsample_reml(
             progress_hook(str(event), dict(payload))
         except Exception:
             return
+
+    he_debug_mode = bool(cfg_use.get("debug_mode", False)) or bool(_GS_DEBUG_STAGE)
+
+    def _emit_he_call_path(
+        call_path: str,
+        call_api: str,
+        *,
+        note: str = "",
+    ) -> None:
+        he_diag["he_call_path"] = str(call_path).strip()
+        he_diag["he_call_api"] = str(call_api).strip()
+        payload = {
+            "vc_method": "HE",
+            "strategy": "he",
+            "he_call_path": str(call_path).strip(),
+            "he_call_api": str(call_api).strip(),
+        }
+        note_txt = str(note).strip()
+        if note_txt != "":
+            payload["note"] = note_txt
+        _emit("pcg_lambda_he_call_path", **payload)
+        if he_debug_mode:
+            msg = (
+                f"[rrBLUP-DEBUG] HE call path={payload['he_call_path']} "
+                f"api={payload['he_call_api']}"
+            )
+            if note_txt != "":
+                msg += f" note={note_txt}"
+            print(msg, flush=True)
 
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
     can_try_he = bool(
@@ -2908,6 +2939,10 @@ def _estimate_rrblup_lambda_subsample_reml(
                             y_vec,
                             **he_call_kwargs,
                         )
+                        _emit_he_call_path(
+                            "external_packed",
+                            "kwargs_blas_threads",
+                        )
                     except TypeError:
                         he_call_kwargs.pop("blas_threads", None)
                         try:
@@ -2917,7 +2952,17 @@ def _estimate_rrblup_lambda_subsample_reml(
                                 y_vec,
                                 **he_call_kwargs,
                             )
+                            _emit_he_call_path(
+                                "external_packed",
+                                "kwargs_no_blas_threads",
+                                note="extension_missing_he_blas_threads_kw",
+                            )
                         except TypeError:
+                            _emit_he_call_path(
+                                "legacy_prefix_reload",
+                                "legacy_positional",
+                                note="extension_missing_packed_he_signature",
+                            )
                             he_out = _jxrs.he_pcg_bed(  # type: ignore[union-attr]
                                 source_prefix,
                                 train_abs,
@@ -5473,6 +5518,8 @@ def GSapi(
                 "lambda_he_accepted",
                 "lambda_he_reject_reason",
                 "lambda_he_error",
+                "lambda_he_call_path",
+                "lambda_he_call_api",
                 "lambda_he_thread_policy",
                 "lambda_he_stage_blas_threads",
                 "lambda_he_stage_rayon_threads",
@@ -5552,6 +5599,8 @@ def GSapi(
             _set_bool("lambda_he_accepted", "he_accepted")
             _set_str("lambda_he_reject_reason", "he_reject_reason")
             _set_str("lambda_he_error", "he_error")
+            _set_str("lambda_he_call_path", "he_call_path")
+            _set_str("lambda_he_call_api", "he_call_api")
             _set_str("lambda_he_thread_policy", "thread_policy")
             _set_int("lambda_he_stage_blas_threads", "stage_blas_threads")
             _set_int("lambda_he_stage_rayon_threads", "stage_rayon_threads")
@@ -13544,6 +13593,7 @@ def _run_gs_pipeline(
         "pcg_std_eps": float(args.rrblup_pcg_std_eps),
         "pcg_progress_every": 1,
         "pcg_block_rows": int(args.rrblup_snp_block_size),
+        "debug_mode": bool(debug_mode),
     }
     bayes_auto_r2_cfg: dict[str, typing.Any] = {
         "cv_reuse": str(args.bayes_r2_cv_reuse),

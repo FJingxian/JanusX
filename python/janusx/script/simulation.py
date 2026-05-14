@@ -39,6 +39,13 @@ from ._common.genoio import determine_genotype_source_from_args as determine_gen
 from ._common.status import log_success
 
 
+def _normalize_chrom(chrom: Any) -> str:
+    s = str(chrom).strip()
+    if s.lower().startswith("chr"):
+        s = s[3:]
+    return s.upper()
+
+
 def _site_to_chr_pos(site: Any) -> Tuple[str, int]:
     if hasattr(site, "chrom") and hasattr(site, "pos"):
         return str(site.chrom), int(site.pos)
@@ -229,30 +236,65 @@ def _sample_gate_from_pool(
     ld_max: float,
     af_min: float,
     af_max: float,
+    same_chrom: bool = True,
     n_trials: int = 256,
 ) -> Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]]:
     m_pool = int(g01_pool.shape[0])
     if m_pool < max(2, int(k_min)):
         return None
-    k_hi = min(int(k_max), m_pool)
-    k_lo = max(2, min(int(k_min), k_hi))
-    if k_lo > k_hi:
-        return None
 
     af_center = 0.5 * (float(af_min) + float(af_max))
     best: Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]] = None
 
+    # Enforce same-chromosome gate by sampling within one chromosome pool.
+    chrom_to_idx: dict[str, np.ndarray] = {}
+    if bool(same_chrom):
+        tmp: dict[str, List[int]] = {}
+        for i, s in enumerate(pool_sites):
+            c = _normalize_chrom(s[0])
+            tmp.setdefault(c, []).append(int(i))
+        for c, idxs in tmp.items():
+            arr = np.asarray(idxs, dtype=int)
+            if int(arr.size) >= max(2, int(k_min)):
+                chrom_to_idx[c] = arr
+        if len(chrom_to_idx) == 0:
+            return None
+
     for _ in range(max(1, int(n_trials))):
-        k = int(rng.integers(k_lo, k_hi + 1))
-        sel = _select_low_ld_indices(
-            g01_pool,
-            k=k,
-            ld_max=float(ld_max),
-            rng=rng,
-            n_trials=64,
-        )
-        if sel is None:
-            sel = np.asarray(rng.choice(np.arange(m_pool), size=k, replace=False), dtype=int)
+        if bool(same_chrom):
+            chrom = str(rng.choice(list(chrom_to_idx.keys())))
+            idx_pool = np.asarray(chrom_to_idx[chrom], dtype=int)
+            g_pool = np.asarray(g01_pool[idx_pool, :], dtype=np.uint8)
+            k_hi = min(int(k_max), int(idx_pool.size))
+            k_lo = max(2, min(int(k_min), k_hi))
+            if k_lo > k_hi:
+                continue
+            k = int(rng.integers(k_lo, k_hi + 1))
+            sel_local = _select_low_ld_indices(
+                g_pool,
+                k=k,
+                ld_max=float(ld_max),
+                rng=rng,
+                n_trials=64,
+            )
+            if sel_local is None:
+                sel_local = np.asarray(rng.choice(np.arange(int(idx_pool.size)), size=k, replace=False), dtype=int)
+            sel = np.asarray(idx_pool[np.asarray(sel_local, dtype=int)], dtype=int)
+        else:
+            k_hi = min(int(k_max), m_pool)
+            k_lo = max(2, min(int(k_min), k_hi))
+            if k_lo > k_hi:
+                return None
+            k = int(rng.integers(k_lo, k_hi + 1))
+            sel = _select_low_ld_indices(
+                g01_pool,
+                k=k,
+                ld_max=float(ld_max),
+                rng=rng,
+                n_trials=64,
+            )
+            if sel is None:
+                sel = np.asarray(rng.choice(np.arange(m_pool), size=k, replace=False), dtype=int)
         gate = np.all(g01_pool[np.asarray(sel, dtype=int), :] > 0, axis=0).astype(np.float32).reshape(-1, 1)
         var_gate = float(np.var(gate, ddof=0))
         if var_gate <= 1e-12:
@@ -477,6 +519,7 @@ def simulate_phenotype_from_genofile(
                     ld_max=float(and_ld_max),
                     af_min=float(and_af_min),
                     af_max=float(and_af_max),
+                    same_chrom=True,
                     n_trials=256,
                 )
                 if cand is not None:
@@ -490,7 +533,7 @@ def simulate_phenotype_from_genofile(
                         y += beta * (gate - float(np.mean(gate)))
                         outsites = sel_sites
 
-        if len(outsites) == 0 and len(low_het_pool_rows) < max(2, int(and_k_min)):
+        if len(outsites) == 0:
             # Final fallback: global streaming pool under the same low-het BIN02 rule.
             g_rows, g_sites = _collect_low_het_pool_global(
                 gfile,
@@ -511,6 +554,7 @@ def simulate_phenotype_from_genofile(
                     ld_max=float(and_ld_max),
                     af_min=float(and_af_min),
                     af_max=float(and_af_max),
+                    same_chrom=True,
                     n_trials=512,
                 )
                 if cand is not None:

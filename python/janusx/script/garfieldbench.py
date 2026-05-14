@@ -199,6 +199,33 @@ def _derive_region_from_causal(
     return chrom0, start, end
 
 
+def _dynamic_window_from_causal(
+    causal_sites: list[tuple[str, int, int]],
+    *,
+    base_extension: int,
+    base_step: Optional[int],
+) -> tuple[int, int, int]:
+    """
+    Build GARFIELD window params from causal-site span on the selected chromosome.
+    Returns (effective_extension, effective_step, causal_span_bp).
+    """
+    ext0 = max(1, int(base_extension))
+    step0 = int(base_step) if base_step is not None else max(1, ext0 // 2)
+    if len(causal_sites) == 0:
+        return ext0, max(1, step0), 0
+
+    chrom0 = _normalize_chrom(causal_sites[0][0])
+    pos = sorted([int(x[1]) for x in causal_sites if _normalize_chrom(x[0]) == chrom0])
+    if len(pos) == 0:
+        return ext0, max(1, step0), 0
+    span = int(max(pos) - min(pos)) if len(pos) >= 2 else 0
+    # Ensure one window centered near one endpoint can still cover the other.
+    eff_ext = max(ext0, span)
+    # Use span-adaptive step to match enlarged windows.
+    eff_step = max(1, eff_ext // 2)
+    return int(eff_ext), int(eff_step), int(span)
+
+
 def _extract_region_plink(
     gfile: str,
     out_prefix: str,
@@ -458,6 +485,12 @@ def build_parser() -> argparse.ArgumentParser:
     optional_group.add_argument("--feature-source", choices=["bin", "mbin"], default="mbin")
     optional_group.add_argument("-ext", "--extension", type=int, default=50_000, help="GARFIELD window extension.")
     optional_group.add_argument("-step", "--step", type=int, default=None, help="GARFIELD window step.")
+    optional_group.add_argument(
+        "--dynamic-window-from-causal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-adjust GARFIELD ext/step by simulated causal-site distance (default: enabled).",
+    )
     optional_group.add_argument("-nsnp", "--nsnp", type=int, default=12, help="GARFIELD beam width.")
     optional_group.add_argument("-m", "--max-pick", type=int, default=2, help="GARFIELD max literals.")
     optional_group.add_argument("--top-k-validate", type=int, default=20, help="GARFIELD top-k validation.")
@@ -532,6 +565,18 @@ def _run_one(
     causal_set = _causal_site_set(causal_sites)
     flank_bp = int(round(float(args.region_flank_mb) * 1_000_000.0))
     chrom, region_start, region_end = _derive_region_from_causal(causal_sites, flank_bp)
+    if bool(args.dynamic_window_from_causal):
+        run_ext, run_step, causal_span_bp = _dynamic_window_from_causal(
+            causal_sites,
+            base_extension=int(args.extension),
+            base_step=args.step,
+        )
+    else:
+        run_ext = int(args.extension)
+        run_step = args.step if args.step is not None else max(1, int(args.extension) // 2)
+        chrom0 = _normalize_chrom(causal_sites[0][0]) if len(causal_sites) > 0 else ""
+        pos0 = [int(x[1]) for x in causal_sites if _normalize_chrom(x[0]) == chrom0]
+        causal_span_bp = int(max(pos0) - min(pos0)) if len(pos0) >= 2 else 0
 
     region_prefix = str(region_dir / "region")
     with CliStatus(f"[{run_name}] Extracting target region...", enabled=True) as task:
@@ -559,8 +604,8 @@ def _run_one(
                 out_dir=str(gar_dir),
                 out_prefix=gf_prefix,
                 feature_source=str(args.feature_source),
-                extension=int(args.extension),
-                step=args.step,
+                extension=int(run_ext),
+                step=int(run_step),
                 nsnp=int(args.nsnp),
                 max_pick=int(args.max_pick),
                 top_k_validate=int(args.top_k_validate),
@@ -597,6 +642,9 @@ def _run_one(
         "region_span_mb": (int(region_end) - int(region_start) + 1) / 1_000_000.0,
         "n_samples_region": int(n_samples_region),
         "n_sites_region": int(n_sites_region),
+        "causal_span_bp": int(causal_span_bp),
+        "effective_extension": int(run_ext),
+        "effective_step": int(run_step),
         "n_causal_sites": int(len(causal_set)),
         "causal_sites": _format_site_set(causal_set),
         "rules_path": rules_path,
@@ -607,7 +655,8 @@ def _run_one(
         **hit,
     }
     logger.info(
-        f"[{run_name}] top1_hit_all={bool(hit['top1_hit_all'])}, "
+        f"[{run_name}] span={int(causal_span_bp)}bp, ext={int(run_ext)}, step={int(run_step)}, "
+        f"top1_hit_all={bool(hit['top1_hit_all'])}, "
         f"top{int(args.top_k_hit)}_hit_all={bool(hit['topk_hit_all'])}, "
         f"best_val={float(hit['best_val_score']):.6g}"
     )
@@ -675,6 +724,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("GARFIELD feature", str(args.feature_source)),
                     ("GARFIELD ext", int(args.extension)),
                     ("GARFIELD step", args.step if args.step is not None else "ext/2"),
+                    ("Dynamic window", bool(args.dynamic_window_from_causal)),
                     ("GARFIELD beam width", int(args.nsnp)),
                     ("GARFIELD max pick", int(args.max_pick)),
                     ("GARFIELD top-K validate", int(args.top_k_validate)),

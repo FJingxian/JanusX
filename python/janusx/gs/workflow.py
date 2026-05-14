@@ -234,6 +234,136 @@ def _rrblup_vc_method_display(name: object) -> str:
     return txt
 
 
+def _format_debug_bytes(n_bytes: object) -> str:
+    try:
+        value = int(n_bytes)
+    except Exception:
+        return "NA"
+    if value < 0:
+        return "NA"
+    if value >= 1024 ** 3:
+        return f"{value / (1024 ** 3):.2f} GiB"
+    if value >= 1024 ** 2:
+        return f"{value / (1024 ** 2):.1f} MiB"
+    if value >= 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value} B"
+
+
+def _get_process_rss_bytes() -> int | None:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:
+        return None
+
+
+def _debug_malloc_trim_enabled() -> bool:
+    raw = str(os.getenv("JX_GS_DEBUG_MALLOC_TRIM", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
+def _maybe_linux_malloc_trim() -> tuple[bool, int | None, int | None, str]:
+    if not _debug_malloc_trim_enabled():
+        return False, None, None, "disabled"
+    before = _get_process_rss_bytes()
+    if not sys.platform.startswith("linux"):
+        return False, before, before, "unsupported_platform"
+    try:
+        gc.collect()
+        import ctypes
+        import ctypes.util
+
+        libc_name = ctypes.util.find_library("c") or "libc.so.6"
+        libc = ctypes.CDLL(libc_name)
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is None:
+            return False, before, _get_process_rss_bytes(), "malloc_trim_unavailable"
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        rc = int(malloc_trim(0))
+        after = _get_process_rss_bytes()
+        return True, before, after, f"rc={rc}"
+    except Exception as ex:
+        return False, before, _get_process_rss_bytes(), f"error={type(ex).__name__}:{ex}"
+
+
+def _emit_debug_malloc_trim(prefix: str) -> None:
+    trimmed, rss_before, rss_after, note = _maybe_linux_malloc_trim()
+    if (not trimmed) and (note == "disabled"):
+        return
+    delta_txt = "NA"
+    if (rss_before is not None) and (rss_after is not None):
+        delta_txt = _format_debug_bytes(int(rss_after) - int(rss_before))
+    print(
+        (
+            f"{prefix} malloc_trim "
+            f"{note} "
+            f"rss_before_trim={_format_debug_bytes(rss_before)} "
+            f"rss_after_trim={_format_debug_bytes(rss_after)} "
+            f"delta={delta_txt}"
+        ),
+        flush=True,
+    )
+
+
+def _emit_packed_load_debug(
+    packed_ctx: dict[str, typing.Any] | None,
+    *,
+    label: str = "",
+    enabled: bool = False,
+) -> None:
+    if (not bool(enabled)) and (not _GS_DEBUG_STAGE) and (not _debug_malloc_trim_enabled()):
+        return
+    if packed_ctx is None:
+        return
+    try:
+        packed = np.asarray(packed_ctx["packed"], dtype=np.uint8)
+        if packed.ndim != 2:
+            print(
+                f"[GS-DEBUG] Packed load {label or 'main'} invalid packed ndim={packed.ndim}",
+                flush=True,
+            )
+            return
+        packed_rows = int(packed.shape[0])
+        bytes_per_snp = int(packed.shape[1])
+        site_keep_raw = packed_ctx.get("site_keep", None)
+        source_rows = packed_rows
+        if site_keep_raw is not None:
+            try:
+                source_rows = int(np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1).shape[0])
+            except Exception:
+                source_rows = packed_rows
+        source_rows = int(max(packed_rows, source_rows))
+        packed_bytes = int(packed.nbytes)
+        source_bed_payload_bytes = int(source_rows * bytes_per_snp)
+        dropped_rows = int(max(0, source_rows - packed_rows))
+        label_txt = str(label).strip()
+        if label_txt != "":
+            label_txt = f" {label_txt}"
+        print(
+            (
+                f"[GS-DEBUG] Packed load{label_txt} "
+                f"rows={packed_rows} "
+                f"source_rows={source_rows} "
+                f"dropped={dropped_rows} "
+                f"bytes_per_snp={bytes_per_snp} "
+                f"packed={_format_debug_bytes(packed_bytes)} "
+                f"source_bed_payload={_format_debug_bytes(source_bed_payload_bytes)} "
+                f"transient_peak_est={_format_debug_bytes(source_bed_payload_bytes + packed_bytes)} "
+                f"rss_after_load={_format_debug_bytes(_get_process_rss_bytes())}"
+            ),
+            flush=True,
+        )
+        _emit_debug_malloc_trim(f"[GS-DEBUG] Packed load{label_txt}")
+    except Exception as ex:
+        print(
+            f"[GS-DEBUG] Packed load {label or 'main'} debug_failed={type(ex).__name__}:{ex}",
+            flush=True,
+        )
+
+
 def _normalize_he_thread_policy_name(
     raw: object,
     *,
@@ -2806,8 +2936,9 @@ def _estimate_rrblup_lambda_subsample_reml(
     )
     if can_try_he:
         try:
+            packed_src_view = np.asarray(packed_ctx["packed"], dtype=np.uint8)
             packed_arg = np.ascontiguousarray(
-                np.asarray(packed_ctx["packed"], dtype=np.uint8),
+                packed_src_view,
                 dtype=np.uint8,
             )
             maf_arg = np.ascontiguousarray(
@@ -2933,11 +3064,19 @@ def _estimate_rrblup_lambda_subsample_reml(
             he_diag["stage_blas_threads"] = int(he_thread_spec["blas_threads"])
             he_diag["stage_rayon_threads"] = int(he_thread_spec["rayon_threads"])
             he_diag["he_threads_arg"] = int(he_thread_spec["he_threads"])
+            he_rss_before: int | None = None
             if he_debug_mode:
+                packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
+                packed_same_obj = bool(packed_arg is packed_src_view)
+                try:
+                    packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
+                except Exception:
+                    packed_shares_memory = False
                 he_block_bytes = int(int(he_block_rows) * int(n_train) * np.dtype(np.float32).itemsize)
                 he_probe_bytes = int(
                     int(n_train) * int(he_trace_probe_batch) * np.dtype(np.float32).itemsize
                 )
+                he_rss_before = _get_process_rss_bytes()
                 print(
                     (
                         "[rrBLUP-DEBUG] HE site_keep mode="
@@ -2947,10 +3086,23 @@ def _estimate_rrblup_lambda_subsample_reml(
                 )
                 print(
                     (
+                        "[rrBLUP-DEBUG] HE packed payload "
+                        f"rows={int(packed_arg.shape[0])} "
+                        f"bytes_per_snp={int(packed_arg.shape[1])} "
+                        f"c_contig={int(packed_c_contig)} "
+                        f"shared_with_ctx={int(packed_shares_memory)} "
+                        f"same_obj={int(packed_same_obj)} "
+                        f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
+                    ),
+                    flush=True,
+                )
+                print(
+                    (
                         "[rrBLUP-DEBUG] HE workspace estimate "
-                        f"packed={packed_arg.nbytes / (1024 ** 3):.2f} GiB "
-                        f"block={he_block_bytes / (1024 ** 3):.2f} GiB "
-                        f"probe={he_probe_bytes / (1024 ** 3):.2f} GiB x2"
+                        f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
+                        f"block={_format_debug_bytes(he_block_bytes)} "
+                        f"probe={_format_debug_bytes(he_probe_bytes)} x2 "
+                        f"rss_before={_format_debug_bytes(he_rss_before)}"
                     ),
                     flush=True,
                 )
@@ -3033,6 +3185,20 @@ def _estimate_rrblup_lambda_subsample_reml(
                                 int(he_seed),
                             )
             finally:
+                if he_debug_mode:
+                    he_rss_after = _get_process_rss_bytes()
+                    delta_txt = "NA"
+                    if (he_rss_before is not None) and (he_rss_after is not None):
+                        delta_txt = _format_debug_bytes(int(he_rss_after) - int(he_rss_before))
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] HE rss after call="
+                            f"{_format_debug_bytes(he_rss_after)} "
+                            f"delta={delta_txt}"
+                        ),
+                        flush=True,
+                    )
+                    _emit_debug_malloc_trim("[rrBLUP-DEBUG] HE")
                 _emit(
                     "pcg_lambda_vc_end",
                     vc_method="HE",
@@ -5973,14 +6139,18 @@ def GSapi(
                 _set_rrblup_solver_state("exact", "rust_rrblup_pcg_kernel_unavailable")
             else:
                 packed_train = typing.cast(dict[str, typing.Any], Xtrain)
+                pcg_debug_mode = bool((rrblup_adamw_cfg or {}).get("debug_mode", False)) or bool(
+                    _GS_DEBUG_STAGE
+                )
                 source_prefix_raw = packed_train.get("source_prefix", None)
                 source_prefix = (
                     ""
                     if source_prefix_raw is None
                     else str(source_prefix_raw).strip()
                 )
+                packed_src_view = np.asarray(packed_train["packed"], dtype=np.uint8)
                 packed_arg = np.ascontiguousarray(
-                    np.asarray(packed_train["packed"], dtype=np.uint8),
+                    packed_src_view,
                     dtype=np.uint8,
                 )
                 maf_arg = np.ascontiguousarray(
@@ -6208,6 +6378,39 @@ def GSapi(
                     if pcg_progress_cb is not None
                     else 0
                 )
+                pcg_rss_before: int | None = None
+                if pcg_debug_mode:
+                    packed_c_contig = bool(getattr(packed_arg, "flags", {}).c_contiguous)
+                    packed_same_obj = bool(packed_arg is packed_src_view)
+                    try:
+                        packed_shares_memory = bool(np.shares_memory(packed_arg, packed_src_view))
+                    except Exception:
+                        packed_shares_memory = False
+                    pcg_block_bytes = int(
+                        int(pcg_block_rows) * int(n_train_expected) * np.dtype(np.float32).itemsize
+                    )
+                    pcg_rss_before = _get_process_rss_bytes()
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] PCG packed payload "
+                            f"rows={int(packed_arg.shape[0])} "
+                            f"bytes_per_snp={int(packed_arg.shape[1])} "
+                            f"c_contig={int(packed_c_contig)} "
+                            f"shared_with_ctx={int(packed_shares_memory)} "
+                            f"same_obj={int(packed_same_obj)} "
+                            f"nbytes={_format_debug_bytes(int(packed_arg.nbytes))}"
+                        ),
+                        flush=True,
+                    )
+                    print(
+                        (
+                            "[rrBLUP-DEBUG] PCG workspace estimate "
+                            f"packed={_format_debug_bytes(int(packed_arg.nbytes))} "
+                            f"block={_format_debug_bytes(pcg_block_bytes)} "
+                            f"rss_before={_format_debug_bytes(pcg_rss_before)}"
+                        ),
+                        flush=True,
+                    )
                 try:
                     with runtime_thread_stage(
                         blas_threads=int(pcg_thread_spec["blas_threads"]),
@@ -6285,6 +6488,21 @@ def GSapi(
                             float(pcg_std_eps),
                             int(pcg_thread_spec["pcg_threads"]),
                         )
+                finally:
+                    if pcg_debug_mode:
+                        pcg_rss_after = _get_process_rss_bytes()
+                        delta_txt = "NA"
+                        if (pcg_rss_before is not None) and (pcg_rss_after is not None):
+                            delta_txt = _format_debug_bytes(int(pcg_rss_after) - int(pcg_rss_before))
+                        print(
+                            (
+                                "[rrBLUP-DEBUG] PCG rss after call="
+                                f"{_format_debug_bytes(pcg_rss_after)} "
+                                f"delta={delta_txt}"
+                            ),
+                            flush=True,
+                        )
+                        _emit_debug_malloc_trim("[rrBLUP-DEBUG] PCG")
                 rr_out_t = tuple(rr_out)
                 beta_export = None
                 if len(rr_out_t) >= 10:
@@ -14315,6 +14533,11 @@ def _run_gs_pipeline(
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        _emit_packed_load_debug(
+            packed_lmm_ctx,
+            label="main",
+            enabled=bool(debug_mode),
+        )
         if preprocess_qc_requested:
             packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
         if ldprune_spec is not None:
@@ -14486,6 +14709,11 @@ def _run_gs_pipeline(
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        _emit_packed_load_debug(
+            packed_lmm_ctx,
+            label="hash",
+            enabled=bool(debug_mode),
+        )
         packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         if ldprune_spec is not None:
@@ -14645,6 +14873,11 @@ def _run_gs_pipeline(
             n = int(sample_ids.shape[0])
             m = int(packed_lmm_ctx["packed"].shape[0]) if packed_lmm_ctx is not None else 0
             task.complete(f"Loading genotype from {gsrc} (n={n}, nSNP={m}, packed)")
+        _emit_packed_load_debug(
+            packed_lmm_ctx,
+            label="ldprune",
+            enabled=bool(debug_mode),
+        )
         packed_qc_baseline_ctx = _snapshot_packed_ctx_for_qc(packed_lmm_ctx)
 
         _spec = typing.cast(_GsLdPruneSpec, ldprune_spec)
@@ -14823,6 +15056,11 @@ def _run_gs_pipeline(
                 "Loading packed rrBLUP helper ...Finished "
                 f"(n={int(packed_ids.shape[0])}, nSNP={m_aux})"
             )
+        _emit_packed_load_debug(
+            rrblup_aux_packed_ctx,
+            label="rrblup_aux",
+            enabled=bool(debug_mode),
+        )
 
     # Cache for repeated trait train/test partitions in GBLUP-only hash kinship mode.
     # Key: (train_idx bytes, test_idx bytes) in genotype sample order.

@@ -8,6 +8,8 @@ pub(crate) type CblasInt = std::os::raw::c_int;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const CBLAS_COL_MAJOR: CblasInt = 102;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) const CBLAS_ROW_MAJOR: CblasInt = 101;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const CBLAS_NO_TRANS: CblasInt = 111;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const CBLAS_TRANS: CblasInt = 112;
@@ -1459,7 +1461,10 @@ unsafe fn cblas_ddot_rust(
     if n <= 0 {
         return 0.0_f64;
     }
-    assert!(incx > 0 && incy > 0, "Rust DDOT fallback expects positive increments");
+    assert!(
+        incx > 0 && incy > 0,
+        "Rust DDOT fallback expects positive increments"
+    );
     let n_usize = n as usize;
     let incx_usize = incx as usize;
     let incy_usize = incy as usize;
@@ -1580,7 +1585,10 @@ unsafe fn cblas_daxpy_rust(
     if n <= 0 || alpha == 0.0_f64 {
         return;
     }
-    assert!(incx > 0 && incy > 0, "Rust DAXPY fallback expects positive increments");
+    assert!(
+        incx > 0 && incy > 0,
+        "Rust DAXPY fallback expects positive increments"
+    );
     let n_usize = n as usize;
     let incx_usize = incx as usize;
     let incy_usize = incy as usize;
@@ -2198,10 +2206,17 @@ pub(crate) fn rust_sgemm_prefers_rayon_rowmajor_f32_kernel() -> bool {
             _ => {}
         }
     }
-    // Default to the current macOS-like policy on all backends: prefer BLAS for
-    // these row-major f32 kernels unless an explicit override requests Rayon.
-    let _ = selected_sgemm_backend();
-    false
+    match selected_sgemm_backend() {
+        // Accelerate-backed dense BLAS is still the safer default on macOS
+        // until HE/PCG kernels are tuned more aggressively there.
+        SgemmBackend::Accelerate => false,
+        // OpenBLAS builds on Linux/Windows (and OpenBLAS-only macOS wheels)
+        // benchmark better with the custom Rayon row-major kernel for the
+        // current HE/PCG matvec access pattern.
+        SgemmBackend::OpenBlas => true,
+        SgemmBackend::Blas => false,
+        SgemmBackend::Rust => true,
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

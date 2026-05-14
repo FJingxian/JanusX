@@ -172,7 +172,17 @@ def detect_effective_threads(override_threads: int = 0) -> tuple[int, str]:
     return max(1, int(detected)), source
 
 
-_HE_THREAD_POLICY_DEFAULT = "rayon_parallel_blas_serial"
+def _default_he_thread_policy() -> str:
+    # Benchmarks on macOS/Accelerate consistently favored keeping BLAS serial
+    # and letting Rayon own the outer HE parallelism.
+    if sys.platform == "darwin":
+        return "rayon_parallel_blas_serial"
+    # Keep the current default unchanged on other platforms until Linux/Windows
+    # benchmark results settle.
+    return "rayon_parallel_blas_serial"
+
+
+_HE_THREAD_POLICY_DEFAULT = _default_he_thread_policy()
 _HE_THREAD_POLICY_SWEEP_DEFAULT = [
     "rayon_parallel_blas_serial",
     "blas_parallel_rayon_serial",
@@ -773,7 +783,10 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
 
     step("SMOKE 2. GWAS runtime check (LM/LMM/FastLMM/FarmCPU)")
     run(["jx", "grm", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)])
-    run(["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)])
+    run_pca_with_backend_report(
+        ["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)],
+        log_path=logdir / "jx_pca_smoke.log",
+    )
     grm_k = find_grm(outdir)
     require_file(outdir / "mouse_hs1940.eigenvec", "PCA eigenvec output missing")
     run(
@@ -824,7 +837,7 @@ def smoke_flow(outdir: Path, logdir: Path, threads: int, cv_folds: int) -> None:
     sep()
 
 
-def full_flow(outdir: Path, postgs_enabled: bool) -> None:
+def full_flow(outdir: Path, logdir: Path, postgs_enabled: bool) -> None:
     step("STEP 1. Simulation for validation flow")
     run(["jx", "sim", "10", "1000", str(outdir / "mouse_hs1940")])
     run(["jx", "gformat", "-vcf", "example/mouse_hs1940.vcf.gz", "-fmt", "plink", "-o", str(outdir)])
@@ -838,7 +851,10 @@ def full_flow(outdir: Path, postgs_enabled: bool) -> None:
     step("STEP 2. Validation of GWAS-related modules")
     run(["jx", "grm", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir), "-m", "1"])
     run(["jx", "grm", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir), "-m", "2"])
-    run(["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)])
+    run_pca_with_backend_report(
+        ["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-o", str(outdir)],
+        log_path=logdir / "jx_pca_full.log",
+    )
     run(["jx", "pca", "-bfile", str(outdir / "mouse_hs1940"), "-rsvd", "-o", str(outdir)])
     grm_k = find_grm(outdir)
     require_file(outdir / "mouse_hs1940.eigenvec", "PCA eigenvec output missing")
@@ -955,6 +971,49 @@ def _parse_grm_kernel_backend(log_path: Path) -> str:
     if re.search(r"packed", text, flags=re.IGNORECASE):
         return "packed-bed kernel"
     return "unknown"
+
+
+def _parse_pca_eigh_backend(log_path: Path) -> str:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    patterns = [
+        r"Eigen decomposition finished \(backend=([^),\s]+)",
+        r"Rust eigh did not use LAPACK backend \(backend=([^)\s]+)\)",
+        r"backend=([A-Za-z0-9_:+.-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return str(m.group(1)).strip()
+    if re.search(r"\bnalgebra\b", text, flags=re.IGNORECASE):
+        return "nalgebra"
+    if re.search(r"\blapack_dsyevd\b", text, flags=re.IGNORECASE):
+        return "lapack_dsyevd"
+    if re.search(r"\blapack_dsyevr\b", text, flags=re.IGNORECASE):
+        return "lapack_dsyevr"
+    return "unknown"
+
+
+def run_pca_with_backend_report(
+    cmd: list[str],
+    *,
+    log_path: Path,
+    label: str = "PCA/EIGH",
+) -> str:
+    try:
+        run(
+            cmd,
+            stdout_path=log_path,
+            stderr_to_stdout=True,
+        )
+    except subprocess.CalledProcessError:
+        print_log(log_path)
+        raise
+
+    backend = _parse_pca_eigh_backend(log_path)
+    print(f"{label} backend         : {backend}")
+    if backend == "unknown":
+        print(f"{label} backend log     : {log_path}")
+    return backend
 
 
 def backend_thread_checks(outdir: Path, *, bench_threads: int = 0) -> None:
@@ -1679,7 +1738,7 @@ def main() -> int:
         smoke_flow(outdir, logdir, args.threads, args.cv)
         backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
     elif not ran_special:
-        full_flow(outdir, postgs_enabled=not args.no_postgs)
+        full_flow(outdir, logdir, postgs_enabled=not args.no_postgs)
         backend_thread_checks(outdir, bench_threads=int(args.bench_threads))
 
     step("Validation completed")

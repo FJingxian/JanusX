@@ -1187,9 +1187,26 @@ class LMM:
                     )
                 )
             except Exception as ex:
-                raise RuntimeError(
-                    f"Rust eigh failed in LMM initialization (inplace): {ex}"
-                ) from ex
+                if _rust_eigh_from_array_f64 is None:
+                    raise RuntimeError(
+                        f"Rust eigh failed in LMM initialization (inplace): {ex}"
+                    ) from ex
+                kinship_retry = np.ascontiguousarray(kinship_eigh, dtype=np.float64)
+                try:
+                    eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (
+                        _rust_eigh_from_array_f64(
+                            kinship_retry,
+                            threads=eig_thr,
+                            driver="auto",
+                            jobz="V",
+                            require_lapack=False,
+                        )
+                    )
+                except Exception as ex_copy:
+                    raise RuntimeError(
+                        f"Rust eigh failed in LMM initialization after inplace retry "
+                        f"(inplace={ex}; copied={ex_copy})"
+                    ) from ex_copy
         elif _rust_eigh_from_array_f64 is not None:
             try:
                 eval_raw, evec_raw, _blas_backend, _evd_backend, _n, _tb, _ti, _ta, _lapack, _sec = (

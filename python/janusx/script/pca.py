@@ -91,6 +91,7 @@ from ._common.genoio import (
     read_matrix_with_ids as _read_matrix_with_ids,
     strip_default_prefix_suffix,
 )
+from ._common.threads import detect_effective_threads
 
 # ======================================================================
 # Helpers: GRM-based PCA (aligned with GWAS module)
@@ -610,7 +611,7 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
         raise RuntimeError(f"PCA eigh expects non-empty square GRM, got shape={g0.shape}")
     g = np.ascontiguousarray(g0)
     n = int(g.shape[0])
-    threads = max(1, int(os.cpu_count() or 1))
+    threads = max(1, int(detect_effective_threads()))
 
     # Keep PCA aligned with GWAS default strategy:
     # default to Rust "auto" (which resolves to dsyevd in current backend),
@@ -625,13 +626,29 @@ def eigendecompose_grm(grm: np.ndarray, logger=None) -> tuple[np.ndarray, np.nda
 
     def _run(driver_name: str, mat: np.ndarray):
         if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
-            return jxrs.rust_eigh_from_array_f64_inplace(
-                mat,
-                threads=int(threads),
-                driver=str(driver_name),
-                jobz="V",
-                require_lapack=False,
-            )
+            try:
+                return jxrs.rust_eigh_from_array_f64_inplace(
+                    mat,
+                    threads=int(threads),
+                    driver=str(driver_name),
+                    jobz="V",
+                    require_lapack=False,
+                )
+            except Exception as ex_inplace:
+                mat_retry = np.ascontiguousarray(mat, dtype=np.float64)
+                try:
+                    return jxrs.rust_eigh_from_array_f64(
+                        mat_retry,
+                        threads=int(threads),
+                        driver=str(driver_name),
+                        jobz="V",
+                        require_lapack=False,
+                    )
+                except Exception as ex_copy:
+                    raise RuntimeError(
+                        f"Rust eigh failed after inplace retry "
+                        f"(inplace={ex_inplace}; copied={ex_copy})"
+                    ) from ex_copy
         return jxrs.rust_eigh_from_array_f64(
             mat,
             threads=int(threads),
@@ -679,7 +696,7 @@ def eigendecompose_grm_file(grm_file: str, logger=None) -> tuple[np.ndarray, np.
             "Rust extension is missing rust_eigh_from_matrix_file_f64. "
             "Rebuild/install JanusX extension first."
         )
-    threads = max(1, int(os.cpu_count() or 1))
+    threads = max(1, int(detect_effective_threads()))
     raw_driver = str(
         os.environ.get(
             "JX_PCA_EIGH_DRIVER",

@@ -99,6 +99,87 @@ fn has_windows_openblas_runtime_dll(lib_dir_s: &str) -> bool {
     false
 }
 
+fn file_contains_all_ascii_markers(path: &Path, markers: &[&[u8]]) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    markers.iter().all(|marker| {
+        if marker.is_empty() {
+            return true;
+        }
+        bytes.windows(marker.len()).any(|w| w == *marker)
+    })
+}
+
+fn windows_openblas_candidate_files(lib_dir_s: &str) -> Vec<std::path::PathBuf> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    let lib_dir = Path::new(lib_dir_s);
+    let mut probe_dirs: Vec<std::path::PathBuf> = vec![lib_dir.to_path_buf()];
+    if let Some(parent) = lib_dir.parent() {
+        probe_dirs.push(parent.join("bin"));
+        probe_dirs.push(parent.join("DLLs"));
+        probe_dirs.push(parent.join("Library").join("bin"));
+        if let Some(grand) = parent.parent() {
+            probe_dirs.push(grand.join("bin"));
+            probe_dirs.push(grand.join("DLLs"));
+            probe_dirs.push(grand.join("Library").join("bin"));
+        }
+    }
+
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for d in probe_dirs {
+        if !(d.exists() && d.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name_raw) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            if !(name_raw.starts_with("openblas") || name_raw.starts_with("libopenblas")) {
+                continue;
+            }
+            let is_candidate = name_raw.ends_with(".dll")
+                || name_raw.ends_with(".lib")
+                || name_raw.ends_with(".a")
+                || name_raw.ends_with(".dll.a");
+            if is_candidate {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn windows_openblas_has_lapack_symbols(lib_dir_s: &str) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    let markers: [&[u8]; 2] = [b"dsyevd_", b"dsyevr_"];
+    for path in windows_openblas_candidate_files(lib_dir_s) {
+        if file_contains_all_ascii_markers(&path, &markers) {
+            emit_verbose_note(format!(
+                "OpenBLAS LAPACK symbols detected directly from {}",
+                path.to_string_lossy()
+            ));
+            return true;
+        }
+    }
+    false
+}
+
 fn maybe_link_blas_family_from_dir(lib_dir_s: &str, source_label: &str) {
     // Explicitly link liblapack/libblas when available in the same prefix
     // (typically conda's lib directory). OpenBLAS itself is still linked by
@@ -262,12 +343,15 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
     let has_win_lapack = has_library_with_prefix(lib_dir_s, "liblapack")
         || has_library_with_prefix(lib_dir_s, "lapack")
         || has_library_with_prefix(lib_dir_s, "lapacke");
+    let has_win_openblas_lapack = windows_openblas_has_lapack_symbols(lib_dir_s);
     let mut lapack_available = !cfg!(target_os = "windows");
     if cfg!(target_os = "windows") {
-        // vcpkg openblas on Windows is commonly built without LAPACK symbols
-        // (e.g. dsyevd_/dsyevr_), so default to disabled unless a lapack
-        // companion library is visible.
-        lapack_available = has_win_lapack;
+        // Windows packages are heterogeneous:
+        // - some ship separate lapack/lapacke import libs
+        // - others embed dsyevd_/dsyevr_ directly inside openblas/libopenblas
+        //   import libs / DLLs.
+        // Treat either case as LAPACK-capable.
+        lapack_available = has_win_lapack || has_win_openblas_lapack;
     }
     if env_flag("JANUSX_FORCE_OPENBLAS_LAPACK") {
         lapack_available = true;

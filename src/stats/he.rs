@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut};
 use crate::blas::{
-    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_TRANS, rust_sgemm_prefers_rayon_rowmajor_f32_kernel,
+    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt,
+    OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
@@ -126,8 +126,7 @@ fn emit_he_stage_timing(
 ) {
     let total = total_secs.max(1e-12_f64);
     let other_secs =
-        (total_secs - train_maf_secs - decode_secs - xmul_secs - xtmul_secs - trace_secs)
-            .max(0.0);
+        (total_secs - train_maf_secs - decode_secs - xmul_secs - xtmul_secs - trace_secs).max(0.0);
     let pct = |x: f64| -> f64 { (x * 100.0) / total };
     eprintln!(
         "HE stage timing {} batch={}/{} train_maf={:.3}s ({:.1}%) decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) trace={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
@@ -370,52 +369,53 @@ pub fn build_row_standardization_stats(
     }
     let mut row_mean = vec![0.0_f32; m];
     let mut row_inv_sd = vec![0.0_f32; m];
-    let compute_row = |j: usize, mean_slot: &mut f32, inv_sd_slot: &mut f32| -> Result<usize, String> {
-        let flip = row_flip[j];
-        let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
-        if use_train_maf {
-            let row = &packed_flat[j * bytes_per_snp..(j + 1) * bytes_per_snp];
-            let mut non_missing = 0usize;
-            let mut alt_sum = 0usize;
-            for &sid in sample_idx {
-                let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
-                match code {
-                    0b00 => {
-                        non_missing += 1;
+    let compute_row =
+        |j: usize, mean_slot: &mut f32, inv_sd_slot: &mut f32| -> Result<usize, String> {
+            let flip = row_flip[j];
+            let mut p = oriented_minor_freq_from_input(row_maf[j], flip)?;
+            if use_train_maf {
+                let row = &packed_flat[j * bytes_per_snp..(j + 1) * bytes_per_snp];
+                let mut non_missing = 0usize;
+                let mut alt_sum = 0usize;
+                for &sid in sample_idx {
+                    let code = (row[sid >> 2] >> ((sid & 3) * 2)) & 0b11;
+                    match code {
+                        0b00 => {
+                            non_missing += 1;
+                        }
+                        0b10 => {
+                            non_missing += 1;
+                            alt_sum += 1;
+                        }
+                        0b11 => {
+                            non_missing += 1;
+                            alt_sum += 2;
+                        }
+                        _ => {}
                     }
-                    0b10 => {
-                        non_missing += 1;
-                        alt_sum += 1;
-                    }
-                    0b11 => {
-                        non_missing += 1;
-                        alt_sum += 2;
-                    }
-                    _ => {}
+                }
+                if non_missing > 0 {
+                    let dosage_sum = if flip {
+                        2usize.saturating_mul(non_missing).saturating_sub(alt_sum)
+                    } else {
+                        alt_sum
+                    };
+                    p = (dosage_sum as f32) / (2.0_f32 * non_missing as f32);
                 }
             }
-            if non_missing > 0 {
-                let dosage_sum = if flip {
-                    2usize.saturating_mul(non_missing).saturating_sub(alt_sum)
-                } else {
-                    alt_sum
-                };
-                p = (dosage_sum as f32) / (2.0_f32 * non_missing as f32);
-            }
-        }
 
-        let p = p.clamp(0.0_f32, 1.0_f32);
-        let mean = 2.0_f32 * p;
-        let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
-        *mean_slot = mean;
-        if var > std_eps32 {
-            *inv_sd_slot = 1.0_f32 / var.sqrt();
-            Ok(1usize)
-        } else {
-            *inv_sd_slot = 0.0_f32;
-            Ok(0usize)
-        }
-    };
+            let p = p.clamp(0.0_f32, 1.0_f32);
+            let mean = 2.0_f32 * p;
+            let var = (2.0_f32 * p * (1.0_f32 - p)).max(0.0_f32);
+            *mean_slot = mean;
+            if var > std_eps32 {
+                *inv_sd_slot = 1.0_f32 / var.sqrt();
+                Ok(1usize)
+            } else {
+                *inv_sd_slot = 0.0_f32;
+                Ok(0usize)
+            }
+        };
     let m_effective = if let Some(tp) = pool {
         tp.install(|| {
             row_mean
@@ -579,7 +579,7 @@ fn row_major_block_mul_mat_f32(
                                 out_row[t] += a * rhs_row[t];
                             }
                         }
-                    }                    
+                    }
                 });
         };
         if let Some(tp) = pool {
@@ -592,19 +592,20 @@ fn row_major_block_mul_mat_f32(
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
-        // Row-major C = A * B is equivalent to column-major C^T = B^T * A^T.
+        // Use the natural row-major layout directly so the BLAS backend sees
+        // the same memory order we already decode into.
         cblas_sgemm_dispatch(
-            CBLAS_COL_MAJOR,
+            CBLAS_ROW_MAJOR,
             CBLAS_NO_TRANS,
             CBLAS_NO_TRANS,
-            n_rhs as CblasInt,
             rows as CblasInt,
+            n_rhs as CblasInt,
             cols as CblasInt,
             1.0,
-            rhs.as_ptr(),
-            n_rhs as CblasInt,
             block.as_ptr(),
             cols as CblasInt,
+            rhs.as_ptr(),
+            n_rhs as CblasInt,
             0.0,
             out.as_mut_ptr(),
             n_rhs as CblasInt,
@@ -689,19 +690,19 @@ fn row_major_block_t_mul_mat_accum_f32(
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     unsafe {
-        // Row-major C += A^T * B  <=>  column-major C^T += B^T * A.
+        // Use the natural row-major layout directly for C += A^T * B.
         cblas_sgemm_dispatch(
-            CBLAS_COL_MAJOR,
-            CBLAS_NO_TRANS,
+            CBLAS_ROW_MAJOR,
             CBLAS_TRANS,
-            n_rhs as CblasInt,
+            CBLAS_NO_TRANS,
             cols as CblasInt,
+            n_rhs as CblasInt,
             rows as CblasInt,
             1.0,
-            rhs.as_ptr(),
-            n_rhs as CblasInt,
             block.as_ptr(),
             cols as CblasInt,
+            rhs.as_ptr(),
+            n_rhs as CblasInt,
             1.0,
             out.as_mut_ptr(),
             n_rhs as CblasInt,
@@ -839,7 +840,9 @@ fn apply_grm_to_mat_f32_with_workspace(
         row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice, pool);
         xmul_acc += t_xmul.elapsed().as_secs_f64();
         let t_xtmul = Instant::now();
-        row_major_block_t_mul_mat_accum_f32(blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out, pool);
+        row_major_block_t_mul_mat_accum_f32(
+            blk_slice, cur_rows, n_out, tmp_slice, n_rhs, out, pool,
+        );
         xtmul_acc += t_xtmul.elapsed().as_secs_f64();
     }
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
@@ -1164,7 +1167,7 @@ pub fn he_variance_components_packed_with_covariates(
                 let trace_secs = (trace_t0.elapsed().as_secs_f64()
                     - trace_apply_t.decode_secs
                     - trace_apply_t.gemm_secs())
-                    .max(0.0_f64);
+                .max(0.0_f64);
                 emit_he_stage_timing(
                     "stage=trace",
                     trace_batches_done,
@@ -1241,7 +1244,7 @@ pub fn he_variance_components_packed_with_covariates(
                 let trace_secs = (trace_t0.elapsed().as_secs_f64()
                     - trace_apply_t.decode_secs
                     - trace_apply_t.gemm_secs())
-                    .max(0.0_f64);
+                .max(0.0_f64);
                 emit_he_stage_timing(
                     "stage=trace",
                     trace_batches_done,
@@ -1339,7 +1342,7 @@ pub fn he_variance_components_packed_with_covariates(
         let trace_secs = (trace_t0.elapsed().as_secs_f64()
             - trace_apply_t.decode_secs
             - trace_apply_t.gemm_secs())
-            .max(0.0_f64);
+        .max(0.0_f64);
         emit_he_stage_timing(
             "final",
             trace_batches_done,

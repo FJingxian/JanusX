@@ -1,5 +1,5 @@
-use nalgebra::DMatrix;
 use memmap2::MmapOptions;
+use nalgebra::DMatrix;
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyRuntimeError;
@@ -192,7 +192,9 @@ fn parse_npy_descr_local(header: &str) -> Result<NpyFloatDtype, String> {
 }
 
 #[inline]
-fn parse_npy_header_for_float_matrix(bytes: &[u8]) -> Result<(usize, usize, usize, NpyFloatDtype), String> {
+fn parse_npy_header_for_float_matrix(
+    bytes: &[u8],
+) -> Result<(usize, usize, usize, NpyFloatDtype), String> {
     if bytes.len() < 10 {
         return Err("NPY file too small".to_string());
     }
@@ -237,7 +239,9 @@ fn load_square_matrix_from_npy_f64(path: &str) -> Result<(Vec<f64>, usize), Stri
     let mmap = unsafe { MmapOptions::new().map(&file).map_err(|e| e.to_string())? };
     let (rows, cols, data_offset, dtype) = parse_npy_header_for_float_matrix(&mmap[..])?;
     if rows == 0 || cols == 0 || rows != cols {
-        return Err(format!("GRM/kinship matrix must be non-empty square, got ({rows}, {cols})"));
+        return Err(format!(
+            "GRM/kinship matrix must be non-empty square, got ({rows}, {cols})"
+        ));
     }
     let n = rows;
     let n_elem = n
@@ -290,9 +294,15 @@ fn load_square_matrix_from_npy_f64(path: &str) -> Result<(Vec<f64>, usize), Stri
 
 fn parse_text_matrix_row(line: &str) -> Vec<&str> {
     if line.contains('\t') {
-        line.split('\t').map(str::trim).filter(|s| !s.is_empty()).collect()
+        line.split('\t')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
     } else if line.contains(',') {
-        line.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+        line.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
     } else {
         line.split_whitespace().collect()
     }

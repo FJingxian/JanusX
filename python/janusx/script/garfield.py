@@ -1,53 +1,64 @@
-import os
-import time
-import socket
 import argparse
-import sys
-from collections import Counter
+import os
+import socket
+import time
+from pathlib import Path
 from typing import Optional
+
 import numpy as np
-from janusx.garfield.garfield2 import (
-    load_all_genotype_int8,
-    load_all_genotype_packed_bed,
-    main_inmemory as garfield_main_inmemory,
-    main_inmemory_packed as garfield_main_inmemory_packed,
-    window as garfield_window,
-    _HAS_SKLEARN as _GARFIELD_HAS_SKLEARN,
-    _SKLEARN_IMPORT_ERROR as _GARFIELD_SKLEARN_IMPORT_ERROR,
-    _HAS_RUST_GARFIELD_ML as _GARFIELD_HAS_RUST_ML,
-)
-from janusx._optional_deps import format_missing_dependency_message
-from janusx.gfreader import SiteInfo, inspect_genotype_file, auto_mmap_window_mb
+
+from janusx.assoc.workflow import load_phenotype
+from janusx.gfreader import SiteInfo, inspect_genotype_file
 from janusx.gfreader.gfreader import save_genotype_streaming
 from janusx.gtools.reader import readanno
+from janusx.script._common.colspec import parse_zero_based_index_specs
+from janusx.script._common.config_render import emit_cli_configuration
+from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
+from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
+from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
-    format_path_for_display,
     ensure_plink_prefix_exists,
+    format_path_for_display,
 )
-from janusx.assoc.workflow import load_phenotype
-from janusx.script._common.log import setup_logging
-from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.status import CliStatus, log_success, stdout_is_tty
-from janusx.script._common.helptext import CliArgumentParser, cli_help_formatter
-from janusx.script._common.genocache import configure_genotype_cache_from_out
-from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
-from janusx.script._common.colspec import parse_zero_based_index_specs
-from janusx.script._common.threads import (
-    apply_blas_thread_env,
-    detect_effective_threads,
-    maybe_warn_non_openblas,
-    require_openblas_by_default,
-)
+from janusx.script._common.threads import apply_blas_thread_env, detect_effective_threads
+
+
+try:
+    from janusx.janusx import (
+        beam_scan_windows_binary_mcc_bin,
+        beam_scan_windows_continuous_corr_bin,
+        garfield_eval_rule_bin,
+        garfield_scan_groups_bin,
+        garfield_subset_bin_samples,
+        load_site_info,
+    )
+except Exception as _exc:  # pragma: no cover
+    beam_scan_windows_binary_mcc_bin = None  # type: ignore[assignment]
+    beam_scan_windows_continuous_corr_bin = None  # type: ignore[assignment]
+    garfield_eval_rule_bin = None  # type: ignore[assignment]
+    garfield_scan_groups_bin = None  # type: ignore[assignment]
+    garfield_subset_bin_samples = None  # type: ignore[assignment]
+    load_site_info = None  # type: ignore[assignment]
+    _RUST_IMPORT_ERROR = _exc
+else:
+    _RUST_IMPORT_ERROR = None
+
+
+# -----------------------------------------------------------------------------
+# Legacy GARFIELD implementation note
+# -----------------------------------------------------------------------------
+# 旧版 GARFIELD（Python 内做窗口/基因扫描、候选筛选与逻辑回归）已经下线。
+# 该版本改为：Python 只做调度，Rust 完成解码/扫描/评分/规则验证。
+# 主要闭环：输入 -> 编码(BIN) -> beam(train) -> 验证(val) -> 导出(pseudo)
 
 
 class _GarfieldPhenoLogger:
-    """
-    Logger proxy for GARFIELD phenotype loading.
-    Suppress duplicate selection line from shared load_phenotype().
-    """
+    """Suppress duplicate phenotype selection line from shared loader."""
 
     def __init__(self, base_logger):
         self._base = base_logger
@@ -60,6 +71,44 @@ class _GarfieldPhenoLogger:
 
     def __getattr__(self, name):
         return getattr(self._base, name)
+
+
+def _require_rust_backend() -> None:
+    missing = (
+        beam_scan_windows_binary_mcc_bin is None
+        or beam_scan_windows_continuous_corr_bin is None
+        or garfield_eval_rule_bin is None
+        or garfield_scan_groups_bin is None
+        or garfield_subset_bin_samples is None
+        or load_site_info is None
+    )
+    if missing:
+        raise ImportError(
+            "janusx Rust extension does not provide new GARFIELD APIs. "
+            "Please rebuild/reinstall JanusX extension."
+        ) from _RUST_IMPORT_ERROR
+
+
+def _resolve_bin_path(path_or_prefix: str) -> Optional[str]:
+    p = str(Path(path_or_prefix).expanduser())
+    if p.lower().endswith(".bin") and Path(p).is_file():
+        return p
+    cand = f"{p}.bin"
+    if Path(cand).is_file():
+        return cand
+    return None
+
+
+def _resolve_input_bin(args) -> tuple[str, str, str]:
+    gfile, prefix = determine_genotype_source(args)
+    bin_path = _resolve_bin_path(gfile)
+    if bin_path is None:
+        raise ValueError(
+            "Current new GARFIELD scheduler requires JXBIN001 input (.bin). "
+            "Please convert first, e.g. `jx gformat -bfile <prefix> -fmt gfd` "
+            "or `jx gformat -vcf <vcf> -fmt gfd` and then run GARFIELD with `-file <gfd_prefix>`."
+        )
+    return gfile, prefix, bin_path
 
 
 def _looks_numeric_token(token: object) -> bool:
@@ -82,10 +131,6 @@ def _split_pheno_line(line: str) -> list[str]:
 
 
 def _read_phenotype_header_names(phenofile: str) -> Optional[list[str]]:
-    """
-    Best-effort read of phenotype header names (excluding sample ID column).
-    Return None when no obvious header is present.
-    """
     try:
         with open(phenofile, "r", encoding="utf-8", errors="ignore") as fh:
             for raw in fh:
@@ -106,14 +151,7 @@ def _read_phenotype_header_names(phenofile: str) -> Optional[list[str]]:
     return None
 
 
-def _normalize_trait_names_from_header(
-    pheno,
-    phenofile: str,
-):
-    """
-    When selected phenotype columns are labeled as numeric indices (e.g., '5'),
-    map them back to header names (e.g., 'test5') if header is available.
-    """
+def _normalize_trait_names_from_header(pheno, phenofile: str):
     trait_names = [str(c) for c in pheno.columns]
     selected_ncol = pheno.attrs.get("selected_ncol", None)
     if not isinstance(selected_ncol, list) or len(selected_ncol) != len(trait_names):
@@ -156,13 +194,6 @@ def _safe_trait_label(label: object) -> str:
     return name.replace("/", "_").replace("\\", "_")
 
 
-def _format_numeric_for_log(value: float) -> str:
-    val = float(value)
-    if np.isfinite(val) and val.is_integer():
-        return str(int(val))
-    return f"{val:g}"
-
-
 def _detect_response_mode(y: np.ndarray) -> tuple[str, np.ndarray, str]:
     y_arr = np.asarray(y, dtype=float).reshape(-1)
     if y_arr.size == 0:
@@ -177,93 +208,14 @@ def _detect_response_mode(y: np.ndarray) -> tuple[str, np.ndarray, str]:
         lo_mask = np.isclose(y_arr, lo, rtol=0.0, atol=1e-12)
         hi_mask = np.isclose(y_arr, hi, rtol=0.0, atol=1e-12)
         if np.all(lo_mask | hi_mask):
-            y_bin = hi_mask.astype(np.float64).reshape(-1, 1)
-            return ("binary", y_bin, "")
+            y_bin = hi_mask.astype(np.float64)
+            note = f", mapped({lo:g}->0,{hi:g}->1)"
+            return ("binary", y_bin, note)
 
-    return "continuous", y_arr.reshape(-1, 1), ""
-
-
-def _log_window_warning_summary(
-    logger,
-    trait_name: str,
-    warnings: list[str],
-    *,
-    max_unique: int = 8,
-) -> None:
-    msgs = [str(w).strip() for w in warnings if str(w).strip() != ""]
-    if len(msgs) == 0:
-        return
-    counter = Counter(msgs)
-    logger.warning(
-        f"GARFIELD trait '{trait_name}' window scan warnings: "
-        f"{len(msgs)} total, {len(counter)} unique."
-    )
-    for i, (msg, count) in enumerate(counter.most_common(max_unique), start=1):
-        logger.warning(f"[{i}] x{count} {msg}")
-    if len(counter) > max_unique:
-        logger.warning(f"... and {len(counter) - max_unique} more unique warning(s).")
-
-
-def _resolve_plink_prefix(path_or_prefix: str):
-    """
-    Return normalized PLINK prefix if {prefix}.bed/.bim/.fam all exist.
-    Accept both bare prefix and explicit .bed/.bim/.fam paths.
-    """
-    raw = str(path_or_prefix)
-    cand = [raw]
-    low = raw.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        cand.append(raw[:-4])
-    for pfx in cand:
-        if (
-            os.path.isfile(f"{pfx}.bed")
-            and os.path.isfile(f"{pfx}.bim")
-            and os.path.isfile(f"{pfx}.fam")
-        ):
-            return pfx
-    return None
-
-
-def write_xcombine_results(
-    outprefix: str,
-    sample_ids: list[str],
-    results: list,
-    *,
-    chrom: str = "pseudo",
-):
-    """
-    Save xcombine results to PLINK/VCF and write {outprefix}.garfield mapping.
-    """
-    map_path = f"{outprefix}.pseudo"
-    n_samples = len(sample_ids)
-
-    def _iter_chunks():
-        pos = 1
-        with open(map_path, "w", encoding="utf-8") as f:
-            f.write("chrom\tpos\texpression\tscore\n")
-            for item in results:
-                if item is None:
-                    continue
-                resdict:dict = item
-                xcombine = np.asarray(resdict.get("xcombine", []), dtype=np.int8).ravel()
-                if xcombine.size != n_samples:
-                    raise ValueError("xcombine length does not match sample_ids")
-                expr = resdict.get("expression", "")
-                score = resdict.get("score", "")
-                f.write(f"{chrom}\t{pos}\t{expr}\t{score}\n")
-                geno = xcombine.reshape(1, -1)
-                sites = [SiteInfo(str(chrom), int(pos), "A", "T")]
-                yield geno, sites
-                pos += 1
-
-    save_genotype_streaming(outprefix, sample_ids, _iter_chunks())
+    return "continuous", y_arr.astype(np.float64, copy=False), ""
 
 
 def _read_geneset_lines(path: str) -> list[list[str]]:
-    """
-    Read gene sets from a text file.
-    Each line can contain multiple genes separated by whitespace.
-    """
     genesets: list[list[str]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -273,182 +225,230 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
     return genesets
 
 
+def _build_interval_groups(
+    genefile: str,
+    gff3: str,
+    extension: int,
+    scan_mode: str,
+) -> tuple[list[str], list[list[tuple[str, int, int]]]]:
+    genesets = _read_geneset_lines(genefile)
+    dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
+    dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
+
+    labels: list[str] = []
+    groups: list[list[tuple[str, int, int]]] = []
+
+    def _iv(gene: str) -> Optional[tuple[str, int, int]]:
+        if gene not in dfgff3.index:
+            return None
+        chrom = str(dfgff3.loc[gene, 0])
+        start = int(dfgff3.loc[gene, 1]) - int(extension)
+        end = int(dfgff3.loc[gene, 2]) + int(extension)
+        return (chrom, start, end)
+
+    if scan_mode == "gene":
+        for genes in genesets:
+            for g in genes:
+                iv = _iv(g)
+                if iv is None:
+                    continue
+                labels.append(g)
+                groups.append([iv])
+    elif scan_mode == "genepair":
+        for genes in genesets:
+            if len(genes) < 2:
+                continue
+            g1, g2 = genes[0], genes[1]
+            iv1, iv2 = _iv(g1), _iv(g2)
+            if iv1 is None or iv2 is None:
+                continue
+            labels.append(f"{g1}|{g2}")
+            groups.append([iv1, iv2])
+    else:
+        raise ValueError(f"unsupported scan_mode: {scan_mode}")
+
+    return labels, groups
+
+
+def _split_train_val(n: int, val_frac: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    if n < 4:
+        raise ValueError("Need at least 4 samples for train/val split.")
+    vf = float(val_frac)
+    if not (0.0 < vf < 0.8):
+        raise ValueError("--val-frac must be in (0, 0.8).")
+    rng = np.random.default_rng(int(seed))
+    idx = np.arange(n, dtype=np.int64)
+    rng.shuffle(idx)
+    n_val = int(max(1, round(n * vf)))
+    n_val = min(n - 1, n_val)
+    val_idx = np.sort(idx[:n_val])
+    train_idx = np.sort(idx[n_val:])
+    return train_idx, val_idx
+
+
+def _write_sample_split(out_prefix: str, sample_ids: list[str], train_idx: np.ndarray, val_idx: np.ndarray) -> None:
+    split_dir = Path(f"{out_prefix}.split")
+    split_dir.mkdir(parents=True, exist_ok=True)
+    train_path = split_dir / "train.samples.txt"
+    val_path = split_dir / "val.samples.txt"
+    with open(train_path, "w", encoding="utf-8") as fw:
+        for i in train_idx.tolist():
+            fw.write(f"{sample_ids[int(i)]}\n")
+    with open(val_path, "w", encoding="utf-8") as fw:
+        for i in val_idx.tolist():
+            fw.write(f"{sample_ids[int(i)]}\n")
+
+
+def _write_xcombine_results(
+    outprefix: str,
+    sample_ids: list[str],
+    records: list[dict],
+    *,
+    chrom: str = "pseudo",
+) -> None:
+    map_path = f"{outprefix}.pseudo"
+    n_samples = len(sample_ids)
+
+    def _iter_chunks():
+        pos = 1
+        with open(map_path, "w", encoding="utf-8") as f:
+            f.write("chrom\tpos\texpression\ttrain_score\tval_score\n")
+            for rec in records:
+                xcombine = np.asarray(rec["xcombine"], dtype=np.int8).reshape(-1)
+                if xcombine.size != n_samples:
+                    raise ValueError("xcombine length does not match sample_ids")
+                expr = str(rec.get("expression", ""))
+                tr = float(rec.get("train_score", float("nan")))
+                va = float(rec.get("val_score", float("nan")))
+                f.write(f"{chrom}\t{pos}\t{expr}\t{tr:.12g}\t{va:.12g}\n")
+                yield xcombine.reshape(1, -1), [SiteInfo(str(chrom), int(pos), "A", "T")]
+                pos += 1
+
+    save_genotype_streaming(outprefix, sample_ids, _iter_chunks())
+
+
+def _literal_lookup(bin_path: str, n_rows: int) -> dict[int, str]:
+    sites = list(load_site_info(str(bin_path), None))
+    out: dict[int, str] = {}
+    for i, s in enumerate(sites[:n_rows]):
+        out[i] = f"{str(getattr(s, 'chrom', 'N'))}_{int(getattr(s, 'pos', i + 1))}"
+    return out
+
+
+def _expression_from_indices(indices: list[int], lut: dict[int, str]) -> str:
+    if not indices:
+        return "1"
+    return " & ".join(lut.get(int(i), f"IDX{int(i)}") for i in indices)
+
+
+def _write_rules_tsv(path: str, rows: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as fw:
+        fw.write(
+            "rank\tscan_mode\tgroup\tn_candidates\tselected_indices\texpression\ttrain_score\tval_score\ttrain_support\tval_support\n"
+        )
+        for i, r in enumerate(rows, start=1):
+            fw.write(
+                f"{i}\t{r['scan_mode']}\t{r['group']}\t{int(r['n_candidates'])}\t"
+                f"{','.join(map(str, r['selected']))}\t{r['expression']}\t"
+                f"{float(r['train_score']):.12g}\t{float(r['val_score']):.12g}\t"
+                f"{int(r['train_support'])}\t{int(r['val_support'])}\n"
+            )
+
+
 def main() -> None:
+    _require_rust_backend()
+
     t_start = time.time()
     use_spinner = stdout_is_tty()
-    parser = CliArgumentParser(
-        prog="jx garfield",
-        formatter_class=cli_help_formatter(),
-    )
+
+    parser = CliArgumentParser(prog="jx garfield", formatter_class=cli_help_formatter())
 
     required_group = parser.add_argument_group("Required Arguments")
     geno_group = required_group.add_mutually_exclusive_group(required=False)
-    geno_group.add_argument(
-        "-bfile", "--bfile", type=str,
-        help="Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).",
-    )
-    geno_group.add_argument(
-        "-vcf", "--vcf", type=str,
-        help="Input genotype in VCF format (.vcf or .vcf.gz).",
-    )
-    geno_group.add_argument(
-        "-hmp", "--hmp", type=str,
-        help="Input genotype in HMP format (.hmp or .hmp.gz).",
-    )
-    geno_group.add_argument(
-        "-file", "--file", type=str,
-        help=(
-            "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
-            "Requires sibling prefix.id. Optional site metadata: prefix.bsite/prefix.site or prefix.bim."
-        ),
-    )
-    required_group.add_argument(
-        "-p", "--pheno", type=str, required=False,
-        help="Phenotype file (sample IDs in the first column).",
-    )
+    geno_group.add_argument("-bfile", "--bfile", type=str, help="PLINK prefix (.bed/.bim/.fam).")
+    geno_group.add_argument("-vcf", "--vcf", type=str, help="VCF/VCF.GZ input.")
+    geno_group.add_argument("-hmp", "--hmp", type=str, help="HMP/HMP.GZ input.")
+    geno_group.add_argument("-file", "--file", type=str, help="Numeric matrix prefix or path.")
+    required_group.add_argument("-p", "--pheno", type=str, required=False, help="Phenotype file.")
 
     optional_group = parser.add_argument_group("Optional Arguments")
+    optional_group.add_argument("-g", "--genefile", type=str, default=None, help="Gene list/set file.")
+    optional_group.add_argument("-gff", "--gff3", type=str, default=None, help="GFF3 annotation.")
     optional_group.add_argument(
-        "-g", "--genefile", type=str, default=None,
-        help="Optional gene-set file (one line per gene set).",
-    )
-    optional_group.add_argument(
-        "-gff", "--gff3", type=str, default=None,
-        help="Optional GFF3 file for gene coordinates.",
-    )
-    optional_group.add_argument(
-        "-n", "--n", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
-        help=(
-            "Phenotype column(s), zero-based index (excluding sample ID), "
-            "comma list (e.g. 0,2), or numeric range (e.g. 0:2). "
-            "Repeat this flag for multiple traits."
-        ),
-    )
-    optional_group.add_argument(
-        "--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol",
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-forceset", "--forceset", action="store_true", default=False,
-        help="Enable gene-set mode when a line has >1 gene (default: off).",
-    )
-    optional_group.add_argument(
-        "-step", "--step", type=int, default=None,
-        help="Step size for sliding windows (default: extension/2).",
-    )
-    optional_group.add_argument(
-        "-ext", "--extension", type=int, default=50_000,
-        help="Window extension length (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "-nsnp", "--nsnp", type=int, default=5,
-        help="Top SNPs selected by model (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--min-literals", type=int, default=2,
-        help="Minimum literals in logic gate (default: %(default)s; 2 enforces '&').",
-    )
-    optional_group.add_argument(
-        "-nestimators", "--nestimators", type=int, default=50,
-        help="Number of trees/estimators (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--ml-engine",
+        "--scan-mode",
         type=str,
-        default="auto",
-        choices=["auto", "sklearn", "rf", "gbdt", "et", "corr", "mcc", "mean_diff", "fisher"],
+        choices=["window", "gene", "genepair"],
+        default="window",
+        help="Scan strategy (default: window).",
+    )
+    optional_group.add_argument(
+        "-n",
+        "--n",
+        action="extend",
+        nargs="+",
+        metavar="COL",
+        default=None,
+        type=str,
+        dest="ncol",
         help=(
-            "Candidate-compression ML engine. "
-            "auto=prefer Rust ET then sklearn fallback; "
-            "et/corr/mcc/mean_diff/fisher require Rust extension support."
+            "Phenotype column(s), zero-based index (excluding sample ID), comma list (e.g. 0,2), "
+            "or numeric range (e.g. 0:2). Repeat this flag for multiple traits."
         ),
     )
-    optional_group.add_argument(
-        "-t", "--thread", dest="thread", type=int, default=detect_effective_threads(),
-        help="Number of CPU threads (default: %(default)s).",
-    )
-    optional_group.add_argument(
-        "--threads", dest="thread", type=int, default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
-        "-o", "--out", type=str, default=".",
-        help="Output directory (default: current directory).",
-    )
-    optional_group.add_argument(
-        "-prefix", "--prefix", type=str, default=None,
-        help="Output prefix (default: inferred from genotype input).",
-    )
-    optional_group.add_argument(
-        "-mmap-limit", "--mmap-limit", action="store_true", default=False,
-        help="Enable windowed mmap for BED inputs (auto: 2x chunk size).",
-    )
+    optional_group.add_argument("--ncol", action="extend", nargs="+", metavar="COL", default=None, type=str, dest="ncol", help=argparse.SUPPRESS)
+    optional_group.add_argument("-step", "--step", type=int, default=None, help="Window step size (default: extension/2).")
+    optional_group.add_argument("-ext", "--extension", type=int, default=50_000, help="Window extension in bp.")
+    optional_group.add_argument("-nsnp", "--nsnp", type=int, default=5, help="Beam width / top SNP candidates.")
+    optional_group.add_argument("-m", "--max-pick", type=int, default=3, help="Maximum literals in beam rule.")
+    optional_group.add_argument("--top-k-validate", type=int, default=10, help="Top train candidates for validation.")
+    optional_group.add_argument("--val-frac", type=float, default=0.2, help="Validation fraction (default: 0.2).")
+    optional_group.add_argument("--seed", type=int, default=42, help="Random seed for split.")
+    optional_group.add_argument("-t", "--thread", dest="thread", type=int, default=detect_effective_threads(), help="CPU threads.")
+    optional_group.add_argument("--threads", dest="thread", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory.")
+    optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
 
     args, extras = parser.parse_known_args()
+
     has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
-            "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+            "the following arguments are required: -p/--pheno & (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if not has_genotype:
-        parser.error(
-            "the following arguments are required: "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
-        )
-    ml_engine = str(args.ml_engine).strip().lower()
-    rust_only_engines = {"et", "corr", "mcc", "mean_diff", "fisher"}
-    needs_sklearn_fallback = ml_engine in {"auto", "sklearn", "rf", "gbdt"}
-    if ml_engine in rust_only_engines and (not _GARFIELD_HAS_RUST_ML):
-        parser.error(
-            f"--ml-engine {ml_engine} requires Rust GARFIELD ML support. "
-            "Rebuild janusx extension with current Rust modules."
-        )
-    if needs_sklearn_fallback and (not _GARFIELD_HAS_RUST_ML) and (not _GARFIELD_HAS_SKLEARN):
-        parser.error(
-            format_missing_dependency_message(
-                "GARFIELD requires either Rust ML engine support or scikit-learn fallback.",
-                packages=("scikit-learn",),
-                extra="ml",
-                original_error=_GARFIELD_SKLEARN_IMPORT_ERROR,
-            )
-        )
-    if ml_engine == "sklearn" and (not _GARFIELD_HAS_SKLEARN):
-        parser.error(
-            format_missing_dependency_message(
-                "--ml-engine sklearn requires scikit-learn.",
-                packages=("scikit-learn",),
-                extra="ml",
-                original_error=_GARFIELD_SKLEARN_IMPORT_ERROR,
-            )
-        )
+        parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+
     if int(args.extension) <= 0:
         parser.error("-ext/--extension must be > 0")
     if args.step is None:
         args.step = max(1, int(args.extension) // 2)
     elif int(args.step) <= 0:
         parser.error("-step/--step must be > 0")
-    if int(args.min_literals) <= 0:
-        parser.error("--min-literals must be >= 1")
+    if int(args.nsnp) <= 0:
+        parser.error("-nsnp/--nsnp must be > 0")
+    if int(args.max_pick) <= 0:
+        parser.error("-m/--max-pick must be > 0")
+    if int(args.top_k_validate) <= 0:
+        parser.error("--top-k-validate must be > 0")
+
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
     except ValueError as e:
         parser.error(str(e))
+
     detected_threads = detect_effective_threads()
-    requested_threads = int(args.thread)
-    thread_capped = False
     if int(args.thread) <= 0:
         args.thread = int(detected_threads)
     if int(args.thread) > int(detected_threads):
-        thread_capped = True
         args.thread = int(detected_threads)
 
-    gfile, prefix = determine_genotype_source(args)
+    gfile, prefix, bin_path = _resolve_input_bin(args)
+
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, prefix)
     os.makedirs(args.out, mode=0o755, exist_ok=True)
@@ -456,55 +456,7 @@ def main() -> None:
 
     log_path = os.path.join(args.out, f"{prefix}.garfield.log")
     logger = setup_logging(log_path)
-    if thread_capped:
-        logger.warning(
-            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
-            f"using {int(args.thread)}."
-        )
     apply_blas_thread_env(int(args.thread))
-    # maybe_warn_non_openblas(
-    #     logger=logger,
-    #     strict=require_openblas_by_default(),
-    # )
-
-    threads = int(args.thread)
-    cfg_rows: list[tuple[str, object]] = [
-        ("Genotype", gfile),
-        ("Phenotype", args.pheno),
-        ("Gene file", args.genefile),
-        ("GFF3", args.gff3),
-    ]
-    if not (args.genefile and args.gff3):
-        cfg_rows.append(("Step", args.step))
-    cfg_rows.extend(
-        [
-            ("Extension", args.extension),
-            ("Top SNPs", args.nsnp),
-            ("Min literals", args.min_literals),
-            ("Estimators", args.nestimators),
-            ("ML engine", args.ml_engine),
-            ("Mmap limit", args.mmap_limit),
-        ]
-    )
-    emit_cli_configuration(
-        logger,
-        app_title="JanusX - GARFIELD",
-        config_title="GARFIELD CONFIG",
-        host=socket.gethostname(),
-        sections=[("General", cfg_rows)],
-        footer_rows=[
-            ("Threads", f"{threads} ({detected_threads} available)"),
-            ("Output prefix", outprefix),
-        ],
-        line_max_chars=60,
-    )
-
-    only_one_gene_arg = bool(args.genefile) ^ bool(args.gff3)
-    if only_one_gene_arg:
-        logger.warning(
-            "Only one of --genefile/-g and --gff3/-gff was provided. "
-            "Gene/gff3 mode requires both; falling back to window mode."
-        )
 
     checks: list[bool] = []
     if args.bfile:
@@ -512,7 +464,7 @@ def main() -> None:
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
     else:
-        checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
+        checks.append(ensure_file_exists(logger, gfile, "Genotype input"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
     if args.genefile:
         checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
@@ -521,218 +473,248 @@ def main() -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    # Load genotype meta
-    sample_ids, n_snps = inspect_genotype_file(gfile)
-    sample_ids = np.array(sample_ids, dtype=str)
-    chunk_size = 100_000
-    mmap_window_mb = (
-        auto_mmap_window_mb(gfile, len(sample_ids), n_snps, chunk_size)
-        if args.mmap_limit else None
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - GARFIELD (Rust-first)",
+        config_title="GARFIELD CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            (
+                "General",
+                [
+                    ("Genotype input", gfile),
+                    ("BIN path", bin_path),
+                    ("Phenotype", args.pheno),
+                    ("Scan mode", args.scan_mode),
+                    ("Gene file", args.genefile),
+                    ("GFF3", args.gff3),
+                    ("Extension", int(args.extension)),
+                    ("Step", int(args.step)),
+                    ("Beam width", int(args.nsnp)),
+                    ("Max pick", int(args.max_pick)),
+                    ("Top-K validate", int(args.top_k_validate)),
+                    ("Val frac", float(args.val_frac)),
+                    ("Seed", int(args.seed)),
+                ],
+            )
+        ],
+        footer_rows=[("Threads", f"{int(args.thread)} ({int(detected_threads)} available)"), ("Output prefix", outprefix)],
+        line_max_chars=60,
     )
 
-    # Load phenotype and align to genotype order (drop NaNs)
+    sample_ids, n_rows = inspect_genotype_file(bin_path)
+    sample_ids = np.asarray(sample_ids, dtype=str)
+    if len(sample_ids) == 0:
+        raise ValueError("No sample IDs found in BIN input.")
+
     with CliStatus("Loading phenotype...", enabled=use_spinner) as task:
         try:
-            pheno = load_phenotype(
-                args.pheno,
-                args.ncol,
-                _GarfieldPhenoLogger(logger),
-                id_col=0,
-            )
+            pheno = load_phenotype(args.pheno, args.ncol, _GarfieldPhenoLogger(logger), id_col=0)
         except Exception:
             task.fail("Loading phenotype ...Failed")
             raise
         task.complete("Loading phenotype ...Finished")
+
     if pheno.shape[1] == 0:
         raise ValueError("No phenotype columns to analyze.")
     pheno, trait_names = _normalize_trait_names_from_header(pheno, args.pheno)
     logger.info("Phenotype columns: " + ", ".join(trait_names))
 
+    full_id_to_idx = {sid: i for i, sid in enumerate(sample_ids.tolist())}
     pheno_all_ids = set(pheno.index.astype(str).to_numpy())
-    sample_pool = [sid for sid in sample_ids if sid in pheno_all_ids]
+    sample_pool = [sid for sid in sample_ids.tolist() if sid in pheno_all_ids]
     if len(sample_pool) == 0:
         raise ValueError("No overlapping samples between genotype and phenotype.")
 
-    bimranges = []
-    gset_flags = []
-    all_genotype_i8 = None
-    all_packed_ctx = None
-    all_sites = None
-    sample_pool_arr = np.asarray(sample_pool, dtype=str)
-    sample_pool_index = {sid: i for i, sid in enumerate(sample_pool)}
-    sample_geno_index = {sid: i for i, sid in enumerate(sample_ids.tolist())}
+    group_labels: list[str] = []
+    group_intervals: list[list[tuple[str, int, int]]] = []
+    if args.scan_mode in {"gene", "genepair"}:
+        if not args.genefile or not args.gff3:
+            raise ValueError(f"scan-mode={args.scan_mode} requires both --genefile and --gff3.")
+        group_labels, group_intervals = _build_interval_groups(
+            args.genefile,
+            args.gff3,
+            int(args.extension),
+            args.scan_mode,
+        )
+        if len(group_intervals) == 0:
+            raise ValueError(f"No valid groups built for scan-mode={args.scan_mode}.")
+        logger.info(f"Prepared {len(group_intervals)} interval groups for {args.scan_mode} scan.")
 
-    # Gene/gff3 mode
-    if args.genefile and args.gff3 and os.path.isfile(args.genefile) and os.path.isfile(args.gff3):
-        genesets = _read_geneset_lines(args.genefile)
-        dfgff3 = readanno(args.gff3, "ID").iloc[:, :4].set_index(3)
-        dupgenemask = dfgff3.index.duplicated()
-        if any(dupgenemask):
-            logger.warning(
-                f"Duplicated genes in GFF3: {np.unique(dfgff3.index[dupgenemask])}"
-            )
-        dfgff3 = dfgff3.loc[~dupgenemask]
-
-        bimranges = []
-        gset_flags = []
-        for geneset in genesets:
-            ranges = []
-            use_gset = args.forceset and len(geneset) > 1
-            for gene in geneset:
-                if gene not in dfgff3.index:
-                    logger.warning(f"Gene not found in GFF3: {gene}")
-                    ranges = []
-                    break
-                chrom = dfgff3.loc[gene, 0]
-                start = int(dfgff3.loc[gene, 1]) - args.extension
-                end = int(dfgff3.loc[gene, 2]) + args.extension
-                ranges.append((chrom, start, end))
-            if ranges:
-                bimranges.append(ranges)
-                gset_flags.append(use_gset)
-
-        plink_prefix = _resolve_plink_prefix(gfile)
-        if plink_prefix is not None:
-            logger.info(
-                "Gene/gff3 mode: loading all genotype as BED-packed matrix "
-                "(memory-optimized; decode by region during GARFIELD scan)."
-            )
-            with CliStatus("Loading packed genotype matrix...", enabled=use_spinner) as task:
-                try:
-                    all_packed_ctx, all_sites = load_all_genotype_packed_bed(
-                        plink_prefix,
-                        maf=0.02,
-                        missing_rate=0.05,
-                    )
-                except Exception:
-                    task.fail("Loading packed genotype matrix ...Failed")
-                    raise
-                task.complete("Loading packed genotype matrix ...Finished")
-            packed = np.asarray(all_packed_ctx["packed"])
-            logger.info(
-                "Loaded packed genotype for gene/gset mode: "
-                f"{packed.shape[0]} SNPs x {int(all_packed_ctx['n_samples'])} samples, "
-                f"bytes_per_snp={packed.shape[1]}, dtype={packed.dtype}"
-            )
-        else:
-            logger.info(
-                "Gene/gff3 mode: loading all genotype as int8 into memory "
-                "(supports PLINK/VCF/TXT; VCF/TXT use cache conversion)."
-            )
-            with CliStatus("Loading genotype matrix...", enabled=use_spinner) as task:
-                try:
-                    all_genotype_i8, all_sites = load_all_genotype_int8(
-                        gfile,
-                        sample_pool_arr,
-                        chunk_size=chunk_size,
-                        maf=0.02,
-                        missing_rate=0.05,
-                        mmap_window_mb=mmap_window_mb,
-                        total_snps=n_snps,
-                    )
-                except Exception:
-                    task.fail("Loading genotype matrix ...Failed")
-                    raise
-                task.complete("Loading genotype matrix ...Finished")
-            logger.info(
-                "Loaded genotype matrix for gene/gset mode: "
-                f"{all_genotype_i8.shape[0]} SNPs x {all_genotype_i8.shape[1]} samples, "
-                f"dtype={all_genotype_i8.dtype}"
-            )
-    else:
-        logger.info("Window mode: streaming genotype loading.")
-
-    logger.info("=" * 60)
-    if ml_engine == "auto":
-        if _GARFIELD_HAS_RUST_ML:
-            logger.info("ML engine(auto): using Rust backend (et).")
-        else:
-            logger.info("ML engine(auto): Rust backend unavailable, using sklearn fallback.")
+    lut = _literal_lookup(bin_path, int(n_rows))
 
     used_trait_labels: dict[str, int] = {}
     saved = 0
 
+    tmp_dir = Path(args.out) / ".garfield_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: list[tuple[str, int, int, int, float]] = []
+
     for trait_idx, trait in enumerate(pheno.columns):
         if trait_idx > 0:
             logger.info("")
+
         trait_name = str(trait)
         pheno_col = pheno[trait].dropna()
         pheno_ids = set(pheno_col.index.astype(str).to_numpy())
-        common = [sid for sid in sample_pool if sid in pheno_ids]
-        if len(common) == 0:
-            logger.warning(
-                f"No overlapping samples for trait '{trait_name}' after dropna; skipped."
-            )
+        common_ids = [sid for sid in sample_pool if sid in pheno_ids]
+        if len(common_ids) == 0:
+            logger.warning(f"No overlapping samples for trait '{trait_name}' after dropna; skipped.")
             continue
 
-        y_raw = pheno_col.loc[common].to_numpy(dtype=float).reshape(-1, 1)
-        response_mode, y, response_note = _detect_response_mode(y_raw)
-        logger.info(f"{trait_name} (n={len(common)}, response={response_mode}{response_note})")
+        y_raw = pheno_col.loc[common_ids].to_numpy(dtype=float)
+        response_mode, y_common, response_note = _detect_response_mode(y_raw)
+        logger.info(f"{trait_name} (n={len(common_ids)}, response={response_mode}{response_note})")
 
-        with CliStatus(
-            f"GARFIELD trait '{trait_name}'...",
-            enabled=use_spinner,
-            timeout=0.1,
-        ) as task:
-            window_warnings: list[str] = []
+        train_idx, val_idx = _split_train_val(len(common_ids), float(args.val_frac), int(args.seed) + trait_idx)
+
+        common_global_idx = [full_id_to_idx[sid] for sid in common_ids]
+        common_bin = str(tmp_dir / f"{prefix}.{_safe_trait_label(trait_name)}.common.bin")
+        train_bin = str(tmp_dir / f"{prefix}.{_safe_trait_label(trait_name)}.train.bin")
+        val_bin = str(tmp_dir / f"{prefix}.{_safe_trait_label(trait_name)}.val.bin")
+
+        with CliStatus(f"Preparing BIN subsets for '{trait_name}'...", enabled=use_spinner) as task:
             try:
-                if all_packed_ctx is not None and all_sites is not None:
-                    idx = np.asarray(
-                        [sample_geno_index[sid] for sid in common], dtype=np.int64
-                    )
-                    results = garfield_main_inmemory_packed(
-                        all_packed_ctx,
-                        all_sites,
-                        idx,
-                        y,
-                        bimranges,
-                        nsnp=args.nsnp,
-                        n_estimators=args.nestimators,
-                        core=args.ml_engine,
-                        min_literals=args.min_literals,
-                        threads=threads,
-                        response=response_mode,
-                        gsetmodes=gset_flags,
-                    )
-                elif all_genotype_i8 is not None and all_sites is not None:
-                    idx = np.asarray([sample_pool_index[sid] for sid in common], dtype=np.int64)
-                    geno_trait = np.ascontiguousarray(all_genotype_i8[:, idx], dtype=np.int8)
-                    results = garfield_main_inmemory(
-                        geno_trait,
-                        all_sites,
-                        y,
-                        bimranges,
-                        nsnp=args.nsnp,
-                        n_estimators=args.nestimators,
-                        core=args.ml_engine,
-                        min_literals=args.min_literals,
-                        threads=threads,
-                        response=response_mode,
-                        gsetmodes=gset_flags,
-                    )
-                else:
-                    results, window_warnings = garfield_window(
-                        gfile,
-                        common,
-                        y,
-                        args.step,
-                        args.extension,
-                        nsnp=args.nsnp,
-                        n_estimators=args.nestimators,
-                        core=args.ml_engine,
-                        min_literals=args.min_literals,
-                        response=response_mode,
-                        gsetmode=False,
-                        threads=threads,
-                        mmap_window_mb=mmap_window_mb,
-                        collect_warnings=True,
-                    )
+                garfield_subset_bin_samples(bin_path, common_bin, common_global_idx)
+                garfield_subset_bin_samples(common_bin, train_bin, train_idx.astype(np.int64).tolist())
+                garfield_subset_bin_samples(common_bin, val_bin, val_idx.astype(np.int64).tolist())
             except Exception:
-                task.fail(f"GARFIELD trait '{trait_name}' ...Failed")
+                task.fail(f"Preparing BIN subsets for '{trait_name}' ...Failed")
                 raise
-            task.complete(f"GARFIELD trait '{trait_name}' ...Finished")
+            task.complete(f"Preparing BIN subsets for '{trait_name}' ...Finished")
 
-        _log_window_warning_summary(logger, trait_name, window_warnings)
+        y_train = np.asarray(y_common[train_idx], dtype=np.float64)
+        y_val = np.asarray(y_common[val_idx], dtype=np.float64)
+
+        candidates: list[dict] = []
+
+        with CliStatus(f"Train beam search for '{trait_name}'...", enabled=use_spinner, timeout=0.1) as task:
+            try:
+                if args.scan_mode == "window":
+                    if response_mode == "binary":
+                        (
+                            _sel,
+                            _best_score,
+                            _w_chrom,
+                            _w_start,
+                            _w_end,
+                            _w_n_candidates,
+                            _w_n_windows,
+                            w_results,
+                        ) = beam_scan_windows_binary_mcc_bin(
+                            train_bin,
+                            y_train,
+                            max_pick=int(args.max_pick),
+                            beam_width=int(args.nsnp),
+                            extension=int(args.extension),
+                            step=int(args.step),
+                            return_window_results=True,
+                        )
+                    else:
+                        (
+                            _sel,
+                            _best_score,
+                            _w_chrom,
+                            _w_start,
+                            _w_end,
+                            _w_n_candidates,
+                            _w_n_windows,
+                            w_results,
+                        ) = beam_scan_windows_continuous_corr_bin(
+                            train_bin,
+                            y_train,
+                            max_pick=int(args.max_pick),
+                            beam_width=int(args.nsnp),
+                            extension=int(args.extension),
+                            step=int(args.step),
+                            return_window_results=True,
+                        )
+
+                    for wi, chrom, bp_start, bp_end, n_cand, sc, sel_idx in w_results:
+                        candidates.append(
+                            {
+                                "scan_mode": "window",
+                                "group": f"{chrom}:{int(bp_start)}-{int(bp_end)}",
+                                "group_id": int(wi),
+                                "n_candidates": int(n_cand),
+                                "train_score": float(sc),
+                                "selected": [int(x) for x in sel_idx],
+                            }
+                        )
+                else:
+                    g_results = garfield_scan_groups_bin(
+                        train_bin,
+                        y_train,
+                        group_intervals,
+                        response=response_mode,
+                        max_pick=int(args.max_pick),
+                        beam_width=int(args.nsnp),
+                    )
+                    for gi, n_cand, sc, sel_idx in g_results:
+                        label = group_labels[int(gi)] if int(gi) < len(group_labels) else f"group_{int(gi)}"
+                        candidates.append(
+                            {
+                                "scan_mode": args.scan_mode,
+                                "group": label,
+                                "group_id": int(gi),
+                                "n_candidates": int(n_cand),
+                                "train_score": float(sc),
+                                "selected": [int(x) for x in sel_idx],
+                            }
+                        )
+            except Exception:
+                task.fail(f"Train beam search for '{trait_name}' ...Failed")
+                raise
+            task.complete(f"Train beam search for '{trait_name}' ...Finished")
+
+        candidates = [c for c in candidates if len(c["selected"]) > 0 and np.isfinite(c["train_score"]) ]
+        if len(candidates) == 0:
+            logger.warning(f"No valid train candidates for trait '{trait_name}', skipped.")
+            continue
+
+        candidates.sort(key=lambda x: (-float(x["train_score"]), len(x["selected"]), x["group"]))
+        top_cands = candidates[: int(args.top_k_validate)]
+
+        final_rows: list[dict] = []
+        for c in top_cands:
+            selected = [int(x) for x in c["selected"]]
+            tr_score, tr_support, _ = garfield_eval_rule_bin(
+                train_bin,
+                y_train,
+                selected,
+                response=response_mode,
+            )
+            va_score, va_support, _ = garfield_eval_rule_bin(
+                val_bin,
+                y_val,
+                selected,
+                response=response_mode,
+            )
+            _full_score, _full_support, xcombine = garfield_eval_rule_bin(
+                common_bin,
+                np.asarray(y_common, dtype=np.float64),
+                selected,
+                response=response_mode,
+            )
+
+            expr = _expression_from_indices(selected, lut)
+            final_rows.append(
+                {
+                    "scan_mode": c["scan_mode"],
+                    "group": c["group"],
+                    "n_candidates": int(c["n_candidates"]),
+                    "selected": selected,
+                    "expression": expr,
+                    "train_score": float(tr_score),
+                    "val_score": float(va_score),
+                    "train_support": int(tr_support),
+                    "val_support": int(va_support),
+                    "xcombine": np.asarray(xcombine, dtype=np.int8),
+                }
+            )
+
+        final_rows.sort(key=lambda x: (-float(x["val_score"]), -float(x["train_score"]), len(x["selected"])))
 
         base_trait = _safe_trait_label(trait_name)
         count = used_trait_labels.get(base_trait, 0) + 1
@@ -740,7 +722,29 @@ def main() -> None:
         suffix = base_trait if count == 1 else f"{base_trait}.{count}"
         trait_outprefix = f"{outprefix}.{suffix}"
 
-        write_xcombine_results(f"{trait_outprefix}.garfield", list(common), results)
+        _write_sample_split(trait_outprefix, list(common_ids), train_idx, val_idx)
+
+        with open(f"{trait_outprefix}.garfield.run_config.json", "w", encoding="utf-8") as fw:
+            fw.write(
+                "{\n"
+                f"  \"scan_mode\": \"{args.scan_mode}\",\n"
+                f"  \"response\": \"{response_mode}\",\n"
+                f"  \"max_pick\": {int(args.max_pick)},\n"
+                f"  \"beam_width\": {int(args.nsnp)},\n"
+                f"  \"extension\": {int(args.extension)},\n"
+                f"  \"step\": {int(args.step)},\n"
+                f"  \"top_k_validate\": {int(args.top_k_validate)},\n"
+                f"  \"val_frac\": {float(args.val_frac):.6g},\n"
+                f"  \"seed\": {int(args.seed) + trait_idx}\n"
+                "}\n"
+            )
+
+        _write_rules_tsv(f"{trait_outprefix}.garfield.rules.tsv", final_rows)
+        _write_xcombine_results(f"{trait_outprefix}.garfield", list(common_ids), final_rows)
+
+        best_val = float(final_rows[0]["val_score"]) if len(final_rows) > 0 else float("nan")
+        summary_rows.append((trait_name, len(common_ids), len(train_idx), len(val_idx), best_val))
+
         log_success(
             logger,
             f"Saved GARFIELD output for trait '{trait_name}': "
@@ -751,16 +755,22 @@ def main() -> None:
     if saved == 0:
         raise ValueError("No GARFIELD outputs were generated for the selected phenotype columns.")
 
+    summary_path = f"{outprefix}.garfield.summary.tsv"
+    with open(summary_path, "w", encoding="utf-8") as fw:
+        fw.write("trait\tn_samples\tn_train\tn_val\tbest_val_score\n")
+        for t, n, nt, nv, b in summary_rows:
+            fw.write(f"{t}\t{int(n)}\t{int(nt)}\t{int(nv)}\t{float(b):.12g}\n")
+
     lt = time.localtime()
     log_success(
         logger,
         f"\nFinished GARFIELD. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
-        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} "
-        f"{lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
+        f"{lt.tm_year}-{lt.tm_mon}-{lt.tm_mday} {lt.tm_hour}:{lt.tm_min}:{lt.tm_sec}",
     )
 
 
 if __name__ == "__main__":
     from janusx.script._common.interrupt import install_interrupt_handlers
+
     install_interrupt_handlers()
     main()

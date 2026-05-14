@@ -16,8 +16,8 @@ use crate::bedmath::{
     decode_standardized_packed_block_f32, is_identity_indices, packed_byte_lut,
 };
 use crate::blas::{
-    cblas_sgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS,
-    CBLAS_TRANS, rust_sgemm_prefers_rayon_rowmajor_f32_kernel,
+    cblas_sgemm_dispatch, rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt,
+    OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
@@ -204,8 +204,7 @@ fn row_major_block_t_mul_vec_accum_f32(
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
-    if prefer_parallel_block_vec(rows, cols, pool)
-        && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
+    if prefer_parallel_block_vec(rows, cols, pool) && rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
     {
         let row_chunk = 256usize.min(rows.max(1));
         let mut run = || {
@@ -799,7 +798,11 @@ pub fn gblup_reml_packed_bed<'py>(
         } else {
             PyArray1::from_owned_array(py, Array1::from_vec(Vec::<f64>::new())).into_bound()
         };
-        let _effect_alpha0_out = if return_effect { effect_alpha0 } else { f64::NAN };
+        let _effect_alpha0_out = if return_effect {
+            effect_alpha0
+        } else {
+            f64::NAN
+        };
 
         return Ok((
             train_arr,
@@ -1181,7 +1184,11 @@ pub fn gblup_reml_packed_bed<'py>(
     } else {
         PyArray1::from_owned_array(py, Array1::from_vec(Vec::<f64>::new())).into_bound()
     };
-    let _effect_alpha0_out = if return_effect { effect_alpha0 } else { f64::NAN };
+    let _effect_alpha0_out = if return_effect {
+        effect_alpha0
+    } else {
+        f64::NAN
+    };
     Ok((
         train_arr,
         test_arr,

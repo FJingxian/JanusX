@@ -2869,13 +2869,29 @@ def _gwas_eigh_from_grm(
             if mat is None:
                 raise RuntimeError("Rust eigh requires either matrix array or matrix file path.")
             if hasattr(jxrs, "rust_eigh_from_array_f64_inplace") and bool(mat.flags.c_contiguous) and bool(mat.flags.writeable):
-                return jxrs.rust_eigh_from_array_f64_inplace(
-                    mat,
-                    threads=int(t),
-                    driver=str(driver_name),
-                    jobz="V",
-                    require_lapack=False,
-                )
+                try:
+                    return jxrs.rust_eigh_from_array_f64_inplace(
+                        mat,
+                        threads=int(t),
+                        driver=str(driver_name),
+                        jobz="V",
+                        require_lapack=False,
+                    )
+                except Exception as ex_inplace:
+                    mat_retry = np.ascontiguousarray(mat, dtype=np.float64)
+                    try:
+                        return jxrs.rust_eigh_from_array_f64(
+                            mat_retry,
+                            threads=int(t),
+                            driver=str(driver_name),
+                            jobz="V",
+                            require_lapack=False,
+                        )
+                    except Exception as ex_copy:
+                        raise RuntimeError(
+                            f"Rust eigh failed after inplace retry "
+                            f"(inplace={ex_inplace}; copied={ex_copy})"
+                        ) from ex_copy
             return jxrs.rust_eigh_from_array_f64(
                 mat,
                 threads=int(t),

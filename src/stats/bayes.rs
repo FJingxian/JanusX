@@ -11,8 +11,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::bedmath::{decode_standardized_packed_block_f32, is_identity_indices};
 use crate::blas::{
-    cblas_daxpy_dispatch, cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt,
-    OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+    cblas_daxpy_dispatch, cblas_ddot_dispatch, cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard,
+    CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
 };
 use crate::stats_common::get_cached_pool;
 
@@ -52,7 +52,13 @@ fn parse_index_vec_i64(indices: &[i64], upper_bound: usize, label: &str) -> PyRe
 }
 
 #[inline]
-fn row_major_block_mul_vec_f64(block: &[f64], rows: usize, cols: usize, vec: &[f64], out: &mut [f64]) {
+fn row_major_block_mul_vec_f64(
+    block: &[f64],
+    rows: usize,
+    cols: usize,
+    vec: &[f64],
+    out: &mut [f64],
+) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), cols);
     debug_assert_eq!(out.len(), rows);
@@ -89,7 +95,13 @@ fn row_major_block_mul_vec_f64(block: &[f64], rows: usize, cols: usize, vec: &[f
 }
 
 #[inline]
-fn row_major_block_t_mul_vec_f64(block: &[f64], rows: usize, cols: usize, vec: &[f64], out: &mut [f64]) {
+fn row_major_block_t_mul_vec_f64(
+    block: &[f64],
+    rows: usize,
+    cols: usize,
+    vec: &[f64],
+    out: &mut [f64],
+) {
     debug_assert_eq!(block.len(), rows.saturating_mul(cols));
     debug_assert_eq!(vec.len(), rows);
     debug_assert_eq!(out.len(), cols);
@@ -181,7 +193,10 @@ fn ddot_f64(x: &[f64], y: &[f64]) -> f64 {
             }
         }
     }
-    x.iter().zip(y.iter()).map(|(xi, yi)| (*xi) * (*yi)).sum::<f64>()
+    x.iter()
+        .zip(y.iter())
+        .map(|(xi, yi)| (*xi) * (*yi))
+        .sum::<f64>()
 }
 
 #[inline]
@@ -1386,24 +1401,8 @@ fn bayesa_packed_core_impl(
         pool,
     )? {
         return bayesa_core_impl(
-            y,
-            &m_dense,
-            x,
-            n,
-            p,
-            q,
-            n_iter,
-            burnin,
-            thin,
-            r2,
-            df0_b,
-            shape0,
-            rate0_opt,
-            s0_b_opt,
-            df0_e,
-            s0_e_opt,
-            0.0,
-            seed,
+            y, &m_dense, x, n, p, q, n_iter, burnin, thin, r2, df0_b, shape0, rate0_opt, s0_b_opt,
+            df0_e, s0_e_opt, 0.0, seed,
         );
     }
     let _blas_guard = OpenBlasThreadGuard::enter(bayes_packed_blas_threads());
@@ -1951,8 +1950,7 @@ fn bayesb_packed_core_impl(
                 let c = x2[j] * inv_var_e + 1.0 / var_b[j];
                 if !(c.is_finite() && c > 0.0) {
                     return Err(
-                        "Non-positive posterior precision in BayesB packed beta update"
-                            .to_string(),
+                        "Non-positive posterior precision in BayesB packed beta update".to_string(),
                     );
                 }
                 let rhs = xe * inv_var_e;
@@ -2761,7 +2759,16 @@ pub fn bayescpi(
     df0_e: f64,
     s0_e: Option<f64>,
     seed: Option<u64>,
-) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>, f64, f64, f64, f64, f64, f64)> {
+) -> PyResult<(
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+)> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
     }
@@ -3325,7 +3332,16 @@ pub fn bayescpi_packed(
     s0_e: Option<f64>,
     threads: usize,
     seed: Option<u64>,
-) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>, f64, f64, f64, f64, f64, f64)> {
+) -> PyResult<(
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+)> {
     if n_iter <= burnin {
         return Err(PyValueError::new_err("n_iter must be > burnin"));
     }

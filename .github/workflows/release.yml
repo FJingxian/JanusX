@@ -833,9 +833,14 @@ jobs:
           set -euo pipefail
           rm -rf wheelhouse
           mkdir -p wheelhouse
+          LABEL="${{ matrix.label }}"
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          "$PY" scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+          if [[ "${LABEL}" != "windows-arm64" ]]; then
+            "$PY" scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+          else
+            echo "[release] skip KMC prebuilt wheel check for ${LABEL} (cross-build path sets JANUSX_PREBUILD_KMC_BIND=0)"
+          fi
           "$PY" - <<'PY'
           import glob
           import os

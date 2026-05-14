@@ -1,14 +1,15 @@
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output, Stdio};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -881,6 +882,11 @@ fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut V
     for name in [
         ".janusx",
         "venv",
+        "jx.new",
+        "jx.previous",
+        "jx.new.exe",
+        "jx.previous.exe",
+        "jx_replace_launcher.cmd",
         RUNTIME_HOME_CONFIG,
         LAUNCHER_VERSION_MARKER,
         UPDATE_TIME_MARKER,
@@ -1219,28 +1225,97 @@ fn install_jx_binary(install_dir: &Path) -> Result<PathBuf, String> {
     let src = env::current_exe().map_err(|e| format!("Failed to locate installer binary: {e}"))?;
     let dst_name = if cfg!(windows) { "jx.exe" } else { "jx" };
     let dst = install_dir.join(dst_name);
-    if dst.exists() {
-        std::fs::remove_file(&dst)
-            .map_err(|e| format!("Failed to replace existing {}: {e}", dst.display()))?;
+    let staged = install_dir.join(if cfg!(windows) {
+        "jx.new.exe"
+    } else {
+        "jx.new"
+    });
+    if staged.exists() {
+        std::fs::remove_file(&staged).map_err(|e| {
+            format!(
+                "Failed to remove stale staged install binary {}: {e}",
+                staged.display()
+            )
+        })?;
     }
-    std::fs::copy(&src, &dst).map_err(|e| {
+    std::fs::copy(&src, &staged).map_err(|e| {
         format!(
-            "Failed to copy installer binary {} -> {}: {e}",
+            "Failed to stage installer binary {} -> {}: {e}",
             src.display(),
-            dst.display()
+            staged.display()
         )
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dst)
-            .map_err(|e| format!("Failed to stat {}: {e}", dst.display()))?
+        let mut perms = std::fs::metadata(&staged)
+            .map_err(|e| format!("Failed to stat {}: {e}", staged.display()))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&dst, perms)
-            .map_err(|e| format!("Failed to chmod {}: {e}", dst.display()))?;
+        std::fs::set_permissions(&staged, perms)
+            .map_err(|e| format!("Failed to chmod {}: {e}", staged.display()))?;
     }
-    Ok(dst)
+
+    if !dst.exists() {
+        std::fs::rename(&staged, &dst).map_err(|e| {
+            format!(
+                "Failed to install launcher {} -> {}: {e}",
+                staged.display(),
+                dst.display()
+            )
+        })?;
+        return Ok(dst);
+    }
+
+    let backup = install_dir.join(if cfg!(windows) {
+        "jx.previous.exe"
+    } else {
+        "jx.previous"
+    });
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| {
+            format!(
+                "Failed to remove stale launcher backup {}: {e}",
+                backup.display()
+            )
+        })?;
+    }
+    std::fs::rename(&dst, &backup).map_err(|e| {
+        format!(
+            "Failed to move existing launcher {} -> {} before replacement: {e}",
+            dst.display(),
+            backup.display()
+        )
+    })?;
+    match std::fs::rename(&staged, &dst) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(dst)
+        }
+        Err(replace_err) => {
+            let restore_res = std::fs::rename(&backup, &dst);
+            Err(match restore_res {
+                Ok(_) => format!(
+                    "Failed to replace launcher {} safely (staged rename {} -> {} failed: {}; original launcher was restored and staged candidate remains at {})",
+                    dst.display(),
+                    staged.display(),
+                    dst.display(),
+                    replace_err,
+                    staged.display()
+                ),
+                Err(restore_err) => format!(
+                    "Failed to replace launcher {} safely (staged rename {} -> {} failed: {}; restore {} -> {} also failed: {})",
+                    dst.display(),
+                    staged.display(),
+                    dst.display(),
+                    replace_err,
+                    backup.display(),
+                    dst.display(),
+                    restore_err
+                ),
+            })
+        }
+    }
 }
 
 fn write_runtime_home_config_near_binary(binary_path: &Path, runtime_home: &Path) {
@@ -1415,7 +1490,9 @@ fn run_upgrade(opts: UpgradeOptions) -> Result<i32, String> {
             print_success_line(
                 "Launcher upgrade compiled and staged. `jx` will be replaced after this command exits.",
             );
-            println!("Keep this command running until update steps finish, then run `jx -v` to verify.");
+            println!(
+                "Keep this command running until update steps finish, then run `jx -v` to verify."
+            );
         }
     }
     let (core_update, core_update_hint) = match &opts.source {
@@ -1745,15 +1822,62 @@ fn replace_current_launcher_binary(
         match std::fs::rename(&staged, &current) {
             Ok(_) => Ok(LauncherReplaceResult::ReplacedNow),
             Err(rename_err) => {
-                let _ = std::fs::remove_file(&current);
-                std::fs::rename(&staged, &current).map_err(|retry_err| {
+                let backup = install_dir.join("jx.previous");
+                if verbose {
+                    eprintln!(
+                        "Direct launcher replace failed for {}: {}. Trying backup swap instead.",
+                        current.display(),
+                        rename_err
+                    );
+                }
+                if backup.exists() {
+                    std::fs::remove_file(&backup).map_err(|e| {
+                        format!(
+                            "Failed to remove stale launcher backup {}: {e}",
+                            backup.display()
+                        )
+                    })?;
+                }
+                std::fs::rename(&current, &backup).map_err(|backup_err| {
                     format!(
-                        "Failed to replace current launcher {} (first: {}; retry: {})",
+                        "Failed to replace current launcher {} safely (direct rename failed: {}; backup move {} -> {} failed: {})",
                         current.display(),
                         rename_err,
-                        retry_err
+                        current.display(),
+                        backup.display(),
+                        backup_err
                     )
                 })?;
+                match std::fs::rename(&staged, &current) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&backup);
+                    }
+                    Err(retry_err) => {
+                        let restore_res = std::fs::rename(&backup, &current);
+                        return Err(match restore_res {
+                            Ok(_) => format!(
+                                "Failed to replace current launcher {} safely (direct rename failed: {}; staged rename {} -> {} failed: {}; original launcher was restored and staged candidate remains at {})",
+                                current.display(),
+                                rename_err,
+                                staged.display(),
+                                current.display(),
+                                retry_err,
+                                staged.display()
+                            ),
+                            Err(restore_err) => format!(
+                                "Failed to replace current launcher {} safely (direct rename failed: {}; staged rename {} -> {} failed: {}; restore {} -> {} also failed: {})",
+                                current.display(),
+                                rename_err,
+                                staged.display(),
+                                current.display(),
+                                retry_err,
+                                backup.display(),
+                                current.display(),
+                                restore_err
+                            ),
+                        });
+                    }
+                }
                 Ok(LauncherReplaceResult::ReplacedNow)
             }
         }
@@ -2591,7 +2715,9 @@ fn windows_find_link_exe_direct() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_capture_batch_env(script_candidates: &[String]) -> Result<Vec<(String, String)>, String> {
+fn windows_capture_batch_env(
+    script_candidates: &[String],
+) -> Result<Vec<(String, String)>, String> {
     fn path_has_link(path_value: &str) -> bool {
         for d in env::split_paths(path_value) {
             if d.join("link.exe").is_file() {
@@ -2658,10 +2784,7 @@ fn windows_try_apply_msvc_env() -> Result<(), String> {
             "call \"{}\" -no_logo -arch=x64 -host_arch=x64 >NUL 2>&1",
             path
         ));
-        probe_scripts.push(format!(
-            "call \"{}\" -no_logo -arch=x64 >NUL 2>&1",
-            path
-        ));
+        probe_scripts.push(format!("call \"{}\" -no_logo -arch=x64 >NUL 2>&1", path));
         probe_scripts.push(format!("call \"{}\" >NUL 2>&1", path));
     }
     if let Some(vcvars64) = windows_find_vcvars64() {
@@ -2990,11 +3113,12 @@ fn maybe_self_update_launcher_from_release(
     else {
         return Ok(false);
     };
-    let Some((tag_name, asset_name, asset_url)) =
-        github_latest_release_asset(python, asset_suffix, verbose)?
-    else {
+    let Some(bundle) = github_latest_release_asset_bundle(python, asset_suffix, verbose)? else {
         return Ok(false);
     };
+    let tag_name = bundle.tag_name.clone();
+    let asset_name = bundle.asset_name.clone();
+    let asset_url = bundle.asset_url.clone();
     let Some(latest_version) = normalize_version_token(&tag_name) else {
         return Ok(false);
     };
@@ -3023,7 +3147,54 @@ fn maybe_self_update_launcher_from_release(
         )
     })?;
     let archive_path = work_dir.join(&asset_name);
-    download_release_asset(python, &asset_url, &archive_path, verbose)?;
+    let archive_source = download_release_asset(
+        python,
+        &asset_url,
+        &archive_path,
+        "launcher installer archive",
+        verbose,
+        true,
+    )?;
+    if archive_source == ReleaseDownloadSource::Mirror && !verbose {
+        println!(
+            "Downloaded launcher installer archive via gh-proxy; verifying it against the official GitHub SHA256 checksum..."
+        );
+    }
+    let checksum_path = work_dir.join(&bundle.checksum_name);
+    download_release_asset(
+        python,
+        &bundle.checksum_url,
+        &checksum_path,
+        "launcher installer checksum",
+        verbose,
+        false,
+    )?;
+    if let Err(err) =
+        verify_downloaded_release_asset_sha256(&archive_path, &checksum_path, &asset_name)
+    {
+        if archive_source == ReleaseDownloadSource::Mirror {
+            eprintln!(
+                "Launcher installer archive from gh-proxy failed SHA256 verification against the official GitHub checksum; retrying the official GitHub release asset..."
+            );
+            if verbose {
+                eprintln!("Reason: {err}");
+            }
+            let _ = std::fs::remove_file(&archive_path);
+            download_release_asset(
+                python,
+                &asset_url,
+                &archive_path,
+                "launcher installer archive",
+                verbose,
+                false,
+            )?;
+            verify_downloaded_release_asset_sha256(&archive_path, &checksum_path, &asset_name)?;
+        } else {
+            return Err(format!(
+                "Launcher installer archive failed SHA256 verification against the official GitHub checksum: {err}"
+            ));
+        }
+    }
     let extract_dir = work_dir.join("extract");
     std::fs::create_dir_all(&extract_dir).map_err(|e| {
         format!(
@@ -3040,6 +3211,20 @@ fn maybe_self_update_launcher_from_release(
     })?;
     run_downloaded_installer(&installer, verbose)?;
     Ok(true)
+}
+
+struct ReleaseAssetBundle {
+    tag_name: String,
+    asset_name: String,
+    asset_url: String,
+    checksum_name: String,
+    checksum_url: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ReleaseDownloadSource {
+    Official,
+    Mirror,
 }
 
 fn release_asset_suffix_for_platform() -> Option<&'static str> {
@@ -3063,11 +3248,11 @@ fn release_asset_suffix_for_platform() -> Option<&'static str> {
     None
 }
 
-fn github_latest_release_asset(
+fn github_latest_release_asset_bundle(
     python: &Path,
     suffix: &str,
     verbose: bool,
-) -> Result<Option<(String, String, String)>, String> {
+) -> Result<Option<ReleaseAssetBundle>, String> {
     let script = r#"
 import json, sys, urllib.request
 url = "https://api.github.com/repos/FJingxian/JanusX/releases/latest"
@@ -3079,13 +3264,29 @@ with urllib.request.urlopen(req, timeout=20) as resp:
     obj = json.load(resp)
 tag = str(obj.get("tag_name", "")).strip()
 suffix = sys.argv[1]
-for a in (obj.get("assets") or []):
+asset_name = ""
+asset_url = ""
+assets = obj.get("assets") or []
+for a in assets:
     name = str(a.get("name", "")).strip()
     if name.endswith(suffix):
-        print(tag)
-        print(name)
-        print(str(a.get("browser_download_url", "")).strip())
+        asset_name = name
+        asset_url = str(a.get("browser_download_url", "")).strip()
         break
+if asset_name:
+    checksum_name = asset_name + ".sha256"
+    checksum_url = ""
+    for a in assets:
+        name = str(a.get("name", "")).strip()
+        if name == checksum_name:
+            checksum_url = str(a.get("browser_download_url", "")).strip()
+            break
+    if checksum_url:
+        print(tag)
+        print(asset_name)
+        print(asset_url)
+        print(checksum_name)
+        print(checksum_url)
 "#;
 
     let out = Command::new(python)
@@ -3112,10 +3313,16 @@ for a in (obj.get("assets") or []):
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty())
         .collect();
-    if lines.len() < 3 {
+    if lines.len() < 5 {
         return Ok(None);
     }
-    Ok(Some((lines[0].clone(), lines[1].clone(), lines[2].clone())))
+    Ok(Some(ReleaseAssetBundle {
+        tag_name: lines[0].clone(),
+        asset_name: lines[1].clone(),
+        asset_url: lines[2].clone(),
+        checksum_name: lines[3].clone(),
+        checksum_url: lines[4].clone(),
+    }))
 }
 
 fn pypi_latest_version(python: &Path, verbose: bool) -> Option<String> {
@@ -3243,22 +3450,37 @@ fn download_release_asset(
     python: &Path,
     url: &str,
     output: &Path,
+    asset_kind: &str,
     verbose: bool,
-) -> Result<(), String> {
-    let mirror_url = github_mirror_url(url);
-    if mirror_url != url {
-        match download_file_with_fallback(
-            python,
-            &mirror_url,
-            output,
-            "Downloading launcher installer (CN mirror) ...",
-            verbose,
-        ) {
-            Ok(_) => return Ok(()),
-            Err(err_cn) => {
-                eprintln!("GitHub CN mirror download failed, retrying source...");
-                if verbose {
-                    eprintln!("Reason: {err_cn}");
+    prefer_mirror: bool,
+) -> Result<ReleaseDownloadSource, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{asset_kind} download URL is empty."));
+    }
+    if !is_official_github_release_asset_url(url) {
+        return Err(format!(
+            "Refusing to download {asset_kind} from non-GitHub release host: {url}"
+        ));
+    }
+    if prefer_mirror && prefer_release_mirror_download() {
+        let mirror_url = github_mirror_url(url);
+        if mirror_url != url {
+            match download_file_with_fallback(
+                python,
+                &mirror_url,
+                output,
+                &format!("Downloading {asset_kind} (gh-proxy mirror) ..."),
+                verbose,
+            ) {
+                Ok(_) => return Ok(ReleaseDownloadSource::Mirror),
+                Err(err_cn) => {
+                    eprintln!(
+                        "gh-proxy download failed for {asset_kind}; retrying the official GitHub release asset..."
+                    );
+                    if verbose {
+                        eprintln!("Reason: {err_cn}");
+                    }
                 }
             }
         }
@@ -3267,9 +3489,24 @@ fn download_release_asset(
         python,
         url,
         output,
-        "Downloading launcher installer (source) ...",
+        &format!("Downloading {asset_kind} (official GitHub release) ..."),
         verbose,
-    )
+    )?;
+    Ok(ReleaseDownloadSource::Official)
+}
+
+fn prefer_release_mirror_download() -> bool {
+    !env::var("JX_DISABLE_RELEASE_MIRROR")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn is_official_github_release_asset_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://github.com/")
+        || trimmed.starts_with("https://objects.githubusercontent.com/")
+        || trimmed.starts_with("https://github-releases.githubusercontent.com/")
 }
 
 fn github_mirror_url(url: &str) -> String {
@@ -3470,6 +3707,114 @@ fn download_file_with_http_tools(
     Err("Neither wget nor curl is available.".to_string())
 }
 
+fn verify_downloaded_release_asset_sha256(
+    archive_path: &Path,
+    checksum_path: &Path,
+    asset_name: &str,
+) -> Result<(), String> {
+    let expected = parse_release_asset_sha256(checksum_path, asset_name)?;
+    let actual = compute_file_sha256(archive_path)?;
+    if actual.eq_ignore_ascii_case(&expected) {
+        return Ok(());
+    }
+    Err(format!(
+        "SHA256 mismatch for {}.\nExpected: {}\nActual:   {}",
+        archive_path.display(),
+        expected,
+        actual
+    ))
+}
+
+fn parse_release_asset_sha256(checksum_path: &Path, asset_name: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(checksum_path).map_err(|e| {
+        format!(
+            "Failed to read release checksum file {}: {e}",
+            checksum_path.display()
+        )
+    })?;
+    for line in text.lines() {
+        if let Some(hash) = parse_sha256_line(line, asset_name) {
+            return Ok(hash);
+        }
+    }
+    Err(format!(
+        "Release checksum file {} does not contain a valid SHA256 entry for {}",
+        checksum_path.display(),
+        asset_name
+    ))
+}
+
+fn parse_sha256_line(line: &str, expected_name: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    if is_sha256_hex(trimmed) {
+        return Some(trimmed.to_ascii_lowercase());
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("SHA256 (") {
+        let (name_part, hash_part) = rest.split_once(") = ")?;
+        if !checksum_name_matches(name_part.trim(), expected_name)
+            || !is_sha256_hex(hash_part.trim())
+        {
+            return None;
+        }
+        return Some(hash_part.trim().to_ascii_lowercase());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let hash = parts.next()?;
+    if !is_sha256_hex(hash) {
+        return None;
+    }
+    let remainder = trimmed[hash.len()..].trim().trim_start_matches('*').trim();
+    if remainder.is_empty() || checksum_name_matches(remainder, expected_name) {
+        return Some(hash.to_ascii_lowercase());
+    }
+    None
+}
+
+fn checksum_name_matches(candidate: &str, expected_name: &str) -> bool {
+    if candidate == expected_name {
+        return true;
+    }
+    Path::new(candidate)
+        .file_name()
+        .and_then(|x| x.to_str())
+        .map(|name| name == expected_name)
+        .unwrap_or(false)
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        format!(
+            "Failed to open {} for SHA256 verification: {e}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| {
+            format!(
+                "Failed to read {} for SHA256 verification: {e}",
+                path.display()
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn extract_tar_gz_with_python(
     python: &Path,
     archive: &Path,
@@ -3477,12 +3822,49 @@ fn extract_tar_gz_with_python(
     verbose: bool,
 ) -> Result<(), String> {
     let script = r#"
-import tarfile, os, sys
+import os, pathlib, shutil, sys, tarfile
 arc = sys.argv[1]
 dst = sys.argv[2]
-os.makedirs(dst, exist_ok=True)
+root = pathlib.Path(dst).resolve()
+root.mkdir(parents=True, exist_ok=True)
+
+def safe_target(member_name: str) -> pathlib.Path:
+    if not member_name:
+        raise SystemExit("Refusing to extract tar entry with empty name")
+    if member_name.startswith(("/", "\\")):
+        raise SystemExit(f"Refusing to extract absolute tar entry: {member_name}")
+    if len(member_name) >= 2 and member_name[1] == ":":
+        raise SystemExit(f"Refusing to extract drive-qualified tar entry: {member_name}")
+    pure = pathlib.PurePosixPath(member_name)
+    parts = [p for p in pure.parts if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise SystemExit(f"Refusing to extract parent-traversal tar entry: {member_name}")
+    target = root.joinpath(*parts)
+    parent = target.parent.resolve()
+    if os.path.commonpath([str(root), str(parent)]) != str(root):
+        raise SystemExit(f"Refusing to extract tar entry outside destination: {member_name}")
+    return target
+
 with tarfile.open(arc, "r:gz") as tf:
-    tf.extractall(dst)
+    for member in tf.getmembers():
+        target = safe_target(member.name)
+        if member.issym() or member.islnk():
+            raise SystemExit(f"Refusing to extract tar link entry: {member.name}")
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise SystemExit(f"Refusing to extract unsupported tar entry: {member.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        src = tf.extractfile(member)
+        if src is None:
+            raise SystemExit(f"Failed to read tar entry payload: {member.name}")
+        with src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        try:
+            os.chmod(target, member.mode & 0o777)
+        except OSError:
+            pass
 "#;
     let mut cmd = Command::new(python);
     cmd.arg("-c")
@@ -3597,9 +3979,22 @@ fn run_downloaded_installer(installer: &Path, verbose: bool) -> Result<(), Strin
             })?;
         }
         let mut cmd = Command::new(installer);
-        cmd.stdin(Stdio::inherit());
-        run_cmd_with_optional_spinner(&mut cmd, "Running launcher installer ...", verbose)
-            .map_err(|e| format!("Installer execution failed: {e}"))?;
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if !verbose {
+            println!("Running launcher installer ...");
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("Failed to launch installer {}: {e}", installer.display()))?;
+        if !status.success() {
+            return Err(format!(
+                "Installer execution failed for {} (exit={})",
+                installer.display(),
+                exit_code(status)
+            ));
+        }
         return Ok(());
     }
 }
@@ -3956,9 +4351,7 @@ fn pip_install_update(
                         desc_override,
                         true,
                     )
-                    .map_err(|retry_err| {
-                        format!("{err}\nRetry without proxy failed: {retry_err}")
-                    })
+                    .map_err(|retry_err| format!("{err}\nRetry without proxy failed: {retry_err}"))
                 } else {
                     Err(err)
                 }
@@ -4128,7 +4521,12 @@ fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<()
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|e| format!("Failed to run `{}` -m janusx.script.gwas -h: {e}", py.display()))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to run `{}` -m janusx.script.gwas -h: {e}",
+                    py.display()
+                )
+            })?;
         if py_status.success() {
             write_warmup_marker(runtime_home);
             return Ok(());
@@ -4141,7 +4539,9 @@ fn warm_up_after_update(jx_bin: Option<&Path>, runtime_home: &Path) -> Result<()
     }
 
     if errs.is_empty() {
-        return Err("Warm-up skipped: no runnable `jx` binary and no runtime python found.".to_string());
+        return Err(
+            "Warm-up skipped: no runnable `jx` binary and no runtime python found.".to_string(),
+        );
     }
     Err(format!("Warm-up failed after update:\n{}", errs.join("\n")))
 }
@@ -5099,7 +5499,9 @@ fn print_cli_help() {
     println!();
     println!(
         "  {}",
-        style_blue("Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):")
+        style_blue(
+            "Genetic Association by Random Forest and InterpretivE Logic Decisions (GARFIELD):"
+        )
     );
     print_help_entry(
         4,

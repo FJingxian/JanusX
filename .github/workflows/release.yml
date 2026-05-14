@@ -1021,7 +1021,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Resolve release tag
+      - name: Resolve installer release tag
         shell: bash
         run: |
           TAG="${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}"
@@ -1032,13 +1032,13 @@ jobs:
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
-      - name: Download installer artifacts
+      - name: Fetch staged installer artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist-installers
           merge-multiple: true
 
-      - name: Restore executable permissions for Unix installers
+      - name: Restore Unix execute bits
         shell: bash
         run: |
           shopt -s nullglob
@@ -1046,7 +1046,7 @@ jobs:
             chmod +x "$f" || true
           done
 
-      - name: Repackage installers as tar.gz
+      - name: Package installer archives
         shell: bash
         run: |
           shopt -s nullglob
@@ -1062,11 +1062,25 @@ jobs:
           done
           find dist-installers -maxdepth 1 -type f -name 'JanusX-*' ! -name '*.tar.gz' -delete
 
-      - name: Upload installers to release
+      - name: Generate installer SHA256 sidecars
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in dist-installers/JanusX-*.tar.gz; do
+            b="$(basename "$f")"
+            (
+              cd dist-installers
+              sha256sum "$b" > "${b}.sha256"
+            )
+          done
+
+      - name: Publish installer archives and checksums
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          files: dist-installers/JanusX-*.tar.gz
+          files: |
+            dist-installers/JanusX-*.tar.gz
+            dist-installers/JanusX-*.tar.gz.sha256
           overwrite_files: true
 
   sync-version-back-to-repo:

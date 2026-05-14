@@ -11,3 +11,6 @@ path = "src/main.rs"
 lto = true
 codegen-units = 1
 strip = true
+
+[dependencies]
+sha2 = "0.10"

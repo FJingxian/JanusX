@@ -74,7 +74,7 @@ static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static INSTALL_SIGNAL_HANDLER_ONCE: Once = Once::new();
 
 #[cfg(unix)]
-unsafe extern "C" {
+extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
 }
 

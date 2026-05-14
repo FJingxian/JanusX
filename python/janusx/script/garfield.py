@@ -180,7 +180,7 @@ def _prepare_input_bins(
     maf: float = 0.0,
     geno: float = 1.0,
     impute: bool = False,
-    het: float = 0.02,
+    het: float = 0.05,
 ) -> tuple[str, Optional[str]]:
     # Explicit .bin input: reuse as primary BIN, skip MBIN synthesis from binary input.
     gfile_norm = str(Path(str(gfile)).expanduser())
@@ -557,6 +557,7 @@ def main() -> None:
     )
     optional_group.add_argument("--top-k-validate", type=int, default=10, help="Top train candidates for validation.")
     optional_group.add_argument("--val-frac", type=float, default=0.2, help="Validation fraction (default: 0.2).")
+    optional_group.add_argument("-het", "--het", type=float, default=0.05, help="Max heterozygosity rate for BIN mode filtering (default: 0.05).")
     optional_group.add_argument("--seed", type=int, default=42, help="Random seed for split.")
     optional_group.add_argument("-t", "--thread", dest="thread", type=int, default=detect_effective_threads(), help="CPU threads.")
     optional_group.add_argument("--threads", dest="thread", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -590,6 +591,8 @@ def main() -> None:
         parser.error("-m/--max-pick must be > 0")
     if int(args.top_k_validate) <= 0:
         parser.error("--top-k-validate must be > 0")
+    if not (0.0 <= float(args.het) <= 1.0):
+        parser.error("-het/--het must be in [0, 1]")
 
     try:
         args.ncol = parse_zero_based_index_specs(args.ncol, label="-n/--n")
@@ -637,6 +640,7 @@ def main() -> None:
         threads=int(args.thread),
         logger=logger,
         use_spinner=use_spinner,
+        het=float(args.het),
     )
     scan_bin_path = bin_path
     if str(args.feature_source).lower() == "mbin":
@@ -676,6 +680,7 @@ def main() -> None:
                     ("Max pick", int(args.max_pick)),
                     ("Top-K validate", int(args.top_k_validate)),
                     ("Val frac", float(args.val_frac)),
+                    ("BIN het max", float(args.het)),
                     ("Seed", int(args.seed)),
                 ],
             )

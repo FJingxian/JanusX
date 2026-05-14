@@ -130,6 +130,143 @@ def _select_low_ld_indices(
     return None
 
 
+def _collapse_to_bin02_with_het_filter(
+    m: np.ndarray,
+    *,
+    het_max: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert genotype rows to BIN02 style for logic simulation:
+    1) drop rows with heterozygote rate > het_max;
+    2) for kept rows, replace genotype==1 with row-wise mode in {0,2}.
+    Returns
+    -------
+    g02 : np.ndarray (m_keep, n), dtype=np.uint8 with values in {0,2}
+    keep_idx : np.ndarray (m_keep,), indices on original row axis.
+    """
+    x = np.asarray(m, dtype=np.float32)
+    if x.ndim != 2 or x.shape[0] == 0:
+        return np.empty((0, 0), dtype=np.uint8), np.asarray([], dtype=int)
+
+    keep_rows: List[np.ndarray] = []
+    keep_idx: List[int] = []
+    het_cap = float(max(0.0, min(1.0, het_max)))
+
+    for ri in range(int(x.shape[0])):
+        row = np.asarray(x[ri, :], dtype=np.float32).reshape(-1)
+        valid = np.isfinite(row) & (row >= 0.0)
+        if int(np.sum(valid)) == 0:
+            continue
+        gv = np.asarray(np.rint(row[valid]), dtype=np.int16)
+        gv = np.where(gv <= 0, 0, np.where(gv >= 2, 2, 1)).astype(np.int16, copy=False)
+        het_rate = float(np.mean(gv == 1))
+        if het_rate > het_cap:
+            continue
+        c0 = int(np.sum(gv == 0))
+        c2 = int(np.sum(gv == 2))
+        mode02 = 2 if c2 > c0 else 0
+
+        out_row = np.full(row.shape[0], mode02, dtype=np.uint8)
+        gv_fill = np.where(gv == 1, mode02, gv).astype(np.uint8, copy=False)
+        out_row[valid] = gv_fill
+        keep_rows.append(out_row)
+        keep_idx.append(ri)
+
+    if len(keep_rows) == 0:
+        return np.empty((0, x.shape[1]), dtype=np.uint8), np.asarray([], dtype=int)
+    return np.vstack(keep_rows), np.asarray(keep_idx, dtype=int)
+
+
+def _collect_low_het_pool_global(
+    gfile: str,
+    *,
+    chunk_size: int,
+    maf: float,
+    missing_rate: float,
+    het_max: float,
+    max_sites: int = 20000,
+) -> Tuple[List[np.ndarray], List[Tuple[str, int, int]]]:
+    rows: List[np.ndarray] = []
+    sites_out: List[Tuple[str, int, int]] = []
+    seen: set[Tuple[str, int]] = set()
+
+    for m_chunk, sites in load_genotype_chunks(
+        gfile,
+        chunk_size=int(chunk_size),
+        maf=float(maf),
+        missing_rate=float(missing_rate),
+        impute=False,
+    ):
+        g02, keep_idx = _collapse_to_bin02_with_het_filter(
+            np.asarray(m_chunk, dtype=np.float32),
+            het_max=float(het_max),
+        )
+        if g02.size == 0 or len(keep_idx) == 0:
+            continue
+        g01 = (np.asarray(g02, dtype=np.uint8) > 0).astype(np.uint8)
+        s_arr = np.asarray(sites, dtype=object)
+        for li in range(int(g01.shape[0])):
+            oi = int(np.asarray(keep_idx, dtype=int)[li])
+            chrom, pos = _site_to_chr_pos(s_arr[oi])
+            key = (str(chrom), int(pos))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(np.asarray(g01[li, :], dtype=np.uint8).copy())
+            sites_out.append((str(chrom), int(pos), int(pos)))
+            if len(rows) >= int(max_sites):
+                return rows, sites_out
+    return rows, sites_out
+
+
+def _sample_gate_from_pool(
+    g01_pool: np.ndarray,
+    pool_sites: List[Tuple[str, int, int]],
+    *,
+    rng: np.random.Generator,
+    k_min: int,
+    k_max: int,
+    ld_max: float,
+    af_min: float,
+    af_max: float,
+    n_trials: int = 256,
+) -> Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]]:
+    m_pool = int(g01_pool.shape[0])
+    if m_pool < max(2, int(k_min)):
+        return None
+    k_hi = min(int(k_max), m_pool)
+    k_lo = max(2, min(int(k_min), k_hi))
+    if k_lo > k_hi:
+        return None
+
+    af_center = 0.5 * (float(af_min) + float(af_max))
+    best: Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]] = None
+
+    for _ in range(max(1, int(n_trials))):
+        k = int(rng.integers(k_lo, k_hi + 1))
+        sel = _select_low_ld_indices(
+            g01_pool,
+            k=k,
+            ld_max=float(ld_max),
+            rng=rng,
+            n_trials=64,
+        )
+        if sel is None:
+            sel = np.asarray(rng.choice(np.arange(m_pool), size=k, replace=False), dtype=int)
+        gate = np.all(g01_pool[np.asarray(sel, dtype=int), :] > 0, axis=0).astype(np.float32).reshape(-1, 1)
+        var_gate = float(np.var(gate, ddof=0))
+        if var_gate <= 1e-12:
+            continue
+        af = float(np.mean(gate))
+        sel_sites = [pool_sites[int(i)] for i in np.asarray(sel, dtype=int)]
+        cand = (gate, sel_sites, af)
+        if float(af_min) <= af <= float(af_max):
+            return cand
+        if best is None or abs(af - af_center) < abs(best[2] - af_center):
+            best = cand
+    return best
+
+
 # -----------------------------
 # Phenotype simulator from genotype stream
 # -----------------------------
@@ -146,6 +283,7 @@ def simulate_phenotype_from_genofile(
     and_k_min: int = 2,
     and_k_max: int = 4,
     and_ld_max: float = 0.2,
+    and_het_max: float = 0.05,
     and_af_min: float = 0.02,
     and_af_max: float = 0.98,
     and_target_pve: float = 0.2,
@@ -230,6 +368,9 @@ def simulate_phenotype_from_genofile(
         outsites = []
         best_candidate: Optional[Tuple[np.ndarray, List[Tuple[str, int, int]], float]] = None
         af_target_center = 0.5 * (float(and_af_min) + float(and_af_max))
+        low_het_pool_rows: List[np.ndarray] = []
+        low_het_pool_sites: List[Tuple[str, int, int]] = []
+        low_het_pool_seen: set[Tuple[str, int]] = set()
 
         if arr.shape[0] == 0:
             return y.astype(np.float32), outsites
@@ -252,8 +393,23 @@ def simulate_phenotype_from_genofile(
                 np.asarray(s_raw, dtype=object),
                 float(min(max(and_ld_max, 0.01), 0.95)),
             )
-            g01 = (np.asarray(m_keep, dtype=np.float32) > 0.5).astype(np.uint8)
+            g02, keep_idx = _collapse_to_bin02_with_het_filter(
+                np.asarray(m_keep, dtype=np.float32),
+                het_max=float(and_het_max),
+            )
+            g01 = (np.asarray(g02, dtype=np.uint8) > 0).astype(np.uint8)
             m = int(g01.shape[0])
+            if m > 0:
+                s_keep_arr = np.asarray(s_keep, dtype=object)
+                for li in range(m):
+                    oi = int(np.asarray(keep_idx, dtype=int)[li])
+                    chrom, pos = _site_to_chr_pos(s_keep_arr[oi])
+                    key = (str(chrom), int(pos))
+                    if key in low_het_pool_seen:
+                        continue
+                    low_het_pool_seen.add(key)
+                    low_het_pool_rows.append(np.asarray(g01[li, :], dtype=np.uint8).copy())
+                    low_het_pool_sites.append((str(chrom), int(pos), int(pos)))
             if m < max(2, int(and_k_min)):
                 continue
 
@@ -278,7 +434,8 @@ def simulate_phenotype_from_genofile(
             af = float(np.mean(gate))
             sel_sites: List[Tuple[str, int, int]] = []
             for si in np.asarray(sel, dtype=int):
-                chrom, pos = _site_to_chr_pos(np.asarray(s_keep, dtype=object)[int(si)])
+                orig_i = int(np.asarray(keep_idx, dtype=int)[int(si)])
+                chrom, pos = _site_to_chr_pos(np.asarray(s_keep, dtype=object)[orig_i])
                 sel_sites.append((str(chrom), int(pos), int(pos)))
 
             if best_candidate is None or abs(af - af_target_center) < abs(best_candidate[2] - af_target_center):
@@ -307,6 +464,65 @@ def simulate_phenotype_from_genofile(
                     beta = float(np.sqrt(target_var / var_gate))
                     y += beta * (gate - float(np.mean(gate)))
                     outsites = sel_sites
+            elif len(low_het_pool_rows) >= max(2, int(and_k_min)):
+                # Fallback: still enforce low-het BIN02 logic, but combine from pooled
+                # low-het variants when no sampled window can satisfy all constraints.
+                pool = np.vstack(low_het_pool_rows).astype(np.uint8, copy=False)
+                cand = _sample_gate_from_pool(
+                    pool,
+                    low_het_pool_sites,
+                    rng=rng,
+                    k_min=int(and_k_min),
+                    k_max=int(and_k_max),
+                    ld_max=float(and_ld_max),
+                    af_min=float(and_af_min),
+                    af_max=float(and_af_max),
+                    n_trials=256,
+                )
+                if cand is not None:
+                    gate, sel_sites, _af = cand
+                    var_gate = float(np.var(gate, ddof=0))
+                    if var_gate > 1e-12:
+                        var_base = float(np.var(y, ddof=0))
+                        target = float(and_target_pve)
+                        target_var = (target / max(1e-12, 1.0 - target)) * max(var_base, 1e-12)
+                        beta = float(np.sqrt(target_var / var_gate))
+                        y += beta * (gate - float(np.mean(gate)))
+                        outsites = sel_sites
+
+        if len(outsites) == 0 and len(low_het_pool_rows) < max(2, int(and_k_min)):
+            # Final fallback: global streaming pool under the same low-het BIN02 rule.
+            g_rows, g_sites = _collect_low_het_pool_global(
+                gfile,
+                chunk_size=int(chunk_size),
+                maf=float(maf),
+                missing_rate=float(missing_rate),
+                het_max=float(and_het_max),
+                max_sites=20000,
+            )
+            if len(g_rows) >= max(2, int(and_k_min)):
+                pool = np.vstack(g_rows).astype(np.uint8, copy=False)
+                cand = _sample_gate_from_pool(
+                    pool,
+                    g_sites,
+                    rng=rng,
+                    k_min=int(and_k_min),
+                    k_max=int(and_k_max),
+                    ld_max=float(and_ld_max),
+                    af_min=float(and_af_min),
+                    af_max=float(and_af_max),
+                    n_trials=512,
+                )
+                if cand is not None:
+                    gate, sel_sites, _af = cand
+                    var_gate = float(np.var(gate, ddof=0))
+                    if var_gate > 1e-12:
+                        var_base = float(np.var(y, ddof=0))
+                        target = float(and_target_pve)
+                        target_var = (target / max(1e-12, 1.0 - target)) * max(var_base, 1e-12)
+                        beta = float(np.sqrt(target_var / var_gate))
+                        y += beta * (gate - float(np.mean(gate)))
+                        outsites = sel_sites
 
     return y.astype(np.float32), outsites
 
@@ -481,6 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum pairwise r^2 among selected loci for strict AND gate (default: %(default)s).",
     )
     optional_group.add_argument(
+        "--and-het-max", type=float, default=0.05,
+        help="Maximum heterozygosity rate allowed before BIN02 collapse in strict AND gate (default: %(default)s).",
+    )
+    optional_group.add_argument(
         "--and-af-min", type=float, default=0.02,
         help="Minimum gate frequency for strict AND gate acceptance (default: %(default)s).",
     )
@@ -540,6 +760,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ("VE", args.ve),
                     ("AND k[min,max]", f"{args.and_k_min},{args.and_k_max}"),
                     ("AND ld max", args.and_ld_max),
+                    ("AND het max", args.and_het_max),
                     ("AND af[min,max]", f"{args.and_af_min},{args.and_af_max}"),
                     ("AND target PVE", args.and_target_pve),
                     ("AND max iter", args.and_max_iter),
@@ -574,6 +795,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not (0.0 <= float(args.and_ld_max) <= 1.0):
         logger.error("--and-ld-max must be in [0, 1].")
         raise SystemExit(1)
+    if not (0.0 <= float(args.and_het_max) <= 1.0):
+        logger.error("--and-het-max must be in [0, 1].")
+        raise SystemExit(1)
     if not (0.0 <= float(args.and_af_min) <= 1.0) or not (0.0 <= float(args.and_af_max) <= 1.0):
         logger.error("--and-af-min/--and-af-max must be in [0, 1].")
         raise SystemExit(1)
@@ -602,6 +826,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         and_k_min=args.and_k_min,
         and_k_max=args.and_k_max,
         and_ld_max=args.and_ld_max,
+        and_het_max=args.and_het_max,
         and_af_min=args.and_af_min,
         and_af_max=args.and_af_max,
         and_target_pve=args.and_target_pve,
@@ -612,16 +837,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     sampleid = np.asarray(sampleid, dtype=str)
 
     write_phenotypes(outprefix, sampleid, y, seed=args.seed)
+    sites_written = False
     if args.write_sites:
         write_sites(outprefix, outsites)
+        sites_written = len(outsites) > 0
 
     log_success(logger, f"Finished in {time.time() - t_start:.2f} s")
     logger.info("Done. Outputs:")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno')}")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.txt')}")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.NA.txt')}")
-    if args.write_sites:
+    if args.write_sites and sites_written:
         logger.info(f"  {format_path_for_display(f'{outprefix}.causal.sites.tsv')}")
+    elif args.write_sites:
+        logger.warning("  causal sites were not generated under current constraints.")
 
     return 0
 

@@ -448,6 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     optional_group.add_argument("--and-k-min", type=int, default=2, help="Minimum AND gate loci.")
     optional_group.add_argument("--and-k-max", type=int, default=2, help="Maximum AND gate loci.")
     optional_group.add_argument("--and-ld-max", type=float, default=0.3, help="Maximum LD (r^2) in AND gate.")
+    optional_group.add_argument("--and-het-max", type=float, default=0.05, help="Maximum heterozygosity before BIN02 collapse in AND gate.")
     optional_group.add_argument("--and-af-min", type=float, default=0.02, help="Minimum AND gate frequency.")
     optional_group.add_argument("--and-af-max", type=float, default=0.90, help="Maximum AND gate frequency.")
     optional_group.add_argument("--and-target-pve", type=float, default=0.45, help="Target PVE from AND gate.")
@@ -512,6 +513,7 @@ def _run_one(
                 and_k_min=int(args.and_k_min),
                 and_k_max=int(args.and_k_max),
                 and_ld_max=float(args.and_ld_max),
+                and_het_max=float(args.and_het_max),
                 and_af_min=float(args.and_af_min),
                 and_af_max=float(args.and_af_max),
                 and_target_pve=float(args.and_target_pve),
@@ -646,6 +648,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.step is not None and int(args.step) <= 0:
         logger.error("-step/--step must be > 0")
         return 1
+    if not (0.0 <= float(args.and_het_max) <= 1.0):
+        logger.error("--and-het-max must be in [0, 1].")
+        return 1
     if not (0.0 <= float(args.hit_ld_r2) <= 1.0):
         logger.error("--hit-ld-r2 must be in [0, 1].")
         return 1
@@ -665,6 +670,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Region flank(Mb)", float(args.region_flank_mb)),
                     ("Sim mode", "garfield"),
                     ("AND k[min,max]", f"{int(args.and_k_min)},{int(args.and_k_max)}"),
+                    ("AND het max", float(args.and_het_max)),
                     ("AND target PVE", float(args.and_target_pve)),
                     ("GARFIELD feature", str(args.feature_source)),
                     ("GARFIELD ext", int(args.extension)),

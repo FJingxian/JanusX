@@ -863,6 +863,25 @@ fn encode_row_to_bits(
     if !keep {
         return None;
     }
+    if matches!(mode, GarfieldBinMode::Bin) {
+        let mut non_missing = 0usize;
+        let mut het_count = 0usize;
+        for &v in row.iter() {
+            if let Some(g) = normalize_genotype3(v) {
+                non_missing += 1;
+                if g == 1 {
+                    het_count += 1;
+                }
+            }
+        }
+        if non_missing == 0 {
+            return None;
+        }
+        let het_rate = het_count as f32 / non_missing as f32;
+        if het_rate > het {
+            return None;
+        }
+    }
 
     match mode {
         GarfieldBinMode::Bin => {
@@ -1366,7 +1385,7 @@ fn validate_continuous_y(y: &[f64]) -> Result<(), String> {
     maf=0.0,
     geno=1.0,
     impute=false,
-    het=0.02,
+    het=0.05,
     sample_ids=None,
     sample_indices=None
 ))]
@@ -1389,8 +1408,8 @@ pub fn garfield_prepare_input_bin_py(
     if !(0.0..=1.0).contains(&geno) {
         return Err(PyValueError::new_err("geno must be within [0, 1]"));
     }
-    if !(0.0..=0.5).contains(&het) {
-        return Err(PyValueError::new_err("het must be within [0, 0.5]"));
+    if !(0.0..=1.0).contains(&het) {
+        return Err(PyValueError::new_err("het must be within [0, 1]"));
     }
 
     let input_kind = parse_input_kind(input_kind).map_err(PyValueError::new_err)?;

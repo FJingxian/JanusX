@@ -151,24 +151,6 @@ def detect_effective_threads(override_threads: int = 0) -> tuple[int, str]:
         detected = int(os.cpu_count() or 1)
         source = "os.cpu_count"
 
-    cap_envs = [
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ]
-    caps: list[tuple[str, int]] = []
-    for name in cap_envs:
-        value = _parse_positive_env_int(name)
-        if value is not None:
-            caps.append((name, value))
-    if caps:
-        cap_name, cap_value = min(caps, key=lambda item: item[1])
-        if cap_value < detected:
-            detected = cap_value
-            source = f"{source}, capped:{cap_name}"
-
     return max(1, int(detected)), source
 
 

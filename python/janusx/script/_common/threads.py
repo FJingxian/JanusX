@@ -80,7 +80,14 @@ def detect_effective_threads() -> int:
       2) CPU affinity mask
       3) cgroup CPU quota
       4) os.cpu_count()
-    Then cap by common math-thread env vars when present.
+
+    Important:
+      Pre-existing BLAS/OpenMP thread env vars are intentionally *not* used to
+      shrink the detected allocation here. Those env vars are runtime caps and
+      may reflect stale shell defaults (for example OPENBLAS_NUM_THREADS=8)
+      rather than the scheduler allocation for the current job. CLI launchers
+      apply the chosen thread budget back to BLAS/Rayon explicitly after
+      detection.
     """
     scheduler_envs = [
         "SLURM_CPUS_PER_TASK",
@@ -113,18 +120,6 @@ def detect_effective_threads() -> int:
     # Last fallback: host-visible cores
     if detected is None:
         detected = int(os.cpu_count() or 1)
-
-    # Optional software caps
-    cap_envs = [
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ]
-    caps = [v for v in (_parse_positive_env_int(k) for k in cap_envs) if v is not None]
-    if len(caps) > 0:
-        detected = min(detected, min(caps))
 
     return max(1, int(detected))
 

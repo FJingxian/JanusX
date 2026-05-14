@@ -1768,7 +1768,12 @@ def detect_effective_threads() -> int:
       2) CPU affinity mask
       3) cgroup CPU quota
       4) os.cpu_count()
-    Then cap by common math-thread env vars when present.
+
+    Important:
+      Do not let existing BLAS/OpenMP thread env vars shrink the detected job
+      allocation here. Those env vars are runtime caps that may have been set
+      by a previous shell/session default and should not override the current
+      scheduler allocation for GS CLI default `-t`.
     """
     # Scheduler-aware allocation hints (most reliable on HPC)
     scheduler_envs = [
@@ -1805,17 +1810,6 @@ def detect_effective_threads() -> int:
         detected = int(os.cpu_count() or 1)
 
     # Optional software caps
-    cap_envs = [
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ]
-    caps = [v for v in (_parse_positive_env_int(k) for k in cap_envs) if v is not None]
-    if len(caps) > 0:
-        detected = min(detected, min(caps))
-
     return max(1, int(detected))
 
 
@@ -9110,17 +9104,17 @@ def _run_methods_parallel(
                     he_blas_threads = int(max(0, int(rr_state.get("lambda_he_stage_blas_threads", 0) or 0)))
                     he_rayon_threads = int(max(0, int(rr_state.get("lambda_he_stage_rayon_threads", 0) or 0)))
                     he_threads_arg = int(max(0, int(rr_state.get("lambda_he_threads_arg", 0) or 0)))
-                    rows.append(
-                        (
-                            "HE threads",
-                            (
-                                f"{he_thread_policy} "
-                                f"(blas={he_blas_threads}, "
-                                f"rayon={he_rayon_threads}, "
-                                f"he={he_threads_arg})"
-                            ),
-                        )
-                    )
+                    # rows.append(
+                    #     (
+                    #         "HE threads",
+                    #         (
+                    #             f"{he_thread_policy} "
+                    #             f"(blas={he_blas_threads}, "
+                    #             f"rayon={he_rayon_threads}, "
+                    #             f"he={he_threads_arg})"
+                    #         ),
+                    #     )
+                    # )
                 va = float(rr_state.get("lambda_vc_sigma_g2", np.nan))
                 ve = float(rr_state.get("lambda_vc_sigma_e2", np.nan))
                 pve_vc = float(rr_state.get("lambda_vc_pve", np.nan))

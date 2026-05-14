@@ -116,6 +116,14 @@ jobs:
             cargo build --release --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
           fi
 
+      - name: Windows launcher smoke test (-upgrade latest + -uninstall -yes)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/ci/windows_launcher_smoke.ps1 `
+            -LauncherPath "launcher/target/${{ matrix.target }}/release/jx.exe" `
+            -WorkspaceRoot "$env:RUNNER_TEMP\jx-launcher-smoke"
+
       - name: Package installer (Unix)
         if: runner.os != 'Windows'
         shell: bash

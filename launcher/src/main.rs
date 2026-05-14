@@ -1584,19 +1584,21 @@ fn prepare_upgrade_launcher_source(
         match git_clone_source_repo(
             &repo_cn,
             &repo_dir,
-            "Cloning JanusX source (CN mirror) ...",
+            "Cloning JanusX source (gh-proxy mirror) ...",
             opts.verbose,
         ) {
             Ok(_) => git_ok = true,
             Err(err_cn) => {
-                eprintln!("GitHub CN mirror clone failed, retrying source...");
+                eprintln!(
+                    "gh-proxy clone failed for JanusX source; retrying the official GitHub source..."
+                );
                 if opts.verbose {
                     eprintln!("Reason: {err_cn}");
                 }
                 git_clone_source_repo(
                     &repo_origin,
                     &repo_dir,
-                    "Cloning JanusX source (source) ...",
+                    "Cloning JanusX source (official GitHub source) ...",
                     opts.verbose,
                 )?;
                 git_ok = true;
@@ -1612,19 +1614,21 @@ fn prepare_upgrade_launcher_source(
     match download_file_with_http_tools(
         GITHUB_ARCHIVE_CN,
         &archive_path,
-        "Downloading GitHub source archive (CN mirror) ...",
+        "Downloading JanusX source archive (gh-proxy mirror) ...",
         opts.verbose,
     ) {
         Ok(_) => {}
         Err(err_cn) => {
-            eprintln!("GitHub source archive CN mirror failed, retrying source...");
+            eprintln!(
+                "gh-proxy download failed for the JanusX source archive; retrying the official GitHub source archive..."
+            );
             if opts.verbose {
                 eprintln!("Reason: {err_cn}");
             }
             download_file_with_http_tools(
                 GITHUB_ARCHIVE_ORIGIN,
                 &archive_path,
-                "Downloading GitHub source archive (source) ...",
+                "Downloading JanusX source archive (official GitHub source) ...",
                 opts.verbose,
             )?;
         }
@@ -2069,19 +2073,21 @@ fn run_update_internal(
                     match download_file_with_http_tools(
                         GITHUB_ARCHIVE_CN,
                         &archive_path,
-                        "Downloading GitHub source archive (CN mirror) ...",
+                        "Downloading JanusX source archive (gh-proxy mirror) ...",
                         opts.verbose,
                     ) {
                         Ok(_) => {}
                         Err(err_cn) => {
-                            eprintln!("GitHub source archive CN mirror failed, retrying source...");
+                            eprintln!(
+                                "gh-proxy download failed for the JanusX source archive; retrying the official GitHub source archive..."
+                            );
                             if opts.verbose {
                                 eprintln!("Reason: {err_cn}");
                             }
                             download_file_with_http_tools(
                                 GITHUB_ARCHIVE_ORIGIN,
                                 &archive_path,
-                                "Downloading GitHub source archive (source) ...",
+                                "Downloading JanusX source archive (official GitHub source) ...",
                                 opts.verbose,
                             )?;
                         }
@@ -2119,12 +2125,14 @@ fn run_update_internal(
                     (repo_url_cn.clone(), None, true)
                 };
             if opts.verbose && !using_cn_repo {
-                println!("CN GitHub mirror is unavailable; using source.");
+                println!(
+                    "gh-proxy GitHub source is unavailable; using the official GitHub source."
+                );
             }
             // `jx -update latest` always performs a full reinstall.
             let gh_force_reinstall = true;
             if opts.verbose {
-                println!("Updating from GitHub (CN mirror) ...");
+                println!("Updating from GitHub (gh-proxy mirror) ...");
             }
             match pip_install_update(
                 &python,
@@ -2133,7 +2141,7 @@ fn run_update_internal(
                 gh_force_reinstall,
                 false,
                 opts.verbose,
-                "Updating from GitHub (CN mirror) ...",
+                "Updating from GitHub (gh-proxy mirror) ...",
                 true,
             ) {
                 Ok(_) => {
@@ -2144,7 +2152,9 @@ fn run_update_internal(
                     return Ok(0);
                 }
                 Err(err_primary) => {
-                    eprintln!("GitHub CN mirror update failed, retrying with source...");
+                    eprintln!(
+                        "gh-proxy update failed for the GitHub source install; retrying the official GitHub source..."
+                    );
                     if opts.verbose {
                         eprintln!("Reason: {err_primary}");
                     }
@@ -2155,7 +2165,7 @@ fn run_update_internal(
                         gh_force_reinstall,
                         false,
                         opts.verbose,
-                        "Updating from GitHub (source)...",
+                        "Updating from GitHub (official GitHub source) ...",
                         false,
                     )?;
                     if let Some(remote) = remote_head.as_deref() {
@@ -2984,12 +2994,14 @@ fn ensure_local_rust_toolchain(
         python,
         &url_cn,
         &installer,
-        "Downloading local Rust toolchain bootstrap (CN mirror) ...",
+        "Downloading local Rust toolchain bootstrap (rsproxy.cn mirror) ...",
         verbose,
     ) {
         Ok(_) => {}
         Err(err_cn) => {
-            eprintln!("CN Rust bootstrap mirror failed, retrying source...");
+            eprintln!(
+                "rsproxy.cn Rust bootstrap mirror failed; retrying the official Rust source..."
+            );
             if verbose {
                 eprintln!("Reason: {err_cn}");
             }
@@ -2997,7 +3009,7 @@ fn ensure_local_rust_toolchain(
                 python,
                 &url_origin,
                 &installer,
-                "Downloading local Rust toolchain bootstrap (source) ...",
+                "Downloading local Rust toolchain bootstrap (official Rust source) ...",
                 verbose,
             )?;
         }
@@ -3056,14 +3068,22 @@ fn ensure_local_rust_toolchain(
         Ok(())
     };
 
-    match run_rustup_install(true, "Installing local Rust toolchain (CN mirror) ...") {
+    match run_rustup_install(
+        true,
+        "Installing local Rust toolchain (rsproxy.cn mirror) ...",
+    ) {
         Ok(_) => {}
         Err(err_cn) => {
-            eprintln!("CN Rust toolchain install failed, retrying source...");
+            eprintln!(
+                "rsproxy.cn Rust toolchain install failed; retrying the official Rust source..."
+            );
             if verbose {
                 eprintln!("Reason: {err_cn}");
             }
-            run_rustup_install(false, "Installing local Rust toolchain (source) ...")?;
+            run_rustup_install(
+                false,
+                "Installing local Rust toolchain (official Rust source) ...",
+            )?;
         }
     }
 

@@ -1,4 +1,5 @@
 use crate::beam::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
+use crate::bitwise::bitand_assign;
 use crate::gfcore::{process_snp_row, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter};
 use crate::gfreader::build_sample_selection;
 use crate::score::{score_binary_mcc_packed, score_cont_corr_packed};
@@ -15,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 const BIN01_MAGIC: &[u8; 8] = b"JXBIN001";
 const BIN01_HEADER_LEN: usize = 32;
+const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
+const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldInputKind {
@@ -111,6 +114,22 @@ fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
 }
 
 #[inline]
+fn garfield_progress_notify(
+    progress_callback: Option<&Py<PyAny>>,
+    done: usize,
+    total: usize,
+) -> PyResult<()> {
+    if let Some(cb) = progress_callback {
+        Python::attach(|py2| -> PyResult<()> {
+            py2.check_signals()?;
+            cb.call1(py2, (done, total))?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[inline]
 fn words_for_samples(n_samples: usize) -> usize {
     n_samples.div_ceil(64).max(1)
 }
@@ -155,37 +174,58 @@ fn score_key(s: f64) -> f64 {
 }
 
 #[inline]
-fn constrained_node_better(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> bool {
+fn cmp_constrained_nodes(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> std::cmp::Ordering {
     let sa = score_key(a.score);
     let sb = score_key(b.score);
-    if sa > sb {
-        return true;
+    match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
+        std::cmp::Ordering::Equal => match a.selected.len().cmp(&b.selected.len()) {
+            std::cmp::Ordering::Equal => a.selected.cmp(&b.selected),
+            other => other,
+        },
+        other => other,
     }
-    if sa < sb {
-        return false;
+}
+
+#[inline]
+fn constrained_node_better(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> bool {
+    cmp_constrained_nodes(a, b) == std::cmp::Ordering::Less
+}
+
+#[inline]
+fn push_top_k_constrained_streaming(
+    nodes: &mut Vec<ConstrainedBeamNode>,
+    cand: ConstrainedBeamNode,
+    k: usize,
+) {
+    if k == 0 {
+        return;
     }
-    if a.selected.len() < b.selected.len() {
-        return true;
+    if nodes.len() < k {
+        nodes.push(cand);
+        return;
     }
-    if a.selected.len() > b.selected.len() {
-        return false;
+
+    let mut worst_idx = 0usize;
+    for i in 1..nodes.len() {
+        if cmp_constrained_nodes(&nodes[i], &nodes[worst_idx]) == std::cmp::Ordering::Greater {
+            worst_idx = i;
+        }
     }
-    a.selected < b.selected
+
+    if cmp_constrained_nodes(&cand, &nodes[worst_idx]) == std::cmp::Ordering::Less {
+        nodes[worst_idx] = cand;
+    }
+}
+
+#[inline]
+fn garfield_should_parallel_constrained(total_cands: usize) -> bool {
+    rayon::current_num_threads() > 1
+        && total_cands >= GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS
 }
 
 #[inline]
 fn sort_truncate_nodes(mut nodes: Vec<ConstrainedBeamNode>, k: usize) -> Vec<ConstrainedBeamNode> {
-    nodes.sort_by(|a, b| {
-        let sa = score_key(a.score);
-        let sb = score_key(b.score);
-        match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
-            std::cmp::Ordering::Equal => match a.selected.len().cmp(&b.selected.len()) {
-                std::cmp::Ordering::Equal => a.selected.cmp(&b.selected),
-                other => other,
-            },
-            other => other,
-        }
-    });
+    nodes.sort_by(cmp_constrained_nodes);
     if nodes.len() > k {
         nodes.truncate(k);
     }
@@ -267,18 +307,63 @@ where
     let max_depth = max_pick.min(n_rows);
     let layer_cap = beam_width.min(n_rows);
 
-    let mut beam: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
-    for i in 0..n_rows {
-        let mut combined = row_prefix(bits_flat, row_words, i, needed_words).to_vec();
-        apply_tail_mask(&mut combined, mask);
-        let score = score_fn(&combined);
-        beam.push(ConstrainedBeamNode {
-            selected: vec![i],
-            combined,
-            score,
-            last_index: i,
-        });
-    }
+    let mut beam: Vec<ConstrainedBeamNode> = if garfield_should_parallel_constrained(n_rows) {
+        let mut work = Vec::<(usize, usize)>::new();
+        let chunk = GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS.max(1);
+        let mut start = 0usize;
+        while start < n_rows {
+            let end = (start + chunk).min(n_rows);
+            work.push((start, end));
+            start = end;
+        }
+        let local_tops: Vec<Vec<ConstrainedBeamNode>> = work
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut local: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+                for i in start..end {
+                    let mut combined = row_prefix(bits_flat, row_words, i, needed_words).to_vec();
+                    apply_tail_mask(&mut combined, mask);
+                    let score = score_fn(&combined);
+                    push_top_k_constrained_streaming(
+                        &mut local,
+                        ConstrainedBeamNode {
+                            selected: vec![i],
+                            combined,
+                            score,
+                            last_index: i,
+                        },
+                        layer_cap,
+                    );
+                }
+                local
+            })
+            .collect();
+        let mut merged: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+        for local in local_tops {
+            for cand in local {
+                push_top_k_constrained_streaming(&mut merged, cand, layer_cap);
+            }
+        }
+        merged
+    } else {
+        let mut seq: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+        for i in 0..n_rows {
+            let mut combined = row_prefix(bits_flat, row_words, i, needed_words).to_vec();
+            apply_tail_mask(&mut combined, mask);
+            let score = score_fn(&combined);
+            push_top_k_constrained_streaming(
+                &mut seq,
+                ConstrainedBeamNode {
+                    selected: vec![i],
+                    combined,
+                    score,
+                    last_index: i,
+                },
+                layer_cap,
+            );
+        }
+        seq
+    };
     beam = sort_truncate_nodes(beam, layer_cap);
     if beam.is_empty() {
         return Err(format!("{ctx}: no candidates"));
@@ -286,30 +371,89 @@ where
 
     let mut best = beam[0].clone();
     for _depth in 2..=max_depth {
-        let mut next: Vec<ConstrainedBeamNode> = Vec::new();
-        for node in beam.iter() {
-            for cand in (node.last_index + 1)..n_rows {
-                let cg = group_ids[cand];
-                if node.selected.iter().any(|&s| group_ids[s] == cg) {
-                    continue;
+        let total_expand = beam
+            .iter()
+            .map(|node| n_rows.saturating_sub(node.last_index.saturating_add(1)))
+            .sum::<usize>();
+        let next: Vec<ConstrainedBeamNode> = if garfield_should_parallel_constrained(total_expand)
+        {
+            let mut work = Vec::<(usize, usize, usize)>::new();
+            let chunk = GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS.max(1);
+            for (bi, node) in beam.iter().enumerate() {
+                let mut start = node.last_index + 1;
+                while start < n_rows {
+                    let end = (start + chunk).min(n_rows);
+                    work.push((bi, start, end));
+                    start = end;
                 }
-                let row = row_prefix(bits_flat, row_words, cand, needed_words);
-                let mut combined = node.combined.clone();
-                for (a, &b) in combined.iter_mut().zip(row.iter()) {
-                    *a &= b;
-                }
-                apply_tail_mask(&mut combined, mask);
-                let score = score_fn(&combined);
-                let mut selected = node.selected.clone();
-                selected.push(cand);
-                next.push(ConstrainedBeamNode {
-                    selected,
-                    combined,
-                    score,
-                    last_index: cand,
-                });
             }
-        }
+            let local_tops: Vec<Vec<ConstrainedBeamNode>> = work
+                .into_par_iter()
+                .map(|(bi, start, end)| {
+                    let node = &beam[bi];
+                    let mut local: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+                    for cand in start..end {
+                        let cg = group_ids[cand];
+                        if node.selected.iter().any(|&s| group_ids[s] == cg) {
+                            continue;
+                        }
+                        let row = row_prefix(bits_flat, row_words, cand, needed_words);
+                        let mut combined = node.combined.clone();
+                        bitand_assign(&mut combined, row);
+                        apply_tail_mask(&mut combined, mask);
+                        let score = score_fn(&combined);
+                        let mut selected = node.selected.clone();
+                        selected.push(cand);
+                        push_top_k_constrained_streaming(
+                            &mut local,
+                            ConstrainedBeamNode {
+                                selected,
+                                combined,
+                                score,
+                                last_index: cand,
+                            },
+                            layer_cap,
+                        );
+                    }
+                    local
+                })
+                .collect();
+            let mut merged: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+            for local in local_tops {
+                for cand in local {
+                    push_top_k_constrained_streaming(&mut merged, cand, layer_cap);
+                }
+            }
+            merged
+        } else {
+            let mut seq: Vec<ConstrainedBeamNode> = Vec::with_capacity(layer_cap);
+            for node in beam.iter() {
+                for cand in (node.last_index + 1)..n_rows {
+                    let cg = group_ids[cand];
+                    if node.selected.iter().any(|&s| group_ids[s] == cg) {
+                        continue;
+                    }
+                    let row = row_prefix(bits_flat, row_words, cand, needed_words);
+                    let mut combined = node.combined.clone();
+                    bitand_assign(&mut combined, row);
+                    apply_tail_mask(&mut combined, mask);
+                    let score = score_fn(&combined);
+                    let mut selected = node.selected.clone();
+                    selected.push(cand);
+                    push_top_k_constrained_streaming(
+                        &mut seq,
+                        ConstrainedBeamNode {
+                            selected,
+                            combined,
+                            score,
+                            last_index: cand,
+                        },
+                        layer_cap,
+                    );
+                }
+            }
+            seq
+        };
         if next.is_empty() {
             break;
         }
@@ -1789,7 +1933,9 @@ pub fn garfield_subset_bin_samples_py(
     response="continuous",
     max_pick=3,
     beam_width=5,
-    enforce_feature_exclusion=true
+    enforce_feature_exclusion=true,
+    progress_callback=None,
+    progress_every=0
 ))]
 pub fn garfield_scan_groups_bin_py(
     bin_path: String,
@@ -1799,6 +1945,8 @@ pub fn garfield_scan_groups_bin_py(
     max_pick: usize,
     beam_width: usize,
     enforce_feature_exclusion: bool,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<Vec<(usize, usize, f64, Vec<usize>)>> {
     if groups.is_empty() {
         return Ok(Vec::new());
@@ -1832,6 +1980,14 @@ pub fn garfield_scan_groups_bin_py(
     } else {
         None
     };
+    let total_groups = groups.len();
+    let notify_step = if progress_every == 0 {
+        (total_groups / 200).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = 0usize;
+    garfield_progress_notify(progress_callback.as_ref(), 0, total_groups)?;
 
     let mut out: Vec<(usize, usize, f64, Vec<usize>)> = Vec::with_capacity(groups.len());
     for (gi, group) in groups.iter().enumerate() {
@@ -1842,6 +1998,11 @@ pub fn garfield_scan_groups_bin_py(
         }
         if idx_all.is_empty() {
             out.push((gi, 0usize, f64::NEG_INFINITY, Vec::new()));
+            let done = gi + 1;
+            if done - last_notified >= notify_step || done == total_groups {
+                garfield_progress_notify(progress_callback.as_ref(), done, total_groups)?;
+                last_notified = done;
+            }
             continue;
         }
         idx_all.sort_unstable();
@@ -1885,6 +2046,11 @@ pub fn garfield_scan_groups_bin_py(
             .map(|&local_idx| idx_all[local_idx])
             .collect::<Vec<_>>();
         out.push((gi, idx_all.len(), res.score, selected_global));
+        let done = gi + 1;
+        if done - last_notified >= notify_step || done == total_groups {
+            garfield_progress_notify(progress_callback.as_ref(), done, total_groups)?;
+            last_notified = done;
+        }
     }
     Ok(out)
 }
@@ -1898,7 +2064,9 @@ pub fn garfield_scan_groups_bin_py(
     beam_width=5,
     extension=50000,
     step=None,
-    enforce_feature_exclusion=true
+    enforce_feature_exclusion=true,
+    progress_callback=None,
+    progress_every=0
 ))]
 pub fn garfield_scan_windows_bin_py(
     bin_path: String,
@@ -1909,6 +2077,8 @@ pub fn garfield_scan_windows_bin_py(
     extension: usize,
     step: Option<usize>,
     enforce_feature_exclusion: bool,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
 ) -> PyResult<Vec<(usize, String, i32, i32, usize, f64, Vec<usize>)>> {
     let resp = parse_response(response).map_err(PyValueError::new_err)?;
     if extension == 0 {
@@ -1949,6 +2119,14 @@ pub fn garfield_scan_windows_bin_py(
     if windows.is_empty() {
         return Ok(Vec::new());
     }
+    let total_windows = windows.len();
+    let notify_step = if progress_every == 0 {
+        (total_windows / 200).max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let mut last_notified = 0usize;
+    garfield_progress_notify(progress_callback.as_ref(), 0, total_windows)?;
     let feature_group_ids_all = if enforce_feature_exclusion {
         Some(build_feature_group_ids(&sites, n_rows_all))
     } else {
@@ -1959,6 +2137,11 @@ pub fn garfield_scan_windows_bin_py(
         Vec::with_capacity(windows.len());
     for (wi0, win) in windows.iter().enumerate() {
         if win.indices.is_empty() {
+            let done = wi0 + 1;
+            if done - last_notified >= notify_step || done == total_windows {
+                garfield_progress_notify(progress_callback.as_ref(), done, total_windows)?;
+                last_notified = done;
+            }
             continue;
         }
         let n_rows = win.indices.len();
@@ -2008,6 +2191,11 @@ pub fn garfield_scan_windows_bin_py(
             res.score,
             selected_global,
         ));
+        let done = wi0 + 1;
+        if done - last_notified >= notify_step || done == total_windows {
+            garfield_progress_notify(progress_callback.as_ref(), done, total_windows)?;
+            last_notified = done;
+        }
     }
     Ok(out)
 }
@@ -2076,4 +2264,75 @@ pub fn garfield_eval_rule_bin_py(
         xcombine[i] = if bit != 0 { 1u8 } else { 0u8 };
     }
     Ok((score, support, xcombine))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_bits(n_rows: usize, n_samples: usize) -> (Vec<u64>, usize, Vec<usize>) {
+        let row_words = words_for_samples(n_samples);
+        let mut bits_flat = vec![0u64; n_rows * row_words];
+        for row in 0..n_rows {
+            for word in 0..row_words {
+                let a = (row as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let b = (word as u64 + 3).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                let rot = ((row * 11 + word * 7) % 63 + 1) as u32;
+                let dense = (!0u64).rotate_right(((row * 5 + word * 13) % 64) as u32);
+                bits_flat[row * row_words + word] = (a ^ b).rotate_left(rot) | dense;
+            }
+        }
+        let group_ids = (0..n_rows).map(|i| i % 96).collect::<Vec<_>>();
+        (bits_flat, row_words, group_ids)
+    }
+
+    #[test]
+    fn test_group_exclusion_parallel_matches_serial() {
+        let n_rows = 1024usize;
+        let n_samples = 256usize;
+        let max_pick = 3usize;
+        let beam_width = 8usize;
+        let (bits_flat, row_words, group_ids) = build_test_bits(n_rows, n_samples);
+        let score_fn = |combined: &[u64]| combined.iter().map(|w| w.count_ones() as f64).sum::<f64>();
+
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("build serial pool")
+            .install(|| {
+                beam_search_and_with_group_exclusion(
+                    &bits_flat,
+                    row_words,
+                    n_rows,
+                    n_samples,
+                    max_pick,
+                    beam_width,
+                    &group_ids,
+                    score_fn,
+                )
+                .expect("serial constrained beam")
+            });
+
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build parallel pool")
+            .install(|| {
+                beam_search_and_with_group_exclusion(
+                    &bits_flat,
+                    row_words,
+                    n_rows,
+                    n_samples,
+                    max_pick,
+                    beam_width,
+                    &group_ids,
+                    score_fn,
+                )
+                .expect("parallel constrained beam")
+            });
+
+        assert_eq!(serial.selected_indices, parallel.selected_indices);
+        assert_eq!(serial.combined_bits, parallel.combined_bits);
+        assert_eq!(serial.score, parallel.score);
+    }
 }

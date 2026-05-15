@@ -25,7 +25,8 @@ from janusx.script._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from janusx.script._common.status import CliStatus, log_success, stdout_is_tty
+from janusx.script._common.progress import ProgressAdapter
+from janusx.script._common.status import CliStatus, log_success, print_failure, stdout_is_tty
 from janusx.script._common.threads import apply_blas_thread_env, detect_effective_threads
 
 
@@ -489,6 +490,25 @@ def _expression_from_indices(indices: list[int], lut: dict[int, str]) -> str:
     return " & ".join(lut.get(int(i), f"IDX{int(i)}") for i in indices)
 
 
+def _dedup_candidates_by_selected(candidates: list[dict]) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    seen: set[tuple[int, ...]] = set()
+    dropped = 0
+    for cand in candidates:
+        key = tuple(int(x) for x in cand.get("selected", []))
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        out.append(cand)
+    return out, dropped
+
+
+def _xcombine_key(xcombine: np.ndarray) -> bytes:
+    arr = np.asarray(xcombine, dtype=np.int8).reshape(-1)
+    return np.ascontiguousarray(arr).view(np.uint8).tobytes()
+
+
 def _write_rules_tsv(path: str, rows: list[dict]) -> None:
     with open(path, "w", encoding="utf-8") as fw:
         fw.write(
@@ -501,6 +521,64 @@ def _write_rules_tsv(path: str, rows: list[dict]) -> None:
                 f"{float(r['train_score']):.12g}\t{float(r['val_score']):.12g}\t"
                 f"{int(r['train_support'])}\t{int(r['val_support'])}\n"
             )
+
+
+def _run_scan_with_progress(
+    desc: str,
+    *,
+    use_spinner: bool,
+    invoke,
+):
+    if not bool(use_spinner):
+        with CliStatus(f"{desc}...", enabled=False, timeout=0.1):
+            return invoke(None)
+
+    progress: Optional[ProgressAdapter] = None
+    done_seen = 0
+    total_seen = 0
+
+    def _progress_cb(done: int, total: int) -> None:
+        nonlocal progress, done_seen, total_seen
+        d = max(0, int(done))
+        t = max(d, int(total))
+        if progress is None and t > 0:
+            progress = ProgressAdapter(
+                total=t,
+                desc=desc,
+                show_spinner=True,
+                show_postfix=True,
+                show_remaining=True,
+                emit_done=True,
+                force_animate=True,
+            )
+        if progress is None:
+            done_seen = max(done_seen, d)
+            total_seen = max(total_seen, t)
+            return
+        delta = max(0, d - done_seen)
+        if delta > 0:
+            progress.update(delta)
+        progress.set_postfix(progress=f"{d}/{t}")
+        done_seen = max(done_seen, d)
+        total_seen = max(total_seen, t)
+
+    try:
+        out = invoke(_progress_cb)
+    except Exception:
+        if progress is not None:
+            progress.close()
+        print_failure(f"{desc} ...Failed", force_color=True)
+        raise
+
+    if progress is not None:
+        if total_seen > 0:
+            if done_seen < total_seen:
+                progress.update(total_seen - done_seen)
+                done_seen = total_seen
+            progress.set_postfix(progress=f"{done_seen}/{total_seen}")
+            progress.finish()
+        progress.close()
+    return out
 
 
 def main() -> None:
@@ -552,7 +630,7 @@ def main() -> None:
         "--feature-source",
         type=str,
         choices=["bin", "mbin"],
-        default="mbin",
+        default="bin",
         help="Feature cache for beam search (default: mbin).",
     )
     optional_group.add_argument("--top-k-validate", type=int, default=10, help="Top train candidates for validation.")
@@ -776,68 +854,98 @@ def main() -> None:
 
         candidates: list[dict] = []
 
-        with CliStatus(f"Train beam search for '{trait_name}'...", enabled=use_spinner, timeout=0.1) as task:
-            try:
-                if args.scan_mode == "window":
-                    w_results = garfield_scan_windows_bin(
-                        train_bin,
-                        y_train,
-                        response=response_mode,
-                        max_pick=int(args.max_pick),
-                        beam_width=int(args.nsnp),
-                        extension=int(args.extension),
-                        step=int(args.step),
-                        enforce_feature_exclusion=True,
-                    )
-                    for wi, chrom, bp_start, bp_end, n_cand, sc, sel_idx in w_results:
-                        candidates.append(
-                            {
-                                "scan_mode": "window",
-                                "group": f"{chrom}:{int(bp_start)}-{int(bp_end)}",
-                                "group_id": int(wi),
-                                "n_candidates": int(n_cand),
-                                "train_score": float(sc),
-                                "selected": [int(x) for x in sel_idx],
-                            }
-                        )
-                else:
-                    g_results = garfield_scan_groups_bin(
-                        train_bin,
-                        y_train,
-                        group_intervals,
-                        response=response_mode,
-                        max_pick=int(args.max_pick),
-                        beam_width=int(args.nsnp),
-                        enforce_feature_exclusion=True,
-                    )
-                    for gi, n_cand, sc, sel_idx in g_results:
-                        label = group_labels[int(gi)] if int(gi) < len(group_labels) else f"group_{int(gi)}"
-                        candidates.append(
-                            {
-                                "scan_mode": args.scan_mode,
-                                "group": label,
-                                "group_id": int(gi),
-                                "n_candidates": int(n_cand),
-                                "train_score": float(sc),
-                                "selected": [int(x) for x in sel_idx],
-                            }
-                        )
-            except Exception:
-                task.fail(f"Train beam search for '{trait_name}' ...Failed")
-                raise
-            task.complete(f"Train beam search for '{trait_name}' ...Finished")
+        scan_desc = {
+            "window": f"Scanning windows for '{trait_name}'",
+            "gene": f"Scanning genes for '{trait_name}'",
+            "genepair": f"Scanning gene pairs for '{trait_name}'",
+        }.get(str(args.scan_mode), f"Train beam search for '{trait_name}'")
 
-        candidates = [c for c in candidates if len(c["selected"]) > 0 and np.isfinite(c["train_score"]) ]
+        if args.scan_mode == "window":
+            w_results = _run_scan_with_progress(
+                scan_desc,
+                use_spinner=use_spinner,
+                invoke=lambda progress_cb: garfield_scan_windows_bin(
+                    train_bin,
+                    y_train,
+                    response=response_mode,
+                    max_pick=int(args.max_pick),
+                    beam_width=int(args.nsnp),
+                    extension=int(args.extension),
+                    step=int(args.step),
+                    enforce_feature_exclusion=True,
+                    progress_callback=progress_cb,
+                ),
+            )
+            for wi, chrom, bp_start, bp_end, n_cand, sc, sel_idx in w_results:
+                candidates.append(
+                    {
+                        "scan_mode": "window",
+                        "group": f"{chrom}:{int(bp_start)}-{int(bp_end)}",
+                        "group_id": int(wi),
+                        "n_candidates": int(n_cand),
+                        "train_score": float(sc),
+                        "selected": [int(x) for x in sel_idx],
+                    }
+                )
+        else:
+            g_results = _run_scan_with_progress(
+                scan_desc,
+                use_spinner=use_spinner,
+                invoke=lambda progress_cb: garfield_scan_groups_bin(
+                    train_bin,
+                    y_train,
+                    group_intervals,
+                    response=response_mode,
+                    max_pick=int(args.max_pick),
+                    beam_width=int(args.nsnp),
+                    enforce_feature_exclusion=True,
+                    progress_callback=progress_cb,
+                ),
+            )
+            for gi, n_cand, sc, sel_idx in g_results:
+                label = group_labels[int(gi)] if int(gi) < len(group_labels) else f"group_{int(gi)}"
+                candidates.append(
+                    {
+                        "scan_mode": args.scan_mode,
+                        "group": label,
+                        "group_id": int(gi),
+                        "n_candidates": int(n_cand),
+                        "train_score": float(sc),
+                        "selected": [int(x) for x in sel_idx],
+                    }
+                )
+
+        candidates = [c for c in candidates if len(c["selected"]) > 0 and np.isfinite(c["train_score"])]
         if len(candidates) == 0:
             logger.warning(f"No valid train candidates for trait '{trait_name}', skipped.")
             continue
 
         candidates.sort(key=lambda x: (-float(x["train_score"]), len(x["selected"]), x["group"]))
-        top_cands = candidates[: int(args.top_k_validate)]
+        candidates, selected_dup_dropped = _dedup_candidates_by_selected(candidates)
+        top_target = int(args.top_k_validate)
 
         final_rows: list[dict] = []
-        for c in top_cands:
+        seen_xcombine: set[bytes] = set()
+        xcombine_dup_dropped = 0
+        for c in candidates:
             selected = [int(x) for x in c["selected"]]
+            _full_score, _full_support, xcombine = garfield_eval_rule_bin(
+                common_bin,
+                np.asarray(y_common, dtype=np.float64),
+                selected,
+                response=response_mode,
+            )
+            if isinstance(xcombine, (bytes, bytearray, memoryview)):
+                xcombine_arr = np.frombuffer(xcombine, dtype=np.uint8).astype(np.int8, copy=False)
+            else:
+                xcombine_arr = np.asarray(xcombine, dtype=np.int8)
+
+            xcombine_sig = _xcombine_key(xcombine_arr)
+            if xcombine_sig in seen_xcombine:
+                xcombine_dup_dropped += 1
+                continue
+            seen_xcombine.add(xcombine_sig)
+
             tr_score, tr_support, _ = garfield_eval_rule_bin(
                 train_bin,
                 y_train,
@@ -850,17 +958,6 @@ def main() -> None:
                 selected,
                 response=response_mode,
             )
-            _full_score, _full_support, xcombine = garfield_eval_rule_bin(
-                common_bin,
-                np.asarray(y_common, dtype=np.float64),
-                selected,
-                response=response_mode,
-            )
-            if isinstance(xcombine, (bytes, bytearray, memoryview)):
-                xcombine_arr = np.frombuffer(xcombine, dtype=np.uint8).astype(np.int8, copy=False)
-            else:
-                xcombine_arr = np.asarray(xcombine, dtype=np.int8)
-
             expr = _expression_from_indices(selected, lut)
             final_rows.append(
                 {
@@ -875,6 +972,16 @@ def main() -> None:
                     "val_support": int(va_support),
                     "xcombine": xcombine_arr,
                 }
+            )
+            if len(final_rows) >= top_target:
+                break
+
+        if selected_dup_dropped > 0 or xcombine_dup_dropped > 0:
+            logger.info(
+                f"GARFIELD dedup for '{trait_name}': "
+                f"selected_dropped={selected_dup_dropped}, "
+                f"xcombine_dropped={xcombine_dup_dropped}, "
+                f"unique_shortlist={len(final_rows)}"
             )
 
         final_rows.sort(key=lambda x: (-float(x["val_score"]), -float(x["train_score"]), len(x["selected"])))

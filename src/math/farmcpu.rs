@@ -8,17 +8,52 @@ pub(crate) fn decode_packed_rows_to_sample_major(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     row_indices: &[usize],
+    packed_row_lookup: Option<&[usize]>,
     sample_idx: &[usize],
     row_flip: &[bool],
     row_maf: &[f32],
-) -> Vec<f64> {
+) -> Result<Vec<f64>, String> {
+    if bytes_per_snp == 0 {
+        return Err("invalid bytes_per_snp=0 in packed decode".to_string());
+    }
+    if packed_flat.len() % bytes_per_snp != 0 {
+        return Err("packed length is not divisible by bytes_per_snp in packed decode".to_string());
+    }
     let n = sample_idx.len();
     let k = row_indices.len();
+    let packed_rows = packed_flat.len() / bytes_per_snp;
     let mut out = vec![0.0_f64; n * k]; // row-major: (n_samples_used, k_rows)
-    for (col, &row_idx) in row_indices.iter().enumerate() {
-        let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-        let flip = row_flip[row_idx];
-        let mean_g = 2.0_f64 * row_maf[row_idx] as f64;
+    for (col, &local_row_idx) in row_indices.iter().enumerate() {
+        if local_row_idx >= row_flip.len() || local_row_idx >= row_maf.len() {
+            return Err(format!(
+                "row metadata index out of bounds in packed decode: idx={}, row_flip={}, row_maf={}",
+                local_row_idx,
+                row_flip.len(),
+                row_maf.len()
+            ));
+        }
+        let packed_row_idx = if let Some(lookup) = packed_row_lookup {
+            *lookup.get(local_row_idx).ok_or_else(|| {
+                format!(
+                    "packed row lookup index out of bounds in packed decode: idx={}, lookup_len={}",
+                    local_row_idx,
+                    lookup.len()
+                )
+            })?
+        } else {
+            local_row_idx
+        };
+        if packed_row_idx >= packed_rows {
+            return Err(format!(
+                "packed row index out of bounds in packed decode: idx={}, packed_rows={}",
+                packed_row_idx,
+                packed_rows
+            ));
+        }
+        let row =
+            &packed_flat[packed_row_idx * bytes_per_snp..(packed_row_idx + 1) * bytes_per_snp];
+        let flip = row_flip[local_row_idx];
+        let mean_g = 2.0_f64 * row_maf[local_row_idx] as f64;
         for (i, &sidx) in sample_idx.iter().enumerate() {
             let b = row[sidx >> 2];
             let code = (b >> ((sidx & 3) * 2)) & 0b11;
@@ -32,7 +67,7 @@ pub(crate) fn decode_packed_rows_to_sample_major(
             out[i * k + col] = gv;
         }
     }
-    out
+    Ok(out)
 }
 
 #[inline]

@@ -223,6 +223,7 @@ fn build_x_with_qtn_packed(
     qtn_idx: &[usize],
     packed_flat: &[u8],
     bytes_per_snp: usize,
+    row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     row_flip: &[bool],
     row_maf: &[f32],
@@ -243,10 +244,11 @@ fn build_x_with_qtn_packed(
             packed_flat,
             bytes_per_snp,
             qtn_idx,
+            row_indices,
             sample_idx,
             row_flip,
             row_maf,
-        );
+        )?;
         for i in 0..n {
             let src = &decoded[i * k..(i + 1) * k];
             let dst = &mut out[i * q_total + q_base..(i + 1) * q_total];
@@ -495,10 +497,12 @@ pub fn farmcpu_rem_packed(
             &packed_flat,
             bytes_per_snp,
             &leadidx,
+            None,
             &sample_idx,
             row_flip,
             row_maf,
-        );
+        )
+        .map_err(PyRuntimeError::new_err)?;
 
         let score = farmcpu_ll_score_from_sample_major(
             y,
@@ -585,17 +589,25 @@ pub fn farmcpu_super_packed<'py>(
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
     };
-    let keep = py.detach(|| {
+    let keep = py.detach(|| -> PyResult<Vec<bool>> {
         let sample_major = decode_packed_rows_to_sample_major(
             &packed_flat,
             bytes_per_snp,
             &ridx,
+            None,
             &sample_idx,
             row_flip,
             row_maf,
-        );
-        farmcpu_super_keep_from_sample_major(&sample_major, n, k, pval, thr)
-    });
+        )
+        .map_err(PyRuntimeError::new_err)?;
+        Ok(farmcpu_super_keep_from_sample_major(
+            &sample_major,
+            n,
+            k,
+            pval,
+            thr,
+        ))
+    })?;
 
     let out = PyArray1::<bool>::zeros(py, [k], false).into_bound();
     let out_slice = unsafe {
@@ -948,22 +960,15 @@ pub fn farmcpu_packed_to_tsv(
     let pool = get_cached_pool(threads)?;
 
     py.detach(|| -> PyResult<()> {
-        let map_local_rows = |local_idx: &[usize]| -> Vec<usize> {
-            if let Some(row_idx_full) = row_idx.as_ref() {
-                local_idx.iter().map(|&j| row_idx_full[j]).collect()
-            } else {
-                local_idx.to_vec()
-            }
-        };
         for it_idx in 0..max_iter_i {
-            let qtn_packed_idx = map_local_rows(&qtn_idx);
             let (x_qtn, q_total) = build_x_with_qtn_packed(
                 &base_x,
                 n,
                 q_base,
-                &qtn_packed_idx,
+                &qtn_idx,
                 &packed_flat,
                 bytes_per_snp,
+                row_idx.as_deref(),
                 &sample_idx,
                 row_flip,
                 row_maf,
@@ -1065,15 +1070,19 @@ pub fn farmcpu_packed_to_tsv(
                     .par_iter()
                     .map(|&(sz, nn)| {
                         let leadidx = select_lead_indices(sz, nn, &femp, &global_pos);
-                        let leadidx_packed = map_local_rows(&leadidx);
                         let sample_major = decode_packed_rows_to_sample_major(
                             &packed_flat,
                             bytes_per_snp,
-                            &leadidx_packed,
+                            &leadidx,
+                            row_idx.as_deref(),
                             &sample_idx,
                             row_flip,
                             row_maf,
                         );
+                        let sample_major = match sample_major {
+                            Ok(v) => v,
+                            Err(_) => return (f64::INFINITY, leadidx),
+                        };
                         let score = farmcpu_ll_score_from_sample_major(
                             y,
                             &x_qtn,
@@ -1134,11 +1143,13 @@ pub fn farmcpu_packed_to_tsv(
                 let sample_major = decode_packed_rows_to_sample_major(
                     &packed_flat,
                     bytes_per_snp,
-                    &map_local_rows(&qtn_union),
+                    &qtn_union,
+                    row_idx.as_deref(),
                     &sample_idx,
                     row_flip,
                     row_maf,
-                );
+                )
+                .map_err(PyRuntimeError::new_err)?;
                 let pvals: Vec<f64> = qtn_union.iter().map(|&ix| femp[ix]).collect();
                 let keep = farmcpu_super_keep_from_sample_major(
                     &sample_major,
@@ -1168,14 +1179,14 @@ pub fn farmcpu_packed_to_tsv(
             qtn_idx = qtn_next;
         }
 
-        let qtn_packed_idx = map_local_rows(&qtn_idx);
         let (x_qtn, q_total) = build_x_with_qtn_packed(
             &base_x,
             n,
             q_base,
-            &qtn_packed_idx,
+            &qtn_idx,
             &packed_flat,
             bytes_per_snp,
+            row_idx.as_deref(),
             &sample_idx,
             row_flip,
             row_maf,

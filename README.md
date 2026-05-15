@@ -33,20 +33,6 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ---
 
-## `jx` & `jxpy`
-
-**JanusX provides two command entry styles**:
-
-- `jx` (Rust launcher): manages runtime/update/toolchain and supports all launcher modules
-- `jxpy` (Python package entry): runs Python-side modules directly
-
-**Practical difference**:
-
-- `fastq2vcf` and `fastq2count` are launcher-only (`jx`)
-- launcher-only flags (`-update/-upgrade/-list/-clean/-uninstall`) are not available in `jxpy`
-
----
-
 ## Installation
 
 ### Option A: Python package install (Recommend)

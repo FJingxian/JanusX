@@ -1212,10 +1212,7 @@ pub(crate) unsafe fn cblas_sgemm_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 cblas_sgemm_openblas(
                     order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
@@ -1253,7 +1250,11 @@ pub(crate) unsafe fn cblas_sgemm_dispatch(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         cblas_sgemm_openblas(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
@@ -1279,9 +1280,12 @@ pub(crate) unsafe fn cblas_sgemm_dispatch(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        cblas_sgemm_openblas(
+        cblas_sgemm_rust(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
@@ -1374,10 +1378,7 @@ pub(crate) unsafe fn cblas_dgemm_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 cblas_dgemm_openblas(
                     order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
@@ -1415,7 +1416,11 @@ pub(crate) unsafe fn cblas_dgemm_dispatch(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         cblas_dgemm_openblas(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
@@ -1441,9 +1446,12 @@ pub(crate) unsafe fn cblas_dgemm_dispatch(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        cblas_dgemm_openblas(
+        cblas_dgemm_rust(
             order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
         );
     }
@@ -1506,10 +1514,7 @@ pub(crate) unsafe fn cblas_ddot_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 return cblas_ddot_openblas(n, x, incx, y, incy);
             }
@@ -1536,7 +1541,11 @@ pub(crate) unsafe fn cblas_ddot_dispatch(
     {
         return cblas_ddot_accelerate(n, x, incx, y, incy);
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         return cblas_ddot_openblas(n, x, incx, y, incy);
     }
@@ -1556,9 +1565,12 @@ pub(crate) unsafe fn cblas_ddot_dispatch(
     {
         return cblas_ddot_rust(n, x, incx, y, incy);
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        return cblas_ddot_openblas(n, x, incx, y, incy);
+        return cblas_ddot_rust(n, x, incx, y, incy);
     }
 
     #[cfg(all(
@@ -1630,10 +1642,7 @@ pub(crate) unsafe fn cblas_daxpy_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
                 return;
@@ -1664,7 +1673,11 @@ pub(crate) unsafe fn cblas_daxpy_dispatch(
         cblas_daxpy_accelerate(n, alpha, x, incx, y, incy);
         return;
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
         return;
@@ -1687,9 +1700,12 @@ pub(crate) unsafe fn cblas_daxpy_dispatch(
         cblas_daxpy_rust(n, alpha, x, incx, y, incy);
         return;
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        cblas_daxpy_openblas(n, alpha, x, incx, y, incy);
+        cblas_daxpy_rust(n, alpha, x, incx, y, incy);
         return;
     }
 }
@@ -1770,10 +1786,7 @@ pub(crate) unsafe fn cblas_ssyrk_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 cblas_ssyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
                 return;
@@ -1803,7 +1816,11 @@ pub(crate) unsafe fn cblas_ssyrk_dispatch(
     {
         cblas_ssyrk_accelerate(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         cblas_ssyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
@@ -1823,9 +1840,12 @@ pub(crate) unsafe fn cblas_ssyrk_dispatch(
     {
         cblas_ssyrk_rust(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        cblas_ssyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
+        cblas_ssyrk_rust(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
 }
 
@@ -1905,10 +1925,7 @@ pub(crate) unsafe fn cblas_dsyrk_dispatch(
             }
         }
         SgemmBackend::OpenBlas => {
-            #[cfg(any(
-                target_os = "windows",
-                all(feature = "blas-openblas", jx_openblas_available)
-            ))]
+            #[cfg(all(feature = "blas-openblas", jx_openblas_available))]
             {
                 cblas_dsyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
                 return;
@@ -1938,7 +1955,11 @@ pub(crate) unsafe fn cblas_dsyrk_dispatch(
     {
         cblas_dsyrk_accelerate(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
-    #[cfg(all(target_os = "linux", feature = "blas-openblas", jx_openblas_available))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "blas-openblas",
+        jx_openblas_available
+    ))]
     {
         cblas_dsyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
@@ -1958,9 +1979,12 @@ pub(crate) unsafe fn cblas_dsyrk_dispatch(
     {
         cblas_dsyrk_rust(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(
+        target_os = "windows",
+        not(all(feature = "blas-openblas", jx_openblas_available))
+    ))]
     {
-        cblas_dsyrk_openblas(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
+        cblas_dsyrk_rust(order, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
     }
 }
 
@@ -2805,10 +2829,7 @@ fn openblas_lapack_dyn() -> Option<&'static OpenBlasLapackDyn> {
         .as_ref()
 }
 
-#[cfg(any(
-    target_os = "windows",
-    all(feature = "blas-openblas", jx_openblas_available)
-))]
+#[cfg(all(feature = "blas-openblas", jx_openblas_available))]
 #[inline]
 fn rust_openblas_set_threads_impl(threads: usize) -> bool {
     unsafe {
@@ -2818,19 +2839,13 @@ fn rust_openblas_set_threads_impl(threads: usize) -> bool {
     true
 }
 
-#[cfg(not(any(
-    target_os = "windows",
-    all(feature = "blas-openblas", jx_openblas_available)
-)))]
+#[cfg(not(all(feature = "blas-openblas", jx_openblas_available)))]
 #[inline]
 fn rust_openblas_set_threads_impl(_threads: usize) -> bool {
     false
 }
 
-#[cfg(any(
-    target_os = "windows",
-    all(feature = "blas-openblas", jx_openblas_available)
-))]
+#[cfg(all(feature = "blas-openblas", jx_openblas_available))]
 #[inline]
 fn rust_openblas_get_threads_impl() -> Option<usize> {
     unsafe {
@@ -2842,10 +2857,7 @@ fn rust_openblas_get_threads_impl() -> Option<usize> {
     None
 }
 
-#[cfg(not(any(
-    target_os = "windows",
-    all(feature = "blas-openblas", jx_openblas_available)
-)))]
+#[cfg(not(all(feature = "blas-openblas", jx_openblas_available)))]
 #[inline]
 fn rust_openblas_get_threads_impl() -> Option<usize> {
     None

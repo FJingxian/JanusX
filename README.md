@@ -49,11 +49,10 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ## Installation
 
-### Option A: Python package install (API-first / development)
+### Option A: Python package install (Recommend)
 
 ```bash
-pip install janusx
-# command entry: jxpy (version>=1.0.14) or jx (version<1.0.14)
+pip install janusx==1.0.24
 ```
 
 ### Option B: launcher install

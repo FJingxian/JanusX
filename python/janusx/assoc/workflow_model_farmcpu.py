@@ -51,6 +51,111 @@ from .workflow import (
 )
 
 
+def _normalize_packed_ctx_for_farmcpu_cache(
+    packed_obj: dict[str, object],
+) -> dict[str, object]:
+    packed_num = np.ascontiguousarray(
+        np.asarray(packed_obj["packed"], dtype=np.uint8)
+    )
+    packed_rows = int(packed_num.shape[0])
+    packed_n = int(packed_obj["n_samples"])
+
+    def _raw_vec(key: str, dtype) -> np.ndarray:
+        return np.ascontiguousarray(
+            np.asarray(packed_obj[key], dtype=dtype).reshape(-1),
+            dtype=dtype,
+        )
+
+    miss_raw = _raw_vec("missing_rate", np.float32)
+    maf_raw = _raw_vec("maf", np.float32)
+
+    row_flip_obj = packed_obj.get("row_flip")
+    if row_flip_obj is None:
+        if hasattr(jxrs, "bed_packed_row_flip_mask"):
+            row_flip_obj = jxrs.bed_packed_row_flip_mask(packed_num, packed_n)
+        else:
+            row_flip_obj = np.zeros(packed_rows, dtype=np.bool_)
+    row_flip_raw = np.ascontiguousarray(
+        np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+
+    row_idx_obj = packed_obj.get("row_indices")
+    if row_idx_obj is None:
+        row_idx_obj = packed_obj.get("active_row_idx")
+    if row_idx_obj is None:
+        site_keep_obj = packed_obj.get("site_keep")
+        if site_keep_obj is not None:
+            site_keep_arr = np.asarray(site_keep_obj, dtype=np.bool_).reshape(-1)
+            if int(site_keep_arr.shape[0]) == packed_rows:
+                row_idx_obj = np.flatnonzero(site_keep_arr).astype(np.int64, copy=False)
+    if row_idx_obj is None:
+        default_rows = int(min(packed_rows, maf_raw.shape[0], miss_raw.shape[0], row_flip_raw.shape[0]))
+        row_idx_obj = np.arange(default_rows, dtype=np.int64)
+
+    row_idx = np.ascontiguousarray(
+        np.asarray(row_idx_obj, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(row_idx.shape[0]) == 0:
+        raise ValueError("FarmCPU packed cache row index set is empty.")
+    if int(row_idx.min()) < 0 or int(row_idx.max()) >= packed_rows:
+        raise ValueError(
+            "FarmCPU packed cache row_indices exceed packed marker bounds."
+        )
+
+    active_rows = int(row_idx.shape[0])
+
+    def _active_view(arr: np.ndarray, name: str) -> np.ndarray:
+        if int(arr.shape[0]) == active_rows:
+            return arr
+        if int(arr.shape[0]) == packed_rows:
+            return np.ascontiguousarray(arr[row_idx], dtype=arr.dtype)
+        raise ValueError(
+            f"FarmCPU packed cache {name} length mismatch: "
+            f"len={int(arr.shape[0])}, packed_rows={packed_rows}, active_rows={active_rows}."
+        )
+
+    miss_arr = _active_view(miss_raw, "missing_rate")
+    maf_arr = _active_view(maf_raw, "maf")
+    row_flip_arr = _active_view(row_flip_raw, "row_flip")
+
+    site_keep_obj = packed_obj.get("site_keep")
+    site_keep_norm: Union[np.ndarray, None]
+    if site_keep_obj is not None:
+        site_keep_arr = np.ascontiguousarray(
+            np.asarray(site_keep_obj, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if int(site_keep_arr.shape[0]) == packed_rows:
+            site_keep_norm = site_keep_arr
+        else:
+            site_keep_norm = None
+    elif active_rows == packed_rows:
+        site_keep_norm = np.ones((packed_rows,), dtype=np.bool_)
+    else:
+        site_keep_norm = np.zeros((packed_rows,), dtype=np.bool_)
+        site_keep_norm[row_idx] = True
+
+    return {
+        "packed": packed_num,
+        "missing_rate": miss_arr,
+        "maf": maf_arr,
+        "row_flip": row_flip_arr,
+        "row_indices": row_idx,
+        "active_row_idx": row_idx,
+        "site_keep": site_keep_norm,
+        "packed_filter_mode": str(
+            packed_obj.get(
+                "packed_filter_mode",
+                "lazy_full" if active_rows != packed_rows else "compact",
+            )
+        ),
+        "n_samples": packed_n,
+        "source_prefix": packed_obj.get("source_prefix"),
+    }
+
+
 def prepare_qk_and_filter(
     geno: np.ndarray,
     ref_alt: pd.DataFrame,
@@ -958,45 +1063,7 @@ def run_farmcpu_fullmem(
         packed_obj = farmcpu_cache.get("packed_ctx")
         packed_ctx = None
         if isinstance(packed_obj, dict):
-            packed_num = np.ascontiguousarray(
-                np.asarray(packed_obj["packed"], dtype=np.uint8)
-            )
-            packed_n = int(packed_obj["n_samples"])
-            row_flip_obj = packed_obj.get("row_flip")
-            if row_flip_obj is None:
-                if hasattr(jxrs, "bed_packed_row_flip_mask"):
-                    row_flip_obj = jxrs.bed_packed_row_flip_mask(packed_num, packed_n)
-                else:
-                    row_flip_obj = np.zeros(int(packed_num.shape[0]), dtype=np.bool_)
-            row_flip_arr = np.ascontiguousarray(
-                np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            if int(row_flip_arr.shape[0]) != int(packed_num.shape[0]):
-                raise ValueError(
-                    "FarmCPU cache row_flip length mismatch with packed markers."
-                )
-            packed_ctx = {
-                "packed": packed_num,
-                "missing_rate": np.ascontiguousarray(
-                    np.asarray(packed_obj["missing_rate"], dtype=np.float32)
-                ),
-                "maf": np.ascontiguousarray(
-                    np.asarray(packed_obj["maf"], dtype=np.float32)
-                ),
-                "row_flip": row_flip_arr,
-                "row_indices": np.ascontiguousarray(
-                    np.asarray(
-                        packed_obj.get(
-                            "row_indices",
-                            np.arange(int(np.asarray(packed_obj["maf"]).reshape(-1).shape[0]), dtype=np.int64),
-                        ),
-                        dtype=np.int64,
-                    ).reshape(-1),
-                    dtype=np.int64,
-                ),
-                "n_samples": packed_n,
-            }
+            packed_ctx = _normalize_packed_ctx_for_farmcpu_cache(packed_obj)
         packed_sample_idx_obj = farmcpu_cache.get("packed_sample_idx")
         packed_sample_idx: Union[np.ndarray, None]
         if packed_sample_idx_obj is None:
@@ -1137,11 +1204,43 @@ def run_farmcpu_fullmem(
                     ).reshape(-1),
                     dtype=np.int64,
                 )
+                packed_rows = int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
+                meta_rows = int(len(chrom_col))
                 sample_idx_use = (
                     None
                     if sample_idx_arg is None
                     else np.ascontiguousarray(np.asarray(sample_idx_arg, dtype=np.int64).reshape(-1))
                 )
+
+                def _compact_packed_for_metadata_alignment() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                    row_idx_local = np.ascontiguousarray(
+                        np.asarray(row_idx_arr, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    if int(row_idx_local.shape[0]) != int(meta_rows):
+                        raise ValueError(
+                            "FarmCPU packed compact fallback cannot align metadata: "
+                            f"row_indices={int(row_idx_local.shape[0])}, metadata={int(meta_rows)}"
+                        )
+                    packed_compact = np.ascontiguousarray(
+                        np.asarray(packed_arr, dtype=np.uint8)[row_idx_local],
+                        dtype=np.uint8,
+                    )
+                    row_flip_compact = np.ascontiguousarray(
+                        np.asarray(row_flip_arr, dtype=np.bool_).reshape(-1),
+                        dtype=np.bool_,
+                    )
+                    maf_compact = np.ascontiguousarray(
+                        np.asarray(maf_arr, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    )
+                    if int(row_flip_compact.shape[0]) != int(meta_rows) or int(maf_compact.shape[0]) != int(meta_rows):
+                        raise ValueError(
+                            "FarmCPU packed compact fallback metadata mismatch: "
+                            f"row_flip={int(row_flip_compact.shape[0])}, maf={int(maf_compact.shape[0])}, metadata={int(meta_rows)}"
+                        )
+                    return packed_compact, row_flip_compact, maf_compact
+
                 if hasattr(jxrs, "gwas_packed_unified_to_tsv"):
                     jobs = [
                         {
@@ -1160,22 +1259,49 @@ def run_farmcpu_fullmem(
                             "scan_progress_callback": _farmcpu_progress,
                         }
                     ]
-                    _res = jxrs.gwas_packed_unified_to_tsv(
-                        jobs,
-                        packed_arr,
-                        int(packed_payload["n_samples"]),
-                        row_flip_arr,
-                        maf_arr,
-                        chrom_col,
-                        pos_col,
-                        allele0_col,
-                        allele1_col,
-                        int(max(1, int(getattr(args, "chunksize", 10000)))),
-                        int(args.thread),
-                        None,
-                        int(max(1, int(getattr(args, "chunksize", 10000)))),
-                        row_indices=row_idx_arr,
-                    )
+                    try:
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
+                            packed_arr,
+                            int(packed_payload["n_samples"]),
+                            row_flip_arr,
+                            maf_arr,
+                            chrom_col,
+                            pos_col,
+                            allele0_col,
+                            allele1_col,
+                            int(max(1, int(getattr(args, "chunksize", 10000)))),
+                            int(args.thread),
+                            None,
+                            int(max(1, int(getattr(args, "chunksize", 10000)))),
+                            row_indices=row_idx_arr,
+                        )
+                    except Exception as ex:
+                        msg = str(ex)
+                        can_retry_compact = (
+                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg)
+                            and int(packed_rows) != int(meta_rows)
+                            and int(row_idx_arr.shape[0]) == int(meta_rows)
+                        )
+                        if not can_retry_compact:
+                            raise
+                        packed_compact, row_flip_compact, maf_compact = _compact_packed_for_metadata_alignment()
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
+                            packed_compact,
+                            int(packed_payload["n_samples"]),
+                            row_flip_compact,
+                            maf_compact,
+                            chrom_col,
+                            pos_col,
+                            allele0_col,
+                            allele1_col,
+                            int(max(1, int(getattr(args, "chunksize", 10000)))),
+                            int(args.thread),
+                            None,
+                            int(max(1, int(getattr(args, "chunksize", 10000)))),
+                            row_indices=None,
+                        )
                     r0 = _res[0]
                     n_pseudo_qtn = int(r0.get("pseudo_rows", 0))
                     rust_qtn_written = int(r0.get("written_rows", 0))

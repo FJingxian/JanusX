@@ -28,14 +28,15 @@ const GITHUB_ARCHIVE_ORIGIN: &str =
 const UPDATE_TIME_MARKER: &str = ".python_core_updated_at";
 const COMMIT_MARKER: &str = ".python_core_commit";
 const LAUNCHER_CARGO_VERSION: &str = env!("CARGO_PKG_VERSION");
-const VERSION_AUTHOR: &str = "Jingxian FU, Yazhouwan National Laboratory";
-const VERSION_CONTACT: &str = "fujingxian@yzwlab.cn";
+const VERSION_AUTHOR: &str = "Jingxian FU, Huazhong Agricultural University";
+const VERSION_CONTACT: &str = "fujingxian@webmail.hzau.edu.cn";
 const RUNTIME_HOME_CONFIG: &str = ".jx_home";
 const INSTALLER_RELAUNCH_ENV: &str = "JX_INSTALLER_RELAUNCHED";
 const SKIP_RUNTIME_REBUILD_ENV: &str = "JX_SKIP_RUNTIME_REBUILD";
 const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
+const RUNTIME_OWNER_MARKER: &str = ".launcher_runtime_owner";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
 const KNOWN_MODULES: [&str; 21] = [
     "grm",
@@ -898,7 +899,7 @@ fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut V
 
     // Also cleanup runtime linked by .jx_home (cross-platform default/override locations).
     if let Some(runtime_home) = linked_runtime {
-        if !is_managed_runtime_home_path(&runtime_home) {
+        if !can_remove_runtime_home(&runtime_home, Some(install_dir)) {
             failed.push(format!(
                 "Refusing to remove linked runtime outside JanusX/.janusx: {}",
                 runtime_home.display()
@@ -4130,10 +4131,10 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
     cleanup_generated_artifacts_in_install_dir(&install_dir, &mut failed);
 
     if let Ok(home) = runtime_home() {
-        cleanup_runtime_home(&home, &mut failed);
+        cleanup_runtime_home(&home, Some(&install_dir), &mut failed);
     }
     if let Ok(def_home) = default_runtime_home() {
-        cleanup_runtime_home(&def_home, &mut failed);
+        cleanup_runtime_home(&def_home, Some(&install_dir), &mut failed);
     }
 
     let mut remove_path = |p: &Path| {
@@ -4194,11 +4195,11 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
+fn cleanup_runtime_home(runtime_home: &Path, install_dir: Option<&Path>, failed: &mut Vec<String>) {
     if !runtime_home.exists() {
         return;
     }
-    if !is_managed_runtime_home_path(runtime_home) {
+    if !can_remove_runtime_home(runtime_home, install_dir) {
         failed.push(format!(
             "Refusing to remove runtime outside JanusX/.janusx: {}",
             runtime_home.display()
@@ -4208,7 +4209,8 @@ fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
     let marker_hits = runtime_home.join("venv").exists()
         || runtime_home.join(UPDATE_TIME_MARKER).exists()
         || runtime_home.join(COMMIT_MARKER).exists()
-        || runtime_home.join(WARMUP_MARKER).exists();
+        || runtime_home.join(WARMUP_MARKER).exists()
+        || runtime_home.join(RUNTIME_OWNER_MARKER).exists();
     if marker_hits {
         if let Err(e) = std::fs::remove_dir_all(runtime_home) {
             failed.push(format!("{} ({e})", runtime_home.display()));
@@ -4217,7 +4219,13 @@ fn cleanup_runtime_home(runtime_home: &Path, failed: &mut Vec<String>) {
     }
 
     // Fallback: only prune known runtime artifacts if directory doesn't look fully managed by JanusX.
-    for name in ["venv", UPDATE_TIME_MARKER, COMMIT_MARKER, WARMUP_MARKER] {
+    for name in [
+        "venv",
+        UPDATE_TIME_MARKER,
+        COMMIT_MARKER,
+        WARMUP_MARKER,
+        RUNTIME_OWNER_MARKER,
+    ] {
         let p = runtime_home.join(name);
         if !p.exists() {
             continue;
@@ -4249,6 +4257,63 @@ fn is_managed_runtime_home_path(runtime_home: &Path) -> bool {
         return false;
     };
     runtime_path_name_eq(parent_name, "JanusX")
+}
+
+fn runtime_owner_marker_path(runtime_home: &Path) -> PathBuf {
+    runtime_home.join(RUNTIME_OWNER_MARKER)
+}
+
+fn write_runtime_owner_marker(runtime_home: &Path) {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let Some(install_dir) = exe.parent() else {
+        return;
+    };
+    let install_dir = canonical_or_self(install_dir);
+    let marker = runtime_owner_marker_path(runtime_home);
+    let body = format!(
+        "install_dir={}\nlauncher_version={}\n",
+        install_dir.display(),
+        LAUNCHER_CARGO_VERSION
+    );
+    let _ = std::fs::write(marker, body);
+}
+
+fn runtime_owner_matches_install_dir(runtime_home: &Path, install_dir: &Path) -> bool {
+    let marker = runtime_owner_marker_path(runtime_home);
+    let Ok(text) = std::fs::read_to_string(marker) else {
+        return false;
+    };
+    let expected = canonical_or_self(install_dir);
+    for line in text.lines() {
+        let raw = if let Some(v) = line.trim().strip_prefix("install_dir=") {
+            v.trim()
+        } else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let marked = canonical_or_self(&expand_tilde(raw));
+        return path_eq(&marked, &expected);
+    }
+    let raw = text.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let marked = canonical_or_self(&expand_tilde(raw));
+    path_eq(&marked, &expected)
+}
+
+fn can_remove_runtime_home(runtime_home: &Path, install_dir: Option<&Path>) -> bool {
+    if is_managed_runtime_home_path(runtime_home) {
+        return true;
+    }
+    let Some(install_dir) = install_dir else {
+        return false;
+    };
+    runtime_owner_matches_install_dir(runtime_home, install_dir)
 }
 
 #[cfg(windows)]
@@ -4630,6 +4695,7 @@ fn ensure_venv() -> Result<PathBuf, String> {
         std::fs::create_dir_all(&home)
             .map_err(|e| format!("Failed to create runtime directory {}: {e}", home.display()))?;
     }
+    write_runtime_owner_marker(&home);
     let venv = home.join("venv");
     let py = venv_python(&venv);
     if py.exists() {

@@ -408,6 +408,69 @@ fn row_major_block_t_mul_vec_accum_f32(
     }
 }
 
+#[inline]
+fn row_major_row_sumsq_f64(row: &[f32]) -> f64 {
+    let mut ss = 0.0_f64;
+    for &v in row {
+        let vf = v as f64;
+        ss += vf * vf;
+    }
+    ss
+}
+
+#[inline]
+fn row_major_block_prepare_rhs_diag_f32(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    dot_blk: &[f32],
+    lambda_use: f32,
+    b_out: &mut [f32],
+    diag_inv_out: &mut [f32],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> f64 {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert!(dot_blk.len() >= rows);
+    debug_assert!(b_out.len() >= rows);
+    debug_assert!(diag_inv_out.len() >= rows);
+
+    if prefer_parallel_block_vec(rows, cols, pool) {
+        let mut run = || {
+            block
+                .par_chunks(cols)
+                .zip(dot_blk[..rows].par_iter())
+                .zip(
+                    b_out[..rows]
+                        .par_iter_mut()
+                        .zip(diag_inv_out[..rows].par_iter_mut()),
+                )
+                .map(|((row, dot), (b_slot, diag_slot))| {
+                    let ss = row_major_row_sumsq_f64(row);
+                    *b_slot = *dot;
+                    let d = ((ss as f32) + lambda_use).max(1e-12_f32);
+                    *diag_slot = 1.0_f32 / d;
+                    ss
+                })
+                .sum::<f64>()
+        };
+        if let Some(tp) = pool {
+            return tp.install(&mut run);
+        }
+        return run();
+    }
+
+    let mut sum_ss = 0.0_f64;
+    for r in 0..rows {
+        let row = &block[r * cols..(r + 1) * cols];
+        let ss = row_major_row_sumsq_f64(row);
+        sum_ss += ss;
+        b_out[r] = dot_blk[r];
+        let d = ((ss as f32) + lambda_use).max(1e-12_f32);
+        diag_inv_out[r] = 1.0_f32 / d;
+    }
+    sum_ss
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PcgMatvecTiming {
     decode_secs: f64,
@@ -1698,6 +1761,10 @@ pub fn rrblup_pcg_bed<'py>(
                 let mut b = vec![0.0_f32; m];
                 let mut diag_inv = vec![0.0_f32; m];
                 let mut sum_ss_global = 0.0_f64;
+                let prep_t0 = Instant::now();
+                let mut prep_decode_secs = 0.0_f64;
+                let mut prep_rhs_secs = 0.0_f64;
+                let mut prep_diag_secs = 0.0_f64;
                 {
                     // This decode workspace can reach multiple GiB for large n_train.
                     // Keep it scoped to the diagonal/preconditioner pass so it is
@@ -1709,6 +1776,7 @@ pub fn rrblup_pcg_bed<'py>(
                         let ed = (st + row_step).min(m);
                         let cur_rows = ed - st;
                         let blk_slice = &mut block[..cur_rows * n_train];
+                        let t_decode = Instant::now();
                         decode_standardized_block_f32(
                             packed_keep.as_ref(),
                             bytes_per_snp,
@@ -1724,6 +1792,8 @@ pub fn rrblup_pcg_bed<'py>(
                             &code4_lut,
                             pool_ref,
                         )?;
+                        prep_decode_secs += t_decode.elapsed().as_secs_f64();
+                        let t_rhs = Instant::now();
                         row_major_block_mul_vec_f32(
                             blk_slice,
                             cur_rows,
@@ -1732,20 +1802,42 @@ pub fn rrblup_pcg_bed<'py>(
                             &mut dot_blk[..cur_rows],
                             pool_ref,
                         );
-                        for r in 0..cur_rows {
-                            let row = &blk_slice[r * n_train..(r + 1) * n_train];
-                            let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
-                            sum_ss_global += ss;
-                            b[st + r] = dot_blk[r];
-                            let d = ((ss as f32) + lambda_use).max(1e-12_f32);
-                            diag_inv[st + r] = 1.0_f32 / d;
-                        }
+                        prep_rhs_secs += t_rhs.elapsed().as_secs_f64();
+                        let t_diag = Instant::now();
+                        sum_ss_global += row_major_block_prepare_rhs_diag_f32(
+                            blk_slice,
+                            cur_rows,
+                            n_train,
+                            &dot_blk[..cur_rows],
+                            lambda_use,
+                            &mut b[st..ed],
+                            &mut diag_inv[st..ed],
+                            pool_ref,
+                        );
+                        prep_diag_secs += t_diag.elapsed().as_secs_f64();
                         tick += cur_rows;
                         if tick >= row_step.saturating_mul(64).max(1) {
                             check_ctrlc()?;
                             tick = 0;
                         }
                     }
+                }
+                if stage_timing {
+                    let prep_total = prep_t0.elapsed().as_secs_f64().max(1e-12_f64);
+                    let prep_decode_s = prep_decode_secs.max(0.0);
+                    let prep_rhs_s = prep_rhs_secs.max(0.0);
+                    let prep_diag_s = prep_diag_secs.max(0.0);
+                    let prep_known = prep_decode_s + prep_rhs_s + prep_diag_s;
+                    let prep_other_s = (prep_total - prep_known).max(0.0_f64);
+                    let pct = |x: f64| -> f64 { (x * 100.0) / prep_total };
+                    eprintln!(
+                        "rrBLUP-PCG pre-pass timing decode={:.3}s ({:.1}%) rhs={:.3}s ({:.1}%) diag={:.3}s ({:.1}%) other={:.3}s ({:.1}%) total={:.3}s",
+                        prep_decode_s, pct(prep_decode_s),
+                        prep_rhs_s, pct(prep_rhs_s),
+                        prep_diag_s, pct(prep_diag_s),
+                        prep_other_s, pct(prep_other_s),
+                        prep_total
+                    );
                 }
 
                 let mut last_notified = 0usize;
@@ -2513,6 +2605,59 @@ mod tests {
             best = best.min(t0.elapsed().as_secs_f64());
         }
         best
+    }
+
+    #[test]
+    fn pcg_prepare_rhs_diag_parallel_matches_serial() {
+        let rows = 257usize;
+        let cols = 1536usize;
+        let lambda_use = 0.37_f32;
+        let (block, weights) = make_xtmul_inputs(rows, cols);
+        let dot_blk: Vec<f32> = (0..rows)
+            .map(|r| {
+                let row = &block[r * cols..(r + 1) * cols];
+                row.iter()
+                    .zip(weights.iter().cycle())
+                    .map(|(a, w)| *a * *w)
+                    .sum::<f32>()
+            })
+            .collect();
+
+        let mut b_serial = vec![0.0_f32; rows];
+        let mut diag_serial = vec![0.0_f32; rows];
+        let ss_serial = row_major_block_prepare_rhs_diag_f32(
+            &block,
+            rows,
+            cols,
+            &dot_blk,
+            lambda_use,
+            &mut b_serial,
+            &mut diag_serial,
+            None,
+        );
+
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("build rayon pool"),
+        );
+        let mut b_parallel = vec![0.0_f32; rows];
+        let mut diag_parallel = vec![0.0_f32; rows];
+        let ss_parallel = row_major_block_prepare_rhs_diag_f32(
+            &block,
+            rows,
+            cols,
+            &dot_blk,
+            lambda_use,
+            &mut b_parallel,
+            &mut diag_parallel,
+            Some(&pool),
+        );
+
+        assert!((ss_serial - ss_parallel).abs() <= 1e-6_f64 * ss_serial.abs().max(1.0));
+        assert!(max_abs_diff(&b_serial, &b_parallel) <= 1e-6_f32);
+        assert!(max_abs_diff(&diag_serial, &diag_parallel) <= 1e-6_f32);
     }
 
     #[test]

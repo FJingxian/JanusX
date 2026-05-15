@@ -1,4 +1,5 @@
 use nalgebra::{DMatrix, SymmetricEigen};
+use memmap2::Mmap;
 use numpy::ndarray::ArrayView2;
 use numpy::{
     PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
@@ -12,8 +13,9 @@ use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::convert::TryFrom;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::gfcore::{
@@ -33,7 +35,6 @@ fn clip32(v: f32) -> f32 {
     v.clamp(EPS32, 1.0 - EPS32)
 }
 
-#[derive(Clone)]
 struct StreamRsvdConfig {
     genotype_path: String,
     snps_only: bool,
@@ -128,10 +129,13 @@ fn detect_bed_prefix(path_or_prefix: &str) -> Option<String> {
 }
 
 struct PackedBedRsvd {
-    packed: Vec<u8>,
+    mmap: Mmap,
+    payload_offset: usize,
     bytes_per_snp: usize,
     n_samples: usize,
     n_snps: usize,
+    n_total_sites: usize,
+    active_row_idx: Vec<usize>,
     row_freq: Vec<f32>,
     row_flip: Vec<bool>,
 }
@@ -139,9 +143,111 @@ struct PackedBedRsvd {
 impl PackedBedRsvd {
     #[inline]
     fn row_bytes(&self, snp_idx: usize) -> &[u8] {
-        let start = snp_idx * self.bytes_per_snp;
-        &self.packed[start..start + self.bytes_per_snp]
+        let src_row = self.active_row_idx[snp_idx];
+        let start = self.payload_offset + src_row * self.bytes_per_snp;
+        &self.mmap[start..start + self.bytes_per_snp]
     }
+}
+
+#[inline]
+fn env_truthy_local(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s.is_empty() || s == "0" || s == "false" || s == "off" || s == "no")
+        }
+        Err(_) => false,
+    }
+}
+
+#[inline]
+fn rsvd_rss_debug_enabled() -> bool {
+    env_truthy_local("JX_RSVD_RSS_DEBUG") || env_truthy_local("JX_PCA_RSS_DEBUG")
+}
+
+#[inline]
+fn format_debug_bytes_local(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut fields = text.split_whitespace();
+    let _size_pages = fields.next()?;
+    let rss_pages: u64 = fields.next()?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some((rss_pages.saturating_mul(page_size as u64), "current"))
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ru = unsafe { ru.assume_init() };
+    Some((ru.ru_maxrss as u64, "peak"))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ru = unsafe { ru.assume_init() };
+    Some(((ru.ru_maxrss as u64).saturating_mul(1024), "peak"))
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    None
+}
+
+fn emit_rsvd_rss_debug(stage: &str, detail: &str) {
+    if !rsvd_rss_debug_enabled() {
+        return;
+    }
+    match process_rss_bytes_local() {
+        Some((rss_bytes, rss_kind)) => {
+            println!(
+                "[RSVD-DEBUG] {stage} rss={} rss_kind={} {detail}",
+                format_debug_bytes_local(rss_bytes),
+                rss_kind,
+            );
+        }
+        None => {
+            println!("[RSVD-DEBUG] {stage} rss=NA rss_kind=unavailable {detail}");
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
+#[inline]
+fn format_f32_vec_bytes(len: usize) -> String {
+    format_debug_bytes_local((len.saturating_mul(std::mem::size_of::<f32>())) as u64)
 }
 
 #[inline]
@@ -208,10 +314,32 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
     let expected_payload = n_snps_total
         .checked_mul(bytes_per_snp)
         .ok_or_else(|| "BED payload size overflow".to_string())?;
-    let mut payload = vec![0u8; expected_payload];
-    file.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    let file_size = usize::try_from(
+        file.metadata().map_err(|e| e.to_string())?.len()
+    )
+    .map_err(|_| "BED file size overflow".to_string())?;
+    let expected_size = 3usize
+        .checked_add(expected_payload)
+        .ok_or_else(|| "BED file size overflow".to_string())?;
+    if file_size != expected_size {
+        return Err(format!(
+            "BED payload size mismatch: file={file_size}, expected={expected_size}"
+        ));
+    }
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    emit_rsvd_rss_debug(
+        "packed_backend/mmap_ready",
+        &format!(
+            "prefix={} n_samples={} n_total_sites={} bytes_per_snp={} mapped_payload={}",
+            prefix,
+            n_samples,
+            n_snps_total,
+            bytes_per_snp,
+            format_debug_bytes_local(expected_payload as u64),
+        ),
+    );
 
-    let mut packed_kept: Vec<u8> = Vec::with_capacity(expected_payload);
+    let mut active_row_idx: Vec<usize> = Vec::with_capacity(n_snps_total);
     let mut row_freq: Vec<f32> = Vec::with_capacity(n_snps_total);
     let mut row_flip: Vec<bool> = Vec::with_capacity(n_snps_total);
     let n_samples_f64 = n_samples as f64;
@@ -221,7 +349,8 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         if cfg.snps_only && !is_simple_snp_alleles(&site.ref_allele, &site.alt_allele) {
             continue;
         }
-        let row = &payload[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+        let row_start = 3 + snp_idx * bytes_per_snp;
+        let row = &mmap[row_start..row_start + bytes_per_snp];
 
         let mut non_missing: usize = 0;
         let mut alt_sum: f64 = 0.0;
@@ -251,7 +380,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
             if cfg.maf > 0.0 {
                 continue;
             }
-            packed_kept.extend_from_slice(row);
+            active_row_idx.push(snp_idx);
             row_freq.push(0.0);
             row_flip.push(false);
             continue;
@@ -263,17 +392,31 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
         if p_minor < cfg.maf as f64 {
             continue;
         }
-        packed_kept.extend_from_slice(row);
+        active_row_idx.push(snp_idx);
         row_freq.push(p_minor as f32);
         row_flip.push(flip);
     }
 
     let n_snps = row_freq.len();
+    emit_rsvd_rss_debug(
+        "packed_backend/filter_done",
+        &format!(
+            "prefix={} active_rows={} dropped={} row_freq={} row_flip={}",
+            prefix,
+            n_snps,
+            n_snps_total.saturating_sub(n_snps),
+            format_debug_bytes_local((row_freq.len() * std::mem::size_of::<f32>()) as u64),
+            format_debug_bytes_local((row_flip.len() * std::mem::size_of::<bool>()) as u64),
+        ),
+    );
     Ok(Some(PackedBedRsvd {
-        packed: packed_kept,
+        mmap,
+        payload_offset: 3,
         bytes_per_snp,
         n_samples,
         n_snps,
+        n_total_sites: n_snps_total,
+        active_row_idx,
         row_freq,
         row_flip,
     }))
@@ -692,15 +835,50 @@ pub fn admx_rsvd_stream<'py>(
 
     let k_eff = k.min(m);
     let kp = (k_eff + 10).max(20).min(m.max(1));
+    let backend_extra = if let Some(backend) = packed_backend.as_ref() {
+        format!(
+            " total_sites={} active_row_idx={}",
+            backend.n_total_sites,
+            format_debug_bytes_local(
+                (backend.active_row_idx.len() * std::mem::size_of::<usize>()) as u64
+            ),
+        )
+    } else {
+        String::new()
+    };
+    emit_rsvd_rss_debug(
+        "stream/backend_ready",
+        &format!(
+            "mode={} n_samples={} n_snps={} kp={} row_freq={}{}",
+            if packed_backend.is_some() { "packed_mmap" } else { "stream" },
+            n,
+            m,
+            kp,
+            format_f32_vec_bytes(row_freq.len()),
+            backend_extra,
+        ),
+    );
 
     let omega = random_omega(m, kp, seed);
+    emit_rsvd_rss_debug(
+        "stream/omega_ready",
+        &format!("omega_shape=({}, {}) omega={}", m, kp, format_f32_vec_bytes(omega.len())),
+    );
     let mut y = if let Some(backend) = packed_backend.as_ref() {
         compute_at_omega_packed(backend, &omega, kp, tile_cols)
     } else {
         compute_at_omega_stream(&cfg, &omega, &row_freq, m, n, kp)
     }
     .map_err(PyRuntimeError::new_err)?;
+    emit_rsvd_rss_debug(
+        "stream/y_ready",
+        &format!("y_shape=({}, {}) y={}", n, kp, format_f32_vec_bytes(y.len())),
+    );
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+    emit_rsvd_rss_debug(
+        "stream/q_ready",
+        &format!("q_shape=({}, {}) q={}", n, kp, format_f32_vec_bytes(q.len())),
+    );
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
@@ -781,6 +959,16 @@ pub fn admx_rsvd_stream<'py>(
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("eigvecs output not contiguous"))?
     };
+    emit_rsvd_rss_debug(
+        "stream/final_ready",
+        &format!(
+            "eigvals={} eigvecs_shape=({}, {}) eigvecs={}",
+            format_f32_vec_bytes(eigvals.len()),
+            m,
+            k_eff,
+            format_f32_vec_bytes(eigvecs.len()),
+        ),
+    );
     eval_slice.copy_from_slice(&eigvals);
     evec_slice.copy_from_slice(&eigvecs);
     Ok((eval_arr, evec_arr))
@@ -887,15 +1075,51 @@ pub fn admx_rsvd_stream_sample<'py>(
 
     let k_eff = k.min(n);
     let kp = (k_eff + 10).max(20).min(m.max(1));
+    let backend_extra = if let Some(backend) = packed_backend.as_ref() {
+        format!(
+            " total_sites={} active_row_idx={}",
+            backend.n_total_sites,
+            format_debug_bytes_local(
+                (backend.active_row_idx.len() * std::mem::size_of::<usize>()) as u64
+            ),
+        )
+    } else {
+        String::new()
+    };
+    emit_rsvd_rss_debug(
+        "stream_sample/backend_ready",
+        &format!(
+            "mode={} n_samples={} n_snps={} kp={} row_freq={} varsum={:.6e}{}",
+            if packed_backend.is_some() { "packed_mmap" } else { "stream" },
+            n,
+            m,
+            kp,
+            format_f32_vec_bytes(row_freq.len()),
+            varsum,
+            backend_extra,
+        ),
+    );
 
     let omega = random_omega(m, kp, seed);
+    emit_rsvd_rss_debug(
+        "stream_sample/omega_ready",
+        &format!("omega_shape=({}, {}) omega={}", m, kp, format_f32_vec_bytes(omega.len())),
+    );
     let mut y = if let Some(backend) = packed_backend.as_ref() {
         compute_at_omega_packed(backend, &omega, kp, tile_cols)
     } else {
         compute_at_omega_stream(&cfg, &omega, &row_freq, m, n, kp)
     }
     .map_err(PyRuntimeError::new_err)?;
+    emit_rsvd_rss_debug(
+        "stream_sample/y_ready",
+        &format!("y_shape=({}, {}) y={}", n, kp, format_f32_vec_bytes(y.len())),
+    );
     let (mut q, _, _) = thin_svd_from_tall(&y, n, kp).map_err(PyRuntimeError::new_err)?;
+    emit_rsvd_rss_debug(
+        "stream_sample/q_ready",
+        &format!("q_shape=({}, {}) q={}", n, kp, format_f32_vec_bytes(q.len())),
+    );
 
     let mut sk = vec![0.0_f32; kp];
     let mut alpha = 0.0_f32;
@@ -950,6 +1174,15 @@ pub fn admx_rsvd_stream_sample<'py>(
         compute_a_omega_stream(&cfg, &q, &row_freq, m, n, kp)
     }
     .map_err(PyRuntimeError::new_err)?;
+    emit_rsvd_rss_debug(
+        "stream_sample/g_small_ready",
+        &format!(
+            "g_small_shape=({}, {}) g_small={}",
+            m,
+            kp,
+            format_f32_vec_bytes(g_small.len()),
+        ),
+    );
     let (_, s_all, v_small) =
         thin_svd_from_tall(&g_small, m, kp).map_err(PyRuntimeError::new_err)?;
 
@@ -988,6 +1221,16 @@ pub fn admx_rsvd_stream_sample<'py>(
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("sample eigvecs output not contiguous"))?
     };
+    emit_rsvd_rss_debug(
+        "stream_sample/final_ready",
+        &format!(
+            "eigvals={} eigvecs_shape=({}, {}) eigvecs={}",
+            format_f32_vec_bytes(eigvals.len()),
+            n,
+            k_eff,
+            format_f32_vec_bytes(eigvecs_sample.len()),
+        ),
+    );
     eval_slice.copy_from_slice(&eigvals);
     evec_slice.copy_from_slice(&eigvecs_sample);
     Ok((eval_arr, evec_arr))

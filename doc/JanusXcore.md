@@ -1,58 +1,31 @@
 # JanusX Core API Guide
 
-Version baseline: `v1.0.21`
+Version baseline: `v1.0.24`
 
-This guide focuses on Python usage (`janusx`) and how it maps to Rust kernels (`janusx.janusx`).
-CLI commands are documented separately in `doc/JanusXcli.md`.
-Repository structure and entrypoint differences are summarized in `doc/PROJECT_MAP.md`.
+This document focuses on Python usage through the `janusx` package. It complements `doc/JanusXcli.md`: the CLI guide explains command-line workflows, while this file explains recommended imports, wrappers, and lower-level kernels.
 
-## 1. Start Here
+## 1. Public package map
 
-If you are new to JanusX, read in this order:
+Use these modules as the main public surface:
 
-1. `Section 2` to understand the core data flow.
-2. `Section 3` to run the minimum working example.
-3. `Section 4` to copy an end-to-end workflow for your task.
-4. `Section 5-8` as reference when you need details.
+| Package | Use it for | Notes |
+| --- | --- | --- |
+| `janusx.gfreader` | genotype IO, chunk streaming, format conversion, packed BED preparation | best first stop for file-backed data |
+| `janusx.assoc` | GWAS-style wrappers and file-mode orchestration | mirrors `jx gwas` |
+| `janusx.gs` | GS-style wrappers and result objects | mirrors `jx gs` |
+| `janusx.pyBLUP` | direct in-memory association, GRM, BLUP, and ML kernels | lower-level than `assoc` / `gs` |
+| `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesCpi`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
+| `janusx.adamixture` | RSVD, ancestry decomposition, CVerror | mirrors `jx adamixture` |
+| `janusx.garfield.logreg` | logical conjunction search on binary features | lightweight Python-facing GARFIELD entry |
+| `janusx.gtools` | GFF/BED readers and region queries | annotation-centric helpers |
+| `janusx.bioplotkit` | GWAS, PCA, GS, and structure plots | some helpers live in submodules rather than the top-level export list |
+| `janusx.pipeline` | `fastq2vcf` / `fastq2count` compatibility checks | preflight only |
+| `janusx.ui` | parser/server entrypoints for the web UI | integration-oriented |
+| `janusx.janusx` | native Rust extension | useful for backend diagnostics and advanced users |
 
-If you already know the project:
+Avoid importing `janusx.assoc.workflow` and `janusx.gs.workflow` directly for ordinary use. The wrapper packages above are the safer API layer.
 
-1. Use `Section 4` (workflow recipes).
-2. Use `Section 8` (quick reference table).
-3. Use `Section 6` when you need Rust-to-Python tracing.
-
-## 2. Core Mental Model
-
-JanusX usually follows this execution path:
-
-1. Read genotype metadata and stream SNP chunks from `janusx.gfreader`.
-2. Build matrices or statistics (`GRM`, fixed-effect scans, LMM/FaST-LMM) in `janusx.pyBLUP`.
-3. Run task-specific inference (`adamixture`, `garfield`, tree/BSA workflows).
-4. Render or summarize outputs (`bioplotkit`, `gtools`, `ui`).
-
-### 2.1 Data shape conventions
-
-- Genotype blocks are SNP-major: `M.shape == (m_snps, n_samples)`.
-- Phenotype is sample-major: `y.shape == (n_samples,)` or `(n_samples, 1)`.
-- Covariates are sample-major: `X.shape == (n_samples, p)`.
-- Always align phenotype/covariates to sample order from `inspect_genotype_file()`.
-
-### 2.2 Main Python packages
-
-- `janusx.gfreader`: genotype IO, chunk streaming, format conversion, packed BED access.
-- `janusx.assoc`: GWAS entry wrappers (`run_gwas_*`) and config/result models.
-- `janusx.gs`: GS entry wrappers (`run_gs_*`) and config/result models.
-- `janusx.pyBLUP`: GRM, LM/LMM/FaST-LMM, FarmCPU, BLUP, MLGS, Bayes prediction.
-- `janusx.adamixture`: RSVD + ADAMixture ancestry inference.
-- `janusx.gtools`: GFF/BED readers and range query helpers.
-- `janusx.bioplotkit`: Manhattan/QQ/LD/PCA/haplotype/admixture visualization.
-- `janusx.garfield`: logic-gate style AND/NOT search.
-- `janusx.pipeline`: runtime compatibility checks for external pipelines.
-- `janusx.ui`: parser/server entry points.
-
-## 3. Minimum Working Example
-
-### 3.1 Install and backend check
+## 2. Installation and backend probe
 
 ```bash
 pip install janusx
@@ -60,27 +33,36 @@ pip install janusx
 pip install -e .
 ```
 
+Backend sanity check:
+
 ```python
 import janusx
 import janusx.janusx as jxrs
 
-print("janusx imported")
-print("rust extension loaded:", jxrs is not None)
+print("SGEMM backend:", jxrs.rust_sgemm_backend())
+print("EIGH backend:", jxrs.rust_eigh_lapack_backend())
+print("BLAS threads:", jxrs.rust_blas_get_num_threads())
 ```
 
-If `import janusx.janusx` fails, build/install the Rust extension first.
+On macOS, this is the quickest way to confirm whether you are using bundled OpenBLAS or an Accelerate fallback path.
 
-### 3.2 Inspect + stream one chunk
+## 3. Genotype IO patterns
+
+### 3.1 Inspect a file and stream chunks
 
 ```python
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 
-geno_path = "example/mouse_hs1940.vcf.gz"
-sample_ids, n_sites = inspect_genotype_file(geno_path)
-print("samples:", len(sample_ids), "sites:", n_sites)
+sample_ids, n_sites = inspect_genotype_file(
+    "example/mouse_hs1940.vcf.gz",
+    snps_only=True,
+    maf=0.02,
+    missing_rate=0.05,
+)
+print(len(sample_ids), n_sites)
 
 for geno_chunk, sites in load_genotype_chunks(
-    geno_path,
+    "example/mouse_hs1940.vcf.gz",
     chunk_size=50_000,
     maf=0.02,
     missing_rate=0.05,
@@ -88,433 +70,306 @@ for geno_chunk, sites in load_genotype_chunks(
     model="add",
     snps_only=True,
 ):
-    print("chunk shape:", geno_chunk.shape)
-    print("first site:", sites[0].chrom, sites[0].pos)
+    print(geno_chunk.shape)  # (m_chunk, n_samples), SNP-major
+    print(sites[0].chrom, sites[0].pos)
     break
 ```
 
-## 4. Workflow Recipes (With Examples)
+`load_genotype_chunks()` is the main Python entry for streaming file-backed genotype data. It returns SNP-major blocks and site metadata together.
 
-### 4.1 End-to-end GWAS (stream -> GRM -> LMM -> Manhattan/QQ)
-
-```python
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
-from janusx.pyBLUP import build_streaming_grm_from_chunks, LMM
-from janusx.bioplotkit import GWASPLOT
-
-geno_path = "example/mouse_hs1940.vcf.gz"
-sample_ids, _ = inspect_genotype_file(geno_path)
-n = len(sample_ids)
-
-# 1) Build GRM from streamed chunks
-chunks_for_grm = load_genotype_chunks(
-    geno_path, chunk_size=80_000, maf=0.02, missing_rate=0.05
-)
-K, grm_stats = build_streaming_grm_from_chunks(
-    chunks_for_grm,
-    n_samples=n,
-    method=1,
-)
-print("GRM:", K.shape, "effective SNPs:", grm_stats.eff_m)
-
-# 2) Prepare phenotype/covariates in sample order
-rng = np.random.default_rng(42)
-y = rng.normal(size=(n, 1)).astype(np.float64)
-X = None
-
-# 3) Run LMM scan chunk by chunk
-lmm = LMM(y=y, X=X, kinship=K.astype(np.float64))
-rows = []
-for geno_chunk, sites in load_genotype_chunks(geno_path, chunk_size=20_000):
-    beta_se_p = lmm.gwas(geno_chunk, threads=8)  # shape (m_chunk, 4)
-    for i, s in enumerate(sites):
-        rows.append(
-            {
-                "CHR": s.chrom,
-                "BP": int(s.pos),
-                "P": float(beta_se_p[i, 2]),  # pwald
-            }
-        )
-
-res_df = pd.DataFrame(rows)
-
-# 4) Plot Manhattan + QQ
-plotter = GWASPLOT(df=res_df, chr="CHR", pos="BP", pvalue="P", compression=True)
-fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-plotter.manhattan(ax=axes[0], threshold=5e-8)
-plotter.qq(ax=axes[1], ci=95)
-plt.tight_layout()
-plt.show()
-```
-
-### 4.2 Streaming write and format conversion
+### 3.2 Save or convert streamed data
 
 ```python
-from janusx.gfreader import (
-    inspect_genotype_file,
-    load_genotype_chunks,
-    save_genotype_streaming,
-)
+from janusx.gfreader import inspect_genotype_file, load_genotype_chunks, save_genotype_streaming
 
 src = "example/mouse_hs1940.vcf.gz"
 sample_ids, n_sites = inspect_genotype_file(src)
 chunks = load_genotype_chunks(src, chunk_size=50_000)
 
-# auto infers output format from path suffix/prefix
 save_genotype_streaming(
-    out="out/panel",  # PLINK prefix
+    out="demo/mouse_hs1940",
     sample_ids=sample_ids,
     chunks=chunks,
-    fmt="auto",
+    fmt="plink",
     total_snps=n_sites,
 )
 ```
 
-### 4.3 Merge multiple genotype datasets
+This is the package-level equivalent of using `jx gformat` for simple conversion tasks.
+
+### 3.3 Prepare packed BED once for repeated large jobs
 
 ```python
-from janusx.gfreader.gmerge import merge
+from janusx.gfreader import prepare_bed_2bit_packed
 
-stats, stats_dict = merge(
-    inputs=["data/cohort_a", "data/cohort_b.vcf.gz"],  # PLINK prefix + VCF
-    out="out/merged",
-    out_fmt="plink",
-    maf=0.01,
-    geno=0.10,
+packed, missing_rate, maf, std_denom, row_flip, site_keep, n_samples, n_total_sites = prepare_bed_2bit_packed(
+    "example/~mouse_hs1940",
+    maf_threshold=0.02,
+    max_missing_rate=0.05,
+    het_threshold=0.02,
+    snps_only=True,
 )
-print(stats_dict["n_sites_written"], stats_dict["n_samples_total"])
+
+print(packed.shape, n_samples, n_total_sites)
+print(site_keep.sum(), "sites retained")
 ```
 
-### 4.4 Ancestry inference with ADAMixture
+Use this path when you want to reuse filtered packed BED payloads across multiple analyses. `site_keep` maps filtered rows back to original site order.
+
+If you only need raw packed bytes plus per-SNP statistics, `load_bed_2bit_packed()` is the simpler entry.
+
+## 4. Workflow-style wrappers
+
+### 4.1 File-backed GWAS via `janusx.assoc`
+
+```python
+from janusx.assoc import AssociationConfig, run_gwas_config
+
+cfg = AssociationConfig(
+    genotype="example/~mouse_hs1940",
+    phenotype="example/mouse_hs1940.pheno",
+    traits=[0],
+    maf=0.02,
+    geno=0.05,
+    het=0.02,
+    threads=8,
+    qcov=3,
+    grm="1",
+    out="demo",
+    prefix="mouse_hs1940",
+)
+
+payload = run_gwas_config(cfg, model_key="lmm")
+print(payload["status"])
+print(payload["result_files"])
+```
+
+Recommended when:
+
+- your data already lives on disk
+- you want behavior close to `jx gwas`
+- you want JanusX to decide the appropriate workflow branch for file-backed input
+
+`run_gwas_config()` returns a payload `dict`. If you want a typed result object, use `LinearModel(...).lm()`, `.lmm()`, `.fastlmm()`, or `.farmcpu()`.
+
+### 4.2 In-memory GWAS via `LinearModel`
+
+```python
+import numpy as np
+from janusx.assoc import LinearModel
+
+rng = np.random.default_rng(42)
+X_sample_major = rng.integers(0, 3, size=(240, 500), dtype=np.int8)   # samples x SNPs
+y = rng.normal(size=240)
+cov = rng.normal(size=(240, 2))
+
+model = LinearModel(
+    genotype=X_sample_major,
+    phenotype=y,
+    covariates=cov,
+    traits=[0],
+    threads=4,
+)
+res = model.lm(write_files=False)
+print(res.ok, res.traits, len(res.summary_rows))
+```
+
+Important distinction:
+
+- `LinearModel` matrix-mode is easiest when genotype is sample-major (`n_samples x n_snps`)
+- lower-level `janusx.pyBLUP` kernels usually expect SNP-major (`m_snps x n_samples`)
+
+Passing a square genotype matrix is ambiguous and should be avoided.
+
+### 4.3 GS via `janusx.gs`
+
+```python
+from janusx.gs import GsConfig, run_gs_config, GenomicSelection
+
+cfg = GsConfig(
+    genotype="example/~mouse_hs1940",
+    phenotype="example/mouse_hs1940.pheno",
+    traits=[0],
+    cv=5,
+    threads=8,
+    rrblup=True,
+    gblup_kernels=("a",),
+    out="demo",
+    prefix="mouse_hs1940",
+)
+
+payload = run_gs_config(cfg)
+print(payload["status"], payload["methods"])
+
+runner = GenomicSelection(
+    "example/~mouse_hs1940",
+    "example/mouse_hs1940.pheno",
+    traits=[0],
+    cv=5,
+    threads=8,
+)
+res = runner.gblup(kernels=("a",))
+print(res.ok, res.methods)
+```
+
+Use `janusx.gs` when you want the Python equivalent of `jx gs`. This layer is file-oriented and is the recommended entry for GS orchestration.
+
+## 5. Direct model kernels
+
+### 5.1 Low-level association kernels
+
+```python
+import numpy as np
+from janusx.pyBLUP import LM, LMM, FastLMM
+
+rng = np.random.default_rng(42)
+M_snp_major = rng.normal(size=(500, 240)).astype(np.float32)  # SNPs x samples
+y = rng.normal(size=240).astype(np.float64)
+cov = rng.normal(size=(240, 2)).astype(np.float64)
+K = np.eye(240, dtype=np.float64)
+
+lm = LM(y=y, X=cov)
+lm_stats = lm.gwas(M_snp_major, threads=4)
+
+lmm = LMM(y=y, X=cov, kinship=K)
+lmm_stats = lmm.gwas(M_snp_major, threads=4)
+
+fast = FastLMM(y=y, X=cov, kinship=K)
+fast_stats = fast.gwas(M_snp_major, threads=4)
+```
+
+This layer is best when you already have in-memory matrices and want to bypass file-mode workflow orchestration.
+
+### 5.2 BLUP, ML, and Bayes kernels
+
+```python
+from janusx.pyBLUP import BLUP, MLGS
+from janusx.pyBLUP.bayes import BayesA, BayesB, BayesCpi, BAYES
+```
+
+Use:
+
+- `BLUP` for direct mixed-model prediction on in-memory matrices
+- `MLGS` for ML-based GS in Python
+- `BayesA`, `BayesB`, `BayesCpi`, or `BAYES` for Bayesian GS
+
+The Bayesian imports live in `janusx.pyBLUP.bayes`, not in `janusx.pyBLUP` top-level exports.
+
+### 5.3 In-memory GRM helpers
+
+```python
+from janusx.pyBLUP import GRM, QK
+```
+
+Use these only when your genotype matrix is already in memory and SNP-major. For large file-backed GRM construction, prefer `jx grm`.
+
+Important caveat:
+
+- `janusx.pyBLUP.build_streaming_grm_from_chunks()` is currently not the recommended public path in this Rust-only build mode; it raises `RuntimeError` instead of acting as a production streaming GRM builder
+- for large on-disk GRM work, use the CLI `jx grm`
+- advanced users can inspect native functions such as `janusx.janusx.grm_stream_bed_f32` and `janusx.janusx.grm_packed_bed_f32`, but those are lower-level interfaces
+
+## 6. ADAMixture, annotation, and plotting
+
+### 6.1 ADAMixture
 
 ```python
 import logging
 from janusx.adamixture import ADAMixtureConfig, rsvd_streaming, train_adamixture
 
-geno_path = "example/mouse_hs1940.vcf.gz"
-
-# Optional: inspect principal components first
 eigvals, eigvecs = rsvd_streaming(
-    geno_path,
-    k=8,
+    "example/~mouse_hs1940",
+    k=6,
     seed=42,
     power=5,
-    tol=1e-1,
+    tol=0.1,
     snps_only=True,
     maf=0.02,
     missing_rate=0.05,
 )
-print("top eigvals:", eigvals[:5])
-
-logger = logging.getLogger("admx")
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
+print(eigvals.shape, eigvecs.shape)
 
 cfg = ADAMixtureConfig(
-    genotype_path=geno_path,
-    k=8,
-    outdir="out/admx",
-    prefix="cohort",
+    genotype_path="example/~mouse_hs1940",
+    k=4,
+    outdir="demo/admixture",
+    prefix="mouse_hs1940",
     threads=8,
-    solver="adam-em",  # auto | adam | adam-em
-    max_iter=500,
 )
+logger = logging.getLogger("admixture")
+logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.INFO)
 
 P, Q, m, n = train_adamixture(cfg, logger)
-print("P:", P.shape, "Q:", Q.shape, "m:", m, "n:", n)
+print(P.shape, Q.shape, m, n)
 ```
 
-### 4.5 Annotation range query with gtools
+### 6.2 Annotation and range queries
 
 ```python
 from janusx.gtools import gffreader, readanno, GFFQuery
 
-gff_df = gffreader("ref/Zea_mays.gff3.gz", attr=["ID", "Name"])
-query = GFFQuery(gff_df)
+gff = gffreader("ref/example.gff3.gz", attr=["ID", "Name"])
+query = GFFQuery(gff)
+hits = query.query_bimrange("1:2.0-2.5", features=["gene"], attr=["ID", "Name"])
+print(hits.head())
 
-# Mb-range string: chr:start-end
-genes = query.query_bimrange("1:2.0-2.5", features=["gene"], attr=["ID", "Name"])
-print(genes.head())
-
-anno_df = readanno("ref/Zea_mays.gff3.gz")
-print("normalized rows:", len(anno_df))
+anno = readanno("ref/example.gff3.gz")
+print(len(anno))
 ```
 
-### 4.6 Logic-gate search (GARFIELD backend)
+### 6.3 GARFIELD logic search
 
 ```python
 import numpy as np
 from janusx.garfield.logreg import backend_available, logreg
 
-if not backend_available():
-    raise RuntimeError("janusx.janusx backend is not available")
-
-rng = np.random.default_rng(0)
-x = rng.integers(0, 2, size=(100, 12), dtype=np.uint8)  # n_samples x n_features
-y = rng.integers(0, 2, size=(100,), dtype=np.uint8)
-
-res = logreg(
-    x,
-    y,
-    response="binary",
-    max_literals=3,
-    allow_empty=True,
-)
-print(res["expression"], res["score"])
+if backend_available():
+    x = np.random.randint(0, 2, size=(100, 12), dtype=np.uint8)
+    y = np.random.randint(0, 2, size=100, dtype=np.uint8)
+    res = logreg(x, y, response="binary", max_literals=3, allow_empty=True)
+    print(res["expression"], res["score"])
 ```
 
-### 4.7 Pipeline compatibility check
+### 6.4 Plotting
+
+```python
+from janusx.bioplotkit import GWASPLOT, PCSHOW, LDblock
+from janusx.bioplotkit.popstructure import plot_admixture_structure
+from janusx.bioplotkit.gsplot import plot_accuracy_runtime_scatter
+```
+
+Top-level `janusx.bioplotkit` exports the most common entrypoints, but some plotting helpers still live in submodules.
+
+## 7. Pipeline checks and web entrypoints
 
 ```python
 from janusx.pipeline import run_fastq2vcf_checks, run_fastq2count_checks, format_report
+from janusx.ui import build_parser, main
 
-r1 = run_fastq2vcf_checks()
-r2 = run_fastq2count_checks()
-
-print(format_report(r1))
-print(format_report(r2))
+print(format_report(run_fastq2vcf_checks()))
+print(format_report(run_fastq2count_checks()))
 ```
 
-### 4.8 rrBLUP progress hook (AdamW/PCG)
+Use `janusx.pipeline` for environment compatibility checks. Use `janusx.ui` when embedding or extending the web interface entrypoint.
 
-```python
-import numpy as np
-from janusx.gs.workflow import GSapi
+## 8. CLI-to-Python mapping
 
-rng = np.random.default_rng(42)
-Xtrain = rng.normal(size=(500, 240)).astype(np.float32)  # SNP-major
-Xtest = rng.normal(size=(500, 40)).astype(np.float32)
-y = rng.normal(size=(240, 1)).astype(np.float64)
+| CLI module | Recommended Python entry |
+| --- | --- |
+| `jx gwas` | `janusx.assoc.AssociationConfig`, `run_gwas_config`, `LinearModel` |
+| `jx gs` | `janusx.gs.GsConfig`, `run_gs_config`, `GenomicSelection` |
+| `jx adamixture` | `janusx.adamixture.ADAMixtureConfig`, `rsvd_streaming`, `train_adamixture` |
+| `jx gformat` | `janusx.gfreader.load_genotype_chunks`, `save_genotype_streaming` |
+| `jx gmerge` | `janusx.gfreader.gmerge.merge` |
+| `jx grm` | CLI recommended for file-backed runs; `janusx.pyBLUP.GRM` or `QK` for in-memory matrices |
+| `jx pca` | `janusx.adamixture.rsvd_streaming`, `janusx.pyBLUP.QK.PCA()`, or plotting helpers, depending on the workflow |
+| `jx fastq2vcf` / `jx fastq2count` | `janusx.pipeline.run_fastq2vcf_checks`, `run_fastq2count_checks` |
 
-def on_rrblup_progress(event: str, payload: dict):
-    if event == "adam_epoch":
-        print("epoch", payload["epoch"], "/", payload["total"], payload.get("stage", "fit"))
-    if event == "pcg_iter":
-        print("pcg", payload["iter"], "/", payload["total"])
+## 9. Practical notes
 
-yhat_train, yhat_test, pve = GSapi(
-    y,
-    Xtrain,
-    Xtest,
-    method="rrBLUP",
-    PCAdec=False,
-    n_jobs=4,
-    rrblup_solver="adamw",
-    rrblup_adamw_cfg={
-        "epochs": 60,
-        "grid_size": 2,
-        "grid_trial_epochs": 20,
-    },
-    rrblup_progress_hook=on_rrblup_progress,
-)
-
-print(yhat_test.shape, pve)
-```
-
-Notes:
-
-- `rrblup_progress_hook` emits `adam_start`, `adam_epoch`, `adam_end` for AdamW, and
-  `pcg_start`, `pcg_iter`, `pcg_end` for PCG.
-- AdamW auto-grid tunes on a validation subset drawn from the current training set, not a full-sample sweep.
-- In CV wrappers, progress payloads also carry labels such as `fold 1/5` or `final`.
-
-## 5. API Reference By Package
-
-### 5.1 `janusx.gfreader`
-
-Use this package when genotype IO is your primary bottleneck.
-
-- `inspect_genotype_file(path_or_prefix) -> (sample_ids, n_sites)`
-- `load_genotype_chunks(...) -> iterator[(geno_chunk, sites)]`
-- `save_genotype_streaming(out, sample_ids, chunks, fmt=...)`
-- `set_genotype_cache_dir(cache_dir)`
-- `load_bed_2bit_packed(prefix) -> (packed, missing_rate, maf, std_denom, n_samples)`
-- `janusx.gfreader.gmerge.merge(...)` for dataset merging.
-
-### 5.2 `janusx.pyBLUP`
-
-Use this package for GRM construction, association scans, and prediction.
-
-- GRM APIs: `build_streaming_grm_from_chunks`, `QK`, `GRM`.
-- Association APIs: `LM`, `LMM`, `FastLMM`, `FEM`, `lmm_reml`, `lmm_reml_null`, `fastlmm_reml`, `fastlmm_reml_null`, `fastlmm_assoc_chunk`, `farmcpu`.
-- Prediction APIs: `BLUP` (from `pyBLUP.mlm`), `MLGS`.
-- Bayes APIs: `janusx.pyBLUP.bayes.BayesA`, `BayesB`, `BayesCpi`, `BAYES`.
-
-### 5.3 `janusx.adamixture`
-
-Use this package for population structure and ancestry decomposition.
-
-- `ADAMixtureConfig`
-- `rsvd_streaming`
-- `train_adamixture`
-- `evaluate_adamixture_cverror`
-
-### 5.4 `janusx.gtools`
-
-Use this package for genome annotation loading and range filtering.
-
-- `gffreader`, `bedreader`, `readanno`
-- `GFFQuery.query_range`, `GFFQuery.query_bimrange`
-- `chrom_sort_key`, `natural_tokens`
-
-### 5.5 `janusx.bioplotkit`
-
-Use this package for publication-facing charts.
-
-- `GWASPLOT` (`manhattan`, `qq`)
-- `LDblock`
-- `PCSHOW` (`pcplot`, `pcplot3D_gif`)
-- `plot_haplotype`
-- `plot_admixture_structure`
-
-### 5.6 `janusx.garfield`
-
-Use this package for logical conjunction search on binary features.
-
-- `backend_available`
-- `logreg` (returns `indices`, `expression`, `xcombine`, `score`)
-
-### 5.7 `janusx.pipeline` and `janusx.ui`
-
-- `janusx.pipeline`: external toolchain checks (`run_fastq2vcf_checks`, `run_fastq2count_checks`, `format_report`)
-- `janusx.ui`: parser/server entry (`build_parser`, `main`)
-
-## 6. Rust-to-Python Mapping (Complete)
-
-This appendix helps with code tracing and backend debugging.
-
-### 6.1 IO and parsing kernels
-
-- `src/io/gfcore.rs`
-- Purpose: low-level parsing for `FAM/BIM/VCF/HMP/TXT/NPY/BIN`, SNP row preprocessing, cache detection, iterators.
-- Consumed by: `janusx.gfreader` high-level readers/writers.
-
-- `src/io/gfreader.rs`
-- Rust exports: `SiteInfo`, `BedChunkReader`, `VcfChunkReader`, `HmpChunkReader`, `TxtChunkReader`, `PlinkStreamWriter`, `VcfStreamWriter`, `HmpStreamWriter`, `count_vcf_snps`, `count_hmp_snps`, `load_bed_2bit_packed`, `load_bed_u8_matrix`, `load_site_info`, `gfd_packbits_from_dosage_block`, `bed_filter_to_plink_rust`.
-- Python entries: `load_genotype_chunks`, `inspect_genotype_file`, `save_genotype_streaming`, `load_bed_2bit_packed`.
-
-- `src/io/gmerge.rs`
-- Rust exports: `merge_genotypes`, `convert_genotypes`, `PyMergeStats`, `PyConvertStats`.
-- Python entries: `janusx.gfreader.gmerge.merge`, script workflows (`gmerge`, `gformat`).
-
-- `src/io/gwasio.rs`
-- Rust export: `load_gwas_triplet_fast`.
-- Python consumers: `bioplotkit.manhanden.GWASPLOT`, `script.postgwas`, `ui.render`.
-
-### 6.2 Math and scoring kernels
-
-- `src/math/bitwise.rs`
-- Rust exports: `popcount_py`, `and_popcount_py`, `bitand_assign_py`, `bitor_into_py`, `bitnot_masked_py`.
-- Used by packed-genotype and bitset-heavy workflows.
-
-- `src/stats/score.rs`
-- Rust exports: `score_binary_ba_py`, `score_binary_mcc_py`, `score_binary_ba_mcc_batch_py`, `score_cont_mean_diff_py`, `score_cont_corr_py`, `score_cont_mean_diff_corr_batch_py`.
-
-- `src/stats/beam.rs`
-- Rust exports: `beam_search_and_binary_mcc_bin_py`, `beam_search_and_binary_mcc_bin_indices_py`, `beam_scan_windows_binary_mcc_bin_py`.
-
-- `src/stats/logreg.rs`
-- Rust export: `fit_best_and_not_py`.
-- Python entry: `janusx.garfield.logreg.logreg`.
-
-### 6.3 Association and prediction kernels
-
-- `src/stats/glm.rs`
-- Fixed-effect kernels: `glmf32`, `glmf32_full`, `glmf32_packed`.
-- Python entries: `janusx.pyBLUP.assoc` fixed-effect GWAS paths.
-
-- `src/stats/gs_native.rs`
-- Packed GS/GRM kernels: `gblup_reml_packed_bed`, `rrblup_pcg_bed`, `grm_packed_bed_f32`,
-  `grm_packed_f32`, `grm_packed_f32_with_stats`, `grm_packed_f64_with_stats`.
-- Python entries: `janusx.gs.workflow` packed GBLUP/rrBLUP paths.
-
-- `src/stats/lmm_scan.rs`
-- LMM/FaST-LMM/AI-REML kernels: `lmm_reml_null_f32`, `ml_loglike_null_f32`, `ai_reml_null_f64`,
-  `ai_reml_multi_f64`, `lmm_reml_chunk_f32`, `lmm_reml_chunk_from_snp_f32`,
-  `lmm_assoc_chunk_f32`, `lmm_assoc_chunk_from_snp_f32`, `lmm_reml_assoc_packed_f32`,
-  `fastlmm_assoc_chunk_f32`, `fastlmm_assoc_packed_f32`.
-- Python entries: `janusx.pyBLUP.assoc` mixed-model scan paths.
-
-- `src/stats/assoc.rs`
-- FarmCPU shell exports: `farmcpu_rem_dense`, `farmcpu_rem_packed`, `farmcpu_super_dense`,
-  `farmcpu_super_packed`.
-
-- `src/stats/packed.rs`
-- Packed decode/hash/projection exports: `bed_packed_row_flip_mask`, `bed_packed_decode_rows_f32`,
-  `bed_packed_decode_stats_f64`, `bed_packed_signed_hash_*`, `cross_grm_times_alpha_packed_f64`,
-  `packed_malpha_f64`.
-
-- `src/stats/ld.rs` + `src/math/ld.rs`
-- Packed LD prune/filters (`bed_packed_ld_prune_maf_priority`, `packed_prune_kernel_stats`,
-  `bed_prune_to_plink_rust`) used by `jx gformat` packed direct prune path.
-
-- `src/stats/lmm.rs`
-- Fast null/chunk helpers: `fastlmm_reml_null_f32`, `fastlmm_reml_chunk_f32`.
-- Python wrappers: FaST-LMM paths in `pyBLUP.assoc`.
-
-- `src/stats/bayes.rs`
-- Rust exports: `bayesa`, `bayesb`, `bayescpi`.
-- Python wrappers: `janusx.pyBLUP.bayes`.
-
-### 6.4 ADAMixture, BSA, tree kernels
-
-- `src/stats/rsvd.rs`
-- Rust export: `py_rsvd_packed_subset`.
-- Python wrappers: `rsvd_streaming`, ADAMixture training initialization.
-
-- `src/stats/adamixture.rs`
-- RSVD/multiply exports: `admx_rsvd_stream`, `admx_rsvd_stream_sample`, `admx_rsvd_power_step_inplace`, `admx_multiply_at_omega`, `admx_multiply_a_omega`, `admx_multiply_at_omega_inplace`, `admx_multiply_a_omega_inplace`.
-- EM/Adam exports: `admx_allele_frequency`, `admx_loglikelihood`, `admx_loglikelihood_f32`, `admx_rmse_f32`, `admx_rmse_f64`, `admx_kl_divergence`, `admx_map_q_f32`, `admx_map_p_f32`, `admx_em_step`, `admx_em_step_inplace`, `admx_em_step_inplace_f32`, `admx_adam_update_p`, `admx_adam_update_q`, `admx_adam_update_p_inplace`, `admx_adam_update_q_inplace`, `admx_adam_update_p_inplace_f32`, `admx_adam_update_q_inplace_f32`, `admx_adam_optimize_f32`, `admx_set_threads`.
-
-- `src/stats/bsa.rs`
-- Rust export: `preprocess_bsa`.
-- Python consumer: `janusx.script.postbsa`.
-
-- `src/stats/tree.rs`
-- Rust exports: `geno_chunk_to_alignment_u8`, `geno_chunk_to_alignment_u8_siteinfo`, `geno_chunk_to_alignment_u8_sites`, `nj_newick_from_alignment_u8`, `nj_newick_from_distance_matrix`, `ml_newick_from_alignment_u8`.
-- Python consumers: tree/haplotype script pipelines.
-
-## 7. Main Return Objects
-
-- `SiteInfo`: `chrom`, `pos`, `ref_allele`, `alt_allele`.
-- `PyMergeStats`: merge statistics with counts and per-input site status.
-- `PyConvertStats`: conversion statistics.
-- `StreamingGrmStats`: `eff_m`, `varsum`, `used_syrk`.
-- `PipelineCompatReport`: pipeline check summary (`checks`, `passed_count`, etc.).
-- `ADAMixtureConfig`: ADAMixture training configuration dataclass.
-
-## 8. Quick Reference Table
-
-| Requirement | Python entry point | Rust core |
-| --- | --- | --- |
-| Stream VCF/HMP/PLINK/TXT | `janusx.gfreader.load_genotype_chunks` | `BedChunkReader` / `VcfChunkReader` / `HmpChunkReader` / `TxtChunkReader` |
-| Read packed BED | `janusx.gfreader.load_bed_2bit_packed` | `load_bed_2bit_packed` |
-| Write VCF/HMP/PLINK | `janusx.gfreader.save_genotype_streaming` | `PlinkStreamWriter` / `VcfStreamWriter` / `HmpStreamWriter` |
-| Linear-model GWAS | `janusx.pyBLUP.assoc.FEM` / `LM.gwas()` | `glmf32` / `glmf32_full` / `glmf32_packed` |
-| LMM GWAS | `janusx.pyBLUP.assoc.lmm_reml` / `LMM.gwas()` | `lmm_reml_chunk_f32` / `lmm_reml_null_f32` |
-| FaST-LMM | `janusx.pyBLUP.assoc.fastlmm_reml` / `FastLMM.gwas()` | `fastlmm_reml_chunk_f32` / `fastlmm_reml_null_f32` |
-| FarmCPU | `janusx.pyBLUP.assoc.farmcpu` | `farmcpu_rem_*` / `farmcpu_super_*` |
-| GS rrBLUP / GBLUP | `janusx.gs.workflow.GSapi` / `janusx.gs.run_gs_*` | `stats/gs_native.rs` + `stats/packed.rs` |
-| Bayes prediction | `janusx.pyBLUP.bayes.BayesA/BayesB/BayesCpi` | `bayesa` / `bayesb` / `bayescpi` |
-| Ancestry inference | `janusx.adamixture.train_adamixture` | `admx_*` family |
-| GFF/gene queries | `janusx.gtools.GFFQuery` | pure Python |
-| GWAS plotting | `janusx.bioplotkit.GWASPLOT` | pure Python (`load_gwas_triplet_fast` for fast summary loading) |
-| Logic-gate search | `janusx.garfield.logreg.logreg` | `fit_best_and_not_py` |
-
-## 9. Practical Tips and Common Pitfalls
-
-- Keep genotype matrices SNP-major before calling `pyBLUP` kernels.
-- Keep phenotype/covariate arrays in exact sample order from genotype metadata.
-- Prefer chunked loading for large cohorts (`load_genotype_chunks`).
-- Set a writable fast cache path with `JANUSX_CACHE_DIR` on shared systems.
-- If performance is unstable, check both Python thread settings and Rust-side thread counts.
-- If results look inconsistent after merge/convert, verify sample IDs and site alignment first.
-
-## 10. Related Docs
-
-- CLI guide: `doc/JanusXcli.md`
-- Project overview: `README.md`
+- Keep sample alignment explicit. The safest order is the sample order returned by `inspect_genotype_file()`.
+- Remember the orientation split: file-backed streams are SNP-major; `LinearModel` matrix-mode is easiest with sample-major input.
+- Use `janusx.gfreader.set_genotype_cache_dir()` or `JANUSX_CACHE_DIR` on shared systems with slow home directories.
+- Prefer wrapper packages first. Drop to `janusx.pyBLUP` or `janusx.janusx` only when you already know you need lower-level control.
+- When results differ across systems, inspect `rust_sgemm_backend()` and `rust_eigh_lapack_backend()` before debugging the model code itself.

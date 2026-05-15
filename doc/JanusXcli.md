@@ -1,950 +1,274 @@
 # JanusX CLI Guide
 
-Version baseline: `v1.0.21`
+Version baseline: `v1.0.24`
 
-## 1. Scope and entrypoints
+This guide tracks the current command-line surface in this repository. For exact flags of any single module, always prefer:
 
-This document describes the current CLI behavior from source code in this repository.
+```bash
+jx <module> -h
+```
 
-Entrypoints:
+## 1. Entrypoints and install modes
 
-- `jx` (installer/launcher build): Rust launcher binary
-- `jx` / `jxpy` (pip/source install): Python dispatcher (`python -m janusx.script.JanusX`)
+JanusX is used in two common ways:
 
-Important boundary:
+- Launcher install: `jx`
+- Source or pip install: `python -m janusx.script.JanusX`
+- Some Python installs also expose the dispatcher as `jxpy`
 
-- Launcher flags `-update/-upgrade/-list/-clean/-uninstall` are launcher-binary-only.
-- In Python dispatcher mode (`jxpy`, and `jx` from pip/source install), `fastq2vcf/fastq2count` run preflight checks only and do not execute the full pipeline.
-- Extra modules `kmerge/view/treeplot/gblupbench` are available in Python dispatcher mode but not in launcher module whitelist.
-- `beam` script exists in repository but is not wired into launcher or Python dispatcher; run it directly via `python -m janusx.script.beam ...`.
+The research modules are shared across both modes. The main boundary is lifecycle management:
 
-Current routing (post-structure refactor):
-
-- `jx gwas` routes to `janusx.assoc.workflow` (via `python/janusx/assoc/runner.py`).
-- `jx gs` routes to `janusx.gs.workflow` (via `python/janusx/gs/runner.py`).
-- `python/janusx/script/JanusX.py` is the dispatcher shell; heavy GWAS/GS workflow code lives in `assoc/` and `gs/`.
+- Launcher-only flags: `-update`, `-upgrade`, `-list`, `-clean`, `-uninstall`
+- Python-dispatcher note: `fastq2vcf` and `fastq2count` run compatibility checks only; use launcher `jx fastq2vcf ...` or `jx fastq2count ...` for the full external pipeline
 
 Quick checks:
 
 ```bash
 jx -h
 jx -v
-jx -list module
-jx <module> -h
+jx gwas -h
+python -m janusx.script.JanusX gs -h
 ```
 
-Optional one-pass module smoke check:
+## 2. Shared input conventions
 
-```bash
-python - <<'PY'
-import subprocess
-mods = [
-    'grm','pca','gwas','postgwas','gs','reml',
-    'garfield','postgarfield','postbsa',
-    'fastq2vcf','fastq2count','kmer','kmerge','view','tree','treeplot',
-    'adamixture','hybrid','gformat','gmerge','webui',
-    'sim','simulation','benchmark','gblupbench','bayesbench'
-]
-for m in mods:
-    p = subprocess.run(['jx', m, '-h'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"{m:12s} {'OK' if p.returncode == 0 else 'FAIL'}")
-PY
-```
+### 2.1 Genotype inputs
 
-## 2. Launcher global flags (`jx`)
+Most scientific modules accept one of these input families:
 
-### `-h`, `--help`
+- `-vcf`: `.vcf` or `.vcf.gz`
+- `-hmp`: `.hmp` or `.hmp.gz`
+- `-bfile`: PLINK prefix for `.bed/.bim/.fam`
+- `-file`: numeric genotype matrix `.txt/.tsv/.csv/.npy`, or a shared prefix
 
-Show launcher help and module overview.
+For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `adamixture`, `gformat`, and related workflows.
 
-### `-v`, `--version`
+### 2.2 `-file` sidecars
 
-Show launcher/core version, build time, and mismatch hints.
+When using `-file prefix`, JanusX expects:
 
-### `-list [module|dlc]`
+- `prefix.id`: sample IDs in matrix column order
+- `prefix.site` or `prefix.bim`: optional site metadata for conversion, LD, plotting, or variant-aware exports
 
-List modules or DLC tool routes.
-
-Examples:
-
-```bash
-jx -list module
-jx -list dlc
-```
-
-### `-update [dlc|latest|<local_path>] [-e|-editable] [-verbose]`
-
-Update behavior:
-
-- `jx -update` -> update Python core from PyPI
-- `jx -update latest` -> update core from GitHub latest source/release route
-- `jx -update <local_path>` -> update core from local source path
-- `jx -update -e <local_path>` -> editable local core update
-- `jx -update dlc` -> update external pipeline toolchain runtime
-
-### `-upgrade [latest|<local_path>] [-verbose]`
-
-Upgrade launcher binary first, then run core update flow:
-
-- `jx -upgrade` behaves as launcher upgrade + core `latest` update
-- `jx -upgrade latest`
-- `jx -upgrade <local_path>`
-
-### `-clean [history_id]`
-
-- `jx -clean` clears GWAS history database in runtime
-- `jx -clean <history_id>` removes a specific history record path
-
-### `-uninstall [-yes]`
-
-Remove launcher/runtime managed files.
-
-- Interactive confirm by default
-- Use `-yes` to skip prompt
-
-## 3. Shared input conventions
-
-### 3.1 Genotype input switches
-
-Most model modules support one of:
-
-- `-vcf` / `--vcf`: `.vcf` / `.vcf.gz`
-- `-hmp` / `--hmp`: `.hmp` / `.hmp.gz`
-- `-bfile` / `--bfile`: PLINK prefix (`.bed/.bim/.fam`)
-- `-file` / `--file`: matrix path or prefix (`.txt/.tsv/.csv/.npy`)
-
-### 3.2 `-file` sidecar files
-
-Required sidecar:
-
-- `prefix.txt` (numeric matrix)
+Minimal examples:
 
 ```text
-1	1	2
-1	1	0
-1	0	0
+# prefix.id
+sample_1
+sample_2
+sample_3
 ```
 
-- `prefix.id` (sample IDs in matrix column order)
-
 ```text
-idv1
-idv2
-idv3
-```
-
-Optional sidecar:
-
-- `prefix.site` or `prefix.bim` (recommended for format conversion, LD, export)
-
-```text
+# prefix.site
 1	3197400	G	A
 1	3407393	A	G
 1	3492195	G	A
 ```
 
-### 3.3 Matrix orientation
+### 2.3 Matrix orientation
 
-JanusX core genotype matrix APIs are SNP-major:
+The CLI and most Rust-backed workflows treat genotype matrices as SNP-major:
 
 - rows: variants
 - columns: samples
 
-### 3.4 Phenotype file
+This matters when you prepare matrices outside the CLI and then feed them back through `-file`.
 
-Expected by major modules:
+### 2.4 Phenotype files
+
+For `gwas`, `gs`, and related modules:
 
 - first column: sample ID
-- remaining columns: traits/covariates
-
-Delimiter is auto-detected in many modules.
-
-```text
-	test0	test1	test2	test3
-x	0.224	0.224	NA	1.0
-1	-0.974	-0.974	NA	0.0
-2	0.195	0.195	NA	1.0
-```
-
-### 3.5 Trait selector `-n`
-
-In `gwas/gs/reml/postgarfield/garfield`, `-n` uses zero-based phenotype column index excluding the sample ID column.
-
-Accepted forms include:
-
-- single index: `-n 0`
-- comma list: `-n 0,2,5`
-- range: `-n 0:5` or `-n 0-5`
-- repeat flag: `-n 0 -n 3`
-
-## 4. Module reference
-
-### 4.1 `grm`
-
-Build genomic relationship matrix from genotype.
+- remaining columns: traits or covariates
+- `-n` is zero-based and excludes the sample ID column
 
 Examples:
 
 ```bash
-jx grm -vcf geno.vcf.gz -m 1 -o out -prefix panel
-jx grm -hmp geno.hmp.gz -m 2 -npy -o out
-jx grm -file matrix_prefix -maf 0.01 -geno 0.1
+jx gwas -bfile panel -p trait.tsv -lmm -n 0
+jx gs   -bfile panel -p trait.tsv -GBLUP -cv 5 -n 0,2
+jx reml -file effects.tsv -n trait1
 ```
 
-Key options:
+### 2.5 Output and threads
 
-- `-m/--method`: `1` centered, `2` standardized
-- `-maf`, `-geno`
-- `-chunksize`
-- `-mmap-limit` (BED mmap window mode)
-- `-npy` (write `.npy` GRM)
+Common flags you will see repeatedly:
 
-Outputs:
+- `-o`: output directory
+- `-prefix`: output prefix
+- `-t`: thread count
 
-- `<prefix>.grm.txt` or `<prefix>.grm.npy`
-- matching `.id`
-- `<prefix>.grm.log`
+Inspect a module-specific log first when debugging unexpected behavior. Most modules emit a dedicated log file under the chosen output prefix or directory.
 
-### 4.2 `pca`
+## 3. Common workflows
 
-PCA from genotype, GRM, or existing PCA results.
-
-Examples:
+### 3.1 Build GRM and PCA
 
 ```bash
-jx pca -vcf geno.vcf.gz -dim 3 -plot
-jx pca -k out/panel -dim 5
-jx pca -c out/panel -plot -plot3D
-jx pca -vcf geno.vcf.gz -rsvd 3 0.1
+jx grm -bfile example/~mouse_hs1940 -m 1 -npy -o demo -prefix mouse_hs1940
+jx pca -k demo/mouse_hs1940 -dim 10 -plot -o demo -prefix mouse_hs1940
 ```
 
-Key options:
+Notes:
 
-- input mode: genotype or `-k/--grm` prefix or `-c/--cov` (existing eigen files)
-- `-dim`
-- `-plot`, `-plot3D`
-- `-group`, `-color`
-- `-rsvd [power] [tol]` (streaming Rust RSVD)
-- `-maf`, `-geno`, `-chunksize`, `-mmap-limit`
+- `jx grm` builds centered (`-m 1`) or standardized (`-m 2`) GRM
+- `jx pca -k` consumes the GRM prefix, not the raw `.npy` filename
+- `jx pca -rsvd` is the direct genotype-to-PCA route when you do not want to materialize GRM first
 
-Outputs:
-
-- `<prefix>.eigenvec`
-- `<prefix>.eigenval`
-- optional plot files
-- `<prefix>.pca.log`
-
-### 4.3 `gwas`
-
-Genome-wide association with streaming and mixed-model kernels.
-
-Examples:
+### 3.2 Run GWAS
 
 ```bash
-jx gwas -vcf geno.vcf.gz -p pheno.tsv -lmm -n 0 -q 3 -k 1 -o out
-jx gwas -bfile geno -p pheno.tsv -lm -model add -n 0,1
-jx gwas -file matrix_prefix -p pheno.tsv -farmcpu -c cov.tsv
-jx gwas -bfile geno -p pheno.tsv -lrlmm 128
+jx gwas -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -lmm -n 0 -q 3 -o demo -prefix mouse_hs1940
+jx gwas -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -lm -model add -n 0 1 -o demo -prefix mouse_hs1940
 ```
 
-Models:
+Current model flags:
 
 - `-lm`
 - `-lmm`
 - `-fastlmm`
-- `-lrlmm [RANK]`
 - `-farmcpu`
 
-Coding mode:
+Useful notes:
 
-- `-model {add,dom,rec,het}`
+- `-k 1` and `-k 2` ask JanusX to build GRM internally; `-k <path>` reuses an external GRM
+- `-q` adds leading PCs as Q covariates
+- `-c` accepts either a covariate file or a single-site token such as `1:1000`
+- `-fast` enables packed full-Rust paths when available and is especially useful with PLINK BED input
 
-Other key options:
-
-- `-k`: `1`, `2`, or external GRM path
-- `-q`: PC count (integer)
-- `-c`: repeatable covariate input
-
-`-c` supports:
-
-- covariate file (ID in first column)
-- single-site token (`chr:pos` or `chr:start:end` where start=end)
-
-```text
-x	0.017407173	-0.0069945143
-1	0.004649966	0.039312065
-2	0.012239488	-0.02688213
-3	0.010048621	-0.0106722545
-4	0.017356979	-0.0052547506
-5	0.012380351	-0.012446985
-```
-
-More options:
-
-- `-snps-only`
-- `-maf`, `-geno`, `-het`
-- `-chunksize`, `-mmap-limit`
-- `-t`
-
-Outputs:
-
-- `<prefix>.<trait>.<model>.tsv`
-- `<prefix>.gwas.log`
-
-### 4.4 `postgwas`
-
-Post-process GWAS results: Manhattan, QQ, LD block, annotation, merge plots.
-
-Examples:
+### 3.3 Run GS and REML
 
 ```bash
-jx postgwas -gwasfile out/a.tsv -manh -qq -o out
-jx postgwas -gwasfile out/*.tsv -merge out/a.tsv out/b.tsv -manh
-jx postgwas -gwasfile out/a.tsv -bimrange 1:214.4-214.6 -ldblock 2 -bfile geno
+jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -GBLUP -rrBLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
+jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
+
+jx reml -file example/rice6048.reml.tsv -n 3 -rh 0 -rh 1 -rh 2 -o demo -prefix rice6048
 ```
 
-Key options:
+Current GS model groups:
 
-- required: `-gwasfile`
-- column mapping: `-chr`, `-pos`, `-pvalue`
-- threshold: `-thr` (default `0.05/nSNP`)
-- merge mode: `-merge` (repeatable)
-- region filter: `-bimrange` (repeatable)
-- Manhattan: `-manh [ratio]`
-- QQ: `-qq`
-- LD: `-ldblock` or `-ldblock-all`
-- annotation: `-a`, `-ab`
-- LD clump for annotation: `-LDclump <window> <r2>`
-- style: `-pallete`, `-scatter-size`, `-full`, `-ylim`, `-fmt`
-- genotype source for LD/clump: `-bfile/-vcf/-file`
+- kernel models: `-GBLUP`, `-rrBLUP`
+- Bayesian models: `-BayesA`, `-BayesB`, `-BayesCpi`
+- ML models: `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
 
-Outputs:
+Useful notes:
 
-- plots and annotation tables under output directory
-- log: `<prefix>.postGWAS.log`
+- `jx gs -model saved.jxmodel ...` reuses a saved model artifact for prediction or evaluation
+- `-ldprune` and `-hash` are available for preprocessing before GS model fitting
+- `-debug` prints thread and backend diagnostics for GS
 
-### 4.5 `gs`
-
-Genomic selection and model comparison.
-
-Examples:
+### 3.4 Run ADAMixture
 
 ```bash
-jx gs -vcf geno.vcf.gz -p pheno.tsv -GBLUP -cv 5 -n 0 -o out
-jx gs -file matrix_prefix -p pheno.tsv -GBLUP ad -BayesA -BayesB -BayesCpi -cv 5
-jx gs -bfile geno -p pheno.tsv -GBLUP a -GBLUP d -GBLUP ad -cv 5
-jx gs -bfile geno -p pheno.tsv -RF -ET -GBDT -XGB -SVM -ENET -cv 5
-jx gs -bfile geno -p pheno.tsv -rrBLUP -cv 5 -n 0
-jx gs -bfile geno -p pheno.tsv -rrBLUP --rrblup-solver exact    # advanced hidden option
+jx adamixture -bfile example/~mouse_hs1940 -k 1..6 -cv -o demo -prefix mouse_hs1940
+jx adamixture -bfile example/~mouse_hs1940 -k 4 -tag sample1,sample2 -o demo -prefix mouse_hs1940
 ```
 
-Model flags:
+Accepted `-k` forms:
 
-- `-GBLUP [a|d|ad]`, `-rrBLUP`
-- `-BayesA`, `-BayesB`, `-BayesCpi`
-- `-RF`, `-ET`, `-GBDT`, `-XGB`, `-SVM`, `-ENET`
+- single value: `4`
+- range: `1..6` or `1:6`
+- stepped range: `1..10..2`
+- list: `1,3,5`
 
-Other options:
-
-- `-n`
-- `-cv`
-- `-strict-cv`
-- `-pcd`
-- `-ldprune`
-- `-maf`, `-geno`
-- `-t`
-
-Notes:
-
-- `rrBLUP` defaults to mini-batch AdamW backend.
-- rrBLUP backend/tuning switches are advanced flags and hidden from `jx gs -h`, but still accepted by CLI (for example `--rrblup-solver exact`).
-- AdamW rrBLUP now runs a small automatic lambda grid (default 2 candidates) with fold-internal validation + early-stop in tuning trials; in CV mode the selected hyperparameters are reused across folds by default to reduce repeated tuning overhead (hidden advanced switch: `--rrblup-grid-reuse-cv off`).
-- rrBLUP sub-progress is shown for both AdamW and PCG: with `-cv`, the rrBLUP sub-bar is rendered below the main CV progress; without `-cv`, only the rrBLUP sub-bar is shown. For AdamW it tracks epochs; for PCG it tracks iterations.
-- AdamW rrBLUP auto-grid is not a full-sample search: it tunes on a validation subset drawn from the current training set (`--rrblup-es-val-frac`, `--rrblup-es-val-min`, `--rrblup-es-min-train`). In CV mode, with default `--rrblup-grid-reuse-cv on`, the first fold's selected lambda/lr are reused for later folds and final refit.
-- AdamW/PCG rrBLUP reports `h2/PVE` in train-variance mode by default (`--rrblup-pve-mode trainvar`), and can switch to lambda-consistent mode via hidden advanced flag `--rrblup-pve-mode lambda`.
-- AdamW rrBLUP memory usage is primarily controlled by `-batchsize/--batchsize` (alias of hidden `--rrblup-batch-size`). By default, `--rrblup-snp-block-size` follows the same value unless explicitly overridden.
-- For `GBLUP/rrBLUP`-only runs with non-PLINK input (`-vcf/-hmp/-file`), `jx gs` will auto-probe data scale and switch to packed BED flow when `n_samples * n_snps` exceeds the hidden threshold `--packed-lmm-auto-min-cells` (default `200000000`).
-- `--ldprune` default backend is JanusX Rust packed kernel; set env `JX_GS_LDPRUNE_BACKEND=plink` to delegate GS LD prune to external PLINK (`--indep-pairwise`) for closer PLINK semantics.
-
-Outputs:
-
-- `<prefix>.<trait>.gs.tsv`
-- `<prefix>.gs.log`
-
-### 4.6 `reml`
-
-REML-BLUP mixed model for variance components and BLUP outputs.
-
-Examples:
+### 3.5 Convert and merge genotype data
 
 ```bash
-# example/rice6048.reml.tsv
-jx reml -file test.reml.txt -n 3 -rh 0 -rh 1 -rh 2 -o out -prefix reml
-jx reml -file test.reml.txt -n trait1 -f sex -r family
+jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o demo -prefix mouse_hs1940
+jx gformat -bfile example/~mouse_hs1940 -fmt npy --prune 500kb 10 0.2 -o demo -prefix mouse_hs1940
+
+jx gmerge -bfile cohort_a cohort_b -fmt plink -o demo -prefix merged
 ```
 
-Key options:
+Use these modules when you need:
 
-- required: `-file`, `-n`
-- random categorical (one-hot): `-rh`
-- fixed categorical (one-hot): `-fh`
-- random terms: `-r`
-- fixed terms: `-f`
-- `-maxiter`
+- cross-format conversion: `gformat`
+- sample filtering or site extraction: `gformat`
+- LD pruning for downstream GWAS or GS: `gformat --prune`
+- multi-panel merging: `gmerge`
 
-Outputs:
-
-- `<prefix>.blup.txt`
-- `<prefix>.reml.summary.tsv`
-- `<prefix>.reml.log`
-
-### 4.7 `garfield`
-
-Random-forest based marker-trait association.
-
-Examples:
+### 3.6 Post-processing and visualization
 
 ```bash
-jx garfield -vcf geno.vcf.gz -p pheno.tsv -n 0 -o out
-jx garfield -file matrix_prefix -p pheno.tsv -g geneset.txt -gff gene.gff3 -forceset
+jx postgwas -gwasfile result.lmm.tsv -manh -qq -o demo/postgwas
+jx postgwas -bfile example/~mouse_hs1940 -bimrange 1:1-2 -ldblock-all -o demo/postgwas
+
+jx postgs -json demo/mouse_hs1940.gs.model/summary.json -o demo/postgs
 ```
 
-Key options:
+The main reporting modules are:
 
-- input: `-vcf/-hmp/-bfile/-file`
-- `-p`, `-n`
-- optional gene mode: `-g`, `-gff`, `-forceset`
-- model control: `-step`, `-ext`, `-nsnp`, `-nestimators`
-- runtime: `-t`, `-mmap-limit`
+- `postgwas`: Manhattan, QQ, LD block, annotation, merged GWAS views
+- `postgs`: GS summary plotting from `summary.json`
+- `postgarfield`: pseudo-genotype GWAS/post-GWAS workflow
+- `postbsa`: BSA filtering, smoothing, and plotting
+- `webui`: browser UI for exploring generated results
 
-Outputs:
+### 3.7 External pipeline preflight
 
-- GARFIELD result tables/artifacts in output dir
-- `<prefix>.garfield.log`
-
-### 4.8 `postgarfield`
-
-Run GWAS + postgwas flow on GARFIELD pseudo-genotype outputs.
-
-Examples:
+In Python-dispatcher mode, these commands validate the environment and stop:
 
 ```bash
-jx postgarfield -bfile demo.garfield -p pheno.tsv -k kinship.npy -n 0 -o out
-jx postgarfield -vcf demo.pseudo.vcf.gz -p pheno.tsv -k kinship.npy -anno genes.gff3
+python -m janusx.script.JanusX fastq2vcf --check-only
+python -m janusx.script.JanusX fastq2count --check-only
 ```
 
-Required:
+Use launcher `jx` when you want the full external workflow to run.
 
-- genotype: `-bfile` or `-vcf`
-- `-p` phenotype
-- `-k` GRM
+## 4. Module catalog
 
-Other options:
+### 4.1 GWAS
 
-- `-q`, `-cov`
-- `-n`
-- `-maf`, `-geno`, `-chunksize`, `-t`
-- `--pseudo`, `--pseudochrom`, `--only-set [BP]`
-- postgwas controls: `-thr`, `-bimrange`, `-fmt`, `-noplot`, `-a`, `-ab`, `-pallete`
+- `grm`: build centered or standardized genomic relationship matrix
+- `pca`: principal component analysis from genotype, GRM, or existing PCA output
+- `gwas`: LM, LMM, FaST-LMM, or FarmCPU association workflow
+- `postgwas`: visualization, annotation, LD block, merged GWAS reporting
 
-Outputs:
+### 4.2 GS
 
-- GWAS/postgwas outputs and log (`<prefix>.postGARFIELD.log`)
+- `gs`: genomic selection and model comparison
+- `reml`: mixed-model REML/BLUP for phenotype and effect tables
+- `postgs`: summarize GS outputs and effect plots
 
-### 4.9 `postbsa`
+### 4.3 GARFIELD and BSA
 
-BSA post-processing with filtering, smoothing, and plotting.
+- `garfield`: logic-gate or interval-based marker-trait association workflow
+- `postgarfield`: pseudo-genotype GWAS and post-processing
+- `postbsa`: BSA table processing and figures
 
-Examples:
+### 4.4 Utility and format tools
 
-```bash
-jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2
-jx postbsa -file '4.merge/Merge.*.SNP.tsv' -b1 Bulk1 -b2 Bulk2 -t 8
-```
+- `gformat`: convert genotype formats, filter samples, extract sites, prune LD
+- `gmerge`: merge multiple genotype panels
+- `view`: print `.bin` and `.bin.site` style files as plain text
+- `hybrid`: generate pairwise hybrid genotype matrices from parent lists
+- `adamixture`: ancestry inference and CVerror scan
+- `tree`: tree workflow entry
+- `treeplot`: visualize Newick or GRM-derived trees
+- `webui`: start the JanusX web interface
 
-Key options:
+### 4.5 K-mer and external pipeline helpers
 
-- required: `-file`, `-b1`, `-b2`
-- sliding window: `-window`, `-step`
-- filtering: `-minDP`, `-minGQ`, `-totalDP`, `-refAlleleFreq`, `-depthDifference`
-- ED control: `-ed`
-- plots: `-ratio`, `-fmt`
-- runtime: `-t`
+- `kmer`: KMC counting or WASTER tree workflow entry
+- `kmerge`: merge KMC outputs into a genotype-like matrix
+- `fastq2vcf`: FASTQ-to-VCF compatibility check in Python mode; full pipeline in launcher mode
+- `fastq2count`: FASTQ-to-count compatibility check in Python mode; full pipeline in launcher mode
 
-Outputs:
+### 4.6 Benchmark and simulation
 
-- processed tables and figures
-- `<prefix>.postbsa.log`
-
-### 4.10 `adamixture`
-
-ADAMIXTURE ancestry inference.
-
-Examples:
-
-```bash
-jx adamixture -bfile geno -k 8 -o out -prefix cohort
-jx adamixture -vcf geno.vcf.gz -k 2..10 -t 16
-jx adamixture -vcf geno.vcf.gz -k 2..10..3 -t 16
-jx adamixture -vcf geno.vcf.gz -k 2,5,8 -t 16
-jx adamixture -vcf geno.vcf.gz -k 2..10 -cv
-jx adamixture -vcf geno.vcf.gz -k 2..10 -cv 5
-jx adamixture -vcf geno.vcf.gz -k 6 -tag sample1,sample2
-jx adamixture -vcf geno.vcf.gz -k 6 --tag tag_samples.txt
-```
-
-Key options:
-
-- required input: one of `-bfile/-vcf/-hmp/-file`
-- required clusters: `-k` (single `8`, range `2..10` / `2:10`, stepped range `2..10..3` / `2:10:3` / `2..10:3`, list `2,5,8`)
-- input filter: `-chunksize`, `-snps-only`, `-maf`, `-geno`
-- structure axis labels: `-tag/--tag` (file with one sample per line, or `sample1,sample2`)
-- runtime: `-t`, `-seed`
-- optimization: `-solver {auto,adam,adam-em}`, `-max-iter`, `-tol`
-- CVerror:
-`-cv` (no value defaults to 5-fold),
-`-cv N` (N-fold, N>=2).
-Omit `-cv` to disable CVerror.
-
-Outputs:
-
-- `<prefix>.<k>.Q.txt`
-- `<prefix>.<k>.P.npy`
-- `<prefix>.<k>.P.site`
-- `<prefix>.<k>.admix.svg`
-- `<prefix>.<k>.adamix.log`
-- `<prefix>.adamixture.cverror.summary.tsv` (when `-cv` enabled)
-- `<prefix>.adamixture.summary.log`
-
-### 4.11 `gformat`
-
-Convert genotype formats and apply basic sample/site filters.
-
-Examples:
-
-```bash
-jx gformat -vcf geno.vcf.gz -fmt npy -o out -prefix panel
-jx gformat -file matrix_prefix -fmt vcf --keep keep_samples.txt
-jx gformat -bfile geno -fmt txt --chr 1-5,8 --from-bp 100000 --to-bp 500000
-jx gformat -bfile geno -fmt npy --prune 1 5 0.2
-jx gformat -bfile geno -fmt npy --prune 0.1 5 0.2
-jx gformat -bfile geno -fmt npy --prune 500kb 10 0.2
-```
-
-Key options:
-
-- input: `-vcf/-hmp/-bfile/-file`
-- output: `-fmt {plink,vcf,hmp,txt,npy}`
-- runtime: `-t/--thread/--threads`
-- `-keep`
-- `-extract` (`--extract <file>` or `--extract range <file>`)
-- chromosome/range filters: `--chr`, `--from-bp`, `--to-bp`
-- site filters: `-maf`, `-geno`
-- LD prune: `-prune/--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>`  
-  Numeric window defaults to `kb` (`1` = `1kb`, `0.1` = `100bp`)
-- filter pushdown: `--keep/--extract/--chr/--from-bp/--to-bp/-maf/-geno/-het` are evaluated in Rust readers/kernels (Python CLI parses and forwards arguments)
-- prune mode (default): strict sliding-window + window-local greedy pruning
-  semantics (PLINK-aligned behavior)
-- external backend (optional): set env `JX_LD_PRUNE_BACKEND=plink` to delegate
-  `--prune` to an external PLINK binary in prune-only `-bfile -> -fmt plink` path;
-  override binary with `JX_PLINK_BIN=/path/to/plink`
-- packed PLINK fast path: for chromosome-sorted `-bfile ... -fmt plink`, simple sample/site
-  filters and `--prune` use a Rust packed streaming path that scans/writes `.bed` rows
-  sequentially instead of materializing the whole packed BED matrix in memory
-- for packed streaming `--prune`, `jx gformat` now shows live prune/write progress and accepts
-  explicit thread count via `-t/--thread/--threads`
-
-Outputs:
-
-- converted genotype files
-- `<prefix>.gformat.log`
-
-### 4.12 `gmerge`
-
-Merge multiple genotype datasets.
-
-Examples:
-
-```bash
-jx gmerge -vcf a.vcf.gz b.vcf.gz -fmt vcf -o out -prefix merged
-jx gmerge -bfile A B -fmt plink -sample-prefix
-jx gmerge -vcf a.vcf.gz -file matrix_prefix -fmt npy
-```
-
-Key options:
-
-- repeatable inputs: `-vcf`, `-bfile`, `-file`
-- at least two total inputs required
-- output format: `-fmt {plink,vcf,txt,npy}`
-- sample renaming: `-sample-prefix`
-- merged site filters: `-maf`, `-geno`
-
-Outputs:
-
-- merged genotype files
-- `<prefix>.merge.log`
-
-### 4.13 `hybrid`
-
-Build pairwise hybrid genotype matrix from parent lists.
-
-Examples:
-
-```bash
-jx hybrid -vcf parents.vcf.gz -p1 p1.txt -p2 p2.txt -fmt npy -o out -prefix hybrid
-jx hybrid -bfile geno -p1 male.txt -p2 female.txt -fmt vcf
-```
-
-Key options:
-
-- input: `-vcf/-bfile/-file`
-- required parent lists: `-p1`, `-p2`
-- output: `-fmt {plink,vcf,txt,npy}`
-- `-chunksize`
-
-Outputs:
-
-- hybrid genotype outputs
-- `<prefix>.hybrid.log`
-
-### 4.14 `webui`
-
-Start local JanusX Web UI service.
-
-Examples:
-
-```bash
-jx webui
-jx webui --host 0.0.0.0 --port 8765
-jx webui --root ~/.janusx/webui --no-browser
-```
-
-Key options:
-
-- `--host`
-- `--port`
-- `--root`
-- `--no-browser`
-
-Behavior notes:
-
-- startup cleanup for invalid GWAS history entries
-- current implementation is GWAS-history-first rendering flow
-
-### 4.15 `sim`
-
-Quick synthetic generator (supports unrelated/family/mixed sample structures).
-
-Usage:
-
-```bash
-jx sim <nsnp_k> <n_individuals> <outprefix>
-jx sim <nsnp_k> <n_individuals> <outprefix> -structure mixed -chunksize 10000
-```
-
-Example:
-
-```bash
-jx sim 10 500 demo/test
-jx sim 250 2500 demo/sim_250k_2500 -structure mixed -chunksize 10000 -seed 1
-```
-
-Semantics:
-
-- `nsnp_k`: SNP count in thousands (`10` -> about 10,000 SNPs)
-- second arg: number of individuals
-- third arg: output prefix
-- optional structure controls:
-  - `-structure {unrelated,family,mixed}` (default: `unrelated`)
-  - family layout is auto-configured internally:
-  - for `mixed`, target family fraction is fixed to `0.8`
-  - family block size is fixed to `4` (2 parents + 2 offspring)
-  - if family samples exist, `<prefix>.family.tsv` is written automatically
-- optional streaming controls:
-  - `-chunksize` (if unset, auto-tuned from sample size)
-- MAF controls:
-  - `-maf-high` (upper bound; lower bound is fixed to `0.02`)
-- phenotype controls:
-  - `-pve`, `-ve`, `-trait-name`, `-na-rate`
-
-### 4.16 `simulation`
-
-Extended simulation from existing genotype input.
-
-Examples:
-
-```bash
-jx simulation -vcf geno.vcf.gz -sm single -pve 0.5 -ve 1.0 -o out
-jx simulation -file matrix_prefix -sm garfield -windows 50000 -write-sites
-```
-
-Key options:
-
-- input: `-vcf/-hmp/-bfile/-file`
-- filter: `-maf`, `-geno`, `-chunksize`
-- variance: `-pve`, `-ve`
-- causal mode: `-sm {single,garfield}`
-- `-windows`
-- `-write-sites`
-- `--seed`
-
-Outputs:
-
-- simulated phenotype files (`.pheno*`)
-- optional causal site file (`.causal.sites.tsv`)
-- `<prefix>.sim.log`
-
-### 4.17 `fastq2vcf` (launcher-only)
-
-End-to-end variant pipeline from FASTQ to merged imputed VCF.
-
-Usage:
-
-```bash
-jx fastq2vcf -r ref.fa -i input_dir -w workdir
-jx fastq2vcf -r ref.fa -i 3.gvcf -w workdir -from-step 4 -to-step 6
-```
-
-Step range:
-
-- `-from-step` valid: `1..5`
-- `-to-step` valid: `1..6`
-
-Pipeline steps:
-
-1. `fastp`
-2. `bwamem+markdup`
-3. `bam2gvcf`
-4. `gvcf2gtprep`
-5. `impute_filter`
-6. `mergevcf`
-
-Notes:
-
-- step-4 resume performs strict gVCF integrity checks
-- step-6 cannot be a start step
-- typically requires DLC runtime setup (`jx -update dlc`)
-
-### 4.18 `fastq2count` (launcher-only)
-
-RNA-seq pipeline from FASTQ to count/FPKM/TPM.
-
-Usage:
-
-```bash
-jx fastq2count -r ref.fa -a anno.gtf -i fastq_dir -w workdir
-jx fastq2count -r ref.fa -a anno.gff3 -i work/3.mapping -w work -from-step 3 -to-step 4
-```
-
-Options:
-
-- required: `-r`, `-a`, `-i`, `-w`
-- resume: `-from-step`, `-to-step`
-- RNA control: `-strandness`, `-feature-type`, `-gene-attr`
-- runtime: `-t`, `--threads`
-
-Pipeline steps:
-
-1. `fastp`
-2. `hisat2-index`
-3. `hisat2-align`
-4. `featurecounts + FPKM/TPM`
-
-Execution note:
-
-- UI may display merged preprocess (`fastp+hisat2-index`) while internal checkpoint steps remain 1..4.
-
-### 4.19 `kmer`
-
-K-mer workflow entry with two modes: KMC counting and WASTER tree inference.
-
-Examples:
-
-```bash
-jx kmer -fa sample.fastq.gz --count -o out -prefix sample_k19 -k 19 -t 8
-jx kmer -fa species1.fa species2.fa --tree -o out -prefix species_tree -t 8 --waster-mode 4
-```
-
-Key options:
-
-- required input: `-fa` (one or more FASTQ/FASTA files)
-- mode: `--count` or `--tree` (default falls back to count mode)
-- shared: `-k`, `-t`, `-o`, `-prefix`, `-limit-mem`
-- count mode: `-ci`, `-cx`, `--counter-max`, `--tmp-dir`
-- tree mode: `--waster-mode`, `--waster-sampled`, `--waster-qcs`, `--waster-qcn`, `--waster-pattern`, `--waster-consensus`, `--waster-continue-file`
-
-Outputs:
-
-- count mode: `<prefix>.kmc_pre`, `<prefix>.kmc_suf`
-- tree mode: `<prefix>.waster.nw`, plus optional `.waster.snps.fa` / `.waster.patterns`
-
-### 4.20 `tree`
-
-Tree workflow (current CLI-exposed path is NJ mode).
-
-Examples:
-
-```bash
-jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj
-jx tree -fa aln.fasta -o out --prefix aln_tree -nj bionj
-jx tree -bfile panel -o out --prefix panel_tree --write-phylip -nj
-```
-
-Key options:
-
-- input: `-vcf/-hmp/-file/-bfile/-fa`
-- model: `-nj [exact|bionj|bionj-dist|bionj-jc|bionj-binom|bionj-auto|approx]`
-- filters/runtime: `-maf`, `-geno`, `-het`, `-snps-only`, `-chunksize`, `-t`
-- output controls: `--write-phylip`, `--profile`, `-o`, `-prefix`
-
-Outputs:
-
-- `<prefix>.nwk`
-- `<prefix>.fasta`
-- optional `<prefix>.phy`
-- optional `<prefix>.profile.tsv`
-- log `<prefix>.tree.log`
-
-### 4.21 `benchmark`
-
-FarmCPU benchmark workflow across JanusX / GAPIT / rMVP.
-
-Examples:
-
-```bash
-jx benchmark -bfile example_prefix -p pheno.tsv -n 0
-jx benchmark -vcf example.vcf.gz -p pheno.tsv -n 0 --kernels janusx,gapit,rmvp
-```
-
-Key options:
-
-- input: `-vcf/-hmp/-file/-bfile`, phenotype `-p`, trait selector `-n`
-- kernels: `--kernels janusx,gapit,rmvp`
-- filters/runtime: `-maf`, `-geno`, `-chunksize`, `-t`, `-q`, `-c`
-- analysis controls: `--topk`, `--check`
-- advanced (dev help): FarmCPU grid/threshold tuning flags with `-h -dev`
-
-Outputs:
-
-- benchmark workspace: `<prefix>.farmcpu_bench/`
-- summary tables: `summary/<prefix>.benchmark.tsv`, `.md`
-
-### 4.22 `kmerge` (Python dispatcher mode)
-
-Merge multiple KMC databases to binary k-mer matrix outputs.
-
-Examples:
-
-```bash
-jxpy kmerge -db s1 s2 s3 -o out -prefix merged_bin
-jxpy kmerge -db sampleA.kmc_pre sampleB -o out -prefix panel
-```
-
-Key options:
-
-- required: `-db` (KMC prefixes or `.kmc_pre/.kmc_suf` paths)
-- optional: `-sid`, `-t`, `--max-kmers`, `-kmerf`
-- safety controls: `--max-output-sites`, `--allow-large-output`
-
-Outputs:
-
-- `<prefix>.bin`
-- `<prefix>.bin.id`
-- `<prefix>.bin.site`
-
-### 4.23 `view` (Python dispatcher mode)
-
-Decode JanusX binary files for shell pipelines.
-
-Examples:
-
-```bash
-jxpy view -bin test/kmerge_new.bin | head
-jxpy view -bin test/kmerge_new.bin.site | head
-```
-
-Key options:
-
-- `-bin` (one or more `.bin` / `.bin.site` files)
-
-Behavior:
-
-- `.bin` -> rows of `0/1` strings
-- `.bin.site` -> decoded DNA k-mer rows
-
-### 4.24 `treeplot` (Python dispatcher mode)
-
-Visualize Newick/GRM trees with toytree.
-
-Examples:
-
-```bash
-jxpy treeplot -nwk result.tree.nwk -o out -prefix fig1 --layout c --showlabels -fmt svg
-jxpy treeplot -k panel.grm.npy -kid panel.grm.npy.id -o out -prefix panel_tree --method nj -fmt pdf
-```
-
-Key options:
-
-- input: `-nwk` or `-k` (GRM)
-- GRM metadata: `-kid`
-- layout/render: `-layout`, `-root`, `-showlabels`, `-regexlabels`, `--node-size`, `--edge-width`, `--scale-bar`, `--hover`
-- output: `-fmt`, `-o`, `-prefix`, `--height`, `-ratio`
-
-Outputs:
-
-- `<prefix>.tree.<fmt>` (`svg/png/pdf/html`)
-- `<prefix>.tree.nwk` when GRM is converted to NJ tree
-
-### 4.25 `gblupbench` (Python dispatcher mode)
-
-GBLUP engine benchmark across JanusX / sommer / rrBLUP / BLUPF90 family / HIBLUP.
-
-Examples:
-
-```bash
-jxpy gblupbench -bfile example_prefix -p pheno.tsv -n 0
-jxpy gblupbench -vcf example.vcf.gz -p pheno.tsv -n 0 --engines janusx,sommer,rrblup
-```
-
-Key options:
-
-- input: `-vcf/-hmp/-file/-bfile`, phenotype `-p`, trait selector `-n`
-- engine set: `--engines janusx,sommer,rrblup,blupf90,blupf90apy,hiblup`
-- CV/runtime: `--cv`, `--seed`, `-t`, `-chunksize`, `-limit-mem`
-- utility: `--check` (env + smoke test)
-
-Outputs:
-
-- benchmark workspace: `<prefix>.gblup_bench/`
-- summary: `summary/<prefix>.gblupbench.tsv`, `.md`
-- prediction compare artifacts: `summary/<prefix>.gblupbench.pred*`
-
-### 4.26 `beam` (direct script entry)
-
-AND-combination beam search over `JXBIN001` (`.bin`) genotype rows.
-
-Entry:
-
-```bash
-python -m janusx.script.beam -bin panel.bin -p pheno.tsv -n 0 -m 3 -nsnp 5 -ext 50000
-```
-
-Key options:
-
-- required: `-bin`, `-p`
-- trait selection: `-n`
-- search control: `-m` (max-pick), `-nsnp`, `-ext`, `-step`
-- optional output prefix: `-o`
-
-Outputs:
-
-- `<prefix>.beam.tsv`
-- `<prefix>.beam.windows.tsv`
+- `sim`: quick simulation workflow
+- `simulation`: extended simulation and benchmarking workflow
+- `benchmark`: FarmCPU benchmark workflow
+- `gblupbench`: GBLUP benchmark workflow
+- `bayesbench`: packed Bayes kernel benchmark workflow
+- `garfieldbench`: GARFIELD local-interval benchmark workflow
 
 ## 5. Practical notes
 
-- Use `jx <module> -h` as the final authority when flags change.
-- For `-file` input, keep `prefix.id` consistent with genotype column order.
-- For large cohorts, prefer streaming/chunked workflows (`-chunksize`, low-memory modes).
-- Keep generated log files for reproducibility (`*.log`).
-- For a full structure/entrypoint matrix, see `doc/PROJECT_MAP.md`.
+- Use `jx <module> -h` as the source of truth for flags. The dispatcher help is intentionally broad; module help is precise.
+- Prefer PLINK BED input when you expect to rerun the same cohort many times. Packed BED paths are reused more efficiently than repeated VCF parsing.
+- Use `-prefix` deliberately. It makes downstream files easier to chain into `postgwas`, `postgs`, and `webui`.
+- For large BED-based GWAS, `-fast` is the easiest switch to test first.
+- For large GS runs, use `-debug` when you need thread policy, BLAS backend, or packed-path diagnostics.
+- There is also a repository script `python -m janusx.script.beam`, but it is not part of the main `jx -h` module surface.

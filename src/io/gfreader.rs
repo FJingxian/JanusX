@@ -402,6 +402,109 @@ fn normalize_chr_key_local(chrom: &str) -> String {
     s.trim().to_ascii_uppercase()
 }
 
+#[inline]
+fn env_truthy_local(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let key = raw.trim().to_ascii_lowercase();
+            matches!(key.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+#[inline]
+fn gfreader_rss_debug_enabled() -> bool {
+    env_truthy_local("JX_GFREADER_RSS_DEBUG")
+        || env_truthy_local("JX_PACKED_IO_DEBUG")
+        || env_truthy_local("JX_GS_DEBUG_STAGE")
+}
+
+#[inline]
+fn format_debug_bytes_local(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut fields = text.split_whitespace();
+    let _size_pages = fields.next()?;
+    let rss_pages: u64 = fields.next()?.parse().ok()?;
+    // SAFETY: sysconf is thread-safe for _SC_PAGESIZE and has no side effects.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some((rss_pages.saturating_mul(page_size as u64), "current"))
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: ru points to valid writable storage for getrusage.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: getrusage succeeded and initialized ru.
+    let ru = unsafe { ru.assume_init() };
+    Some((ru.ru_maxrss as u64, "peak"))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: ru points to valid writable storage for getrusage.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: getrusage succeeded and initialized ru.
+    let ru = unsafe { ru.assume_init() };
+    Some(((ru.ru_maxrss as u64).saturating_mul(1024), "peak"))
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn process_rss_bytes_local() -> Option<(u64, &'static str)> {
+    None
+}
+
+fn emit_gfreader_rss_debug(stage: &str, detail: &str) {
+    if !gfreader_rss_debug_enabled() {
+        return;
+    }
+    match process_rss_bytes_local() {
+        Some((rss_bytes, rss_kind)) => {
+            println!(
+                "[GFREADER-DEBUG] {stage} rss={} rss_kind={} {detail}",
+                format_debug_bytes_local(rss_bytes),
+                rss_kind,
+            );
+        }
+        None => {
+            println!("[GFREADER-DEBUG] {stage} rss=NA rss_kind=unavailable {detail}");
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
 fn parse_npy_shape_local(header: &str) -> Result<(usize, usize), String> {
     let shape_key_pos = header
         .find("'shape'")
@@ -3585,6 +3688,10 @@ pub fn load_bed_2bit_packed<'py>(
             if n_samples == 0 {
                 return Err("no samples found in PLINK input".to_string());
             }
+            emit_gfreader_rss_debug(
+                "load_bed_2bit_packed/read_fam",
+                &format!("prefix={bed_prefix} n_samples={n_samples}"),
+            );
 
             let bed_path = format!("{bed_prefix}.bed");
             let bed_file = File::open(&bed_path)
@@ -3607,6 +3714,13 @@ pub fn load_bed_2bit_packed<'py>(
             }
             let n_snps = data_len / bytes_per_snp;
             let packed_src = &mmap[3..];
+            emit_gfreader_rss_debug(
+                "load_bed_2bit_packed/mmap_ready",
+                &format!(
+                    "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} payload={}",
+                    format_debug_bytes_local(packed_src.len() as u64),
+                ),
+            );
 
             let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
             let mut maf: Vec<f32> = vec![0.0; n_snps];
@@ -3634,7 +3748,23 @@ pub fn load_bed_2bit_packed<'py>(
                         *std_dst = 0.0_f32;
                     }
                 });
+            let stats_bytes = ((missing_rate.len() + maf.len() + std_denom.len())
+                * std::mem::size_of::<f32>()) as u64;
+            emit_gfreader_rss_debug(
+                "load_bed_2bit_packed/row_stats_ready",
+                &format!(
+                    "n_snps={n_snps} stats_bytes={} arrays=3xf32",
+                    format_debug_bytes_local(stats_bytes),
+                ),
+            );
             let packed = packed_src.to_vec();
+            emit_gfreader_rss_debug(
+                "load_bed_2bit_packed/packed_copy_done",
+                &format!(
+                    "packed_bytes={} n_snps={n_snps} bytes_per_snp={bytes_per_snp}",
+                    format_debug_bytes_local(packed.len() as u64),
+                ),
+            );
             Ok((
                 packed,
                 missing_rate,
@@ -3736,11 +3866,19 @@ pub fn prepare_bed_2bit_packed<'py>(
             if n_samples == 0 {
                 return Err("no samples found in PLINK input".to_string());
             }
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/read_fam",
+                &format!("prefix={bed_prefix} n_samples={n_samples}"),
+            );
             let sites = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
             let n_snps = sites.len();
             if n_snps == 0 {
                 return Err("no SNP sites found in PLINK BIM input".to_string());
             }
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/read_bim",
+                &format!("prefix={bed_prefix} n_snps={n_snps}"),
+            );
 
             let bed_path = format!("{bed_prefix}.bed");
             let bed_file = File::open(&bed_path)
@@ -3769,6 +3907,13 @@ pub fn prepare_bed_2bit_packed<'py>(
             }
 
             let packed_full = &mmap[3..];
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/mmap_ready",
+                &format!(
+                    "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} payload={}",
+                    format_debug_bytes_local(packed_full.len() as u64),
+                ),
+            );
 
             let apply_het_filter = het_threshold > 0.0_f32;
             #[derive(Clone, Copy)]
@@ -3817,6 +3962,17 @@ pub fn prepare_bed_2bit_packed<'py>(
                     row_scan.len()
                 ));
             }
+            let row_scan_bytes =
+                (row_scan.len() * std::mem::size_of::<RowScanLite>()) as u64;
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/row_scan_ready",
+                &format!(
+                    "n_snps={n_snps} row_scan_bytes={} het_filter={} snps_only={}",
+                    format_debug_bytes_local(row_scan_bytes),
+                    if apply_het_filter { 1 } else { 0 },
+                    if snps_only { 1 } else { 0 },
+                ),
+            );
 
             let site_keep: Vec<bool> = row_scan.iter().map(|x| x.keep).collect();
             let kept_n = site_keep.iter().filter(|&&x| x).count();
@@ -3826,6 +3982,14 @@ pub fn prepare_bed_2bit_packed<'py>(
                         .to_string(),
                 );
             }
+            emit_gfreader_rss_debug(
+                "prepare_bed_2bit_packed/site_keep_ready",
+                &format!(
+                    "n_snps={n_snps} kept_n={kept_n} dropped={} keep_ratio={:.6}",
+                    n_snps.saturating_sub(kept_n),
+                    (kept_n as f64) / (n_snps as f64),
+                ),
+            );
 
             let (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep) = if kept_n == n_snps {
                 let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
@@ -3844,7 +4008,22 @@ pub fn prepare_bed_2bit_packed<'py>(
                     std_keep.push(std_v);
                     row_flip_keep.push(rs.flip);
                 }
-                (packed_full.to_vec(), miss_keep, maf_keep, std_keep, row_flip_keep)
+                let packed_keep = packed_full.to_vec();
+                emit_gfreader_rss_debug(
+                    "prepare_bed_2bit_packed/full_copy_done",
+                    &format!(
+                        "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
+                        format_debug_bytes_local(packed_keep.len() as u64),
+                        format_debug_bytes_local(
+                            ((miss_keep.len() + maf_keep.len() + std_keep.len())
+                                * std::mem::size_of::<f32>()) as u64
+                        ),
+                        format_debug_bytes_local(
+                            (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
+                        ),
+                    ),
+                );
+                (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep)
             } else {
                 let mut packed_keep = vec![0u8; kept_n * bytes_per_snp];
                 let mut miss_keep = Vec::<f32>::with_capacity(kept_n);
@@ -3874,6 +4053,20 @@ pub fn prepare_bed_2bit_packed<'py>(
                     dst = dst.saturating_add(1);
                 }
                 debug_assert_eq!(dst, kept_n);
+                emit_gfreader_rss_debug(
+                    "prepare_bed_2bit_packed/subset_copy_done",
+                    &format!(
+                        "kept_n={kept_n} packed_bytes={} stats_bytes={} row_flip_bytes={}",
+                        format_debug_bytes_local(packed_keep.len() as u64),
+                        format_debug_bytes_local(
+                            ((miss_keep.len() + maf_keep.len() + std_keep.len())
+                                * std::mem::size_of::<f32>()) as u64
+                        ),
+                        format_debug_bytes_local(
+                            (row_flip_keep.len() * std::mem::size_of::<bool>()) as u64
+                        ),
+                    ),
+                );
                 (packed_keep, miss_keep, maf_keep, std_keep, row_flip_keep)
             };
 

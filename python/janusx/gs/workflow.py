@@ -363,7 +363,7 @@ def _emit_packed_load_debug(
                 f"bytes_per_snp={bytes_per_snp} "
                 f"packed={_format_debug_bytes(packed_bytes)} "
                 f"source_bed_payload={_format_debug_bytes(source_bed_payload_bytes)} "
-                f"transient_peak_est={_format_debug_bytes(source_bed_payload_bytes + packed_bytes)} "
+                f"theoretical_load_peak_est={_format_debug_bytes(source_bed_payload_bytes + packed_bytes)} "
                 f"rss_after_load={_format_debug_bytes(_get_process_rss_bytes())}"
             ),
             flush=True,
@@ -2954,6 +2954,8 @@ def _estimate_rrblup_lambda_subsample_reml(
         site_keep_raw_obj: typing.Any,
         site_keep_arr: np.ndarray | None,
         packed_rows: int,
+        *,
+        packed_is_lazy: bool,
     ) -> tuple[str, str]:
         if site_keep_arr is None:
             if site_keep_raw_obj is None:
@@ -2972,9 +2974,18 @@ def _estimate_rrblup_lambda_subsample_reml(
         keep_true = int(np.count_nonzero(site_keep_arr))
         if keep_true == keep_len and bool(np.all(site_keep_arr)):
             return "identity", f"site_keep len={keep_len}, all_true=1"
+        if packed_is_lazy:
+            return (
+                "active_mask_lazy_map",
+                "site_keep "
+                f"len={keep_len}, keep_true={keep_true}, packed_rows={int(packed_rows)}, "
+                "packed_mode=lazy_full",
+            )
         return (
-            "subset_copy_candidate",
-            f"site_keep len={keep_len}, keep_true={keep_true}, packed_rows={int(packed_rows)}",
+            "subset_mask_compact",
+            "site_keep "
+            f"len={keep_len}, keep_true={keep_true}, packed_rows={int(packed_rows)}, "
+            "packed_mode=compact",
         )
 
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
@@ -3040,6 +3051,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                 site_keep_raw,
                 site_keep_arg,
                 int(maf_arg.shape[0]),
+                packed_is_lazy=bool(packed_is_lazy),
             )
             he_diag["he_site_keep_mode"] = str(he_site_keep_mode)
 
@@ -13894,6 +13906,9 @@ def _run_gs_pipeline(
     if args is None:
         args = parse_args(argv)
     debug_mode = bool(getattr(args, "debug", False))
+    if bool(debug_mode):
+        os.environ.setdefault("JX_GFREADER_RSS_DEBUG", "1")
+        os.environ.setdefault("JX_GS_DEBUG_STAGE", "1")
 
     gblup_modes = _parse_gblup_kernel_modes(
         typing.cast(list[list[str]] | None, args.GBLUP)

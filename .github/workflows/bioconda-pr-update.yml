@@ -125,17 +125,54 @@ jobs:
           import os
           import re
           import shutil
+          import time
           import urllib.request
+          import urllib.error
           from pathlib import Path
 
           version = os.environ["VERSION"]
           source_url = f"https://files.pythonhosted.org/packages/source/j/janusx/janusx-{version}.tar.gz"
-          try:
-              data = urllib.request.urlopen(source_url, timeout=120).read()
-          except Exception as exc:
-              raise SystemExit(
-                  f"Failed to fetch PyPI sdist once (no polling): {source_url}; {exc}"
-              ) from exc
+
+          def fetch_pypi_sdist_with_poll(url: str) -> bytes:
+              timeout_s = int(os.environ.get("BIOCONDA_PYPI_SDIST_TIMEOUT_SECONDS", "900"))
+              interval_s = int(os.environ.get("BIOCONDA_PYPI_SDIST_POLL_SECONDS", "15"))
+              deadline = time.time() + max(timeout_s, 1)
+              attempt = 0
+              last_err: Exception | None = None
+              while True:
+                  attempt += 1
+                  try:
+                      with urllib.request.urlopen(url, timeout=120) as resp:
+                          data = resp.read()
+                      if not data:
+                          raise RuntimeError("empty response body")
+                      print(
+                          f"[bioconda] PyPI sdist available after attempt {attempt}: "
+                          f"{url} ({len(data)} bytes)"
+                      )
+                      return data
+                  except urllib.error.HTTPError as exc:
+                      last_err = exc
+                      detail = f"HTTP {exc.code}"
+                  except Exception as exc:
+                      last_err = exc
+                      detail = str(exc)
+
+                  now = time.time()
+                  if now >= deadline:
+                      raise SystemExit(
+                          f"Failed to fetch PyPI sdist after {attempt} attempts over "
+                          f"{timeout_s}s: {url}; last_error={last_err}"
+                      ) from last_err
+
+                  sleep_s = min(interval_s, max(1, int(deadline - now)))
+                  print(
+                      f"[bioconda] PyPI sdist not ready yet (attempt {attempt}, "
+                      f"detail={detail}); sleeping {sleep_s}s"
+                  )
+                  time.sleep(sleep_s)
+
+          data = fetch_pypi_sdist_with_poll(source_url)
           sha = hashlib.sha256(data).hexdigest()
           md5 = hashlib.md5(data).hexdigest()
 

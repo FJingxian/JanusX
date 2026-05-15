@@ -8,6 +8,7 @@ OPENBLAS_PREFIX="${OPENBLAS_PREFIX:-/tmp/janusx-openblas-prefix}"
 OPENBLAS_TARBALL="${OPENBLAS_BUILD_ROOT}/OpenBLAS-${OPENBLAS_VERSION}.tar.gz"
 OPENBLAS_SRC_DIR="${OPENBLAS_BUILD_ROOT}/OpenBLAS-${OPENBLAS_VERSION}"
 OPENBLAS_JOBS="${OPENBLAS_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)}"
+OPENBLAS_BUILD_TARGET="${OPENBLAS_BUILD_TARGET:-shared}"
 
 mkdir -p "${OPENBLAS_BUILD_ROOT}"
 rm -rf "${OPENBLAS_PREFIX}" "${OPENBLAS_SRC_DIR}"
@@ -42,9 +43,14 @@ case "${arch}" in
 esac
 
 echo "[build_linux_openblas] version=${OPENBLAS_VERSION} arch=${arch} jobs=${OPENBLAS_JOBS}"
+echo "[build_linux_openblas] build_target=${OPENBLAS_BUILD_TARGET}"
 echo "[build_linux_openblas] make args: ${make_args[*]}"
 
-make -C "${OPENBLAS_SRC_DIR}" -j"${OPENBLAS_JOBS}" "${make_args[@]}"
+# Use `shared` instead of the default `all` target so wheel builds compile the
+# required shared library without running OpenBLAS self-tests. The default
+# target expands to `tests`, and ARM64 runners can fail in optional SBGEMM test
+# binaries even when the library itself is built correctly.
+make -C "${OPENBLAS_SRC_DIR}" -j"${OPENBLAS_JOBS}" "${make_args[@]}" "${OPENBLAS_BUILD_TARGET}"
 make -C "${OPENBLAS_SRC_DIR}" PREFIX="${OPENBLAS_PREFIX}" "${make_args[@]}" install
 
 if [[ ! -d "${OPENBLAS_PREFIX}/lib" ]]; then

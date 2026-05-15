@@ -10,6 +10,10 @@ from janusx.gfreader import (
     inspect_genotype_file,
     load_bed_2bit_packed,
 )
+try:
+    from janusx.gfreader import scan_bed_2bit_packed_stats
+except Exception:
+    scan_bed_2bit_packed_stats = None  # type: ignore[assignment]
 
 try:
     from janusx.gfreader import prepare_bed_2bit_packed
@@ -58,6 +62,34 @@ def _plink_snp_mask(prefix: str) -> np.ndarray:
             a1 = str(toks[5])
             mask.append(_is_simple_snp_allele(a0) and _is_simple_snp_allele(a1))
     return np.asarray(mask, dtype=np.bool_)
+
+
+def _open_plink_bed_payload_memmap(
+    prefix: str,
+    *,
+    n_samples: int,
+    n_snps: int,
+) -> np.memmap:
+    plink_prefix = _normalize_plink_prefix(prefix)
+    bed_path = f"{plink_prefix}.bed"
+    if not os.path.isfile(bed_path):
+        raise ValueError(f"Cannot find BED file for PLINK prefix: {plink_prefix}")
+    bytes_per_snp = (int(n_samples) + 3) // 4
+    expected_size = 3 + int(n_snps) * int(bytes_per_snp)
+    actual_size = int(os.path.getsize(bed_path))
+    if actual_size != expected_size:
+        raise ValueError(
+            f"BED payload size mismatch: file={actual_size}, expected={expected_size} "
+            f"(n_samples={int(n_samples)}, n_snps={int(n_snps)}, bytes_per_snp={int(bytes_per_snp)})"
+        )
+    return np.memmap(
+        bed_path,
+        dtype=np.uint8,
+        mode="r",
+        offset=3,
+        shape=(int(n_snps), int(bytes_per_snp)),
+        order="C",
+    )
 
 
 def _packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
@@ -183,11 +215,142 @@ def prepare_packed_ctx_from_plink(
                     dtype=np.int64,
                 ),
                 "packed_filter_mode": "compact",
+                "packed_storage": "owned",
                 "source_prefix": str(plink_prefix),
             }
             return sample_ids_arr, packed_ctx
         except Exception:
             # Fall through to legacy path for compatibility.
+            pass
+
+    if scan_bed_2bit_packed_stats is not None:
+        try:
+            miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
+                str(plink_prefix)
+            )
+            if int(packed_n) != int(sample_ids_arr.shape[0]):
+                raise ValueError(
+                    f"Packed sample size mismatch: packed n={int(packed_n)}, expected {sample_ids_arr.shape[0]}"
+                )
+
+            miss_arr = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1))
+            maf_arr = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1))
+            std_arr = np.ascontiguousarray(np.asarray(std_raw, dtype=np.float32).reshape(-1))
+            row_flip_full = np.ascontiguousarray(
+                np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            het_arr = np.ascontiguousarray(np.asarray(het_raw, dtype=np.float32).reshape(-1))
+            n_total_sites = int(maf_arr.shape[0])
+
+            keep = np.ones((n_total_sites,), dtype=np.bool_)
+            maf_thr = float(maf)
+            if maf_thr > 0.0:
+                keep &= (maf_arr >= maf_thr) & (maf_arr <= (1.0 - maf_thr))
+            miss_thr = float(missing_rate)
+            if miss_thr < 1.0:
+                keep &= miss_arr <= miss_thr
+            het_thr = float(het_threshold)
+            if het_thr > 0.0:
+                keep &= (het_arr >= het_thr) & (het_arr <= (1.0 - het_thr))
+            if bool(snps_only):
+                snp_mask = _plink_snp_mask(str(plink_prefix))
+                if snp_mask.shape[0] != keep.shape[0]:
+                    raise ValueError(
+                        f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
+                    )
+                keep &= snp_mask
+            if not np.any(keep):
+                raise ValueError(
+                    "No SNPs left after packed BED filtering. Please relax --maf/--geno thresholds."
+                )
+
+            site_keep = np.ascontiguousarray(
+                np.asarray(keep, dtype=np.bool_).reshape(-1),
+                dtype=np.bool_,
+            )
+            keep_idx = np.ascontiguousarray(
+                np.flatnonzero(site_keep).astype(np.int64, copy=False),
+                dtype=np.int64,
+            )
+            keep_ratio = (
+                float(keep_idx.shape[0]) / float(site_keep.shape[0])
+                if int(site_keep.shape[0]) > 0
+                else 0.0
+            )
+            use_lazy = False
+            if filter_mode_key == "lazy":
+                use_lazy = True
+            elif filter_mode_key == "auto":
+                lazy_keep_ratio = float(
+                    os.environ.get("JX_PACKED_LAZY_KEEP_RATIO", "0.98").strip() or "0.98"
+                )
+                if not np.isfinite(lazy_keep_ratio):
+                    lazy_keep_ratio = 0.98
+                lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
+                use_lazy = bool(keep_ratio >= lazy_keep_ratio)
+
+            if use_lazy:
+                packed_memmap = _open_plink_bed_payload_memmap(
+                    str(plink_prefix),
+                    n_samples=int(packed_n),
+                    n_snps=n_total_sites,
+                )
+                packed_ctx = {
+                    "packed": packed_memmap,
+                    "missing_rate": miss_arr,
+                    "maf": maf_arr,
+                    "std_denom": std_arr,
+                    "row_flip": row_flip_full,
+                    "site_keep": site_keep,
+                    "active_row_idx": keep_idx,
+                    "n_samples": int(packed_n),
+                    "n_total_sites": int(site_keep.shape[0]),
+                    "n_active_sites": int(keep_idx.shape[0]),
+                    "packed_filter_mode": "lazy_full",
+                    "packed_storage": "memmap",
+                    "source_prefix": str(plink_prefix),
+                }
+                return sample_ids_arr, packed_ctx
+
+            packed_memmap = _open_plink_bed_payload_memmap(
+                str(plink_prefix),
+                n_samples=int(packed_n),
+                n_snps=n_total_sites,
+            )
+            if not np.all(keep):
+                packed = np.ascontiguousarray(
+                    np.asarray(packed_memmap[keep], dtype=np.uint8),
+                    dtype=np.uint8,
+                )
+                miss_keep = np.ascontiguousarray(miss_arr[keep], dtype=np.float32)
+                maf_keep = np.ascontiguousarray(maf_arr[keep], dtype=np.float32)
+                std_keep = np.ascontiguousarray(std_arr[keep], dtype=np.float32)
+                row_flip = np.ascontiguousarray(row_flip_full[keep], dtype=np.bool_)
+            else:
+                packed = np.ascontiguousarray(np.asarray(packed_memmap, dtype=np.uint8), dtype=np.uint8)
+                miss_keep = miss_arr
+                maf_keep = maf_arr
+                std_keep = std_arr
+                row_flip = row_flip_full
+
+            packed_ctx = {
+                "packed": packed,
+                "missing_rate": miss_keep,
+                "maf": maf_keep,
+                "std_denom": std_keep,
+                "row_flip": row_flip,
+                "site_keep": site_keep,
+                "active_row_idx": keep_idx,
+                "n_samples": int(packed_n),
+                "n_total_sites": int(site_keep.shape[0]),
+                "n_active_sites": int(keep_idx.shape[0]),
+                "packed_filter_mode": "compact",
+                "packed_storage": "owned",
+                "source_prefix": str(plink_prefix),
+            }
+            return sample_ids_arr, packed_ctx
+        except Exception:
             pass
 
     packed_raw, miss_raw, maf_raw, std_raw, packed_n = load_bed_2bit_packed(str(plink_prefix))
@@ -267,6 +430,7 @@ def prepare_packed_ctx_from_plink(
             "n_total_sites": int(site_keep.shape[0]),
             "n_active_sites": int(keep_idx.shape[0]),
             "packed_filter_mode": "lazy_full",
+            "packed_storage": "owned",
             "source_prefix": str(plink_prefix),
         }
         return sample_ids_arr, packed_ctx
@@ -292,6 +456,7 @@ def prepare_packed_ctx_from_plink(
         "n_total_sites": int(site_keep.shape[0]),
         "n_active_sites": int(keep_idx.shape[0]),
         "packed_filter_mode": "compact",
+        "packed_storage": "owned",
         "source_prefix": str(plink_prefix),
     }
     return sample_ids_arr, packed_ctx

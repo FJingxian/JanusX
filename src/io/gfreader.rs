@@ -3790,6 +3790,162 @@ pub fn load_bed_2bit_packed<'py>(
     Ok((packed_arr, miss_arr, maf_arr, denom_arr, n_samples))
 }
 
+#[pyfunction]
+pub fn scan_bed_2bit_packed_stats<'py>(
+    py: Python<'py>,
+    prefix: String,
+) -> PyResult<(
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<f32>>,
+    usize,
+)> {
+    let mut bed_prefix = prefix;
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+    let (missing_rate, maf, std_denom, row_flip, het_rate, n_samples, n_snps) = py
+        .detach(move || -> Result<
+            (
+                Vec<f32>,
+                Vec<f32>,
+                Vec<f32>,
+                Vec<bool>,
+                Vec<f32>,
+                usize,
+                usize,
+            ),
+            String,
+        > {
+            let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+            let n_samples = samples.len();
+            if n_samples == 0 {
+                return Err("no samples found in PLINK input".to_string());
+            }
+            emit_gfreader_rss_debug(
+                "scan_bed_2bit_packed_stats/read_fam",
+                &format!("prefix={bed_prefix} n_samples={n_samples}"),
+            );
+
+            let bed_path = format!("{bed_prefix}.bed");
+            let bed_file = File::open(&bed_path)
+                .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+            let mmap = unsafe { Mmap::map(&bed_file) }
+                .map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 {
+                return Err("BED too small".to_string());
+            }
+            if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+                return Err("Only SNP-major BED supported".to_string());
+            }
+
+            let bytes_per_snp = (n_samples + 3) / 4;
+            let data_len = mmap.len() - 3;
+            if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+                ));
+            }
+            let n_snps = data_len / bytes_per_snp;
+            let packed_src = &mmap[3..];
+            emit_gfreader_rss_debug(
+                "scan_bed_2bit_packed_stats/mmap_ready",
+                &format!(
+                    "prefix={bed_prefix} n_samples={n_samples} n_snps={n_snps} bytes_per_snp={bytes_per_snp} payload={}",
+                    format_debug_bytes_local(packed_src.len() as u64),
+                ),
+            );
+
+            let mut missing_rate: Vec<f32> = vec![0.0; n_snps];
+            let mut maf: Vec<f32> = vec![0.0; n_snps];
+            let mut std_denom: Vec<f32> = vec![0.0; n_snps];
+            let mut row_flip: Vec<bool> = vec![false; n_snps];
+            let mut het_rate: Vec<f32> = vec![0.0; n_snps];
+
+            missing_rate
+                .par_iter_mut()
+                .zip(maf.par_iter_mut())
+                .zip(std_denom.par_iter_mut())
+                .zip(row_flip.par_iter_mut())
+                .zip(het_rate.par_iter_mut())
+                .enumerate()
+                .for_each(
+                    |(snp_idx, ((((miss_dst, maf_dst), std_dst), row_flip_dst), het_dst))| {
+                        let row =
+                            &packed_src[snp_idx * bytes_per_snp..(snp_idx + 1) * bytes_per_snp];
+                        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                        let non_missing = n_samples.saturating_sub(missing);
+                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+
+                        *miss_dst = (missing as f32) / (n_samples as f32);
+                        if non_missing > 0 {
+                            let p_alt = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                            let maf_v = p_alt.min(1.0_f32 - p_alt);
+                            *maf_dst = maf_v;
+                            let d = (2.0_f32 * p_alt * (1.0_f32 - p_alt)).sqrt();
+                            *std_dst = if d.is_finite() { d } else { 0.0_f32 };
+                            *row_flip_dst = p_alt > 0.5_f32;
+                            *het_dst = (het as f32) / (non_missing as f32);
+                        } else {
+                            *maf_dst = 0.0_f32;
+                            *std_dst = 0.0_f32;
+                            *row_flip_dst = false;
+                            *het_dst = 0.0_f32;
+                        }
+                    },
+                );
+
+            let stats_bytes = ((missing_rate.len() + maf.len() + std_denom.len() + het_rate.len())
+                * std::mem::size_of::<f32>()
+                + row_flip.len() * std::mem::size_of::<bool>()) as u64;
+            emit_gfreader_rss_debug(
+                "scan_bed_2bit_packed_stats/row_stats_ready",
+                &format!(
+                    "n_snps={n_snps} stats_bytes={} arrays=4xf32+1xbool",
+                    format_debug_bytes_local(stats_bytes),
+                ),
+            );
+
+            Ok((
+                missing_rate,
+                maf,
+                std_denom,
+                row_flip,
+                het_rate,
+                n_samples,
+                n_snps,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?;
+
+    if maf.len() != n_snps {
+        return Err(PyRuntimeError::new_err(
+            "internal error: stats rows mismatch after BED scan",
+        ));
+    }
+    #[allow(deprecated)]
+    let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(missing_rate)).into_bound();
+    #[allow(deprecated)]
+    let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound();
+    #[allow(deprecated)]
+    let denom_arr = PyArray1::from_owned_array(py, Array1::from_vec(std_denom)).into_bound();
+    #[allow(deprecated)]
+    let row_flip_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_flip)).into_bound();
+    #[allow(deprecated)]
+    let het_arr = PyArray1::from_owned_array(py, Array1::from_vec(het_rate)).into_bound();
+    Ok((
+        miss_arr,
+        maf_arr,
+        denom_arr,
+        row_flip_arr,
+        het_arr,
+        n_samples,
+    ))
+}
+
 #[inline]
 fn _is_simple_snp_allele(a: &str) -> bool {
     let t = a.trim().to_ascii_uppercase();

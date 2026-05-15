@@ -338,6 +338,7 @@ def _emit_packed_load_debug(
             )
         )
         filter_mode = str(packed_ctx.get("packed_filter_mode", "compact")).strip() or "compact"
+        packed_storage = str(packed_ctx.get("packed_storage", "owned")).strip() or "owned"
         site_keep_raw = packed_ctx.get("site_keep", None)
         source_rows = packed_rows
         if site_keep_raw is not None:
@@ -360,6 +361,7 @@ def _emit_packed_load_debug(
                 f"source_rows={source_rows} "
                 f"dropped={dropped_rows} "
                 f"mode={filter_mode} "
+                f"storage={packed_storage} "
                 f"bytes_per_snp={bytes_per_snp} "
                 f"packed={_format_debug_bytes(packed_bytes)} "
                 f"source_bed_payload={_format_debug_bytes(source_bed_payload_bytes)} "

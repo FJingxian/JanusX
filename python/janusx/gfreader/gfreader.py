@@ -21,6 +21,10 @@ from janusx.janusx import (
     SiteInfo,
 )
 try:
+    from janusx.janusx import scan_bed_2bit_packed_stats as _scan_bed_2bit_packed_stats
+except Exception:
+    _scan_bed_2bit_packed_stats = None
+try:
     from janusx.janusx import prepare_bed_2bit_packed as _prepare_bed_2bit_packed
 except Exception:
     _prepare_bed_2bit_packed = None
@@ -87,6 +91,28 @@ def load_bed_2bit_packed(prefix: str):
     n_samples : int
     """
     return _load_bed_2bit_packed(str(prefix))
+
+
+def scan_bed_2bit_packed_stats(prefix: str):
+    """
+    Scan PLINK BED genotypes and return per-SNP statistics without copying
+    the packed payload into Python-owned memory.
+
+    Returns
+    -------
+    missing_rate : np.ndarray[float32], shape (n_snps,)
+    maf : np.ndarray[float32], shape (n_snps,)
+    std_denom : np.ndarray[float32], shape (n_snps,)
+    row_flip : np.ndarray[bool], shape (n_snps,)
+    het_rate : np.ndarray[float32], shape (n_snps,)
+    n_samples : int
+    """
+    if _scan_bed_2bit_packed_stats is None:
+        raise RuntimeError(
+            "scan_bed_2bit_packed_stats is unavailable in Rust extension. "
+            "Please rebuild/install JanusX."
+        )
+    return _scan_bed_2bit_packed_stats(str(prefix))
 
 
 def prepare_bed_2bit_packed(

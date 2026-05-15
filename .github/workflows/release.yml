@@ -55,7 +55,7 @@ jobs:
             use_zigbuild: false
             asset_suffix: darwin-universal
             ext: ""
-          - runner: windows-latest
+          - runner: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             rust_targets: x86_64-pc-windows-msvc
             use_zigbuild: false
@@ -63,7 +63,7 @@ jobs:
             ext: exe
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -89,9 +89,28 @@ jobs:
 
       - name: Set up Zig (Linux compatibility build)
         if: ${{ matrix.use_zigbuild }}
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.14.0
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu) ZIG_ARCH=x86_64 ;;
+            aarch64-unknown-linux-gnu) ZIG_ARCH=aarch64 ;;
+            *)
+              echo "Unsupported Zig install target: ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+          ZIG_BASENAME="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
+          ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_BASENAME}.tar.xz"
+          ZIG_ROOT="${RUNNER_TEMP}/${ZIG_BASENAME}"
+          rm -rf "${ZIG_ROOT}"
+          curl --retry 5 --retry-connrefused --location --silent --show-error --fail \
+            "${ZIG_URL}" -o "${RUNNER_TEMP}/${ZIG_BASENAME}.tar.xz"
+          mkdir -p "${ZIG_ROOT}"
+          tar -xJf "${RUNNER_TEMP}/${ZIG_BASENAME}.tar.xz" -C "${ZIG_ROOT}" --strip-components=1
+          echo "${ZIG_ROOT}" >> "${GITHUB_PATH}"
+          "${ZIG_ROOT}/zig" version
 
       - name: Install cargo-zigbuild
         if: ${{ matrix.use_zigbuild }}
@@ -255,7 +274,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE." }
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: installer-${{ matrix.asset_suffix }}
           path: ${{ env.PACKAGED_FILE }}
@@ -422,7 +441,7 @@ jobs:
             expected_backend: accelerate
             upload_wheel: "true"
           - label: windows-x86_64
-            runner: windows-latest
+            runner: windows-2025-vs2026
             platform: windows
             python-version: "3.10"
             target: x86_64-pc-windows-msvc
@@ -430,10 +449,10 @@ jobs:
             prefer_accelerate: "0"
             expected_backend: openblas
             upload_wheel: "true"
-          # Build Windows ARM64 wheel via cross-target on windows-latest.
+          # Build Windows ARM64 wheel via cross-target on windows-2025-vs2026.
           # If your org has native ARM runners, you can switch runner to windows-11-arm.
           - label: windows-arm64
-            runner: windows-latest
+            runner: windows-2025-vs2026
             platform: windows
             python-version: "3.10"
             target: aarch64-pc-windows-msvc
@@ -443,7 +462,7 @@ jobs:
             upload_wheel: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -461,7 +480,7 @@ jobs:
           $PY scripts/sync_version_from_tag.py "$VERSION"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -481,7 +500,8 @@ jobs:
         shell: bash
         run: |
           brew update
-          brew install openblas pkg-config
+          brew list --versions openblas >/dev/null 2>&1 || brew install openblas
+          command -v pkg-config >/dev/null 2>&1 || brew install pkgconf
           OPENBLAS_PREFIX="$(brew --prefix openblas)"
           echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib" >> "$GITHUB_ENV"
           echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include" >> "$GITHUB_ENV"
@@ -846,7 +866,7 @@ jobs:
 
       - name: Upload final wheel artifact
         if: ${{ matrix.upload_wheel == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.label }}
           path: wheelhouse/*.whl
@@ -859,7 +879,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -877,7 +897,7 @@ jobs:
           $PY scripts/sync_version_from_tag.py "$VERSION"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -891,7 +911,7 @@ jobs:
           maturin sdist --out dist
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -907,20 +927,20 @@ jobs:
       contents: read
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: wheelhouse
           merge-multiple: true
 
       - name: Download sdist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -954,20 +974,20 @@ jobs:
       contents: read
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: wheelhouse
           merge-multiple: true
 
       - name: Download sdist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -1022,7 +1042,7 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Fetch staged installer artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist-installers
           merge-multiple: true
@@ -1082,7 +1102,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout default branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
@@ -1118,7 +1138,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout default branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0

@@ -37,6 +37,7 @@ const SKIP_WARMUP_ENV: &str = "JX_SKIP_WARMUP";
 const WARMUP_MARKER: &str = ".runtime_warmed";
 const LAUNCHER_VERSION_MARKER: &str = ".launcher_version";
 const RUNTIME_OWNER_MARKER: &str = ".launcher_runtime_owner";
+const UNINSTALL_HELPER_NAME: &str = "jx_uninstall_cleanup.cmd";
 const GWAS_HISTORY_DB_FILE: &str = "janusx_tasks.db";
 const KNOWN_MODULES: [&str; 21] = [
     "grm",
@@ -888,6 +889,7 @@ fn cleanup_generated_artifacts_in_install_dir(install_dir: &Path, failed: &mut V
         "jx.new.exe",
         "jx.previous.exe",
         "jx_replace_launcher.cmd",
+        UNINSTALL_HELPER_NAME,
         RUNTIME_HOME_CONFIG,
         LAUNCHER_VERSION_MARKER,
         UPDATE_TIME_MARKER,
@@ -1936,6 +1938,43 @@ endlocal\r\n"
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to stage launcher replacement: {e}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn schedule_windows_launcher_self_delete(jx_exe: &Path) -> Result<(), String> {
+    let install_dir = jx_exe.parent().ok_or_else(|| {
+        "Failed to resolve launcher install directory for self-delete.".to_string()
+    })?;
+    let helper = install_dir.join(UNINSTALL_HELPER_NAME);
+    let esc_target = jx_exe.to_string_lossy().replace('"', "\"\"");
+    let helper_script = format!(
+        "@echo off\r\n\
+setlocal enableextensions\r\n\
+set \"TARGET={esc_target}\"\r\n\
+for /L %%i in (1,1,900) do (\r\n\
+  del /F /Q \"%TARGET%\" >NUL 2>NUL\r\n\
+  if not exist \"%TARGET%\" goto :done\r\n\
+  >NUL 2>NUL ping 127.0.0.1 -n 2\r\n\
+)\r\n\
+:done\r\n\
+del /F /Q \"%~f0\" >NUL 2>NUL\r\n\
+endlocal\r\n"
+    );
+    std::fs::write(&helper, helper_script).map_err(|e| {
+        format!(
+            "Failed to create launcher self-delete helper {}: {e}",
+            helper.display()
+        )
+    })?;
+    Command::new("cmd")
+        .arg("/C")
+        .arg(&helper)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch launcher self-delete helper: {e}"))?;
     Ok(())
 }
 
@@ -4161,18 +4200,9 @@ fn run_uninstall(args: &[String]) -> Result<i32, String> {
         let jx_exe = install_dir.join("jx.exe");
         if jx_exe.exists() {
             if let Err(e) = std::fs::remove_file(&jx_exe) {
-                let escaped = jx_exe.to_string_lossy().replace('"', "\"\"");
-                let cmdline =
-                    format!("ping 127.0.0.1 -n 2 >NUL & del /f /q \"{escaped}\" >NUL 2>NUL");
-                let spawned = Command::new("cmd")
-                    .arg("/C")
-                    .arg(cmdline)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if spawned.is_err() {
+                if let Err(schedule_err) = schedule_windows_launcher_self_delete(&jx_exe) {
                     failed.push(format!("{} ({e})", jx_exe.display()));
+                    failed.push(schedule_err);
                 }
             }
         }

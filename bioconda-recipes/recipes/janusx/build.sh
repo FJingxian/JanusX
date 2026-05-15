@@ -322,6 +322,7 @@ echo "[build.sh] project cargo config prepared"
 
 # Build/install using the conda-provided maturin + Rust toolchain.
 export JANUSX_REQUIRE_OPENBLAS=1
+export JANUSX_BUILD_VERBOSE="${JANUSX_BUILD_VERBOSE:-1}"
 # v1.0.23 source build can fail to prebuild KMC on some Linux arches due to
 # hardcoded `-lz` linking without conda lib search flags. Disable that prebuild
 # in recipe build; runtime path can still lazy-build KMC when needed.
@@ -362,9 +363,22 @@ if [[ -n "${PREFIX:-}" ]]; then
     fi
   fi
 fi
-python -m pip install . \
+py_bin="${PYTHON:-python}"
+wheel_dir="${PWD}/dist-conda-wheel"
+rm -rf "${wheel_dir}"
+mkdir -p "${wheel_dir}"
+
+# Build the wheel directly with maturin to avoid opaque pip/PEP517 hook
+# failures inside bioconda-utils/conda-build containers.
+"${py_bin}" -m maturin build \
+  --release \
+  --interpreter "${py_bin}" \
+  --compatibility off \
+  --out "${wheel_dir}" \
+  -v
+
+"${py_bin}" -m pip install "${wheel_dir}"/janusx-*.whl \
   --no-deps \
-  --no-build-isolation \
   -vv
 
 # Strict post-build backend gate: fail when Rust backend is not OpenBLAS.

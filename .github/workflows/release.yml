@@ -1017,7 +1017,6 @@ jobs:
     uses: ./.github/workflows/bioconda-pr-update.yml
     with:
       release_tag: ${{ github.event.inputs.release_tag || github.event.inputs.ref || github.ref_name }}
-      source_ref: ${{ github.event.inputs.ref || github.ref }}
       bioconda_fork: FJingxian/bioconda-recipes
     secrets: inherit
 

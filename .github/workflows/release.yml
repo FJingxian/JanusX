@@ -549,7 +549,7 @@ jobs:
               ${INTERP} -m pip install -U pip
               ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
               export OPENBLAS_VERSION=0.3.33
-              bash /io/scripts/ci/build_linux_openblas.sh
+              . /io/scripts/ci/build_linux_openblas.sh
               export JANUSX_REQUIRE_OPENBLAS=1
               export JANUSX_STRICT_KMC_BIND=1
               ${INTERP} -m build --wheel --outdir dist_raw --no-isolation

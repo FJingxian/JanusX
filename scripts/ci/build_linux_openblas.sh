@@ -58,25 +58,27 @@ if [[ ! -d "${OPENBLAS_PREFIX}/lib" ]]; then
   exit 1
 fi
 
-cd "${OPENBLAS_PREFIX}/lib"
-if [[ ! -e libopenblas.so ]]; then
-  candidate="$(ls -1 libopenblas*.so* 2>/dev/null | head -n1 || true)"
-  if [[ -n "${candidate}" ]]; then
-    ln -sf "${candidate}" libopenblas.so
+(
+  cd "${OPENBLAS_PREFIX}/lib"
+  if [[ ! -e libopenblas.so ]]; then
+    candidate="$(ls -1 libopenblas*.so* 2>/dev/null | head -n1 || true)"
+    if [[ -n "${candidate}" ]]; then
+      ln -sf "${candidate}" libopenblas.so
+    fi
   fi
-fi
-if [[ ! -e libopenblas.so.0 ]]; then
-  candidate="$(ls -1 libopenblas*.so* 2>/dev/null | head -n1 || true)"
-  if [[ -n "${candidate}" ]]; then
-    ln -sf "${candidate}" libopenblas.so.0
+  if [[ ! -e libopenblas.so.0 ]]; then
+    candidate="$(ls -1 libopenblas*.so* 2>/dev/null | head -n1 || true)"
+    if [[ -n "${candidate}" ]]; then
+      ln -sf "${candidate}" libopenblas.so.0
+    fi
   fi
-fi
 
-if [[ ! -e libopenblas.so ]]; then
-  echo "ERROR: OpenBLAS install did not produce libopenblas.so" >&2
-  ls -al "${OPENBLAS_PREFIX}/lib" >&2
-  exit 1
-fi
+  if [[ ! -e libopenblas.so ]]; then
+    echo "ERROR: OpenBLAS install did not produce libopenblas.so" >&2
+    ls -al "${OPENBLAS_PREFIX}/lib" >&2
+    exit 1
+  fi
+)
 
 if [[ ! -d "${OPENBLAS_PREFIX}/include" ]]; then
   echo "ERROR: OpenBLAS install did not produce ${OPENBLAS_PREFIX}/include" >&2

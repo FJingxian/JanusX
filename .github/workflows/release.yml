@@ -540,37 +540,18 @@ jobs:
             bash -lc "
               set -euo pipefail
               yum install -y epel-release || true
-              yum install -y openblas-devel pkgconfig curl
-              THREAD_LIB=\"\$(ls -1 /usr/lib64/libopenblasp-r*.so /usr/lib/libopenblasp-r*.so 2>/dev/null | head -n1 || true)\"
-              if [[ -z \"\${THREAD_LIB}\" ]]; then
-                echo \"ERROR: pthread OpenBLAS candidate not found (expected libopenblasp-r*.so).\"
-                exit 1
-              fi
+              yum install -y gcc gcc-gfortran make pkgconfig curl tar gzip
               rm -rf dist dist_raw
               mkdir -p dist dist_raw
-              mkdir -p /tmp/openblas_threaded
-              ln -sf \"\${THREAD_LIB}\" /tmp/openblas_threaded/libopenblas.so
-              ln -sf \"\${THREAD_LIB}\" /tmp/openblas_threaded/libopenblas.so.0
-              # Ensure auditwheel can resolve SONAME libopenblasp.so.0 when only versioned file exists.
-              if [[ -d /usr/lib64 ]]; then
-                ln -sf \"\${THREAD_LIB}\" /usr/lib64/libopenblasp.so
-                ln -sf \"\${THREAD_LIB}\" /usr/lib64/libopenblasp.so.0
-              fi
-              if [[ -d /usr/lib ]]; then
-                ln -sf \"\${THREAD_LIB}\" /usr/lib/libopenblasp.so
-                ln -sf \"\${THREAD_LIB}\" /usr/lib/libopenblasp.so.0
-              fi
-              export LD_LIBRARY_PATH=/tmp/openblas_threaded:/usr/lib64:/usr/lib:\${LD_LIBRARY_PATH:-}
-              echo \"[linux build container] threaded OpenBLAS candidate: \${THREAD_LIB}\"
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
               source /root/.cargo/env
               export PATH=\"$(dirname ${INTERP}):\${PATH}\"
               ${INTERP} -m pip install -U pip
               ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
+              export OPENBLAS_VERSION=0.3.33
+              bash /io/scripts/ci/build_linux_openblas.sh
               export JANUSX_REQUIRE_OPENBLAS=1
               export JANUSX_STRICT_KMC_BIND=1
-              export OPENBLAS_LIB_DIR=/tmp/openblas_threaded
-              export OPENBLAS_INCLUDE_DIR=/usr/include/openblas
               ${INTERP} -m build --wheel --outdir dist_raw --no-isolation
               ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist_raw/*.whl
               auditwheel show dist_raw/*.whl
